@@ -4,7 +4,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use axo_ai::{Accumulator, AssistantMessage, Message, Model, Streamer, ThinkingLevel, ToolCall};
+use axo_ai::{
+    Accumulator, AssistantMessage, Message, Model, Streamer, ThinkingLevel, ToolCall,
+    ToolResultMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -222,6 +225,28 @@ impl Agent {
         };
         let _guard = RunGuard(self);
         run::run_loop(self, RunStart::Continue, cancel).await
+    }
+
+    /// Classifies an already persisted response without streaming or replaying its
+    /// completed calls. Recovery and any subsequent requests share one run lifetime.
+    pub async fn recover_response(
+        &self,
+        response: AssistantMessage,
+        model: Model,
+        tool_results: Vec<ToolResultMessage>,
+    ) -> Result<RunOutcome, Error> {
+        let cancel = Self::begin_run(&mut self.lock())?;
+        let _guard = RunGuard(self);
+        run::run_loop(
+            self,
+            RunStart::RecoverResponse {
+                response,
+                model,
+                tool_results,
+            },
+            cancel,
+        )
+        .await
     }
 
     /// Queues a message injected after the current turn's tool calls finish.

@@ -3,9 +3,10 @@
 //!
 //! `drive [--dir <AXO_DIR>] [--cwd <path>] [--model <provider/id>] [--thinking <level>]
 //! [--answer recommended|first] [--resume <session.jsonl> [--fork <entry-id>]]
-//! [--request-id <id>] [<prompt>]`
+//! [--navigate <entry-id|root> [--summarize]] [--request-id <id>] [<prompt>]`
 //!
-//! `--resume` without a prompt only lets recovery finish.
+//! Standalone `/compact` and `/shake [elide|images|thinking]` perform maintenance.
+//! `--resume` without a prompt only lets recovery/navigation finish.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,7 +14,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axo::store::{self, Entry, EntryId, SeqEntry};
-use axo::{Answer, Axo, PromptRequest, PromptResult, Session, SessionEvent, SessionOptions};
+use axo::{
+    Answer, Axo, NavigateOptions, PromptRequest, PromptResult, Session, SessionEvent,
+    SessionOptions, ShakeMode,
+};
 use axo_agent::AgentEvent;
 use axo_ai::{AssistantBlock, AssistantEvent, ThinkingLevel, UserBlock};
 use serde_json::Value;
@@ -44,6 +48,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut first = false;
     let mut resume = None;
     let mut fork = None;
+    let mut navigate = None;
+    let mut summarize = false;
     let mut request_id = None;
     let mut prompt = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -64,6 +70,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--resume" => resume = Some(PathBuf::from(args.next().ok_or("--resume needs a path")?)),
             "--fork" => fork = Some(args.next().ok_or("--fork needs an entry id")?),
+            "--navigate" => {
+                navigate = Some(args.next().ok_or("--navigate needs an entry id or root")?)
+            }
+            "--summarize" => summarize = true,
             "--request-id" => request_id = Some(args.next().ok_or("--request-id needs an id")?),
             _ => prompt.push(arg),
         }
@@ -71,6 +81,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = prompt.join(" ");
     if fork.is_some() && resume.is_none() {
         return Err("--fork needs --resume".into());
+    }
+    if navigate.is_some() && resume.is_none() {
+        return Err("--navigate needs --resume".into());
+    }
+    if summarize && navigate.is_none() {
+        return Err("--summarize needs --navigate".into());
+    }
+    if navigate.is_some() && fork.is_some() {
+        return Err("--navigate cannot be combined with --fork".into());
+    }
+    let words: Vec<_> = prompt.split_whitespace().collect();
+    let maintenance = match words.as_slice() {
+        ["/compact"] => Some(None),
+        ["/compact", ..] => return Err("/compact takes no arguments".into()),
+        ["/shake"] | ["/shake", "elide"] => Some(Some(ShakeMode::Elide)),
+        ["/shake", "images"] => Some(Some(ShakeMode::Images)),
+        ["/shake", "thinking"] => Some(Some(ShakeMode::Thinking)),
+        ["/shake", ..] => return Err("/shake takes only elide, images, or thinking".into()),
+        _ => None,
+    };
+    if maintenance.is_some() && request_id.is_some() {
+        return Err("--request-id cannot be used with maintenance commands".into());
     }
     if prompt.is_empty() && resume.is_none() {
         return Err("a prompt is required".into());
@@ -113,7 +145,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             None => println!("[run] unknown"),
         }
     }
+    if let Some(target) = navigate {
+        let mut events = session.attach(None).await.events;
+        let target = (target != "root").then(|| EntryId::from(target));
+        let result = session
+            .navigate(target, NavigateOptions { summarize })
+            .await;
+        while let Ok(event) = events.try_recv() {
+            print_maintenance(&event);
+        }
+        result?;
+    }
+    if let Some(mode) = maintenance {
+        let mut events = session.attach(None).await.events;
+        let result = match mode {
+            Some(mode) => session.shake(mode).await,
+            None => session.compact().await,
+        };
+        while let Ok(event) = events.try_recv() {
+            print_maintenance(&event);
+        }
+        print_system_sections(&session).await;
+        return result.map_err(Into::into);
+    }
     if prompt.is_empty() {
+        print_system_sections(&session).await;
         return Ok(());
     }
 
@@ -125,6 +181,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             request_id,
         })
         .await;
+    print_system_sections(&session).await;
     match result {
         Ok(PromptResult::Settled { outcome, .. }) => {
             printer.await?;
@@ -157,6 +214,7 @@ async fn print_events(
             Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => return None,
         };
+        print_maintenance(&event);
         match event {
             SessionEvent::Entry(SeqEntry {
                 entry: Entry::RunEnd { outcome, .. },
@@ -242,5 +300,42 @@ async fn print_events(
             _ => {}
         }
         let _ = stdout.flush();
+    }
+}
+
+fn print_maintenance(event: &SessionEvent) {
+    match event {
+        SessionEvent::MaintenanceStart { kind } => println!("[maintenance-start] {kind:?}"),
+        SessionEvent::MaintenanceEnd {
+            kind,
+            error,
+            aborted,
+        } => {
+            println!("[maintenance-end] {kind:?} aborted={aborted} error={error:?}");
+        }
+        SessionEvent::Retry { attempt, delay_ms } => {
+            println!("[retry] attempt={attempt} delay_ms={delay_ms}");
+        }
+        _ => {}
+    }
+}
+
+async fn print_system_sections(session: &Session) {
+    let attached = session.attach(None).await;
+    let messages: Vec<_> = store::project(&attached.missed, None)
+        .messages
+        .into_iter()
+        .filter_map(|message| match message {
+            axo_agent::AgentMessage::Llm(message) => Some(message),
+            _ => None,
+        })
+        .collect();
+    if let Some(system) = axo_ai::transcript::current_system_message(&messages) {
+        let names = system
+            .sections
+            .unwrap_or_default()
+            .into_keys()
+            .collect::<Vec<_>>();
+        println!("[system-sections] {}", names.join(", "));
     }
 }

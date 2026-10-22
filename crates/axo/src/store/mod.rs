@@ -15,7 +15,7 @@ pub use entry::{
     SessionInfo, SubmissionKind, TIMESTAMP_FORMAT,
 };
 pub use jsonl::JsonlStore;
-pub use project::{Projection, project};
+pub use project::{ProjectedSource, Projection, project};
 pub use recovery::{RecoveryPlan, plan_recovery};
 
 use crate::error::Error;

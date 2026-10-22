@@ -169,6 +169,8 @@ pub enum Entry {
         base: EntryBase,
         summary: String,
         first_kept_entry_id: EntryId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preserved_user_ids: Vec<EntryId>,
         tokens_before: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,

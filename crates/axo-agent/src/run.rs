@@ -28,6 +28,7 @@ use crate::message::{AgentMessage, unanswered_calls};
 use crate::tool::{ExecutionMode, Tool, ToolOutput, ToolUpdate};
 
 /// How a run starts.
+#[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 pub(crate) enum RunStart {
     /// `Agent::prompt`: append and emit these messages, then request a turn.
     Prompt(Vec<AgentMessage>),
@@ -35,6 +36,11 @@ pub(crate) enum RunStart {
     /// tool-result message, an assistant message with unanswered tool calls (those calls
     /// run first), or a settled reply with queued steering or follow-ups.
     Continue,
+    RecoverResponse {
+        response: AssistantMessage,
+        model: Model,
+        tool_results: Vec<ToolResultMessage>,
+    },
 }
 
 /// Runs one agent run to completion. `cancel` is the run's token (already registered in
@@ -110,17 +116,34 @@ impl Run<'_> {
                 }
                 pending = self.drain_queue(true).await;
             }
+            RunStart::RecoverResponse {
+                response,
+                model,
+                tool_results,
+            } => {
+                resume = Some((response, model, tool_results, true));
+            }
             RunStart::Continue => {
-                resume = unanswered_calls(self.context.messages.iter()).map(|(message, calls)| {
-                    let calls: Vec<ToolCall> = calls.into_iter().cloned().collect();
-                    (message.clone(), calls)
+                resume = unanswered_calls(self.context.messages.iter()).map(|(message, _)| {
+                    let results = self
+                        .context
+                        .messages
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            AgentMessage::Llm(Message::ToolResult(result))
+                                if message
+                                    .tool_calls()
+                                    .any(|call| call.id == result.tool_call_id) =>
+                            {
+                                Some(result.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    (message.clone(), self.model().0, results, false)
                 });
-                // Steering polled now would be overwritten by the poll after the resumed
-                // calls finish, so only poll when there is nothing to resume.
                 if resume.is_none() {
                     pending = self.drain_queue(true).await;
-                    // After a settled reply only queued input starts a turn (pi `agent.ts`
-                    // `continue`): follow-ups count when there is no steering.
                     let after_reply = matches!(
                         self.context.messages.iter().rev().find(|message| !matches!(
                             message,
@@ -135,141 +158,221 @@ impl Run<'_> {
             }
         }
 
-        let mut last_turn: Option<(AssistantMessage, Vec<ToolResultMessage>)> = None;
-        let mut explicit_continuation = false;
+        let mut last_turn: Option<(AssistantMessage, Model, Vec<ToolResultMessage>)> = None;
         loop {
-            let mut more_tool_calls = true;
-            while more_tool_calls || !pending.is_empty() {
-                let (message, calls) = match resume.take() {
-                    Some(resumed) => resumed,
-                    None => {
-                        let mut prepared = Vec::new();
-                        if let Some((message, tool_results)) = &last_turn {
-                            let update = agent
-                                .hooks
-                                .prepare_next_turn(
-                                    TurnContext {
-                                        message,
-                                        tool_results,
-                                        context: &self.context,
-                                        new_messages: &self.new_messages,
-                                    },
-                                    &self.cancel,
-                                )
-                                .await;
-                            if let Some(update) = update {
-                                prepared = update.messages;
-                                self.apply_update(update.context, update.model, update.thinking);
-                            }
-                            // Preparation can be long (e.g. compaction): pick up steering
-                            // queued meanwhile, unless one-at-a-time already took one.
-                            if pending.is_empty() {
-                                pending = self.drain_queue(true).await;
-                            }
-                            self.emit(AgentEvent::TurnStart).await?;
-                        }
-
-                        self.context.tools = agent.lock().tools.clone();
-                        prepared.append(&mut pending);
-                        for message in declare_tool_changes(&self.context, prepared) {
-                            self.add_message(message).await?;
-                        }
-
-                        let (model, thinking) = self.model();
+            let (message, model, results, recovered) = match resume.take() {
+                Some(resumed) => resumed,
+                None => {
+                    if self.cancel.is_cancelled() {
+                        return self.finish_aborted().await;
+                    }
+                    let mut prepared = Vec::new();
+                    if let Some((message, model, tool_results)) = &last_turn {
                         let update = agent
                             .hooks
-                            .prepare_request(
-                                PrepareRequestContext {
+                            .prepare_next_turn(
+                                TurnContext {
+                                    message,
+                                    model,
+                                    tool_results,
                                     context: &self.context,
-                                    model: &model,
-                                    thinking,
+                                    new_messages: &self.new_messages,
                                 },
                                 &self.cancel,
                             )
                             .await;
+                        if self.cancel.is_cancelled() {
+                            return self.finish_aborted().await;
+                        }
                         if let Some(update) = update {
+                            prepared = update.messages;
                             self.apply_update(update.context, update.model, update.thinking);
                         }
-
-                        let message = self.stream_turn().await?;
-                        if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-                            return self.end_failed_turn(message).await;
+                        if pending.is_empty() {
+                            pending = self.drain_queue(true).await;
                         }
-                        let calls = message.tool_calls().cloned().collect();
-                        (message, calls)
+                        self.emit(AgentEvent::TurnStart).await?;
                     }
-                };
-
-                let mut tool_results = Vec::new();
-                more_tool_calls = false;
-                if !calls.is_empty() {
-                    // A `Length` stop may have cut any call's arguments short: run none.
-                    let (results, terminate) = if message.stop_reason == StopReason::Length {
-                        (self.fail_truncated_calls(&calls).await?, false)
-                    } else {
-                        self.execute_tool_calls(&message, &calls).await?
+                    self.context.tools = agent.lock().tools.clone();
+                    prepared.append(&mut pending);
+                    for message in declare_tool_changes(&self.context, prepared) {
+                        self.add_message(message).await?;
+                    }
+                    if self.cancel.is_cancelled() {
+                        return self.finish_aborted().await;
+                    }
+                    let (model, thinking) = self.model();
+                    let update = agent
+                        .hooks
+                        .prepare_request(
+                            PrepareRequestContext {
+                                context: &self.context,
+                                model: &model,
+                                thinking,
+                            },
+                            &self.cancel,
+                        )
+                        .await;
+                    match update {
+                        Ok(Some(update)) => {
+                            self.apply_update(update.context, update.model, update.thinking)
+                        }
+                        Ok(None) => {}
+                        Err(_) if self.cancel.is_cancelled() => return self.finish_aborted().await,
+                        Err(error) => return self.finish(RunOutcome::Failed(error.0)).await,
+                    }
+                    if self.cancel.is_cancelled() {
+                        return self.finish_aborted().await;
+                    }
+                    let Some((message, model)) = self.stream_turn().await? else {
+                        return self.finish_aborted().await;
                     };
-                    tool_results = results;
-                    more_tool_calls = !terminate;
+                    (message, model, Vec::new(), false)
                 }
+            };
 
-                if self.cancel.is_cancelled() {
-                    return self.end_aborted_turn(message, &calls, tool_results).await;
+            let (tool_results, continue_turn, outcome) = self
+                .complete_response(&message, &model, results, recovered)
+                .await?;
+            if let Some(outcome) = outcome {
+                return self.finish(outcome).await;
+            }
+            pending = self.drain_queue(true).await;
+            if !continue_turn && pending.is_empty() {
+                pending = self.drain_queue(false).await;
+                if pending.is_empty() {
+                    return self.finish(RunOutcome::Done).await;
                 }
+            }
+            last_turn = Some((message, model, tool_results));
+        }
+    }
 
-                let decision = agent
+    /// Fresh and recovered responses share classification, result completion and
+    /// maintenance ordering. Recovery never executes a missing call.
+    async fn complete_response(
+        &mut self,
+        message: &AssistantMessage,
+        model: &Model,
+        existing: Vec<ToolResultMessage>,
+        recovered: bool,
+    ) -> Result<(Vec<ToolResultMessage>, bool, Option<RunOutcome>), Error> {
+        let calls: Vec<ToolCall> = message.tool_calls().cloned().collect();
+        let mut results = Vec::with_capacity(calls.len());
+        let skipped = self.agent.hooks.should_skip_tools(message, model);
+        let failed = message.stop_reason == StopReason::Error;
+        let aborted = message.stop_reason == StopReason::Aborted || self.cancel.is_cancelled();
+        let missing: Vec<ToolCall> = calls
+            .iter()
+            .filter(|call| !existing.iter().any(|result| result.tool_call_id == call.id))
+            .cloned()
+            .collect();
+        let mut terminate = false;
+        let produced = if aborted {
+            Vec::new()
+        } else if skipped || failed {
+            self.fail_calls(&missing, false).await?
+        } else if message.stop_reason == StopReason::Length {
+            self.fail_calls(&missing, true).await?
+        } else if recovered {
+            self.fail_calls(&missing, false).await?
+        } else {
+            let (produced, ended) = self.execute_tool_calls(message, &missing).await?;
+            terminate = ended;
+            produced
+        };
+        let mut available = existing;
+        available.extend(produced);
+        for call in &calls {
+            if let Some(index) = available
+                .iter()
+                .position(|result| result.tool_call_id == call.id)
+            {
+                results.push(available.remove(index));
+            }
+        }
+        if aborted || self.cancel.is_cancelled() {
+            self.complete_aborted_results(&calls, &mut results).await?;
+        }
+        let finish = if self.cancel_reason() != Some(CancelReason::Shutdown) {
+            Some(
+                self.agent
                     .hooks
                     .finish_turn(
                         TurnContext {
-                            message: &message,
-                            tool_results: &tool_results,
+                            message,
+                            model,
+                            tool_results: &results,
                             context: &self.context,
                             new_messages: &self.new_messages,
                         },
                         &self.cancel,
                     )
-                    .await;
-                self.emit(AgentEvent::TurnEnd {
-                    message: AgentMessage::Llm(Message::Assistant(message.clone())),
-                    tool_results: tool_results.clone(),
-                })
-                .await?;
-                if decision == Some(TurnDecision::End) {
-                    return self.finish(RunOutcome::Done).await;
+                    .await,
+            )
+        } else {
+            None
+        };
+        // Cancellation wins over errors and continuation, even when the hook returned
+        // just as cancellation arrived. Do not invoke the hook a second time.
+        let cancelled = aborted || self.cancel.is_cancelled();
+        let mut decision = None;
+        let mut outcome = None;
+        if let Some(finish) = finish {
+            match finish {
+                Ok(finish) => {
+                    self.apply_update(finish.context, None, None);
+                    decision = finish.decision;
                 }
-
-                explicit_continuation = decision == Some(TurnDecision::Continue);
-                pending = self.drain_queue(true).await;
-                if more_tool_calls || !pending.is_empty() {
-                    explicit_continuation = false;
-                }
-                last_turn = Some((message, tool_results));
+                Err(error) => outcome = Some(RunOutcome::Failed(error.0)),
             }
-
-            // The run would stop here: follow-ups keep it going.
-            let follow_ups = self.drain_queue(false).await;
-            if !follow_ups.is_empty() {
-                explicit_continuation = false;
-                pending = follow_ups;
-                continue;
-            }
-            // `finish_turn` asked for one more request and nothing else provided one.
-            if explicit_continuation {
-                explicit_continuation = false;
-                continue;
-            }
-            return self.finish(RunOutcome::Done).await;
         }
+        if cancelled {
+            self.complete_aborted_results(&calls, &mut results).await?;
+            outcome = Some(RunOutcome::Aborted(
+                self.cancel_reason().unwrap_or(CancelReason::User),
+            ));
+        }
+        self.emit(AgentEvent::TurnEnd {
+            message: AgentMessage::Llm(Message::Assistant(message.clone())),
+            tool_results: results.clone(),
+        })
+        .await?;
+        if outcome.is_none() && decision != Some(TurnDecision::Continue) {
+            if failed || skipped {
+                outcome = Some(RunOutcome::Failed(
+                    message
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "Model response could not be used".into()),
+                ));
+            } else if decision == Some(TurnDecision::End) {
+                outcome = Some(RunOutcome::Done);
+            }
+        }
+        let continue_turn =
+            decision == Some(TurnDecision::Continue) || (!calls.is_empty() && !terminate);
+        Ok((results, continue_turn, outcome))
+    }
+
+    async fn finish_aborted(&mut self) -> Result<RunOutcome, Error> {
+        self.finish(RunOutcome::Aborted(
+            self.cancel_reason().unwrap_or(CancelReason::User),
+        ))
+        .await
     }
 
     /// Streams one assistant response (pi `streamAssistantResponse`) and adds it to the
     /// transcript, unless the run is shutting down.
-    async fn stream_turn(&mut self) -> Result<AssistantMessage, Error> {
+    async fn stream_turn(&mut self) -> Result<Option<(AssistantMessage, Model)>, Error> {
         let agent = self.agent;
         let messages = agent
             .hooks
             .transform_context(self.context.messages.clone(), &self.cancel)
             .await;
+        if self.cancel.is_cancelled() {
+            return Ok(None);
+        }
         let mut messages = agent.hooks.convert_to_llm(messages);
         // Failed and aborted turns stay in the transcript but are never sent (providers'
         // `transform_messages` applies the same rule; doing it here keeps every request,
@@ -350,10 +453,11 @@ impl Run<'_> {
         let adjusted = self
             .end_message(AgentMessage::Llm(Message::Assistant(message.clone())))
             .await?;
-        Ok(match adjusted {
+        let message = match adjusted {
             Some(AgentMessage::Llm(Message::Assistant(adjusted))) => adjusted,
             _ => message,
-        })
+        };
+        Ok(Some((message, model)))
     }
 
     /// Runs the calls of one assistant message (pi `executeToolCalls`). Returns their
@@ -589,10 +693,11 @@ impl Run<'_> {
         Ok(finished)
     }
 
-    /// Fails every call of a response cut off by the output-token limit.
-    async fn fail_truncated_calls(
+    /// Produces ordered nonexecuted results; ordinary Length keeps its diagnostic.
+    async fn fail_calls(
         &mut self,
         calls: &[ToolCall],
+        truncated: bool,
     ) -> Result<Vec<ToolResultMessage>, Error> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -600,10 +705,15 @@ impl Run<'_> {
             let outcome = Outcome {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
-                output: error_output(format!(
-                    "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
-                    call.name
-                )),
+                output: error_output(if truncated {
+                    format!(
+                        "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                        call.name
+                    )
+                } else {
+                    "Tool call was not executed because the model response could not be used."
+                        .into()
+                }),
                 duration_ms: None,
             };
             self.emit_end(&outcome).await?;
@@ -612,44 +722,12 @@ impl Run<'_> {
         Ok(results)
     }
 
-    /// Ends the run after a response that failed or was aborted (no tool execution).
-    async fn end_failed_turn(&mut self, message: AssistantMessage) -> Result<RunOutcome, Error> {
-        if message.stop_reason == StopReason::Aborted {
-            // User aborts answer every call so the saved transcript is complete, and
-            // `drop_failed_turns` keeps the turn and its results out of requests.
-            let calls: Vec<ToolCall> = message.tool_calls().cloned().collect();
-            return self.end_aborted_turn(message, &calls, Vec::new()).await;
-        }
-        // The decision is ignored: a failed turn always ends the run.
-        self.agent
-            .hooks
-            .finish_turn(
-                TurnContext {
-                    message: &message,
-                    tool_results: &[],
-                    context: &self.context,
-                    new_messages: &self.new_messages,
-                },
-                &self.cancel,
-            )
-            .await;
-        let error = message.error_message.clone().unwrap_or_default();
-        self.emit(AgentEvent::TurnEnd {
-            message: AgentMessage::Llm(Message::Assistant(message)),
-            tool_results: Vec::new(),
-        })
-        .await?;
-        self.finish(RunOutcome::Failed(error)).await
-    }
-
-    /// Ends a cancelled run. A user cancel answers every call of `calls` left without a
-    /// result with `"Operation aborted"`; a shutdown records nothing (see `persist`).
-    async fn end_aborted_turn(
+    /// User cancellation answers missing calls; shutdown leaves durable history open.
+    async fn complete_aborted_results(
         &mut self,
-        message: AssistantMessage,
         calls: &[ToolCall],
-        mut tool_results: Vec<ToolResultMessage>,
-    ) -> Result<RunOutcome, Error> {
+        tool_results: &mut Vec<ToolResultMessage>,
+    ) -> Result<(), Error> {
         let reason = self.cancel_reason().unwrap_or(CancelReason::User);
         if reason == CancelReason::User {
             for call in calls {
@@ -667,25 +745,10 @@ impl Run<'_> {
                 };
                 tool_results.extend(self.add_tool_result(&outcome).await?);
             }
-            self.agent
-                .hooks
-                .finish_turn(
-                    TurnContext {
-                        message: &message,
-                        tool_results: &tool_results,
-                        context: &self.context,
-                        new_messages: &self.new_messages,
-                    },
-                    &self.cancel,
-                )
-                .await;
         }
-        self.emit(AgentEvent::TurnEnd {
-            message: AgentMessage::Llm(Message::Assistant(message)),
-            tool_results,
-        })
-        .await?;
-        self.finish(RunOutcome::Aborted(reason)).await
+        tool_results
+            .sort_by_key(|result| calls.iter().position(|call| call.id == result.tool_call_id));
+        Ok(())
     }
 
     async fn finish(&mut self, outcome: RunOutcome) -> Result<RunOutcome, Error> {
@@ -737,6 +800,7 @@ impl Run<'_> {
         let mut state = agent.lock();
         if let Some(context) = context {
             state.tools = context.tools.clone();
+            state.messages = context.messages.clone();
             self.context = context;
         }
         if let Some(model) = model {

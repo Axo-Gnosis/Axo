@@ -22,11 +22,14 @@ pub enum Error {
     NoModel,
     #[error("Model not found: {0}")]
     ModelNotFound(String),
-    /// A run is active: `prompt` and `navigate` need an idle session.
+    /// A run or maintenance operation owns the session's idle reservation.
     #[error(
         "Agent is already processing. Use steer() or follow_up() to queue messages, or wait for completion."
     )]
     Busy,
+    /// Invalid compaction limits, rejected summaries, or aborted maintenance.
+    #[error("{0}")]
+    Compaction(String),
     /// `answer`/`dismiss` named a tool call with no pending question.
     #[error("No pending question for tool call: {0}")]
     NoPendingQuestion(String),

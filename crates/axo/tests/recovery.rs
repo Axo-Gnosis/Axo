@@ -158,7 +158,13 @@ impl Log {
     }
 
     fn plan(&self, spool_dir: &Path) -> RecoveryPlan {
-        plan_recovery(&self.entries, &replay_of, spool_dir)
+        plan_recovery(
+            &self.entries,
+            &axo::store::project(&self.entries, None),
+            &model(),
+            &replay_of,
+            spool_dir,
+        )
     }
 }
 
@@ -217,7 +223,9 @@ fn settled_but_unclosed_run_is_finished() {
     assert_eq!(
         log.plan(spool.path()),
         RecoveryPlan::Finish {
-            run_id: "r1".into()
+            run_id: "r1".into(),
+            outcome: RunOutcome::Done,
+            reason: None,
         }
     );
 
@@ -350,4 +358,186 @@ fn follow_up_left_after_a_settled_reply_resumes_the_run() {
             requeue: vec![follow_up],
         }
     );
+}
+
+#[test]
+fn hidden_transient_response_is_recovered_before_any_tool_replay() {
+    let spool = tempfile::tempdir().unwrap();
+    let mut log = Log::default();
+    log.user("s1", SubmissionKind::Prompt, "start");
+    log.run_start("r1");
+    let failed = log.message(
+        Message::Assistant(AssistantMessage {
+            content: vec![AssistantBlock::ToolCall(call("danger", "bash"))],
+            stop_reason: StopReason::Error,
+            error_message: Some("503 service unavailable".into()),
+            ..AssistantMessage::empty(&model())
+        }),
+        None,
+    );
+    let response_id = failed.entry.base().unwrap().id.clone();
+    log.push(|base| Entry::ContextEdit {
+        base,
+        target_id: response_id.clone(),
+        replacement: None,
+    });
+    assert_eq!(
+        log.plan(spool.path()),
+        RecoveryPlan::RecoverResponse {
+            run_id: "r1".into(),
+            attempt: 1,
+            response_id: response_id.clone(),
+            requeue: vec![],
+        }
+    );
+    for attempt in 1..=5 {
+        log.run_resumed("r1", attempt);
+    }
+    assert_eq!(
+        log.plan(spool.path()),
+        RecoveryPlan::Park {
+            run_id: "r1".into()
+        }
+    );
+}
+
+#[test]
+fn checkpoint_absorbed_answer_finishes_but_later_consumed_input_continues() {
+    let spool = tempfile::tempdir().unwrap();
+    let mut log = Log::default();
+    log.user("s1", SubmissionKind::Prompt, "start");
+    let user_id = log.entries.last().unwrap().entry.base().unwrap().id.clone();
+    log.run_start("r1");
+    log.assistant_text("completed");
+    log.push(|base| Entry::Compaction {
+        first_kept_entry_id: base.id.clone(),
+        base,
+        preserved_user_ids: vec![user_id],
+        summary: "completed work".into(),
+        tokens_before: 500,
+        details: None,
+        usage: None,
+        from_hook: None,
+        system_message: None,
+    });
+    assert_eq!(
+        log.plan(spool.path()),
+        RecoveryPlan::Finish {
+            run_id: "r1".into(),
+            outcome: RunOutcome::Done,
+            reason: None,
+        }
+    );
+    log.user("s2", SubmissionKind::FollowUp, "next task");
+    assert!(matches!(
+        log.plan(spool.path()),
+        RecoveryPlan::Resume { .. }
+    ));
+}
+
+#[test]
+fn terminal_fault_outcomes_are_not_reported_as_success_or_replayed() {
+    let spool = tempfile::tempdir().unwrap();
+    for (stop_reason, outcome) in [
+        (StopReason::Error, RunOutcome::Failed),
+        (StopReason::Aborted, RunOutcome::Aborted),
+    ] {
+        let mut log = Log::default();
+        log.user("s1", SubmissionKind::Prompt, "start");
+        log.run_start("r1");
+        log.message(
+            Message::Assistant(AssistantMessage {
+                content: vec![AssistantBlock::ToolCall(call("unsafe", "bash"))],
+                stop_reason,
+                error_message: Some("permission denied".into()),
+                ..AssistantMessage::empty(&model())
+            }),
+            None,
+        );
+        assert_eq!(
+            log.plan(spool.path()),
+            RecoveryPlan::Finish {
+                run_id: "r1".into(),
+                outcome,
+                reason: Some("permission denied".into()),
+            }
+        );
+    }
+}
+
+#[test]
+fn hidden_successful_reply_cannot_settle_a_run() {
+    let spool = tempfile::tempdir().unwrap();
+    let mut log = Log::default();
+    log.user("s1", SubmissionKind::Prompt, "start");
+    log.run_start("r1");
+    log.assistant_text("answer");
+    let target_id = log.entries.last().unwrap().entry.base().unwrap().id.clone();
+    log.push(|base| Entry::ContextEdit {
+        base,
+        target_id,
+        replacement: None,
+    });
+    assert!(
+        matches!(log.plan(spool.path()), RecoveryPlan::Resume { rerun, interrupted, .. }
+        if rerun.is_empty() && interrupted.is_empty())
+    );
+}
+
+#[test]
+fn recovery_length_uses_actual_output_limit_not_summary_ceiling() {
+    let mut selected = model();
+    selected.max_tokens = 65_536;
+    let mut response = AssistantMessage::empty(&selected);
+    response.stop_reason = StopReason::Length;
+    response.usage.output = 40_000;
+    let mut log = Log::default();
+    log.run_start("r1");
+    log.message(Message::Assistant(response), None);
+    assert!(matches!(
+        plan_recovery(
+            &log.entries,
+            &axo::store::project(&log.entries, None),
+            &selected,
+            &replay_of,
+            Path::new("/unused"),
+        ),
+        RecoveryPlan::RecoverResponse { .. }
+    ));
+}
+
+#[test]
+fn model_switch_precedes_reopen_numeric_classification() {
+    for stop_reason in [StopReason::Error, StopReason::Length, StopReason::Stop] {
+        let mut response = AssistantMessage::empty(&model());
+        response.stop_reason = stop_reason;
+        response.usage.input = 50_000;
+        response.usage.output = 4_096;
+        response.error_message =
+            (stop_reason == StopReason::Error).then(|| "permission denied".into());
+        let mut log = Log::default();
+        log.run_start("r1");
+        log.message(Message::Assistant(response), None);
+        let mut selected = model();
+        selected.id = "replacement".into();
+        selected.context_window = 10_000;
+        let plan = plan_recovery(
+            &log.entries,
+            &axo::store::project(&log.entries, None),
+            &selected,
+            &replay_of,
+            Path::new("/unused"),
+        );
+        if stop_reason == StopReason::Stop {
+            assert!(matches!(
+                plan,
+                RecoveryPlan::Finish {
+                    outcome: RunOutcome::Done,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(plan, RecoveryPlan::RecoverResponse { .. }));
+        }
+    }
 }

@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axo_agent::{
-    Agent, AgentConfig, AgentEvent, AgentMessage, BeforeToolCallContext, CancelReason,
-    ExecutionMode, LoopHooks, Persist, PersistError, RunOutcome, Tool, ToolCallDecision, ToolError,
-    ToolOutput, ToolUpdate, TurnContext, TurnDecision,
+    Agent, AgentConfig, AgentContext, AgentEvent, AgentMessage, BeforeToolCallContext,
+    CancelReason, ExecutionMode, HookError, LoopHooks, Persist, PersistError,
+    PrepareRequestContext, RequestUpdate, RunOutcome, Tool, ToolCallDecision, ToolError,
+    ToolOutput, ToolUpdate, TurnContext, TurnDecision, TurnFinish,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
@@ -116,6 +117,18 @@ struct Recorder {
     prep_delay_ms: Vec<(String, u64)>,
     /// Delay inside `persist` for `MessageEnd`, to expose a loop that doesn't await it.
     slow_persist: bool,
+    recover: bool,
+    skip_tools: bool,
+    wait_prepare: bool,
+    wait_finish: bool,
+    hook_failure: bool,
+    prepare_failure: bool,
+    replace_final: bool,
+    switch_model: bool,
+    agent: OnceLock<Weak<Agent>>,
+    entered: Notify,
+    finished_results: Mutex<Vec<Vec<String>>>,
+    finished_models: Mutex<Vec<String>>,
 }
 
 impl Recorder {
@@ -152,11 +165,69 @@ impl Recorder {
 impl LoopHooks for Recorder {
     async fn finish_turn(
         &self,
-        _turn: TurnContext<'_>,
-        _cancel: &CancellationToken,
-    ) -> Option<TurnDecision> {
+        turn: TurnContext<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<TurnFinish, HookError> {
+        self.finished_results.lock().unwrap().push(
+            turn.tool_results
+                .iter()
+                .map(|result| result.tool_call_id.clone())
+                .collect(),
+        );
+        self.finished_models
+            .lock()
+            .unwrap()
+            .push(turn.model.id.clone());
         self.push("finish_turn".into());
-        None
+        if self.wait_finish {
+            self.entered.notify_one();
+            cancel.cancelled().await;
+        }
+        if self.hook_failure {
+            return Err(HookError("maintenance failed".into()));
+        }
+        if self.recover
+            && (turn.message.stop_reason == StopReason::Error
+                || self.should_skip_tools(turn.message, turn.model))
+        {
+            return Ok(TurnFinish {
+                decision: Some(TurnDecision::Continue),
+                context: Some(AgentContext {
+                    messages: vec![user("projected")],
+                    tools: turn.context.tools.clone(),
+                }),
+            });
+        }
+        if self.replace_final {
+            return Ok(TurnFinish {
+                decision: None,
+                context: Some(AgentContext {
+                    messages: vec![user("final projection")],
+                    tools: turn.context.tools.clone(),
+                }),
+            });
+        }
+        Ok(TurnFinish::default())
+    }
+
+    fn should_skip_tools(&self, response: &AssistantMessage, _model: &Model) -> bool {
+        self.skip_tools && response.tool_calls().next().is_some()
+    }
+
+    async fn prepare_request(
+        &self,
+        _request: PrepareRequestContext<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<RequestUpdate>, HookError> {
+        if self.prepare_failure {
+            return Err(HookError("preparation failed".into()));
+        }
+        if self.wait_prepare {
+            self.entered.notify_one();
+            cancel.cancelled().await;
+            return Err(HookError("cancelled preparation".into()));
+        }
+        Ok(None)
     }
 
     async fn before_tool_call(
@@ -202,6 +273,11 @@ impl Persist for Recorder {
                             }
                             Message::Assistant(assistant) => {
                                 self.assistants.lock().unwrap().push(assistant.clone());
+                                if self.switch_model {
+                                    let mut next = model();
+                                    next.id = "next-model".into();
+                                    self.agent.get().unwrap().upgrade().unwrap().set_model(next);
+                                }
                             }
                             Message::System(_) | Message::User(_) => {}
                         }
@@ -481,6 +557,18 @@ fn setup(
         block: Vec::new(),
         prep_delay_ms: Vec::new(),
         slow_persist: false,
+        recover: false,
+        skip_tools: false,
+        wait_prepare: false,
+        wait_finish: false,
+        hook_failure: false,
+        prepare_failure: false,
+        replace_final: false,
+        switch_model: false,
+        agent: OnceLock::new(),
+        entered: Notify::new(),
+        finished_results: Mutex::default(),
+        finished_models: Mutex::default(),
     };
     configure(&mut recorder);
     let rec = Arc::new(recorder);
@@ -488,11 +576,9 @@ fn setup(
     config.tools = tools;
     config.hooks = rec.clone();
     config.persist = Some(rec.clone());
-    Harness {
-        agent: Arc::new(Agent::new(config)),
-        api,
-        rec,
-    }
+    let agent = Arc::new(Agent::new(config));
+    rec.agent.set(Arc::downgrade(&agent)).unwrap();
+    Harness { agent, api, rec }
 }
 
 impl Harness {
@@ -1146,5 +1232,245 @@ async fn runs_started_after_shutdown_begin_cancelled() {
     assert!(
         names.iter().all(|name| !name.starts_with("end:")),
         "no MessageEnd persisted: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_response_recovers_inside_one_run_after_synthetic_results() {
+    let probe = Arc::new(Probe::default());
+    let mut failed = reply_tool_calls(&[("c1", "sleep", json!({})), ("c2", "sleep", json!({}))]);
+    failed.stop_reason = StopReason::Error;
+    let h = setup(
+        vec![ScriptedTurn::Reply(failed), text("done")],
+        vec![probe_tool("sleep", ExecutionMode::Parallel, &probe)],
+        |rec| rec.recover = true,
+    );
+    assert_eq!(h.prompt("go").await, RunOutcome::Done);
+    assert!(probe.started().is_empty());
+    assert_eq!(h.api.requests().len(), 2);
+    assert_eq!(h.request(1), labels(&["user:projected"]));
+    let messages: Vec<Message> = h
+        .agent
+        .messages()
+        .into_iter()
+        .filter_map(|message| match message {
+            AgentMessage::Llm(message) => Some(message),
+            _ => None,
+        })
+        .collect();
+    // Replacing the transcript drops the failed assistant and both synthetic results.
+    // The loop may restore tool declarations, but only the successful reply is appended
+    // to the replacement conversation.
+    assert_eq!(
+        convo(&messages),
+        labels(&["user:projected", "assistant:Stop"])
+    );
+    let Some(Message::Assistant(response)) = messages.last() else {
+        panic!("the recovered response must finish the public transcript");
+    };
+    assert!(matches!(
+        response.content.as_slice(),
+        [AssistantBlock::Text { text, .. }] if text == "done"
+    ));
+    let names = h.rec.names();
+    assert_eq!(names.iter().filter(|name| *name == "AgentStart").count(), 1);
+    assert_eq!(names.iter().filter(|name| *name == "AgentEnd").count(), 1);
+    assert!(h.rec.position("end:result:c2") < h.rec.position("finish_turn"));
+    assert!(h.rec.position("finish_turn") < h.rec.position("TurnEnd"));
+    assert!(!names.contains(&"end:user:projected".to_owned()));
+    for id in ["c1", "c2"] {
+        assert_eq!(
+            first_text(&h.rec.result(id).content),
+            "Tool call was not executed because the model response could not be used."
+        );
+    }
+}
+
+#[tokio::test]
+async fn skipped_stop_never_executes_calls_or_silently_succeeds() {
+    for recover in [false, true] {
+        let probe = Arc::new(Probe::default());
+        let mut response = reply_tool_calls(&[("c1", "sleep", json!({}))]);
+        response.stop_reason = StopReason::Stop;
+        response.usage.input = model().context_window + 1;
+        let h = setup(
+            vec![ScriptedTurn::Reply(response), text("done")],
+            vec![probe_tool("sleep", ExecutionMode::Parallel, &probe)],
+            |rec| {
+                rec.skip_tools = true;
+                rec.recover = recover;
+            },
+        );
+        let outcome = h.prompt("go").await;
+        if recover {
+            assert_eq!(outcome, RunOutcome::Done);
+            assert_eq!(h.api.requests().len(), 2);
+        } else {
+            assert!(matches!(outcome, RunOutcome::Failed(_)));
+            assert_eq!(h.api.requests().len(), 1);
+        }
+        assert!(probe.started().is_empty());
+        assert!(h.rec.result("c1").is_error);
+    }
+}
+
+#[tokio::test]
+async fn recovered_response_reuses_results_without_reemitting_assistant() {
+    let probe = Arc::new(Probe::default());
+    let h = setup(
+        vec![text("done")],
+        vec![probe_tool("sleep", ExecutionMode::Parallel, &probe)],
+        |rec| rec.recover = true,
+    );
+    let mut response = reply_tool_calls(&[
+        ("c1", "sleep", json!({})),
+        ("c2", "sleep", json!({})),
+        ("c3", "sleep", json!({})),
+    ]);
+    response.stop_reason = StopReason::Error;
+    let result = |id: &str| ToolResultMessage {
+        tool_call_id: id.into(),
+        tool_name: "sleep".into(),
+        content: vec![UserBlock::Text {
+            text: "already completed".into(),
+        }],
+        details: None,
+        is_error: false,
+        timestamp: now_ms(),
+        duration_ms: None,
+    };
+    let mut original_model = model();
+    original_model.id = "original-request-model".into();
+    h.agent.set_messages(vec![user("go")]);
+    assert_eq!(
+        h.agent
+            .recover_response(response, original_model, vec![result("c3"), result("c1")])
+            .await
+            .unwrap(),
+        RunOutcome::Done,
+    );
+    assert_eq!(h.api.requests().len(), 1);
+    assert!(probe.started().is_empty());
+    assert_eq!(h.rec.results.lock().unwrap().len(), 1);
+    assert!(h.rec.result("c2").is_error);
+    assert_eq!(
+        h.rec.finished_results.lock().unwrap()[0],
+        labels(&["c1", "c2", "c3"])
+    );
+    assert_eq!(
+        h.rec.finished_models.lock().unwrap()[0],
+        "original-request-model"
+    );
+    assert_eq!(h.rec.assistants.lock().unwrap().len(), 1);
+    let names = h.rec.names();
+    assert_eq!(names.iter().filter(|name| *name == "AgentStart").count(), 1);
+    assert_eq!(names.iter().filter(|name| *name == "AgentEnd").count(), 1);
+    assert!(h.rec.position("end:result:c2") < h.rec.position("finish_turn"));
+}
+
+#[tokio::test]
+async fn cancellation_during_hooks_wins_over_errors_and_continuation() {
+    for prepare in [false, true] {
+        for reason in [CancelReason::User, CancelReason::Shutdown] {
+            let h = setup(
+                vec![ScriptedTurn::Error("transient".into()), text("never")],
+                Vec::new(),
+                |rec| {
+                    rec.wait_prepare = prepare;
+                    rec.wait_finish = !prepare;
+                    rec.hook_failure = prepare;
+                    rec.recover = true;
+                },
+            );
+            let agent = h.agent.clone();
+            let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+            tokio::time::timeout(TIMEOUT, h.rec.entered.notified())
+                .await
+                .unwrap();
+            h.agent.cancel(reason);
+            let outcome = tokio::time::timeout(TIMEOUT, run)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome, RunOutcome::Aborted(reason));
+            assert_eq!(h.api.requests().len(), usize::from(!prepare));
+            let names = h.rec.names();
+            assert_eq!(names.iter().filter(|name| *name == "AgentEnd").count(), 1);
+            assert_eq!(
+                names.iter().filter(|name| *name == "TurnEnd").count(),
+                usize::from(!prepare && reason == CancelReason::User)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hook_error_uses_one_persisted_terminal_event() {
+    let h = setup(vec![text("done")], Vec::new(), |rec| {
+        rec.hook_failure = true
+    });
+    assert_eq!(
+        h.prompt("go").await,
+        RunOutcome::Failed("maintenance failed".into())
+    );
+    let names = h.rec.names();
+    assert_eq!(names.iter().filter(|name| *name == "AgentEnd").count(), 1);
+    assert_eq!(names.iter().filter(|name| *name == "TurnEnd").count(), 1);
+    assert!(h.rec.position("finish_turn") < h.rec.position("TurnEnd"));
+}
+
+#[tokio::test]
+async fn preparation_failure_does_not_manufacture_a_turn() {
+    let h = setup(vec![text("never")], Vec::new(), |rec| {
+        rec.prepare_failure = true
+    });
+    assert_eq!(
+        h.prompt("go").await,
+        RunOutcome::Failed("preparation failed".into())
+    );
+    assert!(h.api.requests().is_empty());
+    assert!(h.rec.assistants.lock().unwrap().is_empty());
+    let names = h.rec.names();
+    assert!(!names.contains(&"TurnEnd".to_owned()));
+    assert_eq!(names.iter().filter(|name| *name == "AgentEnd").count(), 1);
+}
+
+#[tokio::test]
+async fn final_context_replacement_is_public_without_duplicate_messages() {
+    let h = setup(vec![text("done")], Vec::new(), |rec| {
+        rec.replace_final = true
+    });
+    assert_eq!(h.prompt("go").await, RunOutcome::Done);
+    assert_eq!(h.api.requests().len(), 1);
+    let messages: Vec<Message> = h
+        .agent
+        .messages()
+        .into_iter()
+        .filter_map(|message| {
+            if let AgentMessage::Llm(message) = message {
+                Some(message)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(convo(&messages), labels(&["user:final projection"]));
+    assert!(
+        !h.rec
+            .names()
+            .contains(&"end:user:final projection".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn response_classification_uses_request_model_after_live_switch() {
+    let h = setup(vec![text("done")], Vec::new(), |rec| {
+        rec.switch_model = true
+    });
+    assert_eq!(h.prompt("go").await, RunOutcome::Done);
+    assert_eq!(
+        *h.rec.finished_models.lock().unwrap(),
+        labels(&["scripted-model"])
     );
 }

@@ -114,37 +114,39 @@ impl Seen {
     }
 }
 
-/// Loads global files, then files from the project root towards `cwd`, in name order.
-/// With `project` false only global files load. Blocking filesystem I/O; unreadable
-/// files become diagnostics. Canonical paths and BOM-stripped contents deduplicate.
+/// Loads `<home_agents>/AGENTS.md` and `<AXO_DIR>/AGENTS.md`, then the enabled names in
+/// every directory from the project root towards `cwd`; the names never apply to user
+/// directories, and with `project` false only user files load. Blocking filesystem I/O;
+/// unreadable files become diagnostics. Canonical paths and BOM-stripped contents
+/// deduplicate.
 pub fn load_context_files(
     dir: &AxoDir,
+    home_agents: Option<&Path>,
     cwd: &Path,
     project: bool,
     names: &[PathBuf],
 ) -> (Vec<ContextFile>, Vec<Diagnostic>) {
-    let mut dirs = vec![dir.root().to_path_buf()];
+    let mut paths: Vec<_> = home_agents
+        .map(|home| home.join("AGENTS.md"))
+        .into_iter()
+        .collect();
+    paths.push(dir.root().join("AGENTS.md"));
     if project {
-        dirs.extend(
-            directories(&project_root(cwd), cwd)
-                .into_iter()
-                .map(Path::to_path_buf),
-        );
+        for dir in directories(&project_root(cwd), cwd) {
+            paths.extend(names.iter().map(|name| dir.join(name)));
+        }
     }
     let mut seen = Seen::default();
     let mut files = Vec::new();
     let mut diagnostics = Vec::new();
-    for dir in dirs {
-        for name in names {
-            let path = dir.join(name);
-            if !path.is_file() {
-                continue;
-            }
-            match read_context_file(path) {
-                Ok(file) if seen.admit(&file.path, &file.content) => files.push(file),
-                Ok(_) => {}
-                Err(diagnostic) => diagnostics.push(diagnostic),
-            }
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        match read_context_file(path) {
+            Ok(file) if seen.admit(&file.path, &file.content) => files.push(file),
+            Ok(_) => {}
+            Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }
     (files, diagnostics)

@@ -165,6 +165,7 @@ impl AnthropicCompat {
 struct RequestOptions {
     max_tokens: u64,
     temperature: Option<f32>,
+    tool_choice: Option<crate::ToolChoice>,
     thinking_enabled: bool,
     thinking_budget_tokens: Option<u64>,
     effort: Option<String>,
@@ -184,6 +185,7 @@ fn request_options(
             simple.max_tokens.unwrap_or(model.max_tokens),
         ),
         temperature: simple.temperature,
+        tool_choice: simple.tool_choice,
         thinking_enabled: false,
         thinking_budget_tokens: None,
         effort: None,
@@ -325,7 +327,8 @@ async fn run(
         error => error.to_string(),
     })?;
     if !response.status().is_success() {
-        return Err(error_response_message(response, cancel).await);
+        output.failure = Some(super::http::response_failure(&response));
+        return Err(error_response_message(response, cancel, output).await);
     }
     emit(AssistantEvent::Start {
         partial: output.clone(),
@@ -365,11 +368,18 @@ async fn run(
 }
 
 /// The Anthropic SDK's `APIError` message: `<status> <body message or JSON or text>`.
-async fn error_response_message(response: reqwest::Response, cancel: &CancellationToken) -> String {
+async fn error_response_message(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+    output: &mut AssistantMessage,
+) -> String {
     let status = response.status().as_u16();
     let Some(text) = error_body(response, cancel).await else {
         return ABORTED.to_owned();
     };
+    if let Ok(body) = serde_json::from_str::<Value>(&text) {
+        super::http::record_failure(output, &body);
+    }
     let detail = match serde_json::from_str::<Value>(&text) {
         Ok(body) => match body.get("message") {
             Some(Value::String(message)) => message.clone(),
@@ -408,6 +418,9 @@ impl BlockMapper {
     ) -> Result<(), String> {
         let name = sse.event.as_deref().unwrap_or_default();
         if name == "error" {
+            if let Ok(body) = serde_json::from_str::<Value>(&sse.data) {
+                super::http::record_failure(output, &body);
+            }
             return Err(sse.data);
         }
         if !ANTHROPIC_MESSAGE_EVENTS.contains(&name) {
@@ -755,6 +768,9 @@ fn build_params(
         "max_tokens": options.max_tokens,
         "stream": true,
     });
+    if let Some(choice) = options.tool_choice {
+        params["tool_choice"] = json!({ "type": choice.as_str() });
+    }
     if !initial_text.is_empty() {
         params["system"] =
             json!([{ "type": "text", "text": initial_text, "cache_control": cache_control }]);

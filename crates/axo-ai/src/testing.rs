@@ -30,12 +30,20 @@ pub enum ScriptedTurn {
     HangAfter(AssistantMessage),
 }
 
+/// One request captured by [`ScriptedApi`].
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    pub model: Model,
+    pub transcript: Transcript,
+    pub options: SimpleStreamOptions,
+}
+
 /// Replays [`ScriptedTurn`]s in order, one per `stream` call, and records every request's
 /// transcript. Running out of turns behaves as `ScriptedTurn::Error("script exhausted")`.
 #[derive(Debug, Default)]
 pub struct ScriptedApi {
     turns: Mutex<VecDeque<ScriptedTurn>>,
-    requests: Mutex<Vec<Transcript>>,
+    requests: Mutex<Vec<RecordedRequest>>,
 }
 
 impl ScriptedApi {
@@ -51,6 +59,16 @@ impl ScriptedApi {
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|request| request.transcript.clone())
+            .collect()
+    }
+
+    /// Complete requests, including the actual model and options, in call order.
+    pub fn recorded_requests(&self) -> Vec<RecordedRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 }
@@ -60,13 +78,17 @@ impl Streamer for ScriptedApi {
         &self,
         model: &Model,
         transcript: Transcript,
-        _opts: SimpleStreamOptions,
+        opts: SimpleStreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(transcript);
+            .push(RecordedRequest {
+                model: model.clone(),
+                transcript,
+                options: opts,
+            });
         let turn = self
             .turns
             .lock()
@@ -225,6 +247,7 @@ fn scripted_message(content: Vec<AssistantBlock>, stop_reason: StopReason) -> As
         usage: Usage::default(),
         stop_reason,
         error_message: None,
+        failure: None,
         raw_stop_reason: None,
         end_turn: None,
         timestamp: now_ms(),

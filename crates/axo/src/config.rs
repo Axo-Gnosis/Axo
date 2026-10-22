@@ -60,9 +60,11 @@ impl AxoDir {
         self.root.join("skills")
     }
 
-    /// A user prompt file, `<AXO_DIR>/<name>.md` (`SYSTEM`, `WORK`, `PROSE`, `AGENTS`).
+    /// A user prompt file, `<AXO_DIR>/prompts/<name>.md`: `SYSTEM`, `WORK`, `PROSE`, and the
+    /// summarizer's `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`,
+    /// `BRANCH_SUMMARY`.
     pub fn prompt_path(&self, name: &str) -> PathBuf {
-        self.root.join(format!("{name}.md"))
+        self.root.join("prompts").join(format!("{name}.md"))
     }
 }
 
@@ -75,6 +77,8 @@ pub struct Settings {
     pub default_thinking_level: ThinkingLevel,
     /// User settings only: `Models` is built once per process.
     pub extended_context: bool,
+    /// User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`.
+    pub home_agents_dir: bool,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
     pub context_files: IndexMap<String, bool>,
@@ -82,6 +86,7 @@ pub struct Settings {
     pub bash: BashSettings,
     pub ask: AskSettings,
     pub project: ProjectSettings,
+    pub compaction: CompactionSettings,
 }
 
 impl Default for Settings {
@@ -90,6 +95,7 @@ impl Default for Settings {
             default_model: None,
             default_thinking_level: ThinkingLevel::Medium,
             extended_context: false,
+            home_agents_dir: false,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
             context_files: default_context_files(),
@@ -97,8 +103,39 @@ impl Default for Settings {
             bash: BashSettings::default(),
             ask: AskSettings::default(),
             project: ProjectSettings::default(),
+            compaction: CompactionSettings::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CompactionSettings {
+    pub enabled: bool,
+    pub max_context: Option<u64>,
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_tokens: Option<u64>,
+    pub summary_request: SummaryRequest,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_context: Some(400_000),
+            reserve_tokens: None,
+            keep_recent_tokens: None,
+            summary_request: SummaryRequest::Live,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryRequest {
+    #[default]
+    Live,
+    Separate,
 }
 
 fn default_context_files() -> IndexMap<String, bool> {
@@ -108,6 +145,7 @@ fn default_context_files() -> IndexMap<String, bool> {
         "CLAUDE.md",
         "CLAUDE.local.md",
         ".agents/AGENTS.md",
+        ".axo/AGENTS.md",
     ]
     .into_iter()
     .map(|name| (name.to_owned(), true))
@@ -155,7 +193,7 @@ impl ProjectSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectFiles {
-    /// `<cwd>/.axo/`: settings.jsonc and the SYSTEM/WORK/PROSE.md overrides.
+    /// `<cwd>/.axo/`: settings.jsonc and `prompts/` overrides.
     pub axo_dir: bool,
     /// Project `.agents/skills`.
     pub skills: bool,
@@ -234,7 +272,7 @@ impl Settings {
     /// and below `Trust` it never sets what runs code.
     /// `defaultModel` resolves commands and environment variables after merging.
     pub fn load(dir: &AxoDir, project: Option<(&Path, ProjectAccess)>) -> Result<Settings, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project", "extendedContext"];
+        const USER_ONLY_KEYS: &[&str] = &["project", "extendedContext", "homeAgentsDir"];
 
         let mut path = dir.settings_path();
         let mut merged = json!({ "contextFiles": default_context_files() });

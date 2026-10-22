@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo_agent::Tool;
@@ -23,7 +23,7 @@ pub type Sections = IndexMap<String, String>;
 pub struct PromptInputs<'a> {
     pub dir: &'a AxoDir,
     pub cwd: &'a Path,
-    /// Read `<cwd>/.axo/<NAME>.md` overrides.
+    /// Read `<cwd>/.axo/prompts/<NAME>.md` overrides.
     pub project_prompts: bool,
     /// Active tools; their guidelines make the `tools` section.
     pub tools: &'a [Arc<dyn Tool>],
@@ -42,31 +42,49 @@ pub struct PromptInputs<'a> {
 const BUNDLED_SYSTEM: &str = include_str!("../../prompts/SYSTEM.md");
 const BUNDLED_PROSE: &str = include_str!("../../prompts/PROSE.md");
 
-/// Builds the sections. `system`, `work` and `prose` come from `<cwd>/.axo/<NAME>.md`
-/// (when `project_prompts`) → `<AXO_DIR>/<NAME>.md` → the bundled file (none for
-/// `WORK.md`); an existing empty or whitespace-only file disables the section. Unreadable
-/// files become diagnostics. Blocking filesystem I/O.
+/// The first existing `<NAME>.md` override, trimmed: `<cwd>/.axo/prompts/` (when `project`),
+/// then `<AXO_DIR>/prompts/`. Unreadable files become diagnostics. Blocking filesystem I/O.
+pub(crate) fn prompt_override(
+    dir: &AxoDir,
+    cwd: &Path,
+    project: bool,
+    name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<(PathBuf, String)> {
+    let project = project.then(|| cwd.join(".axo/prompts").join(format!("{name}.md")));
+    for path in project.into_iter().chain([dir.prompt_path(name)]) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => return Some((path, text.trim().to_owned())),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => diagnostics.push(Diagnostic {
+                path: Some(path),
+                message: error.to_string(),
+            }),
+        }
+    }
+    None
+}
+
+/// Builds the sections. `system`, `work` and `prose` come from [`prompt_override`], else
+/// the bundled file (none for `WORK.md`); an existing empty or whitespace-only file
+/// disables the section. Blocking filesystem I/O.
 pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     // Bodies first; rendering into tags happens at the end, after host overrides.
     let mut bodies: IndexMap<String, String> = IndexMap::new();
 
     let mut prompt_file = |name: &str, bundled: Option<&str>| -> String {
-        let project = inputs
-            .project_prompts
-            .then(|| inputs.cwd.join(".axo").join(format!("{name}.md")));
-        for path in project.into_iter().chain([inputs.dir.prompt_path(name)]) {
-            match std::fs::read_to_string(&path) {
-                // An existing empty file switches the section off.
-                Ok(text) => return text.trim().to_owned(),
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => diagnostics.push(Diagnostic {
-                    path: Some(path),
-                    message: error.to_string(),
-                }),
-            }
-        }
-        bundled.map(str::trim).unwrap_or_default().to_owned()
+        prompt_override(
+            inputs.dir,
+            inputs.cwd,
+            inputs.project_prompts,
+            name,
+            &mut diagnostics,
+        )
+        .map_or_else(
+            || bundled.unwrap_or_default().trim().to_owned(),
+            |(_, text)| text,
+        )
     };
     let system = prompt_file("SYSTEM", Some(BUNDLED_SYSTEM));
     let work = prompt_file("WORK", None);

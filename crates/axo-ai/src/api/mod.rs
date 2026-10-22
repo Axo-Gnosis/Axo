@@ -48,12 +48,28 @@ pub trait Streamer: Send + Sync {
     ) -> BoxStream<'static, AssistantEvent>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+}
+
+impl ToolChoice {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Request options shared by every API.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SimpleStreamOptions {
     pub thinking: ThinkingLevel,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f32>,
+    pub tool_choice: Option<ToolChoice>,
     /// Stable id for prompt-cache keys and session-affinity headers.
     pub session_id: Option<String>,
     /// Overrides every other key source.

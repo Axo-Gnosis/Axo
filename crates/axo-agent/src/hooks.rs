@@ -1,10 +1,9 @@
 //! Loop hooks, ported from pi `agent/src/types.ts` (`AgentLoopConfig` and the hook
 //! contexts). Every method has a no-op default. When each fires: `docs/pi/loop.md` §4.
 //!
-//! Failure contract: only `before_tool_call` and `after_tool_call` can fail. A failing
-//! `before_tool_call` blocks the call (its error text becomes the error result); a failing
-//! `after_tool_call` is logged and the executed result is kept. All other hooks are
-//! infallible, mirroring pi's "must not throw" contracts.
+//! Failure contract: request preparation and turn finishing can fail the run.
+//! A failing `before_tool_call` blocks the call; a failing `after_tool_call` is logged
+//! and the executed result is kept. Other hooks are infallible.
 
 use std::sync::Arc;
 
@@ -42,10 +41,23 @@ pub struct RequestUpdate {
     pub thinking: Option<ThinkingLevel>,
 }
 
+/// A maintenance-hook failure, displayed without wrapping.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
+pub struct HookError(pub String);
+
+#[derive(Default)]
+pub struct TurnFinish {
+    pub decision: Option<TurnDecision>,
+    pub context: Option<AgentContext>,
+}
+
 /// A completed turn (pi `AgentTurnContext`, also `PrepareNextTurnContext`).
 pub struct TurnContext<'a> {
     /// The assistant message that completed the turn.
     pub message: &'a AssistantMessage,
+    /// The model used for this response's actual provider request.
+    pub model: &'a Model,
     /// Tool results of the turn, in call order.
     pub tool_results: &'a [ToolResultMessage],
     /// The context after the message and its results were appended.
@@ -142,8 +154,8 @@ pub trait LoopHooks: Send + Sync {
         &self,
         _request: PrepareRequestContext<'_>,
         _cancel: &CancellationToken,
-    ) -> Option<RequestUpdate> {
-        None
+    ) -> Result<Option<RequestUpdate>, HookError> {
+        Ok(None)
     }
 
     /// After `TurnEnd` when the loop continues, before the next turn starts.
@@ -155,16 +167,20 @@ pub trait LoopHooks: Send + Sync {
         None
     }
 
-    /// After the turn's assistant message and tool results, before `TurnEnd`. Ignored on
-    /// error/aborted turns, which always end the run.
+    /// After the persisted assistant and results, before `TurnEnd`.
+    /// Errors may request continuation; aborted turns always end the run.
     async fn finish_turn(
         &self,
         _turn: TurnContext<'_>,
         _cancel: &CancellationToken,
-    ) -> Option<TurnDecision> {
-        None
+    ) -> Result<TurnFinish, HookError> {
+        Ok(TurnFinish::default())
     }
 
+    /// Intercepts unusable responses before any tool side effects.
+    fn should_skip_tools(&self, _response: &AssistantMessage, _model: &Model) -> bool {
+        false
+    }
     /// After argument validation, in source order. An `Err` blocks the call.
     async fn before_tool_call(
         &self,

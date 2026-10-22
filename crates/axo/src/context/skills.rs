@@ -27,10 +27,15 @@ const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
 /// Discovers skills in order: `.agents/skills` from `cwd` up to the git root (skipped when
-/// `project` is false), `<AXO_DIR>/skills`, then `$HOME/.agents/skills`. The
+/// `project` is false), `<AXO_DIR>/skills`, then `<home_agents>/skills`. The
 /// first skill with a given name wins; later ones, name-rule violations and skills dropped
 /// for a missing `description` become diagnostics. Blocking filesystem I/O.
-pub fn load_skills(dir: &AxoDir, cwd: &Path, project: bool) -> (Vec<Skill>, Vec<Diagnostic>) {
+pub fn load_skills(
+    dir: &AxoDir,
+    home_agents: Option<&Path>,
+    cwd: &Path,
+    project: bool,
+) -> (Vec<Skill>, Vec<Diagnostic>) {
     let mut roots: Vec<PathBuf> = Vec::new();
     if project {
         match git_root(cwd) {
@@ -43,9 +48,7 @@ pub fn load_skills(dir: &AxoDir, cwd: &Path, project: bool) -> (Vec<Skill>, Vec<
         }
     }
     roots.push(dir.skills_dir());
-    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-        roots.push(PathBuf::from(home).join(".agents").join("skills"));
-    }
+    roots.extend(home_agents.map(|home| home.join("skills")));
 
     let mut skills: Vec<Skill> = Vec::new();
     let mut names: HashSet<String> = HashSet::new();

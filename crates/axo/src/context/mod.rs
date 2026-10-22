@@ -40,3 +40,10 @@ pub fn git_root(cwd: &Path) -> Option<PathBuf> {
 pub fn project_root(cwd: &Path) -> PathBuf {
     git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
+
+/// `$HOME/.agents`, the folder other agent tools share; read only with `homeAgentsDir`.
+pub fn home_agents_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".agents"))
+}

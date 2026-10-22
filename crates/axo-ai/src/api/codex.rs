@@ -210,7 +210,11 @@ fn build_request_body(
     if let Some(key) = prompt_cache_key {
         body["prompt_cache_key"] = json!(key);
     }
-    body["tool_choice"] = json!("auto");
+    body["tool_choice"] = json!(
+        opts.simple
+            .tool_choice
+            .map_or("auto", crate::ToolChoice::as_str)
+    );
     body["parallel_tool_calls"] = json!(true);
     if let Some(temperature) = opts.simple.temperature {
         // Through the shortest decimal form, so 0.7f32 is sent as 0.7.
@@ -337,7 +341,8 @@ async fn drive(
         error => error.to_string(),
     })?;
     if !response.status().is_success() {
-        return Err(parse_error_response(response, cancel).await);
+        output.failure = Some(super::http::response_failure(&response));
+        return Err(parse_error_response(response, cancel, output).await);
     }
 
     let _ = tx.unbounded_send(AssistantEvent::Start {
@@ -408,6 +413,7 @@ fn map_codex_event(
     };
     match kind {
         "error" => {
+            super::http::record_failure(stream.output, &event);
             let field = |key: &str| {
                 event
                     .get(key)
@@ -420,12 +426,15 @@ fn map_codex_event(
                 .map_or_else(|| event.to_string(), str::to_owned);
             Err(format!("Codex error: {detail}"))
         }
-        "response.failed" => Err(event
-            .pointer("/response/error/message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.is_empty())
-            .unwrap_or("Codex response failed")
-            .to_owned()),
+        "response.failed" => {
+            super::http::record_failure(stream.output, &event);
+            Err(event
+                .pointer("/response/error/message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("Codex response failed")
+                .to_owned())
+        }
         "response.done" | "response.completed" | "response.incomplete" => {
             if let Some(end_turn) = event.pointer("/response/end_turn").and_then(Value::as_bool) {
                 stream.output.end_turn = Some(end_turn);
@@ -448,11 +457,18 @@ fn map_codex_event(
 
 /// pi `parseErrorResponse`: the provider's error message, or a friendly usage-limit
 /// message.
-async fn parse_error_response(response: reqwest::Response, cancel: &CancellationToken) -> String {
+async fn parse_error_response(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+    output: &mut AssistantMessage,
+) -> String {
     let status = response.status();
     let Some(raw) = error_body(response, cancel).await else {
         return ABORTED.to_owned();
     };
+    if let Ok(body) = serde_json::from_str::<Value>(&raw) {
+        super::http::record_failure(output, &body);
+    }
     let mut message = if raw.is_empty() {
         status
             .canonical_reason()
@@ -508,7 +524,10 @@ async fn parse_error_response(response: reqwest::Response, cancel: &Cancellation
             .or_else(|| friendly.clone())
             .unwrap_or(message);
     }
-    friendly.unwrap_or(message)
+    match friendly {
+        Some(friendly) => format!("{friendly}\n{raw}"),
+        None => message,
+    }
 }
 
 /// pi `applyServiceTierPricing` for the tier the response reports.

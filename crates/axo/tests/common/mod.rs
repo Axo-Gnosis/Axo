@@ -1,14 +1,14 @@
 //! Helpers shared by the session-level tests.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use axo::{Axo, ProjectAccess, SessionOptions, Settings, StaticEnv};
+use axo::{Axo, Settings};
 use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn};
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+mod session;
+
+pub use session::{options, within};
 
 /// An `Axo` whose sessions stream from `turns`, with one model `test/m`.
 pub async fn axo(dir: &Path, turns: Vec<ScriptedTurn>) -> Axo {
@@ -33,25 +33,4 @@ pub async fn axo(dir: &Path, turns: Vec<ScriptedTurn>) -> Axo {
         .build()
         .await
         .unwrap()
-}
-
-/// Options for a session in `<dir>/work` on `test/m`, without project resources or a
-/// dev shell.
-pub fn options(dir: &Path) -> SessionOptions {
-    let cwd = dir.join("work");
-    std::fs::create_dir_all(&cwd).unwrap();
-    SessionOptions {
-        cwd,
-        model: Some("test/m".into()),
-        project_access: Some(ProjectAccess::Ignore),
-        exec_env: Some(Arc::new(StaticEnv(Arc::new(BTreeMap::new())))),
-        ..SessionOptions::default()
-    }
-}
-
-/// Awaits `future`, failing the test after five seconds.
-pub async fn within<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(TIMEOUT, future)
-        .await
-        .expect("timed out")
 }

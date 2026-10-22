@@ -7,6 +7,7 @@ use serde_json::Value;
 
 /// A transcript entry. `Custom` messages never reach a provider directly:
 /// [`LoopHooks::convert_to_llm`](crate::LoopHooks::convert_to_llm) lowers or drops them.
+#[allow(clippy::large_enum_variant)] // Keep transcript messages inline; boxing adds an allocation per LLM message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AgentMessage {

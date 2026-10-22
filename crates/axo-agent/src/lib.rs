@@ -15,9 +15,9 @@ pub use cancel::CancelReason;
 pub use error::Error;
 pub use event::{AgentEvent, Persist, PersistError};
 pub use hooks::{
-    AfterToolCallContext, AfterToolCallResult, AgentContext, BeforeToolCallContext, LoopHooks,
-    NoHooks, PrepareRequestContext, RequestUpdate, ToolCallDecision, TurnContext, TurnDecision,
-    TurnUpdate,
+    AfterToolCallContext, AfterToolCallResult, AgentContext, BeforeToolCallContext, HookError,
+    LoopHooks, NoHooks, PrepareRequestContext, RequestUpdate, ToolCallDecision, TurnContext,
+    TurnDecision, TurnFinish, TurnUpdate,
 };
 pub use message::{AgentMessage, CustomMessage, unanswered_calls};
 pub use tool::{ExecutionMode, Replay, Tool, ToolError, ToolOutput, ToolUpdate};

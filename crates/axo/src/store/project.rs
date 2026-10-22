@@ -17,16 +17,23 @@ const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
+/// Provenance of one selected context entry, including entries hidden by edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedSource {
+    pub entry_index: usize,
+    pub messages: std::ops::Range<usize>,
+}
+
 /// What a session's current position contributes to the next request.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Projection {
     pub messages: Vec<AgentMessage>,
+    pub sources: Vec<ProjectedSource>,
     /// `provider/model-id` of the latest `model_change` on the path.
     pub model: Option<String>,
     /// The latest `thinking_level_change` on the path.
     pub thinking: Option<ThinkingLevel>,
-    /// Every entry seen so far, kept for rebuilds.
-    entries: Vec<SeqEntry>,
+    processed: usize,
     /// Id of the entry the path ends at.
     leaf: Option<String>,
 }
@@ -36,21 +43,31 @@ impl Projection {
     /// current position. A child of the current leaf that is not a `leaf`,
     /// `context_edit` or `compaction` entry extends the projection in place;
     /// anything else rebuilds it.
-    pub fn apply(&mut self, entry: &SeqEntry) {
-        let extends = entry.entry.parent_id() == self.leaf.as_deref();
-        self.entries.push(entry.clone());
+    pub fn apply(&mut self, entries: &[SeqEntry]) {
+        let Some(entry) = entries.last() else {
+            *self = Self::default();
+            return;
+        };
+        let extends =
+            entries.len() == self.processed + 1 && entry.entry.parent_id() == self.leaf.as_deref();
         if !extends
             || matches!(
                 entry.entry,
                 Entry::Leaf { .. } | Entry::ContextEdit { .. } | Entry::Compaction { .. }
             )
         {
-            *self = build(std::mem::take(&mut self.entries), None);
+            *self = build(entries, None);
             return;
         }
         self.leaf = entry.entry.id().map(str::to_owned);
+        self.processed = entries.len();
         self.track(&entry.entry);
+        let start = self.messages.len();
         self.messages.extend(entry_messages(&entry.entry));
+        self.sources.push(ProjectedSource {
+            entry_index: entries.len() - 1,
+            messages: start..self.messages.len(),
+        });
     }
 
     /// Follows the settings a path entry changes (pi `getSessionContextSettings`).
@@ -71,10 +88,10 @@ impl Projection {
 /// in `entries` (the last entry, or the target of a trailing `leaf` entry).
 /// An unknown `leaf` id falls back to the last entry, as pi does.
 pub fn project(entries: &[SeqEntry], leaf: Option<&EntryId>) -> Projection {
-    build(entries.to_vec(), leaf.map(EntryId::as_str))
+    build(entries, leaf.map(EntryId::as_str))
 }
 
-fn build(entries: Vec<SeqEntry>, leaf: Option<&str>) -> Projection {
+fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
     // pi `buildSessionPath`: later duplicates of an id win.
     let index: HashMap<&str, usize> = entries
         .iter()
@@ -101,52 +118,17 @@ fn build(entries: Vec<SeqEntry>, leaf: Option<&str>) -> Projection {
 
     let mut projection = Projection {
         leaf: start.and_then(|at| entries[at].entry.id().map(str::to_owned)),
+        processed: entries.len(),
         ..Projection::default()
     };
     for &at in &path {
         projection.track(&entries[at].entry);
     }
 
-    // pi `buildContextEntries`: the latest compaction, then the kept entries
-    // from `first_kept_entry_id` (minus system messages), then everything after it.
-    let compaction =
-        path.iter()
-            .enumerate()
-            .rev()
-            .find_map(|(pos, &at)| match &entries[at].entry {
-                Entry::Compaction {
-                    first_kept_entry_id,
-                    ..
-                } => Some((pos, first_kept_entry_id.as_str())),
-                _ => None,
-            });
-    let context: Vec<&Entry> = match compaction {
-        None => path.iter().map(|&at| &entries[at].entry).collect(),
-        Some((pos, first_kept)) => {
-            let kept = path[..pos]
-                .iter()
-                .map(|&at| &entries[at].entry)
-                .skip_while(|entry| entry.id() != Some(first_kept))
-                .filter(|entry| {
-                    !matches!(
-                        entry,
-                        Entry::Message {
-                            message: AgentMessage::Llm(Message::System(_)),
-                            ..
-                        }
-                    )
-                });
-            std::iter::once(&entries[path[pos]].entry)
-                .chain(kept)
-                .chain(path[pos + 1..].iter().map(|&at| &entries[at].entry))
-                .collect()
-        }
-    };
-
-    // pi `buildSessionProjection`: the last edit of a target in context wins.
-    let edits: HashMap<&str, &Option<ContextReplacement>> = context
+    // Resolve edits across the entire branch before cutting away old context.
+    let edits: HashMap<&str, &Option<ContextReplacement>> = path
         .iter()
-        .filter_map(|entry| match entry {
+        .filter_map(|&at| match &entries[at].entry {
             Entry::ContextEdit {
                 target_id,
                 replacement,
@@ -155,30 +137,100 @@ fn build(entries: Vec<SeqEntry>, leaf: Option<&str>) -> Projection {
             _ => None,
         })
         .collect();
-    for (pos, entry) in context.iter().enumerate() {
-        // An older compaction kept inside the newest retained range contributes nothing.
-        if pos > 0 && matches!(entry, Entry::Compaction { .. }) {
-            continue;
+    let invalid_before = path.iter().rposition(|&at| {
+        matches!(
+            entries[at].entry,
+            Entry::ContextEdit { .. } | Entry::Compaction { .. }
+        )
+    });
+    let positions: HashMap<usize, usize> = path
+        .iter()
+        .enumerate()
+        .map(|(pos, &at)| (at, pos))
+        .collect();
+    let compaction =
+        path.iter()
+            .enumerate()
+            .rev()
+            .find_map(|(pos, &at)| match &entries[at].entry {
+                Entry::Compaction {
+                    first_kept_entry_id,
+                    preserved_user_ids,
+                    ..
+                } => Some((pos, first_kept_entry_id, preserved_user_ids)),
+                _ => None,
+            });
+    let context = match compaction {
+        None => path.clone(),
+        Some((pos, first_kept, preserved)) => {
+            let tail_start = path[..pos]
+                .iter()
+                .position(|&at| entries[at].entry.id() == Some(first_kept.as_str()))
+                .unwrap_or(pos);
+            let mut selected = vec![path[pos]];
+            let mut users = Vec::new();
+            for id in preserved {
+                let valid = index.get(id.as_str()).copied().filter(|at| {
+                    positions.get(at).is_some_and(|&p| p < pos)
+                        && matches!(
+                            &entries[*at].entry,
+                            Entry::Message {
+                                message: AgentMessage::Llm(Message::User(_)),
+                                ..
+                            }
+                        )
+                });
+                match valid {
+                    Some(at) if positions[&at] < tail_start => users.push(at),
+                    Some(_) => {}
+                    None => tracing::warn!(%id, "invalid preserved user reference ignored"),
+                }
+            }
+            users.sort_unstable_by_key(|at| positions[at]);
+            users.dedup();
+            selected.extend(users);
+            selected.extend(path[tail_start..pos].iter().copied().filter(|&at| {
+                !matches!(
+                    &entries[at].entry,
+                    Entry::Message {
+                        message: AgentMessage::Llm(Message::System(_)),
+                        ..
+                    }
+                )
+            }));
+            selected.extend_from_slice(&path[pos + 1..]);
+            selected
         }
-        let mut messages = entry_messages(entry);
-        match entry.id().and_then(|id| edits.get(id)) {
-            None => {}
-            Some(None) => continue,
-            // Only user, assistant, tool-result and custom messages take a replacement;
-            // summaries and system messages stay as they are.
-            Some(Some(replacement))
-                if matches!(entry, Entry::Message { .. } | Entry::CustomMessage { .. }) =>
+    };
+    for at in context {
+        let entry = &entries[at].entry;
+        let start = projection.messages.len();
+        let older_checkpoint = matches!(entry, Entry::Compaction { .. })
+            && compaction.is_some_and(|(pos, _, _)| at != path[pos]);
+        let hidden = matches!(entry.id().and_then(|id| edits.get(id)), Some(None));
+        if !older_checkpoint && !hidden {
+            let mut messages = entry_messages(entry);
+            if let Some(Some(replacement)) = entry.id().and_then(|id| edits.get(id))
+                && matches!(entry, Entry::Message { .. } | Entry::CustomMessage { .. })
             {
                 for message in &mut messages {
                     replace_content(message, replacement);
                 }
             }
-            Some(Some(_)) => {}
+            if invalid_before.is_some_and(|boundary| positions[&at] < boundary) {
+                for message in &mut messages {
+                    if let AgentMessage::Llm(Message::Assistant(assistant)) = message {
+                        assistant.usage = Default::default();
+                    }
+                }
+            }
+            projection.messages.extend(messages);
         }
-        projection.messages.extend(messages);
+        projection.sources.push(ProjectedSource {
+            entry_index: at,
+            messages: start..projection.messages.len(),
+        });
     }
-
-    projection.entries = entries;
     projection
 }
 

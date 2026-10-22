@@ -127,6 +127,7 @@ fn branched_tree() -> Vec<SeqEntry> {
             base: base("comp", Some("edit")),
             summary: "SUMMARY of early work".into(),
             first_kept_entry_id: EntryId("aA".into()),
+            preserved_user_ids: Vec::new(),
             tokens_before: 1234,
             details: None,
             usage: None,
@@ -228,6 +229,162 @@ fn context_edit_replacement_patches_the_target() {
         texts(&project(&entries, None).messages),
         ["original question", "patched answer"]
     );
+}
+
+fn checkpoint(id: &str, parent: &str, kept: &str, users: &[&str]) -> Entry {
+    Entry::Compaction {
+        base: base(id, Some(parent)),
+        summary: format!("summary {id}"),
+        first_kept_entry_id: EntryId(kept.into()),
+        preserved_user_ids: users.iter().map(|id| EntryId((*id).into())).collect(),
+        tokens_before: 1000,
+        details: None,
+        usage: None,
+        from_hook: None,
+        system_message: None,
+    }
+}
+
+#[tokio::test]
+async fn preserved_users_are_edited_deduplicated_and_keep_provenance_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonlStore::new(dir.path().join("sessions"));
+    let mut writer = store
+        .create(Header::new(PathBuf::from("/work"), None, None))
+        .await
+        .unwrap();
+    let mut entries = Vec::new();
+    for entry in [
+        user_entry("u1", None, "old"),
+        user_entry("u2", Some("u1"), "hidden"),
+        Entry::ContextEdit {
+            base: base("edit1", Some("u2")),
+            target_id: EntryId("u1".into()),
+            replacement: Some(ContextReplacement {
+                content: "edited".into(),
+            }),
+        },
+        Entry::ContextEdit {
+            base: base("edit2", Some("edit1")),
+            target_id: EntryId("u2".into()),
+            replacement: None,
+        },
+        user_entry("tail", Some("edit2"), "tail"),
+        checkpoint(
+            "c1",
+            "tail",
+            "tail",
+            &["tail", "u2", "u1", "u1", "missing", "edit1"],
+        ),
+        checkpoint("c2", "c1", "tail", &["u2", "u1"]),
+    ] {
+        entries.push(writer.append(entry).await.unwrap());
+    }
+    let path = writer.planned_path().to_owned();
+    drop(writer);
+    let (_, reopened) = store.open_read(&path).await.unwrap();
+    assert_eq!(entries, reopened);
+    let projection = project(&reopened, None);
+    assert_eq!(texts(&projection.messages)[1..], ["edited", "tail"]);
+    assert_eq!(
+        projection.messages.len(),
+        3,
+        "previous summary is not duplicated"
+    );
+    let source = |id: &str| {
+        projection
+            .sources
+            .iter()
+            .find(|s| reopened[s.entry_index].entry.id() == Some(id))
+            .unwrap()
+    };
+    assert_eq!(source("u1").messages, 1..2);
+    assert!(source("u2").messages.is_empty());
+    assert!(source("c1").messages.is_empty());
+    assert_eq!(source("tail").messages, 2..3);
+    let old_branch = project(&reopened, Some(&EntryId("u2".into())));
+    assert_eq!(texts(&old_branch.messages), ["old", "hidden"]);
+    let encoded = serde_json::to_value(&reopened.last().unwrap().entry).unwrap();
+    assert_eq!(encoded["preservedUserIds"], serde_json::json!(["u2", "u1"]));
+    let mut fork = store
+        .create(Header::new(
+            PathBuf::from("/work"),
+            Some(path),
+            Some(EntryId("c2".into())),
+        ))
+        .await
+        .unwrap();
+    for seq in &reopened {
+        fork.append(seq.entry.clone()).await.unwrap();
+    }
+    let fork_path = fork.planned_path().to_owned();
+    drop(fork);
+    let (_, forked) = store.open_read(&fork_path).await.unwrap();
+    assert_eq!(project(&forked, None), projection);
+}
+
+#[test]
+fn equal_timestamp_edits_invalidate_only_earlier_projected_usage_and_apply_borrows_history() {
+    let mut before = assistant_entry("before", "u", "before");
+    let mut after = assistant_entry("after", "edit", "after");
+    for entry in [&mut before, &mut after] {
+        if let Entry::Message {
+            message: AgentMessage::Llm(Message::Assistant(a)),
+            ..
+        } = entry
+        {
+            a.usage.input = 123;
+            a.usage.cost.total = 4.5;
+        }
+    }
+    let mut entries: Vec<_> = [
+        user_entry("u", None, "question"),
+        before,
+        Entry::ContextEdit {
+            base: base("edit", Some("before")),
+            target_id: EntryId("u".into()),
+            replacement: Some(ContextReplacement {
+                content: "short".into(),
+            }),
+        },
+        after,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(seq, mut entry)| {
+        match &mut entry {
+            Entry::Message { base, .. } | Entry::ContextEdit { base, .. } => {
+                base.timestamp = "2026-10-22T00:00:00Z".into()
+            }
+            _ => unreachable!(),
+        }
+        SeqEntry {
+            seq: seq as u64,
+            entry,
+        }
+    })
+    .collect();
+    let mut projection = axo::store::Projection::default();
+    for end in 1..=entries.len() {
+        projection.apply(&entries[..end]);
+        assert_eq!(projection, project(&entries[..end], None));
+    }
+    let usage = |message: &AgentMessage| match message {
+        AgentMessage::Llm(Message::Assistant(a)) => a.usage.clone(),
+        _ => panic!("expected assistant"),
+    };
+    assert_eq!(usage(&projection.messages[1]), Default::default());
+    assert_eq!(usage(&projection.messages[2]).input, 123);
+    if let Entry::Message { message, .. } = &entries[1].entry {
+        assert_eq!(
+            usage(message).cost.total,
+            4.5,
+            "durable cost remains intact"
+        );
+    }
+    entries.clear();
+    projection.apply(&entries);
+    assert_eq!(projection, Default::default());
 }
 
 fn submission(id: &str, parent: Option<&str>) -> Entry {
@@ -344,4 +501,41 @@ async fn second_writer_is_refused() {
         store.open_write(&path).await.is_ok(),
         "lock released on drop"
     );
+}
+
+#[test]
+fn skipped_incremental_updates_and_checkpoint_snapshot_match_full_projection() {
+    let mut entries = branched_tree();
+    let mut projection = axo::store::Projection::default();
+    for end in 1..=entries.len() {
+        projection.apply(&entries[..end]);
+        assert_eq!(projection, project(&entries[..end], None));
+    }
+    projection.apply(&entries[..2]);
+    projection.apply(&entries);
+    assert_eq!(projection, project(&entries, None));
+    let mut checkpoint = checkpoint("last", "nav", "last", &["u1"]);
+    if let Entry::Compaction { system_message, .. } = &mut checkpoint {
+        *system_message = Some(axo_ai::SystemMessage {
+            content: vec![axo_ai::TextBlock {
+                text: "system snapshot".into(),
+            }],
+            sections: None,
+            tools_added: vec![],
+            tools_removed: vec![],
+            timestamp: 0,
+        });
+    }
+    entries.push(SeqEntry {
+        seq: entries.len() as u64,
+        entry: checkpoint,
+    });
+    projection.apply(&entries);
+    assert_eq!(projection, project(&entries, None));
+    assert_eq!(projection.sources[0].messages, 0..2);
+    assert!(matches!(
+        projection.messages[0],
+        AgentMessage::Llm(Message::System(_))
+    ));
+    assert_eq!(texts(&projection.messages)[2], "first question");
 }

@@ -506,6 +506,7 @@ impl<'a> ResponsesStream<'a> {
                 self.finalize(event.get("response").unwrap_or(&Value::Null))?;
             }
             "error" => {
+                super::http::record_failure(self.output, event);
                 let js_text = |value: Option<&Value>| match value {
                     None => "undefined".to_owned(),
                     Some(Value::String(text)) => text.clone(),
@@ -518,6 +519,7 @@ impl<'a> ResponsesStream<'a> {
                 ));
             }
             "response.failed" => {
+                super::http::record_failure(self.output, event);
                 self.saw_terminal = true;
                 let response = event.get("response");
                 self.output.raw_stop_reason = response
@@ -875,7 +877,20 @@ impl<'a> ResponsesStream<'a> {
             Some(other) => return Err(format!("Unhandled stop reason: {other}")),
         };
         self.output.stop_reason = stop_reason;
-        self.output.error_message = error_message;
+        // Error metadata can also arrive on a normalized Codex terminal event.
+        if stop_reason == StopReason::Error {
+            super::http::record_failure(self.output, response);
+        }
+        self.output.error_message = error_message.or_else(|| {
+            (stop_reason == StopReason::Error)
+                .then(|| {
+                    response
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        });
         if stop_reason == StopReason::Stop && self.output.tool_calls().next().is_some() {
             self.output.stop_reason = StopReason::ToolUse;
         }

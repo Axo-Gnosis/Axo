@@ -209,3 +209,276 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
         "the stranded prompt was answered"
     );
 }
+
+async fn navigation_host(
+    dir: &std::path::Path,
+    turns: Vec<ScriptedTurn>,
+) -> (axo::Axo, std::sync::Arc<axo_ai::ScriptedApi>, axo_ai::Model) {
+    use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi};
+    use std::sync::Arc;
+    let config = ModelsConfig::parse_jsonc(
+        r#"{"providers":{"test":{"api":"openai-completions","baseUrl":"http://127.0.0.1:9/v1",
+        "models":[{"id":"m","contextWindow":131072,"maxTokens":4096,"reasoning":true},
+                  {"id":"live","contextWindow":131072,"maxTokens":4096,"reasoning":true}]}}}"#,
+    )
+    .unwrap();
+    let models = Arc::new(
+        Models::load(ModelsOptions {
+            cache_dir: None,
+            config,
+            extended_context: false,
+            credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
+        })
+        .await
+        .unwrap(),
+    );
+    let live = models.find("test/live").unwrap().clone();
+    let api = Arc::new(ScriptedApi::new(turns));
+    let mut settings = axo::Settings::default();
+    settings.compaction.enabled = false;
+    let host = axo::Axo::builder()
+        .dir(dir.to_path_buf())
+        .settings(settings)
+        .models(models)
+        .streamer(api.clone())
+        .build()
+        .await
+        .unwrap();
+    (host, api, live)
+}
+
+// Seed an abandoned branch whose raw text differs from its effective contribution.
+// No active run exists: reopening must not answer these historical messages.
+async fn navigation_history(
+    host: &axo::Axo,
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, EntryId) {
+    let session = host.create_session(options(dir)).await.unwrap();
+    within(session.prompt("shared ancestor")).await.unwrap();
+    let path = session.path().to_path_buf();
+    session.shutdown().await;
+    drop(session);
+    let sessions = JsonlStore::new(dir.join("sessions"));
+    let (_, entries, mut writer) = sessions.open_write(&path).await.unwrap();
+    let destination = EntryId::from(entries.last().unwrap().entry.id().unwrap().to_owned());
+    let mut parent = destination.clone();
+    for (id, message) in [
+        (
+            "abandoned-user",
+            AgentMessage::Llm(Message::User(axo_ai::UserMessage {
+                content: vec![UserBlock::Text {
+                    text: "RAW-ABANDONED-SECRET".repeat(1000),
+                }],
+                timestamp: 0,
+            })),
+        ),
+        ("hidden-failure", {
+            let mut failure = reply_text("HIDDEN-FAILURE-SECRET");
+            failure.stop_reason = axo_ai::StopReason::Error;
+            failure.error_message = Some("quota exhausted".into());
+            AgentMessage::Llm(Message::Assistant(failure))
+        }),
+    ] {
+        writer
+            .append(Entry::Message {
+                base: EntryBase::new(EntryId(id.into()), Some(parent)),
+                message,
+                submission_id: None,
+            })
+            .await
+            .unwrap();
+        parent = EntryId(id.into());
+    }
+    writer
+        .append(Entry::ContextEdit {
+            base: EntryBase::new(EntryId("edited-abandoned".into()), Some(parent)),
+            target_id: EntryId("abandoned-user".into()),
+            replacement: Some(store::ContextReplacement {
+                content: json!([{"type":"text", "text":"EDITED-BRANCH-FACT ".repeat(1000)}]),
+            }),
+        })
+        .await
+        .unwrap();
+    writer
+        .append(Entry::ContextEdit {
+            base: EntryBase::new(
+                EntryId("hidden-abandoned".into()),
+                Some(EntryId("edited-abandoned".into())),
+            ),
+            target_id: EntryId("hidden-failure".into()),
+            replacement: None,
+        })
+        .await
+        .unwrap();
+    (path, destination)
+}
+
+#[tokio::test]
+async fn summarized_navigation_uses_effective_branch_and_preserves_live_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, api, live_model) = navigation_host(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_text("ancestor")),
+            ScriptedTurn::Reply(reply_text("Learned EDITED-BRANCH-FACT.")),
+        ],
+    )
+    .await;
+    let (path, destination) = navigation_history(&host, dir.path()).await;
+    let session = host.open_session(&path, options(dir.path())).await.unwrap();
+    session.set_model(live_model).await.unwrap();
+    let thinking = session
+        .set_thinking(axo_ai::ThinkingLevel::High)
+        .await
+        .unwrap();
+    let before = session.attach(None).await.missed;
+    let old_leaf = before.last().unwrap().entry.id().unwrap().to_owned();
+    within(session.navigate(
+        Some(destination.clone()),
+        axo::NavigateOptions { summarize: true },
+    ))
+    .await
+    .unwrap();
+    let requests = api.recorded_requests();
+    assert_eq!(requests.len(), 2);
+    let request = requests.last().unwrap();
+    let input = serde_json::to_string(request.transcript.messages()).unwrap();
+    assert!(input.contains("EDITED-BRANCH-FACT"));
+    assert!(!input.contains("RAW-ABANDONED-SECRET"));
+    assert!(!input.contains("HIDDEN-FAILURE-SECRET"));
+    assert_eq!(request.model.id, "live");
+    assert_eq!(request.options.thinking, thinking);
+    let entries = session.attach(None).await.missed;
+    let branch_id = entries
+        .iter()
+        .find_map(|seq| match &seq.entry {
+            Entry::BranchSummary {
+                base,
+                from_id,
+                summary,
+                ..
+            } => {
+                assert_eq!(base.parent_id.as_ref(), Some(&destination));
+                assert_eq!(from_id, &old_leaf);
+                assert!(summary.contains("EDITED-BRANCH-FACT"));
+                Some(base.id.clone())
+            }
+            _ => None,
+        })
+        .expect("one branch summary");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|seq| matches!(seq.entry, Entry::BranchSummary { .. }))
+            .count(),
+        1
+    );
+    let projected = store::project(&entries, None);
+    assert_eq!(projected.model.as_deref(), Some("test/live"));
+    assert_eq!(projected.thinking, Some(thinking));
+    let forked = session.fork(&branch_id).await.unwrap().session;
+    let fork_projection = store::project(&forked.attach(None).await.missed, None);
+    assert!(
+        serde_json::to_string(&fork_projection.messages)
+            .unwrap()
+            .contains("EDITED-BRANCH-FACT")
+    );
+    assert_eq!(fork_projection.model.as_deref(), Some("test/live"));
+    assert_eq!(fork_projection.thinking, Some(thinking));
+    session.shutdown().await;
+    drop(session);
+    let reopened = host
+        .open_session(
+            &path,
+            axo::SessionOptions {
+                model: None,
+                thinking: None,
+                ..options(dir.path())
+            },
+        )
+        .await
+        .unwrap();
+    let projection = store::project(&reopened.attach(None).await.missed, None);
+    assert!(
+        serde_json::to_string(&projection.messages)
+            .unwrap()
+            .contains("EDITED-BRANCH-FACT")
+    );
+    assert_eq!(projection.model.as_deref(), Some("test/live"));
+    assert_eq!(projection.thinking, Some(thinking));
+    within(reopened.navigate(Some(destination.clone()), axo::NavigateOptions::default()))
+        .await
+        .unwrap();
+    let plain = reopened.attach(None).await.missed;
+    assert!(plain.iter().any(|seq| matches!(&seq.entry, Entry::Leaf { base } if base.parent_id.as_ref() == Some(&destination))));
+    assert_eq!(
+        api.recorded_requests().len(),
+        2,
+        "plain navigation never summarizes"
+    );
+}
+
+#[tokio::test]
+async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
+    for scenario in ["failure", "cancel", "oversize"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut turns = vec![ScriptedTurn::Reply(reply_text("ancestor"))];
+        if scenario == "cancel" {
+            turns.push(ScriptedTurn::HangUntilCancel);
+        } else {
+            turns.extend((0..3).map(|_| ScriptedTurn::Reply(reply_text(" "))));
+        }
+        let (host, api, mut model) = navigation_host(dir.path(), turns).await;
+        let (path, destination) = navigation_history(&host, dir.path()).await;
+        let session = host.open_session(&path, options(dir.path())).await.unwrap();
+        if scenario == "oversize" {
+            model.context_window = 8192;
+            session.set_model(model).await.unwrap();
+        }
+        let before = session.attach(None).await.missed;
+        let messages = store::project(&before, None).messages;
+        let operation =
+            session.navigate(Some(destination), axo::NavigateOptions { summarize: true });
+        let result = if scenario == "cancel" {
+            let cancel = async {
+                within(async {
+                    while api.recorded_requests().len() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                session.abort().await;
+            };
+            let (result, ()) = tokio::join!(within(operation), cancel);
+            result
+        } else {
+            within(operation).await
+        };
+        let error = result.expect_err(scenario).to_string();
+        if scenario == "oversize" {
+            assert!(error.contains("Rewind to an earlier point"), "{error}");
+            assert_eq!(
+                api.recorded_requests().len(),
+                1,
+                "no doomed summary request"
+            );
+        }
+        if scenario == "cancel" {
+            assert!(error.contains("Maintenance aborted"), "{error}");
+        }
+        let after = session.attach(None).await;
+        assert_eq!(
+            store::project(&after.missed, None).messages,
+            messages,
+            "{scenario}"
+        );
+        assert!(
+            !after.missed[before.len()..]
+                .iter()
+                .any(|seq| matches!(seq.entry, Entry::Leaf { .. } | Entry::BranchSummary { .. })),
+            "{scenario} must not move"
+        );
+        assert!(after.live.maintenance.is_none());
+        assert!(!after.live.agent.running);
+    }
+}

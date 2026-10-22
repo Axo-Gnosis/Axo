@@ -129,7 +129,7 @@ pub(crate) async fn error_body(response: Response, cancel: &CancellationToken) -
 
 /// Seconds (≥ 0) from `retry-after-ms`, else `retry-after` as seconds or an HTTP date.
 /// Kept as `f64` so the caller checks the cap before converting to a `Duration`.
-fn server_delay(headers: &HeaderMap) -> Option<f64> {
+pub(crate) fn server_delay(headers: &HeaderMap) -> Option<f64> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     if let Some(ms) = header("retry-after-ms").and_then(|value| value.trim().parse::<f64>().ok())
         && ms.is_finite()
@@ -147,6 +147,67 @@ fn server_delay(headers: &HeaderMap) -> Option<f64> {
             let ms = timestamp.as_millisecond() - jiff::Timestamp::now().as_millisecond();
             Some((ms as f64 / 1000.0).max(0.0))
         }
+    }
+}
+
+/// Capture only classification metadata, never authentication or request headers.
+pub(crate) fn response_failure(response: &Response) -> crate::ProviderFailure {
+    crate::ProviderFailure {
+        status: Some(response.status().as_u16()),
+        code: None,
+        retry_after_ms: server_delay(response.headers())
+            .map(|seconds| (seconds * 1000.0).ceil() as u64),
+        should_retry: response
+            .headers()
+            .get("x-should-retry")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| match value {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }),
+    }
+}
+
+/// Merge structured error fields into any HTTP metadata captured before reading the body.
+pub(crate) fn record_failure(output: &mut crate::AssistantMessage, body: &serde_json::Value) {
+    let error = body
+        .pointer("/response/error")
+        .or_else(|| body.get("error"))
+        .unwrap_or(body);
+    let code = ["code", "type"].into_iter().find_map(|key| {
+        let value = error.get(key)?;
+        value
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .or_else(|| value.as_i64().map(|code| code.to_string()))
+    });
+    let failure = output.failure.get_or_insert(crate::ProviderFailure {
+        status: None,
+        code: None,
+        retry_after_ms: None,
+        should_retry: None,
+    });
+    if code.is_some() {
+        failure.code = code;
+    }
+    if failure.status.is_none() {
+        failure.status = error
+            .get("status")
+            .or_else(|| error.get("status_code"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok());
+    }
+    if failure.should_retry.is_none() {
+        failure.should_retry = error
+            .get("should_retry")
+            .and_then(serde_json::Value::as_bool);
+    }
+    if failure.retry_after_ms.is_none() {
+        failure.retry_after_ms = error
+            .get("retry_after_ms")
+            .and_then(serde_json::Value::as_u64);
     }
 }
 

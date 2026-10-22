@@ -351,6 +351,9 @@ fn build_params(
     params.insert("model".into(), model.id.clone().into());
     params.insert("messages".into(), Value::Array(converted));
     params.insert("stream".into(), true.into());
+    if let Some(choice) = simple.tool_choice {
+        params.insert("tool_choice".into(), choice.as_str().into());
+    }
     if base_url.contains("api.openai.com")
         && let Some(session_id) = &simple.session_id
     {
@@ -1246,9 +1249,13 @@ impl Response {
         })?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            self.output.failure = Some(super::http::response_failure(&response));
             let Some(text) = error_body(response, cancel).await else {
                 return Err(ABORTED.to_owned());
             };
+            if let Ok(body) = serde_json::from_str::<Value>(&text) {
+                super::http::record_failure(&mut self.output, &body);
+            }
             return Err(http_error_message(status, &text));
         }
         let _ = self.tx.unbounded_send(AssistantEvent::Start {
@@ -1320,6 +1327,7 @@ impl Response {
         }
         let chunk: Value = serde_json::from_str(data).map_err(|error| error.to_string())?;
         if let Some(error) = chunk.get("error").filter(|error| truthy(Some(error))) {
+            super::http::record_failure(&mut self.output, &chunk);
             return Err(with_raw_metadata(
                 api_error_message(None, Some(error), None),
                 Some(error),

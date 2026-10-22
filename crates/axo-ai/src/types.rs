@@ -26,6 +26,7 @@ pub fn now_ms() -> i64 {
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
+#[allow(clippy::large_enum_variant)] // Keep public variants inline; boxing adds an allocation per assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum Message {
@@ -63,6 +64,15 @@ pub struct UserMessage {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderFailure {
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub should_retry: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
@@ -87,6 +97,8 @@ pub struct AssistantMessage {
     pub stop_reason: StopReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ProviderFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_stop_reason: Option<String>,
     /// Provider indication of whether the model explicitly ended its turn.
@@ -115,6 +127,7 @@ impl AssistantMessage {
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
+            failure: None,
             raw_stop_reason: None,
             end_turn: None,
             timestamp: now_ms(),
