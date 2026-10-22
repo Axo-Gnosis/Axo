@@ -1,0 +1,27 @@
+[package]
+name = "axo-agent"
+version = "0.1.0"
+description = "axo's agent loop: turns, tool execution, hooks, queues and cancellation"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axo-ai = { path = "../axo-ai" }
+futures.workspace = true
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axo-ai = { path = "../axo-ai", features = ["testing"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
