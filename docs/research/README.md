@@ -16,6 +16,8 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 | [`agents-dir.md`](agents-dir.md) | What lives in `.agents/` and its neighbors across tools, and what axo reads |
 | [`shell-tool.md`](shell-tool.md) | pi's and omp's bash tools compared; whether the tool can run fish |
 | [`nix-shell.md`](nix-shell.md) | Running agent commands inside Nix dev shells: techniques, timings, design |
+| [`compaction.md`](compaction.md) | When agents compact, how much reply headroom they reserve, and what they keep verbatim; provider limits and context-rot evidence |
+| [`compaction-methods.md`](compaction-methods.md) | How pi, omp, Claude Code, Codex, the Anthropic and OpenAI APIs and others actually compact; prompts, carried state, failure lessons, evaluation, ideas for axo |
 
 ## Why a new core
 
