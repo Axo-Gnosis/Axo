@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axo::{Axo, SessionOptions, Settings, StaticEnv};
+use axo::{Axo, ProjectAccess, SessionOptions, Settings, StaticEnv};
 use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -42,7 +42,7 @@ pub fn options(dir: &Path) -> SessionOptions {
     SessionOptions {
         cwd,
         model: Some("test/m".into()),
-        project_resources: false,
+        project_access: Some(ProjectAccess::Ignore),
         exec_env: Some(Arc::new(StaticEnv(Arc::new(BTreeMap::new())))),
         ..SessionOptions::default()
     }

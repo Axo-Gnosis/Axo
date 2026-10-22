@@ -35,3 +35,8 @@ pub fn git_root(cwd: &Path) -> Option<PathBuf> {
         .find(|dir| dir.join(".git").exists())
         .map(Path::to_path_buf)
 }
+
+/// The git root, or `cwd` itself outside a repository.
+pub fn project_root(cwd: &Path) -> PathBuf {
+    git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}

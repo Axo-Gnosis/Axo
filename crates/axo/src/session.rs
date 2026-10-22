@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::config::{AxoDir, Settings};
+use crate::config::{AxoDir, ProjectAccess, Settings};
 use crate::context::files::{ContextFile, load_context_files};
 use crate::context::prompt::{PromptInputs, Sections, build_sections, system_message};
 use crate::context::skills::{Skill, expand_skill_command, load_skills};
@@ -43,8 +43,9 @@ pub struct SessionOptions {
     pub thinking: Option<ThinkingLevel>,
     /// Register the `ask` tool.
     pub ask_enabled: bool,
-    /// Read project `.axo/` files, project context files and project skills.
-    pub project_resources: bool,
+    /// Forces the project's access level; `None` takes it from `project.paths`/`project.access`
+    /// in user settings.
+    pub project_access: Option<ProjectAccess>,
     /// Overrides the environment provider built from settings.
     pub exec_env: Option<Arc<dyn ExecEnv>>,
     /// Host prompt sections, applied last; `None` removes a section.
@@ -61,7 +62,7 @@ impl Default for SessionOptions {
             model: None,
             thinking: None,
             ask_enabled: false,
-            project_resources: true,
+            project_access: None,
             exec_env: None,
             sections: Vec::new(),
             recovery: RecoveryPolicy::default(),
@@ -155,7 +156,7 @@ pub(crate) struct SessionSetup {
     pub(crate) thinking: ThinkingLevel,
     pub(crate) exec: Arc<dyn ExecEnv>,
     pub(crate) ask_enabled: bool,
-    pub(crate) project_resources: bool,
+    pub(crate) project_access: ProjectAccess,
     pub(crate) host_sections: Vec<(String, Option<String>)>,
     pub(crate) store: Arc<dyn SessionStore>,
     /// The header id, forwarded to providers as the session id.
@@ -186,7 +187,7 @@ pub struct Session {
     // Prompt inputs, kept to rebuild the prompt when the exec environment changes.
     dir: AxoDir,
     cwd: PathBuf,
-    project_resources: bool,
+    project_access: ProjectAccess,
     tools: Vec<Arc<dyn Tool>>,
     context_files: Vec<ContextFile>,
     skills: Vec<Skill>,
@@ -497,7 +498,7 @@ impl Session {
             thinking,
             exec,
             ask_enabled,
-            project_resources,
+            project_access,
             host_sections,
             store,
             session_id,
@@ -521,8 +522,10 @@ impl Session {
         );
         let tools = tools::builtin(&session_tools, ask_enabled);
 
-        let (context_files, file_diagnostics) = load_context_files(&dir, &cwd, project_resources);
-        let (skills, skill_diagnostics) = load_skills(&dir, &cwd, project_resources);
+        let project = project_access != ProjectAccess::Ignore;
+        let (context_files, file_diagnostics) = load_context_files(&dir, &cwd, project);
+        let (skills, skill_diagnostics) =
+            load_skills(&dir, &cwd, project && settings.project.files.skills);
         for diagnostic in file_diagnostics.iter().chain(&skill_diagnostics) {
             warn!("{diagnostic}");
         }
@@ -572,7 +575,7 @@ impl Session {
             ask_enabled,
             dir,
             cwd,
-            project_resources,
+            project_access,
             tools,
             context_files,
             skills,
@@ -816,7 +819,8 @@ impl Session {
         let (sections, diagnostics) = build_sections(&PromptInputs {
             dir: &self.dir,
             cwd: &self.cwd,
-            project_resources: self.project_resources,
+            project_prompts: self.project_access != ProjectAccess::Ignore
+                && self.settings.project.files.axo_dir,
             tools: &self.tools,
             context_files: &self.context_files,
             skills: &self.skills,
@@ -1156,7 +1160,7 @@ impl Session {
             thinking,
             exec: self.exec.clone(),
             ask_enabled: self.ask_enabled,
-            project_resources: self.project_resources,
+            project_access: self.project_access,
             host_sections: self.host_sections.clone(),
             store: self.store.clone(),
             session_id,

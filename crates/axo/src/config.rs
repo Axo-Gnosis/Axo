@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
 use axo_ai::{ModelsConfig, ThinkingLevel};
+use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -76,6 +77,7 @@ pub struct Settings {
     pub follow_up_mode: QueueMode,
     pub bash: BashSettings,
     pub ask: AskSettings,
+    pub project: ProjectSettings,
 }
 
 impl Default for Settings {
@@ -87,8 +89,77 @@ impl Default for Settings {
             follow_up_mode: QueueMode::OneAtATime,
             bash: BashSettings::default(),
             ask: AskSettings::default(),
+            project: ProjectSettings::default(),
         }
     }
+}
+
+/// What projects may contribute. Read from user settings only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProjectSettings {
+    pub files: ProjectFiles,
+    /// Access for a project no `paths` glob matches.
+    pub access: ProjectAccess,
+    /// Glob over the project root → access; the last matching glob wins. `~/` expands to `$HOME`.
+    pub paths: IndexMap<String, ProjectAccess>,
+}
+
+impl ProjectSettings {
+    pub fn access_for(&self, root: &Path) -> ProjectAccess {
+        let mut access = self.access;
+        for (pattern, &value) in &self.paths {
+            let expanded;
+            let glob = if let Some(suffix) = pattern.strip_prefix("~/") {
+                let Some(home) = std::env::var_os("HOME") else {
+                    continue;
+                };
+                expanded = Path::new(&home).join(suffix).to_string_lossy().into_owned();
+                &expanded
+            } else {
+                pattern.as_str()
+            };
+            match globset::GlobBuilder::new(glob)
+                .literal_separator(true)
+                .build()
+            {
+                Ok(glob) if glob.compile_matcher().is_match(root) => access = value,
+                Ok(_) => {}
+                Err(err) => tracing::warn!(pattern, %err, "invalid project.paths glob"),
+            }
+        }
+        access
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProjectFiles {
+    /// `<cwd>/.axo/`: settings.jsonc and the SYSTEM/WORK/PROSE.md overrides.
+    pub axo_dir: bool,
+    /// Project `.agents/skills`.
+    pub skills: bool,
+}
+
+impl Default for ProjectFiles {
+    fn default() -> Self {
+        Self {
+            axo_dir: true,
+            skills: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectAccess {
+    /// Nothing from the project is read.
+    Ignore,
+    /// Read project files, dropping settings that run code.
+    #[default]
+    Read,
+    /// Everything, including what runs code.
+    Trust,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -107,7 +178,7 @@ pub struct BashSettings {
 impl Default for BashSettings {
     fn default() -> Self {
         Self {
-            dev_shell: DevShellMode::Direnv,
+            dev_shell: DevShellMode::Off,
             dev_shell_ref: ".#default".to_owned(),
             dev_shell_watch: Vec::new(),
             dev_shell_timeout_ms: 600_000,
@@ -116,18 +187,17 @@ impl Default for BashSettings {
     }
 }
 
-/// How bash commands pick up a project environment. Ordered `Off < Direnv < Auto`: a
-/// project settings file can only lower the user's mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+/// How bash commands pick up a project environment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DevShellMode {
     /// Host environment only.
-    Off,
-    /// An allowed `.envrc` via direnv.
     #[default]
+    Off,
+    /// The allowed `.envrc` via direnv.
     Direnv,
-    /// `.envrc` via direnv, else the nearest `flake.nix` dev shell.
-    Auto,
+    /// The nearest `flake.nix` dev shell (up to the git root); `.envrc` is ignored.
+    Nix,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -138,43 +208,53 @@ pub struct AskSettings {
 }
 
 impl Settings {
-    /// Loads `<AXO_DIR>/settings.jsonc`, then, when `project` is `Some(cwd)`,
-    /// `<cwd>/.axo/settings.jsonc`, deep-merging objects with the project winning (arrays
-    /// replace) except that `bash.devShell` takes the lower of the two modes.
-    /// `defaultModel` goes through `axo_ai::resolve_config_value` when it starts with `!`
-    /// or contains `$NAME`. Missing files mean defaults.
-    pub fn load(dir: &AxoDir, project: Option<&Path>) -> Result<Settings, Error> {
-        let user = read_settings_value(&dir.settings_path())?;
-        let project = match project {
-            Some(cwd) => {
-                let path = cwd.join(".axo").join("settings.jsonc");
-                read_settings_value(&path)?.map(|value| (path, value))
-            }
-            None => None,
-        };
+    /// Loads `<AXO_DIR>/settings.jsonc`, then, for `Some((cwd, access))` with access other
+    /// than `Ignore`, `<cwd>/.axo/settings.jsonc`. Objects merge key by key with the
+    /// project winning; arrays replace. The project file never sets user-only keys,
+    /// and below `Trust` it never sets what runs code.
+    /// `defaultModel` resolves commands and environment variables after merging.
+    pub fn load(dir: &AxoDir, project: Option<(&Path, ProjectAccess)>) -> Result<Settings, Error> {
+        const USER_ONLY_KEYS: &[&str] = &["project"];
 
-        let user_mode = user
-            .as_ref()
-            .map_or(DevShellMode::default(), |value| value.1.bash.dev_shell);
-        let project_mode = project.as_ref().and_then(|(_, (value, settings))| {
-            value
-                .pointer("/bash/devShell")
-                .is_some()
-                .then_some(settings.bash.dev_shell)
-        });
-
-        let mut settings = match (user, project) {
-            (None, None) => Settings::default(),
-            (Some((_, settings)), None) | (None, Some((_, (_, settings)))) => settings,
-            (Some((mut merged, _)), Some((path, (overlay, _)))) => {
-                deep_merge(&mut merged, overlay);
-                serde_json::from_value(merged).map_err(|error| Error::Config {
-                    path,
-                    message: error.to_string(),
-                })?
+        let mut path = dir.settings_path();
+        let mut merged = Value::Object(Default::default());
+        if let Some(user) = read_settings_value(&path)? {
+            deep_merge(&mut merged, user);
+        }
+        if let Some((cwd, access)) = project.filter(|(_, access)| *access != ProjectAccess::Ignore)
+        {
+            let project_path = cwd.join(".axo").join("settings.jsonc");
+            if let Some(mut project) = read_settings_value(&project_path)? {
+                path = project_path;
+                let object = project.as_object_mut().expect("validated settings object");
+                for key in USER_ONLY_KEYS {
+                    if object.remove(*key).is_some() {
+                        tracing::warn!(path = %path.display(), "\"{key}\" is a user setting; ignored in project settings");
+                    }
+                }
+                if access != ProjectAccess::Trust {
+                    if let Some(bash) = object.get_mut("bash").and_then(Value::as_object_mut)
+                        && bash.remove("devShell").is_some()
+                    {
+                        tracing::warn!(path = %path.display(), "bash.devShell needs a trusted project; ignored in project settings");
+                    }
+                    if object
+                        .get("defaultModel")
+                        .and_then(Value::as_str)
+                        .is_some_and(|model| model.starts_with('!'))
+                    {
+                        object.remove("defaultModel");
+                        tracing::warn!(path = %path.display(), "a \"!command\" defaultModel needs a trusted project; ignored in project settings");
+                    }
+                }
+                deep_merge(&mut merged, project);
             }
-        };
-        settings.bash.dev_shell = project_mode.map_or(user_mode, |mode| mode.min(user_mode));
+        }
+        let mut settings: Settings =
+            serde_json::from_value(merged).map_err(|error| Error::Config {
+                path,
+                message: error.to_string(),
+            })?;
 
         if let Some(model) = &settings.default_model {
             let bytes = model.as_bytes();
@@ -190,9 +270,9 @@ impl Settings {
     }
 }
 
-/// Reads one settings file as its raw JSONC value plus its own deserialization (so a bad
-/// value is reported against the file that holds it). A missing or empty file is `None`.
-fn read_settings_value(path: &Path) -> Result<Option<(Value, Settings)>, Error> {
+/// Reads and independently validates one settings file so a bad value is reported
+/// against the file that holds it. A missing or empty file is `None`.
+fn read_settings_value(path: &Path) -> Result<Option<Value>, Error> {
     let Some(text) = read_optional(path)? else {
         return Ok(None);
     };
@@ -208,9 +288,9 @@ fn read_settings_value(path: &Path) -> Result<Option<(Value, Settings)>, Error> 
         Some(value @ Value::Object(_)) => value,
         Some(_) => return Err(config_error("expected a JSON object".to_owned())),
     };
-    let settings =
-        serde_json::from_value(value.clone()).map_err(|error| config_error(error.to_string()))?;
-    Ok(Some((value, settings)))
+    serde_json::from_value::<Settings>(value.clone())
+        .map_err(|error| config_error(error.to_string()))?;
+    Ok(Some(value))
 }
 
 /// `Ok(None)` when the file does not exist.

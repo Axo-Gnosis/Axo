@@ -24,7 +24,7 @@ pub struct PromptInputs<'a> {
     pub dir: &'a AxoDir,
     pub cwd: &'a Path,
     /// Read `<cwd>/.axo/<NAME>.md` overrides.
-    pub project_resources: bool,
+    pub project_prompts: bool,
     /// Active tools; their snippets and guidelines make the `tools` section.
     pub tools: &'a [Arc<dyn Tool>],
     pub context_files: &'a [ContextFile],
@@ -41,7 +41,7 @@ const BUNDLED_SYSTEM: &str = include_str!("../../prompts/SYSTEM.md");
 const BUNDLED_PROSE: &str = include_str!("../../prompts/PROSE.md");
 
 /// Builds the sections. `system`, `work` and `prose` come from `<cwd>/.axo/<NAME>.md`
-/// (when `project_resources`) → `<AXO_DIR>/<NAME>.md` → the bundled file (none for
+/// (when `project_prompts`) → `<AXO_DIR>/<NAME>.md` → the bundled file (none for
 /// `WORK.md`); an existing empty or whitespace-only file disables the section. Unreadable
 /// files become diagnostics. Blocking filesystem I/O.
 pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) {
@@ -51,7 +51,7 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
 
     let mut prompt_file = |name: &str, bundled: Option<&str>| -> String {
         let project = inputs
-            .project_resources
+            .project_prompts
             .then(|| inputs.cwd.join(".axo").join(format!("{name}.md")));
         for path in project.into_iter().chain([inputs.dir.prompt_path(name)]) {
             match std::fs::read_to_string(&path) {

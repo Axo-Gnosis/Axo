@@ -48,9 +48,9 @@ const NOTICE_TAIL_LINES: usize = 20;
 static FLIGHTS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
 
-/// Resolves, per `cwd`: an allowed `.envrc` (direnv) → the nearest `flake.nix` up to the
-/// git root (captured dev shell, `Auto` only) → `base`. Captures are cached in memory and
-/// under `cache_dir`, single-flight per key, and invalidated by the stat watch list.
+/// Resolves, per `cwd`, an allowed `.envrc` in `Direnv` mode or the nearest `flake.nix`
+/// up to the git root in `Nix` mode, falling back to `base`. Flake captures are cached in
+/// memory and under `cache_dir`, single-flight per key, and invalidated by the watch list.
 pub struct DevShellEnv {
     inner: Arc<Inner>,
 }
@@ -124,8 +124,8 @@ struct Layer {
 
 impl DevShellEnv {
     /// `base`: the host snapshot every resolution starts from and falls back to.
-    /// `settings`: the effective bash settings (`dev_shell` already lowered by the project
-    /// rule; the session uses `HostEnv` instead when it is `Off`).
+    /// `settings`: the effective bash settings after project access filtering;
+    /// the session uses `HostEnv` instead when `dev_shell` is `Off`.
     /// `cache_dir`: `<AXO_DIR>/cache/devshell`; each capture lives in
     /// `<cache_dir>/<hex hash of (flake_dir, ref, system)>/{env.json, watches.json, gcroot}`.
     pub fn new(base: Arc<EnvMap>, settings: BashSettings, cache_dir: PathBuf) -> Self {
@@ -164,32 +164,34 @@ impl ExecEnv for DevShellEnv {
     ) -> Resolved {
         let inner = &self.inner;
         let mode = inner.settings.dev_shell;
-        if mode == DevShellMode::Off {
-            return inner.host();
-        }
-        let lookup = inner.lookup(cwd, mode);
-        if let Some(dir) = &lookup.envrc_dir {
-            let loaded = tokio::select! {
-                env = inner.direnv(dir) => env,
-                () = cancel.cancelled() => return inner.host(),
-            };
-            if let Some(env) = loaded {
-                return Resolved {
-                    env,
-                    notice: None,
-                    prompt_note: None,
-                };
+        match mode {
+            DevShellMode::Off => inner.host(),
+            DevShellMode::Direnv => {
+                if let Some(dir) = inner.lookup(cwd, mode).envrc_dir {
+                    let loaded = tokio::select! {
+                        env = inner.direnv(&dir) => env,
+                        () = cancel.cancelled() => return inner.host(),
+                    };
+                    if let Some(env) = loaded {
+                        return Resolved {
+                            env,
+                            notice: None,
+                            prompt_note: None,
+                        };
+                    }
+                }
+                inner.host()
             }
-        }
-        match lookup.flake_dir {
-            Some(dir) if mode == DevShellMode::Auto => {
+            DevShellMode::Nix => {
+                let Some(dir) = inner.lookup(cwd, mode).flake_dir else {
+                    return inner.host();
+                };
                 if let Some(resolved) = inner.warm(&dir) {
                     return resolved;
                 }
                 progress(&format!("Capturing Nix dev shell for {}…", dir.display()));
                 inner.flake(dir, cancel).await
             }
-            _ => inner.host(),
         }
     }
 
@@ -223,8 +225,8 @@ impl Inner {
         }
     }
 
-    /// The nearest `.envrc` (up to `/`, as direnv) and `flake.nix` (up to the git root),
-    /// cached per `cwd` for [`STAT_GUARD_TTL`].
+    /// The nearest `.envrc` up to `/` in `Direnv` mode, or `flake.nix` up to the git root
+    /// in `Nix` mode, cached per `cwd` for [`STAT_GUARD_TTL`].
     fn lookup(&self, cwd: &Path, mode: DevShellMode) -> Lookup {
         if let Some(found) = self
             .lookups
@@ -237,20 +239,24 @@ impl Inner {
         }
         let mut envrc_dir = None;
         let mut flake_dir = None;
-        let mut flake_open = mode == DevShellMode::Auto;
         for dir in cwd.ancestors() {
-            if envrc_dir.is_none() && dir.join(".envrc").is_file() {
-                envrc_dir = Some(dir.to_path_buf());
-            }
-            if flake_open && dir.join("flake.nix").is_file() {
-                flake_dir = Some(dir.to_path_buf());
-                flake_open = false;
-            }
-            if dir.join(".git").exists() {
-                flake_open = false;
-            }
-            if envrc_dir.is_some() && !flake_open {
-                break;
+            match mode {
+                DevShellMode::Off => break,
+                DevShellMode::Direnv => {
+                    if dir.join(".envrc").is_file() {
+                        envrc_dir = Some(dir.to_path_buf());
+                        break;
+                    }
+                }
+                DevShellMode::Nix => {
+                    if dir.join("flake.nix").is_file() {
+                        flake_dir = Some(dir.to_path_buf());
+                        break;
+                    }
+                    if dir.join(".git").exists() {
+                        break;
+                    }
+                }
             }
         }
         let found = Lookup {
@@ -605,10 +611,10 @@ impl Inner {
         resolved
     }
 
-    /// `flake.nix`, `flake.lock`, `.envrc`, every git-tracked `*.nix` under `dir`, and the
+    /// `flake.nix`, `flake.lock`, every git-tracked `*.nix` under `dir`, and the
     /// `devShellWatch` globs (relative to `dir`).
     async fn watch_list(&self, dir: &Path) -> Vec<Watch> {
-        let mut paths: Vec<PathBuf> = ["flake.nix", "flake.lock", ".envrc"]
+        let mut paths: Vec<PathBuf> = ["flake.nix", "flake.lock"]
             .into_iter()
             .map(|name| dir.join(name))
             .collect();

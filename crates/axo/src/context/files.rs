@@ -24,15 +24,15 @@ const CANDIDATES: [&str; 4] = [
 /// Loads context files in prompt order. Per directory, the first existing file among
 /// `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, `.agents/AGENTS.md` wins. Order: the
 /// global `<AXO_DIR>` match first, then each directory from the git root (or `cwd` alone
-/// outside a repository) in towards `cwd`. With `project_resources` false only the global
+/// outside a repository) in towards `cwd`. With `project` false only the global
 /// file loads. Unreadable files become diagnostics. Blocking filesystem I/O.
 pub fn load_context_files(
     dir: &AxoDir,
     cwd: &Path,
-    project_resources: bool,
+    project: bool,
 ) -> (Vec<ContextFile>, Vec<Diagnostic>) {
     let mut dirs = vec![dir.root().to_path_buf()];
-    if project_resources {
+    if project {
         let mut project: Vec<PathBuf> = match git_root(cwd) {
             Some(root) => cwd
                 .ancestors()

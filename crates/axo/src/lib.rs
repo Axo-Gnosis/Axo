@@ -11,7 +11,10 @@ pub mod store;
 pub mod tools;
 
 pub use axo::{Axo, AxoBuilder};
-pub use config::{AskSettings, AxoDir, BashSettings, DevShellMode, Settings};
+pub use config::{
+    AskSettings, AxoDir, BashSettings, DevShellMode, ProjectAccess, ProjectFiles, ProjectSettings,
+    Settings,
+};
 pub use context::Diagnostic;
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;

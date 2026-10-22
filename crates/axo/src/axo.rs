@@ -7,7 +7,8 @@ use std::sync::Arc;
 use axo_ai::thinking::clamp_level;
 use axo_ai::{FileCredentialStore, Models, ModelsOptions, Streamer};
 
-use crate::config::{self, AxoDir, DevShellMode, Settings};
+use crate::config::{self, AxoDir, DevShellMode, ProjectAccess, Settings};
+use crate::context::project_root;
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::{EnvMap, ExecEnv, HostEnv};
@@ -203,14 +204,19 @@ impl Axo {
             model,
             thinking,
             ask_enabled,
-            project_resources,
+            project_access,
             exec_env,
             sections,
             recovery: _,
         } = options;
 
-        let settings = if project_resources && self.settings_from_dir {
-            Settings::load(&self.dir, Some(&cwd))?
+        let access =
+            project_access.unwrap_or_else(|| self.settings.project.access_for(&project_root(&cwd)));
+        let settings = if self.settings_from_dir
+            && access != ProjectAccess::Ignore
+            && self.settings.project.files.axo_dir
+        {
+            Settings::load(&self.dir, Some((&cwd, access)))?
         } else {
             self.settings.clone()
         };
@@ -250,7 +256,7 @@ impl Axo {
             thinking,
             exec,
             ask_enabled,
-            project_resources,
+            project_access: access,
             host_sections: sections,
             store: self.store.clone(),
             session_id,

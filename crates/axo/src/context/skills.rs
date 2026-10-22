@@ -27,16 +27,12 @@ const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
 /// Discovers skills in order: `.agents/skills` from `cwd` up to the git root (skipped when
-/// `project_resources` is false), `<AXO_DIR>/skills`, then `$HOME/.agents/skills`. The
+/// `project` is false), `<AXO_DIR>/skills`, then `$HOME/.agents/skills`. The
 /// first skill with a given name wins; later ones, name-rule violations and skills dropped
 /// for a missing `description` become diagnostics. Blocking filesystem I/O.
-pub fn load_skills(
-    dir: &AxoDir,
-    cwd: &Path,
-    project_resources: bool,
-) -> (Vec<Skill>, Vec<Diagnostic>) {
+pub fn load_skills(dir: &AxoDir, cwd: &Path, project: bool) -> (Vec<Skill>, Vec<Diagnostic>) {
     let mut roots: Vec<PathBuf> = Vec::new();
-    if project_resources {
+    if project {
         match git_root(cwd) {
             Some(root) => roots.extend(
                 cwd.ancestors()
