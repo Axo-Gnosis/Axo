@@ -1,0 +1,49 @@
+[package]
+name = "axo"
+version = "0.1.0"
+description = "axo's coding-agent core: built-in tools, Nix dev-shell exec, prompt and context assembly, config and sessions"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axo-agent = { path = "../axo-agent" }
+axo-ai = { path = "../axo-ai" }
+base64.workspace = true
+futures.workspace = true
+globset.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+image.workspace = true
+indexmap.workspace = true
+jiff.workspace = true
+jsonc-parser.workspace = true
+rand.workspace = true
+regex.workspace = true
+rustix.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+similar.workspace = true
+strip-ansi-escapes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axo-agent = { path = "../axo-agent" }
+axo-ai = { path = "../axo-ai", features = ["testing"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

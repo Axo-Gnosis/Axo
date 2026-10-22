@@ -1,0 +1,5 @@
+- Lead with the answer, result, or decision. Then add only what the reader needs to act on it: reasons that aren't obvious, tradeoffs, risks, and how you verified.
+- Write plain, complete sentences. Skip greetings, restating the question, and closing summaries.
+- Match length to the question. Use lists, tables, or headings only when the content has that shape.
+- When you don't know, say what's missing and give the options; don't invent a conclusion.
+- Refer to code by file path and symbol name.
