@@ -163,10 +163,6 @@ impl Tool for BashTool {
         Replay::Never
     }
 
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Execute bash commands (ls, grep, find, etc.)")
-    }
-
     async fn execute(
         &self,
         call: &ToolCall,

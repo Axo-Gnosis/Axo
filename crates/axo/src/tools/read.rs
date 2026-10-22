@@ -71,10 +71,6 @@ impl Tool for ReadTool {
         Replay::Safe
     }
 
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Read file contents")
-    }
-
     fn prompt_guidelines(&self) -> &[&str] {
         GUIDELINES
     }

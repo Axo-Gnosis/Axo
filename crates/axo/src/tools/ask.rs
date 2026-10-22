@@ -239,10 +239,6 @@ impl Tool for AskTool {
         Replay::Safe
     }
 
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Ask the user a clarifying question")
-    }
-
     async fn execute(
         &self,
         call: &ToolCall,

@@ -82,10 +82,6 @@ impl Tool for GrepTool {
         Replay::Safe
     }
 
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Search file contents for patterns (respects .gitignore)")
-    }
-
     async fn execute(
         &self,
         call: &ToolCall,

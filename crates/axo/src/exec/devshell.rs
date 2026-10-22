@@ -550,9 +550,8 @@ impl Inner {
             env: Arc::new(env),
             notice: None,
             prompt_note: Some(format!(
-                "Shell commands run inside the Nix dev shell of {} ({}); its tools are already on PATH, so don't wrap commands in \"nix develop\".",
-                dir.display(),
-                self.settings.dev_shell_ref
+                "Commands run inside the Nix dev shell of {}; its tools are already on PATH.",
+                dir.display()
             )),
         }
     }

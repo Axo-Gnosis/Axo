@@ -61,10 +61,6 @@ impl Tool for WriteTool {
         Replay::Safe
     }
 
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Create or overwrite files")
-    }
-
     fn prompt_guidelines(&self) -> &[&str] {
         GUIDELINES
     }

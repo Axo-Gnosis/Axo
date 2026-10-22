@@ -15,8 +15,8 @@ use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
-/// `system, tools, work, prose, project_context, skills, cwd, <host sections>`, with empty
-/// sections omitted.
+/// `system, tools, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
+/// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
 /// Everything one prompt build reads besides the prompt files.
@@ -25,13 +25,15 @@ pub struct PromptInputs<'a> {
     pub cwd: &'a Path,
     /// Read `<cwd>/.axo/<NAME>.md` overrides.
     pub project_prompts: bool,
-    /// Active tools; their snippets and guidelines make the `tools` section.
+    /// Active tools; their guidelines make the `tools` section.
     pub tools: &'a [Arc<dyn Tool>],
     pub context_files: &'a [ContextFile],
     /// Skills with `disable_model_invocation` are left out of the listing.
     pub skills: &'a [Skill],
-    /// `Resolved::prompt_note`, appended to the `cwd` section.
-    pub prompt_note: Option<&'a str>,
+    /// `Resolved::prompt_note`: the `dev_shell` section.
+    pub dev_shell: Option<&'a str>,
+    /// Today as `YYYY-MM-DD`: the `date` section.
+    pub date: &'a str,
     /// Host sections, applied last: `Some(body)` sets or replaces a section, `None`
     /// removes it.
     pub host_sections: &'a [(String, Option<String>)],
@@ -71,42 +73,34 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
     let prose = prompt_file("PROSE", Some(BUNDLED_PROSE));
 
     bodies.insert("system".into(), system);
-    bodies.insert("tools".into(), render_tools(inputs.tools));
+    bodies.insert("tools".into(), render_guidelines(inputs.tools));
     bodies.insert("work".into(), work);
     bodies.insert("prose".into(), prose);
 
     if !inputs.context_files.is_empty() {
-        let mut parts = vec!["Project-specific instructions and guidelines:".to_owned()];
-        parts.extend(inputs.context_files.iter().map(|file| {
-            format!(
-                "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-                file.path.display(),
-                file.content
-            )
-        }));
+        let parts: Vec<String> = inputs
+            .context_files
+            .iter()
+            .map(|file| {
+                format!(
+                    "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+                    file.path.display(),
+                    file.content
+                )
+            })
+            .collect();
         bodies.insert("project_context".into(), parts.join("\n\n"));
     }
 
     let has_tool = |name: &str| inputs.tools.iter().any(|tool| tool.name() == name);
-    let reader = if has_tool("read") {
-        Some("Use the read tool to load a skill's file when the task matches its description.")
-    } else if has_tool("bash") {
-        Some("Use bash to load a skill's file when the task matches its description.")
-    } else {
-        None
-    };
     let visible: Vec<&Skill> = inputs
         .skills
         .iter()
         .filter(|skill| !skill.disable_model_invocation)
         .collect();
-    if let Some(reader) = reader
-        && !visible.is_empty()
-    {
+    if (has_tool("read") || has_tool("bash")) && !visible.is_empty() {
         let mut lines = vec![
-            "The following skills provide specialized instructions for specific tasks.".to_owned(),
-            reader.to_owned(),
-            "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_owned(),
+            "When a task matches a skill's description, read its file first; relative paths in it resolve against the skill's directory.".to_owned(),
             String::new(),
             "<available_skills>".to_owned(),
         ];
@@ -127,16 +121,15 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
         bodies.insert("skills".into(), lines.join("\n"));
     }
 
-    let mut cwd = format!("Current working directory: {}", inputs.cwd.display());
+    bodies.insert("cwd".into(), inputs.cwd.display().to_string());
     if let Some(note) = inputs
-        .prompt_note
+        .dev_shell
         .map(str::trim)
         .filter(|note| !note.is_empty())
     {
-        cwd.push('\n');
-        cwd.push_str(note);
+        bodies.insert("dev_shell".into(), note.to_owned());
     }
-    bodies.insert("cwd".into(), cwd);
+    bodies.insert("date".into(), inputs.date.to_owned());
 
     for (name, body) in inputs.host_sections {
         let valid = name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
@@ -173,49 +166,20 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
     (sections, diagnostics)
 }
 
-/// pi's `tools` section (`- name: snippet`, snippets collapsed to one line) followed by
-/// its `rules` list: deduplicated, trimmed tool guidelines in tool order. Empty when no
-/// tool has a snippet or a guideline.
-fn render_tools(tools: &[Arc<dyn Tool>]) -> String {
-    let listed: Vec<String> = tools
-        .iter()
-        .filter_map(|tool| {
-            let snippet = tool
-                .prompt_snippet()?
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!snippet.is_empty()).then(|| format!("- {}: {snippet}", tool.name()))
-        })
-        .collect();
-
+/// Deduplicated, trimmed tool guidelines in tool order.
+fn render_guidelines(tools: &[Arc<dyn Tool>]) -> String {
     let mut seen = HashSet::new();
     let mut rules = Vec::new();
-    let has = |name: &str| tools.iter().any(|tool| tool.name() == name);
-    let bash_rule = (has("bash") && !has("grep") && !has("find") && !has("ls"))
-        .then_some("Use bash for file operations like ls, rg, find");
-    for rule in bash_rule.into_iter().chain(
-        tools
-            .iter()
-            .flat_map(|tool| tool.prompt_guidelines().iter().copied()),
-    ) {
+    for rule in tools
+        .iter()
+        .flat_map(|tool| tool.prompt_guidelines().iter().copied())
+    {
         let rule = rule.trim();
         if !rule.is_empty() && seen.insert(rule) {
             rules.push(format!("- {rule}"));
         }
     }
-
-    let mut parts = Vec::new();
-    if !listed.is_empty() {
-        parts.push(format!(
-            "{}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.",
-            listed.join("\n")
-        ));
-    }
-    if !rules.is_empty() {
-        parts.push(format!("Guidelines:\n{}", rules.join("\n")));
-    }
-    parts.join("\n\n")
+    rules.join("\n")
 }
 
 /// The transcript system message moving the prompt from `prev` to `next`: with no `prev`,

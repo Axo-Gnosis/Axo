@@ -70,10 +70,6 @@ impl Tool for FindTool {
         Replay::Safe
     }
 
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Find files by glob pattern (respects .gitignore)")
-    }
-
     async fn execute(
         &self,
         call: &ToolCall,

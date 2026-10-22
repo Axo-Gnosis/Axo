@@ -19,9 +19,7 @@ pub trait Tool: Send + Sync {
     fn replay(&self) -> Replay {
         Replay::Never
     }
-    fn prompt_snippet(&self) -> Option<&str> {
-        None
-    }
+    /// Bullets for the system prompt's `tools` section.
     fn prompt_guidelines(&self) -> &[&str] {
         &[]
     }

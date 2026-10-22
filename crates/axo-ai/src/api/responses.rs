@@ -93,7 +93,7 @@ pub(crate) fn convert_messages(
                                 if declared_additional_tools {
                                     // Without it, models read the latest item as the complete
                                     // tool set once a removal was announced.
-                                    let notice = "This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.";
+                                    let notice = "Tool list update: tools declared here replace earlier definitions; other tools stay available unless listed as unavailable.";
                                     let content = if unavailable.is_empty() {
                                         notice.to_owned()
                                     } else {

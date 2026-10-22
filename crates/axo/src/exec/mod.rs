@@ -37,7 +37,7 @@ pub struct Resolved {
     pub env: Arc<EnvMap>,
     /// Shown once in the next bash result, e.g. why the dev shell fell back to the host env.
     pub notice: Option<String>,
-    /// A stable line for the `cwd` prompt section, e.g. that commands run in a dev shell.
+    /// A stable line for the `dev_shell` prompt section.
     pub prompt_note: Option<String>,
 }
 

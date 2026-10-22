@@ -184,7 +184,7 @@ pub struct Session {
     settings: Settings,
     streamer: Arc<dyn Streamer>,
     ask_enabled: bool,
-    // Prompt inputs, kept to rebuild the prompt when the exec environment changes.
+    // Prompt inputs, kept to rebuild the prompt when the exec environment or date changes.
     dir: AxoDir,
     cwd: PathBuf,
     project_access: ProjectAccess,
@@ -195,12 +195,16 @@ pub struct Session {
     prompt: Mutex<PromptState>,
 }
 
-/// The last prompt build and the exec-environment note it used.
+/// The last prompt build and the exec-environment note and local date it used.
 struct PromptState {
-    /// `None` until the first build.
-    note: Option<Option<String>>,
+    note: Option<String>,
+    date: String,
     /// `None` until the first build.
     sections: Option<Sections>,
+}
+
+fn today() -> String {
+    jiff::Zoned::now().date().to_string()
 }
 
 /// The session's loop hooks, durable log and event relay.
@@ -582,6 +586,7 @@ impl Session {
             host_sections,
             prompt: Mutex::new(PromptState {
                 note: None,
+                date: String::new(),
                 sections: None,
             }),
         };
@@ -589,7 +594,7 @@ impl Session {
             .exec
             .resolve(&session.cwd, &CancellationToken::new(), &|_| {})
             .await;
-        session.rebuild_prompt(resolved.prompt_note);
+        session.rebuild_prompt(resolved.prompt_note, today());
 
         let resume = {
             let mut log = session.hooks.log.lock().await;
@@ -809,11 +814,11 @@ impl Session {
         Ok(None)
     }
 
-    /// Rebuilds the prompt sections for `note` unless it is unchanged; returns the system
-    /// message announcing the change (every section on the first build).
-    fn rebuild_prompt(&self, note: Option<String>) -> Option<SystemMessage> {
+    /// Rebuilds the prompt sections unless `note` and `date` are unchanged; returns the
+    /// system message announcing the change (every section on the first build).
+    fn rebuild_prompt(&self, note: Option<String>, date: String) -> Option<SystemMessage> {
         let mut state = self.prompt.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.note.as_ref() == Some(&note) {
+        if state.sections.is_some() && state.note == note && state.date == date {
             return None;
         }
         let (sections, diagnostics) = build_sections(&PromptInputs {
@@ -824,7 +829,8 @@ impl Session {
             tools: &self.tools,
             context_files: &self.context_files,
             skills: &self.skills,
-            prompt_note: note.as_deref(),
+            dev_shell: note.as_deref(),
+            date: &date,
             host_sections: &self.host_sections,
         });
         for diagnostic in &diagnostics {
@@ -832,10 +838,21 @@ impl Session {
         }
         let message = system_message(state.sections.as_ref(), &sections);
         *state = PromptState {
-            note: Some(note),
+            note,
+            date,
             sections: Some(sections),
         };
         message
+    }
+
+    fn refresh_prompt(&self, note: Option<String>) {
+        if let Some(message) = self.rebuild_prompt(note, today()) {
+            self.hooks
+                .system
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(AgentMessage::Llm(Message::System(message)));
+        }
     }
 
     /// The session file. With lazy creation it exists only after the first submission.
@@ -881,6 +898,13 @@ impl Session {
             self.hooks.running.send_replace(true);
             submitted
         };
+        let note = self
+            .prompt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .note
+            .clone();
+        self.refresh_prompt(note);
         let mut messages = self.hooks.take_system();
         messages.push(message);
         // Spawned so that dropping this future leaves the run to settle on its own.
@@ -1177,20 +1201,14 @@ impl Session {
     }
 
     /// Drops the cached project environment and resolves it again now. When its prompt
-    /// note changed, the prompt diff reaches the model before its next request.
+    /// note or the date changed, the prompt diff reaches the model before its next request.
     pub async fn reload_exec_env(&self) {
         self.exec.invalidate();
         let resolved = self
             .exec
             .resolve(&self.cwd, &CancellationToken::new(), &|_| {})
             .await;
-        if let Some(message) = self.rebuild_prompt(resolved.prompt_note) {
-            self.hooks
-                .system
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(AgentMessage::Llm(Message::System(message)));
-        }
+        self.refresh_prompt(resolved.prompt_note);
     }
 }
 
