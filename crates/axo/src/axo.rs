@@ -1,16 +1,20 @@
-//! The process-wide entry point: directory, settings, models and the host environment.
+//! The process-wide entry point: directory, settings, models, the session store and the
+//! host environment.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo_ai::thinking::clamp_level;
-use axo_ai::{FileCredentialStore, Models, ModelsOptions};
+use axo_ai::{FileCredentialStore, Models, ModelsOptions, Streamer};
 
 use crate::config::{self, AxoDir, DevShellMode, Settings};
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::{EnvMap, ExecEnv, HostEnv};
-use crate::session::{Session, SessionOptions, SessionSetup};
+use crate::session::{RecoveryPolicy, Session, SessionOptions, SessionSetup};
+use crate::store::{
+    Header, JsonlStore, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
+};
 
 pub struct Axo {
     dir: AxoDir,
@@ -19,17 +23,22 @@ pub struct Axo {
     /// reload it merged with their project's settings.
     settings_from_dir: bool,
     models: Arc<Models>,
+    /// What sessions stream through: `models` unless the builder overrode it.
+    streamer: Arc<dyn Streamer>,
+    store: Arc<dyn SessionStore>,
     /// Host environment snapshot taken at `build`.
     base_env: Arc<EnvMap>,
 }
 
-/// Unset parts load from the axo directory: `settings.jsonc`, `models.jsonc`, `auth.json`
-/// and the catalog cache in `cache/`.
+/// Unset parts load from the axo directory: `settings.jsonc`, `models.jsonc`, `auth.json`,
+/// the catalog cache in `cache/` and the session store in `sessions/`.
 #[derive(Default)]
 pub struct AxoBuilder {
     dir: Option<PathBuf>,
     settings: Option<Settings>,
     models: Option<Arc<Models>>,
+    streamer: Option<Arc<dyn Streamer>>,
+    store: Option<Arc<dyn SessionStore>>,
 }
 
 impl AxoBuilder {
@@ -47,6 +56,19 @@ impl AxoBuilder {
 
     pub fn models(mut self, models: Arc<Models>) -> Self {
         self.models = Some(models);
+        self
+    }
+
+    /// Streams every session's requests through `streamer` instead of `Models`; models
+    /// are still looked up in `Models`. For tests (e.g. `axo_ai::ScriptedApi`).
+    pub fn streamer(mut self, streamer: Arc<dyn Streamer>) -> Self {
+        self.streamer = Some(streamer);
+        self
+    }
+
+    /// Defaults to a [`JsonlStore`] rooted at `<AXO_DIR>/sessions`.
+    pub fn store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -71,11 +93,21 @@ impl AxoBuilder {
                 .await?,
             ),
         };
+        let streamer: Arc<dyn Streamer> = match self.streamer {
+            Some(streamer) => streamer,
+            None => models.clone(),
+        };
+        let store: Arc<dyn SessionStore> = match self.store {
+            Some(store) => store,
+            None => Arc::new(JsonlStore::new(dir.sessions_dir())),
+        };
         Ok(Axo {
             dir,
             settings,
             settings_from_dir,
             models,
+            streamer,
+            store,
             base_env: HostEnv::snapshot().0,
         })
     }
@@ -99,9 +131,72 @@ impl Axo {
     }
 
     /// Resolves the model, thinking level, exec environment, tools and system prompt, and
-    /// returns an idle session. Resolving the exec environment may capture a Nix dev
-    /// shell, which can take minutes on a cold cache.
+    /// returns an idle session. Its file is created on the first submission. Resolving
+    /// the exec environment may capture a Nix dev shell, which can take minutes on a
+    /// cold cache.
     pub async fn create_session(&self, options: SessionOptions) -> Result<Session, Error> {
+        let header = Header::new(options.cwd.clone(), None, None);
+        let session_id = header.id.clone();
+        let writer = self.store.create(header).await?;
+        self.start(
+            options,
+            session_id,
+            writer,
+            Vec::new(),
+            Projection::default(),
+            None,
+        )
+        .await
+    }
+
+    /// Opens a saved session for writing (`Error::SessionBusy` while another writer holds
+    /// it) in the cwd it was started in. The transcript, model and thinking level come
+    /// from the session; `options.model`/`thinking` override them. A run left unfinished
+    /// is handled per `options.recovery`; a resumed run continues in the background, so
+    /// this returns right away (watch for its `run_end` via `Session::attach`).
+    pub async fn open_session(
+        &self,
+        path: &Path,
+        options: SessionOptions,
+    ) -> Result<Session, Error> {
+        let (header, entries, writer) = self.store.open_write(path).await?;
+        let projection = project(&entries, None);
+        let recovery = options.recovery;
+        self.start(
+            SessionOptions {
+                cwd: header.cwd,
+                ..options
+            },
+            header.id,
+            writer,
+            entries,
+            projection,
+            Some(recovery),
+        )
+        .await
+    }
+
+    /// Reads a saved session without locking it.
+    pub async fn open_session_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error> {
+        self.store.open_read(path).await
+    }
+
+    /// Sessions started in `cwd`, most recently modified first.
+    pub async fn list_sessions(&self, cwd: &Path) -> Result<Vec<SessionInfo>, Error> {
+        self.store.list(cwd).await
+    }
+
+    /// Resolves settings, model, thinking level and exec environment for a session over
+    /// `entries` and starts it.
+    async fn start(
+        &self,
+        options: SessionOptions,
+        session_id: String,
+        writer: Box<dyn SessionWriter>,
+        entries: Vec<SeqEntry>,
+        projection: Projection,
+        recovery: Option<RecoveryPolicy>,
+    ) -> Result<Session, Error> {
         let SessionOptions {
             cwd,
             model,
@@ -110,6 +205,7 @@ impl Axo {
             project_resources,
             exec_env,
             sections,
+            recovery: _,
         } = options;
 
         let settings = if project_resources && self.settings_from_dir {
@@ -119,6 +215,7 @@ impl Axo {
         };
 
         let selector = model
+            .or_else(|| projection.model.clone())
             .or_else(|| settings.default_model.clone())
             .ok_or(Error::NoModel)?;
         let model = self
@@ -126,7 +223,12 @@ impl Axo {
             .find(&selector)
             .ok_or(Error::ModelNotFound(selector))?
             .clone();
-        let thinking = clamp_level(&model, thinking.unwrap_or(settings.default_thinking_level));
+        let thinking = clamp_level(
+            &model,
+            thinking
+                .or(projection.thinking)
+                .unwrap_or(settings.default_thinking_level),
+        );
 
         let exec: Arc<dyn ExecEnv> = match exec_env {
             Some(exec) => exec,
@@ -142,13 +244,19 @@ impl Axo {
             dir: self.dir.clone(),
             cwd,
             settings,
-            streamer: self.models.clone(),
+            streamer: self.streamer.clone(),
             model,
             thinking,
             exec,
             ask_enabled,
             project_resources,
             host_sections: sections,
+            store: self.store.clone(),
+            session_id,
+            writer,
+            entries,
+            projection,
+            recovery,
         })
         .await
     }

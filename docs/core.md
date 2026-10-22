@@ -159,8 +159,9 @@ trait Tool: Send + Sync {
     fn replay(&self) -> Replay { Replay::Never }    // may it run again after a crash? See Durability
     fn prompt_snippet(&self) -> Option<&str> { None }
     fn prompt_guidelines(&self) -> &[&str] { &[] }
-    async fn execute(&self, call: ToolCall, cx: &ToolContext, cancel: CancellationToken,
-                     updates: &dyn Fn(ToolUpdate)) -> Result<ToolOutput, ToolError>;
+    // No ToolContext: each tool holds its session's shared state (`Arc<SessionTools>`).
+    async fn execute(&self, call: &ToolCall, cancel: CancellationToken,
+                     updates: &(dyn Fn(ToolUpdate) + Send + Sync)) -> Result<ToolOutput, ToolError>;
 }
 struct ToolOutput { content: Vec<UserBlock>, details: Option<Value>, is_error: bool, terminate: bool }
 ```
@@ -270,7 +271,7 @@ axo is built for an always-on host from the start: sworm-server keeps sessions r
 - **Durable prompts.** Prompts, steers and follow-ups are saved as `submission` entries before they are queued, so a restart doesn't lose them. A submission may carry a `request_id`; submitting the same id twice returns the first submission. That stops a trigger that fires both before and after a restart from running twice.
 - **One writer.** Opening a session for writing takes an OS file lock (`File::try_lock`), released automatically if the process dies. A second writer gets `SessionBusy`. Read-only opens don't lock.
 - **Catching up.** Every entry has a sequence number, its position in the file. `session.attach(from)` returns the entries a client missed since `from`, a snapshot of the run in progress (the partial reply, running tools, any pending `ask` question, the queue), and a live event receiver. This is also what a lagging receiver uses to resync, and it maps directly onto ACP's `session/load`.
-- **bash after a crash.** Commands get `PR_SET_PDEATHSIG` so they die with the server, and their full output is spooled under the session directory rather than `/tmp`, so an interrupted result can point to it.
+- **bash after a crash.** Each command's process group has a small guard process holding a pipe from the server; when the server dies, the pipe closes and the guard kills the whole group. (`PR_SET_PDEATHSIG` alone is not enough: bash forks non-final commands, and the death signal is cleared across fork.) Full output is spooled under the session directory rather than `/tmp`, so an interrupted result can point to it.
 - **Deferred:** saving partial replies while they stream (a crash simply re-sends the request), durable timers and schedules (those belong to Sworm), and locks shared across machines.
 
 The estimated cost is 1.0–1.6k lines of Rust, spread over M2 (`replay`, cancel reasons, `continue_run`, the split event delivery) and M4 (the entries, recovery, the lock, the cursor and `attach`). Subagents later reuse the same rules: a child session is linked to the tool call that started it, so a resumed parent finds its child instead of starting a second one.

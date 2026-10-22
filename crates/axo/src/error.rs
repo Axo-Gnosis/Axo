@@ -30,4 +30,10 @@ pub enum Error {
     /// `answer`/`dismiss` named a tool call with no pending question.
     #[error("No pending question for tool call: {0}")]
     NoPendingQuestion(String),
+    /// Another writer holds the session's lock.
+    #[error("Session is open in another process: {}", path.display())]
+    SessionBusy { path: PathBuf },
+    /// `navigate`/`fork` named an entry id the session does not have.
+    #[error("Entry not found: {0}")]
+    EntryNotFound(String),
 }

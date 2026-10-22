@@ -4,11 +4,12 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -37,10 +38,51 @@ pub struct ProcessGroup {
     pub child: Child,
     pub pgid: Pid,
     armed: bool,
+    /// Kills the group if axo dies; `None` when it could not be spawned.
+    guard: Option<Guard>,
+}
+
+/// `sh -c 'read _; kill -KILL -- -<pgid>'` with its stdin piped from axo. If axo dies
+/// (even `kill -9`) the kernel closes the pipe, `read` hits EOF and the guard kills the
+/// group. PDEATHSIG cannot do this: bash forks every non-final command of a script and
+/// the death signal is cleared across fork, so `sleep 20; echo` would outlive axo.
+struct Guard {
+    child: Child,
+    /// Held open for the call; closing it fires the guard.
+    _stdin: ChildStdin,
+}
+
+impl Guard {
+    fn spawn(pgid: Pid) -> io::Result<Self> {
+        let mut child = Command::new("sh")
+            .args(["-c", r#"read _; kill -KILL -- -"$0""#])
+            .arg(pgid.as_raw_nonzero().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("guard has no stdin"))?;
+        Ok(Self {
+            child,
+            _stdin: stdin,
+        })
+    }
+
+    /// SIGKILLs the guard before its pipe closes, so it never reaches its `kill`
+    /// (a SIGKILLed process runs no further user code). Dropping the tokio `Child`
+    /// leaves the zombie to tokio's orphan reaper.
+    fn disarm(mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.try_wait();
+    }
 }
 
 impl ProcessGroup {
-    /// Spawns `command` as the leader of a new process group.
+    /// Spawns `command` as the leader of a new process group, plus its guard (which
+    /// stays in axo's own process group).
     pub fn spawn(mut command: Command) -> io::Result<Self> {
         command.process_group(0);
         let child = command.spawn()?;
@@ -49,10 +91,14 @@ impl ProcessGroup {
             .and_then(|id| i32::try_from(id).ok())
             .and_then(Pid::from_raw)
             .ok_or_else(|| io::Error::other("spawned process has no pid"))?;
+        let guard = Guard::spawn(pgid)
+            .inspect_err(|err| tracing::warn!(%err, "cannot spawn the process-group guard"))
+            .ok();
         Ok(Self {
             child,
             pgid,
             armed: true,
+            guard,
         })
     }
 
@@ -60,6 +106,9 @@ impl ProcessGroup {
     /// keep running, as in pi).
     pub fn release(&mut self) {
         self.armed = false;
+        if let Some(guard) = self.guard.take() {
+            guard.disarm();
+        }
     }
 
     /// Takes the child's piped stdout and stderr and forwards their chunks, interleaved
@@ -80,6 +129,9 @@ impl ProcessGroup {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.disarm();
+        }
         if self.armed {
             let _ = kill_process_group(self.pgid, Signal::KILL);
         }
