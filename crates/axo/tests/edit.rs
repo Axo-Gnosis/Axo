@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axo::context::files::NestedContext;
 use axo::tools::FileLedger;
 use axo::{PendingQuestions, SessionTools, StaticEnv};
 use axo_agent::{Tool, ToolUpdate};
@@ -31,6 +32,7 @@ impl Fixture {
             Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
             None,
             false,
+            NestedContext::disabled(),
         );
         Self {
             tools: axo::tools::builtin(&session, false),

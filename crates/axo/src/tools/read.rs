@@ -104,7 +104,7 @@ impl Tool for ReadTool {
         }
         let mut details = json!({ "ledger": self.tools.ledger.record(&absolute, &bytes) });
 
-        let content = if let Some(mime) =
+        let mut content = if let Some(mime) =
             detect_image_mime(&bytes[..bytes.len().min(IMAGE_SNIFF_BYTES)])
         {
             let processed = tokio::task::spawn_blocking(move || process_image(&bytes, mime))
@@ -197,6 +197,7 @@ impl Tool for ReadTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
+        content.extend(self.tools.context.attach(&absolute));
         Ok(ToolOutput {
             content,
             details: Some(details),

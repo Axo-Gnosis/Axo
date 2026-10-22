@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::OwnedMutexGuard;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::context::files::NestedContext;
 use crate::exec::ExecEnv;
 use ask::{AskTool, PendingQuestions};
 use bash::BashTool;
@@ -41,6 +42,8 @@ pub struct SessionTools {
     pub exec: Arc<dyn ExecEnv>,
     /// Content hashes of files this session has read or written (the stale-file guard).
     pub ledger: FileLedger,
+    /// Nested project instructions attached once to successful file tool results.
+    pub context: NestedContext,
     /// Where bash streams full command output (`<call_id>.log`).
     pub spool_dir: PathBuf,
     pub questions: Arc<PendingQuestions>,
@@ -58,11 +61,13 @@ impl SessionTools {
         questions: Arc<PendingQuestions>,
         ask_timeout: Option<Duration>,
         ci_env: bool,
+        context: NestedContext,
     ) -> Arc<SessionTools> {
         Arc::new(SessionTools {
             cwd,
             exec,
             ledger: FileLedger::default(),
+            context,
             spool_dir,
             questions,
             ask_timeout,
@@ -153,7 +158,7 @@ pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
 /// The key two paths to the same file share: the deepest existing ancestor canonicalized,
 /// with the missing tail re-appended, so a file not created yet keys the same through a
 /// symlinked parent. Falls back to the path itself when no ancestor resolves.
-fn file_key(path: &Path) -> PathBuf {
+pub(crate) fn file_key(path: &Path) -> PathBuf {
     path.ancestors()
         .find_map(|ancestor| {
             let canonical = std::fs::canonicalize(ancestor).ok()?;

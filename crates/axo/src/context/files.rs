@@ -1,9 +1,16 @@
 //! Context files (`AGENTS.md` and friends), per `docs/core.md` "Context files".
 
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+
+use axo_agent::AgentMessage;
+use axo_ai::{Message, UserBlock};
+use indexmap::IndexMap;
 
 use crate::config::AxoDir;
-use crate::context::{Diagnostic, git_root};
+use crate::context::{Diagnostic, project_root};
+use crate::tools::{FileLedger, file_key};
 
 /// One loaded context file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,62 +20,234 @@ pub struct ContextFile {
     pub content: String,
 }
 
-/// Per directory, the first existing one wins.
-const CANDIDATES: [&str; 4] = [
-    "AGENTS.override.md",
-    "AGENTS.md",
-    "CLAUDE.md",
-    ".agents/AGENTS.md",
-];
+impl ContextFile {
+    pub fn render(&self) -> String {
+        format!(
+            "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+            self.path.display(),
+            self.content
+        )
+    }
 
-/// Loads context files in prompt order. Per directory, the first existing file among
-/// `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, `.agents/AGENTS.md` wins. Order: the
-/// global `<AXO_DIR>` match first, then each directory from the git root (or `cwd` alone
-/// outside a repository) in towards `cwd`. With `project` false only the global
-/// file loads. Unreadable files become diagnostics. Blocking filesystem I/O.
+    fn parse(text: &str) -> Option<(PathBuf, &str)> {
+        let (path, content) = text
+            .strip_prefix("<project_instructions path=\"")?
+            .split_once("\">\n")?;
+        Some((
+            PathBuf::from(path),
+            content.strip_suffix("\n</project_instructions>")?,
+        ))
+    }
+}
+
+/// The enabled `contextFiles` names in load order, plus diagnostics for invalid keys.
+pub fn context_file_names(map: &IndexMap<String, bool>) -> (Vec<PathBuf>, Vec<Diagnostic>) {
+    let mut enabled = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (key, on) in map {
+        let path = Path::new(key);
+        // Components normalizes interior `.` segments, so check the spelling as well.
+        if key.is_empty()
+            || key.split(std::path::is_separator).any(|part| part == ".")
+            || !path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            diagnostics.push(Diagnostic {
+                path: None,
+                message: format!(
+                    "contextFiles key \"{key}\" ignored: must be a relative path without \"..\""
+                ),
+            });
+        } else if *on {
+            enabled.push(path.to_path_buf());
+        }
+    }
+    let bases: Vec<_> = enabled.iter().map(|name| tagged_base(name)).collect();
+    let mut names = Vec::with_capacity(enabled.len());
+    for (index, base) in bases.iter().enumerate() {
+        if !base.as_ref().is_some_and(|base| enabled.contains(base)) {
+            emit_name(index, &enabled, &bases, &mut names);
+        }
+    }
+    (names, diagnostics)
+}
+
+fn tagged_base(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_name()?.to_str()?.strip_suffix(".md")?;
+    let (base, tag) = stem.rsplit_once('.')?;
+    if tag.is_empty() {
+        return None;
+    }
+    Some(path.with_file_name(format!("{base}.md")))
+}
+
+fn emit_name(index: usize, enabled: &[PathBuf], bases: &[Option<PathBuf>], out: &mut Vec<PathBuf>) {
+    out.push(enabled[index].clone());
+    // Recurse so enabled multi-tag chains remain adjacent and are never dropped.
+    for (child, base) in bases.iter().enumerate() {
+        if base.as_ref() == Some(&enabled[index]) {
+            emit_name(child, enabled, bases, out);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct Seen {
+    paths: HashSet<PathBuf>,
+    hashes: HashSet<String>,
+}
+
+impl Seen {
+    fn admit(&mut self, path: &Path, content: &str) -> bool {
+        let path = file_key(path);
+        if self.paths.contains(&path) {
+            return false;
+        }
+        let hash = FileLedger::hash(content.as_bytes());
+        if self.hashes.contains(&hash) {
+            return false;
+        }
+        self.paths.insert(path);
+        self.hashes.insert(hash);
+        true
+    }
+}
+
+/// Loads global files, then files from the project root towards `cwd`, in name order.
+/// With `project` false only global files load. Blocking filesystem I/O; unreadable
+/// files become diagnostics. Canonical paths and BOM-stripped contents deduplicate.
 pub fn load_context_files(
     dir: &AxoDir,
     cwd: &Path,
     project: bool,
+    names: &[PathBuf],
 ) -> (Vec<ContextFile>, Vec<Diagnostic>) {
     let mut dirs = vec![dir.root().to_path_buf()];
     if project {
-        let mut project: Vec<PathBuf> = match git_root(cwd) {
-            Some(root) => cwd
-                .ancestors()
-                .take_while(|ancestor| ancestor.starts_with(&root))
-                .map(Path::to_path_buf)
-                .collect(),
-            None => vec![cwd.to_path_buf()],
-        };
-        project.reverse();
-        dirs.extend(project);
+        dirs.extend(
+            directories(&project_root(cwd), cwd)
+                .into_iter()
+                .map(Path::to_path_buf),
+        );
     }
-
-    let mut files: Vec<ContextFile> = Vec::new();
+    let mut seen = Seen::default();
+    let mut files = Vec::new();
     let mut diagnostics = Vec::new();
     for dir in dirs {
-        let Some(path) = CANDIDATES
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|path| path.is_file())
-        else {
-            continue;
-        };
-        // `<AXO_DIR>` can also sit on the project walk; load it once.
-        if files.iter().any(|file| file.path == path) {
-            continue;
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let content = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
-                files.push(ContextFile { path, content });
+        for name in names {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
             }
-            Err(error) => diagnostics.push(Diagnostic {
-                path: Some(path),
-                message: error.to_string(),
-            }),
+            match read_context_file(path) {
+                Ok(file) if seen.admit(&file.path, &file.content) => files.push(file),
+                Ok(_) => {}
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
         }
     }
     (files, diagnostics)
+}
+
+fn directories<'a>(root: &Path, dir: &'a Path) -> Vec<&'a Path> {
+    let mut dirs: Vec<_> = dir
+        .ancestors()
+        .take_while(|dir| dir.starts_with(root))
+        .collect();
+    dirs.reverse();
+    dirs
+}
+
+fn read_context_file(path: PathBuf) -> Result<ContextFile, Diagnostic> {
+    match std::fs::read_to_string(&path) {
+        Ok(mut content) => {
+            if content.starts_with('\u{feff}') {
+                content.replace_range(..'\u{feff}'.len_utf8(), "");
+            }
+            Ok(ContextFile { path, content })
+        }
+        Err(error) => Err(Diagnostic {
+            path: Some(path),
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// Context files outside the startup walk, attached to file-tool results on first touch.
+pub struct NestedContext {
+    root: Option<PathBuf>,
+    names: Vec<PathBuf>,
+    base: Seen,
+    seen: Mutex<Seen>,
+}
+
+impl NestedContext {
+    /// `root`: the project root, or `None` to disable. `startup`: system-prompt files.
+    pub fn new(root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) -> Self {
+        let mut base = Seen::default();
+        for file in startup {
+            base.admit(&file.path, &file.content);
+        }
+        Self {
+            root,
+            names,
+            seen: Mutex::new(base.clone()),
+            base,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(None, Vec::new(), &[])
+    }
+
+    /// Blocking filesystem I/O.
+    pub fn attach(&self, file: &Path) -> Vec<UserBlock> {
+        let Some(root) = self.root.as_ref().filter(|root| file.starts_with(root)) else {
+            return Vec::new();
+        };
+        let Some(parent) = file.parent() else {
+            return Vec::new();
+        };
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut blocks = Vec::new();
+        for dir in directories(root, parent) {
+            for name in &self.names {
+                let path = dir.join(name);
+                if !path.is_file() {
+                    continue;
+                }
+                match read_context_file(path) {
+                    Ok(file) if seen.admit(&file.path, &file.content) => {
+                        blocks.push(UserBlock::Text {
+                            text: file.render(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(diagnostic) => {
+                        tracing::warn!(path = ?diagnostic.path, message = %diagnostic.message, "cannot read nested context file");
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    /// Resets to startup files plus every context block in the current tool results.
+    pub fn restore(&self, messages: &[AgentMessage]) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.clone_from(&self.base);
+        for message in messages {
+            let AgentMessage::Llm(Message::ToolResult(result)) = message else {
+                continue;
+            };
+            for block in &result.content {
+                if let UserBlock::Text { text } = block
+                    && let Some((path, content)) = ContextFile::parse(text)
+                {
+                    seen.admit(&path, content);
+                }
+            }
+        }
+    }
 }

@@ -180,10 +180,12 @@ impl Tool for EditTool {
             .context_radius(CONTEXT_LINES)
             .header(&path, &path)
             .to_string();
+        let mut content = vec![UserBlock::Text {
+            text: format!("Successfully replaced {block_count} block(s) in {path}."),
+        }];
+        content.extend(self.tools.context.attach(&absolute));
         Ok(ToolOutput {
-            content: vec![UserBlock::Text {
-                text: format!("Successfully replaced {block_count} block(s) in {path}."),
-            }],
+            content,
             details: Some(json!({
                 "diff": display,
                 "patch": patch,

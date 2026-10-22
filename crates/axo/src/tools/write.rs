@@ -114,10 +114,12 @@ impl Tool for WriteTool {
             return Err(error);
         }
 
+        let mut content = vec![UserBlock::Text {
+            text: format!("Successfully wrote to {path}"),
+        }];
+        content.extend(self.tools.context.attach(&absolute));
         Ok(ToolOutput {
-            content: vec![UserBlock::Text {
-                text: format!("Successfully wrote to {path}"),
-            }],
+            content,
             details: Some(json!({ "ledger": ledger })),
             ..ToolOutput::default()
         })

@@ -6,7 +6,7 @@ use axo_agent::QueueMode;
 use axo_ai::{ModelsConfig, ThinkingLevel};
 use indexmap::IndexMap;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::Error;
 
@@ -77,6 +77,8 @@ pub struct Settings {
     pub extended_context: bool,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
+    pub context_files: IndexMap<String, bool>,
+    pub nested_context_files: bool,
     pub bash: BashSettings,
     pub ask: AskSettings,
     pub project: ProjectSettings,
@@ -90,11 +92,26 @@ impl Default for Settings {
             extended_context: false,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
+            context_files: default_context_files(),
+            nested_context_files: true,
             bash: BashSettings::default(),
             ask: AskSettings::default(),
             project: ProjectSettings::default(),
         }
     }
+}
+
+fn default_context_files() -> IndexMap<String, bool> {
+    [
+        "AGENTS.md",
+        "AGENTS.local.md",
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        ".agents/AGENTS.md",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), true))
+    .collect()
 }
 
 /// What projects may contribute. Read from user settings only.
@@ -220,7 +237,7 @@ impl Settings {
         const USER_ONLY_KEYS: &[&str] = &["project", "extendedContext"];
 
         let mut path = dir.settings_path();
-        let mut merged = Value::Object(Default::default());
+        let mut merged = json!({ "contextFiles": default_context_files() });
         if let Some(user) = read_settings_value(&path)? {
             deep_merge(&mut merged, user);
         }

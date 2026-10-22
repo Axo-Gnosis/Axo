@@ -21,7 +21,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::{AxoDir, ProjectAccess, Settings};
-use crate::context::files::{ContextFile, load_context_files};
+use crate::context::files::{ContextFile, NestedContext, context_file_names, load_context_files};
+use crate::context::project_root;
 use crate::context::prompt::{PromptInputs, Sections, build_sections, system_message};
 use crate::context::skills::{Skill, expand_skill_command, load_skills};
 use crate::error::Error;
@@ -516,6 +517,24 @@ impl Session {
         let spool_dir = path.with_extension("").join("bash");
         let (events, _) = broadcast::channel(1024);
         let questions = Arc::new(PendingQuestions::new(events.clone()));
+        let project = project_access != ProjectAccess::Ignore;
+        let (names, name_diagnostics) = context_file_names(&settings.context_files);
+        let (context_files, file_diagnostics) = load_context_files(&dir, &cwd, project, &names);
+        let context = NestedContext::new(
+            (project && settings.nested_context_files).then(|| project_root(&cwd)),
+            names,
+            &context_files,
+        );
+        let (skills, skill_diagnostics) =
+            load_skills(&dir, &cwd, project && settings.project.files.skills);
+        for diagnostic in name_diagnostics
+            .iter()
+            .chain(&file_diagnostics)
+            .chain(&skill_diagnostics)
+        {
+            warn!("{diagnostic}");
+        }
+
         let session_tools = SessionTools::new(
             cwd.clone(),
             exec.clone(),
@@ -523,16 +542,9 @@ impl Session {
             questions.clone(),
             settings.ask.timeout_ms.map(Duration::from_millis),
             settings.bash.ci,
+            context,
         );
         let tools = tools::builtin(&session_tools, ask_enabled);
-
-        let project = project_access != ProjectAccess::Ignore;
-        let (context_files, file_diagnostics) = load_context_files(&dir, &cwd, project);
-        let (skills, skill_diagnostics) =
-            load_skills(&dir, &cwd, project && settings.project.files.skills);
-        for diagnostic in file_diagnostics.iter().chain(&skill_diagnostics) {
-            warn!("{diagnostic}");
-        }
 
         let ids = entries
             .iter()
@@ -614,6 +626,7 @@ impl Session {
             };
             // After recovery's results, so a replayed `write` finds the file it saw.
             session.tool_state.ledger.restore(&messages);
+            session.tool_state.context.restore(&messages);
             session.agent.set_messages(messages);
             resume
         };
@@ -1084,6 +1097,7 @@ impl Session {
         let mut messages = projection.messages;
         self.sync_prompt(&mut log, &mut messages).await?;
         self.tool_state.ledger.restore(&messages);
+        self.tool_state.context.restore(&messages);
         self.agent.set_messages(messages);
         Ok(())
     }

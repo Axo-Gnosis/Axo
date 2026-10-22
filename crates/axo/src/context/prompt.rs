@@ -81,13 +81,7 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
         let parts: Vec<String> = inputs
             .context_files
             .iter()
-            .map(|file| {
-                format!(
-                    "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-                    file.path.display(),
-                    file.content
-                )
-            })
+            .map(ContextFile::render)
             .collect();
         bodies.insert("project_context".into(), parts.join("\n\n"));
     }
