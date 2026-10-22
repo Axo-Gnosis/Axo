@@ -15,7 +15,7 @@ use axo_ai::{
     Accumulator, Message, Model, Streamer, SystemMessage, ThinkingLevel, ToolCall,
     ToolResultMessage, UserBlock, UserMessage, now_ms,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
@@ -172,6 +172,8 @@ pub(crate) struct SessionSetup {
 pub struct Session {
     agent: Arc<Agent>,
     hooks: Arc<SessionHooks>,
+    /// The tools' shared state; its read record follows the current branch.
+    tool_state: Arc<SessionTools>,
     questions: Arc<PendingQuestions>,
     exec: Arc<dyn ExecEnv>,
     /// The session file (created lazily on the first submission).
@@ -209,6 +211,9 @@ struct SessionHooks {
     /// Every append, and every event relay, happens under this lock, so `attach` sees one
     /// consistent point.
     log: tokio::sync::Mutex<Log>,
+    /// A run is active or about to start; guards against a second one. Changed only
+    /// while holding the log lock.
+    running: watch::Sender<bool>,
 }
 
 struct Log {
@@ -217,8 +222,6 @@ struct Log {
     ids: HashSet<String>,
     model: Model,
     thinking: ThinkingLevel,
-    /// A run is active or about to start; guards against a second one.
-    running: bool,
     /// The open run's id, set by its `run_start` (or by recovery).
     run_id: Option<String>,
     /// Submitted user messages not yet saved as `message` entries, with their
@@ -241,6 +244,57 @@ impl Log {
             .map(|id| EntryId(id.to_owned()));
         EntryBase::new(EntryId::generate(|id| self.ids.contains(id)), parent)
     }
+}
+
+/// What `Session::start` runs after recovery.
+enum Resumption {
+    /// Continue the open run; requeued input goes through the agent's queues.
+    Continue(Vec<(SubmissionKind, AgentMessage)>),
+    /// No run was open: queue steers and follow-ups, and start a run with the prompts.
+    Requeue(Vec<(SubmissionKind, AgentMessage)>),
+}
+
+/// How `run_to_settle` starts its run.
+enum RunRequest {
+    Prompt(Vec<AgentMessage>),
+    Continue,
+}
+
+/// The user messages of requeued `submission` entries, registered in `log.pending` so
+/// their `message` entries carry the submission ids.
+fn requeued(log: &mut Log, requeue: Vec<SeqEntry>) -> Vec<(SubmissionKind, AgentMessage)> {
+    let mut queued = Vec::new();
+    for seq in requeue {
+        if let Entry::Submission {
+            submission_id,
+            kind,
+            content,
+            ..
+        } = seq.entry
+        {
+            let message = AgentMessage::Llm(Message::User(UserMessage {
+                content,
+                timestamp: now_ms(),
+            }));
+            log.pending.push((message.clone(), submission_id));
+            queued.push((kind, message));
+        }
+    }
+    queued
+}
+
+/// Runs `request` and settles it. Callers spawn it, so the run ends (and `run_end` is
+/// written) even when nobody awaits the result.
+async fn run_to_settle(
+    agent: Arc<Agent>,
+    hooks: Arc<SessionHooks>,
+    request: RunRequest,
+) -> Result<RunOutcome, Error> {
+    let result = match request {
+        RunRequest::Prompt(messages) => agent.prompt(messages).await,
+        RunRequest::Continue => agent.continue_run().await,
+    };
+    hooks.settle(result).await
 }
 
 impl SessionHooks {
@@ -266,7 +320,7 @@ impl SessionHooks {
         result: Result<RunOutcome, axo_agent::Error>,
     ) -> Result<RunOutcome, Error> {
         let mut log = self.log.lock().await;
-        log.running = false;
+        self.running.send_replace(false);
         log.streaming = None;
         log.tool_calls.clear();
         if let Some(run_id) = log.run_id.take() {
@@ -297,19 +351,48 @@ impl SessionHooks {
         }
         result.map_err(Error::Agent)
     }
+
+    /// Appends `model_change` / `thinking_level_change` when the current branch records a
+    /// different selection than the live one in `log` (pi `_recordSelection`), so reopening
+    /// restores what is live.
+    async fn record_selection(
+        &self,
+        log: &mut Log,
+        model: Option<&str>,
+        thinking: Option<ThinkingLevel>,
+    ) -> Result<(), Error> {
+        if model != Some(format!("{}/{}", log.model.provider, log.model.id).as_str()) {
+            let base = log.next_base();
+            let entry = Entry::ModelChange {
+                base,
+                provider: log.model.provider.clone(),
+                model_id: log.model.id.clone(),
+            };
+            self.write(log, entry).await?;
+        }
+        if thinking != Some(log.thinking) {
+            let base = log.next_base();
+            let entry = Entry::ThinkingLevelChange {
+                base,
+                thinking_level: log.thinking,
+            };
+            self.write(log, entry).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl LoopHooks for SessionHooks {
     /// pi `convertToLlm` (`messages.ts:150-196`): a custom message reaches the model as a
     /// user message with its content.
-    fn convert_to_llm(&self, messages: &[AgentMessage]) -> Vec<Message> {
+    fn convert_to_llm(&self, messages: Vec<AgentMessage>) -> Vec<Message> {
         messages
-            .iter()
+            .into_iter()
             .map(|message| match message {
-                AgentMessage::Llm(message) => message.clone(),
+                AgentMessage::Llm(message) => message,
                 AgentMessage::Custom(custom) => Message::User(UserMessage {
-                    content: custom.content.clone(),
+                    content: custom.content,
                     timestamp: custom.timestamp,
                 }),
             })
@@ -401,8 +484,9 @@ impl Persist for SessionHooks {
 
 impl Session {
     /// Builds the tools, loads context files and skills, resolves the exec environment
-    /// once for its prompt note, restores the transcript, records model, thinking and
-    /// prompt changes, and runs recovery. A resumed run continues in a spawned task.
+    /// once for its prompt note, restores the transcript and the read record, records
+    /// model, thinking and prompt changes, and runs recovery. A resumed run, or requeued
+    /// prompts, run in a spawned task.
     pub(crate) async fn start(setup: SessionSetup) -> Result<Session, Error> {
         let SessionSetup {
             dir,
@@ -443,9 +527,6 @@ impl Session {
             warn!("{diagnostic}");
         }
 
-        let model_changed = projection.model.as_deref()
-            != Some(format!("{}/{}", model.provider, model.id).as_str());
-        let thinking_changed = projection.thinking != Some(thinking);
         let ids = entries
             .iter()
             .filter_map(|entry| entry.entry.id())
@@ -460,12 +541,12 @@ impl Session {
                 ids,
                 model: model.clone(),
                 thinking,
-                running: false,
                 run_id: None,
                 pending: Vec::new(),
                 streaming: None,
                 tool_calls: Vec::new(),
             }),
+            running: watch::channel(false).0,
         });
         let agent = Arc::new(Agent::new(AgentConfig {
             thinking,
@@ -475,12 +556,13 @@ impl Session {
             steering_mode: settings.steering_mode,
             follow_up_mode: settings.follow_up_mode,
             session_id: Some(session_id),
-            ..AgentConfig::new(streamer.clone(), model.clone())
+            ..AgentConfig::new(streamer.clone(), model)
         }));
 
         let session = Session {
             agent,
             hooks,
+            tool_state: session_tools,
             questions,
             exec,
             path,
@@ -506,26 +588,13 @@ impl Session {
             .await;
         session.rebuild_prompt(resolved.prompt_note);
 
-        let mut messages = projection.messages;
         let resume = {
             let mut log = session.hooks.log.lock().await;
-            if model_changed {
-                let base = log.next_base();
-                let entry = Entry::ModelChange {
-                    base,
-                    provider: model.provider.clone(),
-                    model_id: model.id.clone(),
-                };
-                session.hooks.write(&mut log, entry).await?;
-            }
-            if thinking_changed {
-                let base = log.next_base();
-                let entry = Entry::ThinkingLevelChange {
-                    base,
-                    thinking_level: thinking,
-                };
-                session.hooks.write(&mut log, entry).await?;
-            }
+            session
+                .hooks
+                .record_selection(&mut log, projection.model.as_deref(), projection.thinking)
+                .await?;
+            let mut messages = projection.messages;
             session.sync_prompt(&mut log, &mut messages).await?;
             let resume = match recovery {
                 Some(policy) => {
@@ -535,33 +604,51 @@ impl Session {
                 }
                 None => None,
             };
+            // After recovery's results, so a replayed `write` finds the file it saw.
+            session.tool_state.ledger.restore(&messages);
             session.agent.set_messages(messages);
             resume
         };
 
-        if let Some(queued) = resume {
-            let agent = session.agent.clone();
-            let hooks = session.hooks.clone();
-            let has_turns = agent
-                .messages()
-                .iter()
-                .any(|message| !matches!(message, AgentMessage::Llm(Message::System(_))));
-            // With no turn to continue, the requeued input starts the run instead.
-            let mut first = Vec::new();
-            for (kind, message) in queued {
-                match kind {
-                    _ if !has_turns => first.push(message),
-                    SubmissionKind::FollowUp => agent.follow_up(message),
-                    SubmissionKind::Prompt | SubmissionKind::Steer => agent.steer(message),
+        let agent = &session.agent;
+        let request = match resume {
+            None => None,
+            Some(Resumption::Continue(queued)) => {
+                let has_turns = agent
+                    .messages()
+                    .iter()
+                    .any(|message| !matches!(message, AgentMessage::Llm(Message::System(_))));
+                // With no turn to continue, the requeued input starts the run instead.
+                let mut first = Vec::new();
+                for (kind, message) in queued {
+                    match kind {
+                        _ if !has_turns => first.push(message),
+                        SubmissionKind::FollowUp => agent.follow_up(message),
+                        SubmissionKind::Prompt | SubmissionKind::Steer => agent.steer(message),
+                    }
                 }
-            }
-            tokio::spawn(async move {
-                let result = if first.is_empty() {
-                    agent.continue_run().await
+                Some(if first.is_empty() {
+                    RunRequest::Continue
                 } else {
-                    agent.prompt(first).await
-                };
-                if let Err(err) = hooks.settle(result).await {
+                    RunRequest::Prompt(first)
+                })
+            }
+            Some(Resumption::Requeue(queued)) => {
+                let mut prompts = Vec::new();
+                for (kind, message) in queued {
+                    match kind {
+                        SubmissionKind::Prompt => prompts.push(message),
+                        SubmissionKind::Steer => agent.steer(message),
+                        SubmissionKind::FollowUp => agent.follow_up(message),
+                    }
+                }
+                (!prompts.is_empty()).then_some(RunRequest::Prompt(prompts))
+            }
+        };
+        if let Some(request) = request {
+            let run = run_to_settle(session.agent.clone(), session.hooks.clone(), request);
+            tokio::spawn(async move {
+                if let Err(err) = run.await {
                     warn!(%err, "resumed run failed");
                 }
             });
@@ -617,14 +704,15 @@ impl Session {
         Ok(())
     }
 
-    /// Acts on the recovery plan; returns the requeued input when the run resumes.
+    /// Acts on the recovery plan; returns what to run when a run resumes or requeued
+    /// input is left.
     async fn recover(
         &self,
         log: &mut Log,
         policy: RecoveryPolicy,
         spool_dir: &Path,
         messages: &mut Vec<AgentMessage>,
-    ) -> Result<Option<Vec<(SubmissionKind, AgentMessage)>>, Error> {
+    ) -> Result<Option<Resumption>, Error> {
         let replay_of = |name: &str| {
             self.tools
                 .iter()
@@ -633,6 +721,19 @@ impl Session {
         };
         let (run_id, outcome, reason) = match plan_recovery(&log.entries, &replay_of, spool_dir) {
             RecoveryPlan::None => return Ok(None),
+            RecoveryPlan::Requeue { requeue } => {
+                if policy == RecoveryPolicy::MarkInterrupted {
+                    return Ok(None);
+                }
+                let queued = requeued(log, requeue);
+                if queued
+                    .iter()
+                    .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt))
+                {
+                    self.hooks.running.send_replace(true);
+                }
+                return Ok(Some(Resumption::Requeue(queued)));
+            }
             RecoveryPlan::Finish { run_id } => (run_id, store::RunOutcome::Done, None),
             RecoveryPlan::Park { run_id } => (
                 run_id,
@@ -689,25 +790,8 @@ impl Session {
                     };
                     self.hooks.write(log, entry).await?;
                     log.run_id = Some(run_id);
-                    log.running = true;
-                    let mut queued = Vec::new();
-                    for seq in requeue {
-                        if let Entry::Submission {
-                            submission_id,
-                            kind,
-                            content,
-                            ..
-                        } = seq.entry
-                        {
-                            let message = AgentMessage::Llm(Message::User(UserMessage {
-                                content,
-                                timestamp: now_ms(),
-                            }));
-                            log.pending.push((message.clone(), submission_id));
-                            queued.push((kind, message));
-                        }
-                    }
-                    return Ok(Some(queued));
+                    self.hooks.running.send_replace(true);
+                    return Ok(Some(Resumption::Continue(requeued(log, requeue))));
                 }
             }
         };
@@ -784,19 +868,27 @@ impl Session {
             {
                 return Ok(PromptResult::Duplicate(existing.clone()));
             }
-            if log.running {
+            if *self.hooks.running.borrow() {
                 return Err(Error::Busy);
             }
             let submitted = self
                 .submit(&mut log, SubmissionKind::Prompt, text, request.request_id)
                 .await?;
-            log.running = true;
+            self.hooks.running.send_replace(true);
             submitted
         };
         let mut messages = self.hooks.take_system();
         messages.push(message);
-        let result = self.agent.prompt(messages).await;
-        let outcome = self.hooks.settle(result).await?;
+        // Spawned so that dropping this future leaves the run to settle on its own.
+        let run = tokio::spawn(run_to_settle(
+            self.agent.clone(),
+            self.hooks.clone(),
+            RunRequest::Prompt(messages),
+        ));
+        let outcome = match run.await {
+            Ok(result) => result?,
+            Err(join) => std::panic::resume_unwind(join.into_panic()),
+        };
         Ok(PromptResult::Settled {
             submission,
             outcome,
@@ -856,6 +948,19 @@ impl Session {
         self.agent.cancel(CancelReason::User);
     }
 
+    /// Stops the session as a host does before exiting: the active run, and any run started
+    /// later, is cancelled with `CancelReason::Shutdown`, so nothing is recorded as aborted
+    /// and the run resumes when the session is next opened. Returns once the run settled.
+    pub async fn shutdown(&self) {
+        self.agent.shutdown();
+        let _ = self
+            .hooks
+            .running
+            .subscribe()
+            .wait_for(|running| !*running)
+            .await;
+    }
+
     /// Switches the model from the next request; the thinking level is clamped to it.
     pub async fn set_model(&self, model: Model) -> Result<(), Error> {
         let thinking = {
@@ -913,11 +1018,8 @@ impl Session {
             log.entries.partition_point(|entry| entry.seq <= seq)
         });
         let mut agent = self.agent.snapshot();
-        agent.running = log.running;
-        agent.streaming = log
-            .streaming
-            .as_ref()
-            .and_then(|streaming| streaming.message().cloned());
+        agent.running = *self.hooks.running.borrow();
+        agent.streaming = log.streaming.as_ref().and_then(Accumulator::snapshot);
         agent.pending_tool_calls = log.tool_calls.clone();
         Attach {
             missed: log.entries[start..].to_vec(),
@@ -931,10 +1033,11 @@ impl Session {
     }
 
     /// Moves the session's position to `target` (`None` = before the first entry) with a
-    /// `leaf` entry; the next prompt continues from there.
+    /// `leaf` entry; the next prompt continues from there with the live model and thinking
+    /// level, recorded on the branch when it implies others.
     pub async fn navigate(&self, target: Option<EntryId>) -> Result<(), Error> {
         let mut log = self.hooks.log.lock().await;
-        if log.running {
+        if *self.hooks.running.borrow() {
             return Err(Error::Busy);
         }
         if let Some(target) = &target
@@ -944,10 +1047,15 @@ impl Session {
         }
         let base = EntryBase::new(EntryId::generate(|id| log.ids.contains(id)), target);
         self.hooks.write(&mut log, Entry::Leaf { base }).await?;
+        let projection = project(&log.entries, None);
+        self.hooks
+            .record_selection(&mut log, projection.model.as_deref(), projection.thinking)
+            .await?;
         // Pending diffs were relative to the old position; `sync_prompt` recomputes them.
         self.hooks.take_system();
-        let mut messages = project(&log.entries, None).messages;
+        let mut messages = projection.messages;
         self.sync_prompt(&mut log, &mut messages).await?;
+        self.tool_state.ledger.restore(&messages);
         self.agent.set_messages(messages);
         Ok(())
     }
@@ -1012,7 +1120,7 @@ impl Session {
         // A run open at the fork point continues nowhere: close it so opening the fork
         // does not try to recover it.
         let open = match plan_recovery(&entries, &|_| Replay::Never, Path::new("")) {
-            RecoveryPlan::None => None,
+            RecoveryPlan::None | RecoveryPlan::Requeue { .. } => None,
             RecoveryPlan::Finish { run_id } => Some((run_id, store::RunOutcome::Done, None)),
             RecoveryPlan::Park { run_id } | RecoveryPlan::Resume { run_id, .. } => Some((
                 run_id,
@@ -1079,5 +1187,13 @@ impl Session {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(AgentMessage::Llm(Message::System(message)));
         }
+    }
+}
+
+/// Dropping a session shuts it down; its run task then settles and releases the writer
+/// lock.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.agent.shutdown();
     }
 }

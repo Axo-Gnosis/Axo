@@ -14,8 +14,9 @@ use axo_agent::{
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
-    ApiKind, AssistantMessage, Compat, Cost, InputKind, Message, Model, ScriptedApi, ScriptedTurn,
-    StopReason, ToolCall, ToolResultMessage, UserBlock, UserMessage, now_ms,
+    ApiKind, AssistantBlock, AssistantEvent, AssistantMessage, Compat, Cost, InputKind, Message,
+    Model, ScriptedApi, ScriptedTurn, StopReason, ToolCall, ToolResultMessage, UserBlock,
+    UserMessage, now_ms,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -1044,4 +1045,106 @@ async fn persist_sees_message_end_before_the_next_request() {
     assert_eq!(requests_at("end:result:c1"), 1);
     assert_eq!(requests_at("end:assistant:Stop"), 2);
     assert_eq!(h.api.requests().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_cancel_mid_stream_answers_streamed_calls() {
+    let h = setup(
+        vec![
+            ScriptedTurn::HangAfter(reply_tool_calls(&[("c1", "sleep", json!({}))])),
+            text("next"),
+        ],
+        Vec::new(),
+        |_| {},
+    );
+    let mut events = h.agent.subscribe();
+    let agent = h.agent.clone();
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+    tokio::time::timeout(TIMEOUT, async {
+        while let Ok(event) = events.recv().await {
+            if matches!(
+                &event,
+                AgentEvent::MessageUpdate {
+                    event: AssistantEvent::ToolCallEnd {
+                        block: AssistantBlock::ToolCall(call),
+                        ..
+                    },
+                } if call.id == "c1"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("c1 streamed");
+    h.agent.cancel(CancelReason::User);
+    let outcome = tokio::time::timeout(TIMEOUT, run)
+        .await
+        .expect("run settles")
+        .expect("task joins")
+        .expect("run succeeds");
+
+    assert_eq!(outcome, RunOutcome::Aborted(CancelReason::User));
+    let answers: Vec<ToolResultMessage> = h
+        .agent
+        .messages()
+        .into_iter()
+        .filter_map(|message| match message {
+            AgentMessage::Llm(Message::ToolResult(result)) if result.tool_call_id == "c1" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert!(answers[0].is_error);
+    assert_eq!(first_text(&answers[0].content), "Operation aborted");
+
+    // The aborted turn and its answer stay in the transcript but are never sent.
+    assert_eq!(h.prompt("again").await, RunOutcome::Done);
+    assert_eq!(h.request(1), labels(&["user:go", "user:again"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continue_run_from_a_reply_runs_queued_input() {
+    let h = setup(vec![text("reply")], Vec::new(), |_| {});
+    h.agent.set_messages(vec![
+        user("go"),
+        AgentMessage::Llm(Message::Assistant(reply_text("hi"))),
+    ]);
+    h.agent.steer(user("more"));
+
+    let outcome = tokio::time::timeout(TIMEOUT, h.agent.continue_run())
+        .await
+        .expect("run settles")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Done);
+    assert_eq!(h.api.requests().len(), 1);
+    assert_eq!(
+        h.request(0),
+        labels(&["user:go", "assistant:Stop", "user:more"])
+    );
+
+    // Nothing queued: the reply is settled and no request is made.
+    let outcome = tokio::time::timeout(TIMEOUT, h.agent.continue_run())
+        .await
+        .expect("run settles")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Done);
+    assert_eq!(h.api.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runs_started_after_shutdown_begin_cancelled() {
+    let h = setup(vec![text("never")], Vec::new(), |_| {});
+    h.agent.shutdown();
+    assert_eq!(
+        h.prompt("go").await,
+        RunOutcome::Aborted(CancelReason::Shutdown)
+    );
+    let names = h.rec.names();
+    assert!(
+        names.iter().all(|name| !name.starts_with("end:")),
+        "no MessageEnd persisted: {names:?}"
+    );
 }

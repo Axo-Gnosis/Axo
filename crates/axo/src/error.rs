@@ -22,7 +22,7 @@ pub enum Error {
     NoModel,
     #[error("Model not found: {0}")]
     ModelNotFound(String),
-    /// `prompt` was called while a run is active.
+    /// A run is active: `prompt` and `navigate` need an idle session.
     #[error(
         "Agent is already processing. Use steer() or follow_up() to queue messages, or wait for completion."
     )]

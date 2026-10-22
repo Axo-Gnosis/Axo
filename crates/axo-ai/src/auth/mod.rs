@@ -7,6 +7,7 @@ pub mod store;
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -39,9 +40,22 @@ pub enum Credential {
     },
 }
 
+/// A credential transform run under the store's exclusive lock: `Ok(None)` keeps the current credential.
+pub type CredentialUpdate = Box<
+    dyn FnOnce(Option<Credential>) -> BoxFuture<'static, Result<Option<Credential>, Error>> + Send,
+>;
+
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn get(&self, provider: &str) -> Result<Option<Credential>, Error>;
     async fn set(&self, provider: &str, credential: Credential) -> Result<(), Error>;
     async fn remove(&self, provider: &str) -> Result<(), Error>;
+    /// Runs `update` on `provider`'s credential while holding the store's exclusive lock
+    /// (across processes) from the read to the write, and saves the result when it is
+    /// `Some`. Returns the credential stored afterwards.
+    async fn update(
+        &self,
+        provider: &str,
+        update: CredentialUpdate,
+    ) -> Result<Option<Credential>, Error>;
 }

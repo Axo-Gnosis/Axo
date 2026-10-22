@@ -7,6 +7,7 @@
 //! - vendor-only fields (Google thought signatures, Responses namespaces, diagnostics,
 //!   deferred handles, nested tool calls) are not ported.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
@@ -165,8 +166,8 @@ pub enum UserBlock {
         text: String,
     },
     Image {
-        /// Base64-encoded image data.
-        data: String,
+        /// Base64-encoded image data, shared by every copy of the transcript.
+        data: Arc<str>,
         /// e.g. `image/png`.
         mime_type: String,
     },

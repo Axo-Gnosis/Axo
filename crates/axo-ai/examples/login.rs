@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 
 use axo_ai::FileCredentialStore;
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,14 +25,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
 
     let store = FileCredentialStore::new(dir.join("auth.json"));
+    // Tokio's stdin read cannot be cancelled and would block runtime shutdown once the callback
+    // wins; a detached thread does not delay process exit.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let line = match std::io::stdin().read_line(&mut line) {
+            Ok(read) if read > 0 => Some(line),
+            _ => None,
+        };
+        let _ = tx.send(line);
+    });
     let manual = async {
-        BufReader::new(tokio::io::stdin())
-            .lines()
-            .next_line()
-            .await
+        rx.await
             .ok()
             .flatten()
-            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
     };
     axo_ai::auth::codex::login(
         &store,

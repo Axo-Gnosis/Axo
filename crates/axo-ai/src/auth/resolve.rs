@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
+
 use crate::auth::{Credential, CredentialStore, ModelAuth, codex};
 use crate::error::Error;
 use crate::types::now_ms;
@@ -34,10 +36,6 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `!cmd` results for the process lifetime (`None` = the command failed).
 static COMMAND_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-    LazyLock::new(Default::default);
-
-/// One refresh at a time per provider, across every request in the process.
-static REFRESH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Default::default);
 
 /// Resolves a config value (API key, header value):
@@ -189,11 +187,15 @@ pub async fn resolve_auth(
         return Ok(with_key(key.to_owned()));
     }
     if let Some(raw) = &info.config_api_key {
-        return Ok(with_key(resolve_config_value(raw)?));
+        let raw = raw.clone();
+        let key = tokio::task::spawn_blocking(move || resolve_config_value(&raw))
+            .await
+            .map_err(|error| Error::Config(error.to_string()))??;
+        return Ok(with_key(key));
     }
     let stored = match store.get(&info.id).await? {
         Some(Credential::Oauth { expires, .. }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
-            refresh_locked(info, store, http).await?
+            refresh(info, store, http).await?
         }
         other => other,
     };
@@ -217,42 +219,43 @@ pub async fn resolve_auth(
     })
 }
 
-/// Refreshes the provider's OAuth credential under its process-wide lock, re-reading the store
-/// first so a refresh finished by another request is reused. Returns the current credential.
-async fn refresh_locked(
+/// Refreshes the provider's OAuth credential under the store's exclusive lock. The store is
+/// re-read under the lock, so a refresh another request or process finished is reused (and a
+/// logout is respected). Returns the current credential.
+async fn refresh(
     info: &ProviderAuthInfo,
     store: &Arc<dyn CredentialStore>,
     http: &reqwest::Client,
 ) -> Result<Option<Credential>, Error> {
-    let lock = REFRESH_LOCKS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .entry(info.id.clone())
-        .or_default()
-        .clone();
-    let _guard = lock.lock().await;
-    match store.get(&info.id).await? {
-        Some(Credential::Oauth {
-            refresh, expires, ..
-        }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
-            let Some(OAuthKind::Codex) = info.oauth else {
-                return Err(Error::Auth(format!(
-                    "OAuth credential for provider {} has expired and cannot be refreshed",
-                    info.id
-                )));
-            };
-            // Refresh and save in one spawned task: the refresh token rotates, so a cancelled
-            // request must not drop the new credential between the refresh and the save.
-            let (store, http, provider) = (Arc::clone(store), http.clone(), info.id.clone());
-            let credential = tokio::spawn(async move {
-                let credential = codex::refresh(&http, &refresh).await?;
-                store.set(&provider, credential.clone()).await?;
-                Ok::<_, Error>(credential)
-            })
+    let Some(OAuthKind::Codex) = info.oauth else {
+        return Err(Error::Auth(format!(
+            "OAuth credential for provider {} has expired and cannot be refreshed",
+            info.id
+        )));
+    };
+    // The lock and the rotated token live together in one spawned update: a cancelled request
+    // can neither release the lock mid-refresh nor drop the new credential before it is saved.
+    let (store, http, provider) = (Arc::clone(store), http.clone(), info.id.clone());
+    tokio::spawn(async move {
+        store
+            .update(
+                &provider,
+                Box::new(move |current: Option<Credential>| {
+                    async move {
+                        match current {
+                            Some(Credential::Oauth {
+                                refresh, expires, ..
+                            }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
+                                codex::refresh(&http, &refresh).await.map(Some)
+                            }
+                            _ => Ok(None),
+                        }
+                    }
+                    .boxed()
+                }),
+            )
             .await
-            .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))??;
-            Ok(Some(credential))
-        }
-        other => Ok(other),
-    }
+    })
+    .await
+    .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))?
 }

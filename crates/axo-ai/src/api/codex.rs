@@ -12,10 +12,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{RetryPolicy, send_with_retry};
+use crate::api::http::{RetryPolicy, error_body, send_with_retry};
 use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
 use crate::api::sse::SseDecoder;
-use crate::api::{Api, StreamOptions};
+use crate::api::{ABORTED, Api, StreamOptions};
 use crate::error::Error;
 use crate::event::AssistantEvent;
 use crate::model::Model;
@@ -29,7 +29,6 @@ const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 /// pi `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH`.
 const PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
-const ABORTED: &str = "Request was aborted";
 /// Statuses kept on terminal responses; anything else is treated as absent.
 const RESPONSE_STATUSES: [&str; 6] = [
     "completed",
@@ -62,11 +61,11 @@ impl Api for CodexApi {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
-        let request = build_request(model, transcript, &opts);
+        let request = build_request(model, &transcript, &opts);
         let http = self.http.clone();
         let model = model.clone();
         let (tx, rx) = mpsc::unbounded();
@@ -338,7 +337,7 @@ async fn drive(
         error => error.to_string(),
     })?;
     if !response.status().is_success() {
-        return Err(parse_error_response(response).await);
+        return Err(parse_error_response(response, cancel).await);
     }
 
     let _ = tx.unbounded_send(AssistantEvent::Start {
@@ -449,9 +448,11 @@ fn map_codex_event(
 
 /// pi `parseErrorResponse`: the provider's error message, or a friendly usage-limit
 /// message.
-async fn parse_error_response(response: reqwest::Response) -> String {
+async fn parse_error_response(response: reqwest::Response, cancel: &CancellationToken) -> String {
     let status = response.status();
-    let raw = response.text().await.unwrap_or_default();
+    let Some(raw) = error_body(response, cancel).await else {
+        return ABORTED.to_owned();
+    };
     let mut message = if raw.is_empty() {
         status
             .canonical_reason()

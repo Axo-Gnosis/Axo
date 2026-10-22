@@ -1,4 +1,4 @@
-//! Recovery plans for runs left open by a crash (plan Step 4.2 `Recovery`).
+//! Recovery plans for runs a crash left open: replay split, finishing, the restart limit and requeued input.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -298,6 +298,56 @@ fn unconsumed_steer_is_requeued() {
             interrupted: Vec::new(),
             rerun: Vec::new(),
             requeue: vec![pending],
+        }
+    );
+}
+
+#[test]
+fn prompt_submitted_before_its_run_started_is_requeued() {
+    let spool = tempfile::tempdir().unwrap();
+
+    let mut log = Log::default();
+    log.user("s1", SubmissionKind::Prompt, "first");
+    log.run_start("r1");
+    log.assistant_text("first answer");
+    log.run_end("r1");
+    let stranded = log.submission("s2", SubmissionKind::Prompt, "second");
+
+    assert_eq!(
+        log.plan(spool.path()),
+        RecoveryPlan::Requeue {
+            requeue: vec![stranded]
+        }
+    );
+}
+
+#[test]
+fn follow_up_left_after_a_settled_reply_resumes_the_run() {
+    let spool = tempfile::tempdir().unwrap();
+
+    let mut log = Log::default();
+    log.submission("s1", SubmissionKind::Prompt, "start");
+    log.run_start("r1");
+    log.message(
+        Message::User(UserMessage {
+            content: vec![UserBlock::Text {
+                text: "start".into(),
+            }],
+            timestamp: now_ms(),
+        }),
+        Some("s1"),
+    );
+    log.assistant_text("answer");
+    let follow_up = log.submission("s2", SubmissionKind::FollowUp, "and then");
+
+    assert_eq!(
+        log.plan(spool.path()),
+        RecoveryPlan::Resume {
+            run_id: "r1".into(),
+            attempt: 1,
+            interrupted: Vec::new(),
+            rerun: Vec::new(),
+            requeue: vec![follow_up],
         }
     );
 }

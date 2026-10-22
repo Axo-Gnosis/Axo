@@ -86,23 +86,25 @@ fn replace_images(content: &[UserBlock], placeholder: &str) -> Vec<UserBlock> {
 /// - text signatures from another model are dropped;
 /// - tool-call ids from another model are normalized for the target API, and the
 ///   matching tool results follow;
-/// - errored and aborted assistant turns are left out;
+/// - errored and aborted assistant turns are left out, with their tool results
+///   ([`drop_failed_turns`]);
 /// - a tool call without a result gets a `"No result provided"` error result before the
 ///   next assistant or user message (system messages between a call and its results are
 ///   held until after the results).
-pub fn transform_messages(transcript: &Transcript, model: &Model) -> Transcript {
+pub fn transform_messages(transcript: Transcript, model: &Model) -> Transcript {
     let vision = model.input.contains(&InputKind::Image);
     let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut messages = transcript.into_messages();
+    drop_failed_turns(&mut messages);
+    let len = messages.len();
 
     // First pass: image downgrade, thinking/text filtering, tool-call id normalization.
-    let transformed = transcript.iter().map(|message| match message {
-        Message::User(user) if !vision => {
-            let mut user = user.clone();
+    let transformed = messages.into_iter().map(|message| match message {
+        Message::User(mut user) if !vision => {
             user.content = replace_images(&user.content, NON_VISION_USER_IMAGE_PLACEHOLDER);
             Message::User(user)
         }
-        Message::ToolResult(result) => {
-            let mut result = result.clone();
+        Message::ToolResult(mut result) => {
             if !vision {
                 result.content = replace_images(&result.content, NON_VISION_TOOL_IMAGE_PLACEHOLDER);
             }
@@ -114,11 +116,11 @@ pub fn transform_messages(transcript: &Transcript, model: &Model) -> Transcript 
         Message::Assistant(assistant) => {
             Message::Assistant(transform_assistant(assistant, model, &mut id_map))
         }
-        Message::System(_) | Message::User(_) => message.clone(),
+        message @ (Message::System(_) | Message::User(_)) => message,
     });
 
-    // Second pass: drop failed turns, synthesize results for orphaned tool calls.
-    let mut result: Vec<Message> = Vec::with_capacity(transcript.len());
+    // Second pass: synthesize results for orphaned tool calls.
+    let mut result: Vec<Message> = Vec::with_capacity(len);
     let mut pending: Vec<ToolCall> = Vec::new();
     let mut answered: HashSet<String> = HashSet::new();
     let mut held: Vec<Message> = Vec::new();
@@ -149,12 +151,6 @@ pub fn transform_messages(transcript: &Transcript, model: &Model) -> Transcript 
         match message {
             Message::Assistant(assistant) => {
                 close_pending(&mut result, &mut pending, &mut answered, &mut held);
-                if matches!(
-                    assistant.stop_reason,
-                    StopReason::Error | StopReason::Aborted
-                ) {
-                    continue;
-                }
                 let calls: Vec<ToolCall> = assistant.tool_calls().cloned().collect();
                 if !calls.is_empty() {
                     pending = calls;
@@ -178,17 +174,40 @@ pub fn transform_messages(transcript: &Transcript, model: &Model) -> Transcript 
     Transcript(result)
 }
 
+/// Removes assistant messages that ended `Error` or `Aborted`, with the tool results
+/// answering their calls: failed turns stay in the transcript but are never sent.
+pub fn drop_failed_turns(messages: &mut Vec<Message>) {
+    // Results answer the calls of the latest assistant, so ids are matched per turn: a
+    // provider that reuses call ids across turns keeps later results.
+    let mut failed: HashSet<String> = HashSet::new();
+    messages.retain(|message| match message {
+        Message::Assistant(assistant) => {
+            let keep = !matches!(
+                assistant.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            );
+            failed = if keep {
+                HashSet::new()
+            } else {
+                assistant.tool_calls().map(|call| call.id.clone()).collect()
+            };
+            keep
+        }
+        Message::ToolResult(result) => !failed.contains(&result.tool_call_id),
+        Message::System(_) | Message::User(_) => true,
+    });
+}
+
 fn transform_assistant(
-    assistant: &AssistantMessage,
+    mut assistant: AssistantMessage,
     model: &Model,
     id_map: &mut HashMap<String, String>,
 ) -> AssistantMessage {
     let same_model = assistant.provider == model.provider
         && assistant.api == model.api
         && assistant.model == model.id;
-    let content = assistant
-        .content
-        .iter()
+    let content = std::mem::take(&mut assistant.content)
+        .into_iter()
         .filter_map(|block| match block {
             AssistantBlock::Thinking {
                 thinking,
@@ -201,30 +220,31 @@ fn transform_assistant(
                     return None;
                 }
                 // Signed or redacted blocks are kept even when empty: they are needed for replay.
-                if *redacted || replay.is_some() || !thinking.trim().is_empty() {
-                    Some(block.clone())
-                } else {
-                    None
-                }
+                (redacted || replay.is_some() || !thinking.trim().is_empty()).then_some(
+                    AssistantBlock::Thinking {
+                        thinking,
+                        replay,
+                        redacted,
+                    },
+                )
             }
             AssistantBlock::Text { text, .. } if !same_model => Some(AssistantBlock::Text {
-                text: text.clone(),
+                text,
                 text_signature: None,
             }),
-            AssistantBlock::ToolCall(call) if !same_model => {
-                let id = normalize_tool_call_id(&call.id, model, assistant);
+            AssistantBlock::ToolCall(mut call) if !same_model => {
+                let id = normalize_tool_call_id(&call.id, model, &assistant);
                 if id != call.id {
-                    id_map.insert(call.id.clone(), id.clone());
+                    id_map.insert(call.id, id.clone());
+                    call.id = id;
                 }
-                Some(AssistantBlock::ToolCall(ToolCall { id, ..call.clone() }))
+                Some(AssistantBlock::ToolCall(call))
             }
-            AssistantBlock::Text { .. } | AssistantBlock::ToolCall(_) => Some(block.clone()),
+            block @ (AssistantBlock::Text { .. } | AssistantBlock::ToolCall(_)) => Some(block),
         })
         .collect();
-    AssistantMessage {
-        content,
-        ..assistant.clone()
-    }
+    assistant.content = content;
+    assistant
 }
 
 /// Each adapter's tool-call id normalizer (pi `anthropic-messages.ts`

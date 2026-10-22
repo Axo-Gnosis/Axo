@@ -108,7 +108,7 @@ The event order follows pi:
 
 ```rust
 trait Api: Send + Sync {
-    fn stream(&self, model: &Model, transcript: &Transcript, opts: StreamOptions, cancel: CancellationToken)
+    fn stream(&self, model: &Model, transcript: Transcript, opts: StreamOptions, cancel: CancellationToken)
         -> BoxStream<'static, AssistantEvent>;
 }
 ```
@@ -126,7 +126,7 @@ trait Api: Send + Sync {
   - **Credentials.** A `CredentialStore` trait. OAuth refresh runs under a per-provider lock, and a cancelled request never abandons a refresh in progress.
   - **Anthropic subscription login is the exception.** pi also switches the system preamble, the tool-name casing and the beta flags when it sees a subscription token. axo will express this as a flag on `ModelAuth` once that login exists.
 - **Cross-model replay.** `transform_messages` makes a transcript produced by one model replayable to another:
-  - drops thinking from other models;
+  - drops thinking from other models; !!! is it neccessary to do this? does omp do this? also a little unrelated but omp has a /shake command that i think we should adopt as well 
   - leaves out failed and aborted turns;
   - normalizes tool-call ids;
   - adds a "No result provided" result for any tool call left without one.
@@ -194,16 +194,16 @@ Event delivery has two paths:
   - Preparation, including `before_tool_call`, runs sequentially in source order.
   - `ToolExecutionEnd` events come in completion order.
   - Tool-result messages come in the order the model issued the calls.
-- **Running a tool sequentially.** Calls run one at a time if the loop is configured sequential, or if any tool in the batch asks for it.
-- **Truncated output.** When a response stops at the output-token limit, every tool call in it fails without running.
-- **Steering** is injected only after all of the current turn's tool calls finish. **Follow-ups** are injected only when the run would otherwise end.
+- **Running a tool sequentially.** Calls run one at a time if the loop is configured sequential, or if any tool in the batch asks for !!! what tools can be sequential? and why?
+- **Truncated output.** When a response stops at the output-token limit, every tool call in it fails without running !!! i actually want to talk about token efficency, theres many things that the models really dont need to see at all and we should think about that
+- **Steering** is injected only after all of the current turn's tool calls finish. **Follow-ups** are injected only when the run would otherwise end. !!! how do you trigger them? like when do you steer vr follow up?
 - **Message placement.** Nothing is ever inserted between a tool call and its result. Custom messages arriving mid-run wait for the turn to end.
 - **Failing hooks.** A failing `before_tool_call` blocks the call. Other hook failures are logged and ignored.
 - **Failed and aborted turns.** Their assistant messages stay in the transcript but are excluded from requests.
 
 **Cancellation.** Each run gets a `CancellationToken`, and tools get child tokens. Cancelling ends the provider stream with an aborted message, never an `Err`. A cancellation carries a reason:
 - **`User`:** the user stopped the run. The aborted assistant message is kept, and every tool call left without a result gets an "aborted" result, so the saved transcript is complete on its own. pi instead patches such calls at request time.
-- **`Shutdown`:** the host is stopping. Nothing is written as aborted; the run stays open and resumes when the session is next opened.
+- **`Shutdown`:** the host is stopping (`Session::shutdown`, or dropping the session). Nothing is written as aborted; the run stays open and resumes when the session is next opened.
 
 ## Sessions (`axo`)
 
@@ -236,7 +236,7 @@ Unknown entry types are preserved on load, not dropped. Fields and semantics of 
 - **Projection.** A pure function `project(entries, leaf) -> Projection`. It applies the latest compaction on the path, then the `context_edit`s, and yields the messages, the model and the thinking level. It is cached per session and updated incrementally on append; pi rebuilds it on every request.
 - **Location.** `~/.axo/sessions/--<encoded cwd>--/<timestamp>_<uuidv7>.jsonl`. A host can supply its own store instead.
 - **Branches and sessions.** One session file holds a tree. A new session exists only when the user explicitly forks or clones.
-  - **Navigating** moves the current position (the leaf) inside the same file, and appends a `leaf` entry so the move survives a restart. The next message becomes a new branch from that point. Optionally the abandoned branch is first summarized into a `branch_summary` entry. Branches in one file are alternatives you switch between; only one is active at a time.
+  - **Navigating** moves the current position (the leaf) inside the same file, and appends a `leaf` entry so the move survives a restart. The next message becomes a new branch from that point. The live model and thinking level carry over; when the branch records others, a `model_change` / `thinking_level_change` is appended so reopening restores what was live. Optionally the abandoned branch is first summarized into a `branch_summary` entry. Branches in one file are alternatives you switch between; only one is active at a time.
   - **Forking** (`fork(entry_id)`) copies the root-to-entry path into a new session file, with a new id, which records its parent session and the entry it forked from. Forking from a user message puts the position just before that message and returns its text for editing, as pi's `/fork` does. Forking at the current position is pi's `/clone`.
   - **A fork is a separate session.** It is listed and resumed on its own, has its own lock and its own runs, and can run at the same time as the original. Use a fork for parallel work and a branch for trying an alternative.
 
@@ -244,7 +244,7 @@ Unknown entry types are preserved on load, not dropped. Fields and semantics of 
 
 Both are ported as they are; the algorithm is in [`pi/session.md` §3.8–3.9](pi/session.md).
 
-- **When it triggers:** when context tokens exceed `context_window − reserve_tokens`. The defaults are 16,384 reserved and 20,000 kept as the recent tail.
+- **When it triggers:** when context tokens exceed `context_window − reserve_tokens`. The defaults are 16,384 reserved and 20,000 kept as the recent tail. !!! why these numbers speciffically? 
 - **When it is checked:** before a prompt, between turns, and after a run.
 - **Cut point:** never at a tool result. A cut in the middle of a turn summarizes the start of that turn separately.
 - **Repeated compactions** update the previous summary instead of starting over. Read and modified files are tracked across summaries.
@@ -268,7 +268,9 @@ axo is built for an always-on host from the start: sworm-server keeps sessions r
   3. A `run_resumed` entry is appended, and the run continues.
 
   A run that keeps crashing (5 resumes in a row with no progress) is parked as interrupted instead of looping. The host chooses the policy: sworm-server resumes; the interactive ACP binary can mark the run interrupted and let the user decide.
-- **Durable prompts.** Prompts, steers and follow-ups are saved as `submission` entries before they are queued, so a restart doesn't lose them. A submission may carry a `request_id`; submitting the same id twice returns the first submission. That stops a trigger that fires both before and after a restart from running twice.
+
+  With no unfinished run, submissions saved after the last `run_end` that no message consumed (a crash between saving a prompt and starting its run) are requeued under the resume policy: steers and follow-ups are queued, and prompts start a run.
+- **Durable prompts.** Prompts, steers and follow-ups are saved as `submission` entries before they are queued, so a restart doesn't lose them. A submission may carry a `request_id`; submitting the same id twice returns the first submission. That stops a trigger that fires both before and after a restart from running twice. A prompt's run belongs to the session, not to the caller's future: dropping `prompt` does not stop the run or leave the session busy.
 - **One writer.** Opening a session for writing takes an OS file lock (`File::try_lock`), released automatically if the process dies. A second writer gets `SessionBusy`. Read-only opens don't lock.
 - **Catching up.** Every entry has a sequence number, its position in the file. `session.attach(from)` returns the entries a client missed since `from`, a snapshot of the run in progress (the partial reply, running tools, any pending `ask` question, the queue), and a live event receiver. This is also what a lagging receiver uses to resync, and it maps directly onto ACP's `session/load`.
 - **bash after a crash.** Each command's process group has a small guard process holding a pipe from the server; when the server dies, the pipe closes and the guard kills the whole group. (`PR_SET_PDEATHSIG` alone is not enough: bash forks non-final commands, and the death signal is cleared across fork.) Full output is spooled under the session directory rather than `/tmp`, so an interrupted result can point to it.
@@ -278,7 +280,8 @@ The estimated cost is 1.0–1.6k lines of Rust, spread over M2 (`replay`, cancel
 
 ## Context (`axo`)
 
-- **System prompt.** Built from named sections, most stable first so the prompt cache holds:
+- **System prompt.** Built from named sections, most stable first so the prompt cache holds: !!! the order matters for agents, we didnt really discuss this but how does omp and pi order these?
+!!! Also I want to say, in the implementation i noticed the SYSTEM.md is kinda meh, it just seems a little uneeded i want to know how it compares to whatever pi does. I was also kind of expecting it to have string replacement for the tools sections and what not, but im asking for that its good it doesnt. however my question is, then there is some "guidelines/instructions" making it to the model that the user CANNOT change? even if small where are those and what do they say?
   1. `system`: from `SYSTEM.md`;
   2. `tools`: generated from the active tools, each tool carrying its own short guidance;
   3. `work`: from `WORK.md`;
@@ -291,7 +294,7 @@ The estimated cost is 1.0–1.6k lines of Rust, spread over M2 (`replay`, cancel
   Other details:
   - Every section is wrapped in `<name>` tags.
   - When the prompt changes, only the changed sections are written to the transcript.
-  - There is no date in it, which keeps the prefix cache-stable.
+  - There is no date in it, which keeps the prefix cache-stable. !!! this is understandable but how will the model know the time then?
 - **Prompt files.** axo's own guidance lives in bundled markdown files, never in code, so every opinion is visible and replaceable:
 
   | File | Holds | Default |
@@ -304,7 +307,7 @@ The estimated cost is 1.0–1.6k lines of Rust, spread over M2 (`replay`, cancel
   - **Overriding.** A file in `~/.axo/` replaces the bundled default, and one in `<project>/.axo/` replaces both. An empty file switches that section off. Hosts and extensions can set the same sections in code.
   - **Not supported:** `APPEND_SYSTEM.md` (the user's `~/.axo/AGENTS.md` already adds text without editing anything), `SOUL.md`, `PERSONALITY.md`, `RULES.md`.
   - **Tool guidance belongs to the tool.** Removing or replacing a tool removes its guidance, so prompt files never mention specific tools.
-- **Context files.** One file per directory, choosing the first match among `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md` and `.agents/AGENTS.md`. Global files come first, then directories from the git root (or cwd outside a repository) in towards cwd. Unlike pi, the walk stops at the git root.
+- **Context files.** One file per directory, choosing the first match among `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md` and `.agents/AGENTS.md`. Global files come first, then directories from the git root (or cwd outside a repository) in towards cwd. Unlike pi, the walk stops at the git root. !!! we should probably also accept .local.md files
 - **Skills** (the one cross-tool standard, the Agent Skills format used by Codex, Cursor, OpenCode, Gemini CLI, Amp, pi and omp).
   - **Format:** a directory per skill with a `SKILL.md` holding `name` and `description` frontmatter. Parsing is lenient: a skill is dropped only when its description is missing.
   - **Discovery:** project `.agents/skills` from cwd up to the git root, then `~/.axo/skills`, then `~/.agents/skills`.
@@ -313,8 +316,8 @@ The estimated cost is 1.0–1.6k lines of Rust, spread over M2 (`replay`, cancel
   - **Model use:** the model picks a skill when its description matches. A skill with `disable-model-invocation: true` (an Agent Skills field) is hidden from the model and only the user can start it.
   - **One namespace.** Skills and extension commands share `/name`. On a clash the extension command wins and axo reports a diagnostic at load.
   - **No commands folder.** Something the agent should be able to run is a skill. Something only the user runs, or that needs code (including commands that call other commands), is an extension command. axo reads no `commands/` or `prompts/` directories.
-- **Not read from `.agents/`:** rules (they duplicate `AGENTS.md` and skills), hook files (axo has no hook concept; extensions do that job), MCP files (MCP servers are configured in `settings.jsonc`), `.agents/SYSTEM.md`, and other tools' directories such as `.claude/`. Survey: [`research/agents-dir.md`](research/agents-dir.md).
-- **Hosts can switch project resources off.** `SessionOptions` has a `project_resources` switch, so Sworm can ignore a repository's `.agents/` until it trusts it.
+- **Not read from `.agents/`:** rules (they duplicate `AGENTS.md` and skills), hook files (axo has no hook concept; extensions do that job), MCP files (MCP servers are configured in `settings.jsonc`), `.agents/SYSTEM.md`, and other tools' directories such as `.claude/`. Survey: [`research/agents-dir.md`](research/agents-dir.md). !!! should we not accept mcp.json? it's very standard now
+- **Hosts can switch project resources off.** `SessionOptions` has a `project_resources` switch, so Sworm can ignore a repository's `.agents/` until it trusts it. !!! yes, but i want to know how this will look in the settings
 - All `.agents/` kinds share one directory walk and load into plain structs that a host can also build directly. Loaders report problems as diagnostics instead of failing.
 
 ## Built-in tools (`axo`)
@@ -357,7 +360,7 @@ Every command `bash` runs gets its environment from an `ExecEnv` provider, chose
   - **Cost.** About 3 ms extra per command. Wrapping each command in `nix develop -c` instead costs about 460 ms on Sworm's flake.
   - **When it recaptures.** When `flake.nix`, `flake.lock`, `.envrc` or a tracked `.nix` file changes. Captures are cached under `~/.axo/cache/devshell/`.
   - **What the model sees.** One fixed line in the system prompt saying commands already run inside the project's dev shell. Capture failures appear as notes in tool results.
-  - **Turning it on.** Settings choose `off`, `direnv` or `auto` (also capture flakes). Capturing a flake runs project code, so it can only be enabled from the user's own settings, not a project's.
+  - **Turning it on.** Settings choose `off`, `direnv` or `auto` (also capture flakes). Capturing a flake runs project code, so it can only be enabled from the user's own settings, not a project's. !!! should be off, direnv, nix
 
 The provider is a trait, so other environments (devenv, containers, remote hosts) can be added later, including by extensions. Nix ships built in because it is how Toph works. Design and timings: [`research/nix-shell.md`](research/nix-shell.md).
 
@@ -365,6 +368,7 @@ The provider is a trait, so other environments (devenv, containers, remote hosts
 
 These are omp tools Toph wants or may want. None is built in M1–M6, but the core leaves room for each.
 
+!!! update this it talks about tools we do have
 | Tool | What it does | Where it fits in axo |
 |---|---|---|
 | `task` (with subagents) | Starts one or more subagents, each with its own context and an optional role and output schema, often in parallel, and returns their results. | Built on child sessions plus the durability links (a resumed parent finds its children instead of starting new ones). Roles are agent definitions read from `.agents/agents` and `~/.axo/agents`: markdown with `name`, `description`, `tools`, `model`, `thinking` and `output` frontmatter, the shape Claude Code, Gemini, OpenCode, Cursor and omp have converged on. |
@@ -376,7 +380,7 @@ These are omp tools Toph wants or may want. None is built in M1–M6, but the co
 
 ## Config (`axo`)
 
-- **Directories:**
+- **Directories:** !!! extensions too no?
   - **User:** `~/.axo/` (`AXO_DIR` overrides it). It holds:
     - `settings.jsonc` and `models.jsonc`;
     - `auth.json` (machine-written, mode 0600, locked);

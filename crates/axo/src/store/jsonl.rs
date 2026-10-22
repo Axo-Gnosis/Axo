@@ -4,6 +4,7 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_agent::AgentMessage;
@@ -106,17 +107,21 @@ impl SessionStore for JsonlStore {
         let path = self.session_dir(&header.cwd).join(file_name);
         let mut pending = serde_json::to_vec(&header).map_err(|err| io_error(&path, err.into()))?;
         pending.push(b'\n');
-        let mut writer = JsonlWriter {
+        // A fork is an explicit copy the user asked for: its file exists right away.
+        let file = if header.parent_session.is_some() {
+            let target = path.clone();
+            let buffered = std::mem::take(&mut pending);
+            let file = blocking(&path, move || create_locked(&target, &buffered)).await?;
+            Some(Arc::new(file))
+        } else {
+            None
+        };
+        Ok(Box::new(JsonlWriter {
             path,
-            file: None,
+            file,
             pending,
             next_seq: 0,
-        };
-        // A fork is an explicit copy the user asked for: its file exists right away.
-        if header.parent_session.is_some() {
-            writer.materialize()?;
-        }
-        Ok(Box::new(writer))
+        }))
     }
 
     async fn open_write(
@@ -154,7 +159,7 @@ impl SessionStore for JsonlStore {
             }
             let writer: Box<dyn SessionWriter> = Box::new(JsonlWriter {
                 path,
-                file: Some(file),
+                file: Some(Arc::new(file)),
                 pending: Vec::new(),
                 next_seq,
             });
@@ -218,28 +223,25 @@ impl SessionStore for JsonlStore {
 struct JsonlWriter {
     path: PathBuf,
     /// The open, locked file; `None` while the session is still lazy.
-    file: Option<File>,
+    file: Option<Arc<File>>,
     pending: Vec<u8>,
     next_seq: u64,
 }
 
-impl JsonlWriter {
-    /// Creates and locks the file and writes everything buffered so far.
-    fn materialize(&mut self) -> Result<(), Error> {
-        let dir = self.path.parent().expect("session path has a directory");
-        fs::create_dir_all(dir).map_err(|err| io_error(dir, err))?;
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create_new(true)
-            .open(&self.path)
-            .map_err(|err| io_error(&self.path, err))?;
-        lock(&file, &self.path)?;
-        file.write_all(&std::mem::take(&mut self.pending))
-            .and_then(|()| file.flush())
-            .map_err(|err| io_error(&self.path, err))?;
-        self.file = Some(file);
-        Ok(())
-    }
+/// Creates and locks the session file at `path` and writes `pending`, everything buffered so far.
+fn create_locked(path: &Path, pending: &[u8]) -> Result<File, Error> {
+    let dir = path.parent().expect("session path has a directory");
+    fs::create_dir_all(dir).map_err(|err| io_error(dir, err))?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| io_error(path, err))?;
+    lock(&file, path)?;
+    file.write_all(pending)
+        .and_then(|()| file.flush())
+        .map_err(|err| io_error(path, err))?;
+    Ok(file)
 }
 
 #[async_trait]
@@ -263,17 +265,35 @@ impl SessionWriter for JsonlWriter {
                 self.next_seq += 1;
                 return Ok(SeqEntry { seq, entry });
             }
-            self.materialize()?;
         }
-        let Some(mut file) = self.file.as_ref() else {
-            unreachable!("the session file exists once a submission or message is appended")
+        let path = self.path.clone();
+        let file = match &self.file {
+            Some(file) => file.clone(),
+            None => {
+                // Created in its own step so a failed line write still keeps the locked file.
+                let pending = self.pending.clone();
+                let create_path = path.clone();
+                let file = Arc::new(
+                    blocking(&self.path, move || create_locked(&create_path, &pending)).await?,
+                );
+                self.pending.clear();
+                self.file = Some(file.clone());
+                file
+            }
         };
-        file.write_all(&line)
-            .and_then(|()| file.flush())
-            .map_err(|err| io_error(&self.path, err))?;
-        if matches!(entry, Entry::RunStart { .. } | Entry::RunEnd { .. }) {
-            file.sync_data().map_err(|err| io_error(&self.path, err))?;
-        }
+        let sync = matches!(entry, Entry::RunStart { .. } | Entry::RunEnd { .. });
+        blocking(&self.path, move || {
+            let mut writer = &*file;
+            writer
+                .write_all(&line)
+                .and_then(|()| writer.flush())
+                .map_err(|err| io_error(&path, err))?;
+            if sync {
+                file.sync_data().map_err(|err| io_error(&path, err))?;
+            }
+            Ok(())
+        })
+        .await?;
         self.next_seq += 1;
         Ok(SeqEntry { seq, entry })
     }

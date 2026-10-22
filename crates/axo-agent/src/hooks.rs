@@ -126,11 +126,11 @@ pub trait LoopHooks: Send + Sync {
 
     /// Lowers agent messages to LLM messages. The default keeps `Llm` messages and
     /// drops `Custom` ones.
-    fn convert_to_llm(&self, messages: &[AgentMessage]) -> Vec<Message> {
+    fn convert_to_llm(&self, messages: Vec<AgentMessage>) -> Vec<Message> {
         messages
-            .iter()
+            .into_iter()
             .filter_map(|message| match message {
-                AgentMessage::Llm(message) => Some(message.clone()),
+                AgentMessage::Llm(message) => Some(message),
                 AgentMessage::Custom(_) => None,
             })
             .collect()

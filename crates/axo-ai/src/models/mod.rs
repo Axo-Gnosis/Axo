@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
-use crate::api::{Api, SimpleStreamOptions, StreamOptions, Streamer};
+use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions, Streamer};
 use crate::auth::resolve::{OAuthKind, ProviderAuthInfo, resolve_auth, resolve_config_value};
 use crate::auth::{CredentialStore, ModelAuth};
 use crate::error::Error;
@@ -298,7 +298,7 @@ impl Streamer for Models {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         opts: SimpleStreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
@@ -317,24 +317,28 @@ impl Streamer for Models {
             opts.api_key.clone(),
         );
         stream::once(async move {
-            match auth.await {
-                Ok(auth) => timed(api.stream(
-                    &model,
-                    &transcript,
-                    StreamOptions { simple: opts, auth },
-                    cancel,
-                )),
-                Err(error) => {
-                    let mut message = AssistantMessage::empty(&model);
-                    message.stop_reason = StopReason::Error;
-                    message.error_message = Some(error.to_string());
-                    stream::iter([AssistantEvent::Error {
-                        reason: StopReason::Error,
-                        message,
-                    }])
-                    .boxed()
+            // A refresh in progress keeps running in its own spawned task.
+            let auth = tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                auth = auth => Some(auth),
+            };
+            let (reason, error) = match auth {
+                Some(Ok(auth)) => {
+                    return timed(api.stream(
+                        &model,
+                        transcript,
+                        StreamOptions { simple: opts, auth },
+                        cancel,
+                    ));
                 }
-            }
+                Some(Err(error)) => (StopReason::Error, error.to_string()),
+                None => (StopReason::Aborted, ABORTED.to_owned()),
+            };
+            let mut message = AssistantMessage::empty(&model);
+            message.stop_reason = reason;
+            message.error_message = Some(error);
+            stream::iter([AssistantEvent::Error { reason, message }]).boxed()
         })
         .flatten()
         .boxed()

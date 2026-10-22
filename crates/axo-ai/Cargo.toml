@@ -15,6 +15,7 @@ async-trait.workspace = true
 base64.workspace = true
 futures.workspace = true
 indexmap.workspace = true
+jiff.workspace = true
 jsonc-parser.workspace = true
 rand.workspace = true
 regex.workspace = true
@@ -29,6 +30,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

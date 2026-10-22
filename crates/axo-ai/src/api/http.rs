@@ -3,7 +3,7 @@
 //! Retry covers only the request, up to the response headers: once a response with a
 //! success status arrives, its body is the caller's. Turn-level retry lives above this.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Response};
@@ -85,18 +85,21 @@ pub async fn send_with_retry(
 
         let delay = match result {
             Ok(response) => match server_delay(response.headers()) {
-                Some(delay)
-                    if !policy.max_retry_delay.is_zero() && delay > policy.max_retry_delay =>
+                Some(seconds)
+                    if !policy.max_retry_delay.is_zero()
+                        && seconds > policy.max_retry_delay.as_secs_f64() =>
                 {
                     let status = response.status().as_u16();
-                    let body = response.text().await.unwrap_or_default();
+                    let Some(body) = error_body(response, cancel).await else {
+                        return Err(Error::Aborted);
+                    };
                     return Err(Error::Provider(format!(
                         "Server requested {}s retry delay (max: {}s). {status} {body}",
-                        delay.as_secs_f64().ceil(),
+                        seconds.ceil(),
                         policy.max_retry_delay.as_secs_f64().ceil(),
                     )));
                 }
-                Some(delay) => delay,
+                Some(seconds) => Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX),
                 None => backoff(retry_index),
             },
             Err(error) => {
@@ -114,60 +117,41 @@ pub async fn send_with_retry(
     }
 }
 
-/// `retry-after-ms`, else `retry-after` as seconds or an HTTP date.
-fn server_delay(headers: &HeaderMap) -> Option<Duration> {
+/// The body of an unsuccessful response, or `None` when `cancel` fires first: the shared
+/// client has no global timeout, so an error body that never finishes must not pin a request.
+pub(crate) async fn error_body(response: Response, cancel: &CancellationToken) -> Option<String> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        text = response.text() => Some(text.unwrap_or_default()),
+    }
+}
+
+/// Seconds (≥ 0) from `retry-after-ms`, else `retry-after` as seconds or an HTTP date.
+/// Kept as `f64` so the caller checks the cap before converting to a `Duration`.
+fn server_delay(headers: &HeaderMap) -> Option<f64> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     if let Some(ms) = header("retry-after-ms").and_then(|value| value.trim().parse::<f64>().ok())
         && ms.is_finite()
     {
-        return Some(Duration::from_secs_f64(ms.max(0.0) / 1000.0));
+        return Some(ms.max(0.0) / 1000.0);
     }
     let retry_after = header("retry-after")?;
-    let seconds = match retry_after.trim().parse::<f64>() {
-        Ok(seconds) if seconds.is_finite() => seconds,
-        Ok(_) => return None,
+    match retry_after.trim().parse::<f64>() {
+        Ok(seconds) if seconds.is_finite() => Some(seconds.max(0.0)),
+        Ok(_) => None,
         Err(_) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_secs_f64();
-            parse_http_date(retry_after)? as f64 - now
+            let timestamp = jiff::fmt::rfc2822::DateTimeParser::new()
+                .parse_timestamp(retry_after.trim())
+                .ok()?;
+            let ms = timestamp.as_millisecond() - jiff::Timestamp::now().as_millisecond();
+            Some((ms as f64 / 1000.0).max(0.0))
         }
-    };
-    Some(Duration::from_secs_f64(seconds.max(0.0)))
+    }
 }
 
 /// Exponential backoff `min(0.5 * 2^n, 8)` seconds with up to 25 % negative jitter.
 fn backoff(retry_index: u32) -> Duration {
     let seconds = (0.5 * 2f64.powi(retry_index.min(16) as i32)).min(8.0);
     Duration::from_secs_f64(seconds * (1.0 - rand::random::<f64>() * 0.25))
-}
-
-/// Parse an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) into Unix seconds.
-fn parse_http_date(text: &str) -> Option<i64> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let fields: Vec<&str> = text.split_ascii_whitespace().collect();
-    let [_, day, month, year, clock, ..] = fields.as_slice() else {
-        return None;
-    };
-    let day: i64 = day.parse().ok()?;
-    let month = MONTHS.iter().position(|name| name == month)? as i64 + 1;
-    let year: i64 = year.parse().ok()?;
-    let mut clock = clock.split(':').map(str::parse::<i64>);
-    let (hour, minute, second) = (
-        clock.next()?.ok()?,
-        clock.next()?.ok()?,
-        clock.next()?.ok()?,
-    );
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }

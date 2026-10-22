@@ -1,6 +1,9 @@
-//! Shaping of raw command output for the model (`docs/research/shell-tool.md` #9-#11).
+//! Shaping of raw command output for the model (`docs/research/shell-tool.md` #9-#11),
+//! and where the full output is spooled.
 
-use axo::tools::bash::shape_output;
+use std::path::Path;
+
+use axo::tools::bash::{shape_output, spool_path};
 
 /// 1000 unique 100-byte lines (100 000 bytes), so every line's offset is `index * 100`.
 fn numbered_lines() -> String {
@@ -130,4 +133,14 @@ fn ansi_escapes_are_stripped() {
         ["red plain", "after", "cleared"]
     );
     assert!(!shaped.truncated);
+}
+
+#[test]
+fn spool_files_stay_inside_the_spool_dir() {
+    let dir = Path::new("/tmp/spool");
+    for id in ["../../etc/passwd", "/tmp/x", "a|b", "toolu_01Ab"] {
+        assert_eq!(spool_path(dir, id).parent(), Some(dir), "{id}");
+    }
+    assert_eq!(spool_path(dir, "a|b"), dir.join("a%7Cb.log"));
+    assert_eq!(spool_path(dir, "toolu_01Ab"), dir.join("toolu_01Ab.log"));
 }

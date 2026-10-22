@@ -1,4 +1,4 @@
-//! Session storage and projection (plan Step 4.2 `JsonlStore`, `Projection`).
+//! Session storage and projection: leaf navigation, compaction, context edits, torn-line repair and the single writer.
 
 use std::collections::BTreeMap;
 use std::io::Write;

@@ -132,9 +132,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let session = Arc::new(session);
 
-    // Recovery may have resumed a run in the background: let it settle first.
+    // Recovery may have resumed a run, or started requeued prompts, in the background:
+    // let it settle first.
     let attach = session.attach(None).await;
-    if attach.live.run_id.is_some() {
+    if attach.live.agent.running {
         match print_events(session.clone(), attach.events, first, false).await {
             Some(outcome) => println!("[run] {outcome:?}"),
             None => println!("[run] unknown"),

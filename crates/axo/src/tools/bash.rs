@@ -4,8 +4,9 @@
 //! ANSI/`\r` cleaning.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,6 +89,23 @@ const NON_INTERACTIVE_ENV: &[(&str, &str)] = &[
     ("__NIXOS_SET_ENVIRONMENT_DONE", "1"),
 ];
 
+/// The spool file of a bash call. Call ids come from the provider, so every byte outside
+/// `[A-Za-z0-9_-]` is written as `%XX`: the name stays inside `spool_dir`, and distinct ids
+/// get distinct files (cut to 200 bytes before `.log`).
+pub fn spool_path(spool_dir: &Path, call_id: &str) -> PathBuf {
+    let mut name = String::with_capacity(call_id.len() + 4);
+    for byte in call_id.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+            name.push(char::from(byte));
+        } else {
+            let _ = write!(name, "%{byte:02X}");
+        }
+    }
+    name.truncate(200);
+    name.push_str(".log");
+    spool_dir.join(name)
+}
+
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
@@ -134,7 +152,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to 2000 lines or 50KB (whichever is hit first), keeping the first 20KB and the last 30KB. If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
+        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to 2000 lines or 50KB (whichever is hit first), keeping the first 20KB and the last 30KB. If truncated, full output is saved to a file whose path is in the result. Optionally provide a timeout in seconds."
     }
 
     fn parameters(&self) -> &Value {
@@ -198,7 +216,7 @@ impl Tool for BashTool {
 
         // The full output is spooled from the first byte; kept only when the inline result
         // is cut.
-        let spool_path = tools.spool_dir.join(format!("{}.log", call.id));
+        let spool_path = spool_path(&tools.spool_dir, &call.id);
         tokio::fs::create_dir_all(&tools.spool_dir)
             .await
             .map_err(|err| {

@@ -109,6 +109,8 @@ pub(crate) struct State {
     pub(crate) streaming: Option<Accumulator>,
     /// Tool calls currently executing.
     pub(crate) pending_tool_calls: Vec<ToolCall>,
+    /// Set by `Agent::shutdown`: every later run begins cancelled.
+    pub(crate) shut_down: bool,
 }
 
 pub(crate) struct ActiveRun {
@@ -151,6 +153,7 @@ impl Agent {
                 run: None,
                 streaming: None,
                 pending_tool_calls: Vec::new(),
+                shut_down: false,
             }),
         }
     }
@@ -162,15 +165,21 @@ impl Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Registers a new run; `Error::Busy` if one is active.
+    /// Registers a new run; `Error::Busy` if one is active. After `shutdown` the run
+    /// begins cancelled with `CancelReason::Shutdown`.
     fn begin_run(state: &mut State) -> Result<CancellationToken, Error> {
         if state.run.is_some() {
             return Err(Error::Busy);
         }
         let cancel = CancellationToken::new();
+        let mut reason = None;
+        if state.shut_down {
+            cancel.cancel();
+            reason = Some(CancelReason::Shutdown);
+        }
         state.run = Some(ActiveRun {
             cancel: cancel.clone(),
-            reason: None,
+            reason,
         });
         Ok(cancel)
     }
@@ -184,8 +193,9 @@ impl Agent {
 
     /// Continues from the current transcript: executes the unanswered tool calls of a
     /// trailing assistant message, or requests a new turn after a user/tool-result
-    /// message. A trailing assistant message without tool calls is already complete:
-    /// returns `Done` without emitting events.
+    /// message. A trailing assistant message without tool calls is a settled reply: with
+    /// queued steering or follow-ups the run starts from them, otherwise this returns
+    /// `Done` without emitting events.
     pub async fn continue_run(&self) -> Result<RunOutcome, Error> {
         let cancel = {
             let mut state = self.lock();
@@ -200,7 +210,9 @@ impl Agent {
             match last {
                 None => return Err(Error::NothingToContinue),
                 Some(AgentMessage::Llm(Message::Assistant(message)))
-                    if message.tool_calls().next().is_none() =>
+                    if message.tool_calls().next().is_none()
+                        && state.steering.is_empty()
+                        && state.follow_up.is_empty() =>
                 {
                     return Ok(RunOutcome::Done);
                 }
@@ -227,6 +239,17 @@ impl Agent {
         let mut state = self.lock();
         if let Some(run) = &mut state.run {
             run.reason.get_or_insert(reason);
+            run.cancel.cancel();
+        }
+    }
+
+    /// Stops the agent for good: the active run is cancelled with `CancelReason::Shutdown`,
+    /// and every run started afterwards begins already cancelled the same way.
+    pub fn shutdown(&self) {
+        let mut state = self.lock();
+        state.shut_down = true;
+        if let Some(run) = &mut state.run {
+            run.reason.get_or_insert(CancelReason::Shutdown);
             run.cancel.cancel();
         }
     }
@@ -263,10 +286,7 @@ impl Agent {
         let state = self.lock();
         AgentSnapshot {
             running: state.run.is_some(),
-            streaming: state
-                .streaming
-                .as_ref()
-                .and_then(|acc| acc.message().cloned()),
+            streaming: state.streaming.as_ref().and_then(Accumulator::snapshot),
             pending_tool_calls: state.pending_tool_calls.clone(),
             queued_steering: state.steering.iter().cloned().collect(),
             queued_follow_up: state.follow_up.iter().cloned().collect(),

@@ -97,7 +97,7 @@ async fn accumulator_reproduces_done_message() {
         let events: Vec<AssistantEvent> = api
             .stream(
                 &model,
-                &transcript,
+                transcript.clone(),
                 SimpleStreamOptions::default(),
                 CancellationToken::new(),
             )
@@ -116,7 +116,7 @@ async fn accumulator_reproduces_done_message() {
             accumulator.apply(event);
         }
         // Rebuilt from `Start` and the block events alone, before `Done` replaces it.
-        assert_eq!(accumulator.message(), Some(done));
+        assert_eq!(accumulator.snapshot().as_ref(), Some(done));
         accumulator.apply(terminal);
         assert_eq!(accumulator.into_message().as_ref(), Some(done));
     }

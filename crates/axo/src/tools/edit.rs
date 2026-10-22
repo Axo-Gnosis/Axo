@@ -174,7 +174,8 @@ impl Tool for EditTool {
         tokio::fs::write(&absolute, &final_content)
             .await
             .map_err(|error| ToolError(fs_error(&error, "open", &absolute)))?;
-        self.tools
+        let ledger = self
+            .tools
             .ledger
             .record(&absolute, final_content.as_bytes());
         if let Some(error) = aborted() {
@@ -196,6 +197,7 @@ impl Tool for EditTool {
                 "diff": display,
                 "patch": patch,
                 "first_changed_line": first_changed_line,
+                "ledger": ledger,
             })),
             ..ToolOutput::default()
         })

@@ -19,6 +19,9 @@ use crate::model::Model;
 use crate::transcript::Transcript;
 use crate::types::ThinkingLevel;
 
+/// The error message of a request the caller cancelled.
+pub(crate) const ABORTED: &str = "Request was aborted";
+
 /// One wire API. Receives a transcript already passed through `transform_messages`
 /// and resolved auth. Never fails by returning `Err`: request, model and runtime failures
 /// end the stream with an `AssistantEvent::Error`.
@@ -26,7 +29,7 @@ pub trait Api: Send + Sync {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent>;
@@ -39,7 +42,7 @@ pub trait Streamer: Send + Sync {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         opts: SimpleStreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent>;

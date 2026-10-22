@@ -2,9 +2,12 @@
 //! shared by `read`, `write` and `edit`.
 
 use std::collections::BTreeMap;
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axo::tools::FileLedger;
 use axo::{PendingQuestions, SessionTools, StaticEnv};
 use axo_agent::{Tool, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
@@ -300,4 +303,36 @@ async fn own_writes_count_as_read() {
     .await
     .expect("write after own edit");
     assert_eq!(fx.get("n.txt"), b"rewritten\n");
+}
+
+#[tokio::test]
+async fn write_refuses_an_existing_file_it_cannot_read() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    fx.put("w.txt", b"keep");
+    let path = fx.path("w.txt");
+    std::fs::set_permissions(&path, Permissions::from_mode(0o200)).expect("chmod");
+    let error = fx
+        .call("write", json!({ "path": "w.txt", "content": "new" }))
+        .await
+        .unwrap_err();
+    std::fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("chmod");
+    assert!(error.starts_with("EACCES"), "{error}");
+    assert_eq!(fx.get("w.txt"), b"keep");
+}
+
+#[test]
+fn missing_files_share_one_key_through_symlinked_parents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("real");
+    let link = dir.path().join("link");
+    std::fs::create_dir(&real).expect("mkdir");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let ledger = FileLedger::default();
+    ledger.record(&link.join("new.txt"), b"x");
+    let recorded = ledger.recorded(&real.join("new.txt"));
+    assert!(recorded.is_some());
+    assert_eq!(recorded, ledger.recorded(&link.join("new.txt")));
 }

@@ -279,7 +279,7 @@ pub(crate) fn convert_messages(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let images: Vec<(&String, &String)> = result
+                let images: Vec<_> = result
                     .content
                     .iter()
                     .filter_map(|block| match block {

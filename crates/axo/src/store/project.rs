@@ -21,7 +21,7 @@ const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Projection {
     pub messages: Vec<AgentMessage>,
-    /// `provider/model-id` of the latest `model_change` or assistant message on the path.
+    /// `provider/model-id` of the latest `model_change` on the path.
     pub model: Option<String>,
     /// The latest `thinking_level_change` on the path.
     pub thinking: Option<ThinkingLevel>,
@@ -59,10 +59,6 @@ impl Projection {
             Entry::ModelChange {
                 provider, model_id, ..
             } => self.model = Some(format!("{provider}/{model_id}")),
-            Entry::Message {
-                message: AgentMessage::Llm(Message::Assistant(message)),
-                ..
-            } => self.model = Some(format!("{}/{}", message.provider, message.model)),
             Entry::ThinkingLevelChange { thinking_level, .. } => {
                 self.thinking = Some(*thinking_level);
             }

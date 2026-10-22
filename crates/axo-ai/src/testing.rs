@@ -8,7 +8,7 @@ use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{SimpleStreamOptions, Streamer};
+use crate::api::{ABORTED, SimpleStreamOptions, Streamer};
 use crate::event::AssistantEvent;
 use crate::model::{ApiKind, Model};
 use crate::transcript::Transcript;
@@ -25,6 +25,9 @@ pub enum ScriptedTurn {
     /// `Start`, a text block with one `"partial"` delta, then wait for cancellation and end
     /// with `Error` / `StopReason::Aborted`, keeping the partial text.
     HangUntilCancel,
+    /// Stream this message's blocks like `Reply`, then wait for cancellation and end with
+    /// `Error` / `StopReason::Aborted`, keeping the streamed blocks.
+    HangAfter(AssistantMessage),
 }
 
 /// Replays [`ScriptedTurn`]s in order, one per `stream` call, and records every request's
@@ -56,14 +59,14 @@ impl Streamer for ScriptedApi {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         _opts: SimpleStreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(transcript.clone());
+            .push(transcript);
         let turn = self
             .turns
             .lock()
@@ -77,6 +80,23 @@ impl Streamer for ScriptedApi {
                 message.provider = model.provider.clone();
                 message.model = model.id.clone();
                 stream::iter(reply_events(message)).boxed()
+            }
+            ScriptedTurn::HangAfter(mut message) => {
+                message.api = model.api;
+                message.provider = model.provider.clone();
+                message.model = model.id.clone();
+                let mut events = reply_events(message.clone());
+                events.pop(); // `Done`
+                message.stop_reason = StopReason::Aborted;
+                message.error_message = Some(ABORTED.into());
+                let aborted = stream::once(async move {
+                    cancel.cancelled().await;
+                    AssistantEvent::Error {
+                        reason: StopReason::Aborted,
+                        message,
+                    }
+                });
+                stream::iter(events).chain(aborted).boxed()
             }
             ScriptedTurn::Error(error) => {
                 let partial = AssistantMessage::empty(model);
@@ -100,7 +120,7 @@ impl Streamer for ScriptedApi {
                     text_signature: None,
                 });
                 message.stop_reason = StopReason::Aborted;
-                message.error_message = Some("Request was aborted".into());
+                message.error_message = Some(ABORTED.into());
                 let prefix = stream::iter([
                     AssistantEvent::Start { partial },
                     AssistantEvent::TextStart { content_index: 0 },

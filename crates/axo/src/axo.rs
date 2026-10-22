@@ -151,9 +151,10 @@ impl Axo {
 
     /// Opens a saved session for writing (`Error::SessionBusy` while another writer holds
     /// it) in the cwd it was started in. The transcript, model and thinking level come
-    /// from the session; `options.model`/`thinking` override them. A run left unfinished
-    /// is handled per `options.recovery`; a resumed run continues in the background, so
-    /// this returns right away (watch for its `run_end` via `Session::attach`).
+    /// from the session; `options.model`/`thinking` override them. A run left unfinished,
+    /// or input submitted after the last run settled, is handled per `options.recovery`;
+    /// a resumed run (or one started for requeued prompts) continues in the background,
+    /// so this returns right away (watch for its `run_end` via `Session::attach`).
     pub async fn open_session(
         &self,
         path: &Path,

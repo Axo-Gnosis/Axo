@@ -14,8 +14,9 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::SessionTools;
-use crate::tools::grep::truncation_details;
-use crate::tools::truncate::{DEFAULT_MAX_BYTES, Limits, format_size, truncate_head};
+use crate::tools::truncate::{
+    DEFAULT_MAX_BYTES, Limits, format_size, truncate_head, truncation_details,
+};
 
 const DEFAULT_LIMIT: usize = 1000;
 

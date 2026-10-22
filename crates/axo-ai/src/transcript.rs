@@ -1,6 +1,7 @@
 //! Transcripts: the prompt and tool set live in the message list as system messages.
 //! Port of pi `utils/transcript.ts` (plus the system-message text helpers of `utils/text.ts`).
 
+use std::borrow::Cow;
 use std::ops::Deref;
 
 use indexmap::IndexMap;
@@ -90,11 +91,11 @@ impl Transcript {
     }
 
     /// Keep later system messages in place when the model accepts them; otherwise collapse them.
-    pub fn resolve(&self, supports_mid_convo_system_messages: bool) -> Transcript {
+    pub fn resolve(&self, supports_mid_convo_system_messages: bool) -> Cow<'_, Transcript> {
         if supports_mid_convo_system_messages {
-            self.clone()
+            Cow::Borrowed(self)
         } else {
-            self.collapse_system_messages()
+            Cow::Owned(self.collapse_system_messages())
         }
     }
 }

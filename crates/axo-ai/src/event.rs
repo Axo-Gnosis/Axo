@@ -162,14 +162,11 @@ impl Accumulator {
             AssistantEvent::ToolCallDelta {
                 content_index,
                 delta,
-            } => {
-                let buffer = self.tool_args.entry(*content_index).or_default();
-                buffer.push_str(delta);
-                let arguments = parse_streaming(buffer);
-                if let Some(AssistantBlock::ToolCall(call)) = self.block_mut(*content_index) {
-                    call.arguments = arguments;
-                }
-            }
+            } => self
+                .tool_args
+                .entry(*content_index)
+                .or_default()
+                .push_str(delta),
             AssistantEvent::TextEnd {
                 content_index,
                 block,
@@ -188,13 +185,18 @@ impl Accumulator {
         }
     }
 
-    /// The message so far; `None` before `Start` (or a setup `Error`).
-    pub fn message(&self) -> Option<&AssistantMessage> {
-        self.message.as_ref()
+    /// The message so far, with the arguments of tool calls still streaming parsed from
+    /// their partial JSON; `None` before `Start` (or a setup `Error`).
+    pub fn snapshot(&self) -> Option<AssistantMessage> {
+        let mut message = self.message.clone()?;
+        parse_tool_args(&mut message, &self.tool_args);
+        Some(message)
     }
 
     pub fn into_message(self) -> Option<AssistantMessage> {
-        self.message
+        let mut message = self.message?;
+        parse_tool_args(&mut message, &self.tool_args);
+        Some(message)
     }
 
     fn put(&mut self, index: usize, block: AssistantBlock) {
@@ -209,6 +211,15 @@ impl Accumulator {
 
     fn block_mut(&mut self, index: usize) -> Option<&mut AssistantBlock> {
         self.message.as_mut()?.content.get_mut(index)
+    }
+}
+
+/// Arguments are parsed only when a message is taken, not on every delta.
+fn parse_tool_args(message: &mut AssistantMessage, tool_args: &HashMap<usize, String>) {
+    for (index, buffer) in tool_args {
+        if let Some(AssistantBlock::ToolCall(call)) = message.content.get_mut(*index) {
+            call.arguments = parse_streaming(buffer);
+        }
     }
 }
 

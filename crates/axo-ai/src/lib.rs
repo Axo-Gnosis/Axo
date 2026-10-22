@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod cost;
 pub mod error;
+pub mod estimate;
 pub mod event;
 pub mod json;
 pub mod model;
@@ -33,7 +34,7 @@ pub use models::{Models, ModelsOptions};
 #[cfg(feature = "testing")]
 pub use testing::{ScriptedApi, ScriptedTurn};
 pub use transcript::{Context, Transcript};
-pub use transform::transform_messages;
+pub use transform::{drop_failed_turns, transform_messages};
 pub use types::{
     AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, StopReason, SystemMessage,
     TextBlock, ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec, Usage, UsageCost, UserBlock,

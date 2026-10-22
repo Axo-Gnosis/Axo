@@ -7,7 +7,7 @@ use axo_ai::transcript::{current_tools, tool_state_changes};
 use axo_ai::{
     Accumulator, AssistantEvent, AssistantMessage, Context, Message, Model, SimpleStreamOptions,
     StopReason, SystemMessage, ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec, Transcript,
-    UserBlock, now_ms,
+    UserBlock, drop_failed_turns, now_ms,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -24,7 +24,7 @@ use crate::hooks::{
     AfterToolCallContext, AgentContext, BeforeToolCallContext, PrepareRequestContext,
     ToolCallDecision, TurnContext, TurnDecision,
 };
-use crate::message::AgentMessage;
+use crate::message::{AgentMessage, unanswered_calls};
 use crate::tool::{ExecutionMode, Tool, ToolOutput, ToolUpdate};
 
 /// How a run starts.
@@ -32,8 +32,8 @@ pub(crate) enum RunStart {
     /// `Agent::prompt`: append and emit these messages, then request a turn.
     Prompt(Vec<AgentMessage>),
     /// `Agent::continue_run` on a non-empty transcript whose last message is a user or
-    /// tool-result message, or an assistant message with unanswered tool calls (those
-    /// calls run first).
+    /// tool-result message, an assistant message with unanswered tool calls (those calls
+    /// run first), or a settled reply with queued steering or follow-ups.
     Continue,
 }
 
@@ -111,11 +111,26 @@ impl Run<'_> {
                 pending = self.drain_queue(true).await;
             }
             RunStart::Continue => {
-                resume = unanswered_calls(&self.context.messages);
+                resume = unanswered_calls(self.context.messages.iter()).map(|(message, calls)| {
+                    let calls: Vec<ToolCall> = calls.into_iter().cloned().collect();
+                    (message.clone(), calls)
+                });
                 // Steering polled now would be overwritten by the poll after the resumed
                 // calls finish, so only poll when there is nothing to resume.
                 if resume.is_none() {
                     pending = self.drain_queue(true).await;
+                    // After a settled reply only queued input starts a turn (pi `agent.ts`
+                    // `continue`): follow-ups count when there is no steering.
+                    let after_reply = matches!(
+                        self.context.messages.iter().rev().find(|message| !matches!(
+                            message,
+                            AgentMessage::Llm(Message::System(_))
+                        )),
+                        Some(AgentMessage::Llm(Message::Assistant(_)))
+                    );
+                    if pending.is_empty() && after_reply {
+                        pending = self.drain_queue(false).await;
+                    }
                 }
             }
         }
@@ -255,17 +270,11 @@ impl Run<'_> {
             .hooks
             .transform_context(self.context.messages.clone(), &self.cancel)
             .await;
-        let mut messages = agent.hooks.convert_to_llm(&messages);
+        let mut messages = agent.hooks.convert_to_llm(messages);
         // Failed and aborted turns stay in the transcript but are never sent (providers'
         // `transform_messages` applies the same rule; doing it here keeps every request,
         // whatever the `Streamer`, free of them).
-        messages.retain(|message| {
-            !matches!(
-                message,
-                Message::Assistant(assistant)
-                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
-            )
-        });
+        drop_failed_turns(&mut messages);
         let transcript = Transcript::normalize(Context {
             system_prompt: None,
             messages,
@@ -280,7 +289,7 @@ impl Run<'_> {
         let mut stream =
             agent
                 .streamer
-                .stream(&model, &transcript, options, self.cancel.child_token());
+                .stream(&model, transcript, options, self.cancel.child_token());
 
         agent.lock().streaming = Some(Accumulator::new());
         let mut started = false;
@@ -606,9 +615,10 @@ impl Run<'_> {
     /// Ends the run after a response that failed or was aborted (no tool execution).
     async fn end_failed_turn(&mut self, message: AssistantMessage) -> Result<RunOutcome, Error> {
         if message.stop_reason == StopReason::Aborted {
-            // The aborted message is never sent, so its calls need no results: one would
-            // answer a call the model never sees.
-            return self.end_aborted_turn(message, &[], Vec::new()).await;
+            // User aborts answer every call so the saved transcript is complete, and
+            // `drop_failed_turns` keeps the turn and its results out of requests.
+            let calls: Vec<ToolCall> = message.tool_calls().cloned().collect();
+            return self.end_aborted_turn(message, &calls, Vec::new()).await;
         }
         // The decision is ignored: a failed turn always ends the run.
         self.agent
@@ -986,32 +996,4 @@ fn declare_tool_changes(
         }
     }
     pending
-}
-
-/// The last assistant message's calls that no later tool result answers, when only tool
-/// results (or system messages) follow it. Failed and aborted responses are never
-/// resumed: continuing after them requests a new turn.
-fn unanswered_calls(messages: &[AgentMessage]) -> Option<(AssistantMessage, Vec<ToolCall>)> {
-    let mut answered = Vec::new();
-    for message in messages.iter().rev() {
-        match message {
-            AgentMessage::Llm(Message::ToolResult(result)) => answered.push(&result.tool_call_id),
-            AgentMessage::Llm(Message::System(_)) => {}
-            AgentMessage::Llm(Message::Assistant(assistant))
-                if !matches!(
-                    assistant.stop_reason,
-                    StopReason::Error | StopReason::Aborted
-                ) =>
-            {
-                let calls: Vec<ToolCall> = assistant
-                    .tool_calls()
-                    .filter(|call| !answered.contains(&&call.id))
-                    .cloned()
-                    .collect();
-                return (!calls.is_empty()).then(|| (assistant.clone(), calls));
-            }
-            _ => return None,
-        }
-    }
-    None
 }

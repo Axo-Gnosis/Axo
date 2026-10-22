@@ -129,7 +129,7 @@ async fn stream_once(
     let mut events = Streamer::stream(
         models,
         model,
-        &transcript,
+        transcript,
         opts.clone(),
         CancellationToken::new(),
     );

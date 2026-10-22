@@ -125,7 +125,7 @@ fn foreign_model_thinking_is_dropped() {
         ),
     ]);
 
-    let output = transform_messages(&input, &target);
+    let output = transform_messages(input, &target);
 
     let contents: Vec<&Vec<AssistantBlock>> = output
         .iter()
@@ -155,7 +155,7 @@ fn errored_and_aborted_assistant_turns_are_omitted() {
         assistant(&target, vec![text("answer")], StopReason::Stop),
     ]);
 
-    let output = transform_messages(&input, &target);
+    let output = transform_messages(input.clone(), &target);
 
     let expected = [&input[0], &input[2], &input[4], &input[5]].map(Clone::clone);
     assert_eq!(output.messages(), expected);
@@ -185,7 +185,7 @@ fn pipe_tool_call_ids_are_normalized_for_anthropic() {
         ),
     ]);
 
-    let output = transform_messages(&input, &target);
+    let output = transform_messages(input, &target);
 
     let Message::Assistant(replayed) = &output[1] else {
         panic!("expected assistant, got {:?}", output[1]);
@@ -218,7 +218,7 @@ fn orphan_tool_call_gets_no_result_provided() {
         user("next"),
     ]);
 
-    let output = transform_messages(&input, &target);
+    let output = transform_messages(input, &target);
 
     assert_eq!(output.len(), 5);
     let Message::ToolResult(synthetic) = &output[3] else {
@@ -245,7 +245,7 @@ fn images_become_placeholders_for_text_only_model() {
         vec![InputKind::Text],
     );
     let image = || UserBlock::Image {
-        data: "aGVsbG8=".to_owned(),
+        data: "aGVsbG8=".into(),
         mime_type: "image/png".to_owned(),
     };
     let input = transcript(vec![
@@ -263,7 +263,7 @@ fn images_become_placeholders_for_text_only_model() {
         tool_result("call_1", vec![image()]),
     ]);
 
-    let output = transform_messages(&input, &target);
+    let output = transform_messages(input, &target);
 
     let Message::User(user) = &output[0] else {
         panic!("expected user, got {:?}", output[0]);

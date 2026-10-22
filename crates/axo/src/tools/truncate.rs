@@ -6,6 +6,8 @@
 
 use std::borrow::Cow;
 
+use serde_json::{Value, json};
+
 pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 /// Max chars per grep match line.
@@ -55,6 +57,25 @@ impl Truncation<'_> {
     pub fn truncated(&self) -> bool {
         self.truncated_by.is_some()
     }
+}
+
+/// pi's `TruncationResult` without its `content`, for tool details.
+pub(crate) fn truncation_details(truncation: &Truncation<'_>) -> Value {
+    json!({
+        "truncated": truncation.truncated(),
+        "truncatedBy": truncation.truncated_by.map(|by| match by {
+            TruncatedBy::Lines => "lines",
+            TruncatedBy::Bytes => "bytes",
+        }),
+        "totalLines": truncation.total_lines,
+        "totalBytes": truncation.total_bytes,
+        "outputLines": truncation.output_lines,
+        "outputBytes": truncation.output_bytes,
+        "lastLinePartial": truncation.last_line_partial,
+        "firstLineExceedsLimit": truncation.first_line_exceeds_limit,
+        "maxLines": truncation.max_lines,
+        "maxBytes": truncation.max_bytes,
+    })
 }
 
 /// `content` without a trailing newline and its line count (pi `splitLinesForCounting`).

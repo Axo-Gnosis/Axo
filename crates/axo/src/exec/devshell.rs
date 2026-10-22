@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::config::{BashSettings, DevShellMode};
 use crate::exec::{EnvMap, ExecEnv, Resolved};
@@ -33,6 +34,7 @@ const DUMP_END: &[u8] = b"__AXO_ENV_END__\0";
 /// original stdout. The hook's own stdout goes to stderr and its EXIT trap runs after the
 /// dump, so neither can corrupt it. The script's `nix-shell.*` temp dir is removed first.
 const CAPTURE_SCRIPT: &str = r#"exec 3>&1 1>&2
+[[ -r $1 ]] || { echo "axo: dev shell script $1 is missing"; exit 1; }
 source "$1"
 if [[ ${NIX_BUILD_TOP:-} == */nix-shell.* ]]; then rm -rf -- "$NIX_BUILD_TOP"; fi
 env -0 >&3
@@ -40,6 +42,11 @@ printf '%s\0' __AXO_ENV_END__ >&3
 "#;
 /// Lines of stderr kept in a failure notice.
 const NOTICE_TAIL_LINES: usize = 20;
+
+/// One capture at a time per cache key across every session in the process (each session
+/// owns its own `DevShellEnv`).
+static FLIGHTS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Mutex::default);
 
 /// Resolves, per `cwd`: an allowed `.envrc` (direnv) → the nearest `flake.nix` up to the
 /// git root (captured dev shell, `Auto` only) → `base`. Captures are cached in memory and
@@ -59,7 +66,6 @@ struct Inner {
     lookups: Mutex<HashMap<PathBuf, Lookup>>,
     direnv: Mutex<HashMap<PathBuf, DirenvState>>,
     shells: Mutex<HashMap<PathBuf, Arc<Capture>>>,
-    flights: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// Set by `invalidate`: an explicit reload recaptures instead of trusting the disk cache.
     disk_stale: AtomicBool,
 }
@@ -142,7 +148,6 @@ impl DevShellEnv {
                 lookups: Mutex::default(),
                 direnv: Mutex::default(),
                 shells: Mutex::default(),
-                flights: Mutex::default(),
                 disk_stale: AtomicBool::new(false),
             }),
         }
@@ -416,11 +421,10 @@ impl Inner {
     /// unchanged, else one capture per key while concurrent callers wait for it. The caller
     /// checks the warm path first and reports progress.
     async fn flake(self: &Arc<Self>, dir: PathBuf, cancel: &CancellationToken) -> Resolved {
-        let flight = self
-            .flights
+        let flight = FLIGHTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(dir.clone())
+            .entry(self.key_dir(&dir))
             .or_default()
             .clone();
         let guard = tokio::select! {
@@ -493,11 +497,12 @@ impl Inner {
     fn key_dir(&self, dir: &Path) -> PathBuf {
         // FNV-1a: stable across Rust releases, unlike `DefaultHasher`.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let parts = [
+        let mut parts = vec![
             dir.as_os_str().as_bytes(),
             self.settings.dev_shell_ref.as_bytes(),
             self.system.as_bytes(),
         ];
+        parts.extend(self.settings.dev_shell_watch.iter().map(String::as_bytes));
         for byte in parts.join(&0u8) {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -558,7 +563,7 @@ impl Inner {
                     (Ok(env), Ok(watch_json)) => {
                         // env.json first: watches.json validates the pair on the next load.
                         for (name, bytes) in [("env.json", env), ("watches.json", watch_json)] {
-                            let tmp = key_dir.join(format!("{name}.tmp"));
+                            let tmp = key_dir.join(format!("{name}.{}.tmp", Uuid::now_v7()));
                             let stored = match tokio::fs::write(&tmp, bytes).await {
                                 Ok(()) => tokio::fs::rename(&tmp, key_dir.join(name)).await,
                                 Err(err) => Err(err),
@@ -727,7 +732,7 @@ impl Inner {
         if !output.status.success() {
             return Err(stderr_tail(&output.stderr));
         }
-        let script = key_dir.join("dev-env.sh");
+        let script = key_dir.join(format!("dev-env-{}.sh", Uuid::now_v7()));
         tokio::fs::write(&script, &output.stdout)
             .await
             .map_err(|err| format!("Cannot write {}: {err}", script.display()))?;

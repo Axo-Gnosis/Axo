@@ -20,11 +20,12 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{RetryPolicy, send_with_retry};
+use crate::api::http::{RetryPolicy, error_body, send_with_retry};
 use crate::api::sse::{SseDecoder, SseEvent};
-use crate::api::{Api, SimpleStreamOptions, StreamOptions};
+use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions};
 use crate::cost::calculate_cost;
 use crate::error::Error;
+use crate::estimate::{CONTEXT_SAFETY_TOKENS, estimate_context_tokens};
 use crate::event::AssistantEvent;
 use crate::json::{parse_streaming, parse_tool_arguments};
 use crate::model::{
@@ -46,8 +47,6 @@ use crate::types::{
 /// the first non-empty one wins.
 const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
-const ABORTED: &str = "Request was aborted";
-
 const USER_AGENT: &str = concat!("axo-ai/", env!("CARGO_PKG_VERSION"));
 
 /// Provider error bodies longer than this are truncated in error messages.
@@ -55,10 +54,6 @@ const MAX_PROVIDER_ERROR_BODY_CHARS: usize = 4000;
 
 /// Tokens always left for the answer when a thinking budget shares the response ceiling.
 const MIN_ANSWER_TOKENS: u64 = 1024;
-
-const CHARS_PER_TOKEN: f64 = 3.5;
-const ESTIMATED_IMAGE_CHARS: usize = 4800;
-const CONTEXT_SAFETY_TOKENS: i64 = 4096;
 
 /// The OpenAI Chat Completions API.
 #[derive(Debug, Clone)]
@@ -76,14 +71,13 @@ impl Api for CompletionsApi {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         let (tx, rx) = mpsc::unbounded();
         let response = Response::new(model.clone(), tx);
         let http = self.http.clone();
-        let transcript = transcript.clone();
         // The request is driven by the returned stream itself: dropping the stream drops
         // the request.
         let producer =
@@ -938,96 +932,6 @@ fn apply_cache_control(messages: &mut [Value], tools: Option<&mut Vec<Value>>, m
     }
 }
 
-/// Estimated prompt tokens (pi `estimateContextTokens`): the usage of the last
-/// applicable assistant reply plus estimates for the messages after it.
-fn estimate_context_tokens(messages: &[Message]) -> u64 {
-    let tokens = |chars: usize| (chars as f64 / CHARS_PER_TOKEN).ceil() as u64;
-    let content_chars = |content: &[UserBlock]| -> usize {
-        content
-            .iter()
-            .map(|block| match block {
-                UserBlock::Text { text } => text.chars().count(),
-                UserBlock::Image { .. } => ESTIMATED_IMAGE_CHARS,
-            })
-            .sum()
-    };
-    let message_tokens = |message: &Message| -> u64 {
-        match message {
-            Message::System(system) => {
-                let added = if system.tools_added.is_empty() {
-                    0
-                } else {
-                    tokens(json!(system.tools_added).to_string().chars().count())
-                };
-                let removed = if system.tools_removed.is_empty() {
-                    0
-                } else {
-                    tokens(json!(system.tools_removed).to_string().chars().count())
-                };
-                tokens(system_message_text(system).chars().count()) + added + removed
-            }
-            Message::User(user) => tokens(content_chars(&user.content)),
-            Message::ToolResult(result) => tokens(content_chars(&result.content)),
-            Message::Assistant(assistant) => tokens(
-                assistant
-                    .content
-                    .iter()
-                    .map(|block| match block {
-                        AssistantBlock::Text { text, .. } => text.chars().count(),
-                        AssistantBlock::Thinking { thinking, .. } => thinking.chars().count(),
-                        AssistantBlock::ToolCall(call) => {
-                            call.name.chars().count()
-                                + Value::Object(call.arguments.clone())
-                                    .to_string()
-                                    .chars()
-                                    .count()
-                        }
-                    })
-                    .sum(),
-            ),
-        }
-    };
-
-    // A message newer than a reply (e.g. a compaction summary) invalidates its usage.
-    let mut latest_timestamp = i64::MIN;
-    let mut last_usage: Option<(usize, u64)> = None;
-    for (index, message) in messages.iter().enumerate() {
-        let timestamp = match message {
-            Message::System(system) => system.timestamp,
-            Message::User(user) => user.timestamp,
-            Message::ToolResult(result) => result.timestamp,
-            Message::Assistant(assistant) => {
-                let usage = &assistant.usage;
-                let used = if usage.total_tokens > 0 {
-                    usage.total_tokens
-                } else {
-                    usage.input + usage.output + usage.cache_read + usage.cache_write
-                };
-                if assistant.timestamp >= latest_timestamp
-                    && !matches!(
-                        assistant.stop_reason,
-                        StopReason::Aborted | StopReason::Error
-                    )
-                    && used > 0
-                {
-                    last_usage = Some((index, used));
-                }
-                assistant.timestamp
-            }
-        };
-        latest_timestamp = latest_timestamp.max(timestamp);
-    }
-    match last_usage {
-        Some((index, used)) => {
-            used + messages[index + 1..]
-                .iter()
-                .map(message_tokens)
-                .sum::<u64>()
-        }
-        None => messages.iter().map(message_tokens).sum(),
-    }
-}
-
 /// JavaScript truthiness of an optional JSON value.
 fn truthy(value: Option<&Value>) -> bool {
     match value {
@@ -1342,7 +1246,9 @@ impl Response {
         })?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            let Some(text) = error_body(response, cancel).await else {
+                return Err(ABORTED.to_owned());
+            };
             return Err(http_error_message(status, &text));
         }
         let _ = self.tx.unbounded_send(AssistantEvent::Start {

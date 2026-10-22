@@ -19,5 +19,5 @@ pub use hooks::{
     NoHooks, PrepareRequestContext, RequestUpdate, ToolCallDecision, TurnContext, TurnDecision,
     TurnUpdate,
 };
-pub use message::{AgentMessage, CustomMessage};
+pub use message::{AgentMessage, CustomMessage, unanswered_calls};
 pub use tool::{ExecutionMode, Replay, Tool, ToolError, ToolOutput, ToolUpdate};

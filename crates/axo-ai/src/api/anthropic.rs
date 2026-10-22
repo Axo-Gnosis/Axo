@@ -13,11 +13,12 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{RetryPolicy, send_with_retry};
+use crate::api::http::{RetryPolicy, error_body, send_with_retry};
 use crate::api::sse::{SseDecoder, SseEvent};
-use crate::api::{Api, SimpleStreamOptions, StreamOptions};
+use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions};
 use crate::cost::calculate_cost;
 use crate::error::Error;
+use crate::estimate::{CONTEXT_SAFETY_TOKENS, estimate_context_tokens};
 use crate::event::AssistantEvent;
 use crate::json::{parse_streaming, parse_tool_arguments, parse_with_repair};
 use crate::model::{ApiKind, Model, SessionAffinityFormat};
@@ -48,12 +49,8 @@ const ANTHROPIC_MESSAGE_EVENTS: [&str; 6] = [
 ];
 const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-const ABORTED: &str = "Request was aborted";
 /// Tokens always left for the answer when a thinking budget shares the response ceiling.
 const MIN_ANSWER_TOKENS: u64 = 1024;
-const CONTEXT_SAFETY_TOKENS: i64 = 4096;
-const CHARS_PER_TOKEN: f64 = 3.5;
-const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
 type Emit<'a> = &'a (dyn Fn(AssistantEvent) + Send + Sync);
 
@@ -72,14 +69,13 @@ impl Api for AnthropicApi {
     fn stream(
         &self,
         model: &Model,
-        transcript: &Transcript,
+        transcript: Transcript,
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         let (tx, rx) = mpsc::unbounded();
         let http = self.http.clone();
         let model = model.clone();
-        let transcript = transcript.clone();
         let driver = async move {
             let emit = |event: AssistantEvent| {
                 // The receiver only goes away when the caller dropped the stream.
@@ -250,90 +246,6 @@ fn clamp_max_tokens_to_context(model: &Model, messages: &[Message], max_tokens: 
     max_tokens.min(available.max(1) as u64)
 }
 
-/// pi `estimateContextTokens`: the usage of the last assistant response that still
-/// describes the prefix, plus estimates for the messages after it.
-fn estimate_context_tokens(messages: &[Message]) -> u64 {
-    let context_tokens = |usage: &Usage| match usage.total_tokens {
-        0 => usage.input + usage.output + usage.cache_read + usage.cache_write,
-        total => total,
-    };
-    let mut latest_prefix_timestamp = i64::MIN;
-    let mut last_usage: Option<(usize, u64)> = None;
-    for (index, message) in messages.iter().enumerate() {
-        let timestamp = match message {
-            Message::System(system) => system.timestamp,
-            Message::User(user) => user.timestamp,
-            Message::ToolResult(result) => result.timestamp,
-            Message::Assistant(assistant) => {
-                // A newer prefix message (e.g. a compaction summary) invalidates older usage.
-                let tokens = context_tokens(&assistant.usage);
-                if assistant.timestamp >= latest_prefix_timestamp
-                    && !matches!(
-                        assistant.stop_reason,
-                        StopReason::Aborted | StopReason::Error
-                    )
-                    && tokens > 0
-                {
-                    last_usage = Some((index, tokens));
-                }
-                assistant.timestamp
-            }
-        };
-        latest_prefix_timestamp = latest_prefix_timestamp.max(timestamp);
-    }
-    let (start, usage_tokens) = last_usage.map_or((0, 0), |(index, tokens)| (index + 1, tokens));
-    usage_tokens
-        + messages[start..]
-            .iter()
-            .map(estimate_message_tokens)
-            .sum::<u64>()
-}
-
-/// pi `estimateMessageTokens`: 3.5 UTF-16 code units per token, images as 4800 units.
-fn estimate_message_tokens(message: &Message) -> u64 {
-    let utf16 = |text: &str| text.encode_utf16().count();
-    let tokens = |chars: usize| (chars as f64 / CHARS_PER_TOKEN).ceil() as u64;
-    let content_chars = |content: &[UserBlock]| -> usize {
-        content
-            .iter()
-            .map(|block| match block {
-                UserBlock::Text { text } => utf16(text),
-                UserBlock::Image { .. } => ESTIMATED_IMAGE_CHARS,
-            })
-            .sum()
-    };
-    match message {
-        Message::System(system) => {
-            let tools = |json: Option<String>| json.map_or(0, |json| tokens(utf16(&json)));
-            tokens(utf16(&system_message_text(system)))
-                + tools(
-                    (!system.tools_added.is_empty())
-                        .then(|| serde_json::to_string(&system.tools_added).unwrap_or_default()),
-                )
-                + tools(
-                    (!system.tools_removed.is_empty())
-                        .then(|| serde_json::to_string(&system.tools_removed).unwrap_or_default()),
-                )
-        }
-        Message::User(user) => tokens(content_chars(&user.content)),
-        Message::ToolResult(result) => tokens(content_chars(&result.content)),
-        Message::Assistant(assistant) => tokens(
-            assistant
-                .content
-                .iter()
-                .map(|block| match block {
-                    AssistantBlock::Text { text, .. } => utf16(text),
-                    AssistantBlock::Thinking { thinking, .. } => utf16(thinking),
-                    AssistantBlock::ToolCall(call) => {
-                        utf16(&call.name)
-                            + utf16(&serde_json::to_string(&call.arguments).unwrap_or_default())
-                    }
-                })
-                .sum(),
-        ),
-    }
-}
-
 /// One request, from building the body to the last SSE event. Returns the stop reason
 /// for `Done`, or the error message for `Error`; `output` keeps the partial content.
 async fn run(
@@ -455,10 +367,8 @@ async fn run(
 /// The Anthropic SDK's `APIError` message: `<status> <body message or JSON or text>`.
 async fn error_response_message(response: reqwest::Response, cancel: &CancellationToken) -> String {
     let status = response.status().as_u16();
-    let text = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return ABORTED.to_owned(),
-        text = response.text() => text.unwrap_or_default(),
+    let Some(text) = error_body(response, cancel).await else {
+        return ABORTED.to_owned();
     };
     let detail = match serde_json::from_str::<Value>(&text) {
         Ok(body) => match body.get("message") {

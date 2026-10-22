@@ -14,6 +14,7 @@ use crate::tools::SessionTools;
 use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, fs_error, process_image};
 use crate::tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, TruncatedBy, format_size, truncate_head,
+    truncation_details,
 };
 
 const GUIDELINES: &[&str] = &["Use read to examine files instead of cat or sed."];
@@ -105,9 +106,8 @@ impl Tool for ReadTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
-        self.tools.ledger.record(&absolute, &bytes);
+        let mut details = json!({ "ledger": self.tools.ledger.record(&absolute, &bytes) });
 
-        let mut details = None;
         let content = if let Some(mime) =
             detect_image_mime(&bytes[..bytes.len().min(IMAGE_SNIFF_BYTES)])
         {
@@ -124,7 +124,7 @@ impl Tool for ReadTool {
                     vec![
                         UserBlock::Text { text: note },
                         UserBlock::Image {
-                            data: image.data,
+                            data: image.data.into(),
                             mime_type: image.mime_type.to_string(),
                         },
                     ]
@@ -193,24 +193,7 @@ impl Tool for ReadTool {
                 truncation.content.to_string()
             };
             if truncation.truncated() {
-                // pi's `TruncationResult` minus `content`, which the result already carries.
-                details = Some(json!({
-                    "truncation": {
-                        "truncated": true,
-                        "truncatedBy": match truncation.truncated_by {
-                            Some(TruncatedBy::Lines) => "lines",
-                            _ => "bytes",
-                        },
-                        "totalLines": truncation.total_lines,
-                        "totalBytes": truncation.total_bytes,
-                        "outputLines": truncation.output_lines,
-                        "outputBytes": truncation.output_bytes,
-                        "lastLinePartial": truncation.last_line_partial,
-                        "firstLineExceedsLimit": truncation.first_line_exceeds_limit,
-                        "maxLines": truncation.max_lines,
-                        "maxBytes": truncation.max_bytes,
-                    }
-                }));
+                details["truncation"] = truncation_details(&truncation);
             }
             vec![UserBlock::Text { text: output }]
         };
@@ -220,7 +203,7 @@ impl Tool for ReadTool {
         }
         Ok(ToolOutput {
             content,
-            details,
+            details: Some(details),
             ..ToolOutput::default()
         })
     }

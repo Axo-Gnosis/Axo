@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tools::SessionTools;
 use crate::tools::truncate::{
-    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Limits, TruncatedBy, Truncation, format_size,
-    truncate_head, truncate_line,
+    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Limits, format_size, truncate_head, truncate_line,
+    truncation_details,
 };
 
 const DEFAULT_LIMIT: usize = 100;
@@ -299,23 +299,4 @@ fn search(
         output,
         (!details.is_empty()).then_some(Value::Object(details)),
     ))
-}
-
-/// pi's `TruncationResult` without its `content`, for tool details.
-pub(super) fn truncation_details(truncation: &Truncation<'_>) -> Value {
-    json!({
-        "truncated": truncation.truncated(),
-        "truncatedBy": truncation.truncated_by.map(|by| match by {
-            TruncatedBy::Lines => "lines",
-            TruncatedBy::Bytes => "bytes",
-        }),
-        "totalLines": truncation.total_lines,
-        "totalBytes": truncation.total_bytes,
-        "outputLines": truncation.output_lines,
-        "outputBytes": truncation.output_bytes,
-        "lastLinePartial": truncation.last_line_partial,
-        "firstLineExceedsLimit": truncation.first_line_exceeds_limit,
-        "maxLines": truncation.max_lines,
-        "maxBytes": truncation.max_bytes,
-    })
 }

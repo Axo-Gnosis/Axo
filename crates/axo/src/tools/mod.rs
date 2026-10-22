@@ -11,13 +11,17 @@ pub mod truncate;
 pub mod write;
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use axo_agent::Tool;
+use axo_agent::{AgentMessage, Tool};
+use axo_ai::Message;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use regex::Regex;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::OwnedMutexGuard;
 use unicode_normalization::UnicodeNormalization;
 
@@ -146,39 +150,81 @@ pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
     list
 }
 
-/// The key two paths to the same file share: the canonical path, or the path itself when
-/// it does not exist yet.
+/// The key two paths to the same file share: the deepest existing ancestor canonicalized,
+/// with the missing tail re-appended, so a file not created yet keys the same through a
+/// symlinked parent. Falls back to the path itself when no ancestor resolves.
 fn file_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    path.ancestors()
+        .find_map(|ancestor| {
+            let canonical = std::fs::canonicalize(ancestor).ok()?;
+            let tail = path.strip_prefix(ancestor).ok()?;
+            Some(if tail.as_os_str().is_empty() {
+                canonical
+            } else {
+                canonical.join(tail)
+            })
+        })
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Full-file content hashes per canonical path, recorded by `read`, `write` and `edit`.
 #[derive(Debug, Default)]
-pub struct FileLedger(Mutex<HashMap<PathBuf, u64>>);
+pub struct FileLedger(Mutex<HashMap<PathBuf, String>>);
 
 impl FileLedger {
-    pub fn hash(content: &[u8]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        hasher.write(content);
-        hasher.finish()
+    /// The SHA-256 of `content`, base64url without padding.
+    pub fn hash(content: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(&Sha256::digest(content)[..])
     }
 
-    /// Records `content` as this session's view of `path`.
-    pub fn record(&self, path: &Path, content: &[u8]) {
+    /// Records `content` as this session's view of `path`, returning the record for the
+    /// tool result's `details.ledger` (see `restore`).
+    pub fn record(&self, path: &Path, content: &[u8]) -> Value {
         let hash = Self::hash(content);
+        let record = json!({ "path": path.to_string_lossy(), "sha256": hash });
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(file_key(path), hash);
+        record
     }
 
     /// The hash recorded for `path`, if this session has read or written it.
-    pub fn recorded(&self, path: &Path) -> Option<u64> {
+    pub fn recorded(&self, path: &Path) -> Option<String> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&file_key(path))
-            .copied()
+            .cloned()
+    }
+
+    /// Replaces the record with what `messages` show this session saw: the `details.ledger`
+    /// of every successful tool result, later results winning. Run on open and after
+    /// navigation, so the record matches the branch the model sees.
+    pub fn restore(&self, messages: &[AgentMessage]) {
+        let mut ledger = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        ledger.clear();
+        for message in messages {
+            let AgentMessage::Llm(Message::ToolResult(result)) = message else {
+                continue;
+            };
+            if result.is_error {
+                continue;
+            }
+            let Some(record) = result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("ledger"))
+            else {
+                continue;
+            };
+            if let (Some(path), Some(hash)) = (
+                record.get("path").and_then(Value::as_str),
+                record.get("sha256").and_then(Value::as_str),
+            ) {
+                ledger.insert(file_key(Path::new(path)), hash.to_owned());
+            }
+        }
     }
 }
 

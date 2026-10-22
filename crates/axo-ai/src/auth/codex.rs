@@ -30,6 +30,7 @@ const ORIGINATOR: &str = "axo";
 /// The provider id credentials are stored under.
 pub const PROVIDER: &str = "openai-codex";
 const PROVIDER_NAME: &str = "OpenAI";
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(15); // pi DEFAULT_OAUTH_REFRESH_TIMEOUT_MS
 
 /// Runs the browser login and stores the credential under `openai-codex`.
 ///
@@ -105,6 +106,7 @@ pub async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Cred
             ("client_id", CLIENT_ID),
         ],
     )
+    .timeout(REFRESH_TIMEOUT)
     .send()
     .await
     .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))?;

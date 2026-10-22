@@ -10,6 +10,7 @@ use regex::{Captures, Regex};
 
 use crate::config::AxoDir;
 use crate::context::{Diagnostic, git_root};
+use crate::tools::files::{normalize_to_lf, split_bom};
 
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,11 +202,7 @@ fn load_skill_file(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<Ski
 /// pi `extractFrontmatter`: BOM stripped, newlines normalized to `\n`; returns the YAML
 /// between the leading `---` and the next `\n---` (if any), and the trimmed body.
 fn split_frontmatter(content: &str) -> (Option<String>, String) {
-    let normalized = content
-        .strip_prefix('\u{feff}')
-        .unwrap_or(content)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let normalized = normalize_to_lf(split_bom(content).1);
     if !normalized.starts_with("---") {
         return (None, normalized);
     }
@@ -227,10 +224,10 @@ pub(crate) fn escape_xml(text: &str) -> String {
 }
 
 /// Expands a leading `/name args` naming one of `skills` into
-/// `<skill name="<name>" location="<path>">\n{body}\n</skill>` (body with arguments
-/// substituted), followed by the args line when non-empty. Any other text, an unknown
-/// name, or an unreadable skill file returns `text` unchanged (the last with a
-/// `tracing::warn!`). Blocking filesystem I/O.
+/// `<skill name="<name>" location="<path>">\nReferences are relative to <dir>.\n\n{body}\n</skill>`
+/// (body with arguments substituted), followed by the args line when non-empty. Any other
+/// text, an unknown name, or an unreadable skill file returns `text` unchanged (the last
+/// with a `tracing::warn!`). Blocking filesystem I/O.
 pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     let Some(rest) = text.strip_prefix('/') else {
         return text.to_owned();

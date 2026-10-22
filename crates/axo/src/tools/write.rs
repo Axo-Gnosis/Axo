@@ -1,6 +1,7 @@
 //! The `write` tool (pi `core/tools/write.ts`), plus the stale-file guard for existing
 //! files.
 
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -90,10 +91,15 @@ impl Tool for WriteTool {
             return Err(error);
         }
 
-        // An existing file must be the version this session last saw; a new file (or a
-        // path that can't be read as a file) needs no prior read.
-        if let Ok(current) = tokio::fs::read(&absolute).await {
-            check_fresh(&self.tools, &absolute, &path, &current)?;
+        // An existing file must be the version this session last saw, unless it already
+        // holds this content: rewriting it changes nothing and needs no read (this also lets
+        // a write replayed after a crash finish). A new file needs no prior read; any other
+        // read failure is reported rather than overwriting a file the session cannot see.
+        match tokio::fs::read(&absolute).await {
+            Ok(current) if current == content.as_bytes() => {}
+            Ok(current) => check_fresh(&self.tools, &absolute, &path, &current)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(ToolError(fs_error(&error, "open", &absolute))),
         }
 
         if let Some(dir) = absolute.parent() {
@@ -107,7 +113,7 @@ impl Tool for WriteTool {
         tokio::fs::write(&absolute, &content)
             .await
             .map_err(|error| ToolError(fs_error(&error, "open", &absolute)))?;
-        self.tools.ledger.record(&absolute, content.as_bytes());
+        let ledger = self.tools.ledger.record(&absolute, content.as_bytes());
         if let Some(error) = aborted() {
             return Err(error);
         }
@@ -116,6 +122,7 @@ impl Tool for WriteTool {
             content: vec![UserBlock::Text {
                 text: format!("Successfully wrote to {path}"),
             }],
+            details: Some(json!({ "ledger": ledger })),
             ..ToolOutput::default()
         })
     }
