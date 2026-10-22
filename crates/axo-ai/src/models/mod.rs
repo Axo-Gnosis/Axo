@@ -32,6 +32,8 @@ use self::config::{ModelsConfig, merge_compat};
 pub struct ModelsOptions {
     /// Where `models.dev.json` is cached; `None` runs without the catalog.
     pub cache_dir: Option<PathBuf>,
+    /// Run catalog and built-in models at their full window even past a context price tier.
+    pub extended_context: bool,
     pub config: ModelsConfig,
     pub credentials: Arc<dyn CredentialStore>,
 }
@@ -64,6 +66,9 @@ impl Models {
             None => None,
         };
         let (mut models, envs) = rules::build(catalog.as_ref());
+        if !opts.extended_context {
+            models.iter_mut().for_each(rules::cap_at_price_tier);
+        }
         let mut providers: HashMap<String, ProviderEntry> = envs
             .into_iter()
             .map(|(id, env)| {

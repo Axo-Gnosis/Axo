@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let models = Models::load(ModelsOptions {
         cache_dir: Some(dir.join("cache")),
         config,
+        extended_context: false,
         credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
     })
     .await?;

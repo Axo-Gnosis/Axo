@@ -20,6 +20,7 @@ pub async fn axo(dir: &Path, turns: Vec<ScriptedTurn>) -> Axo {
     let models = Models::load(ModelsOptions {
         cache_dir: None,
         config,
+        extended_context: false,
         credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
     })
     .await

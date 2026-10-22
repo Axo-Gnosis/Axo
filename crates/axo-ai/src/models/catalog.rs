@@ -55,6 +55,8 @@ pub(crate) struct DevLimit {
     #[serde(default)]
     pub context: Option<u64>,
     #[serde(default)]
+    pub input: Option<u64>,
+    #[serde(default)]
     pub output: Option<u64>,
 }
 

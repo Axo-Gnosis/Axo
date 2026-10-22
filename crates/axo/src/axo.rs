@@ -89,6 +89,7 @@ impl AxoBuilder {
                 Models::load(ModelsOptions {
                     cache_dir: Some(dir.cache_dir()),
                     config: config::load_models_config(&dir)?,
+                    extended_context: settings.extended_context,
                     credentials: Arc::new(FileCredentialStore::new(dir.auth_path())),
                 })
                 .await?,

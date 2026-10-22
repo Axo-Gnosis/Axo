@@ -73,6 +73,8 @@ pub struct Settings {
     /// `provider/model-id`.
     pub default_model: Option<String>,
     pub default_thinking_level: ThinkingLevel,
+    /// User settings only: `Models` is built once per process.
+    pub extended_context: bool,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
     pub bash: BashSettings,
@@ -85,6 +87,7 @@ impl Default for Settings {
         Self {
             default_model: None,
             default_thinking_level: ThinkingLevel::Medium,
+            extended_context: false,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
             bash: BashSettings::default(),
@@ -214,7 +217,7 @@ impl Settings {
     /// and below `Trust` it never sets what runs code.
     /// `defaultModel` resolves commands and environment variables after merging.
     pub fn load(dir: &AxoDir, project: Option<(&Path, ProjectAccess)>) -> Result<Settings, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project"];
+        const USER_ONLY_KEYS: &[&str] = &["project", "extendedContext"];
 
         let mut path = dir.settings_path();
         let mut merged = Value::Object(Default::default());

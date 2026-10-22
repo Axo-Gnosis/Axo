@@ -69,7 +69,16 @@ pub(crate) fn build(catalog: Option<&Catalog>) -> (Vec<Model>, HashMap<String, V
                 thinking_level_map: None,
                 input,
                 cost: models_dev_cost(dev.cost.unwrap_or_default()),
-                context_window: limit.context.filter(|&context| context > 0).unwrap_or(4096),
+                context_window: limit
+                    .context
+                    .filter(|&context| context > 0)
+                    .map(|context| {
+                        limit
+                            .input
+                            .filter(|&input| input > 0)
+                            .map_or(context, |input| context.min(input))
+                    })
+                    .unwrap_or(4096),
                 max_tokens: limit.output.filter(|&output| output > 0).unwrap_or(4096),
                 headers: Default::default(),
                 compat: Compat::default(),
@@ -97,6 +106,19 @@ pub(crate) fn build(catalog: Option<&Catalog>) -> (Vec<Model>, HashMap<String, V
         apply_thinking_level_metadata(model);
     }
     (models, envs)
+}
+
+/// Without extended context, stop at the lowest context price tier's threshold.
+pub(crate) fn cap_at_price_tier(model: &mut Model) {
+    if let Some(threshold) = model
+        .cost
+        .tiers
+        .iter()
+        .map(|tier| tier.input_tokens_above)
+        .min()
+    {
+        model.context_window = model.context_window.min(threshold);
+    }
 }
 
 /// The provider table: which wire API and base URL a models.dev provider uses, or
