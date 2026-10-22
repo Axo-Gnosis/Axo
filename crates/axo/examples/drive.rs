@@ -3,10 +3,9 @@
 //!
 //! `drive [--dir <AXO_DIR>] [--cwd <path>] [--model <provider/id>] [--thinking <level>]
 //! [--answer recommended|first] [--resume <session.jsonl> [--fork <entry-id>]]
-//! [--request-id <id>] [--measure] [<prompt>]`
+//! [--request-id <id>] [<prompt>]`
 //!
-//! `--resume` without a prompt only lets recovery finish. `--measure` prints `VmRSS`
-//! with one idle session, three idle sessions, mid-turn and after the run settles.
+//! `--resume` without a prompt only lets recovery finish.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -46,7 +45,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut resume = None;
     let mut fork = None;
     let mut request_id = None;
-    let mut measure = false;
     let mut prompt = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -67,7 +65,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--resume" => resume = Some(PathBuf::from(args.next().ok_or("--resume needs a path")?)),
             "--fork" => fork = Some(args.next().ok_or("--fork needs an entry id")?),
             "--request-id" => request_id = Some(args.next().ok_or("--request-id needs an id")?),
-            "--measure" => measure = true,
             _ => prompt.push(arg),
         }
     }
@@ -75,7 +72,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if fork.is_some() && resume.is_none() {
         return Err("--fork needs --resume".into());
     }
-    if prompt.is_empty() && (resume.is_none() || measure) {
+    if prompt.is_empty() && resume.is_none() {
         return Err("a prompt is required".into());
     }
 
@@ -91,31 +88,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ask_enabled: true,
         ..SessionOptions::default()
     };
-
-    if measure {
-        let session = Arc::new(axo.create_session(options()).await?);
-        println!("session: {}", session.path().display());
-        println!("VmRSS idle-1: {}", vm_rss());
-        let _idle = [
-            axo.create_session(options()).await?,
-            axo.create_session(options()).await?,
-        ];
-        println!("VmRSS idle-3: {}", vm_rss());
-        let events = session.attach(None).await.events;
-        let printer = tokio::spawn(print_events(session.clone(), events, first, true));
-        let outcome = session.prompt(&prompt).await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                printer.abort();
-                return Err(error.into());
-            }
-        };
-        printer.await?;
-        println!("[run] {outcome:?}");
-        println!("VmRSS settled: {}", vm_rss());
-        return Ok(());
-    }
 
     let mut session = match &resume {
         Some(path) => axo.open_session(path, options()).await?,
@@ -136,7 +108,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // let it settle first.
     let attach = session.attach(None).await;
     if attach.live.agent.running {
-        match print_events(session.clone(), attach.events, first, false).await {
+        match print_events(session.clone(), attach.events, first).await {
             Some(outcome) => println!("[run] {outcome:?}"),
             None => println!("[run] unknown"),
         }
@@ -146,7 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let events = session.attach(None).await.events;
-    let printer = tokio::spawn(print_events(session.clone(), events, first, false));
+    let printer = tokio::spawn(print_events(session.clone(), events, first));
     let result = session
         .prompt_with(PromptRequest {
             text: prompt,
@@ -171,30 +143,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `VmRSS` from `/proc/self/status`, e.g. `12345 kB`.
-fn vm_rss() -> String {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("VmRSS:"))
-                .map(|value| value.trim().to_owned())
-        })
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
 /// Prints events and answers questions until the run's `run_end` entry; returns its
-/// outcome (`None` if the channel closed first). With `measure`, prints `VmRSS` at the
-/// first streaming update.
+/// outcome (`None` if the channel closed first).
 async fn print_events(
     session: Arc<Session>,
     mut events: broadcast::Receiver<SessionEvent>,
     first: bool,
-    measure: bool,
 ) -> Option<store::RunOutcome> {
     let mut stdout = std::io::stdout();
-    let mut measured = !measure;
     loop {
         let event = match events.recv().await {
             Ok(event) => event,
@@ -207,22 +163,16 @@ async fn print_events(
                 ..
             }) => return Some(outcome),
             SessionEvent::Agent(AgentEvent::TurnStart) => println!("[turn]"),
-            SessionEvent::Agent(AgentEvent::MessageUpdate { event }) => {
-                if !measured {
-                    measured = true;
-                    println!("VmRSS mid-turn: {}", vm_rss());
-                }
-                match event {
-                    AssistantEvent::TextStart { .. } => print!("[text] "),
-                    AssistantEvent::TextDelta { delta, .. } => print!("{delta}"),
-                    AssistantEvent::TextEnd { .. } => println!(),
-                    AssistantEvent::ToolCallEnd {
-                        block: AssistantBlock::ToolCall(call),
-                        ..
-                    } => println!("[tool] {} {}", call.name, Value::Object(call.arguments)),
-                    _ => {}
-                }
-            }
+            SessionEvent::Agent(AgentEvent::MessageUpdate { event }) => match event {
+                AssistantEvent::TextStart { .. } => print!("[text] "),
+                AssistantEvent::TextDelta { delta, .. } => print!("{delta}"),
+                AssistantEvent::TextEnd { .. } => println!(),
+                AssistantEvent::ToolCallEnd {
+                    block: AssistantBlock::ToolCall(call),
+                    ..
+                } => println!("[tool] {} {}", call.name, Value::Object(call.arguments)),
+                _ => {}
+            },
             SessionEvent::Agent(AgentEvent::ToolExecutionEnd {
                 name,
                 result,

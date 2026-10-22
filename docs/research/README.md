@@ -70,6 +70,21 @@ PSS, idle, with empty profiles and no model calls, so these are lower bounds:
 | `pi --mode rpc`, ×3 | 160–209 |
 | pi SDK, 3 sessions in one Node process | 84–119 |
 
+### axo
+
+| Mode / sampling point | 1 session PSS (MiB) | 3 sessions PSS (MiB) |
+|---|---:|---:|
+| Scripted, idle | 13.7 | 15.6 |
+| Scripted, mid-turn | 14.5 | 16.9 |
+| Live, idle | 91.7 | 91.7 |
+| Live, mid-turn | 92.1 | Unavailable |
+
+Measured on 2026-10-22 with `cargo run --release -p axo --example memory`: PSS from `/proc/self/smaps_rollup`, one process per mode/session-count group, idle after 500 ms and mid-turn after every session's first text or thinking delta; the live model was `zebes/qwen3.8-27b`.
+
+The live three-session run timed out after 120 seconds: the server reports `--parallel 1`, so it cannot supply three simultaneous mid-turn streams. Its idle reading is retained; the missing mid-turn value is not estimated.
+
+All measured values are clearly under three `pi --mode rpc` processes (160–209 MiB), meeting the [core design's memory target](../core.md#build-order) for the measured cases; three simultaneously streaming live sessions remain unmeasured.
+
 ## Porting omp features onto pi
 
 Estimates from reading omp's source. Line counts exclude tests.
