@@ -39,8 +39,8 @@ axo/
 ├── Cargo.toml              workspace: shared versions, lints, edition 2024
 ├── flake.nix               dev shell
 ├── crates/
-│   ├── axo-ai/             types · event (AssistantEvent, Accumulator) · api (Api trait, sse,
-│   │                       anthropic, openai_completions) · transform · models · auth ·
+│   ├── axo-ai/             types · event (AssistantEvent, Accumulator) · api (Api trait, sse, http,
+│   │                       anthropic, completions, responses, codex) · transform · models · auth ·
 │   │                       retry · overflow · cost · json (partial/repair) · testing (ScriptedApi)
 │   ├── axo-agent/          agent (Agent, queues) · run (the loop) · tool (Tool, ToolOutput, Replay) ·
 │   │                       hooks (LoopHooks) · event (AgentEvent, delivery) · cancel (CancelReason)
@@ -171,7 +171,7 @@ struct ToolOutput { content: Vec<UserBlock>, details: Option<Value>, is_error: b
   - `details` is for hosts and logs only and never reaches the model.
 
 **Hooks.** A `LoopHooks` trait, every method with a no-op default. The hooks are:
-- `transform_context`, `convert_to_llm`, `api_key`;
+- `transform_context`, `convert_to_llm` (auth is resolved inside `Models::stream`, so there is no `api_key` hook);
 - `prepare_request`, `prepare_next_turn`, `finish_turn`;
 - `before_tool_call`, `after_tool_call`;
 - `steering`, `follow_up`.
