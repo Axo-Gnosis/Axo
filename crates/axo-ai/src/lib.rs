@@ -34,7 +34,7 @@ pub use model::{ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevel
 pub use models::config::ModelsConfig;
 pub use models::{Models, ModelsOptions};
 pub use overflow::{is_context_overflow, is_recoverable_length};
-pub use retry::{is_retryable_error, retry_delay};
+pub use retry::{is_fatal_error, is_retryable_error, retry_delay};
 #[cfg(feature = "testing")]
 pub use testing::{RecordedRequest, ScriptedApi, ScriptedTurn};
 pub use transcript::{Context, Transcript};

@@ -2,21 +2,23 @@
 use std::path::Path;
 
 use axo_agent::AgentMessage;
-use axo_ai::estimate::estimate_message_tokens;
+use axo_ai::estimate::{estimate_message_tokens, estimate_text_tokens};
 use axo_ai::{
-    Accumulator, AssistantBlock, Context, Message, Model, SimpleStreamOptions, StopReason,
-    Streamer, SystemMessage, ThinkingLevel, ToolChoice, Transcript, Usage, UserBlock, UserMessage,
-    drop_failed_turns, is_context_overflow, now_ms, retry_delay,
+    Accumulator, AssistantBlock, AssistantMessage, Context, Message, Model, SimpleStreamOptions,
+    StopReason, Streamer, SystemMessage, ThinkingLevel, ToolChoice, Transcript, Usage, UserBlock,
+    UserMessage, drop_failed_turns, is_context_overflow, now_ms, retry_delay,
 };
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{AxoDir, SummaryRequest};
-use crate::context::Diagnostic;
 use crate::context::prompt::prompt_override;
-use crate::session::lower_messages;
+use crate::context::{Diagnostic, lower_messages};
 
 pub(super) const TOO_LARGE: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
+const NOT_FINISHED: &str = "Summary response must finish normally without tool calls";
+const NOT_SMALLER: &str =
+    "Summary is empty, exceeds its output allowance, or does not shrink the replaced content";
 
 /// Summarizer instructions: bundled defaults, each replaceable by a `<NAME>.md` prompt file.
 #[derive(Debug)]
@@ -154,12 +156,9 @@ fn user(text: String) -> Message {
     })
 }
 
-fn text_tokens(text: &str) -> u64 {
-    // Keep the shared UTF-16 estimator as the sole token convention.
-    estimate_message_tokens(&user(text.to_owned()))
-}
-
 fn lowered(messages: &[AgentMessage]) -> Vec<Message> {
+    // Mirrors axo-agent's request pipeline: convert_to_llm then drop_failed_turns
+    // (SessionHooks has no transform_context).
     let mut messages = lower_messages(messages.to_vec());
     drop_failed_turns(&mut messages);
     messages
@@ -319,6 +318,18 @@ fn ceiling(
     }
 }
 
+fn response_text(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[allow(
     clippy::result_large_err,
     reason = "Failures retain billable usage inline; boxing adds an unnecessary allocation"
@@ -345,8 +356,15 @@ async fn request(
     let mut usage = Usage::default();
     let result = async {
         for retry in 0..=3 {
-            if cancel.is_cancelled() { return Err(SummaryFailure::aborted()); }
-            let mut stream = context.streamer.stream(context.model, transcript.clone(), options.clone(), cancel.clone());
+            if cancel.is_cancelled() {
+                return Err(SummaryFailure::aborted());
+            }
+            let mut stream = context.streamer.stream(
+                context.model,
+                transcript.clone(),
+                options.clone(),
+                cancel.clone(),
+            );
             let mut accumulator = Accumulator::new();
             let mut terminal = None;
             let mut cancelled = false;
@@ -367,13 +385,28 @@ async fn request(
                 }
             }
             let message = accumulator.into_message();
-            if let Some(message) = &message { add_usage(&mut usage, &message.usage); }
-            if cancelled || cancel.is_cancelled() { return Err(SummaryFailure::aborted()); }
-            let mut message = message.filter(|_| terminal.is_some()).ok_or_else(|| SummaryFailure::new("Summary stream ended without a terminal response", false))?;
+            if let Some(message) = &message {
+                add_usage(&mut usage, &message.usage);
+            }
+            if cancelled || cancel.is_cancelled() {
+                return Err(SummaryFailure::aborted());
+            }
+            let mut message = message.filter(|_| terminal.is_some()).ok_or_else(|| {
+                SummaryFailure::new("Summary stream ended without a terminal response", false)
+            })?;
             message.stop_reason = terminal.expect("terminal response checked");
-            if message.stop_reason == StopReason::Aborted { return Err(SummaryFailure::aborted()); }
+            if message.stop_reason == StopReason::Aborted {
+                return Err(SummaryFailure::aborted());
+            }
             if is_context_overflow(&message, context.model.context_window) {
-                return Err(SummaryFailure::new(if live { "Live summary exceeded the model context window" } else { TOO_LARGE }, !live));
+                return Err(SummaryFailure::new(
+                    if live {
+                        "Live summary exceeded the model context window"
+                    } else {
+                        TOO_LARGE
+                    },
+                    !live,
+                ));
             }
             if message.stop_reason == StopReason::Error {
                 if let Some(delay) = retry_delay(&message, retry) {
@@ -383,27 +416,33 @@ async fn request(
                     }
                     continue;
                 }
-                let diagnostic = message.error_message.as_deref().unwrap_or("Summary request failed");
-                let lower = diagnostic.to_ascii_lowercase();
-                let fatal = message.failure.as_ref().and_then(|failure| failure.status).is_some_and(|status| matches!(status, 401 | 403))
-                    || ["api key", "api_key", "unauthorized", "authentication", "credentials", "billing", "quota"].iter().any(|word| lower.contains(word));
-                return Err(SummaryFailure::new(diagnostic, fatal));
+                let diagnostic = message
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("Summary request failed");
+                return Err(SummaryFailure::new(
+                    diagnostic,
+                    axo_ai::is_fatal_error(&message),
+                ));
             }
             if message.stop_reason != StopReason::Stop || message.tool_calls().next().is_some() {
-                return Err(SummaryFailure::new("Summary response must finish normally without tool calls", false));
+                return Err(SummaryFailure::new(NOT_FINISHED, false));
             }
-            let text = message.content.iter().filter_map(|block| match block {
-                AssistantBlock::Text { text, .. } => Some(text.as_str()), _ => None,
-            }).collect::<Vec<_>>().join("\n");
-            let estimate = text_tokens(&text);
-            let generated_tokens = if message.usage.output > 0 { message.usage.output } else { estimate_message_tokens(&Message::Assistant(message)) };
+            let text = response_text(&message);
+            let estimate = estimate_text_tokens(&text);
+            let generated_tokens = if message.usage.output > 0 {
+                message.usage.output
+            } else {
+                estimate_message_tokens(&Message::Assistant(message))
+            };
             if text.trim().is_empty() || generated_tokens > output || estimate >= replaced_tokens {
-                return Err(SummaryFailure::new("Summary is empty, exceeds its output allowance, or does not shrink the replaced content", false));
+                return Err(SummaryFailure::new(NOT_SMALLER, false));
             }
             return Ok(text);
         }
         Err(SummaryFailure::new("Summary retry budget exhausted", false))
-    }.await;
+    }
+    .await;
     match result {
         Ok(text) => Ok(GeneratedSummary { text, usage }),
         Err(mut error) => {
@@ -490,7 +529,7 @@ pub(crate) async fn generate(
         error.usage = combined.usage;
         return Err(error);
     }
-    if text_tokens(&combined.text) >= input.replaced_tokens {
+    if estimate_text_tokens(&combined.text) >= input.replaced_tokens {
         return Err(SummaryFailure {
             usage: combined.usage,
             ..SummaryFailure::new(

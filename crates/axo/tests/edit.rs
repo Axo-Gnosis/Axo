@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axo::context::files::NestedContext;
-use axo::tools::FileLedger;
+use axo::tools::{FileAccess, FileLedger};
 use axo::{PendingQuestions, SessionTools, StaticEnv};
 use axo_agent::{Tool, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
@@ -333,7 +333,7 @@ fn missing_files_share_one_key_through_symlinked_parents() {
     std::fs::create_dir(&real).expect("mkdir");
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
     let ledger = FileLedger::default();
-    ledger.record(&link.join("new.txt"), b"x");
+    ledger.record(&link.join("new.txt"), b"x", FileAccess::Read);
     let recorded = ledger.recorded(&real.join("new.txt"));
     assert!(recorded.is_some());
     assert_eq!(recorded, ledger.recorded(&link.join("new.txt")));

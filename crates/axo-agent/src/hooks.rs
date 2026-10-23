@@ -56,7 +56,9 @@ pub struct TurnFinish {
 pub struct TurnContext<'a> {
     /// The assistant message that completed the turn.
     pub message: &'a AssistantMessage,
-    /// The model used for this response's actual provider request.
+    /// The model the run uses for this turn: the request model for streamed responses;
+    /// for resumed or recovered responses, the run's current model, which may not have
+    /// served `message` (compare `message.provider`/`message.model`).
     pub model: &'a Model,
     /// Tool results of the turn, in call order.
     pub tool_results: &'a [ToolResultMessage],
@@ -178,6 +180,10 @@ pub trait LoopHooks: Send + Sync {
     }
 
     /// Intercepts unusable responses before any tool side effects.
+    ///
+    /// `model` is the model the run uses for this turn: the request model for streamed
+    /// responses; for resumed or recovered responses, the run's current model, which
+    /// may not have served `message` (compare `message.provider`/`message.model`).
     fn should_skip_tools(&self, _response: &AssistantMessage, _model: &Model) -> bool {
         false
     }

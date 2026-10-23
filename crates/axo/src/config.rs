@@ -10,6 +10,12 @@ use serde_json::{Value, json};
 
 use crate::error::Error;
 
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The axo directory: `AXO_DIR`, else `$HOME/.axo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxoDir {
@@ -26,10 +32,8 @@ impl AxoDir {
         if let Some(dir) = std::env::var_os("AXO_DIR").filter(|dir| !dir.is_empty()) {
             return Ok(Self::new(PathBuf::from(dir)));
         }
-        let home = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .ok_or(Error::NoAxoDir)?;
-        Ok(Self::new(Path::new(&home).join(".axo")))
+        let home = home_dir().ok_or(Error::NoAxoDir)?;
+        Ok(Self::new(home.join(".axo")))
     }
 
     pub fn root(&self) -> &Path {
@@ -179,10 +183,10 @@ impl ProjectSettings {
         for (pattern, &value) in &self.paths {
             let expanded;
             let glob = if let Some(suffix) = pattern.strip_prefix("~/") {
-                let Some(home) = std::env::var_os("HOME") else {
+                let Some(home) = home_dir() else {
                     continue;
                 };
-                expanded = Path::new(&home).join(suffix).to_string_lossy().into_owned();
+                expanded = home.join(suffix).to_string_lossy().into_owned();
                 &expanded
             } else {
                 pattern.as_str()
@@ -356,8 +360,7 @@ fn read_settings_value(path: &Path) -> Result<Option<Value>, Error> {
         Some(value @ Value::Object(_)) => value,
         Some(_) => return Err(config_error("expected a JSON object".to_owned())),
     };
-    serde_json::from_value::<Settings>(value.clone())
-        .map_err(|error| config_error(error.to_string()))?;
+    Settings::deserialize(&value).map_err(|error| config_error(error.to_string()))?;
     Ok(Some(value))
 }
 

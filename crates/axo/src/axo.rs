@@ -240,12 +240,27 @@ impl Axo {
 
         let exec: Arc<dyn ExecEnv> = match exec_env {
             Some(exec) => exec,
-            None if settings.bash.dev_shell != DevShellMode::Off => Arc::new(DevShellEnv::new(
-                self.base_env.clone(),
-                settings.bash.clone(),
-                self.dir.cache_dir().join("devshell"),
-            )),
-            None => Arc::new(HostEnv(self.base_env.clone())),
+            None if settings.bash.dev_shell != DevShellMode::Off
+                && access == ProjectAccess::Trust =>
+            {
+                Arc::new(DevShellEnv::new(
+                    self.base_env.clone(),
+                    settings.bash.clone(),
+                    self.dir.cache_dir().join("devshell"),
+                ))
+            }
+            None => {
+                if settings.bash.dev_shell != DevShellMode::Off {
+                    tracing::warn!(
+                        mode = ?settings.bash.dev_shell,
+                        concat!(
+                            "bash.devShell runs project code and needs a trusted project; ",
+                            "using the host environment"
+                        )
+                    );
+                }
+                Arc::new(HostEnv(self.base_env.clone()))
+            }
         };
 
         Session::start(SessionSetup {

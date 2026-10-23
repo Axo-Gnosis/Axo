@@ -108,7 +108,7 @@ impl Deref for Transcript {
     }
 }
 
-fn system_messages(messages: &[Message]) -> impl Iterator<Item = &SystemMessage> {
+fn system_messages(messages: &[Message]) -> impl Iterator<Item = &SystemMessage> + Clone {
     messages.iter().filter_map(|message| match message {
         Message::System(system) => Some(system),
         _ => None,
@@ -161,7 +161,8 @@ pub fn current_tools(messages: &[Message]) -> Vec<ToolSpec> {
     replay_tools(system_messages(messages))
 }
 
-fn replay_tools<'a>(systems: impl Iterator<Item = &'a SystemMessage>) -> Vec<ToolSpec> {
+/// Replay tool additions and removals from system messages in order.
+pub fn replay_tools<'a>(systems: impl IntoIterator<Item = &'a SystemMessage>) -> Vec<ToolSpec> {
     let mut tools: IndexMap<String, ToolSpec> = IndexMap::new();
     for system in systems {
         for name in &system.tools_removed {
@@ -178,10 +179,20 @@ fn replay_tools<'a>(systems: impl Iterator<Item = &'a SystemMessage>) -> Vec<Too
 /// tools: later `content` is appended to the base prompt, `sections` are patched by
 /// name, and tools are resolved with [`current_tools`].
 pub fn current_system_message(messages: &[Message]) -> Option<SystemMessage> {
+    replay_system_message(system_messages(messages))
+}
+
+/// Replay system messages into the current prompt, sections, and tool set.
+pub fn replay_system_message<'a, I>(systems: I) -> Option<SystemMessage>
+where
+    I: IntoIterator<Item = &'a SystemMessage>,
+    I::IntoIter: Clone,
+{
+    let iter = systems.into_iter();
     let mut content = Vec::new();
     let mut sections: IndexMap<String, String> = IndexMap::new();
     let mut timestamp = None;
-    for system in system_messages(messages) {
+    for system in iter.clone() {
         timestamp.get_or_insert(system.timestamp);
         let text = system_content_text(system);
         if !text.is_empty() {
@@ -198,7 +209,7 @@ pub fn current_system_message(messages: &[Message]) -> Option<SystemMessage> {
             }
         }
     }
-    let tools = current_tools(messages);
+    let tools = replay_tools(iter.clone());
     if timestamp.is_none() && tools.is_empty() {
         return None;
     }

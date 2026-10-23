@@ -27,9 +27,15 @@ pub enum Error {
         "Agent is already processing. Use steer() or follow_up() to queue messages, or wait for completion."
     )]
     Busy,
-    /// Invalid compaction limits, rejected summaries, or aborted maintenance.
+    /// Invalid compaction limits, or a compaction that cannot be produced or was rejected.
     #[error("{0}")]
     Compaction(String),
+    #[error("Maintenance aborted")]
+    MaintenanceAborted,
+    #[error("Session context changed during maintenance")]
+    ContextChanged,
+    #[error("Invalid session history: {0}")]
+    InvalidHistory(String),
     /// `answer`/`dismiss` named a tool call with no pending question.
     #[error("No pending question for tool call: {0}")]
     NoPendingQuestion(String),

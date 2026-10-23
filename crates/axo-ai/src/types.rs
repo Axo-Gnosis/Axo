@@ -64,7 +64,7 @@ pub struct UserMessage {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderFailure {
     pub status: Option<u16>,

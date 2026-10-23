@@ -3,10 +3,31 @@
 use crate::transcript::system_message_text;
 use crate::types::{AssistantBlock, Message, StopReason, Usage, UserBlock};
 
-const CHARS_PER_TOKEN: f64 = 3.5;
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
 /// Tokens kept free below the context window when clamping a response ceiling.
 pub(crate) const CONTEXT_SAFETY_TOKENS: i64 = 4096;
+
+fn units_to_tokens(units: usize) -> u64 {
+    (units as u64 * 2).div_ceil(7)
+}
+
+/// Estimate tokens from UTF-16 code units, at 3.5 units per token.
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    units_to_tokens(text.encode_utf16().count())
+}
+
+/// Estimate user content tokens, counting each image as 4800 UTF-16 code units.
+pub fn estimate_blocks_tokens(content: &[UserBlock]) -> u64 {
+    units_to_tokens(
+        content
+            .iter()
+            .map(|block| match block {
+                UserBlock::Text { text } => text.encode_utf16().count(),
+                UserBlock::Image { .. } => ESTIMATED_IMAGE_CHARS,
+            })
+            .sum(),
+    )
+}
 
 /// pi `estimateContextTokens`: the usage of the last assistant response that still
 /// describes the prefix, plus estimates for the messages after it.
@@ -50,20 +71,11 @@ pub fn estimate_context_tokens(messages: &[Message]) -> u64 {
 /// pi `estimateMessageTokens`: 3.5 UTF-16 code units per token, images as 4800 units.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     let utf16 = |text: &str| text.encode_utf16().count();
-    let tokens = |chars: usize| (chars as f64 / CHARS_PER_TOKEN).ceil() as u64;
-    let content_chars = |content: &[UserBlock]| -> usize {
-        content
-            .iter()
-            .map(|block| match block {
-                UserBlock::Text { text } => utf16(text),
-                UserBlock::Image { .. } => ESTIMATED_IMAGE_CHARS,
-            })
-            .sum()
-    };
+    let tokens = units_to_tokens;
     match message {
         Message::System(system) => {
-            let tools = |json: Option<String>| json.map_or(0, |json| tokens(utf16(&json)));
-            tokens(utf16(&system_message_text(system)))
+            let tools = |json: Option<String>| json.map_or(0, |json| estimate_text_tokens(&json));
+            estimate_text_tokens(&system_message_text(system))
                 + tools(
                     (!system.tools_added.is_empty())
                         .then(|| serde_json::to_string(&system.tools_added).unwrap_or_default()),
@@ -73,8 +85,8 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                         .then(|| serde_json::to_string(&system.tools_removed).unwrap_or_default()),
                 )
         }
-        Message::User(user) => tokens(content_chars(&user.content)),
-        Message::ToolResult(result) => tokens(content_chars(&result.content)),
+        Message::User(user) => estimate_blocks_tokens(&user.content),
+        Message::ToolResult(result) => estimate_blocks_tokens(&result.content),
         Message::Assistant(assistant) => tokens(
             assistant
                 .content

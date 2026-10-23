@@ -75,6 +75,19 @@ pub(crate) async fn run_loop(
     }
 }
 
+struct Response {
+    message: AssistantMessage,
+    model: Model,
+    results: Vec<ToolResultMessage>,
+    recovered: bool,
+}
+
+struct Completed {
+    results: Vec<ToolResultMessage>,
+    continue_turn: bool,
+    outcome: Option<RunOutcome>,
+}
+
 /// One finished tool call, before it becomes a tool-result message.
 struct Outcome {
     call_id: String,
@@ -107,7 +120,7 @@ impl Run<'_> {
         self.emit(AgentEvent::AgentStart).await?;
         self.emit(AgentEvent::TurnStart).await?;
 
-        let mut resume = None;
+        let mut resume: Option<Response> = None;
         let mut pending = Vec::new();
         match start {
             RunStart::Prompt(messages) => {
@@ -121,27 +134,21 @@ impl Run<'_> {
                 model,
                 tool_results,
             } => {
-                resume = Some((response, model, tool_results, true));
+                resume = Some(Response {
+                    message: response,
+                    model,
+                    results: tool_results,
+                    recovered: true,
+                });
             }
             RunStart::Continue => {
-                resume = unanswered_calls(self.context.messages.iter()).map(|(message, _)| {
-                    let results = self
-                        .context
-                        .messages
-                        .iter()
-                        .filter_map(|entry| match entry {
-                            AgentMessage::Llm(Message::ToolResult(result))
-                                if message
-                                    .tool_calls()
-                                    .any(|call| call.id == result.tool_call_id) =>
-                            {
-                                Some(result.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    (message.clone(), self.model().0, results, false)
-                });
+                resume =
+                    unanswered_calls(self.context.messages.iter()).map(|unanswered| Response {
+                        message: unanswered.message.clone(),
+                        model: self.model().0,
+                        results: unanswered.results.into_iter().cloned().collect(),
+                        recovered: false,
+                    });
                 if resume.is_none() {
                     pending = self.drain_queue(true).await;
                     let after_reply = matches!(
@@ -158,16 +165,27 @@ impl Run<'_> {
             }
         }
 
-        let mut last_turn: Option<(AssistantMessage, Model, Vec<ToolResultMessage>)> = None;
+        let mut last_turn: Option<Response> = None;
         loop {
-            let (message, model, results, recovered) = match resume.take() {
+            let Response {
+                message,
+                model,
+                results,
+                recovered,
+            } = match resume.take() {
                 Some(resumed) => resumed,
                 None => {
                     if self.cancel.is_cancelled() {
                         return self.finish_aborted().await;
                     }
                     let mut prepared = Vec::new();
-                    if let Some((message, model, tool_results)) = &last_turn {
+                    if let Some(Response {
+                        message,
+                        model,
+                        results: tool_results,
+                        ..
+                    }) = &last_turn
+                    {
                         let update = agent
                             .hooks
                             .prepare_next_turn(
@@ -227,11 +245,20 @@ impl Run<'_> {
                     let Some((message, model)) = self.stream_turn().await? else {
                         return self.finish_aborted().await;
                     };
-                    (message, model, Vec::new(), false)
+                    Response {
+                        message,
+                        model,
+                        results: Vec::new(),
+                        recovered: false,
+                    }
                 }
             };
 
-            let (tool_results, continue_turn, outcome) = self
+            let Completed {
+                results,
+                continue_turn,
+                outcome,
+            } = self
                 .complete_response(&message, &model, results, recovered)
                 .await?;
             if let Some(outcome) = outcome {
@@ -244,7 +271,12 @@ impl Run<'_> {
                     return self.finish(RunOutcome::Done).await;
                 }
             }
-            last_turn = Some((message, model, tool_results));
+            last_turn = Some(Response {
+                message,
+                model,
+                results,
+                recovered,
+            });
         }
     }
 
@@ -256,7 +288,7 @@ impl Run<'_> {
         model: &Model,
         existing: Vec<ToolResultMessage>,
         recovered: bool,
-    ) -> Result<(Vec<ToolResultMessage>, bool, Option<RunOutcome>), Error> {
+    ) -> Result<Completed, Error> {
         let calls: Vec<ToolCall> = message.tool_calls().cloned().collect();
         let mut results = Vec::with_capacity(calls.len());
         let skipped = self.agent.hooks.should_skip_tools(message, model);
@@ -352,7 +384,11 @@ impl Run<'_> {
         }
         let continue_turn =
             decision == Some(TurnDecision::Continue) || (!calls.is_empty() && !terminate);
-        Ok((results, continue_turn, outcome))
+        Ok(Completed {
+            results,
+            continue_turn,
+            outcome,
+        })
     }
 
     async fn finish_aborted(&mut self) -> Result<RunOutcome, Error> {

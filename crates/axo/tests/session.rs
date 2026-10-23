@@ -214,37 +214,20 @@ async fn navigation_host(
     dir: &std::path::Path,
     turns: Vec<ScriptedTurn>,
 ) -> (axo::Axo, std::sync::Arc<axo_ai::ScriptedApi>, axo_ai::Model) {
-    use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi};
-    use std::sync::Arc;
-    let config = ModelsConfig::parse_jsonc(
-        r#"{"providers":{"test":{"api":"openai-completions","baseUrl":"http://127.0.0.1:9/v1",
-        "models":[{"id":"m","contextWindow":131072,"maxTokens":4096,"reasoning":true},
-                  {"id":"live","contextWindow":131072,"maxTokens":4096,"reasoning":true}]}}}"#,
-    )
-    .unwrap();
-    let models = Arc::new(
-        Models::load(ModelsOptions {
-            cache_dir: None,
-            config,
-            extended_context: false,
-            credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
-        })
-        .await
-        .unwrap(),
-    );
-    let live = models.find("test/live").unwrap().clone();
-    let api = Arc::new(ScriptedApi::new(turns));
     let mut settings = axo::Settings::default();
     settings.compaction.enabled = false;
-    let host = axo::Axo::builder()
-        .dir(dir.to_path_buf())
-        .settings(settings)
-        .models(models)
-        .streamer(api.clone())
-        .build()
-        .await
-        .unwrap();
-    (host, api, live)
+    let host = common::host(
+        dir,
+        json!([
+            {"id":"m", "contextWindow":131072, "maxTokens":4096, "reasoning":true},
+            {"id":"live", "contextWindow":131072, "maxTokens":4096, "reasoning":true},
+        ]),
+        settings,
+        turns,
+    )
+    .await;
+    let live = host.models.find("test/live").unwrap().clone();
+    (host.axo, host.api, live)
 }
 
 // Seed an abandoned branch whose raw text differs from its effective contribution.
@@ -339,7 +322,7 @@ async fn summarized_navigation_uses_effective_branch_and_preserves_live_selectio
     ))
     .await
     .unwrap();
-    let requests = api.recorded_requests();
+    let requests = api.requests();
     assert_eq!(requests.len(), 2);
     let request = requests.last().unwrap();
     let input = serde_json::to_string(request.transcript.messages()).unwrap();
@@ -411,11 +394,7 @@ async fn summarized_navigation_uses_effective_branch_and_preserves_live_selectio
         .unwrap();
     let plain = reopened.attach(None).await.missed;
     assert!(plain.iter().any(|seq| matches!(&seq.entry, Entry::Leaf { base } if base.parent_id.as_ref() == Some(&destination))));
-    assert_eq!(
-        api.recorded_requests().len(),
-        2,
-        "plain navigation never summarizes"
-    );
+    assert_eq!(api.requests().len(), 2, "plain navigation never summarizes");
 }
 
 #[tokio::test]
@@ -442,7 +421,7 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
         let result = if scenario == "cancel" {
             let cancel = async {
                 within(async {
-                    while api.recorded_requests().len() < 2 {
+                    while api.requests().len() < 2 {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -454,17 +433,16 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
         } else {
             within(operation).await
         };
-        let error = result.expect_err(scenario).to_string();
+        let error = result.expect_err(scenario);
         if scenario == "oversize" {
-            assert!(error.contains("Rewind to an earlier point"), "{error}");
-            assert_eq!(
-                api.recorded_requests().len(),
-                1,
-                "no doomed summary request"
+            assert!(
+                error.to_string().contains("Rewind to an earlier point"),
+                "{error}"
             );
+            assert_eq!(api.requests().len(), 1, "no doomed summary request");
         }
         if scenario == "cancel" {
-            assert!(error.contains("Maintenance aborted"), "{error}");
+            assert!(matches!(error, axo::Error::MaintenanceAborted), "{error}");
         }
         let after = session.attach(None).await;
         assert_eq!(

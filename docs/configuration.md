@@ -16,7 +16,7 @@ Resolved by `AxoDir::from_env()` (`AXO_DIR` when set and non-empty, else `$HOME/
 | `AGENTS.md` | `root().join("AGENTS.md")` | User-wide instructions loaded at the start of `project_context` |
 | `prompts/<NAME>.md` | `prompt_path(name)` | Prompt overrides: `SYSTEM.md`, `WORK.md`, `PROSE.md`, `SUMMARY.md`, `COMPACTION.md`, `COMPACTION_UPDATE.md`, `COMPACTION_SPLIT_TURN.md`, `BRANCH_SUMMARY.md` |
 | `skills/` | `skills_dir()` | User skills (`<skill>/SKILL.md`) |
-| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`) and per-session `<session>/bash/` spool directories |
+| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`), per-session `<session>/bash/` spool directories, and `<session>/context/` maintenance artifacts |
 | `cache/` | `cache_dir()` | Cached `models.dev` catalog (`cache/models.json`), bundled documentation (`cache/docs/`, via `docs_dir()` / `docs_path()`), and captured Nix dev-shell environments (`cache/devshell/`) |
 
 When `homeAgentsDir` is `true` in `~/.axo/settings.jsonc`, `axo` also reads `~/.agents/AGENTS.md` (before `~/.axo/AGENTS.md`) and `~/.agents/skills/` (after `~/.axo/skills/`).
@@ -86,7 +86,7 @@ Settings files use JSON with Comments (JSONC), parsed with `jsonc-parser` (UTF-8
 
 | Key | Rust field | Default | Scope | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `defaultModel` | `default_model` | `None` | User or project | Model selector (`provider/id` or `id`). Resolved through `resolve_config_value`: `$ENV_VAR` reads the environment, `!command` runs `sh -c` (trimmed, 10 s timeout), and any other string is literal. A `!command` value in project settings requires `ProjectAccess::Trust` |
+| `defaultModel` | `default_model` | `None` | User or project | Model selector (`provider/id` or `id`). Accepts `$ENV` and `!command` (see [Config values](#config-values)); a `!command` value in project settings requires `ProjectAccess::Trust` |
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
 | `extendedContext` | `extended_context` | `false` | User only | When `false`, catalog and built-in model context windows are capped at the lowest `cost.tiers` threshold (`CostTier`). Ignored with a warning in project settings because `Models` is loaded once per `Axo` instance |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |
@@ -107,8 +107,8 @@ The `project` block is **user-only** (`~/.axo/settings.jsonc`). If present in `<
 | `ProjectAccess` | Effect |
 | :--- | :--- |
 | `Ignore` (`"ignore"`) | Loads no project settings, prompt overrides, context files, or skills |
-| `Read` (`"read"`) | Loads enabled markdown context files, skills, prompt overrides, and safe settings; strips `bash.devShell` and `!command` `defaultModel` from project settings with a warning |
-| `Trust` (`"trust"`) | Permits all project settings, including `bash.devShell` and `!command` `defaultModel` |
+| `Read` (`"read"`) | Loads enabled markdown context files, skills, prompt overrides, and safe settings; strips `bash.devShell` and `!command` `defaultModel` from project settings with a warning. Dev shells remain disabled even if enabled in user settings |
+| `Trust` (`"trust"`) | Permits all project settings, including `!command` `defaultModel`, and lets `bash.devShell` take effect regardless of which settings file enabled it |
 
 A Rust host can override the resolved access level per session via `SessionOptions::project_access`.
 
@@ -116,7 +116,7 @@ A Rust host can override the resolved access level per session via `SessionOptio
 
 | Key | Rust field | Default | Meaning |
 | :--- | :--- | :--- | :--- |
-| `bash.devShell` | `dev_shell` | `"off"` | `DevShellMode::Off` (`"off"`), `Direnv` (`"direnv"`), or `Nix` (`"nix"`). Project settings require `Trust` |
+| `bash.devShell` | `dev_shell` | `"off"` | `DevShellMode::Off` (`"off"`), `Direnv` (`"direnv"`), or `Nix` (`"nix"`). Takes effect only at `Trust`, whether enabled in user or project settings |
 | `bash.devShellRef` | `dev_shell_ref` | `".#default"` | Flake output reference appended to the flake directory when capturing with `nix print-dev-env` |
 | `bash.devShellWatch` | `dev_shell_watch` | `[]` | Additional globs relative to the flake root whose mtime/size changes trigger recapture |
 | `bash.devShellTimeoutMs` | `dev_shell_timeout_ms` | `600000` | Timeout in milliseconds for `nix print-dev-env` or `direnv export json` |
@@ -177,6 +177,35 @@ In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `fla
 - **Auto-discovery:** If a custom `"openai-completions"` provider omits `models` (`None`) and supplies `baseUrl`, `Models::load` queries `<baseUrl>/models` to populate its model list.
 - **Price-tier window caps:** For catalog and built-in models with `cost.tiers`, `extendedContext: false` caps `context_window` at the lowest positive `up_to` tier threshold. Models defined in `models.jsonc` or patched via `modelOverrides.contextWindow` keep their explicit window.
 - **Credentials (`auth.json` and environment):** `Models` resolves credentials in order:
-  1. `ProviderConfig::api_key` in `models.jsonc` (`!cmd`, `$ENV`, or literal).
+  1. `ProviderConfig::api_key` in `models.jsonc` (a [config value](#config-values): `!command`, `$ENV`, or literal).
   2. Stored credentials in `<AXO_DIR>/auth.json` (`Credential::ApiKey` or `Credential::OAuth`, refreshed under a per-provider lock and persisted with mode `0600`).
   3. Provider environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `DEEPSEEK_API_KEY`, `CEREBRAS_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `PERPLEXITY_API_KEY`, `COHERE_API_KEY`).
+
+## Config values
+
+Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of being used as written: `apiKey` and `headers` values in `models.jsonc` (on providers, models, and `modelOverrides`), and `defaultModel` in settings.
+
+| Form | Result |
+| :--- | :--- |
+| `!command` | Runs `bash -c command` and uses its trimmed stdout. Only a leading `!` counts |
+| `$NAME` / `${NAME}` | Replaced by the environment variable; can appear anywhere in the value (`"Bearer $TOKEN"`) |
+| `$$` / `$!` | A literal `$` / `!` (start a literal value that begins with `!` with `$!`) |
+| anything else | Used as written |
+
+```jsonc
+{
+  "providers": {
+    "zebes": {
+      "api": "openai-completions",
+      "baseUrl": "http://zebes:8080/v1",
+      "apiKey": "!pass show zebes/api-key",
+      "headers": { "X-Team": "$ZEBES_TEAM" }
+    }
+  }
+}
+```
+
+- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves once when settings load.
+- **Caching:** each distinct `!command` runs at most once per process; its output (or failure) is reused until the process restarts, so a rotated secret needs a restart.
+- **Failures:** a command that cannot start, exits non-zero, prints nothing, or runs past 10 seconds is a `Config` error, as is an unset or empty environment variable. stdin is closed and stderr is discarded.
+- **Trust:** a `!command` runs code. A project `defaultModel` starting with `!` is stripped below `Trust` (see [Project access](#project-access-project--axoprojectsettings)); `models.jsonc` is user-only.

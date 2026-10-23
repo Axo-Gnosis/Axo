@@ -1,8 +1,8 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
+use axo_ai::testing::read_http_request;
 use axo_ai::{
     AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, Compat, CompletionsApi,
     Context, Cost, InputKind, Model, ModelAuth, SimpleStreamOptions, StreamOptions, ToolChoice,
@@ -23,35 +23,7 @@ fn server(status: u16, headers: &str, body: &str) -> (String, JoinHandle<Value>)
     );
     let thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut bytes = Vec::new();
-        let (body_start, length) = loop {
-            let mut chunk = [0; 4096];
-            let count = stream.read(&mut chunk).unwrap();
-            assert_ne!(count, 0);
-            bytes.extend_from_slice(&chunk[..count]);
-            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                break (end + 4, length);
-            }
-        };
-        while bytes.len() < body_start + length {
-            let mut chunk = [0; 4096];
-            let count = stream.read(&mut chunk).unwrap();
-            assert_ne!(count, 0);
-            bytes.extend_from_slice(&chunk[..count]);
-        }
-        let body = serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap();
+        let body = read_http_request(&mut stream);
         stream.write_all(response.as_bytes()).unwrap();
         body
     });

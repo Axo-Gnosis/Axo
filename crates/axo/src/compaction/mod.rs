@@ -2,11 +2,17 @@
 pub(crate) mod elide;
 pub(crate) mod summary;
 
-use crate::store::{Entry, EntryId, Projection, SeqEntry};
-use crate::{CompactionSettings, Error};
+use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
+
 use axo_agent::AgentMessage;
-use axo_ai::{AssistantBlock, Message, Model, StopReason, UserBlock};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use axo_ai::estimate::estimate_blocks_tokens;
+use axo_ai::transcript::replay_system_message;
+use axo_ai::{Message, Model, StopReason};
+
+use crate::store::{Entry, EntryId, Projection, SeqEntry};
+use crate::tools::{FileAccess, ledger_access};
+use crate::{CompactionSettings, Error};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
@@ -57,18 +63,7 @@ impl Limits {
 pub(crate) fn message_tokens(message: &AgentMessage) -> u64 {
     match message {
         AgentMessage::Llm(message) => axo_ai::estimate::estimate_message_tokens(message),
-        AgentMessage::Custom(message) => {
-            // Same UTF-16 convention as the lowered User message, without cloning content.
-            let units: usize = message
-                .content
-                .iter()
-                .map(|block| match block {
-                    UserBlock::Text { text } => text.encode_utf16().count(),
-                    UserBlock::Image { .. } => 4800,
-                })
-                .sum();
-            (units as u64 * 2).div_ceil(7)
-        }
+        AgentMessage::Custom(message) => estimate_blocks_tokens(&message.content),
     }
 }
 fn system(message: &AgentMessage) -> bool {
@@ -87,9 +82,9 @@ fn tokens(messages: &[AgentMessage]) -> u64 {
     messages.iter().map(message_tokens).sum()
 }
 
-/// Projection has already invalidated usage by source ordering. Only system patches
-/// are copied to replay the current prompt; no transcript or raw-log clone is needed.
-pub(crate) fn estimate(projection: &Projection, _entries: &[SeqEntry]) -> u64 {
+/// Projection has already invalidated usage by source ordering. System patches
+/// replay the current prompt without cloning the transcript or raw log.
+pub(crate) fn estimate(projection: &Projection) -> u64 {
     for (at, message) in projection.messages.iter().enumerate().rev() {
         if let AgentMessage::Llm(Message::Assistant(assistant)) = message {
             let usage = &assistant.usage;
@@ -118,14 +113,11 @@ pub(crate) fn estimate(projection: &Projection, _entries: &[SeqEntry]) -> u64 {
 // Edits invalidate provider measurements, so clearing evaluates the actual
 // candidate with the same replayed-system fallback used by projection estimates.
 pub(super) fn estimate_messages(messages: &[AgentMessage]) -> u64 {
-    let systems: Vec<Message> = messages
-        .iter()
-        .filter_map(|message| match message {
-            AgentMessage::Llm(Message::System(value)) => Some(Message::System(value.clone())),
-            _ => None,
-        })
-        .collect();
-    let prompt = axo_ai::transcript::current_system_message(&systems).map_or(0, |value| {
+    let prompt = replay_system_message(messages.iter().filter_map(|message| match message {
+        AgentMessage::Llm(Message::System(value)) => Some(value),
+        _ => None,
+    }))
+    .map_or(0, |value| {
         axo_ai::estimate::estimate_message_tokens(&Message::System(value))
     });
     prompt.saturating_add(
@@ -139,12 +131,11 @@ pub(super) fn estimate_messages(messages: &[AgentMessage]) -> u64 {
 
 pub(crate) fn validate_projection(
     projection: &Projection,
-    entries: &[SeqEntry],
     before: u64,
     limits: &Limits,
     require_trigger: bool,
 ) -> Result<u64, Error> {
-    let after = estimate(projection, entries);
+    let after = estimate(projection);
     if after >= before {
         return Err(Error::Compaction(
             "Compaction did not make the projected context smaller".into(),
@@ -184,52 +175,33 @@ impl FileLists {
         serde_json::json!({"readFiles": self.read, "modifiedFiles": self.modified})
     }
 }
+
+pub(crate) fn history_summary(text: &str, session: &Path, files: &FileLists) -> String {
+    format!(
+        "{text}\n\nSession history: {}\n{}",
+        session.display(),
+        files.render()
+    )
+}
+
 pub(crate) fn file_lists<'a>(
     messages: impl Iterator<Item = &'a AgentMessage>,
     entries: impl Iterator<Item = &'a Entry>,
 ) -> FileLists {
     let mut read = BTreeSet::new();
     let mut modified = BTreeSet::new();
-    let mut add = |name: &str, args: &axo_ai::JsonMap| {
-        if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
-            match name {
-                "read" => {
+    for message in messages {
+        if let AgentMessage::Llm(Message::ToolResult(result)) = message
+            && let Some((path, access)) = ledger_access(result)
+        {
+            match access {
+                FileAccess::Read => {
                     read.insert(path.to_owned());
                 }
-                "write" | "edit" => {
+                FileAccess::Modify => {
                     modified.insert(path.to_owned());
                 }
-                _ => {}
             }
-        }
-    };
-    for message in messages {
-        match message {
-            AgentMessage::Llm(Message::Assistant(assistant)) => {
-                for block in &assistant.content {
-                    if let AssistantBlock::ToolCall(call) = block {
-                        add(&call.name, &call.arguments);
-                    }
-                }
-            }
-            AgentMessage::Llm(Message::ToolResult(result)) => {
-                if let Some(calls) = result
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.pointer("/nestedCalls/calls"))
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for call in calls {
-                        if let (Some(name), Some(args)) = (
-                            call.get("name").and_then(serde_json::Value::as_str),
-                            call.get("arguments").and_then(serde_json::Value::as_object),
-                        ) {
-                            add(name, args);
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
     for entry in entries {
@@ -437,7 +409,7 @@ pub(crate) fn prepare_compaction(
         files,
         first_kept_entry_id,
         preserved_user_ids: preserved,
-        tokens_before: estimate(projection, entries),
+        tokens_before: estimate(projection),
     })
 }
 
@@ -447,39 +419,23 @@ pub(crate) fn prepare_branch(
     entries: &[SeqEntry],
     target: Option<&EntryId>,
 ) -> Option<(summary::SummaryInput, FileLists)> {
-    let index: HashMap<&str, &Entry> = entries
+    let target_path: HashSet<usize> = target
+        .and_then(|target| {
+            entries
+                .iter()
+                .rposition(|entry| entry.entry.id() == Some(target.as_str()))
+        })
+        .map_or_else(HashSet::new, |at| {
+            crate::store::project::path_to(entries, at)
+                .into_iter()
+                .collect()
+        });
+    let common = projection
+        .path()
         .iter()
-        .filter_map(|e| e.entry.id().map(|id| (id, &e.entry)))
-        .collect();
-    let mut target_path = HashSet::new();
-    let mut cursor = target.map(EntryId::as_str);
-    while let Some(id) = cursor {
-        if !target_path.insert(id) {
-            break;
-        }
-        cursor = index.get(id).and_then(|entry| entry.parent_id());
-    }
-    let mut cursor = entries.last().and_then(|entry| match &entry.entry {
-        Entry::Leaf { base } => base.parent_id.as_ref().map(EntryId::as_str),
-        entry => entry.id(),
-    });
-    let mut visited = HashSet::new();
-    let mut common_id = None;
-    while let Some(id) = cursor {
-        if !visited.insert(id) {
-            break;
-        }
-        if target_path.contains(id) {
-            common_id = Some(id);
-            break;
-        }
-        cursor = index.get(id).and_then(|entry| entry.parent_id());
-    }
-    let common = common_id.and_then(|id| {
-        entries
-            .iter()
-            .rposition(|entry| entry.entry.id() == Some(id))
-    });
+        .rev()
+        .copied()
+        .find(|at| target_path.contains(at));
     let selected: Vec<_> = projection
         .sources
         .iter()

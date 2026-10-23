@@ -1,7 +1,7 @@
 //! Context projection: the messages, model and thinking level of the
 //! root→leaf path (pi `buildSessionProjection`, `SM:439-583`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axo_agent::{AgentMessage, CustomMessage};
 use axo_ai::{Message, ThinkingLevel, UserBlock};
@@ -36,9 +36,21 @@ pub struct Projection {
     processed: usize,
     /// Id of the entry the path ends at.
     leaf: Option<String>,
+    path: Vec<usize>,
+    omitted: HashSet<String>,
 }
 
 impl Projection {
+    /// Raw root-to-leaf entry indices, including entries hidden by edits.
+    pub fn path(&self) -> &[usize] {
+        &self.path
+    }
+
+    /// Whether the latest edit on the path omits `id`.
+    pub fn is_omitted(&self, id: &str) -> bool {
+        self.omitted.contains(id)
+    }
+
     /// Updates the projection for one newly appended entry, which becomes the
     /// current position. A child of the current leaf that is not a `leaf`,
     /// `context_edit` or `compaction` entry extends the projection in place;
@@ -61,6 +73,7 @@ impl Projection {
         }
         self.leaf = entry.entry.id().map(str::to_owned);
         self.processed = entries.len();
+        self.path.push(entries.len() - 1);
         self.track(&entry.entry);
         let start = self.messages.len();
         self.messages.extend(entry_messages(&entry.entry));
@@ -91,18 +104,15 @@ pub fn project(entries: &[SeqEntry], leaf: Option<&EntryId>) -> Projection {
     build(entries, leaf.map(EntryId::as_str))
 }
 
-fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
-    // pi `buildSessionPath`: later duplicates of an id win.
+/// Follows parents from `start`, with later duplicate ids winning.
+pub(crate) fn path_to(entries: &[SeqEntry], start: usize) -> Vec<usize> {
     let index: HashMap<&str, usize> = entries
         .iter()
         .enumerate()
         .filter_map(|(at, entry)| entry.entry.id().map(|id| (id, at)))
         .collect();
-    let start = leaf
-        .and_then(|id| index.get(id).copied())
-        .or(entries.len().checked_sub(1));
     let mut path = Vec::new();
-    let mut current = start;
+    let mut current = Some(start);
     while let Some(at) = current {
         if path.len() == entries.len() {
             tracing::warn!("session entries form a parent cycle; path cut");
@@ -115,6 +125,19 @@ fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
             .and_then(|parent| index.get(parent).copied());
     }
     path.reverse();
+    path
+}
+
+fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
+    let index: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| entry.entry.id().map(|id| (id, at)))
+        .collect();
+    let start = leaf
+        .and_then(|id| index.get(id).copied())
+        .or(entries.len().checked_sub(1));
+    let path = start.map_or_else(Vec::new, |at| path_to(entries, at));
 
     let mut projection = Projection {
         leaf: start.and_then(|at| entries[at].entry.id().map(str::to_owned)),
@@ -136,6 +159,11 @@ fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
             } => Some((target_id.as_str(), replacement)),
             _ => None,
         })
+        .collect();
+    projection.omitted = edits
+        .iter()
+        .filter(|(_, replacement)| replacement.is_none())
+        .map(|(&id, _)| id.to_owned())
         .collect();
     let invalid_before = path.iter().rposition(|&at| {
         matches!(
@@ -231,6 +259,7 @@ fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
             messages: start..projection.messages.len(),
         });
     }
+    projection.path = path;
     projection
 }
 

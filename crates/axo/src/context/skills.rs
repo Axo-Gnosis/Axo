@@ -9,7 +9,7 @@ use ignore::WalkBuilder;
 use regex::{Captures, Regex};
 
 use crate::config::AxoDir;
-use crate::context::{Diagnostic, git_root};
+use crate::context::{Diagnostic, project_dirs, project_root};
 use crate::tools::files::{normalize_to_lf, split_bom};
 
 /// One discovered skill.
@@ -38,14 +38,13 @@ pub fn load_skills(
 ) -> (Vec<Skill>, Vec<Diagnostic>) {
     let mut roots: Vec<PathBuf> = Vec::new();
     if project {
-        match git_root(cwd) {
-            Some(root) => roots.extend(
-                cwd.ancestors()
-                    .take_while(|ancestor| ancestor.starts_with(&root))
-                    .map(|ancestor| ancestor.join(".agents").join("skills")),
-            ),
-            None => roots.push(cwd.join(".agents").join("skills")),
-        }
+        let root = project_root(cwd);
+        roots.extend(
+            project_dirs(&root, cwd)
+                .into_iter()
+                .rev()
+                .map(|dir| dir.join(".agents").join("skills")),
+        );
     }
     roots.push(dir.skills_dir());
     roots.extend(home_agents.map(|home| home.join("skills")));

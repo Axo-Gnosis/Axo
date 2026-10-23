@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::files::{check_fresh, fs_error};
-use crate::tools::{SessionTools, lock_file};
+use crate::tools::{FileAccess, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &["Use write only for new files or complete rewrites."];
 
@@ -109,7 +109,10 @@ impl Tool for WriteTool {
         tokio::fs::write(&absolute, &content)
             .await
             .map_err(|error| ToolError(fs_error(&error, "open", &absolute)))?;
-        let ledger = self.tools.ledger.record(&absolute, content.as_bytes());
+        let ledger = self
+            .tools
+            .ledger
+            .record(&absolute, content.as_bytes(), FileAccess::Modify);
         if let Some(error) = aborted() {
             return Err(error);
         }
@@ -117,7 +120,7 @@ impl Tool for WriteTool {
         let mut content = vec![UserBlock::Text {
             text: format!("Successfully wrote to {path}"),
         }];
-        content.extend(self.tools.context.attach(&absolute));
+        content.extend(self.tools.context.attach(&absolute).await);
         Ok(ToolOutput {
             content,
             details: Some(json!({ "ledger": ledger })),

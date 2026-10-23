@@ -1,95 +1,66 @@
 //! Recoverable local shrinking. Selection is complete before artifact I/O begins.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axo_agent::AgentMessage;
-use axo_ai::{AssistantBlock, Message};
+use axo_ai::estimate::estimate_text_tokens;
+use axo_ai::{AssistantBlock, Message, UserBlock};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
+use super::Limits;
+use crate::Error;
 use crate::store::{ContextReplacement, EntryId};
-use crate::tools::{SessionTools, file_key};
+use crate::tools::{FileAccess, file_key, ledger_access};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ElisionMode {
     Elide,
     Images,
     Thinking,
-    Clearing { trigger: u64 },
+    Clearing { limits: Limits },
 }
 
-struct Artifact {
-    path: PathBuf,
-    bytes: Vec<u8>,
+pub(crate) struct Artifact {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
 }
 
-fn text_tokens(text: &str) -> u64 {
-    (text.encode_utf16().count() as u64 * 2).div_ceil(7)
+pub(crate) struct Elision {
+    pub edits: Vec<(EntryId, ContextReplacement)>,
+    pub artifacts: Vec<Artifact>,
 }
 
-fn artifact(tools: &SessionTools, extension: &str, bytes: Vec<u8>) -> Artifact {
+fn artifact(artifacts_dir: &Path, extension: &str, bytes: Vec<u8>) -> Artifact {
     Artifact {
-        path: tools
-            .spool_dir
-            .join(format!("context-{}.{}", uuid::Uuid::now_v7(), extension)),
+        path: artifacts_dir.join(format!("context-{}.{}", uuid::Uuid::now_v7(), extension)),
         bytes,
     }
 }
 
 /// `sources` contains only original ordinary sources, never synthetic summaries.
-/// The caller owns this snapshot and must not hold a session lock across the await.
-pub(crate) async fn prepare(
+pub(crate) fn prepare(
     messages: &[AgentMessage],
     sources: &[(EntryId, Range<usize>)],
-    tools: &SessionTools,
+    artifacts_dir: &Path,
     skill_paths: &[PathBuf],
     mode: ElisionMode,
-) -> Result<Option<Vec<(EntryId, ContextReplacement)>>, String> {
+) -> Result<Option<Elision>, Error> {
     let clearing = matches!(mode, ElisionMode::Clearing { .. });
-    if matches!(mode, ElisionMode::Clearing { trigger } if trigger < 20_000) {
+    if matches!(mode, ElisionMode::Clearing { limits } if limits.trigger < 20_000) {
         return Ok(None);
     }
     let skill_keys: HashSet<_> = skill_paths.iter().map(|path| file_key(path)).collect();
-    let mut calls = HashMap::new();
     let mut protected = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
-        match message {
-            AgentMessage::Llm(Message::Assistant(message)) => {
-                for block in &message.content {
-                    if let AssistantBlock::ToolCall(call) = block {
-                        calls.insert(call.id.as_str(), call);
-                    }
-                }
+        if let AgentMessage::Llm(Message::ToolResult(result)) = message
+            && let Some((path, FileAccess::Read)) = ledger_access(result)
+        {
+            let path = Path::new(path);
+            if path.ends_with("SKILL.md") || skill_keys.contains(&file_key(path)) {
+                protected.insert(index);
             }
-            AgentMessage::Llm(Message::ToolResult(result)) => {
-                let skill_path = |path: &str| {
-                    let path = tools.resolve_path(path);
-                    path.file_name().is_some_and(|name| name == "SKILL.md")
-                        || skill_keys.contains(&file_key(&path))
-                };
-                let paired = calls.get(result.tool_call_id.as_str()).is_some_and(|call| {
-                    call.name == "read"
-                        && call
-                            .arguments
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .is_some_and(skill_path)
-                });
-                let ledger = result.tool_name == "read"
-                    && result
-                        .details
-                        .as_ref()
-                        .and_then(|details| details.get("ledger"))
-                        .and_then(|ledger| ledger.get("path"))
-                        .and_then(Value::as_str)
-                        .is_some_and(skill_path);
-                if paired || ledger {
-                    protected.insert(index);
-                }
-            }
-            _ => {}
         }
     }
     let mut recent = 0u64;
@@ -132,148 +103,244 @@ pub(crate) async fn prepare(
         if clearing && !tool_result {
             continue;
         }
-        let content = match message {
-            AgentMessage::Llm(Message::User(message)) => serde_json::to_value(&message.content),
+        let (updated, content) = match message {
+            AgentMessage::Llm(Message::User(message)) => {
+                let Some(blocks) = elide_user_blocks(
+                    &message.content,
+                    mode,
+                    tool_result,
+                    artifacts_dir,
+                    &mut artifacts,
+                )?
+                else {
+                    continue;
+                };
+                let mut updated = message.clone();
+                updated.content = blocks;
+                let content =
+                    serde_json::to_value(&updated.content).expect("content blocks serialize");
+                (AgentMessage::Llm(Message::User(updated)), content)
+            }
             AgentMessage::Llm(Message::Assistant(message)) => {
-                serde_json::to_value(&message.content)
+                let Some(blocks) =
+                    elide_assistant_blocks(&message.content, mode, artifacts_dir, &mut artifacts)
+                else {
+                    continue;
+                };
+                let mut updated = message.clone();
+                updated.content = blocks;
+                let content =
+                    serde_json::to_value(&updated.content).expect("content blocks serialize");
+                (AgentMessage::Llm(Message::Assistant(updated)), content)
             }
             AgentMessage::Llm(Message::ToolResult(message)) => {
-                serde_json::to_value(&message.content)
+                let Some(blocks) = elide_user_blocks(
+                    &message.content,
+                    mode,
+                    tool_result,
+                    artifacts_dir,
+                    &mut artifacts,
+                )?
+                else {
+                    continue;
+                };
+                let mut updated = message.clone();
+                updated.content = blocks;
+                let content =
+                    serde_json::to_value(&updated.content).expect("content blocks serialize");
+                (AgentMessage::Llm(Message::ToolResult(updated)), content)
             }
-            AgentMessage::Custom(message) => serde_json::to_value(&message.content),
+            AgentMessage::Custom(message) => {
+                let Some(blocks) = elide_user_blocks(
+                    &message.content,
+                    mode,
+                    tool_result,
+                    artifacts_dir,
+                    &mut artifacts,
+                )?
+                else {
+                    continue;
+                };
+                let mut updated = message.clone();
+                updated.content = blocks;
+                let content =
+                    serde_json::to_value(&updated.content).expect("content blocks serialize");
+                (AgentMessage::Custom(updated), content)
+            }
             AgentMessage::Llm(Message::System(_)) => continue,
-        }
-        .map_err(|error| error.to_string())?;
-        let mut content = content;
-        let blocks = content
-            .as_array_mut()
-            .ok_or("message content is not an array")?;
-        // Inline skill instructions also protect attached non-text content.
-        let has_skill = blocks
-            .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .any(|text| !skill_spans(text).is_empty());
-        let mut changed = false;
-        for block in blocks {
-            match (mode, block.get("type").and_then(Value::as_str)) {
-                (ElisionMode::Elide | ElisionMode::Clearing { .. }, Some("text")) => {
-                    let text = block["text"].as_str().ok_or("invalid text block")?;
-                    let ranges = if tool_result {
-                        unprotected_spans(text)
-                    } else {
-                        block_ranges(text)
-                    };
-                    let mut new_text = text.to_owned();
-                    for range in ranges.into_iter().rev() {
-                        let original = &text[range.clone()];
-                        let tokens = text_tokens(original);
-                        if (!clearing && tokens < 400) || original.contains("[shaken ") {
-                            continue;
-                        }
-                        let recovery = artifact(tools, "txt", original.as_bytes().to_vec());
-                        let marker = format!(
-                            "[shaken ~{tokens} tokens; full text: {}]",
-                            recovery.path.display()
-                        );
-                        if text_tokens(&marker) >= tokens {
-                            continue;
-                        }
-                        new_text.replace_range(range, &marker);
-                        artifacts.push(recovery);
-                    }
-                    if new_text != text {
-                        block["text"] = Value::String(new_text);
-                        if let Some(object) = block.as_object_mut() {
-                            object.remove("textSignature");
-                        }
-                        changed = true;
-                    }
-                }
-                (ElisionMode::Images, Some("image")) if !has_skill => {
-                    let data = block["data"].as_str().ok_or("invalid image data")?;
-                    let bytes = STANDARD
-                        .decode(data)
-                        .map_err(|error| format!("cannot recover image: {error}"))?;
-                    let extension = match block["mimeType"].as_str().unwrap_or("") {
-                        "image/png" => "png",
-                        "image/jpeg" => "jpg",
-                        "image/gif" => "gif",
-                        "image/webp" => "webp",
-                        "image/avif" => "avif",
-                        "image/svg+xml" => "svg",
-                        "image/bmp" => "bmp",
-                        "image/tiff" => "tiff",
-                        "image/x-icon" => "ico",
-                        _ => "bin",
-                    };
-                    let recovery = artifact(tools, extension, bytes);
-                    *block = json!({"type":"text", "text":format!("[shaken image; full image: {}]", recovery.path.display())});
-                    artifacts.push(recovery);
-                    changed = true;
-                }
-                (ElisionMode::Thinking, Some("thinking")) if !has_skill => {
-                    let recovery = artifact(
-                        tools,
-                        "json",
-                        serde_json::to_vec(block).map_err(|error| error.to_string())?,
-                    );
-                    *block = json!({"type":"text", "text":format!("[shaken thinking; full thinking: {}]", recovery.path.display())});
-                    artifacts.push(recovery);
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
-        if changed {
-            let mut updated = message.clone();
-            match &mut updated {
-                AgentMessage::Llm(Message::User(message)) => {
-                    message.content = serde_json::from_value(content.clone())
-                        .map_err(|error| error.to_string())?
-                }
-                AgentMessage::Llm(Message::Assistant(message)) => {
-                    message.content = serde_json::from_value(content.clone())
-                        .map_err(|error| error.to_string())?
-                }
-                AgentMessage::Llm(Message::ToolResult(message)) => {
-                    message.content = serde_json::from_value(content.clone())
-                        .map_err(|error| error.to_string())?
-                }
-                AgentMessage::Custom(message) => {
-                    message.content = serde_json::from_value(content.clone())
-                        .map_err(|error| error.to_string())?
-                }
-                AgentMessage::Llm(Message::System(_)) => unreachable!(),
-            }
-            candidate_tokens = candidate_tokens
-                .saturating_sub(super::message_tokens(message))
-                .saturating_add(super::message_tokens(&updated));
-            replacements.push((id.clone(), ContextReplacement { content }));
-        }
+        };
+        candidate_tokens = candidate_tokens
+            .saturating_sub(super::message_tokens(message))
+            .saturating_add(super::message_tokens(&updated));
+        replacements.push((id.clone(), ContextReplacement { content }));
     }
-    if let ElisionMode::Clearing { trigger } = mode
-        && (replacements.is_empty() || candidate_tokens > trigger.saturating_sub(20_000))
+    if let ElisionMode::Clearing { limits } = mode
+        && (replacements.is_empty() || candidate_tokens > limits.trigger.saturating_sub(20_000))
     {
         return Ok(None);
     }
-    if !artifacts.is_empty() {
-        tokio::fs::create_dir_all(&tools.spool_dir)
-            .await
-            .map_err(|error| error.to_string())?;
+    Ok(Some(Elision {
+        edits: replacements,
+        artifacts,
+    }))
+}
+
+fn elide_text(
+    text: &str,
+    ranges: Vec<Range<usize>>,
+    mode: ElisionMode,
+    artifacts_dir: &Path,
+    artifacts: &mut Vec<Artifact>,
+) -> Option<String> {
+    let mut updated = None;
+    for range in ranges.into_iter().rev() {
+        let original = &text[range.clone()];
+        let tokens = estimate_text_tokens(original);
+        if (!matches!(mode, ElisionMode::Clearing { .. }) && tokens < 400)
+            || original.contains("[shaken ")
+        {
+            continue;
+        }
+        let recovery = artifact(artifacts_dir, "txt", original.as_bytes().to_vec());
+        let marker = format!(
+            "[shaken ~{tokens} tokens; full text: {}]",
+            recovery.path.display()
+        );
+        if estimate_text_tokens(&marker) >= tokens {
+            continue;
+        }
+        updated
+            .get_or_insert_with(|| text.to_owned())
+            .replace_range(range, &marker);
+        artifacts.push(recovery);
     }
-    for recovery in artifacts {
+    updated
+}
+
+fn elide_user_blocks(
+    blocks: &[UserBlock],
+    mode: ElisionMode,
+    tool_result: bool,
+    artifacts_dir: &Path,
+    artifacts: &mut Vec<Artifact>,
+) -> Result<Option<Vec<UserBlock>>, Error> {
+    let has_skill = blocks
+        .iter()
+        .any(|block| matches!(block, UserBlock::Text { text } if !skill_spans(text).is_empty()));
+    let mut updated = None;
+    for (index, block) in blocks.iter().enumerate() {
+        let replacement = match (mode, block) {
+            (ElisionMode::Elide | ElisionMode::Clearing { .. }, UserBlock::Text { text }) => {
+                let ranges = if tool_result {
+                    unprotected_spans(text)
+                } else {
+                    block_ranges(text)
+                };
+                elide_text(text, ranges, mode, artifacts_dir, artifacts)
+                    .map(|text| UserBlock::Text { text })
+            }
+            (ElisionMode::Images, UserBlock::Image { data, mime_type }) if !has_skill => {
+                let bytes = STANDARD
+                    .decode(data.as_ref())
+                    .map_err(|error| Error::Compaction(format!("cannot recover image: {error}")))?;
+                let extension = match mime_type.as_str() {
+                    "image/png" => "png",
+                    "image/jpeg" => "jpg",
+                    "image/gif" => "gif",
+                    "image/webp" => "webp",
+                    "image/avif" => "avif",
+                    "image/svg+xml" => "svg",
+                    "image/bmp" => "bmp",
+                    "image/tiff" => "tiff",
+                    "image/x-icon" => "ico",
+                    _ => "bin",
+                };
+                let recovery = artifact(artifacts_dir, extension, bytes);
+                let text = format!("[shaken image; full image: {}]", recovery.path.display());
+                artifacts.push(recovery);
+                Some(UserBlock::Text { text })
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            updated.get_or_insert_with(|| blocks.to_vec())[index] = replacement;
+        }
+    }
+    Ok(updated)
+}
+
+fn elide_assistant_blocks(
+    blocks: &[AssistantBlock],
+    mode: ElisionMode,
+    artifacts_dir: &Path,
+    artifacts: &mut Vec<Artifact>,
+) -> Option<Vec<AssistantBlock>> {
+    let has_skill = blocks.iter().any(
+        |block| matches!(block, AssistantBlock::Text { text, .. } if !skill_spans(text).is_empty()),
+    );
+    let mut updated = None;
+    for (index, block) in blocks.iter().enumerate() {
+        let text = match (mode, block) {
+            (
+                ElisionMode::Elide | ElisionMode::Clearing { .. },
+                AssistantBlock::Text { text, .. },
+            ) => elide_text(text, block_ranges(text), mode, artifacts_dir, artifacts),
+            (ElisionMode::Thinking, AssistantBlock::Thinking { .. }) if !has_skill => {
+                let recovery = artifact(
+                    artifacts_dir,
+                    "json",
+                    serde_json::to_vec(&block).expect("content blocks serialize"),
+                );
+                let text = format!(
+                    "[shaken thinking; full thinking: {}]",
+                    recovery.path.display()
+                );
+                artifacts.push(recovery);
+                Some(text)
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            updated.get_or_insert_with(|| blocks.to_vec())[index] = AssistantBlock::Text {
+                text,
+                text_signature: None,
+            };
+        }
+    }
+    updated
+}
+
+pub(crate) async fn write_artifacts(dir: &Path, artifacts: &[Artifact]) -> Result<(), Error> {
+    if !artifacts.is_empty() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|source| Error::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+    }
+    for artifact in artifacts {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&recovery.path)
+            .open(&artifact.path)
             .await
-            .map_err(|error| format!("{}: {error}", recovery.path.display()))?;
-        file.write_all(&recovery.bytes)
+            .map_err(|source| Error::Io {
+                path: artifact.path.clone(),
+                source,
+            })?;
+        file.write_all(&artifact.bytes)
             .await
-            .map_err(|error| error.to_string())?;
-        file.sync_all().await.map_err(|error| error.to_string())?;
+            .map_err(|source| Error::Io {
+                path: artifact.path.clone(),
+                source,
+            })?;
+        file.sync_all().await.map_err(|source| Error::Io {
+            path: artifact.path.clone(),
+            source,
+        })?;
     }
-    Ok(Some(replacements))
+    Ok(())
 }
 
 /// Exclude skill regions before looking for nested markup. An open skill
@@ -339,6 +406,18 @@ fn xml_tag(line: &str, closing: bool) -> Option<&str> {
     Some(name)
 }
 
+fn fence_run(trimmed: &str) -> Option<(char, usize)> {
+    let character = trimmed.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let run = trimmed
+        .bytes()
+        .take_while(|byte| *byte == character as u8)
+        .count();
+    (run >= 3).then_some((character, run))
+}
+
 /// Conservative omp scanner: only closed fences and complete top-level XML.
 /// Nested fences in an unterminated XML region are not independently removable.
 fn block_ranges(text: &str) -> Vec<Range<usize>> {
@@ -365,16 +444,22 @@ fn block_ranges(text: &str) -> Vec<Range<usize>> {
             offset += line.len();
             continue;
         }
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            if let Some(start) = fence.take() {
-                if tags.is_empty() {
-                    if !contains_skill {
-                        ranges.push(start..end);
+        if let Some((character, run)) = fence_run(trimmed) {
+            if let Some((start, open_character, open_run)) = fence {
+                if character == open_character
+                    && run >= open_run
+                    && trimmed[run..].trim().is_empty()
+                {
+                    fence = None;
+                    if tags.is_empty() {
+                        if !contains_skill {
+                            ranges.push(start..end);
+                        }
+                        contains_skill = false;
                     }
-                    contains_skill = false;
                 }
             } else {
-                fence = Some(offset);
+                fence = Some((offset, character, run));
             }
         } else if fence.is_none() {
             if body == trimmed
@@ -417,6 +502,9 @@ mod tests {
         assert!(block_ranges("```\n<outer>\nsecret\n</outer>").is_empty());
         assert!(block_ranges("<outer>\n<skill>x</skill>\n```\nsecret\n```").is_empty());
         assert!(block_ranges("<outer>\n<skill>x</skill>\n</outer>").is_empty());
+        assert!(block_ranges("```rust\ncode\n~~~\nmore").is_empty());
+        let text = "````\n```\nx\n````";
+        assert_eq!(block_ranges(text), vec![0..text.len()]);
     }
 
     #[test]
@@ -428,8 +516,8 @@ mod tests {
             &text[ranges[0].clone()],
             "<outer>\n```\ninner\n```\n</outer>"
         );
-        assert_eq!(text_tokens("😀"), 1);
-        assert_eq!(text_tokens("abcdefg"), 2);
+        assert_eq!(estimate_text_tokens("😀"), 1);
+        assert_eq!(estimate_text_tokens("abcdefg"), 2);
     }
 }
 

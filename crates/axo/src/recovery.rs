@@ -1,19 +1,38 @@
-//! Recovery of a run left unfinished by a crash or shutdown.
+//! What to do with a terminal response: live classification and crash recovery.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use axo_agent::{AgentMessage, Replay, unanswered_calls};
-use axo_ai::{
-    Message, Model, StopReason, ToolCall, is_context_overflow, is_recoverable_length,
-    is_retryable_error,
-};
+use axo_ai::{AssistantMessage, Message, Model, StopReason, ToolCall, is_retryable_error};
 
-use super::{Entry, EntryId, Projection, RunOutcome, SeqEntry};
+use crate::store::{Entry, EntryId, Projection, RunOutcome, SeqEntry};
 use crate::tools::bash::spool_path;
 
 /// Restarts without a new `message` entry after which a run is parked.
 const RESTART_LIMIT: usize = 5;
+
+/// Whether `model` served `response`; only then do its window and output limits apply.
+pub(crate) fn served_by(response: &AssistantMessage, model: &Model) -> bool {
+    response.provider == model.provider && response.model == model.id
+}
+
+/// Context pressure: provider overflow signals, plus usage against `model`'s limits when it
+/// served the response.
+pub(crate) fn is_pressure(response: &AssistantMessage, model: &Model) -> bool {
+    if served_by(response, model) {
+        axo_ai::is_context_overflow(response, model.context_window)
+            || axo_ai::is_recoverable_length(response, model.max_tokens)
+    } else {
+        axo_ai::is_context_overflow(response, u64::MAX)
+    }
+}
+
+/// For a response another model served: it must be dropped and re-requested.
+pub(crate) fn foreign_unusable(response: &AssistantMessage, model: &Model) -> bool {
+    matches!(response.stop_reason, StopReason::Error | StopReason::Length)
+        || (response.tool_calls().next().is_some() && is_pressure(response, model))
+}
 
 /// What opening a session must do about its last `run_start` without a `run_end`, or
 /// about input submitted after the last run settled.
@@ -24,7 +43,8 @@ pub enum RecoveryPlan {
     /// No unfinished run, but submissions written after the last settled run were never
     /// consumed.
     Requeue { requeue: Vec<SeqEntry> },
-    /// The run's last message is a settled assistant reply: only `run_end` is missing.
+    /// Only `run_end` is missing: the run's last response settled it (`Done`), or it failed
+    /// or aborted with every call answered (`Failed`/`Aborted`).
     Finish {
         run_id: String,
         outcome: RunOutcome,
@@ -65,22 +85,7 @@ pub fn plan_recovery(
     replay_of: &dyn Fn(&str) -> Replay,
     spool_dir: &Path,
 ) -> RecoveryPlan {
-    let by_id: HashMap<&str, usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(at, seq)| seq.entry.id().map(|id| (id, at)))
-        .collect();
-    let mut active = HashSet::new();
-    let mut cursor = entries.len().checked_sub(1);
-    while let Some(at) = cursor {
-        if !active.insert(at) {
-            break;
-        }
-        cursor = entries[at]
-            .entry
-            .parent_id()
-            .and_then(|id| by_id.get(id).copied());
-    }
+    let active: HashSet<usize> = projection.path().iter().copied().collect();
     // Submissions since the last run settled (an open run's own prompt is written
     // before its `run_start`); earlier leftovers were dropped with their run.
     let since = entries
@@ -151,23 +156,10 @@ pub fn plan_recovery(
         });
     let mut recover = None;
     if let Some((at, id, response)) = latest {
-        let hidden = run
-            .iter()
-            .rev()
-            .find_map(|seq| match &seq.entry {
-                Entry::ContextEdit {
-                    target_id,
-                    replacement,
-                    ..
-                } if target_id == id => Some(replacement.is_none()),
-                _ => None,
-            })
-            .unwrap_or(false);
+        let hidden = projection.is_omitted(id.as_str());
         // Old usage belongs to its request model, not the newly selected model.
-        let switched = response.provider != model.provider || response.model != model.id;
-        let overflow = !switched
-            && (is_context_overflow(response, model.context_window)
-                || is_recoverable_length(response, model.max_tokens));
+        let switched = !served_by(response, model);
+        let overflow = !switched && is_pressure(response, model);
         let faulty = overflow
             || matches!(
                 response.stop_reason,
@@ -182,23 +174,35 @@ pub fn plan_recovery(
                 }
             )
         });
-        if switched
-            && (hidden || matches!(response.stop_reason, StopReason::Error | StopReason::Length))
-        {
+        if switched && (hidden || foreign_unusable(response, model)) {
             recover = Some(id.clone());
         } else if faulty {
             if hidden || overflow || is_retryable_error(response) {
                 recover = Some(id.clone());
             } else {
-                return RecoveryPlan::Finish {
-                    run_id: run_id.clone(),
-                    outcome: if response.stop_reason == StopReason::Aborted {
-                        RunOutcome::Aborted
-                    } else {
-                        RunOutcome::Failed
-                    },
-                    reason: response.error_message.clone(),
-                };
+                let unanswered = response.tool_calls().any(|call| {
+                    !run[at + 1..].iter().any(|seq| {
+                        matches!(&seq.entry,
+                            Entry::Message {
+                                message: AgentMessage::Llm(Message::ToolResult(result)),
+                                ..
+                            } if result.tool_call_id == call.id
+                        )
+                    })
+                });
+                if unanswered {
+                    recover = Some(id.clone());
+                } else {
+                    return RecoveryPlan::Finish {
+                        run_id: run_id.clone(),
+                        outcome: if response.stop_reason == StopReason::Aborted {
+                            RunOutcome::Aborted
+                        } else {
+                            RunOutcome::Failed
+                        },
+                        reason: response.error_message.clone(),
+                    };
+                }
             }
         } else if !hidden
             && !later_input
@@ -245,7 +249,7 @@ pub fn plan_recovery(
         .iter()
         .filter(|source| source.entry_index > start)
         .flat_map(|source| projection.messages[source.messages.clone()].iter());
-    let unanswered = unanswered_calls(messages).map_or_else(Vec::new, |(_, calls)| calls);
+    let unanswered = unanswered_calls(messages).map_or_else(Vec::new, |u| u.calls);
 
     let mut interrupted = Vec::new();
     let mut rerun = Vec::new();

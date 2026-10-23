@@ -16,10 +16,11 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use axo_agent::{AgentMessage, Tool};
-use axo_ai::Message;
+use axo_ai::{Message, ToolResultMessage};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedMutexGuard;
@@ -87,7 +88,7 @@ impl SessionTools {
             })
             .collect();
         let path = spaced.strip_prefix('@').unwrap_or(&spaced);
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::config::home_dir();
         let expanded = match (path, home) {
             ("~", Some(home)) => home,
             (path, Some(home)) if path.starts_with("~/") => home.join(&path[2..]),
@@ -172,6 +173,23 @@ pub(crate) fn file_key(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAccess {
+    Read,
+    Modify,
+}
+
+pub(crate) fn ledger_access(result: &ToolResultMessage) -> Option<(&str, FileAccess)> {
+    if result.is_error {
+        return None;
+    }
+    let ledger = result.details.as_ref()?.get("ledger")?;
+    let path = ledger.get("path")?.as_str()?;
+    let access = FileAccess::deserialize(ledger.get("access")?).ok()?;
+    Some((path, access))
+}
+
 /// Full-file content hashes per canonical path, recorded by `read`, `write` and `edit`.
 #[derive(Debug, Default)]
 pub struct FileLedger(Mutex<HashMap<PathBuf, String>>);
@@ -184,9 +202,9 @@ impl FileLedger {
 
     /// Records `content` as this session's view of `path`, returning the record for the
     /// tool result's `details.ledger` (see `restore`).
-    pub fn record(&self, path: &Path, content: &[u8]) -> Value {
+    pub fn record(&self, path: &Path, content: &[u8], access: FileAccess) -> Value {
         let hash = Self::hash(content);
-        let record = json!({ "path": path.to_string_lossy(), "sha256": hash });
+        let record = json!({ "path": path.to_string_lossy(), "sha256": hash, "access": access });
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

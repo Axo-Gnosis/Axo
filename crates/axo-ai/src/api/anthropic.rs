@@ -377,16 +377,17 @@ async fn error_response_message(
     let Some(text) = error_body(response, cancel).await else {
         return ABORTED.to_owned();
     };
-    if let Ok(body) = serde_json::from_str::<Value>(&text) {
-        super::http::record_failure(output, &body);
+    let body = serde_json::from_str::<Value>(&text).ok();
+    if let Some(body) = &body {
+        super::http::record_failure(output, body);
     }
-    let detail = match serde_json::from_str::<Value>(&text) {
-        Ok(body) => match body.get("message") {
+    let detail = match body {
+        Some(body) => match body.get("message") {
             Some(Value::String(message)) => message.clone(),
             Some(message) => message.to_string(),
             None => body.to_string(),
         },
-        Err(_) => text,
+        None => text,
     };
     if detail.is_empty() {
         format!("{status} status code (no body)")

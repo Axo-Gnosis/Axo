@@ -466,8 +466,9 @@ async fn parse_error_response(
     let Some(raw) = error_body(response, cancel).await else {
         return ABORTED.to_owned();
     };
-    if let Ok(body) = serde_json::from_str::<Value>(&raw) {
-        super::http::record_failure(output, &body);
+    let body = serde_json::from_str::<Value>(&raw).ok();
+    if let Some(body) = &body {
+        super::http::record_failure(output, body);
     }
     let mut message = if raw.is_empty() {
         status
@@ -478,8 +479,10 @@ async fn parse_error_response(
         raw.clone()
     };
     let mut friendly = None;
-    if let Ok(parsed) = serde_json::from_str::<Value>(&raw)
-        && let Some(error) = parsed.get("error").filter(|error| error.is_object())
+    if let Some(error) = body
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .filter(|error| error.is_object())
     {
         let field = |key: &str| {
             error

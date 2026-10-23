@@ -590,7 +590,7 @@ impl Harness {
     }
 
     fn request(&self, index: usize) -> Vec<String> {
-        convo(&self.api.requests()[index])
+        convo(&self.api.requests()[index].transcript)
     }
 }
 
@@ -858,7 +858,7 @@ async fn nothing_sits_between_a_tool_call_and_its_result() {
     let requests = h.api.requests();
     assert_eq!(requests.len(), 3);
     for request in &requests {
-        assert_results_adjacent(request);
+        assert_results_adjacent(&request.transcript);
     }
     assert_results_adjacent(
         &h.agent

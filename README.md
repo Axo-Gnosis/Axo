@@ -47,7 +47,7 @@ Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cw
 
 `axo` manages context pressure through append-only `context_edit` and `compaction` entries without mutating earlier history in place:
 
-- **Manual `/shake` (`session.shake(mode)`):** Shrinks context without a model call. `ShakeMode::Elide` replaces older tool results and large fenced/XML blocks outside the newest ~4k tokens with `[shaken ~N tokens; full text: <path>]` pointing to recoverable files in the session's spool directory; `Images` and `Thinking` strip older media or reasoning blocks. Undo is an ordinary branch navigation to the entry before the shake.
+- **Manual `/shake` (`session.shake(mode)`):** Shrinks context without a model call. `ShakeMode::Elide` replaces older tool results and large fenced/XML blocks outside the newest ~4k tokens with `[shaken ~N tokens; full text: <path>]` pointing to recoverable files in the session's `context/` directory; `Images` and `Thinking` strip older media or reasoning blocks. Undo is an ordinary branch navigation to the entry before the shake.
 - **One action per automatic pass:** When context tokens cross `W - reserve`, `axo` chooses either **recoverable clearing** (eliding tool results older than the newest 40k tokens of tool output when that frees at least 20k tokens below the trigger) or **summarization**, never both in the same pass.
 - **Live then separate summaries:** By default (`compaction.summaryRequest: "live"`), `axo` requests the checkpoint summary inside the live conversation with `ToolChoice::None` so the entire history hits the prompt cache, falling back to a standalone tool-free summarizer request (`"separate"`) if the response is rejected or triggered by context overflow. Recent user messages (within `keepRecentTokens`), tracked read/modified file lists, and the session file path carry over automatically.
 
@@ -61,7 +61,7 @@ The system prompt lives in the transcript as named `<section>` blocks (`system`,
 
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 
-When `bash.devShell` is set to `"nix"` or `"direnv"`, `axo` captures the project's environment once (via `nix print-dev-env` or an approved `.envrc`), caches Nix captures under `~/.axo/cache/devshell/` with a GC root, and runs every subsequent `bash` command directly against the captured environment (~3 ms overhead per command instead of ~460 ms for `nix develop -c`). Captures invalidate automatically when `flake.nix`, `flake.lock`, tracked `.nix` files, or `bash.devShellWatch` globs change.
+When `bash.devShell` is set to `"nix"` or `"direnv"` in a trusted project, `axo` captures the project's environment once (via `nix print-dev-env` or an approved `.envrc`), caches Nix captures under `~/.axo/cache/devshell/` with a GC root, and runs every subsequent `bash` command directly against the captured environment (~3 ms overhead per command instead of ~460 ms for `nix develop -c`). Captures invalidate automatically when `flake.nix`, `flake.lock`, tracked `.nix` files, or `bash.devShellWatch` globs change.
 
 ### Project access levels (`ignore` | `read` | `trust`)
 
@@ -84,8 +84,8 @@ Configured exclusively in the user's `~/.axo/settings.jsonc` (a project cannot e
 ```
 
 - `"ignore"` loads nothing from the repository.
-- `"read"` (default) loads markdown context files, skills, prompt overrides, and safe settings, while dropping code-running project settings (`bash.devShell` and `!command` `defaultModel`).
-- `"trust"` permits all project settings, including `bash.devShell` and `!command` `defaultModel`.
+- `"read"` (default) loads markdown context files, skills, prompt overrides, and safe settings, while dropping code-running project settings (`bash.devShell` and `!command` `defaultModel`). Dev shells remain disabled even if enabled in user settings.
+- `"trust"` permits all project settings, including `!command` `defaultModel`, and is required for dev shells regardless of which settings file enables `bash.devShell`.
 
 ---
 

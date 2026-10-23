@@ -1,4 +1,3 @@
-#[path = "common/session.rs"]
 mod common;
 
 use std::{path::Path, sync::Arc};
@@ -7,10 +6,7 @@ use axo::store::{self, Entry, EntryBase, EntryId, JsonlStore, SessionStore};
 use axo::{Axo, CompactionSettings, Error, Settings, ShakeMode};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
-use axo_ai::{
-    AssistantBlock, FileCredentialStore, Message, Model, Models, ModelsConfig, ModelsOptions,
-    ScriptedApi, ScriptedTurn, UserBlock, UserMessage,
-};
+use axo_ai::{AssistantBlock, Message, Model, ScriptedApi, ScriptedTurn, UserBlock, UserMessage};
 use common::{options, within};
 use serde_json::json;
 
@@ -21,35 +17,18 @@ async fn harness(
     output: u64,
     turns: Vec<ScriptedTurn>,
 ) -> (Axo, Arc<ScriptedApi>, Model) {
-    let models = Models::load(ModelsOptions {
-        cache_dir: None,
-        config: ModelsConfig::parse_jsonc(
-            &json!({"providers":{"test":{
-                "api":"openai-completions", "baseUrl":"http://127.0.0.1:9/v1",
-                "models":[{"id":"m", "contextWindow":window,"maxTokens":output}]
-            }}})
-            .to_string(),
-        )
-        .unwrap(),
-        extended_context: false,
-        credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
-    })
-    .await
-    .unwrap();
-    let model = models.find("test/m").unwrap().clone();
-    let api = Arc::new(ScriptedApi::new(turns));
-    let axo = Axo::builder()
-        .dir(dir.to_path_buf())
-        .settings(Settings {
+    let host = common::host(
+        dir,
+        json!([{"id":"m", "contextWindow":window, "maxTokens":output}]),
+        Settings {
             compaction,
             ..Settings::default()
-        })
-        .models(Arc::new(models))
-        .streamer(api.clone())
-        .build()
-        .await
-        .unwrap();
-    (axo, api, model)
+        },
+        turns,
+    )
+    .await;
+    let model = host.models.find("test/m").unwrap().clone();
+    (host.axo, host.api, model)
 }
 
 async fn history(dir: &Path) -> std::path::PathBuf {
@@ -77,7 +56,7 @@ async fn history(dir: &Path) -> std::path::PathBuf {
 }
 
 #[tokio::test]
-async fn invalid_limits_reject_create_and_open_without_requests_or_history_changes() {
+async fn invalid_limits_reject_compaction_but_not_session_lifecycle() {
     for (window, output, cap, reserve, tail) in [
         (0, 4096, None, None, None),
         (100_000, 0, None, None, None),
@@ -90,7 +69,6 @@ async fn invalid_limits_reject_create_and_open_without_requests_or_history_chang
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = history(dir.path()).await;
-        let before = std::fs::read(&path).unwrap();
         let (axo, api, _) = harness(
             dir.path(),
             CompactionSettings {
@@ -105,12 +83,16 @@ async fn invalid_limits_reject_create_and_open_without_requests_or_history_chang
             vec![],
         )
         .await;
+        let created = within(axo.create_session(options(dir.path())))
+            .await
+            .unwrap();
+        created.shutdown().await;
+        let session = within(axo.open_session(&path, options(dir.path())))
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
         assert!(matches!(
-            within(axo.create_session(options(dir.path()))).await,
-            Err(Error::Compaction(_))
-        ));
-        assert!(matches!(
-            within(axo.open_session(&path, options(dir.path()))).await,
+            within(session.compact()).await,
             Err(Error::Compaction(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -119,7 +101,7 @@ async fn invalid_limits_reject_create_and_open_without_requests_or_history_chang
 }
 
 #[tokio::test]
-async fn model_switch_revalidates_limits_before_persisting_or_changing_the_request_model() {
+async fn model_switch_validates_limits_only_when_compacting() {
     let dir = tempfile::tempdir().unwrap();
     let (axo, api, model) = harness(
         dir.path(),
@@ -137,13 +119,14 @@ async fn model_switch_revalidates_limits_before_persisting_or_changing_the_reque
     .await;
     let path = history(dir.path()).await;
     let session = axo.open_session(&path, options(dir.path())).await.unwrap();
-    let before = std::fs::read(&path).unwrap();
     for (window, output) in [(0, 4096), (100_000, 0), (1000, 4096), (3000, 4096)] {
         let mut invalid = model.clone();
         invalid.context_window = window;
         invalid.max_tokens = output;
+        session.set_model(invalid).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
         assert!(matches!(
-            session.set_model(invalid).await,
+            within(session.compact()).await,
             Err(Error::Compaction(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -153,12 +136,17 @@ async fn model_switch_revalidates_limits_before_persisting_or_changing_the_reque
     let mut valid = model.clone();
     valid.context_window = 3001;
     session.set_model(valid).await.unwrap();
+    if let Err(Error::Compaction(message)) = within(session.compact()).await {
+        assert!(!message.contains("must be positive"));
+        assert!(!message.contains("reserve must be smaller"));
+        assert!(!message.contains("retained-tail budget must be smaller"));
+    }
     session.set_model(model.clone()).await.unwrap();
     assert_eq!(
         within(session.prompt("continue")).await.unwrap(),
         RunOutcome::Done
     );
-    assert_eq!(api.recorded_requests()[0].model, model);
+    assert_eq!(api.requests()[0].model, model);
 }
 
 #[tokio::test]

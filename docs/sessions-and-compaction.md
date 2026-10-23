@@ -44,7 +44,7 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"…","timestamp":"�
 3. **`ContextEdit` application:** On the active path, the last `Entry::ContextEdit` targeting an entry ID wins. `replacement: None` removes that message from the projection (used to hide transient-error or overflow turns); `Some(ContextReplacement)` replaces its content blocks (used by `/shake` and automatic clearing) and invalidates provider token usage recorded on or before the edit timestamp.
 4. **Incremental caching (`ProjectedLog`):** `Session` maintains the projection incrementally as entries are appended, rebuilding from scratch only when navigating or when an edit/compaction invalidates earlier entries.
 
-## Crash Recovery (`crates/axo/src/store/recovery.rs`)
+## Crash Recovery (`crates/axo/src/recovery.rs`)
 
 When `Axo::open_session` opens a session file, `plan_recovery` inspects the log after the last `Entry::RunEnd`:
 
@@ -55,6 +55,7 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
 - **Interrupted or failed assistant responses:**
   - If the last assistant response stopped with `StopReason::Length` and had tool calls, every unanswered call receives a truncated-output error result and the run continues.
   - If the last assistant response was a silent stop (`StopReason::Stop` with empty content and no tool calls), a retryable provider error, or a context overflow, recovery hides the failed assistant turn with `Entry::ContextEdit { replacement: None }` and resumes the run (consuming one retry budget slot or running overflow compaction).
+  - A non-retryable failed or aborted response with unanswered tool calls gets not-executed (or `Operation aborted`) results before the run closes `Failed`/`Aborted`.
 - **Unconsumed submissions:** Any `Entry::Submission` saved after the last `RunEnd` (or during an open run) whose `submission_id` has not yet been consumed by an `Entry::Message` is requeued in order (`Steer`, `FollowUp`, or starting a new `Prompt` run).
 - **Restart loop cap (`MAX_CONSECUTIVE_RESUMES = 5`):** If a run accumulates 5 `Entry::RunResumed` markers in a row without an intervening `Entry::Message`, recovery appends `Entry::RunEnd { outcome: Parked }` and stops resuming it.
 
@@ -77,9 +78,9 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
 
 | `ShakeMode` | Behavior |
 | :--- | :--- |
-| `ShakeMode::Elide` | Outside the newest `4,000` tokens (`PROTECTED_TAIL_TOKENS`), replaces tool-result text blocks and fenced/XML blocks in user or assistant text of `>= 400` tokens (`MIN_ELIDE_TOKENS`) with `[shaken ~N tokens; full text: <path>]`, writing the original text to `<session>/bash/context-<uuid>.txt` first. Skill spans (`<skill …>…</skill>`), `SKILL.md` read results, system messages, compaction summaries, and tool-call arguments are never touched |
-| `ShakeMode::Images` | Replaces every `UserBlock::Image` in user messages and tool results with `[shaken image; full image: <path>]`, writing the decoded image bytes to `<session>/bash/context-<uuid>.<ext>` |
-| `ShakeMode::Thinking` | Strips `AssistantBlock::Thinking` blocks from assistant messages, saving them to `<session>/bash/context-<uuid>.thinking.json` and adding a notice block if an assistant message had only thinking |
+| `ShakeMode::Elide` | Outside the newest `4,000` tokens (`PROTECTED_TAIL_TOKENS`), replaces tool-result text blocks and fenced/XML blocks in user or assistant text of `>= 400` tokens (`MIN_ELIDE_TOKENS`) with `[shaken ~N tokens; full text: <path>]`, writing the original text to `<session>/context/context-<uuid>.txt` first. Skill spans (`<skill …>…</skill>`), `SKILL.md` read results, system messages, compaction summaries, and tool-call arguments are never touched |
+| `ShakeMode::Images` | Replaces every `UserBlock::Image` in user messages and tool results with `[shaken image; full image: <path>]`, writing the decoded image bytes to `<session>/context/context-<uuid>.<ext>` |
+| `ShakeMode::Thinking` | Strips `AssistantBlock::Thinking` blocks from assistant messages, saving them to `<session>/context/context-<uuid>.thinking.json` and adding a notice block if an assistant message had only thinking |
 
 Each modified message receives one `Entry::ContextEdit`. Because edits are append-only, navigating to the entry before the shake restores the unshaken view.
 
@@ -103,12 +104,12 @@ Automatic maintenance checks `estimate > trigger` in `prepare_request` (before a
 
 When `estimate > trigger`, `axo` evaluates two candidates locally:
 
-1. **Recoverable clearing (`prepare_clearing`):** Protects the newest `40,000` tokens (`CLEARING_PROTECTED_TOOL_TOKENS`) of tool-result content and elides older eligible tool-result text of `>= 400` tokens into `<session>/bash/context-<uuid>.txt` markers (`[cleared ~N tokens; full text: <path>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000` (`CLEARING_HEADROOM_TOKENS`), avoiding repeated prompt-cache invalidations.
+1. **Recoverable clearing (`prepare_clearing`):** Protects the newest `40,000` tokens (`CLEARING_PROTECTED_TOOL_TOKENS`) of tool-result content and elides older eligible tool-result text of `>= 400` tokens into `<session>/context/context-<uuid>.txt` markers (`[shaken ~N tokens; full text: <path>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000` (`CLEARING_HEADROOM_TOKENS`), avoiding repeated prompt-cache invalidations.
 2. **Checkpoint summarization (`Entry::Compaction`):**
    - **Cut point:** Walks backward from the end of the transcript accumulating `keep_recent` tokens and cuts at the first valid boundary (`User`, `Custom`, or `Assistant`, never a `ToolResult`). If a single turn exceeds the budget, the turn is split at an `Assistant` boundary and its prefix is summarized with `COMPACTION_SPLIT_TURN.md` and merged with the history summary.
    - **Live summary (`SummaryRequest::Live`):** Appends the summary prompt to the live uncleared conversation with `ToolChoice::None` so the request reuses the provider's prompt cache. If the response contains a tool call, stops with `Length` / `Error` / `Aborted`, is empty, or is not strictly smaller than the messages it replaces, it is rejected and `axo` falls back to a separate summary request.
    - **Separate summary (`SummaryRequest::Separate`):** Serializes the messages to summarize into `<conversation>` text and sends a tool-free request under `SUMMARY.md`.
-   - **Carryover:** The committed `Entry::Compaction` stores the current `SystemMessage` snapshot, `preserved_user_ids` (recent whole user messages from the summarized region that fit within `keep_recent`), `details: {"readFiles": […], "modifiedFiles": […]}`, and the summary text.
+   - **Carryover:** The committed `Entry::Compaction` stores the current `SystemMessage` snapshot, `preserved_user_ids` (recent whole user messages from the summarized region that fit within `keep_recent`), `details: {"readFiles": […], "modifiedFiles": […]}`, and the summary text. File lists come from successful `read`, `write`, and `edit` results and use absolute paths.
    - **Escalation bound:** Automatic maintenance attempts at most 3 actions per check before failing with `Error::Compaction`.
 
 ## Transient Retry & Overflow Recovery

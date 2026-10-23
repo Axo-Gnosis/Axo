@@ -183,12 +183,7 @@ pub(crate) fn record_failure(output: &mut crate::AssistantMessage, body: &serde_
             .map(str::to_owned)
             .or_else(|| value.as_i64().map(|code| code.to_string()))
     });
-    let failure = output.failure.get_or_insert(crate::ProviderFailure {
-        status: None,
-        code: None,
-        retry_after_ms: None,
-        should_retry: None,
-    });
+    let failure = output.failure.get_or_insert_default();
     if code.is_some() {
         failure.code = code;
     }

@@ -31,9 +31,10 @@ use crate::context::skills::{Skill, expand_skill_command, load_skills};
 use crate::context::{home_agents_dir, project_root};
 use crate::error::Error;
 use crate::exec::ExecEnv;
+use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::store::{
-    self, Entry, EntryBase, EntryId, Header, Projection, RecoveryPlan, SeqEntry, SessionStore,
-    SessionWriter, SubmissionKind, plan_recovery, project,
+    self, Entry, EntryBase, EntryId, Header, Projection, SeqEntry, SessionStore, SessionWriter,
+    SubmissionKind, project,
 };
 use crate::tools::ask::{Answer, PendingQuestions, Question};
 use crate::tools::{self, SessionTools};
@@ -278,6 +279,7 @@ struct Maintenance {
     prompts: compaction::summary::SummaryPrompts,
     session_id: String,
     path: PathBuf,
+    artifacts_dir: PathBuf,
     tools: Arc<SessionTools>,
     tool_specs: Vec<ToolSpec>,
     skill_paths: Vec<PathBuf>,
@@ -316,6 +318,13 @@ impl Log {
             .map(|id| EntryId(id.to_owned()));
         EntryBase::new(EntryId::generate(|id| self.ids.contains(id)), parent)
     }
+}
+
+struct FailureState {
+    at: usize,
+    retries: u32,
+    overflow_used: bool,
+    hidden: bool,
 }
 
 /// What `Session::start` runs after recovery.
@@ -431,9 +440,8 @@ impl SessionHooks {
         if log.maintenance.is_some() || (standalone && *self.running.borrow()) {
             return Err(Error::Busy);
         }
-        Limits::resolve(&log.model, &self.maintenance.settings)?;
         if self.maintenance.shutdown.load(Ordering::Acquire) {
-            return Err(Error::Compaction("Maintenance aborted".into()));
+            return Err(Error::MaintenanceAborted);
         }
         log.maintenance = Some(kind);
         *self
@@ -474,12 +482,10 @@ impl SessionHooks {
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
         if cancel.is_cancelled() || self.maintenance.shutdown.load(Ordering::Acquire) {
-            return Err(Error::Compaction("Maintenance aborted".into()));
+            return Err(Error::MaintenanceAborted);
         }
         if log.revision != revision {
-            return Err(Error::Compaction(
-                "Session context changed during maintenance".into(),
-            ));
+            return Err(Error::ContextChanged);
         }
         Ok(())
     }
@@ -513,13 +519,7 @@ impl SessionHooks {
             }));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let projected = project(&log.entries, None);
-            compaction::validate_projection(
-                &projected,
-                &log.entries,
-                before,
-                limits,
-                require_trigger,
-            )
+            compaction::validate_projection(&projected, before, limits, require_trigger)
         }));
         log.entries.truncate(len);
         match result {
@@ -557,9 +557,8 @@ impl SessionHooks {
         mode: compaction::elide::ElisionMode,
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
-        let (messages, sources, revision, before, limits) = {
+        let (messages, sources, revision, before) = {
             let log = self.log.lock().await;
-            let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
             let sources = log
                 .projection
                 .sources
@@ -579,27 +578,25 @@ impl SessionHooks {
                 log.projection.messages.clone(),
                 sources,
                 log.revision,
-                compaction::estimate(&log.projection, &log.entries),
-                limits,
+                compaction::estimate(&log.projection),
             )
         };
-        let edits = compaction::elide::prepare(
+        let elision = compaction::elide::prepare(
             &messages,
             &sources,
-            &self.maintenance.tools,
+            &self.maintenance.artifacts_dir,
             &self.maintenance.skill_paths,
             mode,
-        )
-        .await
-        .map_err(Error::Compaction)?;
-        let Some(edits) = edits.filter(|edits| !edits.is_empty()) else {
+        )?;
+        let Some(elision) = elision.filter(|elision| !elision.edits.is_empty()) else {
             return Ok(false);
         };
         let mut log = self.log.lock().await;
         self.check_commit(&log, revision, cancel)?;
         let mut parent = log.next_base().parent_id;
         let mut reserved_ids = HashSet::new();
-        let pending: Vec<_> = edits
+        let pending: Vec<_> = elision
+            .edits
             .into_iter()
             .map(|(target_id, replacement)| {
                 let id = EntryId::generate(|id| log.ids.contains(id) || reserved_ids.contains(id));
@@ -613,18 +610,17 @@ impl SessionHooks {
                 }
             })
             .collect();
-        if let compaction::elide::ElisionMode::Clearing { trigger } = mode {
+        if let compaction::elide::ElisionMode::Clearing { limits } = mode {
             let Ok(after) = Self::candidate(&mut log, &pending, before, &limits, true) else {
                 return Ok(false);
             };
-            if trigger < 20_000 || after > trigger - 20_000 || after >= before {
+            if limits.trigger < 20_000 || after > limits.trigger - 20_000 || after >= before {
                 return Ok(false);
             }
         }
-        for entry in pending {
-            self.check_commit(&log, log.revision, cancel)?;
-            self.write(&mut log, entry).await?;
-        }
+        compaction::elide::write_artifacts(&self.maintenance.artifacts_dir, &elision.artifacts)
+            .await?;
+        self.write_all(&mut log, pending).await?;
         Ok(true)
     }
 
@@ -637,22 +633,14 @@ impl SessionHooks {
         let limits = {
             let log = self.log.lock().await;
             let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            if automatic
-                && !force
-                && compaction::estimate(&log.projection, &log.entries) <= limits.trigger
-            {
+            if automatic && !force && compaction::estimate(&log.projection) <= limits.trigger {
                 return Ok(false);
             }
             limits
         };
         if automatic
             && self
-                .elide(
-                    compaction::elide::ElisionMode::Clearing {
-                        trigger: limits.trigger,
-                    },
-                    cancel,
-                )
+                .elide(compaction::elide::ElisionMode::Clearing { limits }, cancel)
                 .await?
         {
             return Ok(true);
@@ -674,24 +662,22 @@ impl SessionHooks {
                     &limits,
                     checkpoint.id.clone(),
                 )?;
-                let systems: Vec<_> = log
-                    .projection
-                    .messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        AgentMessage::Llm(Message::System(system)) => {
-                            Some(Message::System(system.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
+                let system = axo_ai::transcript::replay_system_message(
+                    log.projection
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            AgentMessage::Llm(Message::System(system)) => Some(system),
+                            _ => None,
+                        }),
+                );
                 (
                     prepared,
                     log.model.clone(),
                     log.thinking,
                     log.revision,
                     checkpoint.id,
-                    axo_ai::transcript::current_system_message(&systems),
+                    system,
                 )
             };
             let context = compaction::summary::SummaryContext {
@@ -707,64 +693,59 @@ impl SessionHooks {
                     self.save_usage(&model, failure.usage, failure.message.clone())
                         .await?;
                     if failure.fatal || failure.aborted {
-                        return Err(Error::Compaction(failure.message));
+                        return Err(if failure.aborted {
+                            Error::MaintenanceAborted
+                        } else {
+                            Error::Compaction(failure.message)
+                        });
                     }
                     last_error = failure.message;
                     method = SummaryRequest::Separate;
                 }
                 Ok(generated) => {
-                    let summary = format!(
-                        "{}\n\nSession history: {}\n{}",
-                        generated.text,
-                        self.maintenance.path.display(),
-                        prepared.files.render()
+                    let summary = compaction::history_summary(
+                        &generated.text,
+                        &self.maintenance.path,
+                        &prepared.files,
                     );
-                    let result: Result<(), Error> = {
+                    let committed: Result<(), Error> = async {
                         let mut log = self.log.lock().await;
-                        match self.check_commit(&log, revision, cancel) {
-                            Err(error) => Err(error),
-                            Ok(()) => {
-                                let base = EntryBase::new(checkpoint, log.next_base().parent_id);
-                                let entry = Entry::Compaction {
-                                    base,
-                                    summary,
-                                    first_kept_entry_id: prepared.first_kept_entry_id,
-                                    preserved_user_ids: prepared.preserved_user_ids,
-                                    tokens_before: prepared.tokens_before,
-                                    details: Some(prepared.files.details()),
-                                    usage: Some(generated.usage.clone()),
-                                    from_hook: None,
-                                    system_message: system,
-                                };
-                                match Self::candidate(
-                                    &mut log,
-                                    std::slice::from_ref(&entry),
-                                    prepared.tokens_before,
-                                    &limits,
-                                    automatic,
-                                ) {
-                                    Err(error) => Err(error),
-                                    Ok(_) => match self.write(&mut log, entry).await {
-                                        Ok(_) => {
-                                            return Ok(true);
-                                        }
-                                        Err(error) => Err(error),
-                                    },
-                                }
+                        self.check_commit(&log, revision, cancel)?;
+                        let base = EntryBase::new(checkpoint, log.next_base().parent_id);
+                        let entry = Entry::Compaction {
+                            base,
+                            summary,
+                            first_kept_entry_id: prepared.first_kept_entry_id,
+                            preserved_user_ids: prepared.preserved_user_ids,
+                            tokens_before: prepared.tokens_before,
+                            details: Some(prepared.files.details()),
+                            usage: Some(generated.usage.clone()),
+                            from_hook: None,
+                            system_message: system,
+                        };
+                        Self::candidate(
+                            &mut log,
+                            std::slice::from_ref(&entry),
+                            prepared.tokens_before,
+                            &limits,
+                            automatic,
+                        )?;
+                        self.write(&mut log, entry).await?;
+                        Ok(())
+                    }
+                    .await;
+                    match committed {
+                        Ok(()) => return Ok(true),
+                        Err(error) => {
+                            self.save_usage(&model, generated.usage, error.to_string())
+                                .await?;
+                            if !matches!(error, Error::Compaction(_) | Error::ContextChanged) {
+                                return Err(error);
                             }
+                            last_error = error.to_string();
+                            method = SummaryRequest::Separate;
                         }
-                    };
-                    let error = result.expect_err("a committed checkpoint returned");
-                    self.save_usage(&model, generated.usage, error.to_string())
-                        .await?;
-                    if !matches!(&error, Error::Compaction(_)) {
-                        return Err(error);
                     }
-                    if cancel.is_cancelled() || self.maintenance.shutdown.load(Ordering::Acquire) {
-                        return Err(Error::Compaction("Maintenance aborted".into()));
-                    }
-                    last_error = error.to_string();
-                    method = SummaryRequest::Separate;
                 }
             }
         }
@@ -772,12 +753,13 @@ impl SessionHooks {
     }
 
     async fn automatic(&self, force: bool, cancel: &CancellationToken) -> Result<bool, Error> {
+        if !self.maintenance.settings.enabled {
+            return Ok(false);
+        }
         {
             let mut log = self.log.lock().await;
             let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            if !self.maintenance.settings.enabled
-                || (!force && compaction::estimate(&log.projection, &log.entries) <= limits.trigger)
-            {
+            if !force && compaction::estimate(&log.projection) <= limits.trigger {
                 return Ok(false);
             }
             self.reserve(&mut log, MaintenanceKind::Compact, false, cancel.clone())?;
@@ -803,10 +785,8 @@ impl SessionHooks {
         current: &Sections,
     ) -> Result<Option<AgentMessage>, Error> {
         let mut effective: Option<Sections> = None;
-        let mut declared = Vec::new();
         for message in &log.projection.messages {
             if let AgentMessage::Llm(Message::System(system)) = message {
-                declared.push(Message::System(system.clone()));
                 let Some(patch) = &system.sections else {
                     continue;
                 };
@@ -824,7 +804,12 @@ impl SessionHooks {
             }
         }
         let changes = axo_ai::transcript::tool_state_changes(
-            &axo_ai::transcript::current_tools(&declared),
+            &axo_ai::transcript::replay_tools(log.projection.messages.iter().filter_map(
+                |message| match message {
+                    AgentMessage::Llm(Message::System(system)) => Some(system),
+                    _ => None,
+                },
+            )),
             &self.maintenance.tool_specs,
         );
         let system = system_message(effective.as_ref(), current);
@@ -907,7 +892,11 @@ impl SessionHooks {
                         self.save_usage(&model, failure.usage, failure.message.clone())
                             .await?;
                         if failure.fatal || failure.aborted || action == 2 {
-                            return Err(Error::Compaction(failure.message));
+                            return Err(if failure.aborted {
+                                Error::MaintenanceAborted
+                            } else {
+                                Error::Compaction(failure.message)
+                            });
                         }
                     }
                 }
@@ -930,12 +919,7 @@ impl SessionHooks {
             Some((summary, files)) => Entry::BranchSummary {
                 base,
                 from_id,
-                summary: format!(
-                    "{}\n\nSession history: {}\n{}",
-                    summary.text,
-                    self.maintenance.path.display(),
-                    files.render()
-                ),
+                summary: compaction::history_summary(&summary.text, &self.maintenance.path, &files),
                 details: Some(files.details()),
                 usage: Some(summary.usage),
                 from_hook: None,
@@ -987,8 +971,6 @@ impl SessionHooks {
                     self.navigate_inner(target, sections, &cancel).await?
                 }
             }
-            let log = self.log.lock().await;
-            self.check_commit(&log, log.revision, &cancel)?;
             Ok::<(), Error>(())
         })
         .catch_unwind()
@@ -996,7 +978,10 @@ impl SessionHooks {
         agent.set_messages(self.log.lock().await.projection.messages.clone());
         let (error, aborted) = match &result {
             Ok(Ok(())) => (None, false),
-            Ok(Err(error)) => (Some(error.to_string()), cancel.is_cancelled()),
+            Ok(Err(error)) => (
+                Some(error.to_string()),
+                matches!(error, Error::MaintenanceAborted),
+            ),
             Err(_) => (Some("Maintenance task panicked".into()), false),
         };
         self.end_maintenance(true, error, aborted).await;
@@ -1006,34 +991,13 @@ impl SessionHooks {
         }
     }
 
-    /// Follow the active raw path, including entries hidden by projection.
-    fn raw_path(log: &Log) -> Vec<usize> {
-        let index: HashMap<_, _> = log
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(at, seq)| seq.entry.id().map(|id| (id, at)))
-            .collect();
-        let mut next = log.entries.last().and_then(|seq| seq.entry.id());
-        let mut path = Vec::new();
-        while let Some(id) = next
-            && path.len() < log.entries.len()
-        {
-            let Some(&at) = index.get(id) else { break };
-            path.push(at);
-            next = log.entries[at].entry.parent_id();
-        }
-        path.reverse();
-        path
-    }
-
     fn failure_state(
         &self,
         log: &Log,
         response: &AssistantMessage,
         model: &Model,
-    ) -> Result<(usize, u32, bool, bool, bool), Error> {
-        let path = Self::raw_path(log);
+    ) -> Result<FailureState, Error> {
+        let path = log.projection.path();
         let at = path
             .iter()
             .rev()
@@ -1045,29 +1009,18 @@ impl SessionHooks {
                 )
             })
             .ok_or_else(|| {
-                Error::Compaction("Completed response is missing from session history".into())
+                Error::InvalidHistory("Completed response is missing from session history".into())
             })?;
-        let mut omissions = HashMap::new();
-        for &index in &path {
-            if let Entry::ContextEdit {
-                target_id,
-                replacement,
-                ..
-            } = &log.entries[index].entry
-            {
-                omissions.insert(target_id.as_str(), replacement.is_none());
-            }
-        }
         let hidden = |index: usize| {
             log.entries[index]
                 .entry
                 .id()
-                .is_some_and(|id| omissions.get(id) == Some(&true))
+                .is_some_and(|id| log.projection.is_omitted(id))
         };
         let mut retries = 0;
         let mut overflow = false;
         let mut selected = None;
-        for &index in &path {
+        for &index in path {
             if index == at {
                 break;
             }
@@ -1098,9 +1051,7 @@ impl SessionHooks {
                         retries = 0;
                         overflow = false;
                     } else if hidden(index) {
-                        if axo_ai::is_context_overflow(previous, model.context_window)
-                            || axo_ai::is_recoverable_length(previous, model.max_tokens)
-                        {
+                        if recovery::is_pressure(previous, model) {
                             overflow = true;
                         } else if axo_ai::is_retryable_error(previous) {
                             retries += 1;
@@ -1116,31 +1067,38 @@ impl SessionHooks {
                 _ => {}
             }
         }
-        let pending = hidden(at);
-        let completed = {
-            let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            let end = if pending { at } else { at + 1 };
-            let prefix = project(&log.entries[..end], None);
-            let before = compaction::estimate(&prefix, &log.entries[..end]);
-            let after = compaction::estimate(&log.projection, &log.entries);
-            let checkpoint = path.iter().any(|&index| {
-                index > at && matches!(log.entries[index].entry, Entry::Compaction { .. })
-            });
-            let clearing = path.iter().any(|&index| {
-                index > at
-                    && matches!(
-                        log.entries[index].entry,
-                        Entry::ContextEdit {
-                            replacement: Some(_),
-                            ..
-                        }
-                    )
-            });
-            after < before
-                && ((checkpoint && after <= limits.trigger)
-                    || (clearing && limits.trigger >= 20_000 && after <= limits.trigger - 20_000))
+        Ok(FailureState {
+            at,
+            retries,
+            overflow_used: overflow,
+            hidden: hidden(at),
+        })
+    }
+
+    fn checkpoint_completed(&self, log: &Log, state: &FailureState) -> bool {
+        let Ok(limits) = Limits::resolve(&log.model, &self.maintenance.settings) else {
+            return false;
         };
-        Ok((at, retries, overflow, pending, completed))
+        let end = if state.hidden { state.at } else { state.at + 1 };
+        let prefix = project(&log.entries[..end], None);
+        let before = compaction::estimate(&prefix);
+        let after = compaction::estimate(&log.projection);
+        let checkpoint = log.projection.path().iter().any(|&index| {
+            index > state.at && matches!(log.entries[index].entry, Entry::Compaction { .. })
+        });
+        let clearing = log.projection.path().iter().any(|&index| {
+            index > state.at
+                && matches!(
+                    log.entries[index].entry,
+                    Entry::ContextEdit {
+                        replacement: Some(_),
+                        ..
+                    }
+                )
+        });
+        after < before
+            && ((checkpoint && after <= limits.trigger)
+                || (clearing && limits.trigger >= 20_000 && after <= limits.trigger - 20_000))
     }
 
     async fn omit_response(
@@ -1149,7 +1107,7 @@ impl SessionHooks {
         at: usize,
         response: &AssistantMessage,
     ) -> Result<(), Error> {
-        let path = Self::raw_path(log);
+        let path = log.projection.path();
         let mut targets = Vec::new();
         for index in path.iter().copied().filter(|&index| index >= at) {
             if index > at
@@ -1169,37 +1127,28 @@ impl SessionHooks {
                     Entry::Message { message: AgentMessage::Llm(Message::ToolResult(result)), .. }
                         if response.tool_calls().any(|call| call.id == result.tool_call_id)))
                 && let Some(id) = entry.id()
+                && !log.projection.is_omitted(id)
             {
-                let omitted = path
-                    .iter()
-                    .rev()
-                    .find_map(|&edit| match &log.entries[edit].entry {
-                        Entry::ContextEdit {
-                            target_id,
-                            replacement,
-                            ..
-                        } if target_id.as_str() == id => Some(replacement.is_none()),
-                        _ => None,
-                    })
-                    .unwrap_or(false);
-                if !omitted {
-                    targets.push(EntryId(id.to_owned()));
-                }
+                targets.push(EntryId(id.to_owned()));
             }
         }
-        for target_id in targets {
-            let base = log.next_base();
-            self.write(
-                log,
+        let mut parent = log.next_base().parent_id;
+        let mut reserved_ids = HashSet::new();
+        let edits = targets
+            .into_iter()
+            .map(|target_id| {
+                let id = EntryId::generate(|id| log.ids.contains(id) || reserved_ids.contains(id));
+                reserved_ids.insert(id.0.clone());
+                let base = EntryBase::new(id.clone(), parent.take());
+                parent = Some(id);
                 Entry::ContextEdit {
                     base,
                     target_id,
                     replacement: None,
-                },
-            )
-            .await?;
-        }
-        Ok(())
+                }
+            })
+            .collect();
+        self.write_all(log, edits).await
     }
 
     async fn context(&self, tools: &[Arc<dyn Tool>]) -> AgentContext {
@@ -1213,10 +1162,10 @@ impl SessionHooks {
         std::mem::take(&mut *self.system.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Appends `entry`, records it and broadcasts it.
-    async fn write(&self, log: &mut Log, entry: Entry) -> Result<SeqEntry, Error> {
+    /// Appends `entry` and records it without refreshing or broadcasting it.
+    async fn append(&self, log: &mut Log, entry: Entry) -> Result<SeqEntry, Error> {
         if log.maintenance.is_some() && self.maintenance.shutdown.load(Ordering::Acquire) {
-            return Err(Error::Compaction("Maintenance aborted".into()));
+            return Err(Error::MaintenanceAborted);
         }
         let appended = log.writer.append(entry).await?;
         if let Some(id) = appended.entry.id() {
@@ -1229,9 +1178,13 @@ impl SessionHooks {
             log.revision = log.revision.wrapping_add(1);
         }
         log.entries.push(appended.clone());
+        Ok(appended)
+    }
+
+    fn refresh(&self, log: &mut Log, appended: &Entry) {
         log.projection.apply(&log.entries);
         if matches!(
-            &appended.entry,
+            appended,
             Entry::ContextEdit { .. }
                 | Entry::Compaction { .. }
                 | Entry::BranchSummary { .. }
@@ -1239,8 +1192,35 @@ impl SessionHooks {
         ) {
             self.restore(log);
         }
+    }
+
+    /// Appends `entry`, refreshes derived state and broadcasts it.
+    async fn write(&self, log: &mut Log, entry: Entry) -> Result<SeqEntry, Error> {
+        let appended = self.append(log, entry).await?;
+        self.refresh(log, &appended.entry);
         let _ = self.events.send(SessionEvent::Entry(appended.clone()));
         Ok(appended)
+    }
+
+    async fn write_all(&self, log: &mut Log, entries: Vec<Entry>) -> Result<(), Error> {
+        let mut appended = Vec::with_capacity(entries.len());
+        let mut result = Ok(());
+        for entry in entries {
+            match self.append(log, entry).await {
+                Ok(entry) => appended.push(entry),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        if let Some(last) = appended.last() {
+            self.refresh(log, &last.entry);
+        }
+        for entry in appended {
+            let _ = self.events.send(SessionEvent::Entry(entry));
+        }
+        result
     }
 
     /// Closes the run with `run_end` (none after a shutdown) and releases the session
@@ -1312,32 +1292,16 @@ impl SessionHooks {
     }
 }
 
-/// The shared lowering used by ordinary requests and summary requests.
-pub(crate) fn lower_messages(messages: Vec<AgentMessage>) -> Vec<Message> {
-    messages
-        .into_iter()
-        .map(|message| match message {
-            AgentMessage::Llm(message) => message,
-            AgentMessage::Custom(custom) => Message::User(UserMessage {
-                content: custom.content,
-                timestamp: custom.timestamp,
-            }),
-        })
-        .collect()
-}
-
 #[async_trait]
 impl LoopHooks for SessionHooks {
     /// pi `convertToLlm` (`messages.ts:150-196`): a custom message reaches the model as a
     /// user message with its content.
     fn convert_to_llm(&self, messages: Vec<AgentMessage>) -> Vec<Message> {
-        lower_messages(messages)
+        crate::context::lower_messages(messages)
     }
 
     fn should_skip_tools(&self, response: &AssistantMessage, model: &Model) -> bool {
-        let pressure = axo_ai::is_context_overflow(response, model.context_window)
-            || axo_ai::is_recoverable_length(response, model.max_tokens);
-        pressure
+        recovery::is_pressure(response, model)
             && (response.stop_reason != StopReason::Stop || response.tool_calls().next().is_some())
     }
 
@@ -1370,51 +1334,61 @@ impl LoopHooks for SessionHooks {
             {
                 let mut log = self.log.lock().await;
                 self.check_commit(&log, log.revision, cancel)?;
-                if response.provider != log.model.provider || response.model != log.model.id {
-                    let (at, _, _, pending, _) = self.failure_state(&log, response, turn.model)?;
-                    if pending
-                        || (response.tool_calls().next().is_some()
-                            && axo_ai::is_context_overflow(response, u64::MAX))
-                        || matches!(response.stop_reason, StopReason::Error | StopReason::Length) {
-                        self.omit_response(&mut log, at, response).await?;
-                        return Ok(TurnFinish { decision: Some(TurnDecision::Continue),
+                if !recovery::served_by(response, &log.model) {
+                    let state = self.failure_state(&log, response, turn.model)?;
+                    let unusable = state.hidden || recovery::foreign_unusable(response, &log.model);
+                    if unusable {
+                        self.omit_response(&mut log, state.at, response).await?;
+                        return Ok(TurnFinish {
+                            decision: Some(TurnDecision::Continue),
                             context: Some(AgentContext {
                                 messages: log.projection.messages.clone(),
                                 tools: turn.context.tools.clone(),
-                            }) });
+                            }),
+                        });
                     }
                     return Ok(TurnFinish::default());
                 }
             }
-            let pressure = axo_ai::is_context_overflow(response, turn.model.context_window)
-                || axo_ai::is_recoverable_length(response, turn.model.max_tokens);
-            let silent_success = pressure && response.stop_reason == StopReason::Stop
+            let pressure = recovery::is_pressure(response, turn.model);
+            let silent_success = pressure
+                && response.stop_reason == StopReason::Stop
                 && response.tool_calls().next().is_none();
             if silent_success {
                 let changed = self.automatic(true, cancel).await?;
-                return Ok(TurnFinish { decision: None,
-                    context: if changed { Some(self.context(&turn.context.tools).await) } else { None } });
+                let context = if changed {
+                    Some(self.context(&turn.context.tools).await)
+                } else {
+                    None
+                };
+                return Ok(TurnFinish {
+                    decision: None,
+                    context,
+                });
             }
-            if pressure || response.stop_reason == StopReason::Error || response.stop_reason == StopReason::Length {
+            let faulty =
+                pressure || matches!(response.stop_reason, StopReason::Error | StopReason::Length);
+            if faulty {
                 let (delay, shrink, retry) = {
                     let mut log = self.log.lock().await;
                     self.check_commit(&log, log.revision, cancel)?;
-                    let (at, retries, overflow_used, pending, completed) =
-                        self.failure_state(&log, response, turn.model)?;
-                    let switched = response.provider != log.model.provider || response.model != log.model.id;
+                    let state = self.failure_state(&log, response, turn.model)?;
+                    let switched = !recovery::served_by(response, &log.model);
                     if switched {
-                        self.omit_response(&mut log, at, response).await?;
+                        self.omit_response(&mut log, state.at, response).await?;
                         (None, false, true)
                     } else if pressure {
-                        if !self.maintenance.settings.enabled || overflow_used {
+                        if !self.maintenance.settings.enabled || state.overflow_used {
                             return Ok(TurnFinish::default());
                         }
-                        self.omit_response(&mut log, at, response).await?;
-                        (None, !(pending && completed), true)
-                    } else if let Some(delay) = axo_ai::retry_delay(response, retries) {
-                        self.omit_response(&mut log, at, response).await?;
+                        let completed = self.checkpoint_completed(&log, &state);
+                        self.omit_response(&mut log, state.at, response).await?;
+                        (None, !(state.hidden && completed), true)
+                    } else if let Some(delay) = axo_ai::retry_delay(response, state.retries) {
+                        self.omit_response(&mut log, state.at, response).await?;
                         let _ = self.events.send(SessionEvent::Retry {
-                            attempt: retries + 1, delay_ms: delay.as_millis() as u64,
+                            attempt: state.retries + 1,
+                            delay_ms: delay.as_millis() as u64,
                         });
                         (Some(delay), false, true)
                     } else {
@@ -1424,23 +1398,35 @@ impl LoopHooks for SessionHooks {
                 if retry {
                     if let Some(delay) = delay {
                         tokio::select! {
-                            _ = cancel.cancelled() => return Err(Error::Compaction("Maintenance aborted".into())),
+                            _ = cancel.cancelled() => return Err(Error::MaintenanceAborted),
                             _ = tokio::time::sleep(delay) => {}
                         }
                     }
-                    if shrink { self.automatic(true, cancel).await?; }
-                    return Ok(TurnFinish { decision: Some(TurnDecision::Continue),
-                        context: Some(self.context(&turn.context.tools).await) });
+                    if shrink {
+                        self.automatic(true, cancel).await?;
+                    }
+                    return Ok(TurnFinish {
+                        decision: Some(TurnDecision::Continue),
+                        context: Some(self.context(&turn.context.tools).await),
+                    });
                 }
                 return Ok(TurnFinish::default());
             }
             if response.tool_calls().next().is_none() {
                 let changed = self.automatic(false, cancel).await?;
-                return Ok(TurnFinish { decision: None,
-                    context: if changed { Some(self.context(&turn.context.tools).await) } else { None } });
+                let context = if changed {
+                    Some(self.context(&turn.context.tools).await)
+                } else {
+                    None
+                };
+                return Ok(TurnFinish {
+                    decision: None,
+                    context,
+                });
             }
             Ok(TurnFinish::default())
-        }.await;
+        }
+        .await;
         result.map_err(|error| HookError(error.to_string()))
     }
 
@@ -1551,10 +1537,10 @@ impl Session {
             projection,
             recovery,
         } = setup;
-        Limits::resolve(&model, &settings.compaction)?;
 
         let path = writer.planned_path().to_path_buf();
         let spool_dir = path.with_extension("").join("bash");
+        let artifacts_dir = path.with_extension("").join("context");
         let (events, _) = broadcast::channel(1024);
         let questions = Arc::new(PendingQuestions::new(events.clone()));
         let project = project_access != ProjectAccess::Ignore;
@@ -1627,6 +1613,7 @@ impl Session {
                 prompts: summary_prompts,
                 session_id: session_id.clone(),
                 path: path.clone(),
+                artifacts_dir,
                 tools: session_tools.clone(),
                 tool_specs: tools
                     .iter()
@@ -1850,7 +1837,7 @@ impl Session {
                         ..
                     } = &log.entries[at].entry
                     else {
-                        return Err(Error::Compaction(
+                        return Err(Error::InvalidHistory(
                             "Recovery response is not an assistant".into(),
                         ));
                     };
@@ -1861,9 +1848,9 @@ impl Session {
                         && response.tool_calls().next().is_none()
                         && requeue.is_empty()
                     {
-                        let (_, _, _, hidden, completed) =
-                            self.hooks.failure_state(log, &response, &log.model)?;
-                        let later_input = SessionHooks::raw_path(log).iter().any(|&index| {
+                        let state = self.hooks.failure_state(log, &response, &log.model)?;
+                        let completed = self.hooks.checkpoint_completed(log, &state);
+                        let later_input = log.projection.path().iter().any(|&index| {
                             index > at
                                 && matches!(
                                     &log.entries[index].entry,
@@ -1874,7 +1861,7 @@ impl Session {
                                     }
                                 )
                         });
-                        if !hidden && completed && !later_input {
+                        if !state.hidden && completed && !later_input {
                             let base = log.next_base();
                             self.hooks
                                 .write(
@@ -1914,14 +1901,7 @@ impl Session {
                             _ => None,
                         })
                         .collect();
-                    let mut model = log.model.clone();
-                    if response.provider != model.provider || response.model != model.id {
-                        // Never classify old usage against the replacement model's limits.
-                        model.provider = response.provider.clone();
-                        model.id = response.model.clone();
-                        model.context_window = u64::MAX;
-                        model.max_tokens = u64::MAX;
-                    }
+                    let model = log.model.clone();
                     let base = log.next_base();
                     self.hooks
                         .write(
@@ -2092,7 +2072,6 @@ impl Session {
             if *self.hooks.running.borrow() {
                 return Err(Error::Busy);
             }
-            Limits::resolve(&log.model, &self.hooks.maintenance.settings)?;
             let submitted = self
                 .submit(&mut log, SubmissionKind::Prompt, text, request.request_id)
                 .await?;
@@ -2182,8 +2161,9 @@ impl Session {
     /// later, is cancelled with `CancelReason::Shutdown`, so nothing is recorded as aborted
     /// and the run resumes when the session is next opened. Returns once the run settled.
     pub async fn shutdown(&self) {
-        self.hooks.cancel_maintenance(true);
+        // Record CancelReason::Shutdown before cancelling the shared maintenance token.
         self.agent.shutdown();
+        self.hooks.cancel_maintenance(true);
         let _ = self
             .hooks
             .running
@@ -2198,7 +2178,6 @@ impl Session {
         if log.maintenance.is_some() {
             return Err(Error::Busy);
         }
-        Limits::resolve(&model, &self.hooks.maintenance.settings)?;
         let level = clamp_level(&model, log.thinking);
         let base = log.next_base();
         self.hooks
@@ -2322,9 +2301,11 @@ impl Session {
             .await
     }
 
-    /// Moves the session's position to `target` (`None` = before the first entry) with a
-    /// `leaf` entry; the next prompt continues from there with the live model and thinking
-    /// level, recorded on the branch when it implies others.
+    /// Moves the session's position to `target` (`None` = before the first entry). Without
+    /// `options.summarize` this appends a `leaf` entry; with it, the abandoned branch is
+    /// summarized first and a `branch_summary` entry at `target` replaces the leaf. The next
+    /// prompt continues from there with the live model and thinking level, recorded on the
+    /// branch when it implies others.
     pub async fn navigate(
         &self,
         target: Option<EntryId>,
@@ -2348,7 +2329,6 @@ impl Session {
         if *self.hooks.running.borrow() {
             return Err(Error::Busy);
         }
-        Limits::resolve(&log.model, &self.hooks.maintenance.settings)?;
         if let Some(target) = &target
             && !log.ids.contains(target.as_str())
         {
@@ -2384,7 +2364,7 @@ impl Session {
             let target = index
                 .get(entry_id.as_str())
                 .ok_or_else(|| Error::EntryNotFound(entry_id.to_string()))?;
-            let (mut next, editable_text) = match &target.entry {
+            let (next, editable_text) = match &target.entry {
                 Entry::Message {
                     message: AgentMessage::Llm(Message::User(user)),
                     base,
@@ -2403,16 +2383,18 @@ impl Session {
                 ),
                 entry => (entry.id(), None),
             };
-            let mut path = Vec::new();
-            // The length bound stops a parent cycle.
-            while let Some(id) = next
-                && path.len() < log.entries.len()
-            {
-                let Some(seq) = index.get(id) else { break };
-                path.push(seq.entry.clone());
-                next = seq.entry.parent_id();
-            }
-            path.reverse();
+            let path = next
+                .and_then(|id| {
+                    log.entries
+                        .iter()
+                        .rposition(|seq| seq.entry.id() == Some(id))
+                })
+                .map_or_else(Vec::new, |at| {
+                    store::project::path_to(&log.entries, at)
+                        .into_iter()
+                        .map(|index| log.entries[index].entry.clone())
+                        .collect()
+                });
             (path, editable_text, log.model.clone(), log.thinking)
         };
 
@@ -2511,7 +2493,7 @@ impl Session {
 /// lock.
 impl Drop for Session {
     fn drop(&mut self) {
-        self.hooks.cancel_maintenance(true);
         self.agent.shutdown();
+        self.hooks.cancel_maintenance(true);
     }
 }

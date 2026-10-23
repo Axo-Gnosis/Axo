@@ -157,8 +157,8 @@ fn startup_walk_is_user_files_then_root_to_cwd_and_reports_bad_text() {
     assert_eq!(files[0].content, "global");
 }
 
-#[test]
-fn nested_context_tracks_model_visible_results_and_reattaches_after_restore() {
+#[tokio::test]
+async fn nested_context_tracks_model_visible_results_and_reattaches_after_restore() {
     let temp = tempfile::tempdir().unwrap();
     let dir = AxoDir::new(temp.path().join("axo"));
     let root = temp.path().join("project");
@@ -172,7 +172,7 @@ fn nested_context_tracks_model_visible_results_and_reattaches_after_restore() {
     assert!(diagnostics.is_empty());
     let context = NestedContext::new(Some(root.clone()), names(), &startup);
     let touched = root.join("sub/feature/x.txt");
-    let blocks = context.attach(&touched);
+    let blocks = context.attach(&touched).await;
     assert_eq!(
         blocks,
         vec![UserBlock::Text {
@@ -183,9 +183,9 @@ fn nested_context_tracks_model_visible_results_and_reattaches_after_restore() {
             .render()
         }]
     );
-    assert!(context.attach(&touched).is_empty());
+    assert!(context.attach(&touched).await.is_empty());
     context.restore(&[]);
-    assert_eq!(context.attach(&touched), blocks);
+    assert_eq!(context.attach(&touched).await, blocks);
     let message = AgentMessage::Llm(Message::ToolResult(ToolResultMessage {
         tool_call_id: "read-1".to_owned(),
         tool_name: "read".to_owned(),
@@ -196,19 +196,21 @@ fn nested_context_tracks_model_visible_results_and_reattaches_after_restore() {
         duration_ms: None,
     }));
     context.restore(&[message]);
-    assert!(context.attach(&touched).is_empty());
-    assert!(context.attach(&root.join("x.txt")).is_empty());
+    assert!(context.attach(&touched).await.is_empty());
+    assert!(context.attach(&root.join("x.txt")).await.is_empty());
     assert!(
         context
             .attach(&temp.path().join("outside/x.txt"))
+            .await
             .is_empty()
     );
     assert!(
         context
             .attach(&temp.path().join("project-other/x.txt"))
+            .await
             .is_empty()
     );
-    assert!(NestedContext::disabled().attach(&touched).is_empty());
+    assert!(NestedContext::disabled().attach(&touched).await.is_empty());
     context.restore(&[]);
-    assert_eq!(context.attach(&touched), blocks);
+    assert_eq!(context.attach(&touched).await, blocks);
 }

@@ -15,7 +15,7 @@ use crate::tools::files::{
     check_fresh, detect_line_ending, error_code, fs_error, normalize_to_lf, restore_line_endings,
     split_bom,
 };
-use crate::tools::{SessionTools, lock_file};
+use crate::tools::{FileAccess, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &[
     "When changing several places in one file, use one edit call with several entries in edits[].",
@@ -165,10 +165,10 @@ impl Tool for EditTool {
         tokio::fs::write(&absolute, &final_content)
             .await
             .map_err(|error| ToolError(fs_error(&error, "open", &absolute)))?;
-        let ledger = self
-            .tools
-            .ledger
-            .record(&absolute, final_content.as_bytes());
+        let ledger =
+            self.tools
+                .ledger
+                .record(&absolute, final_content.as_bytes(), FileAccess::Modify);
         if let Some(error) = aborted() {
             return Err(error);
         }
@@ -183,7 +183,7 @@ impl Tool for EditTool {
         let mut content = vec![UserBlock::Text {
             text: format!("Successfully replaced {block_count} block(s) in {path}."),
         }];
-        content.extend(self.tools.context.attach(&absolute));
+        content.extend(self.tools.context.attach(&absolute).await);
         Ok(ToolOutput {
             content,
             details: Some(json!({

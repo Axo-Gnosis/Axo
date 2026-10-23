@@ -13,6 +13,27 @@ static EXCLUDED: LazyLock<Regex> = LazyLock::new(|| {
     )).expect("valid retry exclusions")
 });
 
+static AUTH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new("(?i)api[ _]key|unauthorized|authentication|credentials")
+        .expect("valid authentication patterns")
+});
+
+/// Whether authentication, billing, or quota failure makes a response fatal.
+pub fn is_fatal_error(message: &AssistantMessage) -> bool {
+    let failure = message.failure.as_ref();
+    if failure.is_some_and(|failure| matches!(failure.status, Some(401 | 403))) {
+        return true;
+    }
+    let diagnostic = message.error_message.as_deref().unwrap_or_default();
+    let code = failure
+        .and_then(|failure| failure.code.as_deref())
+        .unwrap_or_default();
+    EXCLUDED.is_match(diagnostic)
+        || EXCLUDED.is_match(code)
+        || AUTH.is_match(diagnostic)
+        || AUTH.is_match(code)
+}
+
 static TRANSIENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"(?i)overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|",

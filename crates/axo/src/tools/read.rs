@@ -10,12 +10,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::SessionTools;
 use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, fs_error, process_image};
 use crate::tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, TruncatedBy, format_size, truncate_head,
     truncation_details,
 };
+use crate::tools::{FileAccess, SessionTools};
 
 const GUIDELINES: &[&str] = &["Use read to examine files instead of cat or sed."];
 
@@ -102,7 +102,8 @@ impl Tool for ReadTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
-        let mut details = json!({ "ledger": self.tools.ledger.record(&absolute, &bytes) });
+        let mut details =
+            json!({ "ledger": self.tools.ledger.record(&absolute, &bytes, FileAccess::Read) });
 
         let mut content = if let Some(mime) =
             detect_image_mime(&bytes[..bytes.len().min(IMAGE_SNIFF_BYTES)])
@@ -197,7 +198,7 @@ impl Tool for ReadTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
-        content.extend(self.tools.context.attach(&absolute));
+        content.extend(self.tools.context.attach(&absolute).await);
         Ok(ToolOutput {
             content,
             details: Some(details),

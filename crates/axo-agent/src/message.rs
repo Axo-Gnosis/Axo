@@ -1,7 +1,7 @@
 //! Messages the agent keeps: LLM messages plus host-defined custom messages
 //! (pi `coding-agent/src/core/messages.ts:30-78`, the `custom` role).
 
-use axo_ai::{AssistantMessage, Message, StopReason, ToolCall, UserBlock};
+use axo_ai::{AssistantMessage, Message, StopReason, ToolCall, ToolResultMessage, UserBlock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -29,16 +29,24 @@ pub struct CustomMessage {
     pub timestamp: i64,
 }
 
+/// A resumable assistant message, its unanswered calls and its trailing results.
+pub struct Unanswered<'a> {
+    pub message: &'a AssistantMessage,
+    pub calls: Vec<&'a ToolCall>,
+    /// Trailing results answering `message`, in transcript order.
+    pub results: Vec<&'a ToolResultMessage>,
+}
+
 /// The last assistant message's calls that no later tool result answers, when only tool
 /// results (or system messages) follow it. Failed and aborted responses are never
 /// resumed: continuing after them requests a new turn.
 pub fn unanswered_calls<'a>(
     messages: impl DoubleEndedIterator<Item = &'a AgentMessage>,
-) -> Option<(&'a AssistantMessage, Vec<&'a ToolCall>)> {
-    let mut answered = Vec::new();
+) -> Option<Unanswered<'a>> {
+    let mut results = Vec::new();
     for message in messages.rev() {
         match message {
-            AgentMessage::Llm(Message::ToolResult(result)) => answered.push(&result.tool_call_id),
+            AgentMessage::Llm(Message::ToolResult(result)) => results.push(result),
             AgentMessage::Llm(Message::System(_)) => {}
             AgentMessage::Llm(Message::Assistant(assistant))
                 if !matches!(
@@ -48,9 +56,14 @@ pub fn unanswered_calls<'a>(
             {
                 let calls: Vec<&ToolCall> = assistant
                     .tool_calls()
-                    .filter(|call| !answered.contains(&&call.id))
+                    .filter(|call| !results.iter().any(|result| result.tool_call_id == call.id))
                     .collect();
-                return (!calls.is_empty()).then_some((assistant, calls));
+                results.reverse();
+                return (!calls.is_empty()).then_some(Unanswered {
+                    message: assistant,
+                    calls,
+                    results,
+                });
             }
             _ => return None,
         }

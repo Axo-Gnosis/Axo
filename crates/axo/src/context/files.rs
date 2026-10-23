@@ -2,14 +2,14 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axo_agent::AgentMessage;
 use axo_ai::{Message, UserBlock};
 use indexmap::IndexMap;
 
 use crate::config::AxoDir;
-use crate::context::{Diagnostic, project_root};
+use crate::context::{Diagnostic, project_dirs, project_root};
 use crate::tools::{FileLedger, file_key};
 
 /// One loaded context file.
@@ -99,16 +99,15 @@ struct Seen {
 }
 
 impl Seen {
-    fn admit(&mut self, path: &Path, content: &str) -> bool {
-        let path = file_key(path);
-        if self.paths.contains(&path) {
+    fn admit(&mut self, key: PathBuf, content: &str) -> bool {
+        if self.paths.contains(&key) {
             return false;
         }
         let hash = FileLedger::hash(content.as_bytes());
         if self.hashes.contains(&hash) {
             return false;
         }
-        self.paths.insert(path);
+        self.paths.insert(key);
         self.hashes.insert(hash);
         true
     }
@@ -132,7 +131,7 @@ pub fn load_context_files(
         .collect();
     paths.push(dir.root().join("AGENTS.md"));
     if project {
-        for dir in directories(&project_root(cwd), cwd) {
+        for dir in project_dirs(&project_root(cwd), cwd) {
             paths.extend(names.iter().map(|name| dir.join(name)));
         }
     }
@@ -144,21 +143,12 @@ pub fn load_context_files(
             continue;
         }
         match read_context_file(path) {
-            Ok(file) if seen.admit(&file.path, &file.content) => files.push(file),
+            Ok(file) if seen.admit(file_key(&file.path), &file.content) => files.push(file),
             Ok(_) => {}
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }
     (files, diagnostics)
-}
-
-fn directories<'a>(root: &Path, dir: &'a Path) -> Vec<&'a Path> {
-    let mut dirs: Vec<_> = dir
-        .ancestors()
-        .take_while(|dir| dir.starts_with(root))
-        .collect();
-    dirs.reverse();
-    dirs
 }
 
 fn read_context_file(path: PathBuf) -> Result<ContextFile, Diagnostic> {
@@ -179,9 +169,9 @@ fn read_context_file(path: PathBuf) -> Result<ContextFile, Diagnostic> {
 /// Context files outside the startup walk, attached to file-tool results on first touch.
 pub struct NestedContext {
     root: Option<PathBuf>,
-    names: Vec<PathBuf>,
+    names: Arc<[PathBuf]>,
     base: Seen,
-    seen: Mutex<Seen>,
+    seen: Arc<Mutex<Seen>>,
 }
 
 impl NestedContext {
@@ -189,12 +179,12 @@ impl NestedContext {
     pub fn new(root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) -> Self {
         let mut base = Seen::default();
         for file in startup {
-            base.admit(&file.path, &file.content);
+            base.admit(file_key(&file.path), &file.content);
         }
         Self {
             root,
-            names,
-            seen: Mutex::new(base.clone()),
+            names: names.into(),
+            seen: Arc::new(Mutex::new(base.clone())),
             base,
         }
     }
@@ -203,42 +193,69 @@ impl NestedContext {
         Self::new(None, Vec::new(), &[])
     }
 
-    /// Blocking filesystem I/O.
-    pub fn attach(&self, file: &Path) -> Vec<UserBlock> {
+    /// Loads context files on a blocking worker without holding the seen-files lock.
+    pub async fn attach(&self, file: &Path) -> Vec<UserBlock> {
         let Some(root) = self.root.as_ref().filter(|root| file.starts_with(root)) else {
             return Vec::new();
         };
-        let Some(parent) = file.parent() else {
-            return Vec::new();
-        };
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut blocks = Vec::new();
-        for dir in directories(root, parent) {
-            for name in &self.names {
-                let path = dir.join(name);
-                if !path.is_file() {
-                    continue;
-                }
-                match read_context_file(path) {
-                    Ok(file) if seen.admit(&file.path, &file.content) => {
-                        blocks.push(UserBlock::Text {
-                            text: file.render(),
-                        });
+        let root = root.clone();
+        let names = Arc::clone(&self.names);
+        let seen = Arc::clone(&self.seen);
+        let file = file.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let Some(parent) = file.parent() else {
+                return Vec::new();
+            };
+            let mut blocks = Vec::new();
+            for dir in project_dirs(&root, parent) {
+                for name in names.iter() {
+                    let path = dir.join(name);
+                    if !path.is_file() {
+                        continue;
                     }
-                    Ok(_) => {}
-                    Err(diagnostic) => {
-                        tracing::warn!(path = ?diagnostic.path, message = %diagnostic.message, "cannot read nested context file");
+                    let key = file_key(&path);
+                    if seen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .paths
+                        .contains(&key)
+                    {
+                        continue;
+                    }
+                    match read_context_file(path) {
+                        Ok(file) => {
+                            let admitted = seen
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .admit(key, &file.content);
+                            if admitted {
+                                blocks.push(UserBlock::Text {
+                                    text: file.render(),
+                                });
+                            }
+                        }
+                        Err(diagnostic) => {
+                            tracing::warn!(
+                                path = ?diagnostic.path,
+                                message = %diagnostic.message,
+                                "cannot read nested context file"
+                            );
+                        }
                     }
                 }
             }
-        }
-        blocks
+            blocks
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot load nested context files");
+            Vec::new()
+        })
     }
 
     /// Resets to startup files plus every context block in the current tool results.
     pub fn restore(&self, messages: &[AgentMessage]) {
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.clone_from(&self.base);
+        let mut restored = Vec::new();
         for message in messages {
             let AgentMessage::Llm(Message::ToolResult(result)) = message else {
                 continue;
@@ -247,9 +264,14 @@ impl NestedContext {
                 if let UserBlock::Text { text } = block
                     && let Some((path, content)) = ContextFile::parse(text)
                 {
-                    seen.admit(&path, content);
+                    restored.push((file_key(&path), content));
                 }
             }
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.clone_from(&self.base);
+        for (key, content) in restored {
+            seen.admit(key, content);
         }
     }
 }

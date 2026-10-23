@@ -1052,11 +1052,9 @@ fn with_raw_metadata(mut message: String, error: Option<&Value>) -> String {
 /// Error message for a non-success HTTP response (pi `normalizeProviderError` +
 /// `formatProviderError` over the SDK's status error): `"<status>: <error JSON>"` when
 /// the body has an `error` object, else the SDK message.
-fn http_error_message(status: u16, text: &str) -> String {
-    let parsed = serde_json::from_str::<Value>(text)
-        .ok()
-        .filter(|value| truthy(Some(value)));
-    let error = parsed.as_ref().and_then(|body| body.get("error"));
+fn http_error_message(status: u16, text: &str, body: Option<&Value>) -> String {
+    let parsed = body.filter(|value| truthy(Some(value)));
+    let error = parsed.and_then(|body| body.get("error"));
     let message = api_error_message(
         Some(status),
         error,
@@ -1253,10 +1251,11 @@ impl Response {
             let Some(text) = error_body(response, cancel).await else {
                 return Err(ABORTED.to_owned());
             };
-            if let Ok(body) = serde_json::from_str::<Value>(&text) {
-                super::http::record_failure(&mut self.output, &body);
+            let body = serde_json::from_str::<Value>(&text).ok();
+            if let Some(body) = body.as_ref() {
+                super::http::record_failure(&mut self.output, body);
             }
-            return Err(http_error_message(status, &text));
+            return Err(http_error_message(status, &text, body.as_ref()));
         }
         let _ = self.tx.unbounded_send(AssistantEvent::Start {
             partial: self.output.clone(),

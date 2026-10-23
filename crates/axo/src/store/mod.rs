@@ -1,10 +1,9 @@
 //! Durable sessions: the entry format, the storage seam with its JSONL
-//! default, context projection and crash recovery.
+//! default, and context projection.
 
 pub mod entry;
 pub mod jsonl;
 pub mod project;
-pub mod recovery;
 
 use std::path::Path;
 
@@ -16,7 +15,6 @@ pub use entry::{
 };
 pub use jsonl::JsonlStore;
 pub use project::{ProjectedSource, Projection, project};
-pub use recovery::{RecoveryPlan, plan_recovery};
 
 use crate::error::Error;
 

@@ -39,31 +39,14 @@ async fn harness(
     window: u64,
     turns: Vec<ScriptedTurn>,
 ) -> (Axo, Arc<ScriptedApi>) {
-    let api = Arc::new(ScriptedApi::new(turns));
-    let models = Models::load(ModelsOptions {
-        cache_dir: None,
-        config: ModelsConfig::parse_jsonc(
-            &json!({"providers":{"test":{
-                "api":"openai-completions", "baseUrl":"http://127.0.0.1:9/v1",
-                "models":[{"id":"m", "contextWindow":window,"maxTokens":4096}]
-            }}})
-            .to_string(),
-        )
-        .unwrap(),
-        extended_context: false,
-        credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
-    })
-    .await
-    .unwrap();
-    let axo = Axo::builder()
-        .dir(dir.to_path_buf())
-        .settings(settings)
-        .models(Arc::new(models))
-        .streamer(api.clone())
-        .build()
-        .await
-        .unwrap();
-    (axo, api)
+    let host = common::host(
+        dir,
+        json!([{"id":"m", "contextWindow":window, "maxTokens":4096}]),
+        settings,
+        turns,
+    )
+    .await;
+    (host.axo, host.api)
 }
 
 fn user(text: impl Into<String>) -> Message {
@@ -88,6 +71,22 @@ fn result(id: &str, name: &str, text: impl Into<String>) -> Message {
         timestamp: 0,
         duration_ms: None,
     })
+}
+
+fn ledger_result(
+    id: &str,
+    name: &str,
+    text: impl Into<String>,
+    path: &str,
+    access: &str,
+) -> Message {
+    let Message::ToolResult(mut result) = result(id, name, text) else {
+        unreachable!("result constructs a tool result");
+    };
+    result.details = Some(json!({
+        "ledger": {"path": path, "sha256": "x", "access": access}
+    }));
+    Message::ToolResult(result)
 }
 
 // Seed durable messages without fabricated run/recovery evidence. All maintenance
@@ -227,7 +226,13 @@ async fn elide_preserves_skills_malformed_regions_and_the_complete_4k_boundary()
         call("old", "read", json!({"path":"old.txt"})),
         result("old", "read", old.clone()),
         call("skill", "read", json!({"path":"skills/SKILL.md"})),
-        result("skill", "read", protected.clone()),
+        ledger_result(
+            "skill",
+            "read",
+            protected.clone(),
+            "skills/SKILL.md",
+            "read",
+        ),
         call("boundary", "read", json!({"path":"recent.txt"})),
         result("boundary", "read", boundary.clone()),
         assistant("recent"),
@@ -313,8 +318,8 @@ async fn image_and_thinking_shakes_are_recoverable_and_idempotent() {
     let raw = entries(&axo, &session).await;
     assert_eq!(edits(&raw), vec![&ids[0], &ids[1]]);
     let after = llm(&raw);
-    let spool = session.path().with_extension("").join("bash");
-    let files: Vec<_> = std::fs::read_dir(spool)
+    let artifacts_dir = session.path().with_extension("").join("context");
+    let files: Vec<_> = std::fs::read_dir(artifacts_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
@@ -449,7 +454,7 @@ async fn three_rejected_summary_actions_never_checkpoint_or_execute_calls() {
     assert!(checkpoints(&raw).is_empty());
     assert_eq!(llm(&raw), before);
     assert!(!options(dir.path()).cwd.join("must-not-exist").exists());
-    let requests = api.recorded_requests();
+    let requests = api.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].options.tool_choice, Some(ToolChoice::None));
     for request in &requests[1..] {
@@ -491,7 +496,7 @@ async fn live_tool_rejection_falls_back_to_separate_without_side_effects() {
     )
     .await;
     session.compact().await.unwrap();
-    let requests = api.recorded_requests();
+    let requests = api.requests();
     assert_eq!(requests.len(), 2);
     let live = &requests[0];
     let separate = &requests[1];
@@ -558,7 +563,7 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
     ];
     let (session, _) = seed_with_options(&axo, dir.path(), messages, opts).await;
     session.compact().await.unwrap();
-    let requests = api.recorded_requests();
+    let requests = api.requests();
     assert_eq!(requests.len(), 2);
     let last_user = |request: &axo_ai::RecordedRequest| {
         text(
@@ -622,7 +627,7 @@ async fn large_tool_history_crosses_threshold_then_continues_with_a_real_tool() 
             .unwrap(),
         RunOutcome::Done
     );
-    let requests = api.recorded_requests();
+    let requests = api.requests();
     assert_eq!(requests.len(), 3);
     // There is no completed earlier turn: only the split-turn prefix needs
     // summarizing, so it uses the tool-free separate serializer.
@@ -705,10 +710,14 @@ async fn split_turn_is_combined_sequentially_and_carries_whole_users_and_file_li
         Some("effective current instruction".into()),
     ));
     let (session, ids) = seed_with_options(&axo, dir.path(), vec![
-        user(old_user), call("r", "read", json!({"path":"a.rs"})), result("r", "read", "source ".repeat(1500)),
-        call("w", "write", json!({"path":"b.rs","content":"changed"})), result("w", "write", "written"),
+        user(old_user),
+        call("r", "read", json!({"path":"a.rs"})),
+        ledger_result("r", "read", "source ".repeat(1500), "a.rs", "read"),
+        call("w", "write", json!({"path":"b.rs","content":"changed"})),
+        ledger_result("w", "write", "written", "b.rs", "modify"),
         assistant("history ".repeat(1500)), user(turn_user),
-        call("e", "edit", json!({"path":"a.rs","edits":[{"oldText":"a","newText":"b"}]})), result("e", "edit", "edited"),
+        call("e", "edit", json!({"path":"a.rs","edits":[{"oldText":"a","newText":"b"}]})),
+        ledger_result("e", "edit", "edited", "a.rs", "modify"),
         assistant("retained tail ".repeat(400)),
         Message::System(serde_json::from_value(json!({
             "content":[], "sections":{"test-section":"superseded","removed-section":"obsolete"},
@@ -764,7 +773,7 @@ async fn split_turn_is_combined_sequentially_and_carries_whole_users_and_file_li
             1
         );
     }
-    let requests = api.recorded_requests();
+    let requests = api.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].options.tool_choice, Some(ToolChoice::None));
     assert_eq!(requests[1].options.tool_choice, None);
@@ -811,11 +820,11 @@ async fn split_turn_is_combined_sequentially_and_carries_whole_users_and_file_li
     );
     let requests = api.requests();
     assert_eq!(requests.len(), 5);
-    assert!(
-        requests[3..]
+    assert!(requests[3..].iter().any(|r| {
+        r.transcript
             .iter()
-            .any(|r| r.iter().any(|m| text(m).contains("Historical cedar work.")))
-    );
+            .any(|m| text(m).contains("Historical cedar work."))
+    }));
 }
 
 fn estimated(messages: &[Message]) -> u64 {
@@ -885,7 +894,7 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
         );
         let raw = entries(&axo, &session).await;
         let added = &raw[baseline..];
-        let requests = api.recorded_requests();
+        let requests = api.requests();
         if above {
             assert!(
                 edits(added).is_empty(),
@@ -958,10 +967,9 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
 
 #[tokio::test]
 async fn http_provider_ignoring_none_cannot_execute_summary_tools() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::Mutex;
-    use std::time::Duration;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -969,36 +977,10 @@ async fn http_provider_ignoring_none_cannot_execute_summary_tools() {
     let server = std::thread::spawn(move || {
         for index in 0..2 {
             let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            let (start, length) = loop {
-                let n = socket.read(&mut buffer).unwrap();
-                assert_ne!(n, 0);
-                bytes.extend_from_slice(&buffer[..n]);
-                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]);
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse().unwrap())
-                        })
-                        .unwrap();
-                    break (end + 4, length);
-                }
-            };
-            while bytes.len() < start + length {
-                let n = socket.read(&mut buffer).unwrap();
-                assert_ne!(n, 0);
-                bytes.extend_from_slice(&buffer[..n]);
-            }
-            captured.lock().unwrap().push(
-                serde_json::from_slice::<serde_json::Value>(&bytes[start..start + length]).unwrap(),
-            );
+            captured
+                .lock()
+                .unwrap()
+                .push(axo_ai::testing::read_http_request(&mut socket));
             let chunk = if index == 0 {
                 json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"forbidden","type":"function","function":{"name":"write","arguments":"{\"path\":\"http-forbidden\",\"content\":\"bad\"}"}}]},"finish_reason":"tool_calls"}]})
             } else {
@@ -1132,7 +1114,8 @@ async fn compaction_retains_an_oversized_call_result_group_as_a_unit() {
         matches!(&projected[call_at + 1], Message::ToolResult(r) if r.tool_call_id == "keep" && blocks_text(&r.content) == output)
     );
     assert!(!api.requests().iter().any(|r| {
-        r.iter()
+        r.transcript
+            .iter()
             .any(|m| matches!(m, Message::ToolResult(t) if t.tool_call_id == "keep"))
     }));
 }

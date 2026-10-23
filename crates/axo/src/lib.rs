@@ -7,6 +7,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod exec;
+pub mod recovery;
 pub mod session;
 pub mod store;
 pub mod tools;

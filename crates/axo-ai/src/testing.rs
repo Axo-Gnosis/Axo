@@ -1,7 +1,10 @@
 //! A deterministic [`Streamer`] that replays scripted turns, for tests.
 
 use std::collections::VecDeque;
+use std::io::Read;
+use std::net::TcpStream;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -54,23 +57,46 @@ impl ScriptedApi {
         }
     }
 
-    /// The transcripts of every `stream` call so far, in call order.
-    pub fn requests(&self) -> Vec<Transcript> {
-        self.requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|request| request.transcript.clone())
-            .collect()
-    }
-
     /// Complete requests, including the actual model and options, in call order.
-    pub fn recorded_requests(&self) -> Vec<RecordedRequest> {
+    pub fn requests(&self) -> Vec<RecordedRequest> {
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+}
+
+/// Read a JSON HTTP request from a finite test-server connection.
+pub fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    let (body_start, length) = loop {
+        let mut chunk = [0; 4096];
+        let count = stream.read(&mut chunk).unwrap();
+        assert_ne!(count, 0);
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            break (end + 4, length);
+        }
+    };
+    while bytes.len() < body_start + length {
+        let mut chunk = [0; 4096];
+        let count = stream.read(&mut chunk).unwrap();
+        assert_ne!(count, 0);
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap()
 }
 
 impl Streamer for ScriptedApi {
