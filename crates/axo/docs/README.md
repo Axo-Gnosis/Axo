@@ -2,7 +2,7 @@
 
 `axo` is an embeddable, headless coding-agent harness core written in Rust across three crates: `axo-ai`, `axo-agent`, and `axo`.
 
-This directory documents the implemented behavior and public APIs of the workspace.
+This directory documents the implemented behavior and public APIs of the workspace. It lives inside the `axo` crate so the five guides are bundled with the crate and embedded in its system-prompt documentation.
 
 ## Reference Guides
 

@@ -1,4 +1,4 @@
-//! Context files (`AGENTS.md` and friends), per `docs/core.md` "Context files".
+//! Context files (`AGENTS.md` and friends), per `plan/design.md` "Context files".
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};

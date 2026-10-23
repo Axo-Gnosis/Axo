@@ -3,7 +3,7 @@
 This is the live planning document for unbuilt work and active design discussions. It changes freely as we work.
 
 - **Goals & settled architecture:** [`design.md`](design.md)
-- **Implemented reference (M1–M5):** [`docs/README.md`](../docs/README.md)
+- **Implemented reference (M1–M5):** [`crates/axo/docs/README.md`](../crates/axo/docs/README.md)
 - **Background studies:** [`pi/`](pi/README.md) and [`research/`](research/README.md)
 
 ## Overview of tracks

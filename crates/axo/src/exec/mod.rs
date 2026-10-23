@@ -1,4 +1,4 @@
-//! The environment bash commands run with (`docs/research/nix-shell.md` §5).
+//! The environment bash commands run with (`plan/research/nix-shell.md` §5).
 
 pub mod devshell;
 pub mod host;

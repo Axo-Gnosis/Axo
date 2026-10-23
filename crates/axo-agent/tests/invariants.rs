@@ -1,4 +1,4 @@
-//! Ordering and lifecycle invariants of the agent loop (`docs/core.md` "Agent loop"),
+//! Ordering and lifecycle invariants of the agent loop (`plan/design.md` "Agent loop"),
 //! exercised through the public `Agent` API with a scripted provider.
 
 use std::collections::BTreeMap;

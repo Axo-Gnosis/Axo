@@ -124,13 +124,13 @@ axo/
 │   ├── axo-agent/                  # Tool-calling loop, hooks, queues, cancellation, split event delivery
 │   └── axo/                        # Axo & Session APIs, JsonlStore, compaction, context, DevShellEnv, tools
 │       ├── prompts/                # Bundled SYSTEM.md, PROSE.md, and summarizer markdown prompts
-│       └── examples/               # `drive` (CLI session driver) and `memory` (PSS benchmark)
-├── docs/                           # Implementation reference (linked in the `<docs>` system-prompt section)
-│   ├── README.md                   # Documentation index
-│   ├── configuration.md            # ~/.axo/ and .axo/ layout, settings.jsonc, models.jsonc, project access
-│   ├── prompts-and-context.md      # System prompt sections, prompt overrides, contextFiles, and skills
-│   ├── sessions-and-compaction.md  # JsonlStore, projection, recovery, attach, /shake, and compaction
-│   └── extending.md                # Declarative files and Rust embedding traits
+│       ├── examples/               # `drive` (CLI session driver) and `memory` (PSS benchmark)
+│       └── docs/                   # Bundled implementation reference for the `<docs>` system-prompt section
+│           ├── README.md           # Documentation index
+│           ├── configuration.md    # ~/.axo/ and .axo/ layout, settings.jsonc, models.jsonc, project access
+│           ├── prompts-and-context.md     # System prompt sections, prompt overrides, contextFiles, and skills
+│           ├── sessions-and-compaction.md # JsonlStore, projection, recovery, attach, /shake, and compaction
+│           └── extending.md        # Declarative files and Rust embedding traits
 └── plan/                           # Architecture design, pi port studies, and background research
     ├── design.md                   # Goals, non-goals, architecture, and settled core decisions
     ├── plan.md                     # Active planning, next tracks, and open design discussions
@@ -168,7 +168,7 @@ cargo run --release -p axo --example memory -- --sessions 3
 
 ## Documentation
 
-- **Implementation Reference (`docs/`):** Start at [`docs/README.md`](docs/README.md) for [`configuration.md`](docs/configuration.md), [`prompts-and-context.md`](docs/prompts-and-context.md), [`sessions-and-compaction.md`](docs/sessions-and-compaction.md), and [`extending.md`](docs/extending.md).
+- **Implementation Reference (`crates/axo/docs/`):** Start at [`crates/axo/docs/README.md`](crates/axo/docs/README.md) for [`configuration.md`](crates/axo/docs/configuration.md), [`prompts-and-context.md`](crates/axo/docs/prompts-and-context.md), [`sessions-and-compaction.md`](crates/axo/docs/sessions-and-compaction.md), and [`extending.md`](crates/axo/docs/extending.md).
 - **Planning & Research (`plan/`):** See [`plan/design.md`](plan/design.md), [`plan/plan.md`](plan/plan.md), [`plan/pi/`](plan/pi/README.md), and [`plan/research/`](plan/research/README.md).
 
 ## License

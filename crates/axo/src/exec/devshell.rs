@@ -1,5 +1,5 @@
 //! Project environments from direnv or a Nix flake dev shell
-//! (`docs/research/nix-shell.md` §4–§5).
+//! (`plan/research/nix-shell.md` §4–§5).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};

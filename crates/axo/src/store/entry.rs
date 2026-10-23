@@ -1,5 +1,5 @@
 //! The session file format: pi's v3 JSONL tree (`session-manager.ts:41-180`,
-//! `docs/pi/session.md` §2) as axo format version 1, plus axo's navigation,
+//! `plan/pi/session.md` §2) as axo format version 1, plus axo's navigation,
 //! run and submission entries.
 
 use std::borrow::Borrow;

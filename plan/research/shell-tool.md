@@ -4,7 +4,7 @@ Sources: pi v1.3.0 at `/tmp/pi-src` (abbreviated `PI/` = `packages/coding-agent/
 
 ## 1. pi's bash tool (what axo's M3 currently ports)
 
-Checked against `docs/pi/context.md` §bash (lines 275-301) and the source.
+Checked against `plan/pi/context.md` §bash (lines 275-301) and the source.
 
 - **Schema.** `{command, timeout?}`, where `timeout` is in seconds and has no default (`PI/core/tools/bash.ts:40-43`). The snippet is "Execute bash commands (ls, grep, find, etc.)" (`:45-48`).
 - **Shell.** The `shellPath` setting if it exists, otherwise `/bin/bash`, otherwise `bash` on PATH, otherwise `sh`. Args are `-c <cmd>` (`PI/utils/shell.ts:86-139`).

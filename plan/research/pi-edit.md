@@ -3,7 +3,7 @@
 Paths below are relative to that omp source tree unless noted. Dependency numbers come from real `cargo tree`/`cargo build` runs on a copy in `/tmp/axo-research-PiEditAnatomy/` (Linux x86_64 host, nixpkgs cargo/rustc 1.98, `-e normal`, unique packages, root excluded).
 
 ## 0. Correction to axo docs
-`docs/core.md:223` and `docs/pi/context.md:426` say hashline reads put `N#TAG` on every line. **That is wrong.** The tag is per file, not per line:
+`plan/design.md:223` and `plan/pi/context.md:426` say hashline reads put `N#TAG` on every line. **That is wrong.** The tag is per file, not per line:
 ```
 [src/lib.rs#49F6]          ← one header per file: path + 4-hex snapshot tag of the whole file
 1:fn a() {}                ← N:TEXT rows; no per-line hash

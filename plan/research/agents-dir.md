@@ -49,7 +49,7 @@ pi is much narrower. The only `.agents/` path it knows is `skills/` (`core/packa
   - The scan recurses until it finds a `SKILL.md`.
   - Frontmatter: `name`, `description` (required), `disable-model-invocation`.
   - Name rules from the spec produce warnings only.
-  - See axo `docs/pi/context.md` §3.4.
+  - See axo `plan/pi/context.md` §3.4.
 - **Prompt templates:** `~/.pi/agent/prompts/*.md` and `<cwd>/.pi/prompts/*.md` (the latter trusted only). **pi does not read `.agents/commands` or `.agents/prompts`** (§3.5).
 - **Context files:** `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` per directory, walking up to the filesystem root, plus `~/.pi/agent/AGENTS.md`. pi does not read `.agents/AGENTS.md` (§3.2).
 - **Not supported:** rules, subagents, hooks-as-files and MCP (the last is in `.pi/mcp.json`, and only through extensions).

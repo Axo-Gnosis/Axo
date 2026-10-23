@@ -1,5 +1,5 @@
 //! The `bash` tool (pi `core/tools/bash.ts`) with omp's additions
-//! (`docs/research/shell-tool.md` #7–#11): SIGTERM → 1 s → SIGKILL on the process group,
+//! (`plan/research/shell-tool.md` #7–#11): SIGTERM → 1 s → SIGKILL on the process group,
 //! a non-interactive environment, head + tail inline output, a per-line cap and
 //! ANSI/`\r` cleaning.
 

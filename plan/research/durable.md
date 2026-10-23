@@ -1,6 +1,6 @@
 # pi-durable vs. what axo needs for an always-on agent in sworm-server
 
-Sources: pi v1.3.0 at `/tmp/pi-src` (paths below are relative to `packages/`), axo `docs/{design,core}.md`, Sworm `.sworm/plans/OVERVIEW_AGENT_PLATFORM_PLAN.md` (abbreviated **SP**). The `phase4-runtime.md` notes cover ACP adapter provisioning only (adapter versions, auth, ports). They have nothing on durability, so they are cited once at most.
+Sources: pi v1.3.0 at `/tmp/pi-src` (paths below are relative to `packages/`), axo `plan/design.md`, Sworm `.sworm/plans/OVERVIEW_AGENT_PLATFORM_PLAN.md` (abbreviated **SP**). The `phase4-runtime.md` notes cover ACP adapter provisioning only (adapter versions, auth, ports). They have nothing on durability, so they are cited once at most.
 
 ---
 
@@ -110,7 +110,7 @@ It is **not** a workflow engine with deterministic replay (Temporal-style), and 
   - It is thoroughly tested: crash and restart tests exist for tools, nested tools, tasks, generation and storage failure.
 - **pi's coding agent does NOT use it.**
   - `coding-agent/package.json:44` depends on `pi-agent-core`, and there is no `pi-durable` or chord import anywhere in `coding-agent/src`.
-  - The coding agent still runs on `AgentSession` with JSONL `SessionManager`. That manager has no fsync, no lock and no recovery of runs. Messages are persisted only on `message_end`, never as partials, and an interrupted run is simply gone; orphaned tool calls get "No result provided" when the next request is built (`axo/docs/pi/session.md:170-181`, `axo/docs/pi/loop.md:162`).
+  - The coding agent still runs on `AgentSession` with JSONL `SessionManager`. That manager has no fsync, no lock and no recovery of runs. Messages are persisted only on `message_end`, never as partials, and an interrupted run is simply gone; orphaned tool calls get "No result provided" when the next request is built (`axo/plan/pi/session.md:170-181`, `axo/plan/pi/loop.md:162`).
   - pi-durable is a *parallel product*. It ships its own ports of `read`/`write`/`edit`/`bash`, `tool_search` and codemode, with examples for print/JSON/chat modes (`README.md:845-864`). It targets embedders such as Cloudflare Workers.
 - **For axo:** the *product* axo ports (`coding-agent`) is not durable. pi-durable is a reference design to borrow ideas from, not a dependency.
 
@@ -172,7 +172,7 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
 2. **Cancellation with a reason.** `tokio_util::CancellationToken` carries no reason, so wrap it as `Cancel { token, reason: Arc<OnceLock<CancelReason>> }` with `enum CancelReason { User, Shutdown }`.
    - On `Shutdown`, the loop **must not** persist aborted assistant messages or the "aborted" tool results from decision 3. The run stays open and resumes after restart, mirroring pi's close semantics (`spec.md:2027-2038`).
    - On `User`, decision 3 applies as written.
-3. **A resume entry point.** `Agent::continue_run(transcript)` starts a run from an existing tail: user message, tool results, or a steer. pi has `continue()` (`axo/docs/pi/loop.md:174`); keep it as a first-class API, not a test hook.
+3. **A resume entry point.** `Agent::continue_run(transcript)` starts a run from an existing tail: user message, tool results, or a steer. pi has `continue()` (`axo/plan/pi/loop.md:174`); keep it as a first-class API, not a test hook.
 4. **Split event delivery.**
    - Keep the *ordered, awaited* subscriber for **persistence only**. It must finish before the next request (`core.md:138`).
    - Host and client fan-out goes through a bounded `tokio::sync::broadcast`. A lagging receiver gets `Lagged`, then resyncs from a snapshot (pi's 100-frame rule, `observation.ts:16`).

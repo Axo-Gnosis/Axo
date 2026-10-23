@@ -1,4 +1,4 @@
-//! The sectioned system prompt (pi `core/system-prompt.ts`, `docs/pi/context.md` §1).
+//! The sectioned system prompt (pi `core/system-prompt.ts`, `plan/pi/context.md` §1).
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -42,23 +42,20 @@ pub struct PromptInputs<'a> {
 const BUNDLED_SYSTEM: &str = include_str!("../../prompts/SYSTEM.md");
 const BUNDLED_PROSE: &str = include_str!("../../prompts/PROSE.md");
 const BUNDLED_DOCS: &[(&str, &str)] = &[
-    ("README.md", include_str!("../../../../docs/README.md")),
+    ("README.md", include_str!("../../docs/README.md")),
     (
         "configuration.md",
-        include_str!("../../../../docs/configuration.md"),
+        include_str!("../../docs/configuration.md"),
     ),
     (
         "prompts-and-context.md",
-        include_str!("../../../../docs/prompts-and-context.md"),
+        include_str!("../../docs/prompts-and-context.md"),
     ),
     (
         "sessions-and-compaction.md",
-        include_str!("../../../../docs/sessions-and-compaction.md"),
+        include_str!("../../docs/sessions-and-compaction.md"),
     ),
-    (
-        "extending.md",
-        include_str!("../../../../docs/extending.md"),
-    ),
+    ("extending.md", include_str!("../../docs/extending.md")),
 ];
 
 fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<PathBuf> {

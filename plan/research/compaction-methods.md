@@ -6,7 +6,7 @@ Two studies made on 2026-10-22 for M5. Thresholds and reserves are in [`compacti
 
 **Short answer:** no, not by default. In pi, and in omp's default "soft" path, compaction is a separate one-shot request. It has its own summarizer system prompt and no tools. The old span goes in as flat text inside a single user message, so the model doesn't treat it as a conversation to continue. omp also has methods that really are "just another prompt" on the live context: handoff, and provider-native server compaction. It also has methods that make no LLM call at all: snapcompact, shake, and experimental notes-based rollover. omp tries them in a configurable order.
 
-Paths: pi is `/tmp/pi-src/packages/coding-agent/` (`CMP` = `src/core/compaction/compaction.ts`, `UT` = `…/utils.ts`, `BS` = `…/branch-summarization.ts`, `AS` = `src/core/agent-session.ts`). omp is `/tmp/omp-src/` (HEAD `0b5c27a`; `OC` = `packages/agent/src/compaction/compaction.ts`, `OU` = `…/utils.ts`, `OP/` = `…/compaction/prompts/`, `SM` = `packages/coding-agent/src/session/session-maintenance.ts`, `DOC` = `docs/compaction.md`). Cut-point and trigger mechanics for pi are already in `docs/pi/session.md` §3.8–3.9; I only repeat what's needed here.
+Paths: pi is `/tmp/pi-src/packages/coding-agent/` (`CMP` = `src/core/compaction/compaction.ts`, `UT` = `…/utils.ts`, `BS` = `…/branch-summarization.ts`, `AS` = `src/core/agent-session.ts`). omp is `/tmp/omp-src/` (HEAD `0b5c27a`; `OC` = `packages/agent/src/compaction/compaction.ts`, `OU` = `…/utils.ts`, `OP/` = `…/compaction/prompts/`, `SM` = `packages/coding-agent/src/session/session-maintenance.ts`, `DOC` = `docs/compaction.md`). Cut-point and trigger mechanics for pi are already in `plan/pi/session.md` §3.8–3.9; I only repeat what's needed here.
 
 ---
 
@@ -16,7 +16,7 @@ Paths: pi is `/tmp/pi-src/packages/coding-agent/` (`CMP` = `src/core/compaction/
 
 **What gets selected**
 - `prepareCompaction` takes the projected branch from the last compaction onward. Entries kept by the previous compaction can be summarized again.
-- It walks back to collect `keepRecentTokens` (default 20000) and cuts only at user, assistant, custom or summary entries, never at a `toolResult`. The span splits into `messagesToSummarize` and, when the cut lands mid-turn, `turnPrefixMessages` (`docs/pi/session.md:281-302`, `CMP:789-923`).
+- It walks back to collect `keepRecentTokens` (default 20000) and cuts only at user, assistant, custom or summary entries, never at a `toolResult`. The span splits into `messagesToSummarize` and, when the cut lands mid-turn, `turnPrefixMessages` (`plan/pi/session.md:281-302`, `CMP:789-923`).
 - System messages are excluded (`CMP:98-102`).
 
 **How the span becomes input**
@@ -37,11 +37,11 @@ Paths: pi is `/tmp/pi-src/packages/coding-agent/` (`CMP` = `src/core/compaction/
 - The call throws on `stopReason` `error` or `length` ("a partial summary must never become a checkpoint"), and on any `toolCall` block (`CMP:585-593`, `CMP:742-748`).
 
 **Split turn**
-- A second call summarizes the prefix with the turn-prefix prompt. The two are merged as `history\n\n---\n\n**Turn Context (split turn):**\n\n prefix` (`docs/pi/session.md:307-310`).
+- A second call summarizes the prefix with the turn-prefix prompt. The two are merged as `history\n\n---\n\n**Turn Context (split turn):**\n\n prefix` (`plan/pi/session.md:307-310`).
 - The calls were serialized rather than run in parallel for single-concurrency local providers (`CHANGELOG.md:1492`).
 
 **Stored entry**
-- `compaction{summary, firstKeptEntryId, tokensBefore, details:{readFiles, modifiedFiles}, usage, fromHook, systemMessage}` (`docs/pi/session.md:328`).
+- `compaction{summary, firstKeptEntryId, tokensBefore, details:{readFiles, modifiedFiles}, usage, fromHook, systemMessage}` (`plan/pi/session.md:328`).
 
 **How it re-enters context**
 - As a `user`-role message: `The conversation history before this point was compacted into the following summary:\n\n<summary>\n…\n</summary>` (`src/core/messages.ts:11-17,176-183`).
@@ -74,7 +74,7 @@ Use this EXACT format:
   - Lists from the previous compaction carry over unless it was `fromHook` (`CMP:60-88`).
   - They are appended to the summary text as `<read-files>` and `<modified-files>`, where read-only means read minus modified (`UT:67-87`).
 - **Nothing else.** No todo/plan state, no re-reading of files, and no re-injecting of AGENTS.md or skills. AGENTS.md and skills live in the system prompt, which compaction doesn't touch.
-- **Extensions.** They can cancel, or supply their own summary, via `session_before_compact` (`docs/pi/session.md:262`).
+- **Extensions.** They can cancel, or supply their own summary, via `session_before_compact` (`plan/pi/session.md:262`).
 
 #### 4. Commands
 
@@ -540,7 +540,7 @@ The local clones are snapshots: Codex `a3d93e1` (/tmp/codex-src), Gemini CLI `c6
   - Long tool outputs are written to files instead of truncated, and the agent reads them with `tail` etc. This led to "fewer unnecessary summarizations" (https://cursor.com/blog/dynamic-context-discovery §1).
   - After summarizing, the agent gets a reference to the **chat history as a file** to search (same post §2).
   - Composer is trained with summarization in the RL loop. A "Please summarize the conversation"-style prompt yields about 1k-token summaries that "reduces the error from compaction by 50%" against a tuned prompt with about a dozen sections and 5k-token output (https://cursor.com/blog/self-summarization).
-- **Factory (Droid): "anchored iterative summarization."** It keeps a persistent structured summary and, on each compaction, summarizes only the newly dropped span and merges it in. It uses two thresholds: a "fill line" T_max and a "drain line" T_retained. Its must-survive list: session intent, play-by-play, artifact trail, and "breadcrumbs" (paths and identifiers the agent can use to re-fetch). The stated goal: "minimize tokens per task, not per request" (https://factory.ai/news/compressing-context). pi already updates its summary iteratively (docs/pi/session.md:15).
+- **Factory (Droid): "anchored iterative summarization."** It keeps a persistent structured summary and, on each compaction, summarizes only the newly dropped span and merges it in. It uses two thresholds: a "fill line" T_max and a "drain line" T_retained. Its must-survive list: session intent, play-by-play, artifact trail, and "breadcrumbs" (paths and identifiers the agent can use to re-fetch). The stated goal: "minimize tokens per task, not per request" (https://factory.ai/news/compressing-context). pi already updates its summary iteratively (plan/pi/session.md:15).
 
 ### 6. Research and engineering posts
 
@@ -587,7 +587,7 @@ The local clones are snapshots: Codex `a3d93e1` (/tmp/codex-src), Gemini CLI `c6
 
 ### Ideas for axo
 
-pi already has: iterative update of the previous summary, a 20k `keepRecentTokens` tail, read/modified file lists, a custom focus, and split-turn handling (docs/pi/session.md:236-331). The list below is what's beyond that.
+pi already has: iterative update of the previous summary, a 20k `keepRecentTokens` tail, read/modified file lists, a custom focus, and split-turn handling (plan/pi/session.md:236-331). The list below is what's beyond that.
 
 1. **Tool-result clearing before summarizing.** Placeholder plus "re-run or re-read to see it" for old tool results; keep the last N; only act when savings exceed a minimum. *Low cost, high benefit:* strongest evidence of any item (Complexity Trap, Claude Code microcompact, Anthropic `clear_tool_uses`). Costs one prompt-cache break per pass.
 2. **Restorable truncation.** Large or old tool output goes to a spill file (or stays in the session JSONL); the context keeps the path. *Low cost:* we already store everything, and it turns lossy into recoverable (Manus, Gemini, Cursor).

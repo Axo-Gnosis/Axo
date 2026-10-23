@@ -1,4 +1,4 @@
-//! Shaping of raw command output for the model (`docs/research/shell-tool.md` #9-#11),
+//! Shaping of raw command output for the model (`plan/research/shell-tool.md` #9-#11),
 //! and where the full output is spooled.
 
 use std::path::Path;

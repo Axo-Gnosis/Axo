@@ -1,5 +1,5 @@
 //! Loop hooks, ported from pi `agent/src/types.ts` (`AgentLoopConfig` and the hook
-//! contexts). Every method has a no-op default. When each fires: `docs/pi/loop.md` §4.
+//! contexts). Every method has a no-op default. When each fires: `plan/pi/loop.md` §4.
 //!
 //! Failure contract: request preparation and turn finishing can fail the run.
 //! A failing `before_tool_call` blocks the call; a failing `after_tool_call` is logged

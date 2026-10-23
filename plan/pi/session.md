@@ -373,7 +373,7 @@ When the runtime calls this:
 
 ## 4. Skip list
 
-- Pre-v3 migrations (`SM:286-347`). axo starts its own format at v1 with no compatibility (`docs/design.md:27`).
+- Pre-v3 migrations (`SM:286-347`). axo starts its own format at v1 with no compatibility (`plan/design.md:27`).
 - `SessionInfo.allMessagesText`, progress callbacks, partial-publish intervals and 10/64 concurrency tuning (`SM:884-1000`): picker UI.
 - `listAll` across projects with `onProgress` overloads (`SM:1921-2012`): TUI `/resume`.
 - `getTree()` timestamp sorting and `labelTimestamp` (`SM:1529-1567`): `/tree` renderer. Keep a minimal children index instead.
@@ -401,7 +401,7 @@ When the runtime calls this:
   - `HashMap<EntryId, u32>` from id to index;
   - `leaf: Option<u32>`;
   - a labels map.
-  Avoid pi's per-call `getEntries()` copy and repeated path rebuilds (`SM:1494`, `SM:1520-1522`); `buildSessionProjection` runs on every request (`AS:793`). [INFERENCE] Cache the projection keyed by `(leaf, entry_count)`, or update it incrementally when appending to the current leaf. Memory per session matters (`docs/design.md:19`).
+  Avoid pi's per-call `getEntries()` copy and repeated path rebuilds (`SM:1494`, `SM:1520-1522`); `buildSessionProjection` runs on every request (`AS:793`). [INFERENCE] Cache the projection keyed by `(leaf, entry_count)`, or update it incrementally when appending to the current leaf. Memory per session matters (`plan/design.md:19`).
 - **Projection API.** A pure function `project(entries, leaf) -> Projection { entries: Vec<(EntryIdx, Range<usize>)>, messages: Vec<AgentMessage>, thinking_level, model }`. Borrowing `Cow<'_, AgentMessage>` avoids cloning unedited messages [INFERENCE]. Keep it a free function, as pi does, so compaction and previews can run it on a slice.
 - **Storage trait** (design: "Storage behind a trait"): `append(&Entry)`, `rewrite(&[FileLine])`, `load() -> Vec<FileLine>`. JSONL impl:
   - buffered reader; skip malformed lines but report a count;

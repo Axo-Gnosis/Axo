@@ -2,7 +2,7 @@
 
 This document holds axo's goals, non-goals, architecture, and settled core decisions. It changes only when goals or core decisions change.
 
-- **Implemented reference:** [`docs/README.md`](../docs/README.md) documents the live APIs, configuration, prompt assembly, session format, and compaction rules as built in M1–M5.
+- **Implemented reference:** [`crates/axo/docs/README.md`](../crates/axo/docs/README.md) documents the live APIs, configuration, prompt assembly, session format, and compaction rules as built in M1–M5.
 - **Active planning:** [`plan.md`](plan.md) holds unbuilt work, design discussions in flight (codemode, subagents, background jobs, schemes, extensions, ACP), and open questions.
 - **Background studies:** [`pi/`](pi/README.md) (source notes on pi v1.3.0) and [`research/`](research/README.md) (comparative studies and measurements).
 
@@ -72,7 +72,7 @@ Tools, context, config, and the script sandbox stay modules inside `axo`. The Bu
 
 ## Settled core decisions
 
-Full operational details live in [`docs/`](../docs/README.md); this section records the architectural rules and why they were chosen.
+Full operational details live in [`crates/axo/docs/`](../crates/axo/docs/README.md); this section records the architectural rules and why they were chosen.
 
 ### Data model and providers (`axo-ai`)
 
