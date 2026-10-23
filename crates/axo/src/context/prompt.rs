@@ -15,7 +15,7 @@ use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
-/// `system, tools, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
+/// `system, docs, tools, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
@@ -41,6 +41,38 @@ pub struct PromptInputs<'a> {
 
 const BUNDLED_SYSTEM: &str = include_str!("../../prompts/SYSTEM.md");
 const BUNDLED_PROSE: &str = include_str!("../../prompts/PROSE.md");
+const BUNDLED_DOCS: &[(&str, &str)] = &[
+    ("README.md", include_str!("../../../../docs/README.md")),
+    (
+        "configuration.md",
+        include_str!("../../../../docs/configuration.md"),
+    ),
+    (
+        "prompts-and-context.md",
+        include_str!("../../../../docs/prompts-and-context.md"),
+    ),
+    (
+        "sessions-and-compaction.md",
+        include_str!("../../../../docs/sessions-and-compaction.md"),
+    ),
+    (
+        "extending.md",
+        include_str!("../../../../docs/extending.md"),
+    ),
+];
+
+fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<PathBuf> {
+    let docs_dir = dir.docs_dir();
+    std::fs::create_dir_all(&docs_dir)?;
+    for &(name, content) in BUNDLED_DOCS {
+        let path = docs_dir.join(name);
+        let unchanged = std::fs::read(&path).is_ok_and(|bytes| bytes == content.as_bytes());
+        if !unchanged {
+            std::fs::write(&path, content)?;
+        }
+    }
+    Ok(dir.docs_path())
+}
 
 /// The first existing `<NAME>.md` override, trimmed: `<cwd>/.axo/prompts/` (when `project`),
 /// then `<AXO_DIR>/prompts/`. Unreadable files become diagnostics. Blocking filesystem I/O.
@@ -91,6 +123,22 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
     let prose = prompt_file("PROSE", Some(BUNDLED_PROSE));
 
     bodies.insert("system".into(), system);
+    match ensure_bundled_docs(inputs.dir) {
+        Ok(docs) => {
+            bodies.insert(
+                "docs".into(),
+                format!(
+                    "axo's documentation, including how to extend it: {}",
+                    docs.display()
+                ),
+            );
+        }
+        Err(error) => diagnostics.push(Diagnostic {
+            path: Some(inputs.dir.docs_dir()),
+            message: error.to_string(),
+        }),
+    }
+
     bodies.insert("tools".into(), render_guidelines(inputs.tools));
     bodies.insert("work".into(), work);
     bodies.insert("prose".into(), prose);
@@ -225,4 +273,42 @@ pub fn system_message(prev: Option<&Sections>, next: &Sections) -> Option<System
         tools_removed: Vec::new(),
         timestamp: now_ms(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docs_section_materializes_bundled_docs_after_system() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = AxoDir::new(temp.path().join("axo"));
+        let (sections, diagnostics) = build_sections(&PromptInputs {
+            dir: &dir,
+            cwd: temp.path(),
+            project_prompts: false,
+            tools: &[],
+            context_files: &[],
+            skills: &[],
+            dev_shell: None,
+            date: "2026-10-22",
+            host_sections: &[],
+        });
+        assert!(diagnostics.is_empty());
+        let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
+        assert_eq!(&keys[..2], &["system", "docs"]);
+        assert_eq!(
+            sections["docs"],
+            format!(
+                "<docs>\naxo's documentation, including how to extend it: {}\n</docs>",
+                dir.docs_path().display()
+            )
+        );
+        for &(name, expected) in BUNDLED_DOCS {
+            assert_eq!(
+                std::fs::read_to_string(dir.docs_dir().join(name)).unwrap(),
+                expected
+            );
+        }
+    }
 }
