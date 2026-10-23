@@ -218,6 +218,8 @@ pub struct Session {
     tool_state: Arc<SessionTools>,
     questions: Arc<PendingQuestions>,
     exec: Arc<dyn ExecEnv>,
+    /// The header id (UUIDv7).
+    id: String,
     /// The session file (created lazily on the first submission).
     path: PathBuf,
     // Kept to fork.
@@ -1635,7 +1637,7 @@ impl Session {
             persist: Some(hooks.clone()),
             steering_mode: settings.steering_mode,
             follow_up_mode: settings.follow_up_mode,
-            session_id: Some(session_id),
+            session_id: Some(session_id.clone()),
             ..AgentConfig::new(streamer.clone(), model)
         }));
 
@@ -1645,6 +1647,7 @@ impl Session {
             tool_state: session_tools,
             questions,
             exec,
+            id: session_id,
             path,
             store,
             settings,
@@ -2038,6 +2041,16 @@ impl Session {
     /// The session file. With lazy creation it exists only after the first submission.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The header id (UUIDv7), known before the session file exists.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The skills loaded at start; the prompt's catalog and `/name` commands use these.
+    pub fn skills(&self) -> &[Skill] {
+        &self.skills
     }
 
     /// Expands a `/skill args` invocation, saves the submission, then runs the prompt;
