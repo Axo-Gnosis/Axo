@@ -83,7 +83,7 @@ Measured on 2026-10-22 with `cargo run --release -p axo --example memory`: PSS f
 
 The live three-session run timed out after 120 seconds: the server reports `--parallel 1`, so it cannot supply three simultaneous mid-turn streams. Its idle reading is retained; the missing mid-turn value is not estimated.
 
-All measured values are clearly under three `pi --mode rpc` processes (160–209 MiB), meeting the [core design's memory target](../core.md#build-order) for the measured cases; three simultaneously streaming live sessions remain unmeasured.
+All measured values are clearly under three `pi --mode rpc` processes (160–209 MiB), meeting the [core design's memory target](../design.md#goals) for the measured cases; three simultaneously streaming live sessions remain unmeasured.
 
 ## Porting omp features onto pi
 

@@ -11,4 +11,4 @@ These are port references for axo's core. They are studies of pi's source, made 
 
 Each note has the same six sections: concepts, types, behavior, skip list, Rust port notes, and size. Claims marked `[INFERENCE]` were not verified against source.
 
-[`../core.md`](../core.md) records what axo takes from these notes and where it deliberately differs.
+[`../design.md`](../design.md) records what axo takes from these notes and where it deliberately differs.

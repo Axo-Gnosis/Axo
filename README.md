@@ -132,8 +132,8 @@ axo/
 │   ├── sessions-and-compaction.md  # JsonlStore, projection, recovery, attach, /shake, and compaction
 │   └── extending.md                # Declarative files and Rust embedding traits
 └── plan/                           # Architecture design, pi port studies, and background research
-    ├── design.md                   # High-level design and future extension plans
-    ├── core.md                     # Core port specification and milestone plan
+    ├── design.md                   # Goals, non-goals, architecture, and settled core decisions
+    ├── plan.md                     # Active planning, next tracks, and open design discussions
     ├── pi/                         # Source studies of pi v1.3.0
     └── research/                   # Background studies and memory/compaction measurements
 ```
@@ -169,7 +169,7 @@ cargo run --release -p axo --example memory -- --sessions 3
 ## Documentation
 
 - **Implementation Reference (`docs/`):** Start at [`docs/README.md`](docs/README.md) for [`configuration.md`](docs/configuration.md), [`prompts-and-context.md`](docs/prompts-and-context.md), [`sessions-and-compaction.md`](docs/sessions-and-compaction.md), and [`extending.md`](docs/extending.md).
-- **Planning & Research (`plan/`):** See [`plan/design.md`](plan/design.md), [`plan/core.md`](plan/core.md), [`plan/pi/`](plan/pi/README.md), and [`plan/research/`](plan/research/README.md).
+- **Planning & Research (`plan/`):** See [`plan/design.md`](plan/design.md), [`plan/plan.md`](plan/plan.md), [`plan/pi/`](plan/pi/README.md), and [`plan/research/`](plan/research/README.md).
 
 ## License
 
