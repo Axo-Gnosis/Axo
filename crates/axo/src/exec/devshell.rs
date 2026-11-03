@@ -6,20 +6,18 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rustix::process::{Pid, Signal, kill_process_group};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::{BashSettings, DevShellMode};
+use crate::exec::host::{ExecSpec, OutputError, ProcessSupervisor, find_on_path};
 use crate::exec::{EnvMap, ExecEnv, Resolved};
 
 /// How long a `.envrc`/`flake.nix` walk-up and a direnv export verified by direnv are
@@ -61,6 +59,9 @@ struct Inner {
     direnv_base: EnvMap,
     settings: BashSettings,
     cache_dir: PathBuf,
+    /// Runs every direnv, git, nix and capture subprocess in its own job container
+    /// (process group or cgroup).
+    supervisor: Arc<ProcessSupervisor>,
     /// Nix system double, part of the disk cache key.
     system: String,
     lookups: Mutex<HashMap<PathBuf, Lookup>>,
@@ -128,7 +129,14 @@ impl DevShellEnv {
     /// the session uses `HostEnv` instead when `dev_shell` is `Off`.
     /// `cache_dir`: `<AXO_DIR>/cache/devshell`; each capture lives in
     /// `<cache_dir>/<hex hash of (flake_dir, ref, system)>/{env.json, watches.json, gcroot}`.
-    pub fn new(base: Arc<EnvMap>, settings: BashSettings, cache_dir: PathBuf) -> Self {
+    /// `supervisor`: runs every subprocess in its own container; when it is unavailable,
+    /// resolution falls back to `base` (with the capture failure notice in `Nix` mode).
+    pub fn new(
+        base: Arc<EnvMap>,
+        settings: BashSettings,
+        cache_dir: PathBuf,
+        supervisor: Arc<ProcessSupervisor>,
+    ) -> Self {
         let direnv_base = base
             .iter()
             .filter(|(key, _)| !key.as_bytes().starts_with(b"DIRENV_"))
@@ -144,6 +152,7 @@ impl DevShellEnv {
                 direnv_base,
                 settings,
                 cache_dir,
+                supervisor,
                 system: format!("{}-{os}", std::env::consts::ARCH),
                 lookups: Mutex::default(),
                 direnv: Mutex::default(),
@@ -222,6 +231,21 @@ impl Inner {
             env: self.base.clone(),
             notice: None,
             prompt_note: None,
+        }
+    }
+
+    /// `program` with `args` in `cwd`, run from the host baseline.
+    fn spec(
+        &self,
+        program: &str,
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+        cwd: &Path,
+    ) -> ExecSpec {
+        ExecSpec {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+            cwd: cwd.to_path_buf(),
+            env: (*self.base).clone(),
         }
     }
 
@@ -360,23 +384,24 @@ impl Inner {
         env: &EnvMap,
         args: &[&str],
     ) -> Option<std::process::Output> {
-        let mut cmd = Command::new("direnv");
-        cmd.args(args)
-            .current_dir(dir)
-            .env_clear()
-            .envs(env)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+        // A missing direnv is a silent fallback, not a failure worth a warning.
+        let program = find_on_path("direnv", env, dir)?;
+        let spec = ExecSpec {
+            program,
+            args: args.iter().map(OsString::from).collect(),
+            cwd: dir.to_path_buf(),
+            env: env.clone(),
+        };
         let timeout = Duration::from_millis(self.settings.dev_shell_timeout_ms);
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => Some(output),
-            Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Ok(Err(err)) => {
-                tracing::warn!(dir = %dir.display(), %err, "direnv failed to start");
+        let deadline = tokio::time::Instant::now() + timeout;
+        match self.supervisor.output(spec, Some(deadline)).await {
+            Ok(output) => Some(output),
+            Err(OutputError::TimedOut) => {
+                tracing::warn!(dir = %dir.display(), ?timeout, "direnv timed out");
                 None
             }
-            Err(_) => {
-                tracing::warn!(dir = %dir.display(), ?timeout, "direnv timed out");
+            Err(OutputError::Failed(err)) => {
+                tracing::warn!(dir = %dir.display(), %err, "direnv failed");
                 None
             }
         }
@@ -617,14 +642,8 @@ impl Inner {
             .into_iter()
             .map(|name| dir.join(name))
             .collect();
-        let mut git = Command::new("git");
-        git.args(["ls-files", "-z", "--", "*.nix"])
-            .current_dir(dir)
-            .env_clear()
-            .envs(self.base.iter())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        match git.output().await {
+        let git = self.spec("git", ["ls-files", "-z", "--", "*.nix"], dir);
+        match self.supervisor.output(git, None).await {
             Ok(output) if output.status.success() => paths.extend(
                 output
                     .stdout
@@ -699,41 +718,23 @@ impl Inner {
 
         // The ref resolves against the flake directory (`.#default`, `sub/dir#ci`); the
         // `--profile` symlink is the GC root that keeps the captured store paths alive.
-        let mut nix = Command::new("nix");
-        nix.args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "print-dev-env",
-            "--no-write-lock-file",
-            "--profile",
-        ])
-        .arg(key_dir.join("gcroot"))
-        .arg(&self.settings.dev_shell_ref)
-        .current_dir(dir)
-        .env_clear()
-        .envs(self.base.iter())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-        let child = nix
-            .spawn()
-            .map_err(|err| format!("Cannot run nix: {err}"))?;
-        let group = child
-            .id()
-            .and_then(|id| i32::try_from(id).ok())
-            .and_then(Pid::from_raw);
-        let output = match tokio::time::timeout_at(deadline, child.wait_with_output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => return Err(format!("nix print-dev-env failed: {err}")),
-            Err(_) => {
-                if let Some(group) = group {
-                    let _ = kill_process_group(group, Signal::KILL);
-                }
-                return Err(timed_out);
-            }
-        };
+        let nix: Vec<OsString> = vec![
+            "--extra-experimental-features".into(),
+            "nix-command flakes".into(),
+            "print-dev-env".into(),
+            "--no-write-lock-file".into(),
+            "--profile".into(),
+            key_dir.join("gcroot").into(),
+            self.settings.dev_shell_ref.clone().into(),
+        ];
+        let output = self
+            .supervisor
+            .output(self.spec("nix", nix, dir), Some(deadline))
+            .await
+            .map_err(|err| match err {
+                OutputError::TimedOut => timed_out.clone(),
+                OutputError::Failed(err) => err,
+            })?;
         if !output.status.success() {
             return Err(stderr_tail(&output.stderr));
         }
@@ -742,31 +743,29 @@ impl Inner {
             .await
             .map_err(|err| format!("Cannot write {}: {err}", script.display()))?;
 
-        let mut bash = Command::new("bash");
-        bash.args(["--noprofile", "--norc", "-c", CAPTURE_SCRIPT, "bash"])
-            .arg(&script)
-            .current_dir(dir)
-            .env_clear()
-            .envs(self.base.iter())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        let spawned = bash.spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
+        let bash = self.spec(
+            "bash",
+            [
+                OsString::from("--noprofile"),
+                "--norc".into(),
+                "-c".into(),
+                CAPTURE_SCRIPT.into(),
+                "bash".into(),
+                script.clone().into(),
+            ],
+            dir,
+        );
+        let mut process = match self.supervisor.spawn(bash).await {
+            Ok(process) => process,
             Err(err) => {
                 let _ = tokio::fs::remove_file(&script).await;
-                return Err(format!("Cannot run bash: {err}"));
+                return Err(err);
             }
         };
-        let group = child
-            .id()
-            .and_then(|id| i32::try_from(id).ok())
-            .and_then(Pid::from_raw);
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
+        let (Some(mut stdout), Some(mut stderr)) = (process.stdout.take(), process.stderr.take())
         else {
+            process.container().kill();
+            process.close().await;
             let _ = tokio::fs::remove_file(&script).await;
             return Err("Cannot read the dev shell's output.".to_owned());
         };
@@ -790,11 +789,9 @@ impl Inner {
             }
         };
         let dump = tokio::time::timeout_at(deadline, read_dump).await;
-        // The hook's process group dies with the dump: no lingering services or traps.
-        if let Some(group) = group {
-            let _ = kill_process_group(group, Signal::KILL);
-        }
-        let _ = child.wait().await;
+        // The hook's job container dies with the dump: no lingering services or traps.
+        process.container().kill();
+        process.close().await;
         let _ = tokio::fs::remove_file(&script).await;
         let dump = match dump {
             Ok(Some(dump)) => {

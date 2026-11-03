@@ -7,15 +7,14 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use axo::store::{Entry, EntryId, SeqEntry};
+use axo::store::EntryId;
 use axo::tools::Located;
-use axo::{ProjectAccess, SchemeUrl, SessionOptions, SessionTools, StaticEnv, Target, ToolFactory};
-use axo_agent::{AgentMessage, RunOutcome, Tool, ToolError, ToolOutput, ToolUpdate};
+use axo::{ProjectAccess, SchemeUrl, SessionOptions, SessionTools, Target, ToolFactory};
+use axo_agent::{RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{reply_text, reply_tool_calls};
-use axo_ai::{Message, ScriptedTurn, ToolCall, UserBlock};
-use common::{axo, options, within};
+use axo_ai::{ScriptedTurn, UserBlock};
+use common::{axo, tool_text, within};
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
 struct Where(Arc<SessionTools>);
 
@@ -35,13 +34,8 @@ impl Tool for Where {
         &PARAMETERS
     }
 
-    async fn execute(
-        &self,
-        _call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
-        if cancel.is_cancelled() {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        if cx.cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
         match self.0.locate("local://").await? {
@@ -57,48 +51,21 @@ impl Tool for Where {
 }
 
 fn bash_options(dir: &Path) -> SessionOptions {
-    let mut options = options(dir);
+    let mut options = common::bash_options(dir);
     let factory: ToolFactory =
         Arc::new(|tools: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Where(tools.clone())) });
     options.tools = vec![factory];
-    options.exec_env = Some(Arc::new(StaticEnv(Arc::new(
-        [(
-            "PATH".into(),
-            std::env::var_os("PATH").expect("test process needs PATH"),
-        )]
-        .into_iter()
-        .collect(),
-    ))));
     options
 }
 
-fn tool_text(entries: &[SeqEntry], call_id: &str) -> String {
-    let result = entries
-        .iter()
-        .find_map(|seq| match &seq.entry {
-            Entry::Message {
-                message: AgentMessage::Llm(Message::ToolResult(result)),
-                ..
-            } if result.tool_call_id == call_id => Some(result),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("missing result for {call_id}"));
-    assert!(!result.is_error, "{call_id}: {:?}", result.content);
-    result
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            UserBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn artifact_id(text: &str) -> u64 {
+    artifact_after(text, "Full output: artifact://")
 }
 
-fn artifact_id(text: &str) -> u64 {
+fn artifact_after(text: &str, marker: &str) -> u64 {
     let (_, suffix) = text
-        .split_once("Full output: artifact://")
-        .expect("bash must report its full-output URL");
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("bash must report {marker}: {text}"));
     let end = suffix
         .find(|ch: char| !ch.is_ascii_digit())
         .unwrap_or(suffix.len());
@@ -309,6 +276,77 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
             .join("artifacts")
             .join(format!("{next_artifact}.bash.c7.log"))
             .is_file()
+    );
+    fork.shutdown().await;
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn forks_snapshot_live_spools_and_share_finished_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = axo(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[
+                ("c1", "bash", json!({"command": "seq 1 5000"})),
+                (
+                    "c2",
+                    "bash",
+                    json!({"command": "sh -c 'while :; do echo tick; sleep 0.1; done' & echo started"}),
+                ),
+            ])),
+            ScriptedTurn::Reply(reply_text("left a helper ticking")),
+        ],
+    )
+    .await;
+    let session = host.create_session(bash_options(dir.path())).await.unwrap();
+    assert_eq!(
+        within(session.prompt("Print a long sequence and start a ticking helper."))
+            .await
+            .unwrap(),
+        RunOutcome::Done
+    );
+    let entries = session.attach(None).await.missed;
+    let finished = format!(
+        "artifacts/{}.bash.c1.log",
+        artifact_id(&tool_text(&entries, "c1"))
+    );
+    let live = format!(
+        "artifacts/{}.bash.c2.log",
+        artifact_after(&tool_text(&entries, "c2"), "continues in artifact://")
+    );
+
+    let last_entry = EntryId(entries.last().unwrap().entry.id().unwrap().to_owned());
+    let fork = within(session.fork(&last_entry)).await.unwrap().session;
+    let parent_dir = session.path().with_extension("");
+    let fork_dir = fork.path().with_extension("");
+
+    // The helper still writes the parent's spool: the child gets a private, frozen copy.
+    let parent_live = std::fs::metadata(parent_dir.join(&live)).unwrap();
+    let fork_live = std::fs::metadata(fork_dir.join(&live)).unwrap();
+    assert_ne!(
+        (parent_live.dev(), parent_live.ino()),
+        (fork_live.dev(), fork_live.ino())
+    );
+    assert!(!parent_live.permissions().readonly());
+    assert!(fork_live.permissions().readonly());
+    let snapshot = std::fs::read(fork_dir.join(&live)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::fs::metadata(parent_dir.join(&live)).unwrap().len() <= snapshot.len() as u64 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper stopped writing the parent's spool"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(std::fs::read(fork_dir.join(&live)).unwrap(), snapshot);
+
+    // Finished artifacts are immutable, so they stay hard-linked.
+    let parent_finished = std::fs::metadata(parent_dir.join(&finished)).unwrap();
+    let fork_finished = std::fs::metadata(fork_dir.join(&finished)).unwrap();
+    assert_eq!(
+        (parent_finished.dev(), parent_finished.ino()),
+        (fork_finished.dev(), fork_finished.ino())
     );
     fork.shutdown().await;
     session.shutdown().await;

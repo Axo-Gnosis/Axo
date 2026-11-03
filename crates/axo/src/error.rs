@@ -54,4 +54,7 @@ pub enum Error {
     /// `navigate`/`fork` named an entry id the session does not have.
     #[error("Entry not found: {0}")]
     EntryNotFound(String),
+    /// A background job could not be journaled: it is unknown or its session is closed.
+    #[error("Background job {0}: session is closed or the job is unknown")]
+    Job(String),
 }

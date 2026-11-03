@@ -117,6 +117,8 @@ async fn seed_with_options(
                 base: EntryBase::new(id.clone(), parent),
                 message: AgentMessage::Llm(message),
                 submission_id: None,
+                admitted_jobs: Vec::new(),
+                delivered_jobs: Vec::new(),
             })
             .await
             .unwrap();

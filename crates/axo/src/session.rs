@@ -2,15 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axo_agent::{
     Agent, AgentConfig, AgentContext, AgentEvent, AgentMessage, AgentSnapshot, CancelReason,
-    HookError, LoopHooks, Persist, PersistError, PrepareRequestContext, Replay, RequestUpdate,
-    RunOutcome, Tool, TurnContext, TurnDecision, TurnFinish, TurnUpdate,
+    CustomMessage, HookError, LoopHooks, MessageOrigin, Persist, PersistError,
+    PrepareRequestContext, QueuedMessage, Replay, RequestUpdate, RunOutcome, Tool, TurnContext,
+    TurnDecision, TurnFinish, TurnUpdate,
 };
 use axo_ai::thinking::clamp_level;
 use axo_ai::{
@@ -32,10 +33,13 @@ use crate::context::skills::{Skill, load_skills};
 use crate::context::{Diagnostic, home_agents_dir, project_root};
 use crate::error::Error;
 use crate::exec::ExecEnv;
+use crate::exec::host::ProcessSupervisor;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
+use crate::jobs::{DeliveryKey, JobEntry, JobHost, JobRegistry, job_name, render_results};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::Artifacts;
 use crate::schemes::dir::DirScheme;
+use crate::schemes::proc::ProcScheme;
 use crate::schemes::skill::SkillScheme;
 use crate::schemes::{ARTIFACTS_DIR, LOCAL_DIR, Scheme, SchemeContext, Schemes};
 use crate::store::{
@@ -221,6 +225,8 @@ pub(crate) struct SessionSetup {
     /// Already clamped to the model.
     pub(crate) thinking: ThinkingLevel,
     pub(crate) exec: Arc<dyn ExecEnv>,
+    /// Runs every local command in its own supervised container (process group or cgroup).
+    pub(crate) supervisor: Arc<ProcessSupervisor>,
     pub(crate) ask_enabled: bool,
     pub(crate) project_access: ProjectAccess,
     pub(crate) host_sections: Vec<(String, Option<String>)>,
@@ -255,17 +261,10 @@ pub struct Session {
     streamer: Arc<dyn Streamer>,
     models: Arc<Models>,
     ask_enabled: bool,
-    // Prompt inputs, kept to rebuild the prompt when the exec environment or date changes.
-    dir: AxoDir,
-    cwd: PathBuf,
+    // Kept to fork; the prompt inputs live in `SessionHooks::prompt`.
     project_access: ProjectAccess,
-    tools: Vec<Arc<dyn Tool>>,
-    context_files: Vec<ContextFile>,
-    skills: Vec<Skill>,
-    host_sections: Vec<(String, Option<String>)>,
     host_tools: Vec<ToolFactory>,
     host_schemes: Vec<Arc<dyn Scheme>>,
-    prompt: Mutex<PromptState>,
 }
 
 /// The last prompt build and the exec-environment note and local date it used.
@@ -274,6 +273,68 @@ struct PromptState {
     date: String,
     /// `None` until the first build.
     sections: Option<Sections>,
+}
+
+/// The session's system prompt: its inputs and its last build.
+struct SessionPrompt {
+    dir: AxoDir,
+    cwd: PathBuf,
+    /// `project_access != Ignore && settings.project.files.axo_dir`.
+    project_prompts: bool,
+    tools: Vec<Arc<dyn Tool>>,
+    /// Fixed at start: `Schemes` cannot change after `Schemes::new`.
+    scheme_docs: Vec<String>,
+    context_files: Vec<ContextFile>,
+    skills: Vec<Skill>,
+    host_sections: Vec<(String, Option<String>)>,
+    state: Mutex<PromptState>,
+}
+
+impl SessionPrompt {
+    fn state(&self) -> std::sync::MutexGuard<'_, PromptState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Rebuilds the prompt sections unless `note` and `date` are unchanged; returns the
+    /// system message announcing the change (every section on the first build).
+    fn rebuild(&self, note: Option<String>, date: String) -> Option<SystemMessage> {
+        let mut state = self.state();
+        if state.sections.is_some() && state.note == note && state.date == date {
+            return None;
+        }
+        let (sections, diagnostics) = build_sections(&PromptInputs {
+            dir: &self.dir,
+            cwd: &self.cwd,
+            project_prompts: self.project_prompts,
+            tools: &self.tools,
+            scheme_docs: &self.scheme_docs,
+            context_files: &self.context_files,
+            skills: &self.skills,
+            dev_shell: note.as_deref(),
+            date: &date,
+            host_sections: &self.host_sections,
+        });
+        for diagnostic in &diagnostics {
+            warn!("{diagnostic}");
+        }
+        let message = system_message(state.sections.as_ref(), &sections);
+        *state = PromptState {
+            note,
+            date,
+            sections: Some(sections),
+        };
+        message
+    }
+
+    /// The exec-environment note of the last build.
+    fn note(&self) -> Option<String> {
+        self.state().note.clone()
+    }
+
+    /// The last build's sections; `None` before the first.
+    fn sections(&self) -> Option<Sections> {
+        self.state().sections.clone()
+    }
 }
 
 fn today() -> String {
@@ -293,6 +354,31 @@ struct SessionHooks {
     /// while holding the log lock.
     running: watch::Sender<bool>,
     maintenance: Maintenance,
+    /// The session's command jobs; their records are appended through `JobHost`.
+    jobs: Arc<JobRegistry>,
+    /// Prompts between their fast-path admission and their run start; idle-wake delivery
+    /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
+    preparing: AtomicUsize,
+    prompt: SessionPrompt,
+    /// Set when a run ends other than `Done` or the user stops an active one; finished
+    /// job results then wait for the user's next input instead of starting a run.
+    auto_paused: AtomicBool,
+    /// Set once in `Session::start`; weak, since the agent holds these hooks.
+    agent: OnceLock<Weak<Agent>>,
+    /// These hooks, for tasks that deliver job results.
+    this: OnceLock<Weak<SessionHooks>>,
+}
+
+/// Counts one prompt in [`SessionHooks::preparing`]; the last to drop re-triggers
+/// delivery that was held off meanwhile.
+struct Preparing(Arc<SessionHooks>);
+
+impl Drop for Preparing {
+    fn drop(&mut self) {
+        if self.0.preparing.fetch_sub(1, Ordering::AcqRel) == 1 {
+            JobHost::results_ready(&*self.0);
+        }
+    }
 }
 
 enum MaintenanceOperation {
@@ -327,9 +413,6 @@ struct Log {
     thinking: ThinkingLevel,
     /// The open run's id, set by its `run_start` (or by recovery).
     run_id: Option<String>,
-    /// Submitted user messages not yet saved as `message` entries, with their
-    /// submission ids. Matched by equality: identical messages are interchangeable.
-    pending: Vec<(AgentMessage, String)>,
     // The live state as relayed so far; the agent's own copy updates after `persist`
     // returns, so `attach` reads these instead.
     streaming: Option<Accumulator>,
@@ -362,21 +445,21 @@ struct FailureState {
 #[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 enum Resumption {
     /// Continue the open run; requeued input goes through the agent's queues.
-    Continue(Vec<(SubmissionKind, AgentMessage)>),
+    Continue(Vec<(SubmissionKind, QueuedMessage)>),
     /// No run was open: queue steers and follow-ups, and start a run with the prompts.
-    Requeue(Vec<(SubmissionKind, AgentMessage)>),
+    Requeue(Vec<(SubmissionKind, QueuedMessage)>),
     RecoverResponse {
         response: AssistantMessage,
         model: Model,
         results: Vec<ToolResultMessage>,
-        queued: Vec<(SubmissionKind, AgentMessage)>,
+        queued: Vec<(SubmissionKind, QueuedMessage)>,
     },
 }
 
 /// How `run_to_settle` starts its run.
 #[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 enum RunRequest {
-    Prompt(Vec<AgentMessage>),
+    Prompt(Vec<QueuedMessage>),
     Continue,
     RecoverResponse {
         response: AssistantMessage,
@@ -472,15 +555,92 @@ impl SessionHooks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
         if let Some(kind) = log.maintenance.take() {
-            if standalone {
-                self.running.send_replace(false);
-            }
             let _ = self.events.send(SessionEvent::MaintenanceEnd {
                 kind,
                 error,
                 aborted,
             });
+            if standalone {
+                self.release_or_deliver(&mut log);
+            }
         }
+    }
+
+    /// Ends the session's busy state, unless pending job results start a delivery run
+    /// first: then `running` stays true and the run settles like any other. Called under
+    /// the log lock wherever the session would go idle.
+    fn release_or_deliver(&self, log: &mut Log) {
+        if !self.auto_paused.load(Ordering::Acquire)
+            && !self.maintenance.shutdown.load(Ordering::Acquire)
+            && log.maintenance.is_none()
+            && self.preparing.load(Ordering::Acquire) == 0
+            && let Some(agent) = self.agent.get().and_then(Weak::upgrade)
+            && let Some(hooks) = self.this.get().and_then(Weak::upgrade)
+            && let Some(delivery) = self.reserve_delivery()
+        {
+            self.running.send_replace(true);
+            let messages = self.run_input(Some(delivery), None);
+            tokio::spawn(async move {
+                if let Err(err) = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await {
+                    warn!(%err, "job result delivery run failed");
+                }
+            });
+        } else {
+            self.running.send_replace(false);
+        }
+    }
+
+    /// Rebuilds the prompt for `note` and today's date; a change goes out as a pending
+    /// system diff.
+    fn refresh_prompt(&self, note: Option<String>) {
+        if let Some(message) = self.prompt.rebuild(note, today()) {
+            self.system
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(AgentMessage::Llm(Message::System(message)));
+        }
+    }
+
+    /// The opening messages of a run: the prompt refreshed to today's date (exec-env note
+    /// kept), pending system diffs, then `delivery`, then `input`.
+    fn run_input(
+        &self,
+        delivery: Option<QueuedMessage>,
+        input: Option<QueuedMessage>,
+    ) -> Vec<QueuedMessage> {
+        self.refresh_prompt(self.prompt.note());
+        let mut messages: Vec<QueuedMessage> =
+            self.take_system().into_iter().map(Into::into).collect();
+        messages.extend(delivery);
+        messages.extend(input);
+        messages
+    }
+
+    /// Reserves every pending job result for one queued `job_result` message; `None`
+    /// when nothing is pending.
+    fn reserve_delivery(&self) -> Option<QueuedMessage> {
+        if !self.jobs.has_pending() {
+            return None;
+        }
+        let id = format!("delivery-{}", Uuid::now_v7());
+        let results = self.jobs.reserve(DeliveryKey::Input(id.clone()));
+        if results.is_empty() {
+            return None;
+        }
+        let jobs: Vec<String> = results.iter().map(|r| job_name(r.id)).collect();
+        let message = AgentMessage::Custom(CustomMessage {
+            custom_type: "job_result".into(),
+            content: vec![UserBlock::Text {
+                text: format!("Background job results:\n\n{}", render_results(&results)),
+            }],
+            display: true,
+            details: Some(serde_json::json!({ "jobs": jobs })),
+            timestamp: now_ms(),
+        });
+        Some(QueuedMessage {
+            message,
+            id: Some(id),
+        })
     }
 
     fn check_commit(
@@ -844,6 +1004,8 @@ impl SessionHooks {
                 base,
                 message: message.clone(),
                 submission_id: None,
+                admitted_jobs: Vec::new(),
+                delivered_jobs: Vec::new(),
             },
         )
         .await?;
@@ -1235,15 +1397,21 @@ impl SessionHooks {
     }
 
     /// Closes the run with `run_end` (none after a shutdown) and releases the session
-    /// for the next run.
+    /// for the next run, or starts delivering pending job results. Reservations and
+    /// admissions the run never committed are released first; a run that did not end
+    /// `Done`, or a failed `run_end`, pauses automatic delivery until the user acts.
     async fn settle(
         &self,
         result: Result<RunOutcome, axo_agent::Error>,
     ) -> Result<RunOutcome, Error> {
         let mut log = self.log.lock().await;
-        self.running.send_replace(false);
+        self.jobs.release_uncommitted();
+        if !matches!(result, Ok(RunOutcome::Done)) {
+            self.auto_paused.store(true, Ordering::Release);
+        }
         log.streaming = None;
         log.tool_calls.clear();
+        let mut closed = Ok(());
         if let Some(run_id) = log.run_id.take() {
             let end = match &result {
                 Ok(RunOutcome::Done) => Some((store::RunOutcome::Done, None)),
@@ -1258,18 +1426,25 @@ impl SessionHooks {
             };
             if let Some((outcome, reason)) = end {
                 let base = log.next_base();
-                self.write(
-                    &mut log,
-                    Entry::RunEnd {
-                        base,
-                        run_id,
-                        outcome,
-                        reason,
-                    },
-                )
-                .await?;
+                closed = self
+                    .write(
+                        &mut log,
+                        Entry::RunEnd {
+                            base,
+                            run_id,
+                            outcome,
+                            reason,
+                        },
+                    )
+                    .await
+                    .map(drop);
             }
         }
+        if closed.is_err() {
+            self.auto_paused.store(true, Ordering::Release);
+        }
+        self.release_or_deliver(&mut log);
+        closed?;
         result.map_err(Error::Agent)
     }
 
@@ -1452,6 +1627,12 @@ impl LoopHooks for SessionHooks {
             ..TurnUpdate::default()
         })
     }
+
+    /// Finished job results reach an active run at each steering drain point. They do
+    /// not set the steer signal, so they never promote `bash` or interrupt `wait`.
+    async fn steering(&self) -> Vec<QueuedMessage> {
+        self.reserve_delivery().into_iter().collect()
+    }
 }
 
 #[async_trait]
@@ -1481,24 +1662,63 @@ impl Persist for SessionHooks {
                     .get_or_insert_with(Accumulator::new)
                     .apply(event);
             }
-            AgentEvent::MessageEnd { message } => {
+            AgentEvent::MessageEnd { message, origin } => {
                 log.streaming = None;
-                let submission_id = log
-                    .pending
-                    .iter()
-                    .position(|(pending, _)| pending == message)
-                    .map(|at| log.pending.remove(at).1);
+                // Receipts: a queued delivery or a `wait` result commits the job results
+                // reserved under its key; a promoting `bash` result admits its job.
+                let (submission_id, key, admission) = match origin {
+                    MessageOrigin::Input(Some(id)) => {
+                        let key = DeliveryKey::Input(id.clone());
+                        if self.jobs.reserved_ids(&key).is_empty() {
+                            (Some(id.clone()), None, None)
+                        } else {
+                            (None, Some(key), None)
+                        }
+                    }
+                    MessageOrigin::Input(None) | MessageOrigin::Run => (None, None, None),
+                    MessageOrigin::Tool(invocation) => (
+                        None,
+                        Some(DeliveryKey::Invocation(*invocation)),
+                        self.jobs.take_admission(*invocation),
+                    ),
+                };
+                let delivered_jobs = key
+                    .as_ref()
+                    .map(|key| self.jobs.reserved_ids(key))
+                    .unwrap_or_default();
+                let admitted_jobs = admission.map(job_name).into_iter().collect();
                 let base = log.next_base();
-                self.write(
-                    &mut log,
-                    Entry::Message {
-                        base,
-                        message: message.clone(),
-                        submission_id,
-                    },
-                )
-                .await
-                .map_err(|err| PersistError(err.to_string()))?;
+                let written = self
+                    .write(
+                        &mut log,
+                        Entry::Message {
+                            base,
+                            message: message.clone(),
+                            submission_id,
+                            admitted_jobs,
+                            delivered_jobs,
+                        },
+                    )
+                    .await;
+                match written {
+                    Ok(_) => {
+                        if let Some(key) = &key {
+                            self.jobs.commit(key);
+                        }
+                        if let Some(id) = admission {
+                            self.jobs.admitted(id);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(key) = &key {
+                            self.jobs.release(key);
+                        }
+                        if let Some(id) = admission {
+                            self.jobs.admission_failed(id);
+                        }
+                        return Err(PersistError(err.to_string()));
+                    }
+                }
             }
             AgentEvent::ToolExecutionStart {
                 call_id,
@@ -1524,42 +1744,63 @@ impl Persist for SessionHooks {
     }
 }
 
+#[async_trait]
+impl JobHost for SessionHooks {
+    /// Appends a job record under the log lock, like every other entry.
+    async fn journal(&self, entry: JobEntry) -> Result<(), Error> {
+        let mut log = self.log.lock().await;
+        let entry = entry.into_entry(log.next_base(), &self.maintenance.session_id);
+        self.write(&mut log, entry).await?;
+        Ok(())
+    }
+
+    /// Starts delivery when the session is idle. While a run or maintenance is active,
+    /// the steering hook or the idle transition's `release_or_deliver` delivers instead.
+    fn results_ready(&self) {
+        let Some(hooks) = self.this.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut log = hooks.log.lock().await;
+            if !*hooks.running.borrow() && log.maintenance.is_none() {
+                hooks.release_or_deliver(&mut log);
+            }
+        });
+    }
+}
+
 /// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
 /// `artifact://` and `local://` in the side folders beside the session file `path`,
-/// `skill://`, `axo://` docs, then `host` schemes. Open sessions and `Axo::schemes` both
-/// build them here, so given the same project access a URL resolves alike whether its
-/// session is open or not.
+/// `skill://`, `axo://` docs, `proc://` over `jobs` when given, then `host` schemes. Open
+/// sessions and `Axo::schemes` both build them here, so given the same project access a
+/// file-backed URL resolves alike whether its session is open or not; only open sessions
+/// get `proc://` (`Axo::schemes` passes no `jobs`), since a closed session has no live
+/// jobs.
 pub(crate) fn session_schemes(
     dir: &AxoDir,
     settings: &Settings,
     access: ProjectAccess,
-    session_id: String,
-    path: &Path,
-    cwd: PathBuf,
+    cx: SchemeContext,
     host: &[Arc<dyn Scheme>],
+    jobs: Option<Arc<JobRegistry>>,
 ) -> Result<(Schemes, Vec<Skill>, Vec<Diagnostic>), Error> {
     let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
     let (skills, diagnostics) = load_skills(
         dir,
         home_agents.as_deref(),
-        &cwd,
+        &cx.cwd,
         access != ProjectAccess::Ignore && settings.project.files.skills,
     );
-    let session_dir = path.with_extension("");
-    let schemes = Schemes::new(
-        SchemeContext {
-            session_id,
-            session_dir: session_dir.clone(),
-            cwd,
-        },
-        Arc::new(Artifacts::new(session_dir.join(ARTIFACTS_DIR))),
-        vec![
-            Arc::new(SkillScheme::new(&skills)),
-            Arc::new(DirScheme::local(session_dir.join(LOCAL_DIR))),
-            Arc::new(DirScheme::docs(dir.docs_dir())),
-        ],
-        host,
-    )?;
+    let mut builtins: Vec<Arc<dyn Scheme>> = vec![
+        Arc::new(SkillScheme::new(&skills)),
+        Arc::new(DirScheme::local(cx.session_dir.join(LOCAL_DIR))),
+        Arc::new(DirScheme::docs(dir.docs_dir())),
+    ];
+    if let Some(jobs) = jobs {
+        builtins.push(Arc::new(ProcScheme { jobs }));
+    }
+    let artifacts = Arc::new(Artifacts::new(cx.session_dir.join(ARTIFACTS_DIR)));
+    let schemes = Schemes::new(cx, artifacts, builtins, host)?;
     Ok((schemes, skills, diagnostics))
 }
 
@@ -1578,6 +1819,7 @@ impl Session {
             model,
             thinking,
             exec,
+            supervisor,
             ask_enabled,
             project_access,
             host_sections,
@@ -1604,14 +1846,18 @@ impl Session {
             names,
             &context_files,
         );
+        let (jobs, unfinished) = JobRegistry::new(session_id.clone(), &entries);
         let (schemes, skills, skill_diagnostics) = session_schemes(
             &dir,
             &settings,
             project_access,
-            session_id.clone(),
-            &path,
-            cwd.clone(),
+            SchemeContext {
+                session_id: session_id.clone(),
+                session_dir: path.with_extension(""),
+                cwd: cwd.clone(),
+            },
             &host_schemes,
+            Some(jobs.clone()),
         )?;
         let (summary_prompts, summary_diagnostics) = compaction::summary::SummaryPrompts::load(
             &dir,
@@ -1628,15 +1874,18 @@ impl Session {
             warn!("{diagnostic}");
         }
 
-        let session_tools = SessionTools::new(
-            cwd.clone(),
-            exec.clone(),
-            schemes,
-            questions.clone(),
-            settings.ask.timeout_ms.map(Duration::from_millis),
-            settings.bash.ci,
+        let session_tools = Arc::new(SessionTools {
+            cwd: cwd.clone(),
+            exec: exec.clone(),
+            ledger: Default::default(),
             context,
-        );
+            schemes,
+            questions: questions.clone(),
+            ask_timeout: settings.ask.timeout_ms.map(Duration::from_millis),
+            ci_env: settings.bash.ci,
+            supervisor,
+            jobs: jobs.clone(),
+        });
         let host: Vec<Arc<dyn Tool>> = host_tools
             .iter()
             .map(|factory| factory(&session_tools))
@@ -1659,7 +1908,6 @@ impl Session {
                 model: model.clone(),
                 thinking,
                 run_id: None,
-                pending: Vec::new(),
                 streaming: None,
                 tool_calls: Vec::new(),
                 maintenance: None,
@@ -1685,7 +1933,31 @@ impl Session {
                 cancel: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
             },
+            jobs,
+            preparing: AtomicUsize::new(0),
+            prompt: SessionPrompt {
+                dir,
+                cwd,
+                project_prompts: project && settings.project.files.axo_dir,
+                tools: tools.clone(),
+                scheme_docs: session_tools.schemes.prompt_docs(),
+                context_files,
+                skills,
+                host_sections,
+                state: Mutex::new(PromptState {
+                    note: None,
+                    date: String::new(),
+                    sections: None,
+                }),
+            },
+            auto_paused: AtomicBool::new(false),
+            agent: OnceLock::new(),
+            this: OnceLock::new(),
         });
+        hooks
+            .jobs
+            .attach(Arc::downgrade(&hooks) as Weak<dyn JobHost>);
+        let _ = hooks.this.set(Arc::downgrade(&hooks));
         let agent = Arc::new(Agent::new(AgentConfig {
             thinking,
             tools: tools.clone(),
@@ -1696,6 +1968,7 @@ impl Session {
             session_id: Some(session_id.clone()),
             ..AgentConfig::new(streamer.clone(), model)
         }));
+        let _ = hooks.agent.set(Arc::downgrade(&agent));
 
         let session = Session {
             agent,
@@ -1710,26 +1983,19 @@ impl Session {
             streamer,
             models,
             ask_enabled,
-            dir,
-            cwd,
             project_access,
-            tools,
-            context_files,
-            skills,
-            host_sections,
             host_tools,
             host_schemes,
-            prompt: Mutex::new(PromptState {
-                note: None,
-                date: String::new(),
-                sections: None,
-            }),
         };
         let resolved = session
             .exec
-            .resolve(&session.cwd, &CancellationToken::new(), &|_| {})
+            .resolve(
+                &session.hooks.prompt.cwd,
+                &CancellationToken::new(),
+                &|_| {},
+            )
             .await;
-        session.rebuild_prompt(resolved.prompt_note, today());
+        session.hooks.prompt.rebuild(resolved.prompt_note, today());
 
         let resume = {
             let mut log = session.hooks.log.lock().await;
@@ -1739,6 +2005,9 @@ impl Session {
                 .await?;
             let mut messages = projection.messages;
             session.sync_prompt(&mut log, &mut messages).await?;
+            if recovery.is_some() {
+                session.reconcile_jobs(&mut log, unfinished).await?;
+            }
             let resume = match recovery {
                 Some(policy) => {
                     session
@@ -1823,6 +2092,35 @@ impl Session {
         Ok(session)
     }
 
+    /// Ends each admitted job a closed session left unfinished: writes its `JobEnd` once
+    /// and makes the interrupted result pending. Delivery waits for the next prompt, a
+    /// resumed run's steering, or `wait`; opening never starts a run for it.
+    async fn reconcile_jobs(&self, log: &mut Log, unfinished: Vec<u64>) -> Result<(), Error> {
+        let artifacts = self.tool_state.schemes.artifacts();
+        for id in unfinished {
+            let Some((job, _)) = self.hooks.jobs.get(id) else {
+                continue;
+            };
+            let text = if artifacts.find(job.artifact).is_some() {
+                format!(
+                    "Command was interrupted when the session closed; it may have partially run. Output so far: artifact://{}",
+                    job.artifact
+                )
+            } else {
+                "Command was interrupted when the session closed; it may have partially run. Its output is unavailable.".to_owned()
+            };
+            let entry = JobEntry::End {
+                job_id: job_name(id),
+                text: text.clone(),
+                is_error: true,
+            }
+            .into_entry(log.next_base(), &self.id);
+            self.hooks.write(log, entry).await?;
+            self.hooks.jobs.recovered_end(id, text);
+        }
+        Ok(())
+    }
+
     /// Appends the system message that moves `messages`' effective prompt to the current
     /// sections, if they differ.
     async fn sync_prompt(
@@ -1830,12 +2128,7 @@ impl Session {
         log: &mut Log,
         messages: &mut Vec<AgentMessage>,
     ) -> Result<(), Error> {
-        let current = self
-            .prompt
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .sections
-            .clone();
+        let current = self.hooks.prompt.sections();
         if let Some(current) = current
             && let Some(message) = self.hooks.sync_sections(log, &current).await?
         {
@@ -1845,13 +2138,9 @@ impl Session {
     }
 
     /// The user messages of requeued `submission` entries, rendered from their parts
-    /// (skills re-expanded, images re-read) and registered in `log.pending` so their
-    /// `message` entries carry the submission ids.
-    async fn requeued(
-        &self,
-        log: &mut Log,
-        requeue: Vec<SeqEntry>,
-    ) -> Vec<(SubmissionKind, AgentMessage)> {
+    /// (skills re-expanded, images re-read) and queued under their submission ids so
+    /// their `message` entries carry them.
+    async fn requeued(&self, requeue: Vec<SeqEntry>) -> Vec<(SubmissionKind, QueuedMessage)> {
         let mut queued = Vec::new();
         for seq in requeue {
             if let Entry::Submission {
@@ -1862,11 +2151,16 @@ impl Session {
             } = seq.entry
             {
                 let message = AgentMessage::Llm(Message::User(UserMessage {
-                    content: render(&parts, &self.skills, &self.tool_state).await,
+                    content: render(&parts, &self.hooks.prompt.skills, &self.tool_state).await,
                     timestamp: now_ms(),
                 }));
-                log.pending.push((message.clone(), submission_id));
-                queued.push((kind, message));
+                queued.push((
+                    kind,
+                    QueuedMessage {
+                        message,
+                        id: Some(submission_id),
+                    },
+                ));
             }
         }
         queued
@@ -1882,7 +2176,9 @@ impl Session {
         messages: &mut Vec<AgentMessage>,
     ) -> Result<Option<Resumption>, Error> {
         let replay_of = |call: &ToolCall| {
-            self.tools
+            self.hooks
+                .prompt
+                .tools
                 .iter()
                 .find(|tool| tool.name() == call.name)
                 .map_or(Replay::Never, |tool| tool.replay(call))
@@ -1899,7 +2195,7 @@ impl Session {
                 if policy == RecoveryPolicy::MarkInterrupted {
                     return Ok(None);
                 }
-                let queued = self.requeued(log, requeue).await;
+                let queued = self.requeued(requeue).await;
                 if queued
                     .iter()
                     .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt))
@@ -2014,7 +2310,7 @@ impl Session {
                         response,
                         model,
                         results,
-                        queued: self.requeued(log, requeue).await,
+                        queued: self.requeued(requeue).await,
                     }));
                 }
             }
@@ -2057,6 +2353,8 @@ impl Session {
                         base,
                         message: message.clone(),
                         submission_id: None,
+                        admitted_jobs: Vec::new(),
+                        delivered_jobs: Vec::new(),
                     };
                     self.hooks.write(log, entry).await?;
                     messages.push(message);
@@ -2073,9 +2371,7 @@ impl Session {
                     self.hooks.write(log, entry).await?;
                     log.run_id = Some(run_id);
                     self.hooks.running.send_replace(true);
-                    return Ok(Some(Resumption::Continue(
-                        self.requeued(log, requeue).await,
-                    )));
+                    return Ok(Some(Resumption::Continue(self.requeued(requeue).await)));
                 }
             }
         };
@@ -2090,49 +2386,6 @@ impl Session {
         Ok(None)
     }
 
-    /// Rebuilds the prompt sections unless `note` and `date` are unchanged; returns the
-    /// system message announcing the change (every section on the first build).
-    fn rebuild_prompt(&self, note: Option<String>, date: String) -> Option<SystemMessage> {
-        let mut state = self.prompt.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.sections.is_some() && state.note == note && state.date == date {
-            return None;
-        }
-        let scheme_docs = self.tool_state.schemes.prompt_docs();
-        let (sections, diagnostics) = build_sections(&PromptInputs {
-            dir: &self.dir,
-            cwd: &self.cwd,
-            project_prompts: self.project_access != ProjectAccess::Ignore
-                && self.settings.project.files.axo_dir,
-            tools: &self.tools,
-            scheme_docs: &scheme_docs,
-            context_files: &self.context_files,
-            skills: &self.skills,
-            dev_shell: note.as_deref(),
-            date: &date,
-            host_sections: &self.host_sections,
-        });
-        for diagnostic in &diagnostics {
-            warn!("{diagnostic}");
-        }
-        let message = system_message(state.sections.as_ref(), &sections);
-        *state = PromptState {
-            note,
-            date,
-            sections: Some(sections),
-        };
-        message
-    }
-
-    fn refresh_prompt(&self, note: Option<String>) {
-        if let Some(message) = self.rebuild_prompt(note, today()) {
-            self.hooks
-                .system
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(AgentMessage::Llm(Message::System(message)));
-        }
-    }
-
     /// The session file. With lazy creation it exists only after the first submission.
     pub fn path(&self) -> &Path {
         &self.path
@@ -2145,7 +2398,7 @@ impl Session {
 
     /// The skills loaded at start; the prompt's catalog and `/name` commands use these.
     pub fn skills(&self) -> &[Skill] {
-        &self.skills
+        &self.hooks.prompt.skills
     }
 
     /// This session's URL schemes, for hosts resolving URLs they display: recognize with
@@ -2157,7 +2410,7 @@ impl Session {
     /// The commands a host may offer, in whatever form it picks: built-ins, then this
     /// session's skills.
     pub fn commands(&self) -> Vec<CommandInfo> {
-        commands::catalog(&self.skills)
+        commands::catalog(&self.hooks.prompt.skills)
     }
 
     /// Runs a built-in command under its policy: `model`/`thinking` alongside a turn,
@@ -2203,10 +2456,14 @@ impl Session {
     /// returns its earlier submission and starts nothing, even while that run is active.
     pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
         // Fast path: a duplicate or busy prompt does no file or image work.
-        let existing = self.admit(&*self.hooks.log.lock().await, request.request_id.as_deref())?;
-        if let Some(existing) = existing {
-            return Ok(PromptResult::Duplicate(existing));
-        }
+        let preparing = {
+            let log = self.hooks.log.lock().await;
+            if let Some(existing) = self.admit(&log, request.request_id.as_deref())? {
+                return Ok(PromptResult::Duplicate(existing));
+            }
+            self.hooks.preparing.fetch_add(1, Ordering::AcqRel);
+            Preparing(self.hooks.clone())
+        };
         let (Prepared { parts, saved }, content) = self.prepare(request.input.parts).await?;
         let (submission, message) = {
             let mut log = self.hooks.log.lock().await;
@@ -2225,17 +2482,14 @@ impl Session {
                 )
                 .await?;
             self.hooks.running.send_replace(true);
+            drop(preparing);
+            self.hooks.auto_paused.store(false, Ordering::Release);
             submitted
         };
-        let note = self
-            .prompt
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .note
-            .clone();
-        self.refresh_prompt(note);
-        let mut messages = self.hooks.take_system();
-        messages.push(message);
+        // Pending job results precede the user's message.
+        let messages = self
+            .hooks
+            .run_input(self.hooks.reserve_delivery(), Some(message));
         // Spawned so that dropping this future leaves the run to settle on its own.
         let run = tokio::spawn(run_to_settle(
             self.agent.clone(),
@@ -2271,13 +2525,13 @@ impl Session {
     /// before the log lock so file and image work never stalls a running turn.
     async fn prepare(&self, parts: Vec<PromptPart>) -> Result<(Prepared, Vec<UserBlock>), Error> {
         let prepared = prepare(parts, &self.tool_state).await?;
-        let content = render(&prepared.parts, &self.skills, &self.tool_state).await;
+        let content = render(&prepared.parts, &self.hooks.prompt.skills, &self.tool_state).await;
         Ok((prepared, content))
     }
 
     /// Saves a `submission` entry for `parts` and returns it with the user message of
-    /// `content`; that message's `message` entry will carry the submission id. `saved`
-    /// files stay only once the entry is written.
+    /// `content`, queued under the submission id so its `message` entry carries it.
+    /// `saved` files stay only once the entry is written.
     async fn submit(
         &self,
         log: &mut Log,
@@ -2286,7 +2540,7 @@ impl Session {
         saved: SavedFiles,
         content: Vec<UserBlock>,
         request_id: Option<String>,
-    ) -> Result<(SeqEntry, AgentMessage), Error> {
+    ) -> Result<(SeqEntry, QueuedMessage), Error> {
         let submission_id = Uuid::now_v7().to_string();
         let base = log.next_base();
         let entry = Entry::Submission {
@@ -2302,8 +2556,13 @@ impl Session {
             content,
             timestamp: now_ms(),
         }));
-        log.pending.push((message.clone(), submission_id));
-        Ok((submission, message))
+        Ok((
+            submission,
+            QueuedMessage {
+                message,
+                id: Some(submission_id),
+            },
+        ))
     }
 
     /// Saves and queues a user message delivered after the current tool calls finish.
@@ -2324,6 +2583,7 @@ impl Session {
         let (_, message) = self
             .submit(&mut log, kind, parts, saved, content, None)
             .await?;
+        self.hooks.auto_paused.store(false, Ordering::Release);
         match kind {
             SubmissionKind::FollowUp => self.agent.follow_up(message),
             SubmissionKind::Prompt | SubmissionKind::Steer => self.agent.steer(message),
@@ -2331,15 +2591,21 @@ impl Session {
         Ok(())
     }
 
-    /// Stops the active run (`CancelReason::User`).
+    /// Stops the active run (`CancelReason::User`). Stopping an active run pauses
+    /// automatic delivery of job results until the user's next input; an idle Stop
+    /// changes nothing.
     pub async fn abort(&self) {
+        if *self.hooks.running.borrow() {
+            self.hooks.auto_paused.store(true, Ordering::Release);
+        }
         self.hooks.cancel_maintenance(false);
         self.agent.cancel(CancelReason::User);
     }
 
     /// Stops the session as a host does before exiting: the active run, and any run started
     /// later, is cancelled with `CancelReason::Shutdown`, so nothing is recorded as aborted
-    /// and the run resumes when the session is next opened. Returns once the run settled.
+    /// and the run resumes when the session is next opened. Then every command job is
+    /// killed. Returns once the run settled and every job task finished.
     pub async fn shutdown(&self) {
         // Record CancelReason::Shutdown before cancelling the shared maintenance token.
         self.agent.shutdown();
@@ -2350,6 +2616,7 @@ impl Session {
             .subscribe()
             .wait_for(|running| !*running)
             .await;
+        self.hooks.jobs.shutdown().await;
     }
 
     /// Switches the model from the next request; the thinking level is clamped to it.
@@ -2492,12 +2759,7 @@ impl Session {
         options: NavigateOptions,
     ) -> Result<(), Error> {
         if options.summarize {
-            let sections = self
-                .prompt
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .sections
-                .clone();
+            let sections = self.hooks.prompt.sections();
             return self
                 .start_maintenance(
                     MaintenanceKind::BranchSummary,
@@ -2549,6 +2811,7 @@ impl Session {
                     message: AgentMessage::Llm(Message::User(user)),
                     base,
                     submission_id,
+                    ..
                 } => {
                     let submitted = submission_id.as_deref().and_then(|wanted| {
                         log.entries.iter().find_map(|seq| match &seq.entry {
@@ -2593,7 +2856,7 @@ impl Session {
         };
 
         let header = Header::new(
-            self.cwd.clone(),
+            self.hooks.prompt.cwd.clone(),
             Some(self.path.clone()),
             Some(entry_id.clone()),
         );
@@ -2601,7 +2864,7 @@ impl Session {
         let mut writer = self.store.create(header).await?;
         let parent_dir = self.path.with_extension("");
         let child_dir = writer.planned_path().with_extension("");
-        crate::schemes::copy_for_fork(&parent_dir, &child_dir).await;
+        crate::schemes::copy_for_fork(&parent_dir, &child_dir, self.hooks.jobs.live_spools()).await;
         let mut entries = Vec::with_capacity(path.len() + 1);
         for entry in path {
             entries.push(writer.append(entry).await?);
@@ -2650,17 +2913,18 @@ impl Session {
 
         let projection = project(&entries, None);
         let session = Session::start(SessionSetup {
-            dir: self.dir.clone(),
-            cwd: self.cwd.clone(),
+            dir: self.hooks.prompt.dir.clone(),
+            cwd: self.hooks.prompt.cwd.clone(),
             settings: self.settings.clone(),
             streamer: self.streamer.clone(),
             models: self.models.clone(),
             model,
             thinking,
             exec: self.exec.clone(),
+            supervisor: self.hooks.maintenance.tools.supervisor.clone(),
             ask_enabled: self.ask_enabled,
             project_access: self.project_access,
-            host_sections: self.host_sections.clone(),
+            host_sections: self.hooks.prompt.host_sections.clone(),
             host_tools: self.host_tools.clone(),
             host_schemes: self.host_schemes.clone(),
             store: self.store.clone(),
@@ -2680,17 +2944,18 @@ impl Session {
         self.exec.invalidate();
         let resolved = self
             .exec
-            .resolve(&self.cwd, &CancellationToken::new(), &|_| {})
+            .resolve(&self.hooks.prompt.cwd, &CancellationToken::new(), &|_| {})
             .await;
-        self.refresh_prompt(resolved.prompt_note);
+        self.hooks.refresh_prompt(resolved.prompt_note);
     }
 }
 
-/// Dropping a session shuts it down; its run task then settles and releases the writer
-/// lock.
+/// Dropping a session shuts it down: its run task then settles and releases the writer
+/// lock, and every command job's container is killed.
 impl Drop for Session {
     fn drop(&mut self) {
         self.agent.shutdown();
         self.hooks.cancel_maintenance(true);
+        self.hooks.jobs.kill_all();
     }
 }

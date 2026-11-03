@@ -27,10 +27,11 @@
 
 ### Built-in tool guidelines (`tools`)
 
-Only `read`, `write`, and `edit` define `prompt_guidelines()` in the built-in tool set:
+Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the built-in tool set:
 - `read`: `"Use read to examine files instead of cat or sed."`
 - `write`: `"Use write only for new files or complete rewrites."`
 - `edit`: `"When changing several places in one file, use one edit call with several entries in edits[]."`
+- `bash`: `"A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes."` and `"List jobs with read proc:// and stop one with write proc://bg_N/kill (empty content)."` (see [Background Jobs](#background-jobs-cratesaxosrcjobsrs))
 
 ### Host section validation
 
@@ -75,7 +76,7 @@ If a summarizer override file is empty or whitespace-only, `SummaryPrompts::load
 
 ### On-demand nested context files (`NestedContext`)
 
-When `settings.nested_context_files` is `true`, successful `read`, `write`, and `edit` calls invoke `SessionTools::nested_context_for(&path)`:
+When `settings.nested_context_files` is `true`, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
 - For a touched path inside `project_root`, `NestedContext` checks every directory from `project_root` down to the file's parent directory.
 - Any enabled context file whose canonical path and content are not already present in the startup `context_files` or in the active projection's tool results is appended to that tool result as `<project_instructions path="…">\n{content}\n</project_instructions>`.
 - `NestedContext::restore(&messages)` reconstructs the seen set from the current projected messages on session open, branch navigation, compaction, and `/shake`. If a tool result carrying a nested context file is elided or compacted away, the next file access in that directory reattaches it.
@@ -193,3 +194,55 @@ Running maintenance (compaction, `/shake`, branch summary) makes every built-in 
 **Rendering** produces the user message: one `Text` block (all parts flattened, a skill command expanded when the message starts with typed `/` text), then for each `Saved { image: true }` in order a `Text` block with its URL (plus any resize hints, one per line) and an `Image` block, processed like `read` does for images. When an image cannot be read or processed, that pair becomes one `Text` block `"{url}\n{message}"` (for example `[image unavailable: …]`) and the message still sends. There is no model-capability check here: requests to text-only models turn images into placeholders.
 
 The `submission` entry stores the prepared parts (with `Saved`, never `Content`), so apps can redraw chips after reload or fork; see [JSONL format](sessions-and-compaction.md#jsonl-format-format_version--1).
+
+## Background Jobs (`crates/axo/src/jobs.rs`)
+
+Every `bash` command runs in its own container under the session's `ProcessSupervisor`: a process group by default, or a cgroup v2 job directory when the host selects `Supervision::Cgroup` through `AxoBuilder::supervision` (see [Command supervision](configuration.md#command-supervision-axosupervision)). A command can move to the background as job `bg_N`; its result reaches the model later as a message. How results are journaled and delivered exactly once is in [Background Job Durability](sessions-and-compaction.md#background-job-durability).
+
+### Promotion (`bash`)
+
+A running `bash` call is promoted to a background job when the first of these happens:
+- `async: true` is set in its arguments (immediately);
+- it is still running after 60 seconds (`PROMOTE_AFTER`);
+- a steer is pending: the user sent a message while it ran (`ToolContext::steer`).
+
+Environment resolution (dev-shell capture) stays in the foreground; the 60 s timer and steer promotion start only once the process runs. A command that already finished is never promoted, and promotion is attempted at most once per call. The tool result then returns at once with the output so far (or `(no output yet)`) followed by:
+
+```text
+Command is still running in the background as bg_N. Full output: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with write proc://bg_N/kill.
+```
+
+Its `details` are `{"job": "bg_N", "fullOutput": "artifact://<n>"}`. After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `write proc://bg_N/kill`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. Stopped by kill, the result reads `Command was stopped (proc://bg_N/kill)` with `is_error: true`.
+
+**Retained helpers.** A result is the root shell's: it returns when the root exits plus a fixed 100 ms drain. If processes the command started are still alive in its container (for example backgrounded `&` or `nohup` children, which stay in the process group; under cgroup supervision also `setsid` descendants, which leave the process group and are invisible to process-group mode), the result, foreground or background, ends with `Processes started by this command are still running as bg_N (read proc://bg_N; stop with write proc://bg_N/kill). Their output continues in artifact://<n>.` They stay listed and killable as `bg_N` until they exit; no second result follows.
+
+**Capture loss.** If writing the output spool fails, the command keeps running and the result shows the bounded output already captured, with `[Output capture failed: {err}. Showing partial output only.]` appended and no artifact URL.
+
+### `wait`
+
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background job finishes, then returns every pending result, each as `[bg_N] <first command line, max 120 chars>\n<result>`, joined by blank lines. It returns `No background jobs are running.` at once when no admitted job is still running, `Wait interrupted by a new message; {n} background job(s) still running: bg_…` when the user steers, and `Operation aborted` (error) on Stop. It sleeps on registry changes instead of polling, and the results it returns are consumed: they are never delivered again. Any tool batch containing `wait` runs one call at a time, so a `bash` promoted earlier in the same batch is already admitted when `wait` looks for running jobs.
+
+### `proc://`
+
+The session's `proc://` scheme (`Target::Virtual`; prompt doc `proc:// background jobs: read proc:// lists them, read proc://bg_N shows one, write proc://bg_N/kill (empty content) stops it.`) inspects and stops jobs without consuming results:
+
+| Operation | Result |
+| :--- | :--- |
+| `read proc://` | One line per job, `bg_N  {status}  {command first line}`, status `running`, `helpers running`, `finished`, or `failed`; or `No background jobs.` |
+| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N` |
+| `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
+
+Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside a session) has no `proc://`.
+
+### Results in context
+
+A result not consumed by `wait` reaches the model as a `job_result` custom message, lowered to a user message:
+
+```text
+Background job results:
+
+[bg_N] <command>
+<result>
+```
+
+During a run it is injected at the next turn boundary, after the current tool batch; it never counts as a steer, so it neither promotes `bash` nor interrupts `wait`. With the session idle, it starts a run of its own unless automatic continuation is latched off by a Stop or an unsuccessful run. A new `prompt` places pending results before the user's message.

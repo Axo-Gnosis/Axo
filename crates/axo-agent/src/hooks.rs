@@ -14,7 +14,7 @@ use axo_ai::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::message::AgentMessage;
+use crate::message::{AgentMessage, QueuedMessage};
 use crate::tool::{Tool, ToolError, ToolOutput};
 
 /// The loop's working context (pi `AgentContext`): the transcript the model sees and the
@@ -207,13 +207,13 @@ pub trait LoopHooks: Send + Sync {
 
     /// Host-supplied steering messages, drained after the agent's own steering queue at
     /// each steering drain point.
-    async fn steering(&self) -> Vec<AgentMessage> {
+    async fn steering(&self) -> Vec<QueuedMessage> {
         Vec::new()
     }
 
     /// Host-supplied follow-up messages, drained after the agent's own follow-up queue
     /// when the run would otherwise end.
-    async fn follow_up(&self) -> Vec<AgentMessage> {
+    async fn follow_up(&self) -> Vec<QueuedMessage> {
         Vec::new()
     }
 }

@@ -48,6 +48,8 @@ fn user_entry(id: &str, parent: Option<&str>, text: &str) -> Entry {
             timestamp: now_ms(),
         })),
         submission_id: None,
+        admitted_jobs: Vec::new(),
+        delivered_jobs: Vec::new(),
     }
 }
 
@@ -62,6 +64,8 @@ fn assistant_entry(id: &str, parent: &str, text: &str) -> Entry {
             ..AssistantMessage::empty(&model())
         })),
         submission_id: None,
+        admitted_jobs: Vec::new(),
+        delivered_jobs: Vec::new(),
     }
 }
 

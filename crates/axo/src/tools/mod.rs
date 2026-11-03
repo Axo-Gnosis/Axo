@@ -9,6 +9,7 @@ pub mod find;
 pub mod grep;
 pub mod read;
 pub mod truncate;
+pub mod wait;
 pub mod write;
 
 use std::borrow::Cow;
@@ -30,6 +31,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
 use crate::exec::ExecEnv;
+use crate::exec::host::ProcessSupervisor;
+use crate::jobs::JobRegistry;
 use crate::schemes::{SchemeUrl, Schemes, Target};
 use ask::{AskTool, PendingQuestions};
 use bash::BashTool;
@@ -37,6 +40,7 @@ use edit::EditTool;
 use find::FindTool;
 use grep::GrepTool;
 use read::ReadTool;
+use wait::WaitTool;
 use write::WriteTool;
 
 /// State shared by one session's tools; each tool holds an `Arc` of it.
@@ -55,6 +59,10 @@ pub struct SessionTools {
     pub ask_timeout: Option<Duration>,
     /// Set `CI=true` for bash commands.
     pub ci_env: bool,
+    /// Runs every local command in its own supervised container (process group or cgroup).
+    pub supervisor: Arc<ProcessSupervisor>,
+    /// The session's command jobs: every bash command registers here while it runs.
+    pub jobs: Arc<JobRegistry>,
 }
 
 /// Builds a host tool for one session from that session's shared state (called again for
@@ -77,27 +85,6 @@ pub enum Located {
 }
 
 impl SessionTools {
-    pub fn new(
-        cwd: PathBuf,
-        exec: Arc<dyn ExecEnv>,
-        schemes: Schemes,
-        questions: Arc<PendingQuestions>,
-        ask_timeout: Option<Duration>,
-        ci_env: bool,
-        context: NestedContext,
-    ) -> Arc<SessionTools> {
-        Arc::new(SessionTools {
-            cwd,
-            exec,
-            ledger: FileLedger::default(),
-            context,
-            schemes,
-            questions,
-            ask_timeout,
-            ci_env,
-        })
-    }
-
     /// Cleans and resolves a scheme URL, leaving ordinary paths for filesystem fallback.
     pub async fn locate(&self, path: &str) -> Result<Located, ToolError> {
         let Some(url) = self.schemes.parse(&clean_path(path))? else {
@@ -238,8 +225,8 @@ fn clean_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-/// The built-in tools in prompt order: `read, write, edit, bash, grep, find`, plus `ask`
-/// when `ask` is set.
+/// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait`, plus
+/// `ask` when `ask` is set.
 pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
     let mut list: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool::new(tools.clone())),
@@ -248,6 +235,7 @@ pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
         Arc::new(BashTool::new(tools.clone())),
         Arc::new(GrepTool::new(tools.clone())),
         Arc::new(FindTool::new(tools.clone())),
+        Arc::new(WaitTool::new(tools.clone())),
     ];
     if ask {
         list.push(Arc::new(AskTool::new(tools.clone())));

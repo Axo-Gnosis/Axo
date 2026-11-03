@@ -9,15 +9,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axo_agent::{
     Agent, AgentConfig, AgentContext, AgentEvent, AgentMessage, BeforeToolCallContext,
-    CancelReason, ExecutionMode, HookError, LoopHooks, Persist, PersistError,
-    PrepareRequestContext, RequestUpdate, RunOutcome, Tool, ToolCallDecision, ToolError,
-    ToolOutput, ToolUpdate, TurnContext, TurnDecision, TurnFinish,
+    CancelReason, ExecutionMode, HookError, LoopHooks, MessageOrigin, Persist, PersistError,
+    PrepareRequestContext, QueuedMessage, RequestUpdate, RunOutcome, Tool, ToolCallDecision,
+    ToolContext, ToolError, ToolInvocationId, ToolOutput, TurnContext, TurnDecision, TurnFinish,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
     ApiKind, AssistantBlock, AssistantEvent, AssistantMessage, Compat, Cost, InputKind, Message,
-    Model, ScriptedApi, ScriptedTurn, StopReason, ToolCall, ToolResultMessage, UserBlock,
-    UserMessage, now_ms,
+    Model, ScriptedApi, ScriptedTurn, StopReason, ToolResultMessage, UserBlock, UserMessage,
+    now_ms,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -111,6 +111,8 @@ struct Recorder {
     results: Mutex<Vec<ToolResultMessage>>,
     assistants: Mutex<Vec<AssistantMessage>>,
     exec_ends: Mutex<Vec<(String, bool)>>,
+    /// The `MessageEnd` label and origin of every persisted message, in order.
+    origins: Mutex<Vec<(String, MessageOrigin)>>,
     /// Call ids whose `before_tool_call` fails.
     block: Vec<String>,
     /// Per-call-id delay inside `before_tool_call`.
@@ -158,6 +160,13 @@ impl Recorder {
         let matching: Vec<_> = results.iter().filter(|r| r.tool_call_id == id).collect();
         assert_eq!(matching.len(), 1, "exactly one persisted result for {id}");
         matching[0].clone()
+    }
+
+    fn origin(&self, label: &str) -> MessageOrigin {
+        let origins = self.origins.lock().unwrap();
+        let matching: Vec<_> = origins.iter().filter(|(name, _)| name == label).collect();
+        assert_eq!(matching.len(), 1, "exactly one {label} in {origins:?}");
+        matching[0].1.clone()
     }
 }
 
@@ -261,11 +270,11 @@ impl Persist for Recorder {
             AgentEvent::TurnEnd { .. } => "TurnEnd".to_owned(),
             AgentEvent::MessageStart { .. } | AgentEvent::MessageUpdate { .. } => return Ok(()),
             AgentEvent::ToolExecutionUpdate { .. } => return Ok(()),
-            AgentEvent::MessageEnd { message } => {
+            AgentEvent::MessageEnd { message, origin } => {
                 if self.slow_persist {
                     tokio::time::sleep(Duration::from_millis(30)).await;
                 }
-                match message {
+                let name = match message {
                     AgentMessage::Llm(message) => {
                         match message {
                             Message::ToolResult(result) => {
@@ -287,7 +296,12 @@ impl Persist for Recorder {
                         }
                     }
                     AgentMessage::Custom(_) => "end:custom".to_owned(),
-                }
+                };
+                self.origins
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), origin.clone()));
+                name
             }
             AgentEvent::ToolExecutionStart { call_id, .. } => format!("exec-start:{call_id}"),
             AgentEvent::ToolExecutionEnd {
@@ -367,12 +381,8 @@ impl Tool for ProbeTool {
         self.mode
     }
 
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let call = cx.call;
         self.probe.started.lock().unwrap().push(call.id.clone());
         let running = self.probe.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.probe.max_running.fetch_max(running, Ordering::SeqCst);
@@ -383,7 +393,7 @@ impl Tool for ProbeTool {
             .unwrap_or(0);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
-            _ = cancel.cancelled() => {}
+            _ = cx.cancel.cancelled() => {}
         }
         self.probe.running.fetch_sub(1, Ordering::SeqCst);
         self.probe.finished.lock().unwrap().push(call.id.clone());
@@ -415,12 +425,7 @@ impl Tool for FailTool {
         &self.schema
     }
 
-    async fn execute(
-        &self,
-        _call: &ToolCall,
-        _cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, _cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         Err(ToolError("tool failed".into()))
     }
 }
@@ -460,15 +465,10 @@ impl Tool for GateTool {
         ExecutionMode::Sequential
     }
 
-    async fn execute(
-        &self,
-        _call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
-        cancel.cancelled().await;
+        cx.cancel.cancelled().await;
         Err(ToolError("gate cancelled".into()))
     }
 }
@@ -506,22 +506,17 @@ impl Tool for QueueTool {
         &self.schema
     }
 
-    async fn execute(
-        &self,
-        _call: &ToolCall,
-        _cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, _cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let agent = self
             .agent
             .get()
             .and_then(Weak::upgrade)
             .expect("agent attached");
         if self.steer {
-            agent.steer(user("steered"));
+            agent.steer(user("steered").into());
         }
         if self.follow_up {
-            agent.follow_up(user("followed"));
+            agent.follow_up(user("followed").into());
         }
         Ok(ToolOutput {
             content: vec![UserBlock::Text {
@@ -529,6 +524,105 @@ impl Tool for QueueTool {
             }],
             ..ToolOutput::default()
         })
+    }
+}
+
+/// Records what the steer signal reads: once on entry and, with `{"wait": true}`, again
+/// after waiting for steering to become pending.
+struct SteerTool {
+    started: Notify,
+    seen: Mutex<Vec<bool>>,
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for SteerTool {
+    fn name(&self) -> &str {
+        "steer"
+    }
+
+    fn description(&self) -> &str {
+        "Observes the steer signal."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let mut steer = cx.steer.clone();
+        self.seen.lock().unwrap().push(steer.is_pending());
+        if cx.call.arguments.get("wait").and_then(Value::as_bool) == Some(true) {
+            self.started.notify_one();
+            steer.pending().await;
+            self.seen.lock().unwrap().push(steer.is_pending());
+        }
+        Ok(ToolOutput::default())
+    }
+}
+
+/// Sequential tool that records each call's invocation id. `{"steer": true}` queues a
+/// steering message under id `"s1"`; `{"hang": true}` signals and waits for cancellation.
+struct OriginTool {
+    agent: OnceLock<Weak<Agent>>,
+    invocations: Mutex<Vec<(String, ToolInvocationId)>>,
+    started: Notify,
+    schema: Value,
+}
+
+impl OriginTool {
+    fn invocation(&self, id: &str) -> ToolInvocationId {
+        self.invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(call, _)| call == id)
+            .map(|(_, invocation)| *invocation)
+            .unwrap_or_else(|| panic!("{id} never executed"))
+    }
+}
+
+#[async_trait]
+impl Tool for OriginTool {
+    fn name(&self) -> &str {
+        "origin"
+    }
+
+    fn description(&self) -> &str {
+        "Records its invocation."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
+    }
+
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        self.invocations
+            .lock()
+            .unwrap()
+            .push((cx.call.id.clone(), cx.invocation));
+        let flag = |name: &str| cx.call.arguments.get(name).and_then(Value::as_bool) == Some(true);
+        if flag("steer") {
+            let agent = self
+                .agent
+                .get()
+                .and_then(Weak::upgrade)
+                .expect("agent attached");
+            agent.steer(QueuedMessage {
+                message: user("steered"),
+                id: Some("s1".into()),
+            });
+        }
+        if flag("hang") {
+            self.started.notify_one();
+            cx.cancel.cancelled().await;
+            return Err(ToolError("origin cancelled".into()));
+        }
+        Ok(ToolOutput::default())
     }
 }
 
@@ -554,6 +648,7 @@ fn setup(
         results: Mutex::default(),
         assistants: Mutex::default(),
         exec_ends: Mutex::default(),
+        origins: Mutex::default(),
         block: Vec::new(),
         prep_delay_ms: Vec::new(),
         slow_persist: false,
@@ -583,7 +678,7 @@ fn setup(
 
 impl Harness {
     async fn prompt(&self, text: &str) -> RunOutcome {
-        tokio::time::timeout(TIMEOUT, self.agent.prompt(vec![user(text)]))
+        tokio::time::timeout(TIMEOUT, self.agent.prompt(vec![user(text).into()]))
             .await
             .expect("run settles")
             .expect("run succeeds")
@@ -811,7 +906,7 @@ async fn follow_ups_are_used_only_when_the_run_would_end() {
         vec![probe_tool("sleep", ExecutionMode::Parallel, &probe)],
         |_| {},
     );
-    h.agent.follow_up(user("later"));
+    h.agent.follow_up(user("later").into());
     assert_eq!(h.prompt("go").await, RunOutcome::Done);
 
     assert_eq!(h.api.requests().len(), 3);
@@ -951,7 +1046,7 @@ async fn user_cancel_mid_tool_aborts_unanswered_calls() {
         |_| {},
     );
     let agent = h.agent.clone();
-    let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
     tokio::time::timeout(TIMEOUT, gate.started.notified())
         .await
         .expect("gate started");
@@ -990,7 +1085,7 @@ async fn shutdown_cancel_persists_nothing_aborted() {
     let h = setup(vec![ScriptedTurn::HangUntilCancel], Vec::new(), |_| {});
     let mut events = h.agent.subscribe();
     let agent = h.agent.clone();
-    let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
     tokio::time::timeout(TIMEOUT, async {
         while let Ok(event) = events.recv().await {
             if matches!(event, AgentEvent::MessageUpdate { .. }) {
@@ -1028,7 +1123,7 @@ async fn shutdown_cancel_persists_nothing_aborted() {
         |_| {},
     );
     let agent = h.agent.clone();
-    let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
     tokio::time::timeout(TIMEOUT, gate.started.notified())
         .await
         .expect("gate started");
@@ -1145,7 +1240,7 @@ async fn user_cancel_mid_stream_answers_streamed_calls() {
     );
     let mut events = h.agent.subscribe();
     let agent = h.agent.clone();
-    let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
     tokio::time::timeout(TIMEOUT, async {
         while let Ok(event) = events.recv().await {
             if matches!(
@@ -1198,7 +1293,7 @@ async fn continue_run_from_a_reply_runs_queued_input() {
         user("go"),
         AgentMessage::Llm(Message::Assistant(reply_text("hi"))),
     ]);
-    h.agent.steer(user("more"));
+    h.agent.steer(user("more").into());
 
     let outcome = tokio::time::timeout(TIMEOUT, h.agent.continue_run())
         .await
@@ -1383,7 +1478,7 @@ async fn cancellation_during_hooks_wins_over_errors_and_continuation() {
                 },
             );
             let agent = h.agent.clone();
-            let run = tokio::spawn(async move { agent.prompt(vec![user("go")]).await });
+            let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
             tokio::time::timeout(TIMEOUT, h.rec.entered.notified())
                 .await
                 .unwrap();
@@ -1472,5 +1567,106 @@ async fn response_classification_uses_request_model_after_live_switch() {
     assert_eq!(
         *h.rec.finished_models.lock().unwrap(),
         labels(&["scripted-model"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn steer_signal_is_pending_until_drained() {
+    let tool = Arc::new(SteerTool {
+        started: Notify::new(),
+        seen: Mutex::default(),
+        schema: json!({ "type": "object" }),
+    });
+    let h = setup(
+        vec![
+            turn(&[("c1", "steer", json!({ "wait": true }))]),
+            turn(&[("c2", "steer", json!({}))]),
+            text("done"),
+        ],
+        vec![tool.clone() as Arc<dyn Tool>],
+        |_| {},
+    );
+    let agent = h.agent.clone();
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
+    tokio::time::timeout(TIMEOUT, tool.started.notified())
+        .await
+        .expect("c1 started");
+    h.agent.steer(user("steered").into());
+    let outcome = tokio::time::timeout(TIMEOUT, run)
+        .await
+        .expect("steering releases the waiting tool")
+        .expect("task joins")
+        .expect("run succeeds");
+
+    assert_eq!(outcome, RunOutcome::Done);
+    // c1: idle on entry, pending after the steer; c2 runs after the steer was drained.
+    assert_eq!(*tool.seen.lock().unwrap(), [false, true, false]);
+    assert_eq!(
+        h.request(1),
+        labels(&["user:go", "assistant:ToolUse", "result:c1", "user:steered"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_end_origins_follow_the_persisted_result() {
+    let tool = Arc::new(OriginTool {
+        agent: OnceLock::new(),
+        invocations: Mutex::default(),
+        started: Notify::new(),
+        schema: json!({ "type": "object" }),
+    });
+    let h = setup(
+        vec![
+            turn(&[("c1", "origin", json!({ "steer": true }))]),
+            turn(&[
+                ("c2", "origin", json!({ "hang": true })),
+                ("c3", "origin", json!({ "hang": true })),
+            ]),
+            ScriptedTurn::HangUntilCancel,
+        ],
+        vec![tool.clone() as Arc<dyn Tool>],
+        |_| {},
+    );
+    assert!(tool.agent.set(Arc::downgrade(&h.agent)).is_ok());
+    let agent = h.agent.clone();
+    let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
+    tokio::time::timeout(TIMEOUT, tool.started.notified())
+        .await
+        .expect("c2 started");
+    h.agent.cancel(CancelReason::User);
+    let outcome = tokio::time::timeout(TIMEOUT, run)
+        .await
+        .expect("run settles")
+        .expect("task joins")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Aborted(CancelReason::User));
+
+    assert_eq!(h.rec.origin("end:user:go"), MessageOrigin::Input(None));
+    assert_eq!(
+        h.rec.origin("end:user:steered"),
+        MessageOrigin::Input(Some("s1".into()))
+    );
+    // Executed results carry their call's invocation, even when cancellation ended the tool.
+    let (c1, c2) = (tool.invocation("c1"), tool.invocation("c2"));
+    assert_ne!(c1, c2);
+    assert_eq!(h.rec.origin("end:result:c1"), MessageOrigin::Tool(c1));
+    assert_eq!(h.rec.origin("end:result:c2"), MessageOrigin::Tool(c2));
+    // The unanswered call never ran; its synthetic aborted result belongs to the run.
+    assert!(
+        tool.invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(id, _)| id != "c3")
+    );
+    assert_eq!(first_text(&h.rec.result("c3").content), "Operation aborted");
+    assert_eq!(h.rec.origin("end:result:c3"), MessageOrigin::Run);
+    let origins = h.rec.origins.lock().unwrap();
+    assert!(
+        origins
+            .iter()
+            .filter(|(name, _)| name.starts_with("end:assistant:"))
+            .all(|(_, origin)| *origin == MessageOrigin::Run),
+        "{origins:?}"
     );
 }

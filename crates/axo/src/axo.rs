@@ -11,8 +11,9 @@ use crate::config::{self, AxoDir, DevShellMode, ProjectAccess, Settings};
 use crate::context::project_root;
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
+use crate::exec::host::{ProcessSupervisor, Supervision};
 use crate::exec::{EnvMap, ExecEnv, HostEnv};
-use crate::schemes::{Scheme, Schemes};
+use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::session::{RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes};
 use crate::store::{
     Header, JsonlStore, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
@@ -30,6 +31,9 @@ pub struct Axo {
     store: Arc<dyn SessionStore>,
     /// Host environment snapshot taken at `build`.
     base_env: Arc<EnvMap>,
+    /// Supervises every local command (bash and dev-shell capture) in its own container
+    /// (process group or cgroup).
+    supervisor: Arc<ProcessSupervisor>,
 }
 
 /// Unset parts load from the axo directory: `settings.jsonc`, `models.jsonc`, `auth.json`,
@@ -41,6 +45,7 @@ pub struct AxoBuilder {
     models: Option<Arc<Models>>,
     streamer: Option<Arc<dyn Streamer>>,
     store: Option<Arc<dyn SessionStore>>,
+    supervision: Option<Supervision>,
 }
 
 impl AxoBuilder {
@@ -74,6 +79,12 @@ impl AxoBuilder {
         self
     }
 
+    /// Defaults to [`Supervision::ProcessGroup`].
+    pub fn supervision(mut self, supervision: Supervision) -> Self {
+        self.supervision = Some(supervision);
+        self
+    }
+
     pub async fn build(self) -> Result<Axo, Error> {
         let dir = match self.dir {
             Some(dir) => AxoDir::new(dir),
@@ -104,6 +115,10 @@ impl AxoBuilder {
             Some(store) => store,
             None => Arc::new(JsonlStore::new(dir.sessions_dir())),
         };
+        let base_env = HostEnv::snapshot().0;
+        // Never fails here: supervision is checked on the first command, so hosts that
+        // never run commands keep working.
+        let supervisor = ProcessSupervisor::new(self.supervision.unwrap_or_default());
         Ok(Axo {
             dir,
             settings,
@@ -111,7 +126,8 @@ impl AxoBuilder {
             models,
             streamer,
             store,
-            base_env: HostEnv::snapshot().0,
+            base_env,
+            supervisor,
         })
     }
 }
@@ -206,7 +222,16 @@ impl Axo {
         let header = self.store.read_header(path).await?;
         let (access, settings) = self.settings_for(&header.cwd, project_access)?;
         let (schemes, _, _) = session_schemes(
-            &self.dir, &settings, access, header.id, path, header.cwd, host,
+            &self.dir,
+            &settings,
+            access,
+            SchemeContext {
+                session_id: header.id,
+                session_dir: path.with_extension(""),
+                cwd: header.cwd,
+            },
+            host,
+            None,
         )?;
         Ok(schemes)
     }
@@ -280,6 +305,7 @@ impl Axo {
                     self.base_env.clone(),
                     settings.bash.clone(),
                     self.dir.cache_dir().join("devshell"),
+                    self.supervisor.clone(),
                 ))
             }
             None => {
@@ -305,6 +331,7 @@ impl Axo {
             model,
             thinking,
             exec,
+            supervisor: self.supervisor.clone(),
             ask_enabled,
             project_access: access,
             host_sections: sections,

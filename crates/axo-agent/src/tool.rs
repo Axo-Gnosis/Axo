@@ -1,9 +1,10 @@
 //! The tool contract (pi `agent/src/types.ts:423-499`). Tools hold their own session
-//! handles, so `execute` gets no context argument.
+//! handles; the per-call state arrives in a [`ToolContext`].
 
 use async_trait::async_trait;
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -25,13 +26,44 @@ pub trait Tool: Send + Sync {
     }
     /// Runs one validated call. An `Err` becomes an error result the model sees; a tool
     /// that reports a failure with output (e.g. a failing command) returns `Ok` with
-    /// `is_error: true`. Must honor `cancel`.
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError>;
+    /// `is_error: true`. Must honor `cx.cancel`.
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError>;
+}
+
+/// Identifies one execution of a tool within an agent; unique per [`crate::Agent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolInvocationId(pub u64);
+
+/// True while steering input is queued and not yet drained into the transcript.
+#[derive(Clone)]
+pub struct SteerSignal(pub(crate) watch::Receiver<bool>);
+
+impl SteerSignal {
+    /// A signal that never becomes pending.
+    pub fn never() -> Self {
+        Self(watch::channel(false).1)
+    }
+
+    pub fn is_pending(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once steering is pending; never resolves if the agent is gone.
+    pub async fn pending(&mut self) {
+        if self.0.wait_for(|pending| *pending).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Per-call state handed to [`Tool::execute`].
+pub struct ToolContext<'a> {
+    pub call: &'a ToolCall,
+    pub cancel: CancellationToken,
+    /// Streams partial results while the call runs.
+    pub updates: &'a (dyn Fn(ToolUpdate) + Send + Sync),
+    pub steer: SteerSignal,
+    pub invocation: ToolInvocationId,
 }
 
 /// How the tool calls of one assistant message run. A batch runs sequentially when the

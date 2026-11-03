@@ -4,14 +4,17 @@
 //! `drive [--dir <AXO_DIR>] [--cwd <path>] [--model <provider/id>] [--thinking <level>]
 //! [--answer recommended|first] [--resume <session.jsonl> [--fork <entry-id>]]
 //! [--navigate <entry-id|root> [--summarize]] [--request-id <id>] [--commands]
-//! [--attach <path>]... [<prompt>]`
+//! [--attach <path>]... [--cgroup] [<prompt>]`
 //!
 //! A prompt naming a built-in command (`/compact`, `/shake images`, `/model <provider/id>`,
 //! …) runs it through `Command::parse` and `run_command`; skills go through the prompt.
 //! `--commands` prints the command catalog as JSON and exits. Prompt
 //! words starting with `@` become file references (`@"path with spaces"` quoted; trailing
 //! punctuation is not part of the path); `--attach` hands a file's bytes over.
-//! `--resume` without a prompt only lets recovery/navigation finish.
+//! `--resume` without a prompt only lets recovery/navigation finish. `--cgroup` selects
+//! cgroup supervision with drive itself as the supervisor process (it routes
+//! `drive axo-supervisor …` to `axo::exec::supervisor::run`) and needs a delegated cgroup;
+//! the default is process-group supervision, which needs nothing extra.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,7 +24,7 @@ use std::sync::Arc;
 use axo::store::{self, Entry, EntryId, SeqEntry};
 use axo::{
     Answer, Axo, Command, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult,
-    Session, SessionEvent, SessionOptions,
+    Session, SessionEvent, SessionOptions, Supervision,
 };
 use axo_agent::AgentEvent;
 use axo_ai::{AssistantBlock, AssistantEvent, ThinkingLevel, UserBlock};
@@ -30,13 +33,29 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, oneshot};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Drive is its own supervisor in `--cgroup` mode: axo runs
+/// `drive axo-supervisor guard|enter …`, routed here to `axo::exec::supervisor::run`.
+const SUPERVISOR_ROUTE: &str = "axo-supervisor";
+
+fn main() -> ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == SUPERVISOR_ROUTE)
+    {
+        return axo::exec::supervisor::run(std::env::args_os().skip(2));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_env("AXO_LOG"))
         .with_writer(std::io::stderr)
         .init();
-    match run().await {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -59,6 +78,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut commands = false;
     let mut attachments = Vec::new();
     let mut prompt = Vec::new();
+    let mut cgroup = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -83,6 +103,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--summarize" => summarize = true,
             "--request-id" => request_id = Some(args.next().ok_or("--request-id needs an id")?),
             "--commands" => commands = true,
+            "--cgroup" => cgroup = true,
             "--attach" => {
                 attachments.push(PathBuf::from(args.next().ok_or("--attach needs a path")?))
             }
@@ -130,6 +151,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut builder = Axo::builder();
+    if cgroup {
+        builder = builder.supervision(Supervision::Cgroup {
+            program: std::env::current_exe()?,
+            args: vec![SUPERVISOR_ROUTE.into()],
+            cgroup_root: None,
+        });
+    }
     if let Some(dir) = dir {
         builder = builder.dir(dir);
     }

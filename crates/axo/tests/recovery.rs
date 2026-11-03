@@ -11,7 +11,7 @@ use axo::recovery::{RecoveryPlan, plan_recovery};
 use axo::store::{
     self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind,
 };
-use axo::{Axo, PromptPart, Session, SessionEvent, SessionOptions, Settings, StaticEnv};
+use axo::{Axo, PromptPart, Session, SessionEvent, Settings};
 use axo_agent::{AgentEvent, AgentMessage, Replay, RunOutcome};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
@@ -22,7 +22,7 @@ use axo_ai::{
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use common::{options, within};
+use common::{bash_options, options, within};
 
 fn model() -> Model {
     Model {
@@ -85,6 +85,8 @@ impl Log {
             base,
             message: AgentMessage::Llm(message),
             submission_id: submission_id.map(str::to_owned),
+            admitted_jobs: Vec::new(),
+            delivered_jobs: Vec::new(),
         })
     }
 
@@ -797,20 +799,6 @@ fn model_switch_precedes_reopen_numeric_classification() {
             assert!(matches!(plan, RecoveryPlan::RecoverResponse { .. }));
         }
     }
-}
-
-fn bash_options(dir: &Path) -> SessionOptions {
-    let mut options = options(dir);
-    // Keep the isolated fixture environment, but allow the real Nix-provided bash.
-    options.exec_env = Some(Arc::new(StaticEnv(Arc::new(
-        [(
-            "PATH".into(),
-            std::env::var_os("PATH").expect("test process needs PATH"),
-        )]
-        .into_iter()
-        .collect(),
-    ))));
-    options
 }
 
 fn assert_once_succeeded(entries: &[SeqEntry]) {

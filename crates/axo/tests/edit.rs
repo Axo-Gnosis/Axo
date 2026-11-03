@@ -1,6 +1,8 @@
 //! The `edit` tool (pi `core/tools/edit.ts`, `edit-diff.ts`) and the stale-file guard
 //! shared by `read`, `write` and `edit`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
@@ -9,12 +11,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo::context::files::NestedContext;
+use axo::jobs::JobRegistry;
 use axo::schemes::artifact::Artifacts;
 use axo::schemes::dir::DirScheme;
 use axo::schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 use axo::tools::{FileAccess, FileLedger};
-use axo::{PendingQuestions, SessionTools, StaticEnv};
-use axo_agent::{Replay, Tool, ToolError, ToolUpdate};
+use axo::{PendingQuestions, ProcessSupervisor, SessionTools, StaticEnv, Supervision};
+use axo_agent::{Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -42,10 +45,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let session = SessionTools::new(
-            dir.path().to_path_buf(),
-            Arc::new(StaticEnv(Arc::new(BTreeMap::new()))),
-            Schemes::new(
+        let env = Arc::new(BTreeMap::new());
+        let session = Arc::new(SessionTools {
+            cwd: dir.path().to_path_buf(),
+            exec: Arc::new(StaticEnv(env)),
+            ledger: Default::default(),
+            context: NestedContext::disabled(),
+            schemes: Schemes::new(
                 SchemeContext {
                     session_id: "test".into(),
                     session_dir: dir.path().into(),
@@ -59,11 +65,12 @@ impl Fixture {
                 &[],
             )
             .unwrap(),
-            Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
-            None,
-            false,
-            NestedContext::disabled(),
-        );
+            questions: Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
+            ask_timeout: None,
+            ci_env: false,
+            supervisor: ProcessSupervisor::new(Supervision::default()),
+            jobs: JobRegistry::new("test".into(), &[]).0,
+        });
         Self {
             tools: axo::tools::builtin(&session, false),
             dir,
@@ -101,7 +108,13 @@ impl Fixture {
         };
         let updates = |_: ToolUpdate| {};
         match tool
-            .execute(&call, CancellationToken::new(), &updates)
+            .execute(ToolContext {
+                call: &call,
+                cancel: CancellationToken::new(),
+                updates: &updates,
+                steer: SteerSignal::never(),
+                invocation: ToolInvocationId(0),
+            })
             .await
         {
             Ok(output) => {

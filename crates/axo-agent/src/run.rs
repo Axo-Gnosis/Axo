@@ -1,6 +1,7 @@
 //! The loop itself (pi `agent/src/agent-loop.ts`).
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axo_ai::transcript::{current_tools, tool_state_changes};
@@ -19,19 +20,21 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, QueueMode, RunOutcome};
 use crate::cancel::CancelReason;
 use crate::error::Error;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, MessageOrigin};
 use crate::hooks::{
     AfterToolCallContext, AgentContext, BeforeToolCallContext, PrepareRequestContext,
     ToolCallDecision, TurnContext, TurnDecision,
 };
-use crate::message::{AgentMessage, unanswered_calls};
-use crate::tool::{ExecutionMode, Tool, ToolOutput, ToolUpdate};
+use crate::message::{AgentMessage, QueuedMessage, unanswered_calls};
+use crate::tool::{
+    ExecutionMode, SteerSignal, Tool, ToolContext, ToolInvocationId, ToolOutput, ToolUpdate,
+};
 
 /// How a run starts.
 #[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 pub(crate) enum RunStart {
     /// `Agent::prompt`: append and emit these messages, then request a turn.
-    Prompt(Vec<AgentMessage>),
+    Prompt(Vec<QueuedMessage>),
     /// `Agent::continue_run` on a non-empty transcript whose last message is a user or
     /// tool-result message, an assistant message with unanswered tool calls (those calls
     /// run first), or a settled reply with queued steering or follow-ups.
@@ -94,6 +97,9 @@ struct Outcome {
     name: String,
     output: ToolOutput,
     duration_ms: Option<u64>,
+    /// Set once the tool is executed; kept whatever it returns. `None` for results the
+    /// loop synthesizes, so the persisted result keeps its provenance.
+    invocation: Option<ToolInvocationId>,
 }
 
 /// What preparing a call yields (pi `prepareToolCall`).
@@ -124,8 +130,9 @@ impl Run<'_> {
         let mut pending = Vec::new();
         match start {
             RunStart::Prompt(messages) => {
-                for message in declare_tool_changes(&self.context, messages) {
-                    self.add_message(message).await?;
+                let messages = messages.into_iter().map(input).collect();
+                for (message, origin) in declare_tool_changes(&self.context, messages) {
+                    self.add_message(message, origin).await?;
                 }
                 pending = self.drain_queue(true).await;
             }
@@ -203,7 +210,11 @@ impl Run<'_> {
                             return self.finish_aborted().await;
                         }
                         if let Some(update) = update {
-                            prepared = update.messages;
+                            prepared = update
+                                .messages
+                                .into_iter()
+                                .map(|message| (message, MessageOrigin::Run))
+                                .collect();
                             self.apply_update(update.context, update.model, update.thinking);
                         }
                         if pending.is_empty() {
@@ -212,9 +223,9 @@ impl Run<'_> {
                         self.emit(AgentEvent::TurnStart).await?;
                     }
                     self.context.tools = agent.lock().tools.clone();
-                    prepared.append(&mut pending);
-                    for message in declare_tool_changes(&self.context, prepared) {
-                        self.add_message(message).await?;
+                    prepared.extend(pending.drain(..).map(input));
+                    for (message, origin) in declare_tool_changes(&self.context, prepared) {
+                        self.add_message(message, origin).await?;
                     }
                     if self.cancel.is_cancelled() {
                         return self.finish_aborted().await;
@@ -487,7 +498,10 @@ impl Run<'_> {
                 .await?;
         }
         let adjusted = self
-            .end_message(AgentMessage::Llm(Message::Assistant(message.clone())))
+            .end_message(
+                AgentMessage::Llm(Message::Assistant(message.clone())),
+                MessageOrigin::Run,
+            )
             .await?;
         let message = match adjusted {
             Some(AgentMessage::Llm(Message::Assistant(adjusted))) => adjusted,
@@ -523,6 +537,7 @@ impl Run<'_> {
                             name: call.name.clone(),
                             output,
                             duration_ms: None,
+                            invocation: None,
                         };
                         self.emit_end(&outcome).await?;
                         outcome
@@ -558,6 +573,7 @@ impl Run<'_> {
                             name: call.name.clone(),
                             output,
                             duration_ms: None,
+                            invocation: None,
                         };
                         self.emit_end(&outcome).await?;
                         slots[index] = Some(outcome);
@@ -645,6 +661,7 @@ impl Run<'_> {
             name: call.name.clone(),
             output: error_output("Operation aborted"),
             duration_ms: None,
+            invocation: None,
         };
         if self.cancel.is_cancelled() {
             return (index, outcome);
@@ -653,10 +670,18 @@ impl Run<'_> {
         let on_update = move |update: ToolUpdate| {
             let _ = updates.send((call_id.clone(), update));
         };
+        let invocation =
+            ToolInvocationId(self.agent.next_invocation.fetch_add(1, Ordering::Relaxed));
+        let cx = ToolContext {
+            call,
+            cancel: self.cancel.child_token(),
+            updates: &on_update,
+            steer: SteerSignal(self.agent.steer_pending.subscribe()),
+            invocation,
+        };
+        outcome.invocation = Some(invocation);
         let started = Instant::now();
-        let result = tool
-            .execute(call, self.cancel.child_token(), &on_update)
-            .await;
+        let result = tool.execute(cx).await;
         outcome.duration_ms =
             Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         outcome.output = result.unwrap_or_else(|error| error_output(error.0));
@@ -751,6 +776,7 @@ impl Run<'_> {
                         .into()
                 }),
                 duration_ms: None,
+                invocation: None,
             };
             self.emit_end(&outcome).await?;
             results.extend(self.add_tool_result(&outcome).await?);
@@ -778,6 +804,7 @@ impl Run<'_> {
                     name: call.name.clone(),
                     output: error_output("Operation aborted"),
                     duration_ms: None,
+                    invocation: None,
                 };
                 tool_results.extend(self.add_tool_result(&outcome).await?);
             }
@@ -796,20 +823,25 @@ impl Run<'_> {
     }
 
     /// Takes the next messages of the steering (`true`) or follow-up queue per its mode,
-    /// then the host's messages from the matching hook.
-    async fn drain_queue(&self, steering: bool) -> Vec<AgentMessage> {
+    /// then the host's messages from the matching hook. Draining the last steering
+    /// message clears the steer signal under the same lock.
+    async fn drain_queue(&self, steering: bool) -> Vec<QueuedMessage> {
         let agent = self.agent;
-        let mut messages: Vec<AgentMessage> = {
+        let mut messages = {
             let mut state = agent.lock();
             let (queue, mode) = if steering {
                 (&mut state.steering, agent.steering_mode)
             } else {
                 (&mut state.follow_up, agent.follow_up_mode)
             };
-            match mode {
+            let taken: Vec<QueuedMessage> = match mode {
                 QueueMode::All => queue.drain(..).collect(),
                 QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
+            };
+            if steering && queue.is_empty() {
+                agent.steer_pending.send_replace(false);
             }
+            taken
         };
         messages.extend(if steering {
             agent.hooks.steering().await
@@ -866,7 +898,12 @@ impl Run<'_> {
         };
         Ok(
             match self
-                .add_message(AgentMessage::Llm(Message::ToolResult(result)))
+                .add_message(
+                    AgentMessage::Llm(Message::ToolResult(result)),
+                    outcome
+                        .invocation
+                        .map_or(MessageOrigin::Run, MessageOrigin::Tool),
+                )
                 .await?
             {
                 Some(AgentMessage::Llm(Message::ToolResult(result))) => Some(result),
@@ -876,21 +913,29 @@ impl Run<'_> {
     }
 
     /// Emits `MessageStart` and `MessageEnd` for a message the run adds.
-    async fn add_message(&mut self, message: AgentMessage) -> Result<Option<AgentMessage>, Error> {
+    async fn add_message(
+        &mut self,
+        message: AgentMessage,
+        origin: MessageOrigin,
+    ) -> Result<Option<AgentMessage>, Error> {
         self.emit(AgentEvent::MessageStart {
             message: message.clone(),
         })
         .await?;
-        self.end_message(message).await
+        self.end_message(message, origin).await
     }
 
     /// Emits `MessageEnd` and appends the message as persistence left it. During a
     /// shutdown the message is neither persisted nor appended; it is still returned.
-    async fn end_message(&mut self, message: AgentMessage) -> Result<Option<AgentMessage>, Error> {
-        let mut event = AgentEvent::MessageEnd { message };
+    async fn end_message(
+        &mut self,
+        message: AgentMessage,
+        origin: MessageOrigin,
+    ) -> Result<Option<AgentMessage>, Error> {
+        let mut event = AgentEvent::MessageEnd { message, origin };
         let persisted = self.persist(&mut event).await?;
         let message = match &event {
-            AgentEvent::MessageEnd { message } => Some(message.clone()),
+            AgentEvent::MessageEnd { message, .. } => Some(message.clone()),
             _ => None,
         };
         {
@@ -1031,22 +1076,27 @@ fn validate_arguments(tool: &dyn Tool, call: &ToolCall) -> Result<(), String> {
     ))
 }
 
+/// A queued input as a pending message with its origin.
+fn input(queued: QueuedMessage) -> (AgentMessage, MessageOrigin) {
+    (queued.message, MessageOrigin::Input(queued.id))
+}
+
 /// Declares tool-set changes to the model (pi `declareToolChanges`): the transcript's
 /// system messages must replay to exactly `context.tools`. The last pending system
-/// message gets the real delta; otherwise a new system message carrying it is inserted
-/// before the first non-system pending message.
+/// message gets the real delta; otherwise a new system message carrying it is inserted,
+/// with origin `Run`, before the first non-system pending message.
 fn declare_tool_changes(
     context: &AgentContext,
-    mut pending: Vec<AgentMessage>,
-) -> Vec<AgentMessage> {
+    mut pending: Vec<(AgentMessage, MessageOrigin)>,
+) -> Vec<(AgentMessage, MessageOrigin)> {
     let system_index = pending
         .iter()
-        .rposition(|message| matches!(message, AgentMessage::Llm(Message::System(_))));
+        .rposition(|(message, _)| matches!(message, AgentMessage::Llm(Message::System(_))));
     let offset = context.messages.len();
     let declared: Vec<Message> = context
         .messages
         .iter()
-        .chain(&pending)
+        .chain(pending.iter().map(|(message, _)| message))
         .enumerate()
         .filter_map(|(index, message)| match message {
             AgentMessage::Llm(Message::System(system)) => {
@@ -1074,7 +1124,7 @@ fn declare_tool_changes(
 
     match system_index {
         Some(index) => {
-            if let AgentMessage::Llm(Message::System(system)) = &mut pending[index] {
+            if let (AgentMessage::Llm(Message::System(system)), _) = &mut pending[index] {
                 system.tools_added = changes.tools_added;
                 system.tools_removed = changes.tools_removed;
             }
@@ -1083,7 +1133,7 @@ fn declare_tool_changes(
         None => {
             let at = pending
                 .iter()
-                .position(|message| !matches!(message, AgentMessage::Llm(Message::System(_))))
+                .position(|(message, _)| !matches!(message, AgentMessage::Llm(Message::System(_))))
                 .unwrap_or(pending.len());
             let update = SystemMessage {
                 content: Vec::new(),
@@ -1092,7 +1142,13 @@ fn declare_tool_changes(
                 tools_removed: changes.tools_removed,
                 timestamp: now_ms(),
             };
-            pending.insert(at, AgentMessage::Llm(Message::System(update)));
+            pending.insert(
+                at,
+                (
+                    AgentMessage::Llm(Message::System(update)),
+                    MessageOrigin::Run,
+                ),
+            );
         }
     }
     pending

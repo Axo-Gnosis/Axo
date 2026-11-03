@@ -185,7 +185,9 @@ So for Toph the env problem is small. It only matters when axo isn't started fro
 - #10 the 768 B per-line cap;
 - #11 ANSI/CR sanitizing.
 
-Keep pi's schema `{command, timeout?}`, no default timeout, stateless processes, error *results* for exit and timeout, and `PR_SET_PDEATHSIG` with a session-dir spool (already in core.md).
+Keep pi's schema `{command, timeout?}`, no default timeout, stateless processes, error *results* for exit and timeout, and a session-dir spool.
+
+**Supervision correction (2026-11-03):** the original recommendation here used `PR_SET_PDEATHSIG`. Actual axo instead has an external pipe-EOF process-group guard. Measured probes show that group escapes survive it, while PDEATHSIG can kill a child when its spawning Tokio blocking thread expires even though the host process remains alive. The running-handle, steering and durable-delivery seams below are still unbuilt, not capabilities supplied by the current follow-up queue. See [`track3-supervision.md`](track3-supervision.md) for the source discrepancies, measurements and lifecycle constraints.
 
 **Later:**
 

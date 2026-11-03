@@ -2,6 +2,7 @@
 
 pub mod devshell;
 pub mod host;
+pub mod supervisor;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

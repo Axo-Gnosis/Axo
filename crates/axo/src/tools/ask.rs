@@ -5,13 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use axo_agent::{Replay, Tool, ToolError, ToolOutput, ToolUpdate};
+use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
-use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 use crate::session::SessionEvent;
@@ -239,12 +238,8 @@ impl Tool for AskTool {
         Replay::Safe
     }
 
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let ToolContext { call, cancel, .. } = cx;
         let AskParams { questions } = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
 

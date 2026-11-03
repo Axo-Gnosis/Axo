@@ -306,6 +306,7 @@ async fn forked_parts_resubmit_with_their_copied_files() {
                 base,
                 message: AgentMessage::Llm(Message::User(_)),
                 submission_id: Some(_),
+                ..
             } => Some(base.id),
             _ => None,
         })

@@ -29,6 +29,20 @@ pub struct CustomMessage {
     pub timestamp: i64,
 }
 
+/// A message waiting to enter the transcript: a prompt or a steering/follow-up entry,
+/// with the host's id for it (reported back as [`MessageOrigin::Input`](crate::MessageOrigin::Input)).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedMessage {
+    pub message: AgentMessage,
+    pub id: Option<String>,
+}
+
+impl From<AgentMessage> for QueuedMessage {
+    fn from(message: AgentMessage) -> Self {
+        Self { message, id: None }
+    }
+}
+
 /// A resumable assistant message, its unanswered calls and its trailing results.
 pub struct Unanswered<'a> {
     pub message: &'a AssistantMessage,

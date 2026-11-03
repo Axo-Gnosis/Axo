@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axo_ai::{AssistantEvent, JsonMap, ToolResultMessage};
 
 use crate::message::AgentMessage;
-use crate::tool::{ToolOutput, ToolUpdate};
+use crate::tool::{ToolInvocationId, ToolOutput, ToolUpdate};
 
 /// One event of a run. Each goes first to [`Persist`] (awaited, may mutate it), then to
 /// the broadcast subscribers.
@@ -33,6 +33,7 @@ pub enum AgentEvent {
     /// The finished message; persistence may adjust it before the loop uses it.
     MessageEnd {
         message: AgentMessage,
+        origin: MessageOrigin,
     },
     ToolExecutionStart {
         call_id: String,
@@ -50,6 +51,17 @@ pub enum AgentEvent {
         result: ToolOutput,
         is_error: bool,
     },
+}
+
+/// Where a finished message came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageOrigin {
+    /// Produced by the run: assistant replies, declarations, hook messages, synthetic tool results.
+    Run,
+    /// A prompted or queued input, with the id it was queued under.
+    Input(Option<String>),
+    /// The result returned by executing a tool with this invocation.
+    Tool(ToolInvocationId),
 }
 
 /// The ordered, awaited event subscriber. The session saves each finished message here

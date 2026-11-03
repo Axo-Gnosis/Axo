@@ -19,6 +19,8 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 | [`compaction.md`](compaction.md) | When agents compact, how much reply headroom they reserve, and what they keep verbatim; provider limits and context-rot evidence |
 | [`compaction-methods.md`](compaction-methods.md) | How pi, omp, Claude Code, Codex, the Anthropic and OpenAI APIs and others actually compact; prompts, carried state, failure lessons, evaluation, ideas for axo |
 
+**2026-11-03 follow-up:** [`track3-supervision.md`](track3-supervision.md) checks Track 3 against actual axo/omp code, session traces, kernel contracts and isolated process-failure probes. It supersedes the older shell study's supervision assumptions; its decisions are implemented; see Track 3 in [plan.md](../plan.md).
+
 ## Why a new core
 
 Axome needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:

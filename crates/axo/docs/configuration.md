@@ -1,6 +1,6 @@
 # Configuration & Directories
 
-`axo` loads configuration from the user directory (`~/.axo/`, overridden by `AXO_DIR`) and, when permitted by the user's project access settings, the project directory (`<cwd>/.axo/`) and `.agents/`. Hosts embedding `axo` in Rust can also pass `Settings`, `Models`, `Streamer`, and `SessionStore` directly via `Axo::builder()` without reading config files.
+`axo` loads configuration from the user directory (`~/.axo/`, overridden by `AXO_DIR`) and, when permitted by the user's project access settings, the project directory (`<cwd>/.axo/`) and `.agents/`. Hosts embedding `axo` in Rust can also pass `Settings`, `Models`, `Streamer`, and `SessionStore` directly via `Axo::builder()` without reading config files. Command supervision (`Supervision`) is host-only: it has no settings key and is set only through `AxoBuilder::supervision` (see [Command supervision](#command-supervision-axosupervision)).
 
 ## Directory Layout
 
@@ -124,6 +124,58 @@ A Rust host can override the resolved access level per session via `SessionOptio
 
 In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment via `nix print-dev-env --json` with a GC root under `<AXO_DIR>/cache/devshell/<sha256>/`, and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and append a capture failure notice to the tool result once.
 
+Every subprocess `DevShellEnv` runs (`direnv export json`, `git ls-files`, `nix print-dev-env`, and the capture `bash` that sources the dev-shell script) goes through the session's `ProcessSupervisor` in its own container (a process group or, in cgroup mode, a job cgroup), as an internal foreground capture: it is never a background job, never promotable, and never listed under `proc://`. `devShellTimeoutMs` kills the whole container, not just the direct child, and the capture `bash` container is killed as soon as the environment dump is read, so services or traps started by `shellHook` die with it. A supervision failure (cgroup mode without a usable root or a supervisor that does not report ready) is handled like any other capture failure: resolution falls back to the host environment (with the capture failure notice in `Nix` mode). Environment resolution always finishes before the `bash` tool starts its command, so the background-promotion timer and steer promotion only begin once the command runs; `Session::abort` still cancels a capture in progress.
+
+### Command supervision (`axo::Supervision`)
+
+Every local command, `bash` tool calls and dev-shell capture alike, runs in its own container through the session's `ProcessSupervisor`. The host picks the container kind with the `Supervision` enum; there are two modes and no third: no PID namespaces, no `unsafe` or in-process fork path, and no silent downgrade from one mode to the other.
+
+`Supervision` is host configuration, not a settings key; project or user `settings.jsonc` cannot change it. Hosts pass it to `AxoBuilder::supervision`; without one, `Supervision::default()` (`ProcessGroup`) applies:
+
+| Variant | Fields | Meaning and limits |
+| :--- | :--- | :--- |
+| `ProcessGroup` (default) | none | Each command leads its own process group. Stopping, timing out, or dropping it signals the group (SIGTERM, up to 1 s, then SIGKILL), and a best-effort `sh` guard kills the group if the host process dies. Needs no helper executable, no delegation, and no privileges. Descendants that leave the group (`setsid`, double fork) are not tracked: they survive the job and are not listed under `proc://` |
+| `Cgroup { program, args, cgroup_root }` | `program: PathBuf`, `args: Vec<OsString>`, `cgroup_root: Option<PathBuf>` | Each command gets its own cgroup v2 job directory, so every descendant, detached or not, stays contained and killable. axo runs the host-provided supervisor command `program args… guard <dir>` and `program args… enter <dir> <command…>`; the host must route those arguments to `axo::exec::supervisor::run`. A bare `program` name is resolved on axo's own `PATH` at spawn. `cgroup_root` is an existing delegated cgroup v2 directory under which job cgroups are created; `None` uses axo's own cgroup, read from the `0::` line of `/proc/self/cgroup` under `/sys/fs/cgroup`. Fails closed when unavailable |
+
+No supervisor binary is distributed: the supervisor is the host's own executable (or any executable the host controls) with a routing prefix of the host's choosing. The route must be the first thing `main` does, synchronously, before any runtime, threads, or host setup:
+
+```rust,no_run
+use std::ffi::{OsStr, OsString};
+use std::process::ExitCode;
+
+use axo::{Axo, Supervision};
+
+const SUPERVISOR_ROUTE: &str = "__axo-supervisor";
+
+fn main() -> ExitCode {
+    // axo spawned this process as a guard or entry: hand over before anything else.
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(SUPERVISOR_ROUTE)) {
+        return axo::exec::supervisor::run(std::env::args_os().skip(2));
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let supervision = Supervision::Cgroup {
+            program: std::env::current_exe().expect("current executable"),
+            args: vec![OsString::from(SUPERVISOR_ROUTE)],
+            cgroup_root: None,
+        };
+        let _axo = Axo::builder().supervision(supervision).build().await.expect("axo");
+        // ... run sessions ...
+    });
+    ExitCode::SUCCESS
+}
+```
+
+Hosts that keep the default need no routing at all: `Axo::builder().build().await?` runs commands in process groups.
+
+- **Delegated cgroup (cgroup mode only):** the root must be a cgroup v2 directory the axo process can create subdirectories in, with `cgroup.kill` available (Linux 5.14+). Under systemd that means running the host in a unit or scope with `Delegate=yes` (for example `systemd-run --user --scope -p Delegate=yes …`), or creating a delegated subtree and passing it as `cgroup_root`. Systemd only provides the delegation; axo never calls systemd at runtime and needs no systemd API.
+- **When it is checked:** `Axo::build` never fails for supervision reasons. In cgroup mode, the first command probes the root by creating and removing `axo-probe-<uuidv7>` and checking for `cgroup.kill`; the result, success or failure, is cached for the lifetime of that `Axo`. Process-group mode has nothing to probe.
+- **Cgroup root:** whether explicit (`cgroup_root`) or derived from `/proc/self/cgroup`, the root is canonicalized (symlinks resolved) before the probe and must lie under `/sys/fs/cgroup`; one that does not fails with the reason `it is not inside the cgroup v2 hierarchy at /sys/fs/cgroup`.
+- **Failures (cgroup mode only):** an unusable root reports `Command supervision unavailable: cannot create a job cgroup under {root}: {err}. Run the host in a delegated cgroup (systemd: Delegate=yes), set cgroup_root in Supervision::Cgroup, or use Supervision::ProcessGroup.` (with `{err}` the OS error, or the hierarchy reason above); a supervisor that cannot start reports `Command supervisor {program} failed to start: {err}`; one that starts but was not routed reports `Command supervisor {program} did not report ready; the host must route these arguments to axo::exec::supervisor::run`. The `bash` tool returns the message as its error and runs nothing; dev-shell resolution falls back as described above. axo never switches to process groups on its own.
+- **Per command, process-group mode:** the command starts with `process_group(0)`, so its pgid is its pid. The guard is `sh -c 'read _; kill -KILL -- -"$0"' <pgid>` holding a pipe from axo, started in its own process group as well: if axo dies, the pipe closes and the guard kills the group; when the job closes normally axo kills the guard first. The guard is best effort (if `sh` cannot start, a warning is logged and the command still runs), and losing the guard never kills the job. Because neither the command nor the guard shares the host's foreground process group, a Ctrl-C or SIGTSTP at the host's terminal reaches no job and no watcher.
+- **Per command, cgroup mode:** each command gets `<root>/axo-job-<uuidv7>`. A `guard` process stays in axo's own cgroup and watches axo through a pidfd while axo watches it; whichever survives the other writes `cgroup.kill` and removes the directory, so detached (`setsid`, double-forked, `nohup`) descendants never outlive both. Only the simultaneous death of axo and the guardian leaves a job behind. The command itself starts as `enter`, which joins the job cgroup, verifies the move, and then `exec`s the program. The guardian and the `enter` root each start in their own process group (`process_group(0)`), like the command in process-group mode, so terminal signals aimed at the host reach neither. The supervisor process inherits the host's own (trusted) launch environment, which a wrapped host executable may need to start at all; the command environment travels over `enter`'s stdin and is applied only after cgroup entry, at `exec`, so nothing in the job environment (such as `LD_PRELOAD`) runs before the process is inside its cgroup. `enter` exits 125 when it cannot join the cgroup, 127 when the program is not found, and 126 for other `exec` failures.
+- **Descendants:** a `bash` result returns when the root shell exits plus a fixed 100 ms output drain. Descendants still in the container stay supervised, drained to the command's artifact, and inspectable and killable through `proc://` (see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)). In process-group mode that covers in-group descendants only; `setsid` escapees need cgroup mode. When the host is PID 1 or a child subreaper, a job's leftover processes are reparented to it; axo reaps those zombies itself (a non-blocking `waitpgid` on the job's group) so the container empties and the job can close instead of hanging on them.
+
 ### Question tool (`ask` / `axo::AskSettings`)
 
 | Key | Rust field | Default | Meaning |
@@ -179,7 +231,7 @@ In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `fla
 - **Credentials (`auth.json` and environment):** `Models` resolves credentials in order:
   1. `ProviderConfig::api_key` in `models.jsonc` (a [config value](#config-values): `!command`, `$ENV`, or literal).
   2. Stored credentials in `<AXO_DIR>/auth.json` (`Credential::ApiKey` or `Credential::OAuth`, refreshed under a per-provider lock and persisted with mode `0600`).
-  3. Provider environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `DEEPSEEK_API_KEY`, `CEREBRAS_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `PERPLEXITY_API_KEY`, `COHERE_API_KEY`).
+  3. The provider's `env` variable names from the models.dev catalog (for example `$ANTHROPIC_API_KEY`).
 
 ## Config values
 

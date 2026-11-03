@@ -9,6 +9,7 @@ pub mod context;
 pub mod error;
 pub mod exec;
 mod input;
+pub mod jobs;
 pub mod recovery;
 pub mod schemes;
 pub mod session;
@@ -24,6 +25,7 @@ pub use config::{
 pub use context::Diagnostic;
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
+pub use exec::host::{OutputError, ProcessSupervisor, Supervision};
 pub use exec::{EnvMap, ExecEnv, HostEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
@@ -33,3 +35,24 @@ pub use session::{
 };
 pub use tools::ask::{Answer, AskOutcome, PendingQuestions, Question, QuestionOption};
 pub use tools::{SessionTools, ToolFactory};
+
+#[cfg(doctest)]
+mod markdown_doctests {
+    #[doc = include_str!("../../../README.md")]
+    mod readme {}
+
+    #[doc = include_str!("../docs/README.md")]
+    mod docs_readme {}
+
+    #[doc = include_str!("../docs/configuration.md")]
+    mod configuration {}
+
+    #[doc = include_str!("../docs/prompts-and-context.md")]
+    mod prompts_and_context {}
+
+    #[doc = include_str!("../docs/sessions-and-compaction.md")]
+    mod sessions_and_compaction {}
+
+    #[doc = include_str!("../docs/extending.md")]
+    mod extending {}
+}

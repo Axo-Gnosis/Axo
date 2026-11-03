@@ -3,12 +3,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_agent::{Tool, ToolError, ToolOutput, ToolUpdate};
-use axo_ai::{ToolCall, UserBlock};
+use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
+use axo_ai::UserBlock;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::tools::files::{
@@ -98,12 +97,8 @@ impl Tool for EditTool {
         GUIDELINES
     }
 
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let ToolContext { call, cancel, .. } = cx;
         let EditArgs { path, edits } =
             serde_json::from_value(Value::Object(call.arguments.clone()))
                 .map_err(|error| ToolError(error.to_string()))?;

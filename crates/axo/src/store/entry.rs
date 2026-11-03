@@ -136,13 +136,20 @@ impl EntryBase {
     rename_all_fields = "camelCase"
 )]
 pub enum Entry {
-    /// A finished message. `submission_id` names the submission it came from.
+    /// A finished message. `submission_id` names the submission it came from;
+    /// `admitted_jobs` and `delivered_jobs` are background-job receipts.
     Message {
         #[serde(flatten)]
         base: EntryBase,
         message: AgentMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submission_id: Option<String>,
+        /// Jobs this message's tool result made deliverable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admitted_jobs: Vec<String>,
+        /// Jobs whose results this message delivered.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delivered_jobs: Vec<String>,
     },
     ThinkingLevelChange {
         #[serde(flatten)]
@@ -277,6 +284,24 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
+    /// A command promoted to a background job; never in context.
+    JobStart {
+        #[serde(flatten)]
+        base: EntryBase,
+        session_id: String,
+        job_id: String,
+        call_id: String,
+        command: String,
+        artifact: u64,
+    },
+    /// A background job's result; never in context.
+    JobEnd {
+        #[serde(flatten)]
+        base: EntryBase,
+        job_id: String,
+        text: String,
+        is_error: bool,
+    },
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -300,7 +325,9 @@ impl Entry {
             | Entry::RunStart { base, .. }
             | Entry::RunEnd { base, .. }
             | Entry::RunResumed { base, .. }
-            | Entry::Submission { base, .. } => Some(base),
+            | Entry::Submission { base, .. }
+            | Entry::JobStart { base, .. }
+            | Entry::JobEnd { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
     }

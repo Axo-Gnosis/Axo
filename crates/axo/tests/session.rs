@@ -267,6 +267,8 @@ async fn navigation_history(
                 base: EntryBase::new(EntryId(id.into()), Some(parent)),
                 message,
                 submission_id: None,
+                admitted_jobs: Vec::new(),
+                delivered_jobs: Vec::new(),
             })
             .await
             .unwrap();

@@ -2,8 +2,10 @@
 
 pub mod artifact;
 pub mod dir;
+pub mod proc;
 pub mod skill;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -77,7 +79,7 @@ pub trait Scheme: Send + Sync {
     }
 
     /// Called only for [`Target::Virtual`]. `content` is the write tool's required
-    /// content; action writes (such as a future `proc://bg_1/kill`) receive `""`.
+    /// content; action writes (such as `proc://bg_1/kill`) receive `""`.
     /// Returns the tool result text.
     async fn write(
         &self,
@@ -284,15 +286,21 @@ pub(crate) fn join_contained(
     Ok(joined)
 }
 
-/// Copies a session's side files into its fork. Artifacts are made read-only and hard-linked
-/// (copy fallback); scratch files are copied under the per-file lock `write`/`edit` hold,
-/// so a concurrent tool write is never copied half-done. Best effort: an entry that cannot be
-/// carried over is logged and skipped, so one bad file never costs the fork the rest.
-pub(crate) async fn copy_for_fork(parent_dir: &Path, child_dir: &Path) {
+/// Copies a session's side files into its fork. Finished artifacts are made read-only and
+/// hard-linked (copy fallback); `live` spools, still being written by running jobs, are
+/// copied as a snapshot and only the copy is made read-only. Scratch files are copied under
+/// the per-file lock `write`/`edit` hold, so a concurrent tool write is never copied half-done.
+/// Best effort: an entry that cannot be carried over is logged and skipped, so one bad file
+/// never costs the fork the rest.
+pub(crate) async fn copy_for_fork(parent_dir: &Path, child_dir: &Path, live: HashSet<PathBuf>) {
     let parent = parent_dir.to_path_buf();
     let child = child_dir.to_path_buf();
     let files = tokio::task::spawn_blocking(move || {
-        link_artifacts(&parent.join(ARTIFACTS_DIR), &child.join(ARTIFACTS_DIR));
+        link_artifacts(
+            &parent.join(ARTIFACTS_DIR),
+            &child.join(ARTIFACTS_DIR),
+            &live,
+        );
         let mut files = Vec::new();
         list_local(
             &parent.join(LOCAL_DIR),
@@ -330,7 +338,7 @@ fn skip(path: &Path, error: &io::Error) {
     }
 }
 
-fn link_artifacts(source: &Path, destination: &Path) {
+fn link_artifacts(source: &Path, destination: &Path, live: &HashSet<PathBuf>) {
     let entries = match fs::read_dir(source) {
         Ok(entries) => entries,
         Err(error) => return skip(source, &error),
@@ -357,6 +365,21 @@ fn link_artifacts(source: &Path, destination: &Path) {
         if !metadata.is_file() {
             continue;
         }
+        let target = destination.join(entry.file_name());
+        if live.contains(&path) {
+            // A running job still writes here: snapshot it, and never chmod the job's spool.
+            match fs::copy(&path, &target) {
+                Ok(_) => {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_readonly(true);
+                    if let Err(error) = fs::set_permissions(&target, permissions) {
+                        skip(&target, &error);
+                    }
+                }
+                Err(error) => skip(&path, &error),
+            }
+            continue;
+        }
         let mut permissions = metadata.permissions();
         permissions.set_readonly(true);
         // A file we could not make read-only is copied, never linked: a writable shared inode
@@ -367,7 +390,6 @@ fn link_artifacts(source: &Path, destination: &Path) {
             Err(_) => false,
         };
         // ponytail: root ignores 0o444; bash_urls still refuses output redirects onto artifacts
-        let target = destination.join(entry.file_name());
         if !(shareable && fs::hard_link(&path, &target).is_ok())
             && let Err(error) = fs::copy(&path, &target)
         {
@@ -609,22 +631,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn fork_copy_skips_unreadable_files_and_keeps_the_rest() {
-        use std::os::unix::fs::PermissionsExt;
+    async fn fork_copy_skips_unreadable_files_snapshots_live_spools_and_keeps_the_rest() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let parent = tempfile::tempdir().unwrap();
         let child = tempfile::tempdir().unwrap();
         fs::create_dir_all(parent.path().join("artifacts")).unwrap();
         fs::create_dir_all(parent.path().join("local")).unwrap();
-        fs::write(parent.path().join("artifacts/0.bash.x.log"), "out").unwrap();
+        let finished = parent.path().join("artifacts/0.bash.x.log");
+        fs::write(&finished, "out").unwrap();
+        let live = parent.path().join("artifacts/1.bash.y.log");
+        fs::write(&live, "partial").unwrap();
         let unreadable = parent.path().join("local/a.md");
         fs::write(&unreadable, "a").unwrap();
         fs::write(parent.path().join("local/b.md"), "b").unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read(&unreadable).is_err() {
-            copy_for_fork(parent.path(), child.path()).await;
-            assert!(child.path().join("artifacts/0.bash.x.log").exists());
-            assert!(child.path().join("local/b.md").exists());
+        // Root reads mode 0o000 files, so the skip assertion only holds unprivileged.
+        let enforced = fs::read(&unreadable).is_err();
+        copy_for_fork(parent.path(), child.path(), HashSet::from([live.clone()])).await;
+
+        let ino = |path: &Path| fs::metadata(path).unwrap().ino();
+        assert_eq!(
+            ino(&finished),
+            ino(&child.path().join("artifacts/0.bash.x.log"))
+        );
+        let snapshot = child.path().join("artifacts/1.bash.y.log");
+        assert_ne!(ino(&live), ino(&snapshot));
+        assert_eq!(fs::read_to_string(&snapshot).unwrap(), "partial");
+        assert!(fs::metadata(&snapshot).unwrap().permissions().readonly());
+        assert!(!fs::metadata(&live).unwrap().permissions().readonly());
+        assert!(child.path().join("local/b.md").exists());
+        if enforced {
             assert!(!child.path().join("local/a.md").exists());
         }
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();

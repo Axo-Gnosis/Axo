@@ -2,6 +2,7 @@
 //! run's cancellation and the event fan-out around the loop in [`crate::run`].
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axo_ai::{
@@ -9,14 +10,14 @@ use axo_ai::{
     ToolResultMessage,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::cancel::CancelReason;
 use crate::error::Error;
 use crate::event::{AgentEvent, Persist};
 use crate::hooks::{LoopHooks, NoHooks};
-use crate::message::AgentMessage;
+use crate::message::{AgentMessage, QueuedMessage};
 use crate::run::{self, RunStart};
 use crate::tool::{ExecutionMode, Tool};
 
@@ -96,6 +97,10 @@ pub struct Agent {
     pub(crate) session_id: Option<String>,
     pub(crate) events: broadcast::Sender<AgentEvent>,
     pub(crate) state: Mutex<State>,
+    /// True while `state.steering` is non-empty; written under the state lock.
+    pub(crate) steer_pending: watch::Sender<bool>,
+    /// The next [`ToolInvocationId`](crate::ToolInvocationId).
+    pub(crate) next_invocation: AtomicU64,
 }
 
 /// Mutable agent state. The lock is never held across an `.await`.
@@ -104,8 +109,8 @@ pub(crate) struct State {
     pub(crate) model: Model,
     pub(crate) thinking: ThinkingLevel,
     pub(crate) tools: Vec<Arc<dyn Tool>>,
-    pub(crate) steering: VecDeque<AgentMessage>,
-    pub(crate) follow_up: VecDeque<AgentMessage>,
+    pub(crate) steering: VecDeque<QueuedMessage>,
+    pub(crate) follow_up: VecDeque<QueuedMessage>,
     /// The active run, if any.
     pub(crate) run: Option<ActiveRun>,
     /// The assistant message being streamed.
@@ -158,6 +163,8 @@ impl Agent {
                 pending_tool_calls: Vec::new(),
                 shut_down: false,
             }),
+            steer_pending: watch::channel(false).0,
+            next_invocation: AtomicU64::new(0),
         }
     }
 
@@ -188,7 +195,7 @@ impl Agent {
     }
 
     /// Starts a run with these messages. Returns when the run settles.
-    pub async fn prompt(&self, messages: Vec<AgentMessage>) -> Result<RunOutcome, Error> {
+    pub async fn prompt(&self, messages: Vec<QueuedMessage>) -> Result<RunOutcome, Error> {
         let cancel = Self::begin_run(&mut self.lock())?;
         let _guard = RunGuard(self);
         run::run_loop(self, RunStart::Prompt(messages), cancel).await
@@ -249,13 +256,16 @@ impl Agent {
         .await
     }
 
-    /// Queues a message injected after the current turn's tool calls finish.
-    pub fn steer(&self, m: AgentMessage) {
-        self.lock().steering.push_back(m);
+    /// Queues a message injected after the current turn's tool calls finish, and raises
+    /// the steer signal tools see until the queue is drained.
+    pub fn steer(&self, m: QueuedMessage) {
+        let mut state = self.lock();
+        state.steering.push_back(m);
+        self.steer_pending.send_replace(true);
     }
 
     /// Queues a message processed only when the run would otherwise end.
-    pub fn follow_up(&self, m: AgentMessage) {
+    pub fn follow_up(&self, m: QueuedMessage) {
         self.lock().follow_up.push_back(m);
     }
 
@@ -313,8 +323,8 @@ impl Agent {
             running: state.run.is_some(),
             streaming: state.streaming.as_ref().and_then(Accumulator::snapshot),
             pending_tool_calls: state.pending_tool_calls.clone(),
-            queued_steering: state.steering.iter().cloned().collect(),
-            queued_follow_up: state.follow_up.iter().cloned().collect(),
+            queued_steering: state.steering.iter().map(|m| m.message.clone()).collect(),
+            queued_follow_up: state.follow_up.iter().map(|m| m.message.clone()).collect(),
         }
     }
 }

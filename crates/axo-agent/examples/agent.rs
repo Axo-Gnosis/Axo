@@ -9,14 +9,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_agent::{
-    Agent, AgentConfig, AgentEvent, AgentMessage, Tool, ToolError, ToolOutput, ToolUpdate,
+    Agent, AgentConfig, AgentEvent, AgentMessage, Tool, ToolContext, ToolError, ToolOutput,
 };
 use axo_ai::{
     AssistantBlock, AssistantEvent, FileCredentialStore, JsonMap, Message, Models, ModelsConfig,
-    ModelsOptions, ThinkingLevel, ToolCall, UserBlock, UserMessage, now_ms,
+    ModelsOptions, ThinkingLevel, UserBlock, UserMessage, now_ms,
 };
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 /// A tool backed by a plain function of its arguments.
@@ -41,15 +40,10 @@ impl Tool for FnTool {
         &self.parameters
     }
 
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        _cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             content: vec![UserBlock::Text {
-                text: (self.run)(&call.arguments).to_string(),
+                text: (self.run)(&cx.call.arguments).to_string(),
             }],
             details: None,
             is_error: false,
@@ -167,12 +161,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let outcome = agent
-        .prompt(vec![AgentMessage::Llm(Message::User(UserMessage {
-            content: vec![UserBlock::Text {
-                text: prompt.join(" "),
-            }],
-            timestamp: now_ms(),
-        }))])
+        .prompt(vec![
+            AgentMessage::Llm(Message::User(UserMessage {
+                content: vec![UserBlock::Text {
+                    text: prompt.join(" "),
+                }],
+                timestamp: now_ms(),
+            }))
+            .into(),
+        ])
         .await?;
     printer.await?;
     println!("[run] {outcome:?}");

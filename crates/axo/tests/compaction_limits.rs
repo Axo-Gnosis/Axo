@@ -48,6 +48,8 @@ async fn history(dir: &Path) -> std::path::PathBuf {
                 timestamp: 0,
             })),
             submission_id: None,
+            admitted_jobs: Vec::new(),
+            delivered_jobs: Vec::new(),
         })
         .await
         .unwrap();

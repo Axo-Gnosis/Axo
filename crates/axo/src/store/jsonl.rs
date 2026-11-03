@@ -41,7 +41,7 @@ fn io_error(path: &Path, source: io::Error) -> Error {
     }
 }
 
-/// Takes the single-writer lock, held for as long as `file` stays open.
+/// Takes the single-writer lock on `file`.
 fn lock(file: &File, path: &Path) -> Result<(), Error> {
     match file.try_lock() {
         Ok(()) => Ok(()),
@@ -49,6 +49,15 @@ fn lock(file: &File, path: &Path) -> Result<(), Error> {
             path: path.to_path_buf(),
         }),
         Err(TryLockError::Error(err)) => Err(io_error(path, err)),
+    }
+}
+
+/// Owns the advisory lock until the last local `Arc` owner is dropped.
+struct LockedFile(File);
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -150,6 +159,7 @@ impl SessionStore for JsonlStore {
                 .open(&path)
                 .map_err(|err| io_error(&path, err))?;
             lock(&file, &path)?;
+            let file = LockedFile(file);
             let bytes = fs::read(&path).map_err(|err| io_error(&path, err))?;
             // Parse before touching the file so an invalid header changes nothing.
             let (header, entries, mut next_seq) = parse(&path, &bytes)?;
@@ -159,14 +169,15 @@ impl SessionStore for JsonlStore {
                     .rposition(|&byte| byte == b'\n')
                     .map_or(0, |at| at + 1);
                 if serde_json::from_slice::<Value>(&bytes[start..]).is_ok() {
-                    (&file)
+                    (&file.0)
                         .write_all(b"\n")
                         .map_err(|err| io_error(&path, err))?;
                 } else {
                     // A torn final line from a crash mid-write (never the header,
                     // which parsed): drop it so the next append starts on a clean line.
                     tracing::warn!(path = %path.display(), "truncating torn final session line");
-                    file.set_len(start as u64)
+                    file.0
+                        .set_len(start as u64)
                         .map_err(|err| io_error(&path, err))?;
                     next_seq -= 1;
                 }
@@ -250,23 +261,25 @@ impl SessionStore for JsonlStore {
 struct JsonlWriter {
     path: PathBuf,
     /// The open, locked file; `None` while the session is still lazy.
-    file: Option<Arc<File>>,
+    file: Option<Arc<LockedFile>>,
     pending: Vec<u8>,
     next_seq: u64,
 }
 
 /// Creates and locks the session file at `path` and writes `pending`, everything buffered so far.
-fn create_locked(path: &Path, pending: &[u8]) -> Result<File, Error> {
+fn create_locked(path: &Path, pending: &[u8]) -> Result<LockedFile, Error> {
     let dir = path.parent().expect("session path has a directory");
     fs::create_dir_all(dir).map_err(|err| io_error(dir, err))?;
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .append(true)
         .create_new(true)
         .open(path)
         .map_err(|err| io_error(path, err))?;
     lock(&file, path)?;
-    file.write_all(pending)
-        .and_then(|()| file.flush())
+    let mut file = LockedFile(file);
+    file.0
+        .write_all(pending)
+        .and_then(|()| file.0.flush())
         .map_err(|err| io_error(path, err))?;
     Ok(file)
 }
@@ -308,15 +321,26 @@ impl SessionWriter for JsonlWriter {
                 file
             }
         };
-        let sync = matches!(entry, Entry::RunStart { .. } | Entry::RunEnd { .. });
+        let sync = match &entry {
+            Entry::RunStart { .. }
+            | Entry::RunEnd { .. }
+            | Entry::JobStart { .. }
+            | Entry::JobEnd { .. } => true,
+            Entry::Message {
+                admitted_jobs,
+                delivered_jobs,
+                ..
+            } => !admitted_jobs.is_empty() || !delivered_jobs.is_empty(),
+            _ => false,
+        };
         blocking(&self.path, move || {
-            let mut writer = &*file;
+            let mut writer = &file.0;
             writer
                 .write_all(&line)
                 .and_then(|()| writer.flush())
                 .map_err(|err| io_error(&path, err))?;
             if sync {
-                file.sync_data().map_err(|err| io_error(&path, err))?;
+                file.0.sync_data().map_err(|err| io_error(&path, err))?;
             }
             Ok(())
         })
@@ -331,5 +355,41 @@ impl SessionWriter for JsonlWriter {
 
     fn planned_path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_waits_for_last_local_owner_and_unlocks_shared_ofd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let locked = Arc::new(create_locked(&path, b"").unwrap());
+        // A fork-inherited descriptor shares the open file description but not the Arc.
+        let inherited = locked.0.try_clone().unwrap();
+        // A blocking append can retain this Arc after its async caller is cancelled.
+        let cancelled_append = locked.clone();
+        drop(locked);
+
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+
+        drop(cancelled_append);
+        let next_writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(next_writer.try_lock().is_ok());
+        drop(inherited);
     }
 }

@@ -4,11 +4,10 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_agent::{Replay, Tool, ToolError, ToolOutput, ToolUpdate};
+use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
 use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, fs_error, process_image};
 use crate::tools::truncate::{
@@ -75,12 +74,8 @@ impl Tool for ReadTool {
         GUIDELINES
     }
 
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let ToolContext { call, cancel, .. } = cx;
         let ReadArgs {
             path,
             offset,

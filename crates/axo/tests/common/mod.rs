@@ -6,8 +6,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axo::store::{Entry, SeqEntry};
 use axo::{Axo, ProjectAccess, SessionOptions, Settings, StaticEnv};
-use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn};
+use axo_agent::AgentMessage;
+use axo_ai::{
+    FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn,
+    UserBlock,
+};
 use serde_json::json;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,6 +78,56 @@ pub fn options(dir: &Path) -> SessionOptions {
         project_access: Some(ProjectAccess::Ignore),
         exec_env: Some(Arc::new(StaticEnv(Arc::new(BTreeMap::new())))),
         ..SessionOptions::default()
+    }
+}
+
+/// [`options`] with the real Nix-provided bash on `PATH`, keeping the isolated fixture
+/// environment otherwise.
+pub fn bash_options(dir: &Path) -> SessionOptions {
+    let mut options = options(dir);
+    options.exec_env = Some(Arc::new(StaticEnv(Arc::new(
+        [(
+            "PATH".into(),
+            std::env::var_os("PATH").expect("test process needs PATH"),
+        )]
+        .into_iter()
+        .collect(),
+    ))));
+    options
+}
+
+/// The text of the successful tool result for `call_id`.
+pub fn tool_text(entries: &[SeqEntry], call_id: &str) -> String {
+    let result = entries
+        .iter()
+        .find_map(|seq| match &seq.entry {
+            Entry::Message {
+                message: AgentMessage::Llm(Message::ToolResult(result)),
+                ..
+            } if result.tool_call_id == call_id => Some(result),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing result for {call_id}"));
+    assert!(!result.is_error, "{call_id}: {:?}", result.content);
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            UserBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Gone or a zombie awaiting its reaper.
+pub fn dead(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        // The state follows the parenthesized command name, which may itself hold ")".
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
     }
 }
 

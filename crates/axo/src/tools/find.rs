@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_agent::{Replay, Tool, ToolError, ToolOutput, ToolUpdate};
+use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
 use globset::GlobBuilder;
 use ignore::WalkBuilder;
@@ -70,12 +70,8 @@ impl Tool for FindTool {
         Replay::Safe
     }
 
-    async fn execute(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        _updates: &(dyn Fn(ToolUpdate) + Send + Sync),
-    ) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let ToolContext { call, cancel, .. } = cx;
         let args: FindArgs = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
         if cancel.is_cancelled() {
