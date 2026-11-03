@@ -148,6 +148,23 @@ impl Schemes {
         self.entries.iter().find(|entry| entry.name() == name)
     }
 
+    fn handler(&self, url: &SchemeUrl) -> Result<&Arc<dyn Scheme>, ToolError> {
+        self.get(&url.scheme)
+            .ok_or_else(|| self.unknown(&url.scheme))
+    }
+
+    fn unknown(&self, scheme: &str) -> ToolError {
+        let supported = self
+            .entries
+            .iter()
+            .map(|entry| format!("{}://", entry.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ToolError(format!(
+            "Unknown scheme: {scheme}://. Supported: {supported}"
+        ))
+    }
+
     /// Non-empty scheme documentation in registration order.
     pub fn prompt_docs(&self) -> Vec<String> {
         self.entries
@@ -172,15 +189,7 @@ impl Schemes {
                     path: captures[2].to_owned(),
                 }));
             }
-            let supported = self
-                .entries
-                .iter()
-                .map(|entry| format!("{}://", entry.name()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ToolError(format!(
-                "Unknown scheme: {scheme}://. Supported: {supported}"
-            )));
+            return Err(self.unknown(&scheme));
         }
         if let Some(captures) = SINGLE_SLASH.captures(input) {
             let scheme = captures[1].to_ascii_lowercase();
@@ -213,6 +222,22 @@ impl Schemes {
             scheme,
             path: captures[2].to_owned(),
         })
+    }
+
+    /// Resolves a URL from `parse` or `exact` against this session. Hosts showing URLs
+    /// (links, tool paths) use `exact` to recognize them, then this.
+    pub async fn resolve(&self, url: &SchemeUrl) -> Result<Target, ToolError> {
+        self.handler(url)?.resolve(url, &self.context).await
+    }
+
+    /// Reads a URL that resolved to [`Target::Virtual`].
+    pub async fn read(&self, url: &SchemeUrl) -> Result<String, ToolError> {
+        self.handler(url)?.read(url, &self.context).await
+    }
+
+    /// Writes a URL that resolved to [`Target::Virtual`], returning the handler's result text.
+    pub async fn write(&self, url: &SchemeUrl, content: &str) -> Result<String, ToolError> {
+        self.handler(url)?.write(url, content, &self.context).await
     }
 }
 

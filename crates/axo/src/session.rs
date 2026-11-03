@@ -2100,6 +2100,12 @@ impl Session {
         &self.skills
     }
 
+    /// This session's URL schemes, for hosts resolving URLs they display: recognize with
+    /// `exact`, then `resolve`, and `read` a `Target::Virtual`. A fork resolves to its own files.
+    pub fn schemes(&self) -> &Schemes {
+        &self.tool_state.schemes
+    }
+
     /// Expands a `/skill args` invocation, saves the submission, then runs the prompt;
     /// returns when the run settles. `Error::Busy` while a run is active (use
     /// `steer`/`follow_up`).

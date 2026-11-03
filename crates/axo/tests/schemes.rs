@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use axo::store::{Entry, EntryId, SeqEntry};
 use axo::tools::Located;
-use axo::{SessionOptions, SessionTools, StaticEnv, ToolFactory};
+use axo::{SchemeUrl, SessionOptions, SessionTools, StaticEnv, Target, ToolFactory};
 use axo_agent::{AgentMessage, RunOutcome, Tool, ToolError, ToolOutput, ToolUpdate};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ToolCall, UserBlock};
@@ -243,6 +243,37 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
     assert_eq!(parent_metadata.dev(), fork_metadata.dev());
     assert_eq!(parent_metadata.ino(), fork_metadata.ino());
     assert!(parent_metadata.permissions().readonly());
+    // Hosts resolve through each session's registry: one URL, one file per session.
+    let url = fork
+        .schemes()
+        .exact(&artifact_url)
+        .expect("artifact:// is registered");
+    assert_eq!(
+        fork.schemes().resolve(&url).await.unwrap(),
+        Target::File {
+            path: fork_dir.join(&artifact_file),
+            writable: false
+        }
+    );
+    assert_eq!(
+        session.schemes().resolve(&url).await.unwrap(),
+        Target::File {
+            path: parent_dir.join(&artifact_file),
+            writable: false
+        }
+    );
+    // Unregistered schemes fall through for links, and resolve errors instead of panicking.
+    assert!(fork.schemes().exact("omp://x").is_none());
+    let unknown = SchemeUrl {
+        scheme: "nope".into(),
+        path: String::new(),
+    };
+    let error = fork.schemes().resolve(&unknown).await.unwrap_err();
+    assert!(
+        error.0.starts_with("Unknown scheme: nope://"),
+        "{}",
+        error.0
+    );
 
     assert_eq!(
         within(fork.prompt("Print another long sequence."))

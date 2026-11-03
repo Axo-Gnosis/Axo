@@ -96,13 +96,11 @@ impl Tool for WriteTool {
                 ..
             } => return Err(ToolError(format!("{url} is read-only"))),
             Located::File { url, path, .. } => (path, Some(url.to_string())),
-            Located::Virtual { url, scheme } => {
+            Located::Virtual { url } => {
                 if cancel.is_cancelled() {
                     return Err(ToolError("Operation aborted".into()));
                 }
-                let text = scheme
-                    .write(&url, &content, self.tools.schemes.context())
-                    .await?;
+                let text = self.tools.schemes.write(&url, &content).await?;
                 return Ok(ToolOutput {
                     content: vec![UserBlock::Text { text }],
                     ..ToolOutput::default()

@@ -30,7 +30,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
 use crate::exec::ExecEnv;
-use crate::schemes::{Scheme, SchemeUrl, Schemes, Target};
+use crate::schemes::{SchemeUrl, Schemes, Target};
 use ask::{AskTool, PendingQuestions};
 use bash::BashTool;
 use edit::EditTool;
@@ -72,11 +72,8 @@ pub enum Located {
         path: PathBuf,
         writable: bool,
     },
-    /// A resource whose handler performs reads and writes directly.
-    Virtual {
-        url: SchemeUrl,
-        scheme: Arc<dyn Scheme>,
-    },
+    /// A resource whose handler performs reads and writes; use `Schemes::read`/`Schemes::write`.
+    Virtual { url: SchemeUrl },
 }
 
 impl SessionTools {
@@ -106,20 +103,13 @@ impl SessionTools {
         let Some(url) = self.schemes.parse(&clean_path(path))? else {
             return Ok(Located::Plain);
         };
-        let scheme = self
-            .schemes
-            .get(&url.scheme)
-            .expect("parsed scheme is registered");
-        match scheme.resolve(&url, self.schemes.context()).await? {
+        match self.schemes.resolve(&url).await? {
             Target::File { path, writable } => Ok(Located::File {
                 url,
                 path,
                 writable,
             }),
-            Target::Virtual => Ok(Located::Virtual {
-                url,
-                scheme: scheme.clone(),
-            }),
+            Target::Virtual => Ok(Located::Virtual { url }),
         }
     }
 

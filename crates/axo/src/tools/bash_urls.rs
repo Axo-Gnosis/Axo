@@ -27,8 +27,7 @@ pub(crate) async fn rewrite<'a>(
         let Some((prefix, url, quoted)) = candidate(&command[word.range.clone()], schemes) else {
             continue;
         };
-        let scheme = schemes.get(&url.scheme).expect("recognized scheme");
-        let path = match scheme.resolve(&url, schemes.context()).await? {
+        let path = match schemes.resolve(&url).await? {
             Target::Virtual => {
                 return Err(ToolError(format!(
                     "Cannot use {url} in bash: no file backs it. Use read {url}."

@@ -22,7 +22,7 @@ pub use context::Diagnostic;
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::{EnvMap, ExecEnv, HostEnv, Resolved, StaticEnv};
-pub use schemes::{Scheme, SchemeContext, SchemeUrl, Target};
+pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     Attach, Fork, LiveSnapshot, MaintenanceKind, NavigateOptions, PromptRequest, PromptResult,
     RecoveryPolicy, Session, SessionEvent, SessionOptions, ShakeMode,

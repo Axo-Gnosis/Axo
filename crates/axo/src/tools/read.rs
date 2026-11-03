@@ -93,8 +93,8 @@ impl Tool for ReadTool {
         let (absolute, label) = match self.tools.locate(&path).await? {
             Located::Plain => (self.tools.resolve_read_path(&path), None),
             Located::File { url, path, .. } => (path, Some(url.to_string())),
-            Located::Virtual { url, scheme } => {
-                let text = scheme.read(&url, self.tools.schemes.context()).await?;
+            Located::Virtual { url } => {
+                let text = self.tools.schemes.read(&url).await?;
                 if cancel.is_cancelled() {
                     return Err(ToolError("Operation aborted".into()));
                 }
