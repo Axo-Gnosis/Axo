@@ -1,5 +1,6 @@
-//! Built-in commands sent as prompt text run under their mid-run policy and are never
-//! submitted; skill commands are expanded and queued like ordinary input.
+//! Built-in commands run through `run_command` under their mid-run policy and are never
+//! submitted; prompt text never runs one. Skill commands are expanded and queued like
+//! ordinary input.
 
 mod common;
 
@@ -7,10 +8,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axo::store::{Entry, SeqEntry};
-use axo::{Error, PromptPart, PromptRequest, PromptResult, Session, SessionEvent, Settings};
+use axo::{Command, Error, PromptPart, Session, SessionEvent, Settings, ShakeMode};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
-use axo_ai::{Message, ProviderFailure, ScriptedTurn, StopReason, UserBlock};
+use axo_ai::{Message, ProviderFailure, ScriptedTurn, StopReason, ThinkingLevel, UserBlock};
 use common::{host, options, within};
 use serde_json::json;
 
@@ -88,82 +89,38 @@ fn skill(dir: &Path, name: &str, frontmatter: &str, body: &str) {
     .unwrap();
 }
 
+fn model(model: &str) -> Command {
+    Command::Model {
+        model: model.into(),
+    }
+}
+
 #[tokio::test]
-async fn builtin_runs_without_submission_or_model_call_and_ignores_request_id() {
+async fn run_command_records_no_submission_or_model_call() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(dir.path(), models(), Settings::default(), vec![]).await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
 
     // The session records its initial selection lazily, so compare against a snapshot
     // taken after the first command rather than counting from creation.
-    assert_eq!(
-        within(session.prompt("/model test/m")).await.unwrap(),
-        RunOutcome::Done
-    );
+    session.run_command(model("test/m")).await.unwrap();
     let before = model_changes(&entries(&session).await);
     assert_eq!(before.last().map(String::as_str), Some("m"));
-    for _ in 0..2 {
-        let result = session
-            .prompt_with(PromptRequest {
-                input: "/model test/other".into(),
-                request_id: Some("r1".into()),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(result, PromptResult::Command), "{result:?}");
-    }
+    session.run_command(model("test/other")).await.unwrap();
     assert!(matches!(
-        session.prompt("/model").await,
-        Err(Error::InvalidCommand { command, .. }) if command == "model"
-    ));
-    assert!(matches!(
-        session.prompt("/model test/nope").await,
+        session.run_command(model("test/nope")).await,
         Err(Error::ModelNotFound(_))
     ));
 
     let entries = entries(&session).await;
-    assert_eq!(
-        model_changes(&entries)[before.len()..],
-        ["other", "other"],
-        "a repeated request_id runs again; invalid commands record nothing"
-    );
+    assert_eq!(model_changes(&entries)[before.len()..], ["other"]);
     assert_eq!(submissions(&entries), 0);
     assert!(host.api.requests().is_empty());
 }
 
 #[tokio::test]
-async fn unknown_slash_word_is_an_ordinary_prompt() {
+async fn slash_text_is_always_a_prompt() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
-        dir.path(),
-        models(),
-        Settings::default(),
-        vec![ScriptedTurn::Reply(reply_text("ok"))],
-    )
-    .await;
-    let session = host.axo.create_session(options(dir.path())).await.unwrap();
-
-    assert_eq!(
-        within(session.prompt("/etc/hosts is broken"))
-            .await
-            .unwrap(),
-        RunOutcome::Done
-    );
-    let entries = entries(&session).await;
-    assert_eq!(submissions(&entries), 1);
-    assert_eq!(user_texts(&entries), ["/etc/hosts is broken"]);
-    assert_eq!(host.api.requests().len(), 1);
-}
-
-#[tokio::test]
-async fn pasted_slash_text_is_never_a_command() {
-    let dir = tempfile::tempdir().unwrap();
-    skill(
-        dir.path(),
-        "review",
-        "description: Review a file",
-        "Review $1",
-    );
     let host = host(
         dir.path(),
         models(),
@@ -176,20 +133,48 @@ async fn pasted_slash_text_is_never_a_command() {
     .await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
 
-    for text in ["/review notes.txt", "/model test/other"] {
-        let paste = vec![PromptPart::Paste { text: text.into() }];
+    for text in ["/model test/other", "/etc/hosts is broken"] {
         assert_eq!(
-            within(session.prompt(paste)).await.unwrap(),
+            within(session.prompt(text)).await.unwrap(),
             RunOutcome::Done
         );
     }
     let entries = entries(&session).await;
     assert_eq!(
         user_texts(&entries),
-        ["/review notes.txt", "/model test/other"]
+        ["/model test/other", "/etc/hosts is broken"]
     );
     assert_eq!(submissions(&entries), 2);
     assert!(!model_changes(&entries).iter().any(|model| model == "other"));
+    assert_eq!(host.api.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn pasted_slash_text_is_never_a_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    skill(
+        dir.path(),
+        "review",
+        "description: Review a file",
+        "Review $1",
+    );
+    let host = host(
+        dir.path(),
+        models(),
+        Settings::default(),
+        vec![ScriptedTurn::Reply(reply_text("one"))],
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+
+    let paste = vec![PromptPart::Paste {
+        text: "/review notes.txt".into(),
+    }];
+    assert_eq!(
+        within(session.prompt(paste)).await.unwrap(),
+        RunOutcome::Done
+    );
+    assert_eq!(user_texts(&entries(&session).await), ["/review notes.txt"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -249,15 +234,19 @@ async fn commands_during_a_run_follow_their_policy() {
     while !matches!(events.recv().await.unwrap(), SessionEvent::Retry { .. }) {}
     let before = model_changes(&entries(&session).await);
 
-    // Alongside: runs mid-turn through any entry point; the builtin wins over the skill.
-    session.steer("/model test/other").await.unwrap();
-    // When idle: refused mid-turn whichever entry point carries it.
+    // Alongside: runs mid-turn.
+    session.run_command(model("test/other")).await.unwrap();
+    // When idle: refused mid-turn.
     assert!(matches!(
-        session.follow_up("/compact").await,
+        session.run_command(Command::Compact).await,
         Err(Error::Busy)
     ));
     assert!(matches!(
-        session.prompt("/shake images").await,
+        session
+            .run_command(Command::Shake {
+                mode: ShakeMode::Images
+            })
+            .await,
         Err(Error::Busy)
     ));
     let busy = vec![PromptPart::Content {
@@ -325,11 +314,15 @@ async fn maintenance_blocks_alongside_commands() {
         }) => {}
     }
     assert!(matches!(
-        session.prompt("/model test/other").await,
+        session.run_command(model("test/other")).await,
         Err(Error::Busy)
     ));
     assert!(matches!(
-        session.steer("/thinking off").await,
+        session
+            .run_command(Command::Thinking {
+                level: ThinkingLevel::Off
+            })
+            .await,
         Err(Error::Busy)
     ));
     session.abort().await;

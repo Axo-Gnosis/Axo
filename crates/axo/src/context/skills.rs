@@ -1,6 +1,7 @@
 //! Agent Skills discovery and `/name args` expansion (pi `core/skills.ts`,
 //! `core/prompt-templates.ts`).
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -230,10 +231,11 @@ pub(crate) fn escape_xml(text: &str) -> String {
 }
 
 /// Expands a leading `/name args` naming one of `skills` into
-/// `<skill name="<name>" location="skill://<name>">\nReferences are relative to skill://<name>/.\n\n{body}\n</skill>`
-/// (body with arguments substituted), followed by the args line when non-empty. Any other
-/// text, an unknown name, or an unreadable skill file returns `text` unchanged (the last
-/// with a `tracing::warn!`). Blocking filesystem I/O.
+/// `<skill name="<name>" location="skill://<name>">\nReferences are relative to skill://<name>/.\n\n{body}\n</skill>`.
+/// Arguments fill the body's `$` placeholders; a body without any gets the args line
+/// appended after the block instead. Any other text, an unknown name, or an unreadable
+/// skill file returns `text` unchanged (the last with a `tracing::warn!`). Blocking
+/// filesystem I/O.
 pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     let Some(rest) = text.strip_prefix('/') else {
         return text.to_owned();
@@ -256,12 +258,18 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
         }
     };
     let (_, body) = split_frontmatter(&raw);
-    let body = substitute_args(body.trim(), &parse_command_args(args));
+    let body = body.trim();
+    let placeholders = ARG_PATTERN.is_match(body);
+    let body = if placeholders {
+        Cow::Owned(substitute_args(body, &parse_command_args(args)))
+    } else {
+        Cow::Borrowed(body)
+    };
     let block = format!(
         "<skill name=\"{name}\" location=\"skill://{name}\">\nReferences are relative to skill://{name}/.\n\n{body}\n</skill>",
         name = skill.name
     );
-    if args.is_empty() {
+    if args.is_empty() || placeholders {
         block
     } else {
         format!("{block}\n\n{args}")

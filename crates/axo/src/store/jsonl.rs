@@ -68,17 +68,7 @@ async fn blocking<T: Send + 'static>(
 fn parse(path: &Path, bytes: &[u8]) -> Result<(Header, Vec<SeqEntry>, u64), Error> {
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let mut lines = body.split(|&byte| byte == b'\n');
-    let header_line = lines
-        .next()
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| Error::Config {
-            path: path.to_path_buf(),
-            message: "missing session header".into(),
-        })?;
-    let header: Header = serde_json::from_slice(header_line).map_err(|err| Error::Config {
-        path: path.to_path_buf(),
-        message: format!("invalid session header: {err}"),
-    })?;
+    let header = parse_header(path, lines.next().unwrap_or_default())?;
     let mut entries = Vec::new();
     let mut count = 0;
     for (seq, line) in (0u64..).zip(lines) {
@@ -94,6 +84,30 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<(Header, Vec<SeqEntry>, u64), Erro
         }
     }
     Ok((header, entries, count))
+}
+
+/// Parses a session header line (without its newline); every read path goes
+/// through here so an empty or corrupt header reports the same error.
+fn parse_header(path: &Path, line: &[u8]) -> Result<Header, Error> {
+    if line.is_empty() {
+        return Err(Error::Config {
+            path: path.to_path_buf(),
+            message: "missing session header".into(),
+        });
+    }
+    serde_json::from_slice(line).map_err(|err| Error::Config {
+        path: path.to_path_buf(),
+        message: format!("invalid session header: {err}"),
+    })
+}
+
+/// The header line of a session file, without reading the rest.
+fn header_line(path: &Path, file: File) -> Result<Header, Error> {
+    let mut line = String::new();
+    BufReader::new(file)
+        .read_line(&mut line)
+        .map_err(|err| io_error(path, err))?;
+    parse_header(path, line.strip_suffix('\n').unwrap_or(&line).as_bytes())
 }
 
 #[async_trait]
@@ -178,6 +192,16 @@ impl SessionStore for JsonlStore {
         .await
     }
 
+    async fn read_header(&self, path: &Path) -> Result<Header, Error> {
+        let path = path.to_path_buf();
+        blocking(&path.clone(), move || {
+            File::open(&path)
+                .map_err(|err| io_error(&path, err))
+                .and_then(|file| header_line(&path, file))
+        })
+        .await
+    }
+
     async fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, Error> {
         let dir = self.session_dir(cwd);
         blocking(&dir.clone(), move || {
@@ -192,20 +216,23 @@ impl SessionStore for JsonlStore {
                 if path.extension().is_none_or(|ext| ext != "jsonl") {
                     continue;
                 }
-                let info = File::open(&path).and_then(|file| {
-                    let modified = file.metadata()?.modified()?;
-                    let mut line = String::new();
-                    BufReader::new(file).read_line(&mut line)?;
-                    let header: Header = serde_json::from_str(&line)?;
-                    Ok(SessionInfo {
-                        path: path.clone(),
-                        id: header.id,
-                        timestamp: header.timestamp,
-                        cwd: header.cwd,
-                        parent_session: header.parent_session,
-                        modified,
-                    })
-                });
+                let info = File::open(&path)
+                    .map_err(|err| io_error(&path, err))
+                    .and_then(|file| {
+                        let modified = file
+                            .metadata()
+                            .and_then(|meta| meta.modified())
+                            .map_err(|err| io_error(&path, err))?;
+                        let header = header_line(&path, file)?;
+                        Ok(SessionInfo {
+                            path: path.clone(),
+                            id: header.id,
+                            timestamp: header.timestamp,
+                            cwd: header.cwd,
+                            parent_session: header.parent_session,
+                            modified,
+                        })
+                    });
                 match info {
                     Ok(info) => sessions.push(info),
                     Err(err) => tracing::warn!(path = %path.display(), %err, "skipping unreadable session file"),

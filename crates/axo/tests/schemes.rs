@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use axo::store::{Entry, EntryId, SeqEntry};
 use axo::tools::Located;
-use axo::{SchemeUrl, SessionOptions, SessionTools, StaticEnv, Target, ToolFactory};
+use axo::{ProjectAccess, SchemeUrl, SessionOptions, SessionTools, StaticEnv, Target, ToolFactory};
 use axo_agent::{AgentMessage, RunOutcome, Tool, ToolError, ToolOutput, ToolUpdate};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ToolCall, UserBlock};
@@ -261,6 +261,26 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
             path: parent_dir.join(&artifact_file),
             writable: false
         }
+    );
+    // A saved session resolves alike without opening it, even while another handle has it open.
+    let closed = host
+        .schemes(fork.path(), Some(ProjectAccess::Ignore), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        closed.resolve(&url).await.unwrap(),
+        fork.schemes().resolve(&url).await.unwrap()
+    );
+    let closed = host
+        .schemes(&path, Some(ProjectAccess::Ignore), &[])
+        .await
+        .unwrap();
+    let plan = closed
+        .exact("local://plan.md")
+        .expect("local:// is registered");
+    assert_eq!(
+        closed.resolve(&plan).await.unwrap(),
+        session.schemes().resolve(&plan).await.unwrap()
     );
     // Unregistered schemes fall through for links, and resolve errors instead of panicking.
     assert!(fork.schemes().exact("omp://x").is_none());

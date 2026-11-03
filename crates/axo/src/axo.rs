@@ -12,7 +12,8 @@ use crate::context::project_root;
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::{EnvMap, ExecEnv, HostEnv};
-use crate::session::{RecoveryPolicy, Session, SessionOptions, SessionSetup};
+use crate::schemes::{Scheme, Schemes};
+use crate::session::{RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes};
 use crate::store::{
     Header, JsonlStore, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
 };
@@ -189,6 +190,45 @@ impl Axo {
         self.store.list(cwd).await
     }
 
+    /// The URL schemes of a saved session that is not open, for hosts resolving links in
+    /// it: the file-backed schemes an open session has (`artifact://`, `local://`,
+    /// `skill://` over the skills on disk now, `axo://`), plus `host`. Reads only the
+    /// header: no lock, no recovery, no model. Resolve for display; write to a session's
+    /// files through an open `Session`. `project_access` is the
+    /// `SessionOptions::project_access` the host opens this session with (`None` uses
+    /// settings), so `skill://` sees the same skills as the open session.
+    pub async fn schemes(
+        &self,
+        path: &Path,
+        project_access: Option<ProjectAccess>,
+        host: &[Arc<dyn Scheme>],
+    ) -> Result<Schemes, Error> {
+        let header = self.store.read_header(path).await?;
+        let (access, settings) = self.settings_for(&header.cwd, project_access)?;
+        let (schemes, _, _) = session_schemes(
+            &self.dir, &settings, access, header.id, path, header.cwd, host,
+        )?;
+        Ok(schemes)
+    }
+
+    /// The project access and settings that apply in `cwd`; `access` forces the level.
+    fn settings_for(
+        &self,
+        cwd: &Path,
+        access: Option<ProjectAccess>,
+    ) -> Result<(ProjectAccess, Settings), Error> {
+        let access = access.unwrap_or_else(|| self.settings.project.access_for(&project_root(cwd)));
+        let settings = if self.settings_from_dir
+            && access != ProjectAccess::Ignore
+            && self.settings.project.files.axo_dir
+        {
+            Settings::load(&self.dir, Some((cwd, access)))?
+        } else {
+            self.settings.clone()
+        };
+        Ok((access, settings))
+    }
+
     /// Resolves settings, model, thinking level and exec environment for a session over
     /// `entries` and starts it.
     async fn start(
@@ -213,16 +253,7 @@ impl Axo {
             recovery: _,
         } = options;
 
-        let access =
-            project_access.unwrap_or_else(|| self.settings.project.access_for(&project_root(&cwd)));
-        let settings = if self.settings_from_dir
-            && access != ProjectAccess::Ignore
-            && self.settings.project.files.axo_dir
-        {
-            Settings::load(&self.dir, Some((&cwd, access)))?
-        } else {
-            self.settings.clone()
-        };
+        let (access, settings) = self.settings_for(&cwd, project_access)?;
 
         let selector = model
             .or_else(|| projection.model.clone())

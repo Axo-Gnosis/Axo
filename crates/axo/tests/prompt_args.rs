@@ -1,5 +1,6 @@
 //! `/name args` parsing and substitution (pi `core/prompt-templates.ts`).
 
+use axo::context::skills::{Skill, expand_skill_command};
 use axo::context::{parse_command_args, substitute_args};
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -90,6 +91,44 @@ fn substitution_is_single_pass() {
     assert_eq!(
         substitute_args("${@:2}", &args(&["a", "$ARGUMENTS"])),
         "$ARGUMENTS"
+    );
+}
+
+#[test]
+fn skill_args_fill_placeholders_or_follow_the_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill = |name: &str, body: &str| {
+        let path = dir.path().join(format!("{name}.md"));
+        std::fs::write(&path, format!("---\ndescription: d\n---\n{body}\n")).unwrap();
+        Skill {
+            name: name.into(),
+            description: "d".into(),
+            path,
+            disable_model_invocation: false,
+            argument_hint: None,
+        }
+    };
+    let skills = [
+        skill("greet", "Say hello to $1 in a ${2:-friendly} tone."),
+        skill("plain", "Do the thing."),
+    ];
+    let block = |name: &str, body: &str| {
+        format!(
+            "<skill name=\"{name}\" location=\"skill://{name}\">\nReferences are relative to skill://{name}/.\n\n{body}\n</skill>"
+        )
+    };
+
+    assert_eq!(
+        expand_skill_command("/greet Alice cheerful", &skills),
+        block("greet", "Say hello to Alice in a cheerful tone.")
+    );
+    assert_eq!(
+        expand_skill_command("/plain Alice cheerful", &skills),
+        format!("{}\n\nAlice cheerful", block("plain", "Do the thing."))
+    );
+    assert_eq!(
+        expand_skill_command("/plain", &skills),
+        block("plain", "Do the thing.")
     );
 }
 

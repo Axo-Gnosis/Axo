@@ -114,14 +114,13 @@ Skill body with optional $ARGUMENTS, $@, $1, ${@:2}, ${1:-default} placeholders.
 - `name` defaults to the parent directory name (or file stem). Names longer than 64 characters, not matching `[a-z0-9-]`, containing `--`, or not matching the parent directory name emit a `Diagnostic` but still load.
 - `argument-hint` is optional placeholder text an app shows after `/name` until arguments are typed (`Skill::argument_hint`, trimmed; empty or non-string values become `None`). It is the only skill-argument metadata: a skill takes one free-text argument and has no typed parameters.
 - `disable-model-invocation: true` omits the skill from the `<skills>` system-prompt section while keeping `/name` user expansion active.
-- A skill named like a [built-in command](#user-commands-cratesaxosrccommandsrs) (`compact`, `shake`, `model`, `thinking`, `navigate`) still loads, but session start logs the warning diagnostic `skill name "<name>" is reserved by the built-in /<name> command; /<name> runs the built-in`, the skill is left out of `Session::commands()`, and `/<name>` runs the built-in.
+- A skill named like a [built-in command](#user-commands-cratesaxosrccommandsrs) (`compact`, `shake`, `model`, `thinking`, `navigate`) still loads, but session start logs the warning diagnostic `skill name "<name>" is reserved by the built-in /<name> command; the command catalog lists the built-in`, and the skill is left out of `Session::commands()`. Prompt text `/<name>` still expands the skill; a host that parses typed commands with `Command::parse` first runs the built-in instead.
 
 ### `/name` expansion (`expand_skill_command`)
 
-`prompt`, `steer`, and `follow_up` treat a message the same way (`Session::prompt_with` and `Session::queue`):
+`prompt`, `steer`, and `follow_up` treat a message the same way (`Session::prompt_with` and `Session::queue`). They never run a [built-in command](#user-commands-cratesaxosrccommandsrs): `/model x` passed to them is prompt text like any other.
 
-1. If the first [prompt part](#prompt-parts-cratesaxosrcinputrs) is `Text` starting with `/` and the word before the first whitespace names a built-in command, the [command](#user-commands-cratesaxosrccommandsrs) runs instead; nothing is saved or sent to the model.
-2. Otherwise the parts are prepared and rendered into model blocks. Rendering flattens them to one text. Only when the first part is typed `Text` starting with `/<skill-name>` followed by whitespace or end-of-string does `expand_skill_command` turn it into the block below. A message that starts with pasted text (or an empty `Text`) is never a command or a skill, even when its text starts with `/`; it reaches the model verbatim:
+The parts are prepared and rendered into model blocks. Rendering flattens them to one text. Only when the first [prompt part](#prompt-parts-cratesaxosrcinputrs) is typed `Text` starting with `/<skill-name>` followed by whitespace or end-of-string does `expand_skill_command` turn it into the block below. A message that starts with pasted text (or an empty `Text`) is never a skill, even when its text starts with `/`; it reaches the model verbatim:
 
 ```xml
 <skill name="my-skill" location="skill://my-skill">
@@ -131,7 +130,7 @@ References are relative to skill://my-skill/.
 </skill>
 ```
 
-A `/word` that names neither a built-in nor a skill stays ordinary prompt text (so `/etc/hosts is broken` reaches the model unchanged).
+A `/word` that names no skill stays ordinary prompt text (so `/etc/hosts is broken` reaches the model unchanged).
 
 If the skill body contains no `$` argument placeholders (`$ARGUMENTS`, `$@`, `$1`…`$9`, `${@:N}`, `${@:N:L}`, `${N:-default}`) and the user passed arguments after `/<skill-name>`, the arguments are appended after a blank line.
 
@@ -139,7 +138,7 @@ The submission stores the original parts, not the expansion; the expansion exist
 
 ## User Commands (`crates/axo/src/commands.rs`)
 
-`Session::commands()` returns the catalog apps render (`Vec<CommandInfo>`): the five built-ins in the order below, then every skill not shadowed by a built-in name, in skill-discovery order. Skills load once per session, so the catalog does not change while a session is open. Hosts run a built-in either as prompt text (`"/shake images"`, parsed by `Command::parse`) or directly (`Command::decode(name, args)` with JSON arguments, then `Session::run_command`). Built-in commands are never saved as submissions, never sent as user prompts, and never deduplicated by `request_id`; `compact` and `navigate` with `summarize: true` may still make summary requests to the model.
+`Session::commands()` returns the catalog a host may offer (`Vec<CommandInfo>`): the five built-ins in the order below, then every skill not shadowed by a built-in name, in skill-discovery order. Skills load once per session, so the catalog does not change while a session is open. The host picks which entries to expose and how (slash menu, buttons, its own pickers, or not at all); `axo` never runs a built-in on its own. A host runs one with `Session::run_command`, given a `Command` decoded from JSON arguments (`Command::decode(name, args)`), parsed from typed text (`Command::parse("/shake images")`, `None` for anything that is not `/<builtin>`), or built directly. Built-in commands are never saved as submissions, never sent as user prompts, and never deduplicated by `request_id`; `compact` and `navigate` with `summarize: true` may still make summary requests to the model.
 
 | Command | Policy | Arguments (positional order) | Runs |
 | :--- | :--- | :--- | :--- |
@@ -167,8 +166,8 @@ Running maintenance (compaction, `/shake`, branch summary) makes every built-in 
 ```
 
 - **`parameters`** is a JSON Schema object (draft 2020-12) with every subschema inlined: no `$ref`, `$defs`, `$schema`, or `title`. Unknown properties are rejected.
-- **Semantic formats:** a string property with `"format": "model"` takes a `provider/id` selector (hosts can offer their model list); `"format": "entry"` takes a session entry ID (hosts can offer a session-tree picker). There is no bare-ID model form and no path format.
-- **Text form:** words after `/name` are split like skill arguments (quotes group words) and map to the schema's properties in order. `boolean` properties accept only `true`/`false`, `integer` properties an `i64`; everything else is a string. Extra words fail with `takes no arguments` or `takes at most {n} arguments`.
+- **Semantic formats:** a string property with `"format": "model"` takes a `provider/id` selector (hosts can offer their model list); `"format": "entry"` takes a session entry ID (hosts can offer a session-tree picker, or leave the command out when their transcript already navigates). There is no bare-ID model form and no path format.
+- **Text form (`Command::parse`):** words after `/name` are split like skill arguments (quotes group words) and map to the schema's properties in order. `boolean` properties accept only `true`/`false`, `integer` properties an `i64`; everything else is a string. Extra words fail with `takes no arguments` or `takes at most {n} arguments`.
 - **Errors:** missing, invalid, or extra arguments, or `Command::decode` with an unknown name, return `Error::InvalidCommand { command, message }`, displayed as `/{command}: {message}` (for example `/shake: unknown variant \`bogus\`, expected one of …`). `Value::Null` arguments count as `{}`.
 
 ## Prompt Parts (`crates/axo/src/input.rs`)

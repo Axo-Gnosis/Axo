@@ -6,8 +6,9 @@
 //! [--navigate <entry-id|root> [--summarize]] [--request-id <id>] [--commands]
 //! [--attach <path>]... [<prompt>]`
 //!
-//! Built-in commands (`/compact`, `/shake images`, `/model <provider/id>`, …) and skills go
-//! through the prompt; `--commands` prints the command catalog as JSON and exits. Prompt
+//! A prompt naming a built-in command (`/compact`, `/shake images`, `/model <provider/id>`,
+//! …) runs it through `Command::parse` and `run_command`; skills go through the prompt.
+//! `--commands` prints the command catalog as JSON and exits. Prompt
 //! words starting with `@` become file references (`@"path with spaces"` quoted; trailing
 //! punctuation is not part of the path); `--attach` hands a file's bytes over.
 //! `--resume` without a prompt only lets recovery/navigation finish.
@@ -19,8 +20,8 @@ use std::sync::Arc;
 
 use axo::store::{self, Entry, EntryId, SeqEntry};
 use axo::{
-    Answer, Axo, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult, Session,
-    SessionEvent, SessionOptions,
+    Answer, Axo, Command, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult,
+    Session, SessionEvent, SessionOptions,
 };
 use axo_agent::AgentEvent;
 use axo_ai::{AssistantBlock, AssistantEvent, ThinkingLevel, UserBlock};
@@ -88,7 +89,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => prompt.push(arg),
         }
     }
-    let mut parts = prompt_parts(&prompt.join(" "));
+    let text = prompt.join(" ");
+    let command = Command::parse(&text).transpose()?;
+    if command.is_some() && !attachments.is_empty() {
+        return Err("--attach cannot be combined with a command".into());
+    }
+    let mut parts = if command.is_some() {
+        Vec::new()
+    } else {
+        prompt_parts(&text)
+    };
     for path in &attachments {
         let name = path
             .file_name()
@@ -115,7 +125,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if navigate.is_some() && fork.is_some() {
         return Err("--navigate cannot be combined with --fork".into());
     }
-    if parts.is_empty() && resume.is_none() && !commands {
+    if command.is_none() && parts.is_empty() && resume.is_none() && !commands {
         return Err("a prompt is required".into());
     }
 
@@ -168,15 +178,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(target) = navigate {
-        let mut events = session.attach(None).await.events;
         let target = (target != "root").then(|| EntryId::from(target));
-        let result = session
-            .navigate(target, NavigateOptions { summarize })
-            .await;
-        while let Ok(event) = events.try_recv() {
-            print_maintenance(&event);
-        }
-        result?;
+        run_maintenance(
+            &session,
+            session.navigate(target, NavigateOptions { summarize }),
+        )
+        .await?;
+    }
+    if let Some(command) = command {
+        run_maintenance(&session, session.run_command(command)).await?;
+        println!("[command] done");
+        return Ok(());
     }
     if parts.is_empty() {
         print_system_sections(&session).await;
@@ -211,12 +223,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("[duplicate] submission seq {}", submission.seq);
             Ok(())
         }
-        Ok(PromptResult::Command) => {
-            println!("[command] done");
-            Ok(())
-        }
         Err(error) => Err(error.into()),
     }
+}
+
+/// Runs `operation`, then prints the maintenance events it emitted.
+async fn run_maintenance(
+    session: &Session,
+    operation: impl Future<Output = Result<(), axo::Error>>,
+) -> Result<(), axo::Error> {
+    let mut events = session.attach(None).await.events;
+    let result = operation.await;
+    while let Ok(event) = events.try_recv() {
+        print_maintenance(&event);
+    }
+    result
 }
 
 /// Prompt text as parts, verbatim except for file references, which start at an `@` at the

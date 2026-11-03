@@ -628,7 +628,7 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(
         skill.join("SKILL.md"),
-        "---\ndescription: Review a file\n---\nReview $1 against the current checklist\n",
+        "---\ndescription: Review a file\n---\nReview $@ against the current checklist\n",
     )
     .unwrap();
     let local = path.with_extension("").join("local");
@@ -682,10 +682,9 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
         ] => {
             assert!(text.contains("<skill name=\"review\""), "{text}");
             assert!(
-                text.contains("Review notes.txt against the current checklist"),
+                text.contains("Review notes.txt @local://shot.png against the current checklist"),
                 "{text}"
             );
-            assert!(text.contains("@local://shot.png"), "{text}");
             assert!(url.starts_with("local://shot.png"), "{url}");
             assert_eq!(mime_type, "image/png");
             assert_eq!(

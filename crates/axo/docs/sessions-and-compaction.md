@@ -7,7 +7,7 @@
 By default, sessions are stored under `<AXO_DIR>/sessions/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`, where `<encoded-cwd>` replaces `/`, `\`, and `:` with `-`.
 
 - **Lazy file creation:** `Axo::create_session` reserves a planned path and `Header` in memory. The first submission or non-system message creates the file and parent directory, flushing earlier buffered metadata. A built-in command that only changes model or thinking settings does not by itself create a new session file.
-- **Single-writer lock:** Opening an existing session for writing (`JsonlStore::open_write`) acquires an exclusive non-blocking OS file lock (`std::fs::File::try_lock`) on `<session>.lock` (or the session file on creation). A second writer receives `Error::SessionBusy`. Read-only opens (`Axo::open_session_read`, `Axo::list_sessions`) take no lock.
+- **Single-writer lock:** Opening an existing session for writing (`JsonlStore::open_write`) acquires an exclusive non-blocking OS file lock (`std::fs::File::try_lock`) on the session file itself, held while the writer is open. A second writer receives `Error::SessionBusy`. Read-only opens (`Axo::open_session_read`, `Axo::list_sessions`, and `Axo::schemes`, which reads only the header) take no lock.
 - **Torn-line repair:** If a crash leaves a final line without a trailing newline (or an unparseable truncated final line), `open_write` truncates the file back to the last complete line before appending.
 - **Sequence numbers (`SeqEntry`):** Every entry loaded or appended receives a 0-based monotonic `seq: u64` corresponding to its line index after the `Header`.
 

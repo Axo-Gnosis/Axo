@@ -29,15 +29,15 @@ use crate::config::{AxoDir, CompactionSettings, ProjectAccess, Settings, Summary
 use crate::context::files::{ContextFile, NestedContext, context_file_names, load_context_files};
 use crate::context::prompt::{PromptInputs, Sections, build_sections, system_message};
 use crate::context::skills::{Skill, load_skills};
-use crate::context::{home_agents_dir, project_root};
+use crate::context::{Diagnostic, home_agents_dir, project_root};
 use crate::error::Error;
 use crate::exec::ExecEnv;
-use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, command_text, prepare, render};
+use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::Artifacts;
 use crate::schemes::dir::DirScheme;
 use crate::schemes::skill::SkillScheme;
-use crate::schemes::{Scheme, SchemeContext, Schemes};
+use crate::schemes::{ARTIFACTS_DIR, LOCAL_DIR, Scheme, SchemeContext, Schemes};
 use crate::store::{
     self, Entry, EntryBase, EntryId, Header, Projection, SeqEntry, SessionStore, SessionWriter,
     SubmissionKind, project,
@@ -176,8 +176,6 @@ pub enum PromptResult {
     /// The `request_id` was already submitted: the earlier `submission` entry. No run
     /// was started.
     Duplicate(SeqEntry),
-    /// The input was a built-in command; it ran and nothing was submitted.
-    Command,
 }
 
 /// A client's view when attaching: what it missed, the live state, and the events from
@@ -385,11 +383,6 @@ enum RunRequest {
         model: Model,
         results: Vec<ToolResultMessage>,
     },
-}
-
-/// Parses `parts` as a built-in command; `None` for ordinary input.
-fn parse_command(parts: &[PromptPart]) -> Option<Result<Command, Error>> {
-    command_text(parts).and_then(|text| Command::parse(&text))
 }
 
 /// Runs `request` and settles it. Callers spawn it, so the run ends (and `run_end` is
@@ -1531,6 +1524,45 @@ impl Persist for SessionHooks {
     }
 }
 
+/// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
+/// `artifact://` and `local://` in the side folders beside the session file `path`,
+/// `skill://`, `axo://` docs, then `host` schemes. Open sessions and `Axo::schemes` both
+/// build them here, so given the same project access a URL resolves alike whether its
+/// session is open or not.
+pub(crate) fn session_schemes(
+    dir: &AxoDir,
+    settings: &Settings,
+    access: ProjectAccess,
+    session_id: String,
+    path: &Path,
+    cwd: PathBuf,
+    host: &[Arc<dyn Scheme>],
+) -> Result<(Schemes, Vec<Skill>, Vec<Diagnostic>), Error> {
+    let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
+    let (skills, diagnostics) = load_skills(
+        dir,
+        home_agents.as_deref(),
+        &cwd,
+        access != ProjectAccess::Ignore && settings.project.files.skills,
+    );
+    let session_dir = path.with_extension("");
+    let schemes = Schemes::new(
+        SchemeContext {
+            session_id,
+            session_dir: session_dir.clone(),
+            cwd,
+        },
+        Arc::new(Artifacts::new(session_dir.join(ARTIFACTS_DIR))),
+        vec![
+            Arc::new(SkillScheme::new(&skills)),
+            Arc::new(DirScheme::local(session_dir.join(LOCAL_DIR))),
+            Arc::new(DirScheme::docs(dir.docs_dir())),
+        ],
+        host,
+    )?;
+    Ok((schemes, skills, diagnostics))
+}
+
 impl Session {
     /// Builds the tools, loads context files and skills, resolves the exec environment
     /// once for its prompt note, restores the transcript and the read record, records
@@ -1560,10 +1592,6 @@ impl Session {
         } = setup;
 
         let path = writer.planned_path().to_path_buf();
-        let session_dir = path.with_extension("");
-        let artifacts = Arc::new(Artifacts::new(
-            session_dir.join(crate::schemes::ARTIFACTS_DIR),
-        ));
         let (events, _) = broadcast::channel(1024);
         let questions = Arc::new(PendingQuestions::new(events.clone()));
         let project = project_access != ProjectAccess::Ignore;
@@ -1576,26 +1604,13 @@ impl Session {
             names,
             &context_files,
         );
-        let (skills, skill_diagnostics) = load_skills(
+        let (schemes, skills, skill_diagnostics) = session_schemes(
             &dir,
-            home_agents.as_deref(),
-            &cwd,
-            project && settings.project.files.skills,
-        );
-        let schemes = Schemes::new(
-            SchemeContext {
-                session_id: session_id.clone(),
-                session_dir: session_dir.clone(),
-                cwd: cwd.clone(),
-            },
-            artifacts,
-            vec![
-                Arc::new(SkillScheme::new(&skills)),
-                Arc::new(DirScheme::local(
-                    session_dir.join(crate::schemes::LOCAL_DIR),
-                )),
-                Arc::new(DirScheme::docs(dir.docs_dir())),
-            ],
+            &settings,
+            project_access,
+            session_id.clone(),
+            &path,
+            cwd.clone(),
             &host_schemes,
         )?;
         let (summary_prompts, summary_diagnostics) = compaction::summary::SummaryPrompts::load(
@@ -2139,7 +2154,8 @@ impl Session {
         &self.tool_state.schemes
     }
 
-    /// The commands this session runs: built-ins, then its skills.
+    /// The commands a host may offer, in whatever form it picks: built-ins, then this
+    /// session's skills.
     pub fn commands(&self) -> Vec<CommandInfo> {
         commands::catalog(&self.skills)
     }
@@ -2166,10 +2182,10 @@ impl Session {
         }
     }
 
-    /// Runs a built-in command, or expands a `/skill args` invocation, saves the
-    /// submission and runs the prompt; returns when the run settles (a built-in command
-    /// reports `Done` once it has run). `Error::Busy` while a run is active (use
-    /// `steer`/`follow_up`).
+    /// Expands a `/skill args` invocation, saves the submission and runs the prompt;
+    /// returns when the run settles. `Error::Busy` while a run is active (use
+    /// `steer`/`follow_up`). Prompt text never runs a built-in command: hosts that offer
+    /// typed commands parse them with `Command::parse` and call `run_command`.
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunOutcome, Error> {
         match self
             .prompt_with(PromptRequest {
@@ -2179,19 +2195,13 @@ impl Session {
             .await?
         {
             PromptResult::Settled { outcome, .. } => Ok(outcome),
-            PromptResult::Command => Ok(RunOutcome::Done),
             PromptResult::Duplicate(_) => unreachable!("a prompt without request id is new"),
         }
     }
 
     /// `prompt`, deduplicated by `request_id`: a request id that was already submitted
     /// returns its earlier submission and starts nothing, even while that run is active.
-    /// Built-in commands are not deduplicated.
     pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
-        if let Some(command) = parse_command(&request.input.parts) {
-            self.run_command(command?).await?;
-            return Ok(PromptResult::Command);
-        }
         // Fast path: a duplicate or busy prompt does no file or image work.
         let existing = self.admit(&*self.hooks.log.lock().await, request.request_id.as_deref())?;
         if let Some(existing) = existing {
@@ -2296,24 +2306,19 @@ impl Session {
         Ok((submission, message))
     }
 
-    /// Saves and queues a user message delivered after the current tool calls finish; a
-    /// built-in command runs under its own policy instead.
+    /// Saves and queues a user message delivered after the current tool calls finish.
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::Steer, input.into()).await
     }
 
-    /// Saves and queues a user message delivered when the run would otherwise end; a
-    /// built-in command runs under its own policy instead.
+    /// Saves and queues a user message delivered when the run would otherwise end.
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::FollowUp, input.into()).await
     }
 
-    /// `steer`/`follow_up`: runs a built-in command, or saves the submission and hands
-    /// its message to the agent's queue for `kind`.
+    /// `steer`/`follow_up`: saves the submission and hands its message to the agent's
+    /// queue for `kind`.
     async fn queue(&self, kind: SubmissionKind, input: PromptInput) -> Result<(), Error> {
-        if let Some(command) = parse_command(&input.parts) {
-            return self.run_command(command?).await;
-        }
         let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
         let mut log = self.hooks.log.lock().await;
         let (_, message) = self

@@ -45,9 +45,9 @@ Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cw
 
 ### Commands & prompt parts
 
-`axo` owns the user command catalog and the shape of a user message, so hosts only render them:
+`axo` owns the user command catalog and the shape of a user message; hosts decide which commands to expose and how:
 
-- **Built-in commands:** `/compact`, `/shake <mode>`, `/model <provider/id>`, `/thinking <level>`, and `/navigate <entry> [summarize]`. `session.commands()` lists them (each with a JSON Schema for its arguments and a mid-run `CommandPolicy`) followed by the session's skills; `session.run_command(command)` runs one directly. Typed as prompt text, a built-in runs instead of being submitted: it is never saved as a submission or sent as a user prompt, and is not deduplicated by `request_id`. `/model` and `/thinking` run alongside a turn; `/compact`, `/shake`, and `/navigate` return `Error::Busy` during one; maintenance (compaction, shake, branch summary) blocks every command. An unknown `/word` stays ordinary prompt text.
+- **Built-in commands:** `/compact`, `/shake <mode>`, `/model <provider/id>`, `/thinking <level>`, and `/navigate <entry> [summarize]`. `session.commands()` lists them (each with a JSON Schema for its arguments and a mid-run `CommandPolicy`) followed by the session's skills, for hosts to expose however they like: a slash menu, buttons, their own pickers, or not at all. A built-in runs only through `session.run_command(command)`, given a `Command` from JSON arguments (`Command::decode`), typed text (`Command::parse("/shake images")`), or a value; `prompt`, `steer`, and `follow_up` never run one. A command is never saved as a submission or sent as a user prompt. `/model` and `/thinking` run alongside a turn; `/compact`, `/shake`, and `/navigate` return `Error::Busy` during one; maintenance (compaction, shake, branch summary) blocks every command.
 - **Prompt parts:** `prompt`, `steer`, and `follow_up` take `impl Into<PromptInput>`: a plain string, or a list of `PromptPart`s (typed text, pastes, `@` file references that give the model only the path, and handed-over content that axo saves under the session's `local://` folder; saved images also reach the model as pixels).
 
 ### Cache-aware compaction & `/shake`
@@ -64,7 +64,7 @@ The system prompt lives in the transcript as named `<section>` blocks (`system`,
 
 - **Replaceable prompt files:** `SYSTEM.md`, `WORK.md`, `PROSE.md`, and the five summarizer prompts can be overridden in `~/.axo/prompts/` or `<cwd>/.axo/prompts/`. Writing an empty `SYSTEM.md`, `WORK.md`, or `PROSE.md` disables that section.
 - **Ordered `contextFiles` & nested loading:** Startup loads `~/.axo/AGENTS.md` (and `~/.agents/AGENTS.md` when `homeAgentsDir: true`), then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, `.axo/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result without invalidating the system prompt cache.
-- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/` and user `~/.axo/skills/`. Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic, is left out of the catalog, and `/name` runs the built-in.
+- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/` and user `~/.axo/skills/`. Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic and is left out of the catalog.
 
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 

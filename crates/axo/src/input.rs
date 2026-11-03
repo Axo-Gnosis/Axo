@@ -111,8 +111,8 @@ fn flatten(parts: &[PromptPart]) -> String {
     text
 }
 
-/// The text to parse as a command: `None` unless the message starts with typed `/` text.
-pub(crate) fn command_text(parts: &[PromptPart]) -> Option<String> {
+/// The text to expand as a skill command: `None` unless the message starts with typed `/` text.
+fn command_text(parts: &[PromptPart]) -> Option<String> {
     match parts.first() {
         Some(PromptPart::Text { text }) if text.starts_with('/') => Some(flatten(parts)),
         _ => None,

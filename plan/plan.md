@@ -393,7 +393,7 @@ Maps the [Agent Client Protocol](https://agentclientprotocol.com) over stdio ont
 | ACP | `Session` |
 |---|---|
 | `session/new` and `session/load` | `create_session` and `open_session` + `attach` |
-| `session/prompt` | `prompt` (and `steer` / `follow_up` mapping) |
+| `session/prompt` | `Command::parse` + `run_command` for `/<builtin>` text (ACP clients send commands as prompt text), otherwise `prompt` (and `steer` / `follow_up` mapping) |
 | `session/cancel` | `abort` |
 | `session/update` | Streams `AgentEvent`s through `Accumulator` |
 | `availableCommands` | Publishes `/skill` commands |

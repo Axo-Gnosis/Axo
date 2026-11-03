@@ -36,6 +36,9 @@ pub trait SessionStore: Send + Sync {
     /// Reads a session without locking it.
     async fn open_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error>;
 
+    /// Reads only a session's header, without locking it or reading its entries.
+    async fn read_header(&self, path: &Path) -> Result<Header, Error>;
+
     /// Sessions started in `cwd`, most recently modified first.
     async fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, Error>;
 }

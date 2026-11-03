@@ -1,5 +1,5 @@
-//! User commands: the built-in session operations and skills, their typed arguments, and
-//! the one parser for the `/name args` text form.
+//! User commands: the built-in session operations and skills a host may offer, their
+//! typed arguments, and the one parser for the `/name args` text form.
 
 use std::sync::LazyLock;
 
@@ -50,7 +50,7 @@ pub enum CommandKind {
     Skill { argument_hint: Option<String> },
 }
 
-/// One entry of the command catalog apps render.
+/// One entry of the command catalog; hosts expose whichever entries they want, in any form.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandInfo {
@@ -265,8 +265,8 @@ impl Command {
             .decode(args)
     }
 
-    /// Parses `/name args` naming a built-in command. `None` for any other text,
-    /// including unknown `/word`s, which stay ordinary prompt text.
+    /// Parses `/name args` naming a built-in command, for hosts that accept typed
+    /// commands. `None` for any other text, including unknown `/word`s and skills.
     pub fn parse(text: &str) -> Option<Result<Command, Error>> {
         let rest = text.strip_prefix('/')?;
         let (name, args) = match rest.find(char::is_whitespace) {
@@ -310,7 +310,7 @@ pub(crate) fn reserved_skill_diagnostics(skills: &[Skill]) -> Vec<Diagnostic> {
         .map(|skill| Diagnostic {
             path: Some(skill.path.clone()),
             message: format!(
-                "skill name \"{name}\" is reserved by the built-in /{name} command; /{name} runs the built-in",
+                "skill name \"{name}\" is reserved by the built-in /{name} command; the command catalog lists the built-in",
                 name = skill.name
             ),
         })
@@ -527,11 +527,6 @@ mod tests {
         assert_eq!(
             diagnostics[0].path,
             Some(PathBuf::from("/skills/compact/SKILL.md"))
-        );
-        assert!(
-            diagnostics[0]
-                .message
-                .contains("/compact runs the built-in")
         );
     }
 }
