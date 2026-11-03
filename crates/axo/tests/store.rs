@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use axo::Error;
 use axo::store::{
     ContextReplacement, Entry, EntryBase, EntryId, Header, JsonlStore, SeqEntry, SessionStore,
     SubmissionKind, project,
 };
+use axo::{Error, PromptPart};
 use axo_agent::AgentMessage;
 use axo_ai::{
     ApiKind, AssistantBlock, AssistantMessage, Compat, Cost, InputKind, Message, Model,
@@ -392,11 +392,30 @@ fn submission(id: &str, parent: Option<&str>) -> Entry {
         base: base(id, parent),
         submission_id: format!("sub-{id}"),
         kind: SubmissionKind::Prompt,
-        content: vec![UserBlock::Text {
+        parts: vec![PromptPart::Text {
             text: "hello".into(),
         }],
         request_id: None,
     }
+}
+
+#[test]
+fn submissions_write_parts_and_read_legacy_content() {
+    let entry = submission("s1", None);
+    let mut value = serde_json::to_value(&entry).unwrap();
+    let object = value.as_object_mut().unwrap();
+    assert!(
+        !object.contains_key("content"),
+        "new files write parts: {object:?}"
+    );
+    let parts = object.remove("parts").expect("parts written");
+    assert_eq!(
+        parts,
+        serde_json::json!([{"type": "text", "text": "hello"}])
+    );
+    // Files written before prompt parts store the text-only user blocks as `content`.
+    object.insert("content".into(), parts);
+    assert_eq!(serde_json::from_value::<Entry>(value).unwrap(), entry);
 }
 
 #[tokio::test]

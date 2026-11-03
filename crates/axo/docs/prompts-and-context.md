@@ -103,6 +103,7 @@ Within each root:
 ---
 name: my-skill
 description: Short description shown to the model in <available_skills>.
+argument-hint: <file>
 disable-model-invocation: false
 ---
 
@@ -111,11 +112,16 @@ Skill body with optional $ARGUMENTS, $@, $1, ${@:2}, ${1:-default} placeholders.
 
 - `description` is required (missing or empty descriptions skip the skill with a `Diagnostic`).
 - `name` defaults to the parent directory name (or file stem). Names longer than 64 characters, not matching `[a-z0-9-]`, containing `--`, or not matching the parent directory name emit a `Diagnostic` but still load.
+- `argument-hint` is optional placeholder text an app shows after `/name` until arguments are typed (`Skill::argument_hint`, trimmed; empty or non-string values become `None`). It is the only skill-argument metadata: a skill takes one free-text argument and has no typed parameters.
 - `disable-model-invocation: true` omits the skill from the `<skills>` system-prompt section while keeping `/name` user expansion active.
+- A skill named like a [built-in command](#user-commands-cratesaxosrccommandsrs) (`compact`, `shake`, `model`, `thinking`, `navigate`) still loads, but session start logs the warning diagnostic `skill name "<name>" is reserved by the built-in /<name> command; /<name> runs the built-in`, the skill is left out of `Session::commands()`, and `/<name>` runs the built-in.
 
 ### `/name` expansion (`expand_skill_command`)
 
-When a user prompt starts with `/<skill-name>` followed by whitespace or end-of-string, `expand_skill_command` expands it before saving the submission:
+`prompt`, `steer`, and `follow_up` treat a message the same way (`Session::prompt_with` and `Session::queue`):
+
+1. If the first [prompt part](#prompt-parts-cratesaxosrcinputrs) is `Text` starting with `/` and the word before the first whitespace names a built-in command, the [command](#user-commands-cratesaxosrccommandsrs) runs instead; nothing is saved or sent to the model.
+2. Otherwise the parts are prepared and rendered into model blocks. Rendering flattens them to one text. Only when the first part is typed `Text` starting with `/<skill-name>` followed by whitespace or end-of-string does `expand_skill_command` turn it into the block below. A message that starts with pasted text (or an empty `Text`) is never a command or a skill, even when its text starts with `/`; it reaches the model verbatim:
 
 ```xml
 <skill name="my-skill" location="skill://my-skill">
@@ -125,4 +131,66 @@ References are relative to skill://my-skill/.
 </skill>
 ```
 
+A `/word` that names neither a built-in nor a skill stays ordinary prompt text (so `/etc/hosts is broken` reaches the model unchanged).
+
 If the skill body contains no `$` argument placeholders (`$ARGUMENTS`, `$@`, `$1`…`$9`, `${@:N}`, `${@:N:L}`, `${N:-default}`) and the user passed arguments after `/<skill-name>`, the arguments are appended after a blank line.
+
+The submission stores the original parts, not the expansion; the expansion exists only in the user message. Recovery re-renders requeued submissions, so their skills are expanded from the current `SKILL.md` (see [Crash Recovery](sessions-and-compaction.md#crash-recovery-cratesaxosrcrecoveryrs)).
+
+## User Commands (`crates/axo/src/commands.rs`)
+
+`Session::commands()` returns the catalog apps render (`Vec<CommandInfo>`): the five built-ins in the order below, then every skill not shadowed by a built-in name, in skill-discovery order. Skills load once per session, so the catalog does not change while a session is open. Hosts run a built-in either as prompt text (`"/shake images"`, parsed by `Command::parse`) or directly (`Command::decode(name, args)` with JSON arguments, then `Session::run_command`). Built-in commands are never saved as submissions, never sent as user prompts, and never deduplicated by `request_id`; `compact` and `navigate` with `summarize: true` may still make summary requests to the model.
+
+| Command | Policy | Arguments (positional order) | Runs |
+| :--- | :--- | :--- | :--- |
+| `compact` | `when_idle` | none | `Session::compact()` |
+| `shake` | `when_idle` | `mode`: `elide`, `images`, or `thinking` (required) | `Session::shake(mode)` |
+| `model` | `alongside` | `model`: `provider/id` (required, string format `model`) | `Models::find`, then `Session::set_model`; an unknown selector is `Error::ModelNotFound` |
+| `thinking` | `alongside` | `level`: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (required) | `Session::set_thinking(level)` |
+| `navigate` | `when_idle` | `entry` (required, string format `entry`), `summarize` (`true`/`false`, default `false`) | `Session::navigate(Some(entry), NavigateOptions { summarize })` |
+
+Each command has one fixed `CommandPolicy`, regardless of its arguments:
+- `Alongside` (`"alongside"`): runs during a turn and takes effect from the next request.
+- `WhenIdle` (`"when_idle"`): `Error::Busy` while a turn is running.
+- `Queued` (`"queued"`): every skill; expanded, then sent through whichever path the app used (`prompt`, `steer`, or `follow_up`).
+
+Running maintenance (compaction, `/shake`, branch summary) makes every built-in return `Error::Busy`, including alongside ones.
+
+`CommandInfo` serializes as camelCase JSON with its kind flattened in:
+
+```json
+[
+  {"name": "shake", "description": "Move large blocks, images, or thinking out of context into recoverable files", "policy": "when_idle", "kind": "builtin",
+   "parameters": {"type": "object", "properties": {"mode": {"description": "What to move out of context into recoverable files: large text blocks (elide), images, or thinking.", "type": "string", "enum": ["elide", "images", "thinking"]}}, "required": ["mode"], "additionalProperties": false}},
+  {"name": "review", "description": "Review a file", "policy": "queued", "kind": "skill", "argumentHint": "<file>"}
+]
+```
+
+- **`parameters`** is a JSON Schema object (draft 2020-12) with every subschema inlined: no `$ref`, `$defs`, `$schema`, or `title`. Unknown properties are rejected.
+- **Semantic formats:** a string property with `"format": "model"` takes a `provider/id` selector (hosts can offer their model list); `"format": "entry"` takes a session entry ID (hosts can offer a session-tree picker). There is no bare-ID model form and no path format.
+- **Text form:** words after `/name` are split like skill arguments (quotes group words) and map to the schema's properties in order. `boolean` properties accept only `true`/`false`, `integer` properties an `i64`; everything else is a string. Extra words fail with `takes no arguments` or `takes at most {n} arguments`.
+- **Errors:** missing, invalid, or extra arguments, or `Command::decode` with an unknown name, return `Error::InvalidCommand { command, message }`, displayed as `/{command}: {message}` (for example `/shake: unknown variant \`bogus\`, expected one of …`). `Value::Null` arguments count as `{}`.
+
+## Prompt Parts (`crates/axo/src/input.rs`)
+
+`prompt`, `steer`, and `follow_up` take `impl Into<PromptInput>` (`PromptInput { parts: Vec<PromptPart> }`; `&str`, `String`, and `&String` convert to one `Text` part, and `Vec<PromptPart>` converts directly); `prompt_with` takes `PromptRequest { input: PromptInput, request_id: Option<String> }`. `PromptPart` serializes with a `type` tag and camelCase names:
+
+| Part | JSON | Meaning | Model sees |
+| :--- | :--- | :--- | :--- |
+| `Text { text }` | `{"type":"text","text":"…"}` | Typed text | The text |
+| `Paste { text }` | `{"type":"paste","text":"…"}` | Pasted text kept inline, marked so apps can redraw it collapsed | The text |
+| `File { path }` | `{"type":"file","path":"src/main.rs"}` | A reference to an existing file or directory: relative to cwd, absolute, `~`, or a scheme URL | `@path` only |
+| `Content { name, bytes }` | `{"type":"content","name":"shot.png","bytes":"<base64>"}` | Content the user hands over (a paste saved as a file, a file from outside the project, an image). Input only | Never stored; replaced by `Saved` |
+| `Saved { url, image }` | `{"type":"saved","url":"local://shot.png","image":true}` | A file axo saved from `Content` | `@url`, plus pixels when `image` |
+
+**`@` is reference only.** Files and saved content reach the model as `@path` (`@"path"` when it contains whitespace) inside the one text block; the model opens them itself with its tools, which strip the leading `@` and the quotes of `@"path"`. File contents are never inlined. Images are the one exception.
+
+**Preparation** runs before anything is written to the log; a failure saves nothing and returns `Error::InvalidInput`. A prompt refused afterwards (`Error::Busy`, a duplicate `request_id`, or a failed write) removes the content it saved; `Busy` and duplicates are checked before any content is saved or rendered.
+- `File`: the path must exist (`File not found: {path}`) or name a known scheme; virtual scheme URLs pass unchecked. The part is stored as typed.
+- `Content`: `name` must not be empty, `.`, `..`, or contain `/`, `\`, or NUL (`Invalid content name: {name}`). The bytes are written to `<session>/local/{name}` (the `local://` root), never overwriting: on collision axo tries `{stem}-2{.ext}`, `{stem}-3{.ext}`, … (split on the last `.`; dotfiles have no extension). The part becomes `Saved { url: "local://{final name}", image }`, where `image` is whether the bytes sniff as a supported image. IO failures are `Error::Io`.
+- `Saved`: must still resolve to an existing `local://` file (`File not found: {url}`), so apps can resubmit parts returned by `Session::fork`. `image` is re-derived from the file's bytes; the value sent is ignored.
+- `Text` / `Paste`: unchanged.
+
+**Rendering** produces the user message: one `Text` block (all parts flattened, a skill command expanded when the message starts with typed `/` text), then for each `Saved { image: true }` in order a `Text` block with its URL (plus any resize hints, one per line) and an `Image` block, processed like `read` does for images. When an image cannot be read or processed, that pair becomes one `Text` block `"{url}\n{message}"` (for example `[image unavailable: …]`) and the message still sends. There is no model-capability check here: requests to text-only models turn images into placeholders.
+
+The `submission` entry stores the prepared parts (with `Saved`, never `Content`), so apps can redraw chips after reload or fork; see [JSONL format](sessions-and-compaction.md#jsonl-format-format_version--1).

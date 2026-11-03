@@ -5,10 +5,10 @@ mod common;
 
 use std::time::Duration;
 
-use axo::SessionEvent;
 use axo::store::{
     self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind,
 };
+use axo::{PromptPart, SessionEvent};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
@@ -146,7 +146,7 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
                 base: EntryBase::new(id, parent),
                 submission_id: "s-stranded".into(),
                 kind: SubmissionKind::Prompt,
-                content: vec![UserBlock::Text {
+                parts: vec![PromptPart::Text {
                     text: "second".into(),
                 }],
                 request_id: None,

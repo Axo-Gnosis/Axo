@@ -270,6 +270,7 @@ impl Axo {
             cwd,
             settings,
             streamer: self.streamer.clone(),
+            models: self.models.clone(),
             model,
             thinking,
             exec,

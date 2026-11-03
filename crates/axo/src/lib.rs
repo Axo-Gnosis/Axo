@@ -2,11 +2,13 @@
 //! assembly, config, and sessions on top of `axo-ai` and `axo-agent`.
 
 pub mod axo;
+mod commands;
 mod compaction;
 pub mod config;
 pub mod context;
 pub mod error;
 pub mod exec;
+mod input;
 pub mod recovery;
 pub mod schemes;
 pub mod session;
@@ -14,6 +16,7 @@ pub mod store;
 pub mod tools;
 
 pub use axo::{Axo, AxoBuilder};
+pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
 pub use config::{
     AskSettings, AxoDir, BashSettings, CompactionSettings, DevShellMode, ProjectAccess,
     ProjectFiles, ProjectSettings, Settings, SummaryRequest,
@@ -22,6 +25,7 @@ pub use context::Diagnostic;
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::{EnvMap, ExecEnv, HostEnv, Resolved, StaticEnv};
+pub use input::{PromptInput, PromptPart};
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     Attach, Fork, LiveSnapshot, MaintenanceKind, NavigateOptions, PromptRequest, PromptResult,

@@ -21,6 +21,8 @@ pub struct Skill {
     pub path: PathBuf,
     /// `disable-model-invocation: true`: hidden from the prompt; only `/name` starts it.
     pub disable_model_invocation: bool,
+    /// `argument-hint`: placeholder text shown after `/name` until arguments are typed.
+    pub argument_hint: Option<String>,
 }
 
 const MAX_NAME_LENGTH: usize = 64;
@@ -194,6 +196,12 @@ fn load_skill_file(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<Ski
             .get("disable-model-invocation")
             .and_then(serde_norway::Value::as_bool)
             == Some(true),
+        argument_hint: frontmatter
+            .get("argument-hint")
+            .and_then(serde_norway::Value::as_str)
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .map(str::to_owned),
     })
 }
 

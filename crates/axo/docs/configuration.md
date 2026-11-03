@@ -16,7 +16,7 @@ Resolved by `AxoDir::from_env()` (`AXO_DIR` when set and non-empty, else `$HOME/
 | `AGENTS.md` | `root().join("AGENTS.md")` | User-wide instructions loaded at the start of `project_context` |
 | `prompts/<NAME>.md` | `prompt_path(name)` | Prompt overrides: `SYSTEM.md`, `WORK.md`, `PROSE.md`, `SUMMARY.md`, `COMPACTION.md`, `COMPACTION_UPDATE.md`, `COMPACTION_SPLIT_TURN.md`, `BRANCH_SUMMARY.md` |
 | `skills/` | `skills_dir()` | User skills (`<skill>/SKILL.md`) |
-| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`), per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` scratch files (`local://<path>`) |
+| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`), per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` (`local://<path>`): model scratch files and content handed over in prompts (see [Prompt Parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs)). Forks copy both directories |
 | `cache/` | `cache_dir()` | Cached `models.dev` catalog (`cache/models.json`), bundled documentation (`cache/docs/`, via `docs_dir()` and `axo://` URLs), and captured Nix dev-shell environments (`cache/devshell/`) |
 
 When `homeAgentsDir` is `true` in `~/.axo/settings.jsonc`, `axo` also reads `~/.agents/AGENTS.md` (before `~/.axo/AGENTS.md`) and `~/.agents/skills/` (after `~/.axo/skills/`).
@@ -86,7 +86,7 @@ Settings files use JSON with Comments (JSONC), parsed with `jsonc-parser` (UTF-8
 
 | Key | Rust field | Default | Scope | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `defaultModel` | `default_model` | `None` | User or project | Model selector (`provider/id` or `id`). Accepts `$ENV` and `!command` (see [Config values](#config-values)); a `!command` value in project settings requires `ProjectAccess::Trust` |
+| `defaultModel` | `default_model` | `None` | User or project | Model selector `provider/id` (the ID may itself contain `/`); a bare ID is not looked up. Accepts `$ENV` and `!command` (see [Config values](#config-values)); a `!command` value in project settings requires `ProjectAccess::Trust` |
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
 | `extendedContext` | `extended_context` | `false` | User only | When `false`, catalog and built-in model context windows are capped at the lowest `cost.tiers` threshold (`CostTier`). Ignored with a warning in project settings because `Models` is loaded once per `Axo` instance |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |

@@ -12,6 +12,8 @@ use axo_ai::{SystemMessage, ThinkingLevel, Usage, UserBlock};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::input::PromptPart;
+
 /// The `version` written into new session headers.
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -269,7 +271,9 @@ pub enum Entry {
         base: EntryBase,
         submission_id: String,
         kind: SubmissionKind,
-        content: Vec<UserBlock>,
+        /// Old sessions stored text-only `content` blocks, which read as `Text` parts.
+        #[serde(alias = "content")]
+        parts: Vec<PromptPart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },

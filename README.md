@@ -38,16 +38,23 @@ The workspace is split into three layered crates so hosts only recompile what ch
 
 Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`) protected by an OS file lock (`File::try_lock`) so a second writer gets `Error::SessionBusy` and a crashed process releases the lock automatically.
 
-- **Durable intent:** Submissions (`prompt`, `steer`, `follow_up`, with optional `request_id` deduplication), `run_start` / `run_end` markers, and finished assistant messages are persisted before tool calls execute.
+- **Durable intent:** Submissions (`prompt`, `steer`, `follow_up`, with optional `request_id` deduplication) store their prompt parts, so apps can redraw file and paste chips after reload; `run_start` / `run_end` markers and finished assistant messages are persisted before tool calls execute.
 - **Reopen recovery:** When a session with an unfinished run reopens under `RecoveryPolicy::Resume`, `Replay::Safe` tools (`read`, `grep`, `find`, `ask`) re-run automatically and `Replay::Never` tools (`bash`, `write`, `edit`) receive an interrupted result pointing to any spooled output. Five consecutive resumes without progress park the run as `Parked`.
 - **Live attach:** `session.attach(from_seq)` returns missed durable entries since `from_seq`, a `LiveSnapshot` of any run or maintenance in progress (partial reply, running tools, pending `ask` questions, queued submissions), and a live broadcast receiver.
-- **Branching & forking:** `session.navigate(target, options)` moves the persisted `leaf` pointer inside the tree (optionally summarizing the abandoned branch into a `branch_summary` entry); `session.fork(entry_id)` clones the path into a new session file.
+- **Branching & forking:** `session.navigate(target, options)` moves the persisted `leaf` pointer inside the tree (optionally summarizing the abandoned branch into a `branch_summary` entry); `session.fork(entry_id)` clones the path into a new session file and returns the forked user message's parts as `Fork::editable` for the client to edit and resubmit.
+
+### Commands & prompt parts
+
+`axo` owns the user command catalog and the shape of a user message, so hosts only render them:
+
+- **Built-in commands:** `/compact`, `/shake <mode>`, `/model <provider/id>`, `/thinking <level>`, and `/navigate <entry> [summarize]`. `session.commands()` lists them (each with a JSON Schema for its arguments and a mid-run `CommandPolicy`) followed by the session's skills; `session.run_command(command)` runs one directly. Typed as prompt text, a built-in runs instead of being submitted: it is never saved as a submission or sent as a user prompt, and is not deduplicated by `request_id`. `/model` and `/thinking` run alongside a turn; `/compact`, `/shake`, and `/navigate` return `Error::Busy` during one; maintenance (compaction, shake, branch summary) blocks every command. An unknown `/word` stays ordinary prompt text.
+- **Prompt parts:** `prompt`, `steer`, and `follow_up` take `impl Into<PromptInput>`: a plain string, or a list of `PromptPart`s (typed text, pastes, `@` file references that give the model only the path, and handed-over content that axo saves under the session's `local://` folder; saved images also reach the model as pixels).
 
 ### Cache-aware compaction & `/shake`
 
 `axo` manages context pressure through append-only `context_edit` and `compaction` entries without mutating earlier history in place:
 
-- **Manual `/shake` (`session.shake(mode)`):** Shrinks context without a model call. `ShakeMode::Elide` replaces older tool results and large fenced/XML blocks outside the newest ~4k tokens with `[shaken ~N tokens; full text: artifact://<n>]` pointing to recoverable files in the session's `artifacts/` directory; `Images` and `Thinking` strip older media or reasoning blocks. Undo is an ordinary branch navigation to the entry before the shake.
+- **Manual `/shake` (`session.shake(mode)` or the `/shake <mode>` command):** Shrinks context without a model call. `ShakeMode::Elide` replaces older tool results and large fenced/XML blocks outside the newest ~4k tokens with `[shaken ~N tokens; full text: artifact://<n>]` pointing to recoverable files in the session's `artifacts/` directory; `Images` and `Thinking` strip older media or reasoning blocks. Undo is an ordinary branch navigation to the entry before the shake.
 - **One action per automatic pass:** When context tokens cross `W - reserve`, `axo` chooses either **recoverable clearing** (eliding tool results older than the newest 40k tokens of tool output when that frees at least 20k tokens below the trigger) or **summarization**, never both in the same pass.
 - **Live then separate summaries:** By default (`compaction.summaryRequest: "live"`), `axo` requests the checkpoint summary inside the live conversation with `ToolChoice::None` so the entire history hits the prompt cache, falling back to a standalone tool-free summarizer request (`"separate"`) if the response is rejected or triggered by context overflow. Recent user messages (within `keepRecentTokens`), tracked read/modified file lists, and the session file path carry over automatically.
 
@@ -57,7 +64,7 @@ The system prompt lives in the transcript as named `<section>` blocks (`system`,
 
 - **Replaceable prompt files:** `SYSTEM.md`, `WORK.md`, `PROSE.md`, and the five summarizer prompts can be overridden in `~/.axo/prompts/` or `<cwd>/.axo/prompts/`. Writing an empty `SYSTEM.md`, `WORK.md`, or `PROSE.md` disables that section.
 - **Ordered `contextFiles` & nested loading:** Startup loads `~/.axo/AGENTS.md` (and `~/.agents/AGENTS.md` when `homeAgentsDir: true`), then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, `.axo/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result without invalidating the system prompt cache.
-- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/` and user `~/.axo/skills/`. Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args`.
+- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/` and user `~/.axo/skills/`. Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic, is left out of the catalog, and `/name` runs the built-in.
 
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 
@@ -93,7 +100,7 @@ Configured exclusively in the user's `~/.axo/settings.jsonc` (a project cannot e
 
 ```rust
 use std::path::PathBuf;
-use axo::{Axo, RecoveryPolicy, SessionOptions};
+use axo::{Axo, PromptPart, RecoveryPolicy, SessionOptions};
 
 let axo = Axo::builder().build().await?;
 
@@ -110,6 +117,16 @@ let session = axo
 let mut events = session.attach(None).await.events;
 let outcome = session
     .prompt("Run the test suite and summarize any failures.")
+    .await?;
+
+// Structured parts: a file reference plus handed-over image bytes saved under `local://`.
+let outcome = session
+    .prompt(vec![
+        PromptPart::Text { text: "Compare ".into() },
+        PromptPart::File { path: "docs/design.png".into() },
+        PromptPart::Text { text: " with this screenshot: ".into() },
+        PromptPart::Content { name: "shot.png".into(), bytes: std::fs::read("/tmp/shot.png")? },
+    ])
     .await?;
 ```
 
@@ -128,9 +145,9 @@ axo/
 │       └── docs/                   # Bundled implementation reference for the `<docs>` system-prompt section
 │           ├── README.md           # Documentation index
 │           ├── configuration.md    # ~/.axo/ and .axo/ layout, settings.jsonc, models.jsonc, project access
-│           ├── prompts-and-context.md     # System prompt sections, prompt overrides, contextFiles, and skills
+│           ├── prompts-and-context.md     # System prompt sections, prompt overrides, contextFiles, skills, prompt parts
 │           ├── sessions-and-compaction.md # JsonlStore, projection, recovery, attach, /shake, and compaction
-│           └── extending.md        # Declarative files and Rust embedding traits
+│           └── extending.md        # Declarative files, Rust embedding (Session, commands), and extension traits
 └── plan/                           # Architecture design, pi port studies, and background research
     ├── design.md                   # Goals, non-goals, architecture, and settled core decisions
     ├── plan.md                     # Active planning, next tracks, and open design discussions
@@ -154,7 +171,10 @@ cargo fmt --check
 Drive a live or resumed session from the command line with the `drive` example:
 
 ```sh
-cargo run -p axo --example drive -- --cwd . --model zebes/qwen3.8-27b "Inspect crates/axo/src/lib.rs"
+cargo run -p axo --example drive -- --cwd . --model zebes/qwen3.8-27b "Inspect @crates/axo/src/lib.rs"
+cargo run -p axo --example drive -- --cwd . --attach /tmp/shot.png "What is in this image?"
+cargo run -p axo --example drive -- --cwd . --commands
+cargo run -p axo --example drive -- --resume ~/.axo/sessions/.../session.jsonl "/model openai-codex/gpt-6-luna"
 cargo run -p axo --example drive -- --resume ~/.axo/sessions/.../session.jsonl "/shake elide"
 ```
 

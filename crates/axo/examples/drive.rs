@@ -3,9 +3,13 @@
 //!
 //! `drive [--dir <AXO_DIR>] [--cwd <path>] [--model <provider/id>] [--thinking <level>]
 //! [--answer recommended|first] [--resume <session.jsonl> [--fork <entry-id>]]
-//! [--navigate <entry-id|root> [--summarize]] [--request-id <id>] [<prompt>]`
+//! [--navigate <entry-id|root> [--summarize]] [--request-id <id>] [--commands]
+//! [--attach <path>]... [<prompt>]`
 //!
-//! Standalone `/compact` and `/shake [elide|images|thinking]` perform maintenance.
+//! Built-in commands (`/compact`, `/shake images`, `/model <provider/id>`, …) and skills go
+//! through the prompt; `--commands` prints the command catalog as JSON and exits. Prompt
+//! words starting with `@` become file references (`@"path with spaces"` quoted; trailing
+//! punctuation is not part of the path); `--attach` hands a file's bytes over.
 //! `--resume` without a prompt only lets recovery/navigation finish.
 
 use std::io::Write;
@@ -15,14 +19,14 @@ use std::sync::Arc;
 
 use axo::store::{self, Entry, EntryId, SeqEntry};
 use axo::{
-    Answer, Axo, NavigateOptions, PromptRequest, PromptResult, Session, SessionEvent,
-    SessionOptions, ShakeMode,
+    Answer, Axo, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult, Session,
+    SessionEvent, SessionOptions,
 };
 use axo_agent::AgentEvent;
 use axo_ai::{AssistantBlock, AssistantEvent, ThinkingLevel, UserBlock};
 use serde_json::Value;
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::{broadcast, oneshot};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -51,6 +55,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut navigate = None;
     let mut summarize = false;
     let mut request_id = None;
+    let mut commands = false;
+    let mut attachments = Vec::new();
     let mut prompt = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -75,10 +81,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--summarize" => summarize = true,
             "--request-id" => request_id = Some(args.next().ok_or("--request-id needs an id")?),
+            "--commands" => commands = true,
+            "--attach" => {
+                attachments.push(PathBuf::from(args.next().ok_or("--attach needs a path")?))
+            }
             _ => prompt.push(arg),
         }
     }
-    let prompt = prompt.join(" ");
+    let mut parts = prompt_parts(&prompt.join(" "));
+    for path in &attachments {
+        let name = path
+            .file_name()
+            .ok_or_else(|| format!("--attach {} has no file name", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        if !parts.is_empty() {
+            parts.push(PromptPart::Text { text: " ".into() });
+        }
+        parts.push(PromptPart::Content {
+            name,
+            bytes: std::fs::read(path)?,
+        });
+    }
     if fork.is_some() && resume.is_none() {
         return Err("--fork needs --resume".into());
     }
@@ -91,20 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if navigate.is_some() && fork.is_some() {
         return Err("--navigate cannot be combined with --fork".into());
     }
-    let words: Vec<_> = prompt.split_whitespace().collect();
-    let maintenance = match words.as_slice() {
-        ["/compact"] => Some(None),
-        ["/compact", ..] => return Err("/compact takes no arguments".into()),
-        ["/shake"] | ["/shake", "elide"] => Some(Some(ShakeMode::Elide)),
-        ["/shake", "images"] => Some(Some(ShakeMode::Images)),
-        ["/shake", "thinking"] => Some(Some(ShakeMode::Thinking)),
-        ["/shake", ..] => return Err("/shake takes only elide, images, or thinking".into()),
-        _ => None,
-    };
-    if maintenance.is_some() && request_id.is_some() {
-        return Err("--request-id cannot be used with maintenance commands".into());
-    }
-    if prompt.is_empty() && resume.is_none() {
+    if parts.is_empty() && resume.is_none() && !commands {
         return Err("a prompt is required".into());
     }
 
@@ -126,12 +137,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => axo.create_session(options()).await?,
     };
     println!("session: {}", session.path().display());
+    if commands {
+        println!("{}", serde_json::to_string_pretty(&session.commands())?);
+        return Ok(());
+    }
     if let Some(id) = fork {
         let forked = session.fork(&EntryId::from(id)).await?;
         session = forked.session;
         println!("session: {}", session.path().display());
-        if let Some(text) = forked.editable_text {
-            println!("editable: {text}");
+        if let Some(parts) = forked.editable {
+            println!("editable: {}", serde_json::to_string(&parts)?);
         }
     }
     let session = Arc::new(session);
@@ -140,7 +155,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // let it settle first.
     let attach = session.attach(None).await;
     if attach.live.agent.running {
-        match print_events(session.clone(), attach.events, first).await {
+        match print_events(
+            session.clone(),
+            attach.events,
+            first,
+            std::future::pending(),
+        )
+        .await
+        {
             Some(outcome) => println!("[run] {outcome:?}"),
             None => println!("[run] unknown"),
         }
@@ -156,63 +178,124 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         result?;
     }
-    if let Some(mode) = maintenance {
-        let mut events = session.attach(None).await.events;
-        let result = match mode {
-            Some(mode) => session.shake(mode).await,
-            None => session.compact().await,
-        };
-        while let Ok(event) = events.try_recv() {
-            print_maintenance(&event);
-        }
-        print_system_sections(&session).await;
-        return result.map_err(Into::into);
-    }
-    if prompt.is_empty() {
+    if parts.is_empty() {
         print_system_sections(&session).await;
         return Ok(());
     }
 
     let events = session.attach(None).await.events;
-    let printer = tokio::spawn(print_events(session.clone(), events, first));
+    let (stop, stopped) = oneshot::channel();
+    let printer = tokio::spawn(print_events(session.clone(), events, first, async move {
+        if stopped.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }));
     let result = session
         .prompt_with(PromptRequest {
-            text: prompt,
+            input: PromptInput { parts },
             request_id,
         })
         .await;
+    if !matches!(result, Ok(PromptResult::Settled { .. })) {
+        // No `run_end` will come: print what is already queued, then stop.
+        let _ = stop.send(());
+    }
+    printer.await?;
     print_system_sections(&session).await;
     match result {
         Ok(PromptResult::Settled { outcome, .. }) => {
-            printer.await?;
             println!("[run] {outcome:?}");
             Ok(())
         }
         Ok(PromptResult::Duplicate(submission)) => {
-            printer.abort();
             println!("[duplicate] submission seq {}", submission.seq);
             Ok(())
         }
-        Err(error) => {
-            printer.abort();
-            Err(error.into())
+        Ok(PromptResult::Command) => {
+            println!("[command] done");
+            Ok(())
         }
+        Err(error) => Err(error.into()),
     }
 }
 
+/// Prompt text as parts, verbatim except for file references, which start at an `@` at the
+/// start of the text or after whitespace: `@"path"` runs to the next `"`, a bare `@path` to
+/// the next whitespace minus trailing `,.;:!?)`. A lone `@`, `@""`, or an unclosed `@"`
+/// stays text.
+fn prompt_parts(text: &str) -> Vec<PromptPart> {
+    let mut parts = Vec::new();
+    // `text[verbatim..]` is not yet in `parts`; `search` is where the next `@` is looked for.
+    let (mut verbatim, mut search) = (0, 0);
+    while let Some(offset) = text[search..].find('@') {
+        let at = search + offset;
+        search = at + 1;
+        if text[..at].ends_with(|c: char| !c.is_whitespace()) {
+            continue;
+        }
+        let after = &text[at + 1..];
+        let (path, end) = match after.strip_prefix('"') {
+            Some(quoted) => match quoted.find('"') {
+                Some(close) => (&quoted[..close], at + close + 3),
+                None => continue,
+            },
+            None => {
+                let word = &after[..after.find(char::is_whitespace).unwrap_or(after.len())];
+                let path = word.trim_end_matches([',', '.', ';', ':', '!', '?', ')']);
+                (path, at + 1 + path.len())
+            }
+        };
+        if path.is_empty() {
+            continue;
+        }
+        if verbatim < at {
+            parts.push(PromptPart::Text {
+                text: text[verbatim..at].into(),
+            });
+        }
+        parts.push(PromptPart::File { path: path.into() });
+        (verbatim, search) = (end, end);
+    }
+    if verbatim < text.len() {
+        parts.push(PromptPart::Text {
+            text: text[verbatim..].into(),
+        });
+    }
+    parts
+}
+
 /// Prints events and answers questions until the run's `run_end` entry; returns its
-/// outcome (`None` if the channel closed first).
+/// outcome (`None` if the channel closed first, or `stop` resolved and the queued events
+/// are printed).
 async fn print_events(
     session: Arc<Session>,
     mut events: broadcast::Receiver<SessionEvent>,
     first: bool,
+    stop: impl Future<Output = ()>,
 ) -> Option<store::RunOutcome> {
+    tokio::pin!(stop);
+    let mut stopping = false;
     let mut stdout = std::io::stdout();
     loop {
-        let event = match events.recv().await {
-            Ok(event) => event,
-            Err(RecvError::Lagged(_)) => continue,
-            Err(RecvError::Closed) => return None,
+        let event = if stopping {
+            match events.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return None,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                received = events.recv() => match received {
+                    Ok(event) => event,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return None,
+                },
+                () = &mut stop => {
+                    stopping = true;
+                    continue;
+                }
+            }
         };
         print_maintenance(&event);
         match event {

@@ -6,7 +6,7 @@
 
 By default, sessions are stored under `<AXO_DIR>/sessions/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`, where `<encoded-cwd>` replaces `/`, `\`, and `:` with `-`.
 
-- **Lazy file creation:** `Axo::create_session` reserves a planned path and `Header` in memory; the file and parent directory are created on disk only when the first entry is appended.
+- **Lazy file creation:** `Axo::create_session` reserves a planned path and `Header` in memory. The first submission or non-system message creates the file and parent directory, flushing earlier buffered metadata. A built-in command that only changes model or thinking settings does not by itself create a new session file.
 - **Single-writer lock:** Opening an existing session for writing (`JsonlStore::open_write`) acquires an exclusive non-blocking OS file lock (`std::fs::File::try_lock`) on `<session>.lock` (or the session file on creation). A second writer receives `Error::SessionBusy`. Read-only opens (`Axo::open_session_read`, `Axo::list_sessions`) take no lock.
 - **Torn-line repair:** If a crash leaves a final line without a trailing newline (or an unparseable truncated final line), `open_write` truncates the file back to the last complete line before appending.
 - **Sequence numbers (`SeqEntry`):** Every entry loaded or appended receives a 0-based monotonic `seq: u64` corresponding to its line index after the `Header`.
@@ -32,7 +32,7 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"â€¦","timestamp":"â
 | `run_start` | `Entry::RunStart { base, run_id }` | Marks the start of an agent run |
 | `run_end` | `Entry::RunEnd { base, run_id, outcome, reason }` | Marks a settled run (`done`, `aborted`, `error`, `interrupted`, `parked`) |
 | `run_resumed` | `Entry::RunResumed { base, run_id, attempt }` | Records a crash recovery resume attempt |
-| `submission` | `Entry::Submission { base, submission_id, kind, content, request_id }` | Durable `prompt`, `steer`, or `follow_up` input recorded before queueing |
+| `submission` | `Entry::Submission { base, submission_id, kind, parts, request_id }` | Durable `prompt`, `steer`, or `follow_up` input recorded before queueing. `parts` holds the prepared [prompt parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs) as sent (`Saved` instead of `Content`, skill commands unexpanded); the model-facing text lives on the user `message` entry. Older files wrote `content` (text blocks); it loads through `#[serde(alias = "content")]` as `Text` parts. Built-in commands write no submission |
 | *(unknown)* | `Entry::Unknown(Value)` | Preserved verbatim on load; ignored by projection |
 
 ## Projection (`crates/axo/src/store/project.rs`)
@@ -56,7 +56,7 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
   - If the last assistant response stopped with `StopReason::Length` and had tool calls, every unanswered call receives a truncated-output error result and the run continues.
   - If the last assistant response was a silent stop (`StopReason::Stop` with empty content and no tool calls), a retryable provider error, or a context overflow, recovery hides the failed assistant turn with `Entry::ContextEdit { replacement: None }` and resumes the run (consuming one retry budget slot or running overflow compaction).
   - A non-retryable failed or aborted response with unanswered tool calls gets not-executed (or `Operation aborted`) results before the run closes `Failed`/`Aborted`.
-- **Unconsumed submissions:** Any `Entry::Submission` saved after the last `RunEnd` (or during an open run) whose `submission_id` has not yet been consumed by an `Entry::Message` is requeued in order (`Steer`, `FollowUp`, or starting a new `Prompt` run).
+- **Unconsumed submissions:** Any `Entry::Submission` saved after the last `RunEnd` (or during an open run) whose `submission_id` has not yet been consumed by an `Entry::Message` is requeued in order (`Steer`, `FollowUp`, or starting a new `Prompt` run). Requeued messages are rendered again from the stored `parts`: a skill command is expanded from the current `SKILL.md`, and a saved image is re-read from `local://`.
 - **Restart loop cap (`MAX_CONSECUTIVE_RESUMES = 5`):** If a run accumulates 5 `Entry::RunResumed` markers in a row without an intervening `Entry::Message`, recovery appends `Entry::RunEnd { outcome: Parked }` and stops resuming it.
 
 ## Attaching, Navigating & Forking (`Session`)
@@ -70,11 +70,12 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
   - With `summarize: true`, first summarizes the abandoned branch (using a live summary request when navigating away from the active tip, or a separate request otherwise) and appends `Entry::BranchSummary` at `target`.
 - **`session.fork(entry_id)`:**
   - Copies the root-to-`entry_id` ancestor chain into a new session file whose `Header` records `parent_session` and `forked_from`.
-  - If `entry_id` is a user message, `fork` copies up to that user message's parent and returns the user message's text in `Fork::editable_text` so a client can prefill an editor. Any open run on the copied path is closed with `RunEnd { outcome: Interrupted, reason: Some("fork") }`.
+  - Copies the parent's side files into the fork's session directory: `artifacts/` (hard-linked read-only, copy fallback) and `local/` (copied), so `artifact://` and `local://` URLs, including saved prompt content, resolve in the fork. Copying is best effort; an entry that cannot be carried over is logged and skipped.
+  - If `entry_id` is a user message, `fork` copies up to that user message's parent and returns `Fork::editable: Option<Vec<PromptPart>>` so a client can prefill its editor, chips included: the parts of the `submission` that produced the message, or, for a message without one (older sessions), one `Text` part joining its text blocks. The returned parts can be resubmitted as-is (`Saved` parts resolve to the copied `local://` files). Any open run on the copied path is closed with `RunEnd { outcome: Interrupted, reason: Some("fork") }`.
 
 ## Manual `/shake` (`Session::shake`)
 
-`session.shake(mode)` shrinks projected context without calling a model:
+`session.shake(mode)` shrinks projected context without calling a model. It is also the [built-in command](prompts-and-context.md#user-commands-cratesaxosrccommandsrs) `/shake <mode>` (`elide`, `images`, or `thinking`; `ShakeMode` serializes lowercase). Like `compact` and `navigate`, it returns `Error::Busy` while a turn or maintenance is running:
 
 | `ShakeMode` | Behavior |
 | :--- | :--- |

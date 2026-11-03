@@ -223,7 +223,14 @@ fn clean_path(path: &str) -> Cow<'_, str> {
             '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
         )
     };
-    let path = path.strip_prefix('@').unwrap_or(path);
+    // `input::reference` writes paths containing whitespace as `@"path"`.
+    let path = match path.strip_prefix('@') {
+        Some(rest) => rest
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or(rest),
+        None => path,
+    };
     if path.contains(unicode_space) {
         Cow::Owned(path.replace(unicode_space, " "))
     } else {
@@ -391,4 +398,19 @@ pub async fn lock_file(path: &Path) -> OwnedMutexGuard<()> {
         }
     };
     lock.lock_owned().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_path;
+
+    #[test]
+    fn clean_path_accepts_references() {
+        assert_eq!(
+            clean_path("@\"local://my notes.txt\""),
+            "local://my notes.txt"
+        );
+        assert_eq!(clean_path("@notes.txt"), "notes.txt");
+        assert_eq!(clean_path("\"quoted\""), "\"quoted\"");
+    }
 }

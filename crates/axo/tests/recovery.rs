@@ -11,7 +11,7 @@ use axo::recovery::{RecoveryPlan, plan_recovery};
 use axo::store::{
     self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind,
 };
-use axo::{Axo, Session, SessionEvent, SessionOptions, Settings, StaticEnv};
+use axo::{Axo, PromptPart, Session, SessionEvent, SessionOptions, Settings, StaticEnv};
 use axo_agent::{AgentEvent, AgentMessage, Replay, RunOutcome};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
@@ -89,11 +89,20 @@ impl Log {
     }
 
     fn submission(&mut self, id: &str, kind: SubmissionKind, text: &str) -> SeqEntry {
+        self.submission_parts(id, kind, vec![PromptPart::Text { text: text.into() }])
+    }
+
+    fn submission_parts(
+        &mut self,
+        id: &str,
+        kind: SubmissionKind,
+        parts: Vec<PromptPart>,
+    ) -> SeqEntry {
         self.push(|base| Entry::Submission {
             base,
             submission_id: id.into(),
             kind,
-            content: vec![UserBlock::Text { text: text.into() }],
+            parts,
             request_id: None,
         })
     }
@@ -574,6 +583,120 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
     }
 }
 
+#[tokio::test]
+async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id":"m", "contextWindow":100000, "maxTokens":4096, "input":["text","image"]}]),
+        Settings::default(),
+        vec![ScriptedTurn::Reply(reply_text("reviewed"))],
+    )
+    .await;
+    let options = options(dir.path());
+    // A crash between saving a prompt (a skill command plus a saved image) and starting its run.
+    let mut log = Log::default();
+    log.user("s1", SubmissionKind::Prompt, "first");
+    log.run_start("r1");
+    log.assistant_text("first answer");
+    log.run_end("r1");
+    log.submission_parts(
+        "s2",
+        SubmissionKind::Prompt,
+        vec![
+            PromptPart::Text {
+                text: "/review notes.txt ".into(),
+            },
+            PromptPart::Saved {
+                url: "local://shot.png".into(),
+                image: true,
+            },
+        ],
+    );
+    let store = JsonlStore::new(dir.path().join("sessions"));
+    let mut writer = store
+        .create(store::Header::new(options.cwd.clone(), None, None))
+        .await
+        .unwrap();
+    let path = writer.planned_path().to_path_buf();
+    for entry in log.entries {
+        writer.append(entry.entry).await.unwrap();
+    }
+    drop(writer);
+    // Recovery reads both from disk: the skill as it is now, the image from `local://`.
+    let skill = dir.path().join("skills/review");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\ndescription: Review a file\n---\nReview $1 against the current checklist\n",
+    )
+    .unwrap();
+    let local = path.with_extension("").join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let mut png = Vec::new();
+    image::RgbaImage::new(1, 1)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(local.join("shot.png"), &png).unwrap();
+
+    let session = host.axo.open_session(&path, options).await.unwrap();
+    // The requeued prompt's run is spawned after `open_session` returns, so `live.run_id`
+    // may still be unset; recovery marks the session running first. Wait for the new
+    // run's `run_end`, whether already appended or still to come.
+    let mut attach = session.attach(None).await;
+    let ended =
+        |seq: &SeqEntry| matches!(&seq.entry, Entry::RunEnd { run_id, .. } if run_id != "r1");
+    if !attach.missed.iter().any(ended) {
+        assert!(
+            attach.live.agent.running,
+            "recovery did not requeue the prompt"
+        );
+        within(async {
+            loop {
+                if let SessionEvent::Entry(seq) = attach.events.recv().await.unwrap()
+                    && ended(&seq)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 1);
+    let user = requests[0]
+        .transcript
+        .messages()
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .expect("the requeued prompt");
+    match user.content.as_slice() {
+        [
+            UserBlock::Text { text },
+            UserBlock::Text { text: url },
+            UserBlock::Image { data, mime_type },
+        ] => {
+            assert!(text.contains("<skill name=\"review\""), "{text}");
+            assert!(
+                text.contains("Review notes.txt against the current checklist"),
+                "{text}"
+            );
+            assert!(text.contains("@local://shot.png"), "{text}");
+            assert!(url.starts_with("local://shot.png"), "{url}");
+            assert_eq!(mime_type, "image/png");
+            assert_eq!(
+                data.as_ref(),
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png)
+            );
+        }
+        other => panic!("requeued prompt blocks: {other:?}"),
+    }
+}
+
 #[test]
 fn foreign_tool_use_with_provider_overflow_recovers_before_replay() {
     let mut selected = model();
@@ -940,7 +1063,7 @@ async fn overflow_uses_separate_summary_once_and_never_repeats_successful_tools(
         )
         .await;
         let session = axo.create_session(bash_options(dir.path())).await.unwrap();
-        let outcome = within(session.prompt(&once_only_task())).await.unwrap();
+        let outcome = within(session.prompt(once_only_task())).await.unwrap();
         let entries = raw(&session).await;
         assert_once_succeeded(&entries);
         assert_eq!(
@@ -1008,7 +1131,7 @@ async fn silent_stop_without_calls_is_kept_and_not_answered_again() {
     .await;
     let session = axo.create_session(options(dir.path())).await.unwrap();
     assert_eq!(
-        within(session.prompt(&"retain this context ".repeat(400)))
+        within(session.prompt("retain this context ".repeat(400)))
             .await
             .unwrap(),
         RunOutcome::Done
@@ -1222,7 +1345,7 @@ async fn shutdown_after_overflow_checkpoint_reuses_it_and_preserves_queued_input
     let path = session.path().to_path_buf();
     let input = once_only_task();
     {
-        let prompt = session.prompt(&input);
+        let prompt = session.prompt(input.as_str());
         tokio::pin!(prompt);
         tokio::select! { result = &mut prompt => panic!("unexpected: {result:?}"), _ = within(async { while api.requests().len() < 4 { tokio::task::yield_now().await; } }) => {} }
     }
@@ -1362,7 +1485,7 @@ async fn reopening_silent_stop_reuses_only_completed_maintenance() {
         let path = session.path().to_path_buf();
         assert_eq!(
             session
-                .prompt(&"retain this context ".repeat(400))
+                .prompt("retain this context ".repeat(400))
                 .await
                 .unwrap(),
             RunOutcome::Done,

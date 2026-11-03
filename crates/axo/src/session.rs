@@ -14,7 +14,7 @@ use axo_agent::{
 };
 use axo_ai::thinking::clamp_level;
 use axo_ai::{
-    Accumulator, AssistantMessage, Message, Model, StopReason, Streamer, SystemMessage,
+    Accumulator, AssistantMessage, Message, Model, Models, StopReason, Streamer, SystemMessage,
     ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec, Usage, UserBlock, UserMessage, now_ms,
 };
 use futures::FutureExt;
@@ -23,14 +23,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
 use crate::config::{AxoDir, CompactionSettings, ProjectAccess, Settings, SummaryRequest};
 use crate::context::files::{ContextFile, NestedContext, context_file_names, load_context_files};
 use crate::context::prompt::{PromptInputs, Sections, build_sections, system_message};
-use crate::context::skills::{Skill, expand_skill_command, load_skills};
+use crate::context::skills::{Skill, load_skills};
 use crate::context::{home_agents_dir, project_root};
 use crate::error::Error;
 use crate::exec::ExecEnv;
+use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, command_text, prepare, render};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::Artifacts;
 use crate::schemes::dir::DirScheme;
@@ -96,7 +98,18 @@ pub enum RecoveryPolicy {
     MarkInterrupted,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ShakeMode {
     #[default]
     Elide,
@@ -148,7 +161,7 @@ pub enum SessionEvent {
 /// A prompt with an optional client id that makes resubmission idempotent.
 #[derive(Debug, Clone)]
 pub struct PromptRequest {
-    pub text: String,
+    pub input: PromptInput,
     pub request_id: Option<String>,
 }
 
@@ -163,6 +176,8 @@ pub enum PromptResult {
     /// The `request_id` was already submitted: the earlier `submission` entry. No run
     /// was started.
     Duplicate(SeqEntry),
+    /// The input was a built-in command; it ran and nothing was submitted.
+    Command,
 }
 
 /// A client's view when attaching: what it missed, the live state, and the events from
@@ -191,8 +206,8 @@ pub struct LiveSnapshot {
 /// A new session copied from a point of another.
 pub struct Fork {
     pub session: Session,
-    /// The text of the user message forked at, for the client to edit and resubmit.
-    pub editable_text: Option<String>,
+    /// The parts of the user message forked at, for the client to edit and resubmit.
+    pub editable: Option<Vec<PromptPart>>,
 }
 
 /// Everything `Axo` resolved for a new, opened or forked session.
@@ -202,6 +217,8 @@ pub(crate) struct SessionSetup {
     /// User settings merged with the project's.
     pub(crate) settings: Settings,
     pub(crate) streamer: Arc<dyn Streamer>,
+    /// Where `/model` looks up models.
+    pub(crate) models: Arc<Models>,
     pub(crate) model: Model,
     /// Already clamped to the model.
     pub(crate) thinking: ThinkingLevel,
@@ -238,6 +255,7 @@ pub struct Session {
     store: Arc<dyn SessionStore>,
     settings: Settings,
     streamer: Arc<dyn Streamer>,
+    models: Arc<Models>,
     ask_enabled: bool,
     // Prompt inputs, kept to rebuild the prompt when the exec environment or date changes.
     dir: AxoDir,
@@ -369,27 +387,9 @@ enum RunRequest {
     },
 }
 
-/// The user messages of requeued `submission` entries, registered in `log.pending` so
-/// their `message` entries carry the submission ids.
-fn requeued(log: &mut Log, requeue: Vec<SeqEntry>) -> Vec<(SubmissionKind, AgentMessage)> {
-    let mut queued = Vec::new();
-    for seq in requeue {
-        if let Entry::Submission {
-            submission_id,
-            kind,
-            content,
-            ..
-        } = seq.entry
-        {
-            let message = AgentMessage::Llm(Message::User(UserMessage {
-                content,
-                timestamp: now_ms(),
-            }));
-            log.pending.push((message.clone(), submission_id));
-            queued.push((kind, message));
-        }
-    }
-    queued
+/// Parses `parts` as a built-in command; `None` for ordinary input.
+fn parse_command(parts: &[PromptPart]) -> Option<Result<Command, Error>> {
+    command_text(parts).and_then(|text| Command::parse(&text))
 }
 
 /// Runs `request` and settles it. Callers spawn it, so the run ends (and `run_end` is
@@ -1542,6 +1542,7 @@ impl Session {
             cwd,
             settings,
             streamer,
+            models,
             model,
             thinking,
             exec,
@@ -1606,6 +1607,7 @@ impl Session {
             .iter()
             .chain(&file_diagnostics)
             .chain(&skill_diagnostics)
+            .chain(&commands::reserved_skill_diagnostics(&skills))
             .chain(&summary_diagnostics)
         {
             warn!("{diagnostic}");
@@ -1691,6 +1693,7 @@ impl Session {
             store,
             settings,
             streamer,
+            models,
             ask_enabled,
             dir,
             cwd,
@@ -1826,6 +1829,34 @@ impl Session {
         Ok(())
     }
 
+    /// The user messages of requeued `submission` entries, rendered from their parts
+    /// (skills re-expanded, images re-read) and registered in `log.pending` so their
+    /// `message` entries carry the submission ids.
+    async fn requeued(
+        &self,
+        log: &mut Log,
+        requeue: Vec<SeqEntry>,
+    ) -> Vec<(SubmissionKind, AgentMessage)> {
+        let mut queued = Vec::new();
+        for seq in requeue {
+            if let Entry::Submission {
+                submission_id,
+                kind,
+                parts,
+                ..
+            } = seq.entry
+            {
+                let message = AgentMessage::Llm(Message::User(UserMessage {
+                    content: render(&parts, &self.skills, &self.tool_state).await,
+                    timestamp: now_ms(),
+                }));
+                log.pending.push((message.clone(), submission_id));
+                queued.push((kind, message));
+            }
+        }
+        queued
+    }
+
     /// Acts on the recovery plan; returns what to run when a run resumes or requeued
     /// input is left.
     async fn recover(
@@ -1853,7 +1884,7 @@ impl Session {
                 if policy == RecoveryPolicy::MarkInterrupted {
                     return Ok(None);
                 }
-                let queued = requeued(log, requeue);
+                let queued = self.requeued(log, requeue).await;
                 if queued
                     .iter()
                     .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt))
@@ -1968,7 +1999,7 @@ impl Session {
                         response,
                         model,
                         results,
-                        queued: requeued(log, requeue),
+                        queued: self.requeued(log, requeue).await,
                     }));
                 }
             }
@@ -2027,7 +2058,9 @@ impl Session {
                     self.hooks.write(log, entry).await?;
                     log.run_id = Some(run_id);
                     self.hooks.running.send_replace(true);
-                    return Ok(Some(Resumption::Continue(requeued(log, requeue))));
+                    return Ok(Some(Resumption::Continue(
+                        self.requeued(log, requeue).await,
+                    )));
                 }
             }
         };
@@ -2106,40 +2139,80 @@ impl Session {
         &self.tool_state.schemes
     }
 
-    /// Expands a `/skill args` invocation, saves the submission, then runs the prompt;
-    /// returns when the run settles. `Error::Busy` while a run is active (use
+    /// The commands this session runs: built-ins, then its skills.
+    pub fn commands(&self) -> Vec<CommandInfo> {
+        commands::catalog(&self.skills)
+    }
+
+    /// Runs a built-in command under its policy: `model`/`thinking` alongside a turn,
+    /// `compact`/`shake`/`navigate` only when idle (`Error::Busy` otherwise).
+    pub async fn run_command(&self, command: Command) -> Result<(), Error> {
+        match command {
+            Command::Compact => self.compact().await,
+            Command::Shake { mode } => self.shake(mode).await,
+            Command::Model { model } => {
+                let model = self
+                    .models
+                    .find(&model)
+                    .ok_or_else(|| Error::ModelNotFound(model.clone()))?
+                    .clone();
+                self.set_model(model).await
+            }
+            Command::Thinking { level } => self.set_thinking(level).await.map(drop),
+            Command::Navigate { entry, summarize } => {
+                self.navigate(Some(entry), NavigateOptions { summarize })
+                    .await
+            }
+        }
+    }
+
+    /// Runs a built-in command, or expands a `/skill args` invocation, saves the
+    /// submission and runs the prompt; returns when the run settles (a built-in command
+    /// reports `Done` once it has run). `Error::Busy` while a run is active (use
     /// `steer`/`follow_up`).
-    pub async fn prompt(&self, text: &str) -> Result<RunOutcome, Error> {
+    pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunOutcome, Error> {
         match self
             .prompt_with(PromptRequest {
-                text: text.to_owned(),
+                input: input.into(),
                 request_id: None,
             })
             .await?
         {
             PromptResult::Settled { outcome, .. } => Ok(outcome),
+            PromptResult::Command => Ok(RunOutcome::Done),
             PromptResult::Duplicate(_) => unreachable!("a prompt without request id is new"),
         }
     }
 
     /// `prompt`, deduplicated by `request_id`: a request id that was already submitted
     /// returns its earlier submission and starts nothing, even while that run is active.
+    /// Built-in commands are not deduplicated.
     pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
-        let text = expand_skill_command(&request.text, &self.skills);
+        if let Some(command) = parse_command(&request.input.parts) {
+            self.run_command(command?).await?;
+            return Ok(PromptResult::Command);
+        }
+        // Fast path: a duplicate or busy prompt does no file or image work.
+        let existing = self.admit(&*self.hooks.log.lock().await, request.request_id.as_deref())?;
+        if let Some(existing) = existing {
+            return Ok(PromptResult::Duplicate(existing));
+        }
+        let (Prepared { parts, saved }, content) = self.prepare(request.input.parts).await?;
         let (submission, message) = {
             let mut log = self.hooks.log.lock().await;
-            if let Some(request_id) = &request.request_id
-                && let Some(existing) = log.entries.iter().find(|seq| {
-                    matches!(&seq.entry, Entry::Submission { request_id: Some(id), .. } if id == request_id)
-                })
-            {
-                return Ok(PromptResult::Duplicate(existing.clone()));
-            }
-            if *self.hooks.running.borrow() {
-                return Err(Error::Busy);
+            // Checked again: another prompt may have started while this one prepared.
+            if let Some(existing) = self.admit(&log, request.request_id.as_deref())? {
+                return Ok(PromptResult::Duplicate(existing));
             }
             let submitted = self
-                .submit(&mut log, SubmissionKind::Prompt, text, request.request_id)
+                .submit(
+                    &mut log,
+                    SubmissionKind::Prompt,
+                    parts,
+                    saved,
+                    content,
+                    request.request_id,
+                )
                 .await?;
             self.hooks.running.send_replace(true);
             submitted
@@ -2169,26 +2242,52 @@ impl Session {
         })
     }
 
-    /// Saves a `submission` entry for `text` and returns it with the user message it
-    /// becomes; that message's `message` entry will carry the submission id.
+    /// `Some(existing)` when `request_id` was already submitted; `Error::Busy` while a run is active.
+    fn admit(&self, log: &Log, request_id: Option<&str>) -> Result<Option<SeqEntry>, Error> {
+        if let Some(request_id) = request_id
+            && let Some(existing) = log.entries.iter().find(|seq| {
+                matches!(&seq.entry, Entry::Submission { request_id: Some(id), .. } if id == request_id)
+            })
+        {
+            return Ok(Some(existing.clone()));
+        }
+        if *self.hooks.running.borrow() {
+            return Err(Error::Busy);
+        }
+        Ok(None)
+    }
+
+    /// Validates `parts`, saves handed-over content, and renders the model blocks; runs
+    /// before the log lock so file and image work never stalls a running turn.
+    async fn prepare(&self, parts: Vec<PromptPart>) -> Result<(Prepared, Vec<UserBlock>), Error> {
+        let prepared = prepare(parts, &self.tool_state).await?;
+        let content = render(&prepared.parts, &self.skills, &self.tool_state).await;
+        Ok((prepared, content))
+    }
+
+    /// Saves a `submission` entry for `parts` and returns it with the user message of
+    /// `content`; that message's `message` entry will carry the submission id. `saved`
+    /// files stay only once the entry is written.
     async fn submit(
         &self,
         log: &mut Log,
         kind: SubmissionKind,
-        text: String,
+        parts: Vec<PromptPart>,
+        saved: SavedFiles,
+        content: Vec<UserBlock>,
         request_id: Option<String>,
     ) -> Result<(SeqEntry, AgentMessage), Error> {
-        let content = vec![UserBlock::Text { text }];
         let submission_id = Uuid::now_v7().to_string();
         let base = log.next_base();
         let entry = Entry::Submission {
             base,
             submission_id: submission_id.clone(),
             kind,
-            content: content.clone(),
+            parts,
             request_id,
         };
         let submission = self.hooks.write(log, entry).await?;
+        saved.keep();
         let message = AgentMessage::Llm(Message::User(UserMessage {
             content,
             timestamp: now_ms(),
@@ -2197,23 +2296,33 @@ impl Session {
         Ok((submission, message))
     }
 
-    /// Saves and queues a user message delivered after the current tool calls finish.
-    pub async fn steer(&self, text: &str) -> Result<(), Error> {
-        let mut log = self.hooks.log.lock().await;
-        let (_, message) = self
-            .submit(&mut log, SubmissionKind::Steer, text.to_owned(), None)
-            .await?;
-        self.agent.steer(message);
-        Ok(())
+    /// Saves and queues a user message delivered after the current tool calls finish; a
+    /// built-in command runs under its own policy instead.
+    pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
+        self.queue(SubmissionKind::Steer, input.into()).await
     }
 
-    /// Saves and queues a user message delivered when the run would otherwise end.
-    pub async fn follow_up(&self, text: &str) -> Result<(), Error> {
+    /// Saves and queues a user message delivered when the run would otherwise end; a
+    /// built-in command runs under its own policy instead.
+    pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
+        self.queue(SubmissionKind::FollowUp, input.into()).await
+    }
+
+    /// `steer`/`follow_up`: runs a built-in command, or saves the submission and hands
+    /// its message to the agent's queue for `kind`.
+    async fn queue(&self, kind: SubmissionKind, input: PromptInput) -> Result<(), Error> {
+        if let Some(command) = parse_command(&input.parts) {
+            return self.run_command(command?).await;
+        }
+        let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
         let mut log = self.hooks.log.lock().await;
         let (_, message) = self
-            .submit(&mut log, SubmissionKind::FollowUp, text.to_owned(), None)
+            .submit(&mut log, kind, parts, saved, content, None)
             .await?;
-        self.agent.follow_up(message);
+        match kind {
+            SubmissionKind::FollowUp => self.agent.follow_up(message),
+            SubmissionKind::Prompt | SubmissionKind::Steer => self.agent.steer(message),
+        }
         Ok(())
     }
 
@@ -2418,9 +2527,9 @@ impl Session {
 
     /// Copies the root→`entry_id` path into a new session file that records this one as
     /// its parent. Forking at a user message copies the path to its parent and returns
-    /// the message's text to edit and resubmit.
+    /// the message's parts to edit and resubmit.
     pub async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error> {
-        let (path, editable_text, model, thinking) = {
+        let (path, editable, model, thinking) = {
             let log = self.hooks.log.lock().await;
             let index: HashMap<&str, &SeqEntry> = log
                 .entries
@@ -2430,23 +2539,37 @@ impl Session {
             let target = index
                 .get(entry_id.as_str())
                 .ok_or_else(|| Error::EntryNotFound(entry_id.to_string()))?;
-            let (next, editable_text) = match &target.entry {
+            let (next, editable) = match &target.entry {
                 Entry::Message {
                     message: AgentMessage::Llm(Message::User(user)),
                     base,
-                    ..
-                } => (
-                    base.parent_id.as_ref().map(EntryId::as_str),
-                    Some(
-                        user.content
-                            .iter()
-                            .filter_map(|block| match block {
-                                UserBlock::Text { text } => Some(text.as_str()),
-                                UserBlock::Image { .. } => None,
-                            })
-                            .collect::<String>(),
-                    ),
-                ),
+                    submission_id,
+                } => {
+                    let submitted = submission_id.as_deref().and_then(|wanted| {
+                        log.entries.iter().find_map(|seq| match &seq.entry {
+                            Entry::Submission {
+                                submission_id,
+                                parts,
+                                ..
+                            } if submission_id == wanted => Some(parts.clone()),
+                            _ => None,
+                        })
+                    });
+                    // Messages without a submission (older sessions) offer their text.
+                    let parts = submitted.unwrap_or_else(|| {
+                        vec![PromptPart::Text {
+                            text: user
+                                .content
+                                .iter()
+                                .filter_map(|block| match block {
+                                    UserBlock::Text { text } => Some(text.as_str()),
+                                    UserBlock::Image { .. } => None,
+                                })
+                                .collect(),
+                        }]
+                    });
+                    (base.parent_id.as_ref().map(EntryId::as_str), Some(parts))
+                }
                 entry => (entry.id(), None),
             };
             let path = next
@@ -2461,7 +2584,7 @@ impl Session {
                         .map(|index| log.entries[index].entry.clone())
                         .collect()
                 });
-            (path, editable_text, log.model.clone(), log.thinking)
+            (path, editable, log.model.clone(), log.thinking)
         };
 
         let header = Header::new(
@@ -2526,6 +2649,7 @@ impl Session {
             cwd: self.cwd.clone(),
             settings: self.settings.clone(),
             streamer: self.streamer.clone(),
+            models: self.models.clone(),
             model,
             thinking,
             exec: self.exec.clone(),
@@ -2542,10 +2666,7 @@ impl Session {
             recovery: None,
         })
         .await?;
-        Ok(Fork {
-            session,
-            editable_text,
-        })
+        Ok(Fork { session, editable })
     }
 
     /// Drops the cached project environment and resolves it again now. When its prompt

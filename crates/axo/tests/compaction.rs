@@ -1066,7 +1066,9 @@ async fn three_valid_but_insufficient_summaries_cannot_commit_over_budget() {
     .await;
     let oversized_user = "whole new request ".repeat(2500);
     assert!(matches!(
-        within(session.prompt(&oversized_user)).await.unwrap(),
+        within(session.prompt(oversized_user.as_str()))
+            .await
+            .unwrap(),
         RunOutcome::Failed(_)
     ));
     let raw = entries(&axo, &session).await;

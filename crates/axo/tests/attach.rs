@@ -83,7 +83,7 @@ async fn prompt_with_a_repeated_request_id_submits_and_runs_once() {
     let axo = axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("hi"))]).await;
     let session = axo.create_session(options(dir.path())).await.unwrap();
     let request = PromptRequest {
-        text: "hello".into(),
+        input: "hello".into(),
         request_id: Some("r1".into()),
     };
 

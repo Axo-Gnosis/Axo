@@ -191,7 +191,7 @@ async fn disabled_automatic_maintenance_still_allows_explicit_compact_and_shake_
             .join("\n")
     );
     assert_eq!(
-        within(session.prompt(&task)).await.unwrap(),
+        within(session.prompt(task)).await.unwrap(),
         RunOutcome::Done
     );
     let raw = session.attach(None).await.missed;
