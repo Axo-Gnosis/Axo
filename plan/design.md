@@ -21,7 +21,7 @@ axo deliberately goes beyond pi where an embedded, always-on Rust library needs 
 ## Goals
 
 1. **Own the core.** Keep the agent loop, sessions and tool contracts small enough to understand completely. Use libraries for plumbing, not for the core.
-2. **Stay headless and host-agnostic.** axo is a Rust library first. A small binary speaks ACP for everything else. No terminal UI, and no knowledge of any particular host (Sworm is one host using axo as a library).
+2. **Stay headless and host-agnostic.** axo is a Rust library first. A small binary speaks ACP for everything else. No terminal UI, and no knowledge of any particular host (Axome is one host using axo as a library).
 3. **Stay light.** Many sessions run in one process. Memory per session matters: the target is for three sessions in one process to stay well under three `pi --mode rpc` processes (160–209 MiB PSS; measured at ~92 MiB in [`research/README.md`](research/README.md#memory-measurements)).
 4. **Survive restarts.** A host restart or crash mid-turn or mid-tool must not corrupt the session or silently drop a run.
 5. **Make extending easy at every layer.** Declarative `.agents/` files, Rust traits for library hosts, an embedded JS sandbox for model-written scripts (codemode), and a Bun extension host for third-party TypeScript extensions.
@@ -49,7 +49,7 @@ flowchart LR
   subgraph C["axo (Rust crates)"]
     L["axo-ai · axo-agent · axo (sessions, tools, sandbox)"]
   end
-  S["Rust hosts (e.g. Sworm)"] --> C
+  S["Rust hosts (e.g. Axome)"] --> C
   X["External TS extensions"] <-->|JSON over stdio| H["Bun extension host"] <--> C
   R["ACP clients (editors)"] -->|ACP over stdio| A["axo-acp binary"] --> C
 ```
@@ -114,7 +114,7 @@ Full operational details live in [`crates/axo/docs/`](../crates/axo/docs/README.
 ## Ways to extend axo
 
 1. **Declarative files (`.agents/` and `.axo/`):** `AGENTS.md`, `SKILL.md`, prompt overrides, `models.jsonc`, and later agent role files (`.agents/agents/*.md`).
-2. **Rust traits (for hosts like Sworm):** `Tool`, `LoopHooks`, `ExecEnv`, `SessionStore`, `Api`, `Streamer`, and `CredentialStore`.
+2. **Rust traits (for hosts like Axome):** `Tool`, `LoopHooks`, `ExecEnv`, `SessionStore`, `Api`, `Streamer`, and `CredentialStore`.
 3. **Embedded script sandbox (`codemode`):** stateless JavaScript scripts running in an embedded engine (such as QuickJS) whose only powers are calling tools. Later, scripts may also define session tools and configure the harness of spawned subagents; see [`plan.md`](plan.md).
 4. **External TypeScript extensions (Bun host):** when third-party extensions need full runtime access (`fetch`, filesystem, processes, npm, OAuth callback servers), axo runs one shared Bun process over stdio against a typed `@axo/sdk`.
 5. **MCP servers:** external tool servers configured in `.mcp.json` / `mcp.json` / `~/.axo/mcp.json`, plugged into the tool registry.

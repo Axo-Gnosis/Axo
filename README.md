@@ -2,7 +2,7 @@
 
 **An embeddable, headless coding-agent harness core in Rust.**
 
-`axo` is built to be linked directly into Rust hosts such as [Sworm](https://github.com/tophc7/Sworm), running many durable agent sessions in a single process (~92 MiB PSS live) without a sidecar runtime or terminal UI.
+`axo` is built to be linked directly into Rust hosts such as [Axome](https://github.com/tophc7/Axome), running many durable agent sessions in a single process (~92 MiB PSS live) without a sidecar runtime or terminal UI.
 
 It ports [pi](https://github.com/earendil-works/pi) v1.3.0's core architecture—a sectioned system prompt stored in the transcript, delta-only streaming events, a tool-calling agent loop, and an append-only JSONL session tree—while adding crash recovery, recoverable `/shake` and cache-preserving compaction, cached Nix flake dev shells, and granular project access controls.
 

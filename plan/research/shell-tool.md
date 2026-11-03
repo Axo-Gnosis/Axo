@@ -96,7 +96,7 @@ Cost is a rough estimate of Rust lines for axo.
 | 3 | `cwd` param plus leading-`cd` extraction | Model ergonomics, approval matching | **Skip for M3.** `cd x && …` works in a fresh process. Revisit if approvals arrive. | 40 |
 | 4 | Default timeout 300 s (pi has none) | Hung commands | **Keep axo's decision** (no default). Note that it becomes safe in practice once #5 exists. | 0 |
 | 5 | Auto-background at 60 s plus `async` plus follow-up delivery plus `wait` | Long builds and tests don't block the turn; steering stays responsive | **Later**, with the `wait` tool. **Shape the seam now** (see the end of this report). | 600-900 |
-| 6 | Named services (`name`/`ready`, `proc://`) | Dev servers and watchers stay observable | **Later**, after #5. Sworm may own services instead. | 500+ |
+| 6 | Named services (`name`/`ready`, `proc://`) | Dev servers and watchers stay observable | **Later**, after #5. Axome may own services instead. | 500+ |
 | 7 | SIGTERM, 1 s grace, then SIGKILL (pi: SIGKILL at once) | Lets cargo/tests/servers clean up locks and temp files | **Adopt in M3.** | ~15 |
 | 8 | Non-interactive env table (pagers=cat, EDITOR=true, GIT_TERMINAL_PROMPT=0, SSH_ASKPASS, npm/pip/cargo flags, `CI=true`, `NO_COLOR`, `TERM=dumb`) | Stops hangs on prompts and pagers and noisy progress bars | **Adopt in M3** as a static table under the process env. `CI=true` behind a setting, since it changes some tools' behavior. | ~60 |
 | 9 | Inline output = 20 KB head plus tail (pi: tail only) | The first compiler error is usually at the top | **Adopt in M3.** This revises core.md's "bash keeps the tail". Spool unchanged. | ~40 |
@@ -149,13 +149,13 @@ On this machine, home-manager manages both shells.
 - **Capture cost.** `fish -l -c 'env -0'` takes about 100 ms. `bash -l` takes about 3 ms.
 - **An inherited PATH (e.g. from `nix develop`) survives both `bash -l` and `fish -l`** (tested with `PATH=/devshell/bin:$PATH`).
 
-So for Toph the env problem is small. It only matters when axo isn't started from a terminal: Sworm launched from the desktop, or as a systemd user service, gets a minimal env.
+So for Toph the env problem is small. It only matters when axo isn't started from a terminal: Axome launched from the desktop, or as a systemd user service, gets a minimal env.
 
 ### 3.4 Options
 
 - **(a) Real bash, inheriting the user's environment.** The model writes the dialect it knows best, which is the dialect the tool says it runs.
   - **Launched from a fish terminal or `nix develop`:** inheriting the process env is already right. That is what pi does, and it costs nothing.
-  - **Launched headless:** the *host* supplies the env. Sworm can capture it once with `$SHELL -l -c 'env -0'`, about 100 ms per process, cached. axo exposes this as an opt-in setting such as `shellEnv: "inherit" | "login"`; the field name is illustrative.
+  - **Launched headless:** the *host* supplies the env. Axome can capture it once with `$SHELL -l -c 'env -0'`, about 100 ms per process, cached. axo exposes this as an opt-in setting such as `shellEnv: "inherit" | "login"`; the field name is illustrative.
   - **Never capture by default.** Capturing would override a `nix develop` env with the login env.
 - **(b) Run fish and call the tool `fish`.** This respects the user's shell, but:
   - it loses the trained-in `bash` tool prior;
@@ -173,7 +173,7 @@ So for Toph the env problem is small. It only matters when axo isn't started fro
 - **Option (a).** The tool is named **`bash`** and always runs real GNU bash.
 - **Resolving bash.** Use `shellPath` if set (documented as "must be bash-compatible"), otherwise `bash` on PATH, otherwise `/bin/bash`, otherwise `sh`. Prefer PATH over `/bin/bash`: NixOS has no `/bin/bash`, and inside `nix develop` PATH bash is the project's.
 - **Never read `$SHELL`.** Never put the user's login shell in the system prompt. The tool description should say "Runs in bash (not your login shell)".
-- **Env.** Inherit the process env by default. Add an opt-in login-env capture via `$SHELL -l -c 'env -0'`, run once and cached, for hosts like Sworm that start headless. Cost: about 40 lines, which could land in M3 or right after.
+- **Env.** Inherit the process env by default. Add an opt-in login-env capture via `$SHELL -l -c 'env -0'`, run once and cached, for hosts like Axome that start headless. Cost: about 40 lines, which could land in M3 or right after.
 - **If fish is ever needed,** the model can run `fish -c '…'` inside bash.
 - **Persistent scripts Axo writes for Toph stay fish.** That is a prompt/AGENTS.md rule, unrelated to the tool's runtime.
 
@@ -201,5 +201,5 @@ Keep pi's schema `{command, timeout?}`, no default timeout, stateless processes,
 
 1. **The exec seam returns a running handle,** not a finished future: output stream/spool, `wait()`, `kill(grace)`, pid/pgid. A session-level process registry owns it, not the tool-call future. Auto-backgrounding then just means "stop awaiting, keep the handle, register a job". ACP terminal and SSH become alternative handle backends.
 2. **A background completion is a submission.** Use the existing follow-up queue, as core.md:326 already intends, with a distinct kind (`job_result{job_id}`) so `wait` can consume it and steering can interrupt a foreground wait. That is omp's "steer → background early" behaviour (`OMP/tools/bash.ts:1239-1245`), and it falls out of the loop's steering signal.
-3. **The env comes from the host** through the exec seam (`SessionOptions`/exec-backend env), so Sworm can inject a captured login env without axo reading dotfiles.
+3. **The env comes from the host** through the exec seam (`SessionOptions`/exec-backend env), so Axome can inject a captured login env without axo reading dotfiles.
 4. **Durability.** A running job's spool path and job id are recorded in the session log. Recovery reports "bg_N interrupted, partial output at …", the same way `Replay::Never` reports an interrupted bash call today.

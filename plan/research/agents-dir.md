@@ -116,7 +116,7 @@ pi is much narrower. The only `.agents/` path it knows is `skills/` (`core/packa
   - Gives axo: the largest existing library (Toph's `~/.agents/skills`, public skill repos) for about 100 tokens per skill.
   - It needs no new tool: `read` is enough. **Already planned for M3.**
 - **Command / prompt template.** A macro the *user* types (`/commit fix the auth bug`). The harness pastes the file with arguments substituted and sends it as the user message. The model never sees a list of commands.
-  - Gives axo: Toph's `/cleanup`, `/review:adversarial`, `/commit`, `/pr` workflows, exposed through ACP `availableCommands` to Zed and Sworm. **Already planned for M3.**
+  - Gives axo: Toph's `/cleanup`, `/review:adversarial`, `/commit`, `/pr` workflows, exposed through ACP `availableCommands` to Zed and Axome. **Already planned for M3.**
 - **Rule.** A conditional context file: "when touching `*.sql`, follow this."
   - The variants are always-in-prompt, listed-by-description (the model reads it if relevant, much like a skill), or triggered by a pattern in the model's output (omp TTSR, a mid-stream interrupt).
   - Gives axo: little beyond what AGENTS.md plus skills already cover. The only distinct behavior is TTSR, which is a loop feature, not a file format.
@@ -134,7 +134,7 @@ pi is much narrower. The only `.agents/` path it knows is `skills/` (`core/packa
 - **Trust.**
   - axo loads project files without asking (core.md:374).
   - Skills and commands are instructions, not code, so the agentskills guidance and pi's gating are about prompt injection from a cloned repo.
-  - That is acceptable for Toph's own repos. A host like Sworm may want a `trust_project: bool` on the context struct so it can skip project `.agents/` (cheap to add now). [INFERENCE: no current axo struct for this; check `axo` config types.]
+  - That is acceptable for Toph's own repos. A host like Axome may want a `trust_project: bool` on the context struct so it can skip project `.agents/` (cheap to add now). [INFERENCE: no current axo struct for this; check `axo` config types.]
 - **Walk direction.** core.md walks context files up to the git root. pi, Codex and omp do the same for `.agents/skills`, so the same root-bounded walk can serve every `.agents/*` kind.
 - **`.agent/` singular.** omp reads it; nobody else does (Amp reads `AGENT.md`, the file). Skip it.
 - **Name strictness.** The spec requires `name` == directory name. pi warns only, and omp accepts no description in the `agents` provider. Use lenient parsing: drop a skill only if the description is missing.
@@ -171,7 +171,7 @@ pi is much narrower. The only `.agents/` path it knows is `skills/` (`core/packa
 1. **One discovery helper**, `agents_dirs(cwd, git_root, home) -> Vec<(PathBuf, Scope)>`. It walks cwd→git root, appends `~/.axo` and `~/.agents`, and is reused by skills, commands, and later agent definitions. That keeps the walk rule in one place, as omp's `getProjectPathCandidates` does (agents.ts:124-155).
 2. **Plain host-buildable structs** `Skill{name, description, path, base_dir, model_invocable}` and `Template{name, description, argument_hint, body, path}` (core.md:342). Every loader returns diagnostics, not errors.
 3. **`skill_content` boundary.** Wrap `/skill:` expansions in `<skill name location>` tags (pi already does). M5 compaction can then recognize and protect that text, as the agentskills guide advises.
-4. **A `project_resources: bool` (or trust) switch** on the loader input, so hosts like Sworm can disable project `.agents/` for untrusted repos before a real trust gate exists.
+4. **A `project_resources: bool` (or trust) switch** on the loader input, so hosts like Axome can disable project `.agents/` for untrusted repos before a real trust gate exists.
 5. **Fix the two core.md lines** above: line 325, roles are "under `.agents/agents/` (axo convention, no cross-tool standard yet)"; line 289, add `~/.axo/commands` and the `prompts/` alias.
 
 Not recommended: `.agent/` (singular), `.claude/*` or `.codex/*` discovery, `.agents/rules`, `.agents/SYSTEM.md`, or TOML commands/agents. Each adds a format nobody in Toph's workflow writes.

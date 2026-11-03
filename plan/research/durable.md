@@ -1,6 +1,6 @@
-# pi-durable vs. what axo needs for an always-on agent in sworm-server
+# pi-durable vs. what axo needs for an always-on agent in axome-server
 
-Sources: pi v1.3.0 at `/tmp/pi-src` (paths below are relative to `packages/`), axo `plan/design.md`, Sworm `.sworm/plans/OVERVIEW_AGENT_PLATFORM_PLAN.md` (abbreviated **SP**). The `phase4-runtime.md` notes cover ACP adapter provisioning only (adapter versions, auth, ports). They have nothing on durability, so they are cited once at most.
+Sources: pi v1.3.0 at `/tmp/pi-src` (paths below are relative to `packages/`), axo `plan/design.md`, Axome `.axome/plans/OVERVIEW_AGENT_PLATFORM_PLAN.md` (abbreviated **SP**). The `phase4-runtime.md` notes cover ACP adapter provisioning only (adapter versions, auth, ports). They have nothing on durability, so they are cited once at most.
 
 ---
 
@@ -116,25 +116,25 @@ It is **not** a workflow engine with deterministic replay (Temporal-style), and 
 
 ---
 
-## 3. What an always-on agent in sworm-server needs
+## 3. What an always-on agent in axome-server needs
 
-Sworm context:
+Axome context:
 - Phase 6 wants "server-owned chat sessions [that] survive client disconnects (agent processes stay up). Desktop and browser clients attach and detach" (SP:411).
 - Its acceptance test: close the desktop → a webhook starts a run → a permission prompt fires a notifier → reopen and approve → the run settles (SP:419-423).
-- Triggers and schedules live in a `sworm-core` Host service (SP:395). The plan also requires **one writer per session** (SP:73).
+- Triggers and schedules live in an `axome-core` Host service (SP:395). The plan also requires **one writer per session** (SP:73).
 
-**What changes with axo.** The plan assumes harnesses are external ACP processes and that "Sworm never owns harness state" (SP:67). Embedding axo makes the *sworm-server process itself* the agent. A systemd restart, an upgrade or a crash therefore kills every live run unless axo recovers on open. If axo instead runs as the `axo` ACP binary under the agent pool, the same holds for that process.
+**What changes with axo.** The plan assumes harnesses are external ACP processes and that "Axome never owns harness state" (SP:67). Embedding axo makes the *axome-server process itself* the agent. A systemd restart, an upgrade or a crash therefore kills every live run unless axo recovers on open. If axo instead runs as the `axo` ACP binary under the agent pool, the same holds for that process.
 
 | Need | pi-durable gives | axo `core.md` already gives | Gap for axo |
 |---|---|---|---|
 | **Survive a server restart mid-run** | Yes, fully: task checkpoints, generation re-request, tool replay policy, restart limit | A finished message is appended on `MessageEnd` before the next request (`core.md:138`). The projection is the source of truth (`:165`). Torn-line repair (`:180`). | No record that a run *was in progress*, so there is nothing to resume. Dangling tool calls get synthetic results at best. No restart-loop guard. |
-| **Detached runs (no client)** | Runs are tasks owned by the Harness, independent of any watcher | `Session` is headless and `prompt()` is a library call (`core.md:250-257`) | Run lifetime must not depend on subscribers (see the next row). The host needs a registry of live sessions (Sworm's side). |
+| **Detached runs (no client)** | Runs are tasks owned by the Harness, independent of any watcher | `Session` is headless and `prompt()` is a library call (`core.md:250-257`) | Run lifetime must not depend on subscribers (see the next row). The host needs a registry of live sessions (Axome's side). |
 | **Many clients attach, detach and catch up** | Current view (committed state, including the 100 ms partial and tool output) plus ops. No replay; a 100-frame lag cap, then a snapshot. | One typed event stream. **Subscribers are awaited in order for back-pressure** (`core.md:138`). | A slow or remote client would stall the loop. There is no cursor on entries and no in-memory "live state" snapshot to hand a late joiner. |
-| **Scheduled and triggered prompts** | Durable sleeps and `onWake`. Inbox plus `requestId` dedupe. | Steer and follow-up queues in memory (`core.md:146-148`) | Queued prompts are lost on restart, and nothing prevents a duplicate trigger (one fired before *and* after a restart). Cron belongs to Sworm (SP:385-395), not axo. |
+| **Scheduled and triggered prompts** | Durable sleeps and `onWake`. Inbox plus `requestId` dedupe. | Steer and follow-up queues in memory (`core.md:146-148`) | Queued prompts are lost on restart, and nothing prevents a duplicate trigger (one fired before *and* after a restart). Cron belongs to Axome (SP:385-395), not axo. |
 | **Background subagents** | Ownership tree, background boundary, abort cascade, reporter tasks with idempotent delivery | Child sessions are a stated goal (`design.md:20`, `:49`) | Child↔parent links must be persisted, spawning must be idempotent per tool call, and the result must be delivered back once. |
 | **Crash-safe tool execution** | Intent committed before execute; `safe` reruns; `interrupted` result with the output so far | Decision 3 records "aborted" results for interrupted calls (`core.md:288-289`) | No per-tool replay policy. Shutdown and user-abort are not distinguished. Bash children may outlive a crashed server [INFERENCE]. |
 | **Approvals while unattended** (SP:412-415) | (none) | `before_tool_call` hook may block (`design.md:146`) | Waiting for approval *before* execute is naturally replay-safe, because nothing ran. On restart the call is simply asked again. |
-| **One writer per session** | None (`README.md:790`) | (none) | Two processes (sworm-server plus an `axo` ACP binary, or a second server instance) appending to one JSONL corrupt the tree. |
+| **One writer per session** | None (`README.md:790`) | (none) | Two processes (axome-server plus an `axo` ACP binary, or a second server instance) appending to one JSONL corrupt the tree. |
 | **Leaf survives restart / multiple clients** | (n/a: linear transcript with forks) | Decision 4 keeps pi's rule: the leaf is the last line, so a navigation that appends nothing is lost on restart (`core.md:290-291`) | A server with several clients needs a persisted leaf. |
 
 **Main conclusion.** axo already has the hard part pi-durable builds generically: an append-only transcript that is the source of truth, with the finished assistant message (which carries its tool calls) persisted *before* those tools run. That message **is** the durable intent. What axo lacks is small:
@@ -156,7 +156,7 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
 |---|---|
 | The effect-sandwich *rule* for tools: intent persisted, then effect, then result, plus `Replay::{Never, Safe}` | General task state machines, phases, memos, migrations, handover on registry reload. These exist so *extensions* can define durable workflows; axo has one loop. |
 | `requestId` idempotent submissions | Chord documents and op-logs, rewindable documents, bases and checkpoints. axo's entries plus projection already are its state. |
-| Restart-limit parking of crash loops | Committing streaming partials every 100 ms. The write amplification only pays off on evictable hosts (Durable Objects). A sworm-server is a long-lived process where crashes are rare; losing one in-flight response and sending it again is acceptable. |
+| Restart-limit parking of crash loops | Committing streaming partials every 100 ms. The write amplification only pays off on evictable hosts (Durable Objects). An axome-server is a long-lived process where crashes are rare; losing one in-flight response and sending it again is acceptable. |
 | "Graceful close ≠ crash": shutdown leaves runs resumable | Structured-concurrency tree, `completing` holds, wait-for cycle detection, `onWake`, multi-backend storage (IndexedDB, Durable Objects) |
 
 ### 4.2 Build in M1–M4 (so nothing is retrofitted)
@@ -176,7 +176,7 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
 4. **Split event delivery.**
    - Keep the *ordered, awaited* subscriber for **persistence only**. It must finish before the next request (`core.md:138`).
    - Host and client fan-out goes through a bounded `tokio::sync::broadcast`. A lagging receiver gets `Lagged`, then resyncs from a snapshot (pi's 100-frame rule, `observation.ts:16`).
-   - This removes the "a slow client stalls the agent" hazard before Sworm ever exists.
+   - This removes the "a slow client stalls the agent" hazard before Axome ever exists.
 
 **M3: tools**
 5. **bash child lifetime.**
@@ -195,7 +195,7 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
    Leaf { entry_id }                   // persist navigation; this changes decision 4
    ```
    Cost: a few short lines per run, against pi-durable's task-record rewrite per phase.
-7. **The `request_id` index** is built on load (`HashMap<String, SubmissionId>`). `session.submit(Submission { request_id, … })` returns the existing id when the request id is a duplicate. Sworm triggers pass `request_id = "<task>:<event-id>"`; subagent reporters pass `"<child-run>:report"`.
+7. **The `request_id` index** is built on load (`HashMap<String, SubmissionId>`). `session.submit(Submission { request_id, … })` returns the existing id when the request id is a duplicate. Axome triggers pass `request_id = "<task>:<event-id>"`; subagent reporters pass `"<child-run>:report"`.
 8. **`recover()` runs on open** when the last `RunStart` has no `RunEnd`:
    1. Count consecutive `RunResumed` entries with no new message entry in between. At or above `restart_limit` (default 5), append `RunEnd{Interrupted{reason:"restart_limit"}}`, report it and stop. The host can offer "retry" (pi: `retryTask`, `spec.md:2204`).
    2. For each tool call in the last assistant message without a result:
@@ -207,14 +207,14 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
    4. Append `RunResumed` and call `continue_run`. A torn assistant message never reached the file (it is only persisted on `MessageEnd`), so the request is simply sent again.
 
    The *host* picks the policy, `RecoverPolicy::{Resume, MarkInterrupted}`:
-   - sworm-server uses `Resume`;
+   - axome-server uses `Resume`;
    - the interactive ACP binary probably uses `MarkInterrupted`, appending `RunEnd{Interrupted}` and letting the user decide.
 9. **Single writer.**
    - `Session::open` takes `File::try_lock()` (std, stable since Rust 1.89: https://releases.rs/docs/1.89.0/) on the session file, or on a sidecar `.lock` file if `SessionStore` is not file-backed.
    - Read-only opens (listing, ACP `session/list`) take no lock or a shared one.
    - An flock is released when the process dies, which gives exactly the crash semantics needed with no lease expiry.
    - A real lease with heartbeat and fencing token is only needed if storage is ever shared across hosts: defer it.
-   - Expose the error as `SessionBusy { holder_pid }`. This enforces Sworm's "one writer per session" (SP:73) at the storage level.
+   - Expose the error as `SessionBusy { holder_pid }`. This enforces Axome's "one writer per session" (SP:73) at the storage level.
 10. **Event cursor.**
     - Each entry gets `seq: u64`, its ordinal position in the append-only file. Derive it on load instead of serializing it.
     - `SessionStore::append` returns it. Forks copy into new files, so their `seq`s restart from 0, which is fine because the cursor is per session.
@@ -234,12 +234,12 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
 - Retry backoff on recovery is "retry now", with `RunResumed` counting toward the limit.
 
 ### 4.3 Seams to leave (no code now)
-- **A `SessionHost` in `axo` or in Sworm.** It owns open sessions by id, calls `recover()` for each one with an open run at startup, and exposes `attach`/`detach`. It is about 300–500 LOC and best written when Sworm Phase 6 starts. Until then, the Session-level API above is sufficient.
+- **A `SessionHost` in `axo` or in Axome.** It owns open sessions by id, calls `recover()` for each one with an open run at startup, and exposes `attach`/`detach`. It is about 300–500 LOC and best written when Axome Phase 6 starts. Until then, the Session-level API above is sufficient.
 - **Child-session links.** Add `ChildSession{session_id, parent_session, parent_call_id, background: bool}` when subagents land.
   - **Foreground subagent:** the tool is `Safe` because spawning is idempotent. Look up the child by `(parent_session, call_id)` and reuse `request_id = call_id` (pi's pattern, `README.md:650-665`).
   - **Background subagent:** the result is delivered as a parent `Submission{mode: FollowUp, request_id: "<child-run>:report"}`.
   - Each child recovers through its own `RunStart` / `RunEnd`; no ownership tree is needed. The one rule to keep from pi: aborting the parent's call aborts a foreground child, while background children survive a parent's Esc (`README.md:674-676`).
-- **Durable sleep and wake:** defer. Schedules belong to Sworm's trigger service (SP:385-395). axo's only in-run waits (retry backoff) restart safely.
+- **Durable sleep and wake:** defer. Schedules belong to Axome's trigger service (SP:385-395). axo's only in-run waits (retry backoff) restart safely.
 - **`ToolStarted` entry and the persisted partial-output tail:** add them only if interrupted results prove too vague.
 - **`SessionStore` beyond JSONL** (for example SQLite, if many sessions per server makes per-file JSONL listing slow): the trait already exists (`core.md:180`).
 
@@ -254,7 +254,7 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
 | bash PDEATHSIG plus durable spool dir | M3 | 30–60 |
 | Run, submission and leaf entries; request-id index; `recover()`; restart count; flock; `seq`; `LiveState` plus `attach` | M4 | 500–800 |
 | Regression tests: (a) kill mid-`bash` → `interrupted` result, then the run completes; (b) duplicate `request_id` → one run; (c) restart loop → parked after N; (d) attach from a cursor gets exactly the missed entries | M4 | 4 tests |
-| `SessionHost` (later, with Sworm Phase 6) | — | 300–500 |
+| `SessionHost` (later, with Axome Phase 6) | — | 300–500 |
 | **Total** | | **~1.0–1.6k**, versus about 16k LOC of pi-durable core (harness, session, storage) plus 14.8k of chord |
 
 ---
@@ -263,7 +263,7 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
 
 1. **Do not depend on or port pi-durable.**
    - It is explicitly experimental, breaks in almost every release, is about 16k LOC of core plus chord, and pi's own coding agent does not use it.
-   - Its generality (extension-defined durable tasks, evictable-host wakeups, Chord documents, committed partials) solves problems a long-lived sworm-server does not have.
+   - Its generality (extension-defined durable tasks, evictable-host wakeups, Chord documents, committed partials) solves problems a long-lived axome-server does not have.
    - That fits Toph's "own the core" preference (`design.md:15`).
 2. **Adopt its rules on top of axo's transcript-as-truth design.** The persisted assistant message is the tool intent. Then:
    - a `RunStart`/`RunEnd` marker makes a run resumable;
@@ -283,9 +283,9 @@ None of that needs pi-durable's task, document, Chord or scheduler machinery.
    - an entry `seq` cursor;
    - an in-memory `LiveState` with `attach(from_seq)`.
 
-   Together these cover all six of Sworm's always-on needs at the library level. They also make ACP `session/load` (v1) and `session/resume{replayFrom}` (v2) trivial.
+   Together these cover all six of Axome's always-on needs at the library level. They also make ACP `session/load` (v1) and `session/resume{replayFrom}` (v2) trivial.
 5. **Revise `core.md`:**
    - decision 3 applies only to user aborts;
    - decision 4 (leaf persistence) should flip to a persisted `Leaf` entry, because a multi-client server needs it;
    - add "durability" to the M4 "done when" line: *kill -9 mid-tool, reopen, the run completes, with an `interrupted` result for bash.*
-6. **Tell Sworm.** An embedded axo makes sworm-server itself the harness process. That changes SP:67's "Sworm never owns harness state" in spirit: the state is axo's, but it lives in the server's data dir. Phase 6 then needs a `SessionHost` that resumes open runs at startup, rather than "agent processes stay up".
+6. **Tell Axome.** An embedded axo makes axome-server itself the harness process. That changes SP:67's "Axome never owns harness state" in spirit: the state is axo's, but it lives in the server's data dir. Phase 6 then needs a `SessionHost` that resumes open runs at startup, rather than "agent processes stay up".

@@ -192,7 +192,7 @@ The session the user talks to is changed only by the user. Children are disposab
 flowchart LR
   R[role files] --> T[task tool]
   C[codemode script] -->|"tools.task(spec)"| T
-  H[Sworm / Rust host] --> A
+  H[Axome / Rust host] --> A
   T --> A["subagents<br/>AgentSpec → child session"]
   A --> K["hooks contract"]
   K --- K1[Rust impl]
@@ -202,7 +202,7 @@ flowchart LR
 
 1. **Subagents (Rust core).** An `AgentSpec` is plain data: role, model, tools, prompt sections, hooks, output schema, inherited policy. Spawning it returns a handle (`agent://<id>`) to wait on. It knows nothing about JS.
 2. **The script sandbox.** Runs JS with injected host functions under limits. Codemode is a thin tool on top of it; `define_tool` sources and script hooks reuse the same sandbox.
-3. **Hooks.** One Rust contract with several implementations: Rust (Sworm, first-party features), TypeScript (Bun extensions), and a script implementation that runs stored JS in the sandbox when the hook fires.
+3. **Hooks.** One Rust contract with several implementations: Rust (Axome, first-party features), TypeScript (Bun extensions), and a script implementation that runs stored JS in the sandbox when the hook fires.
 
 #### Which tool grants each rung
 
@@ -300,7 +300,7 @@ From `research/shell-tool.md` §2.3 and "Core seams needed now":
   - Returns the output so far, the spool path, and a job ID (`bg_N`).
 - **Follow-up delivery & `wait`.** When a background job finishes, it queues a `job_result` follow-up submission that wakes the session. The `wait` tool blocks until background jobs (or async subagents) settle when the model has nothing else to do.
 - **Durability.** Running jobs are recorded in the session log; crash recovery kills orphaned groups via the pipe guard and reports `"bg_N interrupted, partial output at <path>"`.
-- **Later in this track:** named services (`name`, `ready { log, port }`) if Sworm does not own service lifecycle itself.
+- **Later in this track:** named services (`name`, `ready { log, port }`) if Axome does not own service lifecycle itself.
 
 ---
 
@@ -310,7 +310,7 @@ Schemes give the model short, stable names for things that are not project files
 
 ### Why axo wants them
 
-- **Host data is rarely files.** A host exposes its own nouns (Sworm tasks, runs) through one trait; `read`/`grep` and later codemode and Bun extensions reach them through the same seam.
+- **Host data is rarely files.** A host exposes its own nouns (Axome tasks, runs) through one trait; `read`/`grep` and later codemode and Bun extensions reach them through the same seam.
 - **Transcripts outlive paths.** Shake markers and bash truncation notices use URLs instead of absolute paths in the permanent transcript. A URL resolves against the current session at read time, survives moves and forks, and costs fewer tokens.
 - **Many tenants share one process.** A session resolves only its own resources: forks get their own files, and subagents will share their parent's (Track 2). Never unrelated sessions'. omp's `artifact://` scans every live session; axo does not. This is isolation, not a security boundary: `read` still accepts absolute paths.
 - **No approvals in the core.** Scheme calls run through the normal tool pipeline, so host hooks see the URL in the arguments and own any policy.

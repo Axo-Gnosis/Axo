@@ -21,13 +21,13 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 
 ## Why a new core
 
-Sworm needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:
+Axome needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:
 
 | Option | Shortfall |
 |---|---|
 | Any harness over ACP | ACP carries a fixed, minimal surface. No per-message history metadata, no forking from a message, no extension surface. |
 | omp over its RPC | Heavy: ~220 MiB PSS per process even with an empty profile, plus any MCP servers from `mcp.json` running once per process. Its dialect changes often. Owned by someone else. |
-| pi as a library (TypeScript SDK) | Feasible and light, but Sworm's backend is Rust, so it needs a JS sidecar. Porting the omp features in use onto pi is roughly 8–14 weeks (see [Porting omp features onto pi](#porting-omp-features-onto-pi)). And it still means adapting to someone else's core. |
+| pi as a library (TypeScript SDK) | Feasible and light, but Axome's backend is Rust, so it needs a JS sidecar. Porting the omp features in use onto pi is roughly 8–14 weeks (see [Porting omp features onto pi](#porting-omp-features-onto-pi)). And it still means adapting to someone else's core. |
 | An existing Rust harness | None is mature, minimal, embeddable and extensible at once. See [Rust harness landscape](#rust-harness-landscape). |
 
 ## pi
