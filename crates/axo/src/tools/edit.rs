@@ -15,7 +15,7 @@ use crate::tools::files::{
     check_fresh, detect_line_ending, error_code, fs_error, normalize_to_lf, restore_line_endings,
     split_bom,
 };
-use crate::tools::{FileAccess, SessionTools, lock_file};
+use crate::tools::{FileAccess, Located, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &[
     "When changing several places in one file, use one edit call with several entries in edits[].",
@@ -112,7 +112,19 @@ impl Tool for EditTool {
                 "Edit tool input is invalid. edits must contain at least one replacement.".into(),
             ));
         }
-        let absolute = self.tools.resolve_path(&path);
+        let (absolute, label) = match self.tools.locate(&path).await? {
+            Located::Plain => (self.tools.resolve_path(&path), None),
+            Located::File {
+                url,
+                writable: false,
+                ..
+            } => return Err(ToolError(format!("{url} is read-only"))),
+            Located::File { url, path, .. } => (path, Some(url.to_string())),
+            Located::Virtual { url, .. } => {
+                return Err(ToolError(format!("{url} is not a file; use read or write")));
+            }
+        };
+        let (path, shown) = super::shown(label.as_deref(), &path, &absolute);
         let _guard = lock_file(&absolute).await;
         // Checked after each step rather than racing the step, so the lock is held until
         // an in-flight filesystem operation has settled.
@@ -143,11 +155,11 @@ impl Tool for EditTool {
         }
         let bytes = tokio::fs::read(&absolute)
             .await
-            .map_err(|error| ToolError(fs_error(&error, "read", &absolute)))?;
+            .map_err(|error| ToolError(fs_error(&error, "read", shown)))?;
         if let Some(error) = aborted() {
             return Err(error);
         }
-        check_fresh(&self.tools, &absolute, &path, &bytes)?;
+        check_fresh(&self.tools, &absolute, path, &bytes)?;
 
         // The BOM is stripped before matching (the model never includes it in oldText) and
         // the file's line ending restored after.
@@ -156,7 +168,7 @@ impl Tool for EditTool {
         let ending = detect_line_ending(content);
         let base = normalize_to_lf(content);
         let block_count = edits.len();
-        let new_content = apply_edits(&base, edits, &path).map_err(ToolError)?;
+        let new_content = apply_edits(&base, edits, path).map_err(ToolError)?;
         if let Some(error) = aborted() {
             return Err(error);
         }
@@ -164,7 +176,7 @@ impl Tool for EditTool {
         let final_content = format!("{bom}{}", restore_line_endings(&new_content, ending));
         tokio::fs::write(&absolute, &final_content)
             .await
-            .map_err(|error| ToolError(fs_error(&error, "open", &absolute)))?;
+            .map_err(|error| ToolError(fs_error(&error, "open", shown)))?;
         let ledger =
             self.tools
                 .ledger
@@ -178,7 +190,7 @@ impl Tool for EditTool {
         let patch = diff
             .unified_diff()
             .context_radius(CONTEXT_LINES)
-            .header(&path, &path)
+            .header(path, path)
             .to_string();
         let mut content = vec![UserBlock::Text {
             text: format!("Successfully replaced {block_count} block(s) in {path}."),

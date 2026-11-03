@@ -15,7 +15,7 @@ use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
-/// `system, docs, tools, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
+/// `system, docs, tools, schemes, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
@@ -27,6 +27,8 @@ pub struct PromptInputs<'a> {
     pub project_prompts: bool,
     /// Active tools; their guidelines make the `tools` section.
     pub tools: &'a [Arc<dyn Tool>],
+    /// Scheme prompt docs: the schemes section.
+    pub scheme_docs: &'a [String],
     pub context_files: &'a [ContextFile],
     /// Skills with `disable_model_invocation` are left out of the listing.
     pub skills: &'a [Skill],
@@ -58,7 +60,7 @@ const BUNDLED_DOCS: &[(&str, &str)] = &[
     ("extending.md", include_str!("../../docs/extending.md")),
 ];
 
-fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<PathBuf> {
+fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<()> {
     let docs_dir = dir.docs_dir();
     std::fs::create_dir_all(&docs_dir)?;
     for &(name, content) in BUNDLED_DOCS {
@@ -68,7 +70,7 @@ fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<PathBuf> {
             std::fs::write(&path, content)?;
         }
     }
-    Ok(dir.docs_path())
+    Ok(())
 }
 
 /// The first existing `<NAME>.md` override, trimmed: `<cwd>/.axo/prompts/` (when `project`),
@@ -121,13 +123,10 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
 
     bodies.insert("system".into(), system);
     match ensure_bundled_docs(inputs.dir) {
-        Ok(docs) => {
+        Ok(()) => {
             bodies.insert(
                 "docs".into(),
-                format!(
-                    "axo's documentation, including how to extend it: {}",
-                    docs.display()
-                ),
+                "axo's documentation, including how to extend it: axo://README.md".into(),
             );
         }
         Err(error) => diagnostics.push(Diagnostic {
@@ -137,6 +136,14 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
     }
 
     bodies.insert("tools".into(), render_guidelines(inputs.tools));
+    if !inputs.scheme_docs.is_empty() {
+        let mut body = "Tools accept these URLs as paths. In bash, a URL that is a whole argument, a `--flag=`/`NAME=` value or a redirect target becomes its file path.".to_owned();
+        for doc in inputs.scheme_docs {
+            body.push_str("\n- ");
+            body.push_str(doc);
+        }
+        bodies.insert("schemes".into(), body);
+    }
     bodies.insert("work".into(), work);
     bodies.insert("prose".into(), prose);
 
@@ -157,7 +164,7 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
         .collect();
     if (has_tool("read") || has_tool("bash")) && !visible.is_empty() {
         let mut lines = vec![
-            "When a task matches a skill's description, read its file first; relative paths in it resolve against the skill's directory.".to_owned(),
+            "When a task matches a skill's description, read its location first; relative paths in it resolve under `skill://<name>/`.".to_owned(),
             String::new(),
             "<available_skills>".to_owned(),
         ];
@@ -169,8 +176,8 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
                 escape_xml(&skill.description)
             ));
             lines.push(format!(
-                "    <location>{}</location>",
-                escape_xml(&skill.path.to_string_lossy())
+                "    <location>skill://{}</location>",
+                escape_xml(&skill.name)
             ));
             lines.push("  </skill>".to_owned());
         }
@@ -285,6 +292,7 @@ mod tests {
             cwd: temp.path(),
             project_prompts: false,
             tools: &[],
+            scheme_docs: &[],
             context_files: &[],
             skills: &[],
             dev_shell: None,
@@ -296,10 +304,7 @@ mod tests {
         assert_eq!(&keys[..2], &["system", "docs"]);
         assert_eq!(
             sections["docs"],
-            format!(
-                "<docs>\naxo's documentation, including how to extend it: {}\n</docs>",
-                dir.docs_path().display()
-            )
+            "<docs>\naxo's documentation, including how to extend it: axo://README.md\n</docs>"
         );
         for &(name, expected) in BUNDLED_DOCS {
             assert_eq!(

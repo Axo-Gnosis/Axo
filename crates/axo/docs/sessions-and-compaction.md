@@ -49,8 +49,8 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"…","timestamp":"�
 When `Axo::open_session` opens a session file, `plan_recovery` inspects the log after the last `Entry::RunEnd`:
 
 - **Unfinished tool calls:** If the last assistant message on the path has tool calls without matching `ToolResult` entries:
-  - Tools with `Replay::Never` (`bash`, `write`, `edit`) immediately receive a persisted synthetic `ToolResult` with `is_error: true` explaining that the process stopped before completion (and pointing to any partial `bash` spool file in `<session>/bash/<call_id>.log` if non-empty).
-  - Under `RecoveryPolicy::Resume` (default), tools with `Replay::Safe` (`read`, `grep`, `find`, `ask`) are left unanswered so `Agent::continue_run` re-executes them in the background.
+  - Tools with `Replay::Never` (`bash`, `edit`, and `write` to a scheme whose `write_replay` is `Never`) immediately receive a persisted synthetic `ToolResult` with `is_error: true` explaining that the process stopped before completion (and pointing to any partial `bash` output as `artifact://<n>`, backed by `<session>/artifacts/<n>.bash.<escaped-call-id>.log`).
+  - Under `RecoveryPolicy::Resume` (default), tools with `Replay::Safe` (`read`, `grep`, `find`, `ask`, and `write` to a plain path or `local://`) are left unanswered so `Agent::continue_run` re-executes them in the background.
   - Under `RecoveryPolicy::MarkInterrupted`, `Replay::Safe` calls also receive interrupted results and `Entry::RunEnd { outcome: Interrupted }` is appended immediately.
 - **Interrupted or failed assistant responses:**
   - If the last assistant response stopped with `StopReason::Length` and had tool calls, every unanswered call receives a truncated-output error result and the run continues.
@@ -78,9 +78,9 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
 
 | `ShakeMode` | Behavior |
 | :--- | :--- |
-| `ShakeMode::Elide` | Outside the newest `4,000` tokens (`PROTECTED_TAIL_TOKENS`), replaces tool-result text blocks and fenced/XML blocks in user or assistant text of `>= 400` tokens (`MIN_ELIDE_TOKENS`) with `[shaken ~N tokens; full text: <path>]`, writing the original text to `<session>/context/context-<uuid>.txt` first. Skill spans (`<skill …>…</skill>`), `SKILL.md` read results, system messages, compaction summaries, and tool-call arguments are never touched |
-| `ShakeMode::Images` | Replaces every `UserBlock::Image` in user messages and tool results with `[shaken image; full image: <path>]`, writing the decoded image bytes to `<session>/context/context-<uuid>.<ext>` |
-| `ShakeMode::Thinking` | Strips `AssistantBlock::Thinking` blocks from assistant messages, saving them to `<session>/context/context-<uuid>.thinking.json` and adding a notice block if an assistant message had only thinking |
+| `ShakeMode::Elide` | Outside the newest `4,000` tokens (`PROTECTED_TAIL_TOKENS`), replaces tool-result text blocks and fenced/XML blocks in user or assistant text of `>= 400` tokens (`MIN_ELIDE_TOKENS`) with `[shaken ~N tokens; full text: artifact://<n>]`, writing the original text to `<session>/artifacts/<n>.shake.txt` first. Skill spans (`<skill …>…</skill>`), `SKILL.md` read results, system messages, compaction summaries, and tool-call arguments are never touched |
+| `ShakeMode::Images` | Replaces every `UserBlock::Image` in user messages and tool results with `[shaken image; full image: artifact://<n>]`, writing the decoded image bytes to `<session>/artifacts/<n>.shake.<ext>` |
+| `ShakeMode::Thinking` | Strips `AssistantBlock::Thinking` blocks from assistant messages, saving them to `<session>/artifacts/<n>.shake.json` and adding `[shaken thinking; full thinking: artifact://<n>]` if an assistant message had only thinking |
 
 Each modified message receives one `Entry::ContextEdit`. Because edits are append-only, navigating to the entry before the shake restores the unshaken view.
 
@@ -104,7 +104,7 @@ Automatic maintenance checks `estimate > trigger` in `prepare_request` (before a
 
 When `estimate > trigger`, `axo` evaluates two candidates locally:
 
-1. **Recoverable clearing (`prepare_clearing`):** Protects the newest `40,000` tokens (`CLEARING_PROTECTED_TOOL_TOKENS`) of tool-result content and elides older eligible tool-result text of `>= 400` tokens into `<session>/context/context-<uuid>.txt` markers (`[shaken ~N tokens; full text: <path>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000` (`CLEARING_HEADROOM_TOKENS`), avoiding repeated prompt-cache invalidations.
+1. **Recoverable clearing (`prepare_clearing`):** Protects the newest `40,000` tokens (`CLEARING_PROTECTED_TOOL_TOKENS`) of tool-result content and elides older eligible tool-result text of `>= 400` tokens into `<session>/artifacts/<n>.shake.txt` markers (`[shaken ~N tokens; full text: artifact://<n>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000` (`CLEARING_HEADROOM_TOKENS`), avoiding repeated prompt-cache invalidations.
 2. **Checkpoint summarization (`Entry::Compaction`):**
    - **Cut point:** Walks backward from the end of the transcript accumulating `keep_recent` tokens and cuts at the first valid boundary (`User`, `Custom`, or `Assistant`, never a `ToolResult`). If a single turn exceeds the budget, the turn is split at an `Assistant` boundary and its prefix is summarized with `COMPACTION_SPLIT_TURN.md` and merged with the history summary.
    - **Live summary (`SummaryRequest::Live`):** Appends the summary prompt to the live uncleared conversation with `ToolChoice::None` so the request reuses the provider's prompt cache. If the response contains a tool call, stops with `Length` / `Error` / `Aborted`, is empty, or is not strictly smaller than the messages it replaces, it is rejected and `axo` falls back to a separate summary request.

@@ -4,9 +4,7 @@
 //! ANSI/`\r` cleaning.
 
 use std::collections::VecDeque;
-use std::fmt::Write as _;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +21,7 @@ use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::host::{ProcessGroup, find_on_path, terminate_group};
+use crate::schemes::artifact::bash_tail;
 use crate::tools::SessionTools;
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
@@ -89,23 +88,6 @@ const NON_INTERACTIVE_ENV: &[(&str, &str)] = &[
     ("__NIXOS_SET_ENVIRONMENT_DONE", "1"),
 ];
 
-/// The spool file of a bash call. Call ids come from the provider, so every byte outside
-/// `[A-Za-z0-9_-]` is written as `%XX`: the name stays inside `spool_dir`, and distinct ids
-/// get distinct files (cut to 200 bytes before `.log`).
-pub fn spool_path(spool_dir: &Path, call_id: &str) -> PathBuf {
-    let mut name = String::with_capacity(call_id.len() + 4);
-    for byte in call_id.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
-            name.push(char::from(byte));
-        } else {
-            let _ = write!(name, "%{byte:02X}");
-        }
-    }
-    name.truncate(200);
-    name.push_str(".log");
-    spool_dir.join(name)
-}
-
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
@@ -152,14 +134,14 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to 2000 lines or 50KB (whichever is hit first), keeping the first 20KB and the last 30KB. If truncated, full output is saved to a file whose path is in the result. Optionally provide a timeout in seconds."
+        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to 2000 lines or 50KB (whichever is hit first), keeping the first 20KB and the last 30KB. If truncated, the full output is saved and its artifact:// URL is in the result. Optionally provide a timeout in seconds."
     }
 
     fn parameters(&self) -> &Value {
         &self.parameters
     }
 
-    fn replay(&self) -> Replay {
+    fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Never
     }
 
@@ -194,6 +176,8 @@ impl Tool for BashTool {
                 tools.cwd.display()
             )));
         }
+        // The transcript keeps the model's command; only the spawned one sees host paths.
+        let script = tools.rewrite_urls(&args.command).await?;
 
         let progress = |line: &str| {
             updates(ToolUpdate {
@@ -212,23 +196,31 @@ impl Tool for BashTool {
 
         // The full output is spooled from the first byte; kept only when the inline result
         // is cut.
-        let spool_path = spool_path(&tools.spool_dir, &call.id);
-        tokio::fs::create_dir_all(&tools.spool_dir)
+        let artifacts = tools.schemes.artifacts();
+        let (artifact, artifact_path) = artifacts.allocate(&bash_tail(&call.id));
+        tokio::fs::create_dir_all(artifacts.dir())
             .await
             .map_err(|err| {
                 ToolError(format!(
                     "Failed to create {}: {err}",
-                    tools.spool_dir.display()
+                    artifacts.dir().display()
                 ))
             })?;
-        let mut spool = Some(tokio::fs::File::create(&spool_path).await.map_err(|err| {
-            ToolError(format!("Failed to create {}: {err}", spool_path.display()))
-        })?);
+        let mut spool = Some(
+            tokio::fs::File::create(&artifact_path)
+                .await
+                .map_err(|err| {
+                    ToolError(format!(
+                        "Failed to create {}: {err}",
+                        artifact_path.display()
+                    ))
+                })?,
+        );
 
         let mut command = Command::new(&bash);
         command
             .arg("-c")
-            .arg(&args.command)
+            .arg(&*script)
             .current_dir(&tools.cwd)
             .env_clear()
             .envs(resolved.env.iter())
@@ -243,7 +235,7 @@ impl Tool for BashTool {
             Ok(group) => group,
             Err(err) => {
                 drop(spool);
-                let _ = tokio::fs::remove_file(&spool_path).await;
+                let _ = tokio::fs::remove_file(&artifact_path).await;
                 return Err(ToolError(format!(
                     "Failed to start {}: {err}",
                     bash.display()
@@ -272,7 +264,7 @@ impl Tool for BashTool {
                         if let Some(file) = &mut spool
                             && let Err(err) = file.write_all(&chunk).await
                         {
-                            tracing::warn!(path = %spool_path.display(), %err, "bash output spool failed");
+                            tracing::warn!(path = %artifact_path.display(), %err, "bash output spool failed");
                             spool = None;
                         }
                         shaper.push(&chunk);
@@ -330,17 +322,16 @@ impl Tool for BashTool {
         let full_output = match spool {
             Some(mut file) if shaper.truncated() => {
                 let _ = file.flush().await;
-                Some(spool_path.as_path())
+                Some(format!("artifact://{artifact}"))
             }
             spool => {
                 drop(spool);
-                let _ = tokio::fs::remove_file(&spool_path).await;
+                let _ = tokio::fs::remove_file(&artifact_path).await;
                 None
             }
         };
-        let body = shaper.render(full_output);
-        let details =
-            full_output.map(|path| json!({ "fullOutputPath": path.display().to_string() }));
+        let body = shaper.render(full_output.as_deref());
+        let details = full_output.map(|url| json!({ "fullOutput": url }));
         let finish = |text: String, status_line: Option<String>| {
             let text = match status_line {
                 Some(line) if text.is_empty() => line,
@@ -413,7 +404,7 @@ impl Tool for BashTool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShapedOutput {
     pub text: String,
-    /// Bytes or lines were cut; the full output stays in the spool file.
+    /// Bytes or lines were cut.
     pub truncated: bool,
 }
 
@@ -527,7 +518,7 @@ impl Shaper {
 
     /// The inline text: head, an omission marker, tail, then the truncation notice naming
     /// `full_output` when given.
-    fn render(&self, full_output: Option<&Path>) -> String {
+    fn render(&self, full_output: Option<&str>) -> String {
         let omitted = self.total_lines - self.head_lines - self.tail.len();
         let mut text = self.head.clone();
         if omitted > 0 {
@@ -540,7 +531,7 @@ impl Shaper {
         text.pop();
 
         let location = full_output
-            .map(|path| format!(". Full output: {}", path.display()))
+            .map(|url| format!(". Full output: {url}"))
             .unwrap_or_default();
         if omitted > 0 {
             let total = self.total_lines;

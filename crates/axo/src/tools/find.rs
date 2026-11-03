@@ -66,7 +66,7 @@ impl Tool for FindTool {
         &self.parameters
     }
 
-    fn replay(&self) -> Replay {
+    fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
 
@@ -81,16 +81,12 @@ impl Tool for FindTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
-        let search_path = self.tools.resolve_path(
-            args.path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-                .unwrap_or("."),
-        );
-        let (text, details) = tokio::task::spawn_blocking(move || find(args, search_path, &cancel))
-            .await
-            .map_err(|err| ToolError(err.to_string()))?
-            .map_err(ToolError)?;
+        let (search_path, label) = self.tools.search_root(args.path.as_deref()).await?;
+        let (text, details) =
+            tokio::task::spawn_blocking(move || find(args, search_path, label, &cancel))
+                .await
+                .map_err(|err| ToolError(err.to_string()))?
+                .map_err(ToolError)?;
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
             details,
@@ -105,15 +101,14 @@ impl Tool for FindTool {
 fn find(
     args: FindArgs,
     search_path: PathBuf,
+    label: Option<String>,
     cancel: &CancellationToken,
 ) -> Result<(String, Option<Value>), String> {
+    let shown_path = super::root_label(&search_path, label.as_deref());
     match std::fs::metadata(&search_path) {
-        Err(_) => return Err(format!("Path not found: {}", search_path.display())),
+        Err(_) => return Err(format!("Path not found: {shown_path}")),
         Ok(metadata) if !metadata.is_dir() => {
-            return Err(format!(
-                "Search path '{}' is not a directory.",
-                search_path.display()
-            ));
+            return Err(format!("Search path '{shown_path}' is not a directory."));
         }
         Ok(_) => {}
     }
@@ -187,7 +182,11 @@ fn find(
     }
     // fd's errors only fail the call when it printed nothing.
     if results.is_empty() && !errors.is_empty() {
-        return Err(errors.join("\n"));
+        return Err(super::unhost(
+            &errors.join("\n"),
+            &search_path,
+            label.as_deref(),
+        ));
     }
     if results.is_empty() {
         return Ok(("No files found matching pattern".into(), None));

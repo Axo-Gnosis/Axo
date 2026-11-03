@@ -7,15 +7,32 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axo::context::files::NestedContext;
+use axo::schemes::artifact::Artifacts;
+use axo::schemes::dir::DirScheme;
+use axo::schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 use axo::tools::{FileAccess, FileLedger};
 use axo::{PendingQuestions, SessionTools, StaticEnv};
-use axo_agent::{Tool, ToolUpdate};
+use axo_agent::{Replay, Tool, ToolError, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+
+struct Vv;
+
+#[async_trait]
+impl Scheme for Vv {
+    fn name(&self) -> &str {
+        "vv"
+    }
+
+    async fn resolve(&self, _url: &SchemeUrl, _cx: &SchemeContext) -> Result<Target, ToolError> {
+        Ok(Target::Virtual)
+    }
+}
 
 struct Fixture {
     dir: TempDir,
@@ -28,7 +45,20 @@ impl Fixture {
         let session = SessionTools::new(
             dir.path().to_path_buf(),
             Arc::new(StaticEnv(Arc::new(BTreeMap::new()))),
-            dir.path().join(".spool"),
+            Schemes::new(
+                SchemeContext {
+                    session_id: "test".into(),
+                    session_dir: dir.path().into(),
+                    cwd: dir.path().into(),
+                },
+                Arc::new(Artifacts::new(dir.path().join("artifacts"))),
+                vec![
+                    Arc::new(DirScheme::local(dir.path().join("local"))),
+                    Arc::new(Vv),
+                ],
+                &[],
+            )
+            .unwrap(),
             Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
             None,
             false,
@@ -102,6 +132,32 @@ impl Fixture {
             .collect();
         self.call("edit", json!({ "path": name, "edits": edits }))
             .await
+    }
+}
+
+#[test]
+fn write_replays_only_safe_targets() {
+    let fx = Fixture::new();
+    let write = fx
+        .tools
+        .iter()
+        .find(|tool| tool.name() == "write")
+        .expect("write registered");
+    for (path, expected) in [
+        ("src/a.rs", Replay::Safe),
+        ("local://a.md", Replay::Safe),
+        ("vv://x", Replay::Never),
+    ] {
+        let Value::Object(arguments) = json!({ "path": path }) else {
+            panic!("arguments must be an object");
+        };
+        let call = ToolCall {
+            id: "call-write".into(),
+            name: "write".into(),
+            arguments,
+            arguments_error: None,
+        };
+        assert_eq!(write.replay(&call), expected, "{path}");
     }
 }
 

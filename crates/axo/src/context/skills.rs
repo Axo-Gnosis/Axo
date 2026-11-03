@@ -222,7 +222,7 @@ pub(crate) fn escape_xml(text: &str) -> String {
 }
 
 /// Expands a leading `/name args` naming one of `skills` into
-/// `<skill name="<name>" location="<path>">\nReferences are relative to <dir>.\n\n{body}\n</skill>`
+/// `<skill name="<name>" location="skill://<name>">\nReferences are relative to skill://<name>/.\n\n{body}\n</skill>`
 /// (body with arguments substituted), followed by the args line when non-empty. Any other
 /// text, an unknown name, or an unreadable skill file returns `text` unchanged (the last
 /// with a `tracing::warn!`). Blocking filesystem I/O.
@@ -249,12 +249,9 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     };
     let (_, body) = split_frontmatter(&raw);
     let body = substitute_args(body.trim(), &parse_command_args(args));
-    let base_dir = skill.path.parent().unwrap_or(Path::new(""));
     let block = format!(
-        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{body}\n</skill>",
-        skill.name,
-        skill.path.display(),
-        base_dir.display()
+        "<skill name=\"{name}\" location=\"skill://{name}\">\nReferences are relative to skill://{name}/.\n\n{body}\n</skill>",
+        name = skill.name
     );
     if args.is_empty() {
         block

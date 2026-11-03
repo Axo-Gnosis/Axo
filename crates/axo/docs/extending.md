@@ -41,6 +41,8 @@ let session = axo
             "host_context".into(),
             Some("Running inside my-host.".into()),
         )],
+        tools: Vec::new(),
+        schemes: Vec::new(),
         recovery: RecoveryPolicy::Resume,
     })
     .await?;
@@ -77,7 +79,7 @@ let outcome = session
 | `compact` | `async fn compact(&self) -> Result<(), Error>` | Runs a standalone compaction summary checkpoint in a session-owned task |
 | `shake` | `async fn shake(&self, mode: ShakeMode) -> Result<(), Error>` | Runs recoverable artifact elision (`Elide`, `Images`, or `Thinking`) without model calls |
 | `navigate` | `async fn navigate(&self, target: Option<EntryId>, options: NavigateOptions) -> Result<(), Error>` | Moves the leaf to `target` (`None` = root), optionally summarizing the abandoned branch into an `Entry::BranchSummary` |
-| `fork` | `async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error>` | Copies the root-to-`entry_id` path into a new session file |
+| `fork` | `async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error>` | Copies the root-to-`entry_id` path into a new session file; hard-links its `artifacts/` (copy fallback) and copies its `local/` scratch files |
 | `reload_exec_env` | `async fn reload_exec_env(&self)` | Invalidates and re-resolves the `ExecEnv` (such as a Nix flake dev shell), queuing a `dev_shell` system-prompt diff if the note changed |
 | `id` / `path` / `skills` | `fn id(&self) -> &str`<br>`fn path(&self) -> &Path`<br>`fn skills(&self) -> &[Skill]` | The header UUIDv7 (known before the file exists); the session file, created lazily on the first submission; the skills loaded at start, which feed the prompt catalog and `/name` commands |
 
@@ -86,8 +88,9 @@ let outcome = session
 | Trait | Crate | Purpose |
 | :--- | :--- | :--- |
 | `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `HostEnv`, `DevShellEnv`, and `StaticEnv`. Passed via `SessionOptions::exec_env` |
+| `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites it to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it). `write_replay` defaults to `Replay::Never`; action writes must keep it at `Never`. Every call gets the session's `SchemeContext`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://`. Passed via `SessionOptions::schemes`; a host scheme named like a built-in replaces it, except `artifact` and `file`, which are reserved |
 | `SessionStore` / `SessionWriter` | `axo::store::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading, listing, and appending session entries. Default implementation: `JsonlStore`. Passed via `AxoBuilder::store` |
-| `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, `prepare_arguments`, `execute`) for `axo_agent::Agent` |
+| `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, `prepare_arguments`, `execute`) for `axo_agent::Agent`. Pass host tools as `SessionOptions::tools` `ToolFactory` closures; axo calls each with the session's `Arc<SessionTools>` (again per fork), so the tool can use `locate`, `schemes`, `rewrite_urls` and the ledger. One named like a built-in replaces it in place |
 | `LoopHooks` | `axo_agent::LoopHooks` | Lifecycle hooks on `axo_agent::Agent`: `prepare_request` (can update context/system prompt or fail the run), `should_skip_tools` (intercepts unusable responses before any tool runs), `before_tool_call` (can return `ToolCallDecision::Block { reason }`), `after_tool_call` (can modify `ToolOutput`), and `finish_turn` (can return `TurnFinish::Stop` or `Continue`) |
 | `Persist` | `axo_agent::Persist` | Ordered async subscriber on `axo_agent::Agent` awaited before the next model request (used by `Session` to persist `Entry::Message` on `MessageEnd`) |
 | `Api` / `Streamer` | `axo_ai::{Api, Streamer}` | Streaming LLM wire adapter (`AnthropicApi`, `CompletionsApi`, `CodexApi`, or `ScriptedApi` behind the `testing` feature). Custom streamers can be injected via `AxoBuilder::streamer` |
@@ -138,7 +141,7 @@ impl Tool for PingTool {
         ExecutionMode::Parallel
     }
 
-    fn replay(&self) -> Replay {
+    fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
 

@@ -4,6 +4,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axo::schemes::artifact::Artifacts;
 use axo::store::{self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore};
 use axo::{Axo, CompactionSettings, NavigateOptions, Session, Settings, ShakeMode, SummaryRequest};
 use axo_agent::{AgentMessage, RunOutcome};
@@ -170,13 +171,18 @@ fn blocks_text(blocks: &[UserBlock]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-fn artifacts(text: &str) -> Vec<PathBuf> {
+fn artifacts(text: &str) -> Vec<u64> {
     text.split("; full ")
         .skip(1)
         .filter_map(|s| s.split_once(": "))
         .filter_map(|(_, s)| s.split_once(']'))
-        .map(|(p, _)| PathBuf::from(p))
+        .map(|(url, _)| url.strip_prefix("artifact://").unwrap().parse().unwrap())
         .collect()
+}
+fn artifact_path(session: &Session, n: u64) -> PathBuf {
+    Artifacts::new(session.path().with_extension("").join("artifacts"))
+        .find(n)
+        .unwrap()
 }
 fn edits(entries: &[SeqEntry]) -> Vec<&EntryId> {
     entries
@@ -262,13 +268,14 @@ async fn elide_preserves_skills_malformed_regions_and_the_complete_4k_boundary()
     let recovered: Vec<String> = projected
         .iter()
         .flat_map(|m| artifacts(&text(m)))
-        .map(|p| {
+        .map(|n| {
+            let p = artifact_path(&session, n);
             assert!(
                 p.file_name()
                     .unwrap()
                     .to_str()
                     .unwrap()
-                    .starts_with("context-")
+                    .starts_with(&format!("{n}.shake."))
             );
             std::fs::read_to_string(p).unwrap()
         })
@@ -318,7 +325,7 @@ async fn image_and_thinking_shakes_are_recoverable_and_idempotent() {
     let raw = entries(&axo, &session).await;
     assert_eq!(edits(&raw), vec![&ids[0], &ids[1]]);
     let after = llm(&raw);
-    let artifacts_dir = session.path().with_extension("").join("context");
+    let artifacts_dir = session.path().with_extension("").join("artifacts");
     let files: Vec<_> = std::fs::read_dir(artifacts_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -861,8 +868,8 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
             ],
         )
         .await;
-        // Measure the real marker including its real absolute artifact path;
-        // UUID names have fixed width, so clearing's new artifact has identical cost.
+        // Measure the real marker; this shake and the next clearing allocate
+        // single-digit IDs, so their artifact URLs have identical token cost.
         session.shake(ShakeMode::Elide).await.unwrap();
         let shaken = llm(&entries(&offline, &session).await);
         assert!(shaken.iter().any(|m| text(m) == protected));

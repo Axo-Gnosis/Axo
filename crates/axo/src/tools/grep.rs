@@ -78,7 +78,7 @@ impl Tool for GrepTool {
         &self.parameters
     }
 
-    fn replay(&self) -> Replay {
+    fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
 
@@ -93,14 +93,9 @@ impl Tool for GrepTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }
-        let search_path = self.tools.resolve_path(
-            args.path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-                .unwrap_or("."),
-        );
+        let (search_path, label) = self.tools.search_root(args.path.as_deref()).await?;
         let (text, details) =
-            tokio::task::spawn_blocking(move || search(args, search_path, &cancel))
+            tokio::task::spawn_blocking(move || search(args, search_path, label, &cancel))
                 .await
                 .map_err(|err| ToolError(err.to_string()))?
                 .map_err(ToolError)?;
@@ -117,10 +112,12 @@ impl Tool for GrepTool {
 fn search(
     args: GrepArgs,
     search_path: PathBuf,
+    label: Option<String>,
     cancel: &CancellationToken,
 ) -> Result<(String, Option<Value>), String> {
+    let shown_path = super::root_label(&search_path, label.as_deref());
     let is_dir = std::fs::metadata(&search_path)
-        .map_err(|_| format!("Path not found: {}", search_path.display()))?
+        .map_err(|_| format!("Path not found: {shown_path}"))?
         .is_dir();
     // pi: `context > 0 ? context : 0` and `Math.max(1, limit ?? 100)`.
     let context = args
@@ -198,7 +195,11 @@ fn search(
     // ripgrep exits 2 after any walk/read error, and pi rejects that unless it killed rg
     // for the match limit.
     if !limit_reached && !errors.is_empty() {
-        return Err(errors.join("\n"));
+        return Err(super::unhost(
+            &errors.join("\n"),
+            &search_path,
+            label.as_deref(),
+        ));
     }
     if matches.is_empty() {
         return Ok(("No matches found".into(), None));
@@ -210,6 +211,9 @@ fn search(
             && !relative.as_os_str().is_empty()
         {
             return relative.to_string_lossy().replace('\\', "/");
+        }
+        if !is_dir && let Some(label) = &label {
+            return label.clone();
         }
         file.file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned())

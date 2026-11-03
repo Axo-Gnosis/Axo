@@ -2,6 +2,7 @@
 //! files.
 
 use std::io::ErrorKind;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::files::{check_fresh, fs_error};
-use crate::tools::{FileAccess, SessionTools, lock_file};
+use crate::tools::{FileAccess, Located, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &["Use write only for new files or complete rewrites."];
 
@@ -57,8 +58,21 @@ impl Tool for WriteTool {
         &self.parameters
     }
 
-    fn replay(&self) -> Replay {
-        Replay::Safe
+    fn replay(&self, call: &ToolCall) -> Replay {
+        let path = call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match self.tools.schemes.parse(&super::clean_path(path)) {
+            Ok(Some(url)) => self
+                .tools
+                .schemes
+                .get(&url.scheme)
+                .map_or(Replay::Never, |scheme| scheme.write_replay()),
+            // Plain paths: identical content is skipped on rerun. Unknown schemes fail again harmlessly.
+            Ok(None) | Err(_) => Replay::Safe,
+        }
     }
 
     fn prompt_guidelines(&self) -> &[&str] {
@@ -74,7 +88,28 @@ impl Tool for WriteTool {
         let WriteArgs { path, content } =
             serde_json::from_value(Value::Object(call.arguments.clone()))
                 .map_err(|error| ToolError(error.to_string()))?;
-        let absolute = self.tools.resolve_path(&path);
+        let (absolute, label) = match self.tools.locate(&path).await? {
+            Located::Plain => (self.tools.resolve_path(&path), None),
+            Located::File {
+                url,
+                writable: false,
+                ..
+            } => return Err(ToolError(format!("{url} is read-only"))),
+            Located::File { url, path, .. } => (path, Some(url.to_string())),
+            Located::Virtual { url, scheme } => {
+                if cancel.is_cancelled() {
+                    return Err(ToolError("Operation aborted".into()));
+                }
+                let text = scheme
+                    .write(&url, &content, self.tools.schemes.context())
+                    .await?;
+                return Ok(ToolOutput {
+                    content: vec![UserBlock::Text { text }],
+                    ..ToolOutput::default()
+                });
+            }
+        };
+        let (path, shown) = super::shown(label.as_deref(), &path, &absolute);
         let _guard = lock_file(&absolute).await;
         // Checked after each step rather than racing the step, so the lock is held until
         // an in-flight filesystem operation has settled.
@@ -93,22 +128,26 @@ impl Tool for WriteTool {
         // read failure is reported rather than overwriting a file the session cannot see.
         match tokio::fs::read(&absolute).await {
             Ok(current) if current == content.as_bytes() => {}
-            Ok(current) => check_fresh(&self.tools, &absolute, &path, &current)?,
+            Ok(current) => check_fresh(&self.tools, &absolute, path, &current)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(ToolError(fs_error(&error, "open", &absolute))),
+            Err(error) => return Err(ToolError(fs_error(&error, "open", shown))),
         }
 
         if let Some(dir) = absolute.parent() {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(|error| ToolError(fs_error(&error, "mkdir", dir)))?;
+            tokio::fs::create_dir_all(dir).await.map_err(|error| {
+                ToolError(fs_error(
+                    &error,
+                    "mkdir",
+                    label.as_deref().map(Path::new).unwrap_or(dir),
+                ))
+            })?;
         }
         if let Some(error) = aborted() {
             return Err(error);
         }
         tokio::fs::write(&absolute, &content)
             .await
-            .map_err(|error| ToolError(fs_error(&error, "open", &absolute)))?;
+            .map_err(|error| ToolError(fs_error(&error, "open", shown)))?;
         let ledger = self
             .tools
             .ledger

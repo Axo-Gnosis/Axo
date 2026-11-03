@@ -208,6 +208,8 @@ impl Axo {
             project_access,
             exec_env,
             sections,
+            tools: host_tools,
+            schemes: host_schemes,
             recovery: _,
         } = options;
 
@@ -274,6 +276,8 @@ impl Axo {
             ask_enabled,
             project_access: access,
             host_sections: sections,
+            host_tools,
+            host_schemes,
             store: self.store.clone(),
             session_id,
             writer,

@@ -9,20 +9,21 @@
 | # | Section | Source |
 | :--- | :--- | :--- |
 | 1 | `system` | `SYSTEM.md` override, else bundled `crates/axo/prompts/SYSTEM.md` |
-| 2 | `docs` | `"axo's documentation, including how to extend it: {path}"` (`<AXO_DIR>/cache/docs/README.md`, materialized from the bundled docs) |
+| 2 | `docs` | `"axo's documentation, including how to extend it: axo://README.md"` (materialized from the bundled docs) |
 | 3 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the active tools, formatted as `- {rule}` bullets |
-| 4 | `work` | `WORK.md` override (no bundled default; omitted unless provided) |
-| 5 | `prose` | `PROSE.md` override, else bundled `crates/axo/prompts/PROSE.md` |
-| 6 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
-| 7 | `skills` | Skill catalog when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
-| 8 | `cwd` | `inputs.cwd.display()` |
-| 9 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."` or `"Commands run with the direnv environment of {dir}."`) |
-| 10 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
-| 11 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section |
+| 4 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
+| 5 | `work` | `WORK.md` override (no bundled default; omitted unless provided) |
+| 6 | `prose` | `PROSE.md` override, else bundled `crates/axo/prompts/PROSE.md` |
+| 7 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
+| 8 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
+| 9 | `cwd` | `inputs.cwd.display()` |
+| 10 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."` or `"Commands run with the direnv environment of {dir}."`) |
+| 11 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
+| 12 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section |
 
 ### Bundled documentation (`docs`)
 
-`build_sections` materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<AXO_DIR>/cache/docs/` (`AxoDir::docs_dir()`), updating files on disk only when their contents differ, and sets `{path}` to `<AXO_DIR>/cache/docs/README.md` (`AxoDir::docs_path()`). If `<AXO_DIR>/cache/docs/` cannot be written, `build_sections` records a `Diagnostic` and omits the `docs` section.
+`build_sections` materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<AXO_DIR>/cache/docs/` (`AxoDir::docs_dir()`), updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If `<AXO_DIR>/cache/docs/` cannot be written, `build_sections` records a `Diagnostic` and omits the `docs` section.
 
 ### Built-in tool guidelines (`tools`)
 
@@ -117,8 +118,8 @@ Skill body with optional $ARGUMENTS, $@, $1, ${@:2}, ${1:-default} placeholders.
 When a user prompt starts with `/<skill-name>` followed by whitespace or end-of-string, `expand_skill_command` expands it before saving the submission:
 
 ```xml
-<skill name="my-skill" location="/abs/path/to/SKILL.md">
-References are relative to /abs/path/to.
+<skill name="my-skill" location="skill://my-skill">
+References are relative to skill://my-skill/.
 
 {substituted body}
 </skill>

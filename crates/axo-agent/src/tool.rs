@@ -15,8 +15,8 @@ pub trait Tool: Send + Sync {
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Parallel
     }
-    /// May the call run again after a crash left its outcome unknown?
-    fn replay(&self) -> Replay {
+    /// May this call run again after a crash left its outcome unknown?
+    fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Never
     }
     /// Bullets for the system prompt's `tools` section.

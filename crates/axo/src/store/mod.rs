@@ -50,6 +50,6 @@ pub trait SessionWriter: Send {
     fn path(&self) -> Option<&Path>;
 
     /// Where the session file is or will be created; known from `create` on, so a
-    /// session can place its side files (the bash spool) before the file exists.
+    /// session can place its side files (artifacts/ and local/) before the file exists.
     fn planned_path(&self) -> &Path;
 }

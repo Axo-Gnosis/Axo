@@ -15,6 +15,9 @@ pub enum Error {
     /// A config file (`settings.jsonc`, `models.jsonc`) could not be parsed.
     #[error("{}: {message}", path.display())]
     Config { path: PathBuf, message: String },
+    /// A host scheme has an invalid or reserved name.
+    #[error("{0}")]
+    Scheme(String),
     /// Neither `AXO_DIR` nor `HOME` is set.
     #[error("Cannot locate the axo directory: set AXO_DIR or HOME")]
     NoAxoDir,

@@ -8,6 +8,7 @@ pub mod context;
 pub mod error;
 pub mod exec;
 pub mod recovery;
+pub mod schemes;
 pub mod session;
 pub mod store;
 pub mod tools;
@@ -21,9 +22,10 @@ pub use context::Diagnostic;
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::{EnvMap, ExecEnv, HostEnv, Resolved, StaticEnv};
+pub use schemes::{Scheme, SchemeContext, SchemeUrl, Target};
 pub use session::{
     Attach, Fork, LiveSnapshot, MaintenanceKind, NavigateOptions, PromptRequest, PromptResult,
     RecoveryPolicy, Session, SessionEvent, SessionOptions, ShakeMode,
 };
-pub use tools::SessionTools;
 pub use tools::ask::{Answer, AskOutcome, PendingQuestions, Question, QuestionOption};
+pub use tools::{SessionTools, ToolFactory};

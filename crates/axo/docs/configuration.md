@@ -16,8 +16,8 @@ Resolved by `AxoDir::from_env()` (`AXO_DIR` when set and non-empty, else `$HOME/
 | `AGENTS.md` | `root().join("AGENTS.md")` | User-wide instructions loaded at the start of `project_context` |
 | `prompts/<NAME>.md` | `prompt_path(name)` | Prompt overrides: `SYSTEM.md`, `WORK.md`, `PROSE.md`, `SUMMARY.md`, `COMPACTION.md`, `COMPACTION_UPDATE.md`, `COMPACTION_SPLIT_TURN.md`, `BRANCH_SUMMARY.md` |
 | `skills/` | `skills_dir()` | User skills (`<skill>/SKILL.md`) |
-| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`), per-session `<session>/bash/` spool directories, and `<session>/context/` maintenance artifacts |
-| `cache/` | `cache_dir()` | Cached `models.dev` catalog (`cache/models.json`), bundled documentation (`cache/docs/`, via `docs_dir()` / `docs_path()`), and captured Nix dev-shell environments (`cache/devshell/`) |
+| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`), per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` scratch files (`local://<path>`) |
+| `cache/` | `cache_dir()` | Cached `models.dev` catalog (`cache/models.json`), bundled documentation (`cache/docs/`, via `docs_dir()` and `axo://` URLs), and captured Nix dev-shell environments (`cache/devshell/`) |
 
 When `homeAgentsDir` is `true` in `~/.axo/settings.jsonc`, `axo` also reads `~/.agents/AGENTS.md` (before `~/.axo/AGENTS.md`) and `~/.agents/skills/` (after `~/.axo/skills/`).
 

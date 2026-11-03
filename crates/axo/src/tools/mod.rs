@@ -2,6 +2,7 @@
 
 pub mod ask;
 pub mod bash;
+pub(crate) mod bash_urls;
 pub mod edit;
 pub mod files;
 pub mod find;
@@ -10,12 +11,13 @@ pub mod read;
 pub mod truncate;
 pub mod write;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use axo_agent::{AgentMessage, Tool};
+use axo_agent::{AgentMessage, Tool, ToolError};
 use axo_ai::{Message, ToolResultMessage};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -28,6 +30,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
 use crate::exec::ExecEnv;
+use crate::schemes::{Scheme, SchemeUrl, Schemes, Target};
 use ask::{AskTool, PendingQuestions};
 use bash::BashTool;
 use edit::EditTool;
@@ -45,8 +48,8 @@ pub struct SessionTools {
     pub ledger: FileLedger,
     /// Nested project instructions attached once to successful file tool results.
     pub context: NestedContext,
-    /// Where bash streams full command output (`<call_id>.log`).
-    pub spool_dir: PathBuf,
+    /// The session's scheme registry.
+    pub schemes: Schemes,
     pub questions: Arc<PendingQuestions>,
     /// `ask` auto-selects the recommended option after this long.
     pub ask_timeout: Option<Duration>,
@@ -54,11 +57,33 @@ pub struct SessionTools {
     pub ci_env: bool,
 }
 
+/// Builds a host tool for one session from that session's shared state (called again for
+/// every fork), so host tools resolve URLs, share the ledger and rewrite bash exactly as
+/// built-ins do.
+pub type ToolFactory = Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>;
+
+/// A tool path located without applying plain-filesystem fallback rules.
+pub enum Located {
+    /// Not a scheme URL: resolve it with `resolve_path` or `resolve_read_path`.
+    Plain,
+    /// A scheme-backed file; mutations require `writable`.
+    File {
+        url: SchemeUrl,
+        path: PathBuf,
+        writable: bool,
+    },
+    /// A resource whose handler performs reads and writes directly.
+    Virtual {
+        url: SchemeUrl,
+        scheme: Arc<dyn Scheme>,
+    },
+}
+
 impl SessionTools {
     pub fn new(
         cwd: PathBuf,
         exec: Arc<dyn ExecEnv>,
-        spool_dir: PathBuf,
+        schemes: Schemes,
         questions: Arc<PendingQuestions>,
         ask_timeout: Option<Duration>,
         ci_env: bool,
@@ -69,25 +94,60 @@ impl SessionTools {
             exec,
             ledger: FileLedger::default(),
             context,
-            spool_dir,
+            schemes,
             questions,
             ask_timeout,
             ci_env,
         })
     }
 
+    /// Cleans and resolves a scheme URL, leaving ordinary paths for filesystem fallback.
+    pub async fn locate(&self, path: &str) -> Result<Located, ToolError> {
+        let Some(url) = self.schemes.parse(&clean_path(path))? else {
+            return Ok(Located::Plain);
+        };
+        let scheme = self
+            .schemes
+            .get(&url.scheme)
+            .expect("parsed scheme is registered");
+        match scheme.resolve(&url, self.schemes.context()).await? {
+            Target::File { path, writable } => Ok(Located::File {
+                url,
+                path,
+                writable,
+            }),
+            Target::Virtual => Ok(Located::Virtual {
+                url,
+                scheme: scheme.clone(),
+            }),
+        }
+    }
+
+    /// Rewrites whole-word scheme URLs in a bash command to file paths; the transcript keeps the original.
+    pub async fn rewrite_urls<'a>(&self, command: &'a str) -> Result<Cow<'a, str>, ToolError> {
+        bash_urls::rewrite(command, &self.schemes).await
+    }
+
+    pub(crate) async fn search_root(
+        &self,
+        path: Option<&str>,
+    ) -> Result<(PathBuf, Option<String>), ToolError> {
+        let path = path.filter(|path| !path.is_empty()).unwrap_or(".");
+        match self.locate(path).await? {
+            Located::Plain => Ok((self.resolve_path(path), None)),
+            Located::File { url, path, .. } => Ok((path, Some(url.to_string()))),
+            Located::Virtual { url, .. } => {
+                Err(ToolError(format!("{url} is not a file; use read {url}")))
+            }
+        }
+    }
+
     /// A tool's path argument as an absolute path (pi `resolveToCwd`): unicode spaces
     /// become plain spaces, a leading `@` is dropped, `~`/`~/` expand to `$HOME`,
     /// `file://` URLs become paths, relative paths join `cwd`, and `.`/`..` are folded.
     pub fn resolve_path(&self, path: &str) -> PathBuf {
-        let spaced: String = path
-            .chars()
-            .map(|c| match c {
-                '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
-                c => c,
-            })
-            .collect();
-        let path = spaced.strip_prefix('@').unwrap_or(&spaced);
+        let cleaned = clean_path(path);
+        let path = cleaned.as_ref();
         let home = crate::config::home_dir();
         let expanded = match (path, home) {
             ("~", Some(home)) => home,
@@ -139,6 +199,48 @@ impl SessionTools {
     }
 }
 
+pub(crate) fn root_label<'a>(root: &'a Path, label: Option<&'a str>) -> Cow<'a, str> {
+    label.map_or_else(|| root.to_string_lossy(), Cow::Borrowed)
+}
+
+pub(crate) fn unhost(text: &str, root: &Path, label: Option<&str>) -> String {
+    let Some(label) = label else {
+        return text.to_owned();
+    };
+    let root = root.to_string_lossy();
+    let base = if label.ends_with('/') {
+        label.to_owned()
+    } else {
+        format!("{label}/")
+    };
+    text.replace(&format!("{root}/"), &base)
+        .replace(root.as_ref(), label)
+}
+
+pub(crate) fn shown<'a>(
+    label: Option<&'a str>,
+    path: &'a str,
+    absolute: &'a Path,
+) -> (&'a str, &'a Path) {
+    (label.unwrap_or(path), label.map_or(absolute, Path::new))
+}
+
+/// Normalizes model path typos shared by scheme and filesystem resolution.
+fn clean_path(path: &str) -> Cow<'_, str> {
+    let unicode_space = |c: char| {
+        matches!(
+            c,
+            '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+        )
+    };
+    let path = path.strip_prefix('@').unwrap_or(path);
+    if path.contains(unicode_space) {
+        Cow::Owned(path.replace(unicode_space, " "))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
 /// The built-in tools in prompt order: `read, write, edit, bash, grep, find`, plus `ask`
 /// when `ask` is set.
 pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
@@ -154,6 +256,32 @@ pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
         list.push(Arc::new(AskTool::new(tools.clone())));
     }
     list
+}
+
+/// Replaces the entry with the same name in place, or appends `entry`.
+pub(crate) fn replace_or_push<T: ?Sized>(
+    entries: &mut Vec<Arc<T>>,
+    entry: Arc<T>,
+    name: fn(&T) -> &str,
+) {
+    match entries
+        .iter()
+        .position(|existing| name(existing) == name(&entry))
+    {
+        Some(index) => entries[index] = entry,
+        None => entries.push(entry),
+    }
+}
+
+/// Applies host tools in order, replacing matching built-ins without changing their position.
+pub(crate) fn merge_tools(
+    mut builtin: Vec<Arc<dyn Tool>>,
+    host: &[Arc<dyn Tool>],
+) -> Vec<Arc<dyn Tool>> {
+    for tool in host {
+        replace_or_push(&mut builtin, tool.clone(), |tool| tool.name());
+    }
+    builtin
 }
 
 /// The key two paths to the same file share: the deepest existing ancestor canonicalized,

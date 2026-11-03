@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::Limits;
 use crate::Error;
+use crate::schemes::artifact::Artifacts;
 use crate::store::{ContextReplacement, EntryId};
 use crate::tools::{FileAccess, file_key, ledger_access};
 
@@ -32,18 +33,17 @@ pub(crate) struct Elision {
     pub artifacts: Vec<Artifact>,
 }
 
-fn artifact(artifacts_dir: &Path, extension: &str, bytes: Vec<u8>) -> Artifact {
-    Artifact {
-        path: artifacts_dir.join(format!("context-{}.{}", uuid::Uuid::now_v7(), extension)),
-        bytes,
-    }
+fn artifact(artifacts: &Artifacts, extension: &str, bytes: Vec<u8>) -> (u64, Artifact) {
+    // Discarded preparations may leave harmless gaps in the artifact IDs.
+    let (n, path) = artifacts.allocate(&format!("shake.{extension}"));
+    (n, Artifact { path, bytes })
 }
 
 /// `sources` contains only original ordinary sources, never synthetic summaries.
 pub(crate) fn prepare(
     messages: &[AgentMessage],
     sources: &[(EntryId, Range<usize>)],
-    artifacts_dir: &Path,
+    artifacts: &Artifacts,
     skill_paths: &[PathBuf],
     mode: ElisionMode,
 ) -> Result<Option<Elision>, Error> {
@@ -78,7 +78,7 @@ pub(crate) fn prepare(
         }
         recent = recent.saturating_add(super::message_tokens(message));
     }
-    let mut artifacts = Vec::new();
+    let mut recoveries = Vec::new();
     let mut replacements = Vec::new();
     let mut candidate_tokens = super::estimate_messages(messages);
     for (id, range) in sources {
@@ -109,8 +109,8 @@ pub(crate) fn prepare(
                     &message.content,
                     mode,
                     tool_result,
-                    artifacts_dir,
-                    &mut artifacts,
+                    artifacts,
+                    &mut recoveries,
                 )?
                 else {
                     continue;
@@ -123,7 +123,7 @@ pub(crate) fn prepare(
             }
             AgentMessage::Llm(Message::Assistant(message)) => {
                 let Some(blocks) =
-                    elide_assistant_blocks(&message.content, mode, artifacts_dir, &mut artifacts)
+                    elide_assistant_blocks(&message.content, mode, artifacts, &mut recoveries)
                 else {
                     continue;
                 };
@@ -138,8 +138,8 @@ pub(crate) fn prepare(
                     &message.content,
                     mode,
                     tool_result,
-                    artifacts_dir,
-                    &mut artifacts,
+                    artifacts,
+                    &mut recoveries,
                 )?
                 else {
                     continue;
@@ -155,8 +155,8 @@ pub(crate) fn prepare(
                     &message.content,
                     mode,
                     tool_result,
-                    artifacts_dir,
-                    &mut artifacts,
+                    artifacts,
+                    &mut recoveries,
                 )?
                 else {
                     continue;
@@ -181,7 +181,7 @@ pub(crate) fn prepare(
     }
     Ok(Some(Elision {
         edits: replacements,
-        artifacts,
+        artifacts: recoveries,
     }))
 }
 
@@ -189,8 +189,8 @@ fn elide_text(
     text: &str,
     ranges: Vec<Range<usize>>,
     mode: ElisionMode,
-    artifacts_dir: &Path,
-    artifacts: &mut Vec<Artifact>,
+    artifacts: &Artifacts,
+    recoveries: &mut Vec<Artifact>,
 ) -> Option<String> {
     let mut updated = None;
     for range in ranges.into_iter().rev() {
@@ -201,18 +201,15 @@ fn elide_text(
         {
             continue;
         }
-        let recovery = artifact(artifacts_dir, "txt", original.as_bytes().to_vec());
-        let marker = format!(
-            "[shaken ~{tokens} tokens; full text: {}]",
-            recovery.path.display()
-        );
+        let (n, recovery) = artifact(artifacts, "txt", original.as_bytes().to_vec());
+        let marker = format!("[shaken ~{tokens} tokens; full text: artifact://{n}]");
         if estimate_text_tokens(&marker) >= tokens {
             continue;
         }
         updated
             .get_or_insert_with(|| text.to_owned())
             .replace_range(range, &marker);
-        artifacts.push(recovery);
+        recoveries.push(recovery);
     }
     updated
 }
@@ -221,8 +218,8 @@ fn elide_user_blocks(
     blocks: &[UserBlock],
     mode: ElisionMode,
     tool_result: bool,
-    artifacts_dir: &Path,
-    artifacts: &mut Vec<Artifact>,
+    artifacts: &Artifacts,
+    recoveries: &mut Vec<Artifact>,
 ) -> Result<Option<Vec<UserBlock>>, Error> {
     let has_skill = blocks
         .iter()
@@ -236,7 +233,7 @@ fn elide_user_blocks(
                 } else {
                     block_ranges(text)
                 };
-                elide_text(text, ranges, mode, artifacts_dir, artifacts)
+                elide_text(text, ranges, mode, artifacts, recoveries)
                     .map(|text| UserBlock::Text { text })
             }
             (ElisionMode::Images, UserBlock::Image { data, mime_type }) if !has_skill => {
@@ -255,9 +252,9 @@ fn elide_user_blocks(
                     "image/x-icon" => "ico",
                     _ => "bin",
                 };
-                let recovery = artifact(artifacts_dir, extension, bytes);
-                let text = format!("[shaken image; full image: {}]", recovery.path.display());
-                artifacts.push(recovery);
+                let (n, recovery) = artifact(artifacts, extension, bytes);
+                let text = format!("[shaken image; full image: artifact://{n}]");
+                recoveries.push(recovery);
                 Some(UserBlock::Text { text })
             }
             _ => None,
@@ -272,8 +269,8 @@ fn elide_user_blocks(
 fn elide_assistant_blocks(
     blocks: &[AssistantBlock],
     mode: ElisionMode,
-    artifacts_dir: &Path,
-    artifacts: &mut Vec<Artifact>,
+    artifacts: &Artifacts,
+    recoveries: &mut Vec<Artifact>,
 ) -> Option<Vec<AssistantBlock>> {
     let has_skill = blocks.iter().any(
         |block| matches!(block, AssistantBlock::Text { text, .. } if !skill_spans(text).is_empty()),
@@ -284,18 +281,15 @@ fn elide_assistant_blocks(
             (
                 ElisionMode::Elide | ElisionMode::Clearing { .. },
                 AssistantBlock::Text { text, .. },
-            ) => elide_text(text, block_ranges(text), mode, artifacts_dir, artifacts),
+            ) => elide_text(text, block_ranges(text), mode, artifacts, recoveries),
             (ElisionMode::Thinking, AssistantBlock::Thinking { .. }) if !has_skill => {
-                let recovery = artifact(
-                    artifacts_dir,
+                let (n, recovery) = artifact(
+                    artifacts,
                     "json",
                     serde_json::to_vec(&block).expect("content blocks serialize"),
                 );
-                let text = format!(
-                    "[shaken thinking; full thinking: {}]",
-                    recovery.path.display()
-                );
-                artifacts.push(recovery);
+                let text = format!("[shaken thinking; full thinking: artifact://{n}]");
+                recoveries.push(recovery);
                 Some(text)
             }
             _ => None,

@@ -32,12 +32,16 @@ use crate::context::{home_agents_dir, project_root};
 use crate::error::Error;
 use crate::exec::ExecEnv;
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
+use crate::schemes::artifact::Artifacts;
+use crate::schemes::dir::DirScheme;
+use crate::schemes::skill::SkillScheme;
+use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::store::{
     self, Entry, EntryBase, EntryId, Header, Projection, SeqEntry, SessionStore, SessionWriter,
     SubmissionKind, project,
 };
 use crate::tools::ask::{Answer, PendingQuestions, Question};
-use crate::tools::{self, SessionTools};
+use crate::tools::{self, SessionTools, ToolFactory};
 
 pub struct SessionOptions {
     /// Ignored by `Axo::open_session`, which uses the cwd in the session header.
@@ -56,6 +60,10 @@ pub struct SessionOptions {
     pub exec_env: Option<Arc<dyn ExecEnv>>,
     /// Host prompt sections, applied last; `None` removes a section.
     pub sections: Vec<(String, Option<String>)>,
+    /// Host tools, built per session (and per fork) from its `SessionTools`; one named like a built-in replaces it.
+    pub tools: Vec<ToolFactory>,
+    /// Host schemes; one named like a built-in replaces it (artifact and file are reserved).
+    pub schemes: Vec<Arc<dyn Scheme>>,
     /// What `Axo::open_session` does with a run left unfinished.
     pub recovery: RecoveryPolicy,
 }
@@ -71,6 +79,8 @@ impl Default for SessionOptions {
             project_access: None,
             exec_env: None,
             sections: Vec::new(),
+            tools: Vec::new(),
+            schemes: Vec::new(),
             recovery: RecoveryPolicy::default(),
         }
     }
@@ -199,6 +209,8 @@ pub(crate) struct SessionSetup {
     pub(crate) ask_enabled: bool,
     pub(crate) project_access: ProjectAccess,
     pub(crate) host_sections: Vec<(String, Option<String>)>,
+    pub(crate) host_tools: Vec<ToolFactory>,
+    pub(crate) host_schemes: Vec<Arc<dyn Scheme>>,
     pub(crate) store: Arc<dyn SessionStore>,
     /// The header id, forwarded to providers as the session id.
     pub(crate) session_id: String,
@@ -235,6 +247,8 @@ pub struct Session {
     context_files: Vec<ContextFile>,
     skills: Vec<Skill>,
     host_sections: Vec<(String, Option<String>)>,
+    host_tools: Vec<ToolFactory>,
+    host_schemes: Vec<Arc<dyn Scheme>>,
     prompt: Mutex<PromptState>,
 }
 
@@ -281,7 +295,6 @@ struct Maintenance {
     prompts: compaction::summary::SummaryPrompts,
     session_id: String,
     path: PathBuf,
-    artifacts_dir: PathBuf,
     tools: Arc<SessionTools>,
     tool_specs: Vec<ToolSpec>,
     skill_paths: Vec<PathBuf>,
@@ -586,7 +599,7 @@ impl SessionHooks {
         let elision = compaction::elide::prepare(
             &messages,
             &sources,
-            &self.maintenance.artifacts_dir,
+            self.maintenance.tools.schemes.artifacts(),
             &self.maintenance.skill_paths,
             mode,
         )?;
@@ -620,8 +633,11 @@ impl SessionHooks {
                 return Ok(false);
             }
         }
-        compaction::elide::write_artifacts(&self.maintenance.artifacts_dir, &elision.artifacts)
-            .await?;
+        compaction::elide::write_artifacts(
+            self.maintenance.tools.schemes.artifacts().dir(),
+            &elision.artifacts,
+        )
+        .await?;
         self.write_all(&mut log, pending).await?;
         Ok(true)
     }
@@ -1532,6 +1548,8 @@ impl Session {
             ask_enabled,
             project_access,
             host_sections,
+            host_tools,
+            host_schemes,
             store,
             session_id,
             writer,
@@ -1541,8 +1559,10 @@ impl Session {
         } = setup;
 
         let path = writer.planned_path().to_path_buf();
-        let spool_dir = path.with_extension("").join("bash");
-        let artifacts_dir = path.with_extension("").join("context");
+        let session_dir = path.with_extension("");
+        let artifacts = Arc::new(Artifacts::new(
+            session_dir.join(crate::schemes::ARTIFACTS_DIR),
+        ));
         let (events, _) = broadcast::channel(1024);
         let questions = Arc::new(PendingQuestions::new(events.clone()));
         let project = project_access != ProjectAccess::Ignore;
@@ -1561,6 +1581,22 @@ impl Session {
             &cwd,
             project && settings.project.files.skills,
         );
+        let schemes = Schemes::new(
+            SchemeContext {
+                session_id: session_id.clone(),
+                session_dir: session_dir.clone(),
+                cwd: cwd.clone(),
+            },
+            artifacts,
+            vec![
+                Arc::new(SkillScheme::new(&skills)),
+                Arc::new(DirScheme::local(
+                    session_dir.join(crate::schemes::LOCAL_DIR),
+                )),
+                Arc::new(DirScheme::docs(dir.docs_dir())),
+            ],
+            &host_schemes,
+        )?;
         let (summary_prompts, summary_diagnostics) = compaction::summary::SummaryPrompts::load(
             &dir,
             &cwd,
@@ -1578,13 +1614,17 @@ impl Session {
         let session_tools = SessionTools::new(
             cwd.clone(),
             exec.clone(),
-            spool_dir.clone(),
+            schemes,
             questions.clone(),
             settings.ask.timeout_ms.map(Duration::from_millis),
             settings.bash.ci,
             context,
         );
-        let tools = tools::builtin(&session_tools, ask_enabled);
+        let host: Vec<Arc<dyn Tool>> = host_tools
+            .iter()
+            .map(|factory| factory(&session_tools))
+            .collect();
+        let tools = tools::merge_tools(tools::builtin(&session_tools, ask_enabled), &host);
 
         let ids = entries
             .iter()
@@ -1615,7 +1655,6 @@ impl Session {
                 prompts: summary_prompts,
                 session_id: session_id.clone(),
                 path: path.clone(),
-                artifacts_dir,
                 tools: session_tools.clone(),
                 tool_specs: tools
                     .iter()
@@ -1660,6 +1699,8 @@ impl Session {
             context_files,
             skills,
             host_sections,
+            host_tools,
+            host_schemes,
             prompt: Mutex::new(PromptState {
                 note: None,
                 date: String::new(),
@@ -1683,7 +1724,12 @@ impl Session {
             let resume = match recovery {
                 Some(policy) => {
                     session
-                        .recover(&mut log, policy, &spool_dir, &mut messages)
+                        .recover(
+                            &mut log,
+                            policy,
+                            session.tool_state.schemes.artifacts().dir(),
+                            &mut messages,
+                        )
                         .await?
                 }
                 None => None,
@@ -1786,21 +1832,21 @@ impl Session {
         &self,
         log: &mut Log,
         policy: RecoveryPolicy,
-        spool_dir: &Path,
+        artifacts_dir: &Path,
         messages: &mut Vec<AgentMessage>,
     ) -> Result<Option<Resumption>, Error> {
-        let replay_of = |name: &str| {
+        let replay_of = |call: &ToolCall| {
             self.tools
                 .iter()
-                .find(|tool| tool.name() == name)
-                .map_or(Replay::Never, |tool| tool.replay())
+                .find(|tool| tool.name() == call.name)
+                .map_or(Replay::Never, |tool| tool.replay(call))
         };
         let (run_id, outcome, reason) = match plan_recovery(
             &log.entries,
             &log.projection,
             &log.model,
             &replay_of,
-            spool_dir,
+            artifacts_dir,
         ) {
             RecoveryPlan::None => return Ok(None),
             RecoveryPlan::Requeue { requeue } => {
@@ -1943,14 +1989,13 @@ impl Session {
                     // Calls that would have been rerun are not run either.
                     calls.extend(rerun.into_iter().map(|call| (call, None)));
                 }
-                for (call, spool) in calls {
+                for (call, artifact) in calls {
                     let mut text = format!(
                         "Tool {} was interrupted and may have partially run.",
                         call.name
                     );
-                    if let Some(spool) = spool {
-                        text.push_str(" Output so far: ");
-                        text.push_str(&spool.display().to_string());
+                    if let Some(n) = artifact {
+                        text.push_str(&format!(" Output so far: artifact://{n}"));
                     }
                     let message = AgentMessage::Llm(Message::ToolResult(ToolResultMessage {
                         tool_call_id: call.id,
@@ -2004,12 +2049,14 @@ impl Session {
         if state.sections.is_some() && state.note == note && state.date == date {
             return None;
         }
+        let scheme_docs = self.tool_state.schemes.prompt_docs();
         let (sections, diagnostics) = build_sections(&PromptInputs {
             dir: &self.dir,
             cwd: &self.cwd,
             project_prompts: self.project_access != ProjectAccess::Ignore
                 && self.settings.project.files.axo_dir,
             tools: &self.tools,
+            scheme_docs: &scheme_docs,
             context_files: &self.context_files,
             skills: &self.skills,
             dev_shell: note.as_deref(),
@@ -2418,6 +2465,9 @@ impl Session {
         );
         let session_id = header.id.clone();
         let mut writer = self.store.create(header).await?;
+        let parent_dir = self.path.with_extension("");
+        let child_dir = writer.planned_path().with_extension("");
+        crate::schemes::copy_for_fork(&parent_dir, &child_dir).await;
         let mut entries = Vec::with_capacity(path.len() + 1);
         for entry in path {
             entries.push(writer.append(entry).await?);
@@ -2476,6 +2526,8 @@ impl Session {
             ask_enabled: self.ask_enabled,
             project_access: self.project_access,
             host_sections: self.host_sections.clone(),
+            host_tools: self.host_tools.clone(),
+            host_schemes: self.host_schemes.clone(),
             store: self.store.clone(),
             session_id,
             writer,

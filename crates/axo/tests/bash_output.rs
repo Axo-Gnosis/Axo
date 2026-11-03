@@ -1,9 +1,8 @@
 //! Shaping of raw command output for the model (`plan/research/shell-tool.md` #9-#11),
-//! and where the full output is spooled.
+//! and how bash output artifacts are named.
 
-use std::path::Path;
-
-use axo::tools::bash::{shape_output, spool_path};
+use axo::schemes::artifact::bash_tail;
+use axo::tools::bash::shape_output;
 
 /// 1000 unique 100-byte lines (100 000 bytes), so every line's offset is `index * 100`.
 fn numbered_lines() -> String {
@@ -136,11 +135,10 @@ fn ansi_escapes_are_stripped() {
 }
 
 #[test]
-fn spool_files_stay_inside_the_spool_dir() {
-    let dir = Path::new("/tmp/spool");
-    for id in ["../../etc/passwd", "/tmp/x", "a|b", "toolu_01Ab"] {
-        assert_eq!(spool_path(dir, id).parent(), Some(dir), "{id}");
+fn bash_artifact_tails_escape_unsafe_call_ids() {
+    assert_eq!(bash_tail("a|b"), "bash.a%7Cb.log");
+    assert_eq!(bash_tail("toolu_01Ab"), "bash.toolu_01Ab.log");
+    for id in ["../../etc/passwd", "/tmp/x"] {
+        assert!(!bash_tail(id).contains('/'), "{id}");
     }
-    assert_eq!(spool_path(dir, "a|b"), dir.join("a%7Cb.log"));
-    assert_eq!(spool_path(dir, "toolu_01Ab"), dir.join("toolu_01Ab.log"));
 }

@@ -235,7 +235,7 @@ impl Tool for AskTool {
         &self.parameters
     }
 
-    fn replay(&self) -> Replay {
+    fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
 

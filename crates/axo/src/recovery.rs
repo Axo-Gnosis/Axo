@@ -1,13 +1,12 @@
 //! What to do with a terminal response: live classification and crash recovery.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use axo_agent::{AgentMessage, Replay, unanswered_calls};
 use axo_ai::{AssistantMessage, Message, Model, StopReason, ToolCall, is_retryable_error};
 
 use crate::store::{Entry, EntryId, Projection, RunOutcome, SeqEntry};
-use crate::tools::bash::spool_path;
 
 /// Restarts without a new `message` entry after which a run is parked.
 const RESTART_LIMIT: usize = 5;
@@ -63,8 +62,8 @@ pub enum RecoveryPlan {
     Resume {
         run_id: String,
         attempt: u32,
-        /// `Replay::Never` calls with their spool file, when one exists.
-        interrupted: Vec<(ToolCall, Option<PathBuf>)>,
+        /// `Replay::Never` calls with their output artifact ID, when one exists.
+        interrupted: Vec<(ToolCall, Option<u64>)>,
         /// `Replay::Safe` calls to run again.
         rerun: Vec<ToolCall>,
         /// `submission` entries no `message` entry references.
@@ -72,9 +71,9 @@ pub enum RecoveryPlan {
     },
 }
 
-/// Plans recovery from a session's entries. `replay_of` maps a tool name to its
-/// replay policy; `spool_dir` is the session's bash spool directory
-/// (`<session_dir>/bash`), where interrupted calls' `<call_id>.log` files live.
+/// Plans recovery from a session's entries. `replay_of` maps an unanswered call to its
+/// replay policy; `artifacts_dir` is the session's artifacts directory
+/// (`<session_dir>/artifacts`), where interrupted bash calls' `<n>.bash.<id>.log` files live.
 ///
 /// Only the last `run_start` is considered: runs never overlap, so once a later
 /// run exists an older unclosed one has nothing left to recover.
@@ -82,8 +81,8 @@ pub fn plan_recovery(
     entries: &[SeqEntry],
     projection: &Projection,
     model: &Model,
-    replay_of: &dyn Fn(&str) -> Replay,
-    spool_dir: &Path,
+    replay_of: &dyn Fn(&ToolCall) -> Replay,
+    artifacts_dir: &Path,
 ) -> RecoveryPlan {
     let active: HashSet<usize> = projection.path().iter().copied().collect();
     // Submissions since the last run settled (an open run's own prompt is written
@@ -253,12 +252,22 @@ pub fn plan_recovery(
 
     let mut interrupted = Vec::new();
     let mut rerun = Vec::new();
+    let mut bash_outputs = None;
     for call in unanswered {
-        match replay_of(&call.name) {
+        match replay_of(call) {
             Replay::Safe => rerun.push(call.clone()),
             Replay::Never => {
-                let log = spool_path(spool_dir, &call.id);
-                interrupted.push((call.clone(), log.is_file().then_some(log)));
+                let artifact = (call.name == "bash")
+                    .then(|| {
+                        bash_outputs
+                            .get_or_insert_with(|| {
+                                crate::schemes::artifact::bash_outputs(artifacts_dir)
+                            })
+                            .get(&crate::schemes::artifact::bash_tail(&call.id))
+                            .copied()
+                    })
+                    .flatten();
+                interrupted.push((call.clone(), artifact));
             }
         }
     }

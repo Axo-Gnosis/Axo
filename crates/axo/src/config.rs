@@ -69,11 +69,6 @@ impl AxoDir {
         self.cache_dir().join("docs")
     }
 
-    /// Entry point for the `docs` system-prompt section: `<AXO_DIR>/cache/docs/README.md`.
-    pub fn docs_path(&self) -> PathBuf {
-        self.docs_dir().join("README.md")
-    }
-
     /// A user prompt file, `<AXO_DIR>/prompts/<name>.md`: `SYSTEM`, `WORK`, `PROSE`, and the
     /// summarizer's `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`,
     /// `BRANCH_SUMMARY`.

@@ -33,7 +33,7 @@ flowchart LR
 | **1. Codemode, script extensions & agent specs** | Embedded JS sandbox (`rquickjs`), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and child script hooks (rungs 2–5) | **Active focus.** Rungs 0–1 decided; rungs 2+ in discussion |
 | **2. Subagents (`task`) & `AgentSpec`** | In-process child sessions linked to parent tool calls, `.agents/agents` / `~/.axo/agents` role definitions, schema-validated outputs | Planned |
 | **3. Async `bash`, background jobs & `wait`** | Running-handle exec seam, session process registry, auto/explicit backgrounding, `job_result` follow-up delivery, `wait` tool | Planned |
-| **4. URL scheme registry & stateful resources** | `Resolver` seam for `scheme://` URLs across tools, plus tool-owned stateful resources (`table://`, `agent://`, `job://`, `browser://`) | Planned |
+| **4. URL scheme registry** | Per-session `scheme://` handlers resolved by `read`/`write`/`edit`/`grep`/`find` (and bash arguments); first wave `artifact://`, `skill://`, `axo://`, `local://`; host-registered schemes | Implemented |
 | **5. Extensions (Bun host), MCP & `ast_edit`** | Extension contract, Bun stdio host & `@axo/sdk`, `.mcp.json` / `~/.axo/mcp.json` tool adapter, optional `ast_edit` | Planned |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | On hold |
 
@@ -142,7 +142,7 @@ Codemode plus bash covers everything eval does except state between calls and or
   |---|---|---|
   | A dataset | A query tool, e.g. SQLite in the session directory | `table://sessions` |
   | A browser tab | The browser tool | `browser://tab/3` |
-  | A long command | The job registry | `job://bg_2` |
+  | A long command | The job registry | `proc://bg_2` |
   | A subagent | Child sessions | `agent://reviewer-4` |
 
 - **B. Everything addressable is callable.** URL schemes supply the nouns, tools the verbs, subagents the workers. A script sees all of them as one object model, and every call passes through the tool pipeline.
@@ -304,14 +304,64 @@ From `research/shell-tool.md` §2.3 and "Core seams needed now":
 
 ---
 
-## Track 4: URL scheme registry & stateful resources
+## Track 4: URL scheme registry — implemented
 
-- **`Resolver` seam (`design.md`).** A per-session/per-`Axo` scheme registry consulted by `read`, `grep`, and `find` so `scheme://` URIs resolve through pluggable providers without changing the tools.
-- **Stateful resources for codemode and the model:**
-  - `agent://<id>` and `history://<id>`: inspect subagent output and transcripts.
-  - `job://<id>` / `proc://<id>`: inspect or stop background jobs.
-  - `table://<name>`: session-scoped query tool (e.g. SQLite in the session directory) for holding and querying large datasets across turns without keeping a persistent JS/Python kernel.
-  - Later: `pr://`, `issue://`, `browser://`.
+Schemes give the model short, stable names for things that are not project files. Tools are the verbs (`read`, `write`, `edit`, `grep`, `find`); schemes are the nouns. A new noun is one handler, not a new set of tools. Prior art: omp `internal-urls/` (v18.15.0, ~7.9k LOC, 21 schemes behind a process-global router).
+
+### Why axo wants them
+
+- **Host data is rarely files.** A host exposes its own nouns (Sworm tasks, runs) through one trait; `read`/`grep` and later codemode and Bun extensions reach them through the same seam.
+- **Transcripts outlive paths.** Shake markers and bash truncation notices use URLs instead of absolute paths in the permanent transcript. A URL resolves against the current session at read time, survives moves and forks, and costs fewer tokens.
+- **Many tenants share one process.** A session resolves only its own resources: forks get their own files, and subagents will share their parent's (Track 2). Never unrelated sessions'. omp's `artifact://` scans every live session; axo does not. This is isolation, not a security boundary: `read` still accepts absolute paths.
+- **No approvals in the core.** Scheme calls run through the normal tool pipeline, so host hooks see the URL in the arguments and own any policy.
+
+### Settled
+
+- **Per-session handlers.** Each session builds its handlers; built-ins hold `Arc`s to session internals (as tools hold `Arc<SessionTools>`). No global router or context bag.
+- **Per-URL resolution, no static spec.** A handler resolves a URL to `File { path, writable }` (the normal file pipeline runs: images, truncation, stale-file guard, locks, ledger; `edit`/`write` refuse when not writable) or `Virtual` (handler renders text, paged by `read`'s `offset`/`limit`). No `:N-M` selector grammar.
+- **The trait.** What a scheme author writes:
+
+  ```rust
+  pub trait Scheme: Send + Sync {
+      fn name(&self) -> &str;        // "local"
+      fn prompt_doc(&self) -> &str;  // one line for the prompt section
+      async fn resolve(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<Target, ToolError>;
+      async fn read(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<String, ToolError>; // Virtual only
+      async fn write(&self, url: &SchemeUrl, content: &str, cx: &SchemeContext) -> Result<String, ToolError>; // Virtual only; default read-only
+      fn write_replay(&self) -> Replay; // default Never
+  }
+  pub enum Target { File { path: PathBuf, writable: bool }, Virtual }
+  ```
+
+  `resolve` is the only call bash's rewriter and `grep`/`find` make.
+- **`write` can act.** A handler may accept writes whose content is an instruction, not stored bytes (future `proc://bg_1/kill`, stdin, messages to a subagent). Content stays required; action writes receive `""` and keep `write_replay` at `Never`. Schemes that don't accept writes are read-only; file-backed schemes like `local://` keep normal write semantics.
+- **`grep`/`find` on file-backed URLs only** at first. Virtual URLs fail with "use `read`"; a virtual handler may still map a URL to a file (a job's log). A listing method arrives only when a host needs it.
+- **Host injection.** `SessionOptions` gained `tools: Vec<ToolFactory>` and `schemes: Vec<Arc<dyn Scheme>>`. Each tool factory is called with the session's `Arc<SessionTools>` at start and again for each fork, so host tools can use `locate`, `schemes` and `rewrite_urls`. Each scheme call gets `SchemeContext { session_id, session_dir, cwd }`, with no parent chain, so one handler can serve every session. Host tools replace built-ins by name or append.
+- **Host schemes.** Names must match `^[a-z][a-z0-9+.-]+$`; `artifact` and `file` are reserved. Other host schemes replace built-ins by name in place or append.
+- **Containment.** File roots reject absolute paths and `..` components. Only `local://` also checks realpaths; skills are often per-file symlinks into `/nix/store`.
+- **Kept from omp:** normalizing model typos (`/cwd/local://x`, `local:/x`); one-line prompt doc per scheme in a prompt section stored in the transcript.
+- **Dropped from omp:** approval tiers, write scopes, plan-mode sandbox roots; TUI parts (sync locate, OSC 8 links, autocomplete, render details); the virtual-filesystem layer for embedded shell, `grep` and `find`; MCP fallback routing; hashline unwrapping.
+
+### Built-in schemes
+
+`<session_dir>` is the session's `.jsonl` path without its extension. Side files live in `<session_dir>/artifacts/<n>.<tail>` and `<session_dir>/local/`. Old `context/` and `bash/` folders are ignored; no migration.
+
+| Scheme | Names | Backing | omp precedent | axo decision |
+|---|---|---|---|---|
+| `artifact://<n>` | Shake recovery text, full output of truncated bash commands | File, read-only | Per-session counter, seeded by scanning the dir; branching copies the dir | `<session_dir>/artifacts/<n>.bash.<callid>.log` for bash (call id escaped for filenames), `<n>.shake.<ext>` for shake. The URL uses only `<n>`; crash recovery finds bash logs by call id. Forks hard-link artifacts with a copy fallback and continue the counter. |
+| `skill://<name>[/<path>]` | A skill's `SKILL.md`, or a file in its directory | File, read-only, text-contained in the skill dir | Same forms, plus `skill://<plugin>/<name>` for plugin collisions | No namespaces: axo skill names are already unique (first wins, collisions diagnosed). Skill blocks use `location="skill://<name>"` and "References are relative to `skill://<name>/`". |
+| `axo://<file>.md` | axo's bundled docs | File, read-only, over `<AXO_DIR>/cache/docs` | `omp://` is virtual (docs embedded in the binary) | Keep the on-disk copy (`ensure_bundled_docs` writes only when changed) so `grep`, `find` and bash work on it. |
+| `local://<path>` | Per-session scratch folder (plans, notes, subagent handoffs) | File, writable, realpath-contained | `<artifacts>/local/`; subagents share the parent's root; branching and plan handoff copy it | `<session_dir>/local/`. Forks copy regular files and recreate directories, skipping symlinks; a fork's edits must not reach the parent. Subagents will share the parent's root (Track 2). |
+
+Later, with the features that use them: `proc://` (Track 3), `agent://` (Track 2: the only subagent scheme, covering output, transcript and messages, e.g. `agent://<id>` and `agent://<id>/history`; no separate `history://`), and ideas like `table://<name>` (session-scoped SQLite), `pr://`, `issue://`, `browser://`.
+
+### Schemes inside `bash`
+
+omp's embedded shell (`crates/pi-shell`, `pi-natives/src/shell/vfs.rs`) sees each command after parsing and expansion:
+- Redirections, globs, `cd` and its in-process utilities (`cat`, `find -exec`, `xargs`, …) open URLs through a virtual filesystem, virtual ones included.
+- For external programs, an argument that is exactly a backed URL, or `--flag=URL`, becomes the host path it aliases. Unknown schemes, URLs inside larger words (`https://x/?next=local://y`) and bare roots (`local://`) pass unchanged. A URL the handler rejects fails the command before it runs.
+
+axo runs real `bash -c`, so a hand-written scanner rewrites URLs before spawn. `brush-parser` was rejected: 0.4.0 pulls in insta+pest, bon, cached and peg. Whole-argument URLs (including wholly quoted URLs), `--flag=`/`NAME=` values and redirect targets become shell-quoted host paths, preserving unquoted globs. Heredoc bodies, comments, URLs embedded in quoted substrings or larger words, unknown schemes and bare roots stay unchanged. A rejected URL fails before spawn; virtual URLs fail with "use `read`", and read-only targets are refused as output redirects. URLs produced only by shell expansion are not seen (`f=local://x` itself is rewritten).
 
 ---
 

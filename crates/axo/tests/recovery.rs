@@ -51,8 +51,8 @@ fn call(id: &str, name: &str) -> ToolCall {
     }
 }
 
-fn replay_of(name: &str) -> Replay {
-    match name {
+fn replay_of(call: &ToolCall) -> Replay {
+    match call.name.as_str() {
         "read" => Replay::Safe,
         _ => Replay::Never,
     }
@@ -169,21 +169,25 @@ impl Log {
         });
     }
 
-    fn plan(&self, spool_dir: &Path) -> RecoveryPlan {
+    fn plan(&self, artifacts_dir: &Path) -> RecoveryPlan {
         plan_recovery(
             &self.entries,
             &axo::store::project(&self.entries, None),
             &model(),
             &replay_of,
-            spool_dir,
+            artifacts_dir,
         )
     }
 }
 
 #[test]
 fn safe_calls_rerun_and_never_calls_are_interrupted() {
-    let spool = tempfile::tempdir().unwrap();
-    std::fs::write(spool.path().join("c-bash.log"), "partial output\n").unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifacts.path().join("0.bash.c-bash.log"),
+        "partial output\n",
+    )
+    .unwrap();
 
     let done = call("c-done", "bash");
     let read = call("c-read", "read");
@@ -202,14 +206,11 @@ fn safe_calls_rerun_and_never_calls_are_interrupted() {
     log.tool_result(&done);
 
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Resume {
             run_id: "r1".into(),
             attempt: 1,
-            interrupted: vec![
-                (bash, Some(spool.path().join("c-bash.log"))),
-                (bash_no_log, None),
-            ],
+            interrupted: vec![(bash, Some(0)), (bash_no_log, None)],
             rerun: vec![read],
             requeue: Vec::new(),
         }
@@ -218,7 +219,7 @@ fn safe_calls_rerun_and_never_calls_are_interrupted() {
 
 #[test]
 fn settled_but_unclosed_run_is_finished() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let read = call("c1", "read");
 
     let mut log = Log::default();
@@ -233,7 +234,7 @@ fn settled_but_unclosed_run_is_finished() {
     log.assistant_text("done reading");
 
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Finish {
             run_id: "r1".into(),
             outcome: store::RunOutcome::Done,
@@ -242,12 +243,12 @@ fn settled_but_unclosed_run_is_finished() {
     );
 
     log.run_end("r1");
-    assert_eq!(log.plan(spool.path()), RecoveryPlan::None);
+    assert_eq!(log.plan(artifacts.path()), RecoveryPlan::None);
 }
 
 #[test]
 fn fifth_consecutive_resume_parks_the_run() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
 
     let mut log = Log::default();
     log.user("s1", SubmissionKind::Prompt, "loop forever");
@@ -259,7 +260,7 @@ fn fifth_consecutive_resume_parks_the_run() {
 
     assert!(
         matches!(
-            &log.plan(spool.path()),
+            &log.plan(artifacts.path()),
             RecoveryPlan::Resume { run_id, attempt: 5, .. } if run_id == "r1"
         ),
         "four resumes still resume"
@@ -267,7 +268,7 @@ fn fifth_consecutive_resume_parks_the_run() {
 
     log.run_resumed("r1", 5);
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Park {
             run_id: "r1".into()
         }
@@ -276,7 +277,7 @@ fn fifth_consecutive_resume_parks_the_run() {
 
 #[test]
 fn a_message_between_resumes_resets_the_restart_limit() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let first = call("c1", "read");
 
     let mut log = Log::default();
@@ -289,14 +290,14 @@ fn a_message_between_resumes_resets_the_restart_limit() {
     log.run_resumed("r1", 5);
 
     assert!(matches!(
-        &log.plan(spool.path()),
+        &log.plan(artifacts.path()),
         RecoveryPlan::Resume { run_id, .. } if run_id == "r1"
     ));
 }
 
 #[test]
 fn unconsumed_steer_is_requeued() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let first = call("c1", "read");
     let second = call("c2", "read");
 
@@ -311,7 +312,7 @@ fn unconsumed_steer_is_requeued() {
     let pending = log.submission("s3", SubmissionKind::Steer, "pending steer");
 
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Resume {
             run_id: "r1".into(),
             attempt: 1,
@@ -324,7 +325,7 @@ fn unconsumed_steer_is_requeued() {
 
 #[test]
 fn prompt_submitted_before_its_run_started_is_requeued() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
 
     let mut log = Log::default();
     log.user("s1", SubmissionKind::Prompt, "first");
@@ -334,7 +335,7 @@ fn prompt_submitted_before_its_run_started_is_requeued() {
     let stranded = log.submission("s2", SubmissionKind::Prompt, "second");
 
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Requeue {
             requeue: vec![stranded]
         }
@@ -343,7 +344,7 @@ fn prompt_submitted_before_its_run_started_is_requeued() {
 
 #[test]
 fn follow_up_left_after_a_settled_reply_resumes_the_run() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
 
     let mut log = Log::default();
     log.submission("s1", SubmissionKind::Prompt, "start");
@@ -361,7 +362,7 @@ fn follow_up_left_after_a_settled_reply_resumes_the_run() {
     let follow_up = log.submission("s2", SubmissionKind::FollowUp, "and then");
 
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Resume {
             run_id: "r1".into(),
             attempt: 1,
@@ -374,7 +375,7 @@ fn follow_up_left_after_a_settled_reply_resumes_the_run() {
 
 #[test]
 fn hidden_transient_response_is_recovered_before_any_tool_replay() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let mut log = Log::default();
     log.user("s1", SubmissionKind::Prompt, "start");
     log.run_start("r1");
@@ -394,7 +395,7 @@ fn hidden_transient_response_is_recovered_before_any_tool_replay() {
         replacement: None,
     });
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::RecoverResponse {
             run_id: "r1".into(),
             attempt: 1,
@@ -406,7 +407,7 @@ fn hidden_transient_response_is_recovered_before_any_tool_replay() {
         log.run_resumed("r1", attempt);
     }
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Park {
             run_id: "r1".into()
         }
@@ -415,7 +416,7 @@ fn hidden_transient_response_is_recovered_before_any_tool_replay() {
 
 #[test]
 fn checkpoint_absorbed_answer_finishes_but_later_consumed_input_continues() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let mut log = Log::default();
     log.user("s1", SubmissionKind::Prompt, "start");
     let user_id = log.entries.last().unwrap().entry.base().unwrap().id.clone();
@@ -433,7 +434,7 @@ fn checkpoint_absorbed_answer_finishes_but_later_consumed_input_continues() {
         system_message: None,
     });
     assert_eq!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Finish {
             run_id: "r1".into(),
             outcome: store::RunOutcome::Done,
@@ -442,14 +443,14 @@ fn checkpoint_absorbed_answer_finishes_but_later_consumed_input_continues() {
     );
     log.user("s2", SubmissionKind::FollowUp, "next task");
     assert!(matches!(
-        log.plan(spool.path()),
+        log.plan(artifacts.path()),
         RecoveryPlan::Resume { .. }
     ));
 }
 
 #[test]
 fn terminal_fault_outcomes_are_not_reported_as_success_or_replayed() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     for (stop_reason, outcome) in [
         (StopReason::Error, store::RunOutcome::Failed),
         (StopReason::Aborted, store::RunOutcome::Aborted),
@@ -473,13 +474,13 @@ fn terminal_fault_outcomes_are_not_reported_as_success_or_replayed() {
             );
             if with_call {
                 assert!(matches!(
-                    log.plan(spool.path()),
+                    log.plan(artifacts.path()),
                     RecoveryPlan::RecoverResponse { .. }
                 ));
                 log.tool_result(&call("unsafe", "bash"));
             }
             assert_eq!(
-                log.plan(spool.path()),
+                log.plan(artifacts.path()),
                 RecoveryPlan::Finish {
                     run_id: "r1".into(),
                     outcome,
@@ -601,7 +602,7 @@ fn foreign_tool_use_with_provider_overflow_recovers_before_replay() {
 
 #[test]
 fn hidden_successful_reply_cannot_settle_a_run() {
-    let spool = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let mut log = Log::default();
     log.user("s1", SubmissionKind::Prompt, "start");
     log.run_start("r1");
@@ -613,7 +614,7 @@ fn hidden_successful_reply_cannot_settle_a_run() {
         replacement: None,
     });
     assert!(
-        matches!(log.plan(spool.path()), RecoveryPlan::Resume { rerun, interrupted, .. }
+        matches!(log.plan(artifacts.path()), RecoveryPlan::Resume { rerun, interrupted, .. }
         if rerun.is_empty() && interrupted.is_empty())
     );
 }
