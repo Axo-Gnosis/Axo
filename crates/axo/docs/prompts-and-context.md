@@ -17,7 +17,7 @@
 | 7 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
 | 8 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
 | 9 | `cwd` | `inputs.cwd.display()` |
-| 10 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."` or `"Commands run with the direnv environment of {dir}."`) |
+| 10 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
 | 11 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
 | 12 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section |
 
@@ -55,13 +55,13 @@ Loaded when a session starts (`crates/axo/src/compaction/summary.rs`):
 
 | File | Bundled default | Used for |
 | :--- | :--- | :--- |
-| `SUMMARY.md` | `crates/axo/prompts/SUMMARY.md` | System prompt for separate summary requests, and appended rules for live summary requests |
+| `SUMMARY.md` | `crates/axo/prompts/SUMMARY.md` | System prompt for separate summary requests; prepended to the checkpoint instructions in the user message appended to the live conversation |
 | `COMPACTION.md` | `crates/axo/prompts/COMPACTION.md` | First compaction checkpoint |
 | `COMPACTION_UPDATE.md` | `crates/axo/prompts/COMPACTION_UPDATE.md` | Subsequent compaction checkpoints updating a previous summary |
 | `COMPACTION_SPLIT_TURN.md` | `crates/axo/prompts/COMPACTION_SPLIT_TURN.md` | Summarizing the prefix of a split turn |
 | `BRANCH_SUMMARY.md` | `crates/axo/prompts/BRANCH_SUMMARY.md` | Summarizing an abandoned branch during `Session::navigate` with `summarize: true` |
 
-If a summarizer override file is empty or whitespace-only, `SummaryPrompts::load` records a `Diagnostic` (`"Empty summary prompt override ignored"`) and keeps the bundled prompt.
+If a summarizer override file is empty or whitespace-only, `SummaryPrompts::load` records a `Diagnostic` (`"empty summary prompt ignored; using the bundled prompt"`) and keeps the bundled prompt.
 
 ## Context Files (`crates/axo/src/context/files.rs`)
 
@@ -71,12 +71,12 @@ If a summarizer override file is empty or whitespace-only, `SummaryPrompts::load
 2. **Project walk:** When `project` is `true` (`project_access != ProjectAccess::Ignore`), `axo` walks every directory from `project_root(cwd)` (the git root, or `cwd` outside a repository) down to `cwd`.
 3. **File selection & ordering (`context_file_names`):**
    - Keys in `settings.context_files` must be non-empty relative paths with only `Component::Normal` segments; absolute paths or paths containing `..` or `.` emit a `Diagnostic` and are skipped.
-   - Enabled keys (`true`) are ordered in map order, except any key matching `<stem>.<tag>.md` is placed immediately after `<stem>.md` when `<stem>.md` is also present in the map.
-4. **Deduplication:** Files are deduplicated by canonical path (`fs::canonicalize`) and by exact trimmed UTF-8 content, so symlinks or identical copies of `AGENTS.md` and `CLAUDE.md` load only once. UTF-8 BOMs are stripped.
+   - Enabled keys (`true`) are ordered in map order, except any key matching `<stem>.<tag>.md` is placed immediately after `<stem>.md` when `<stem>.md` is also enabled (multi-tag chains such as `A.x.y.md` → `A.x.md` → `A.md` stay adjacent recursively).
+4. **Deduplication:** Files are deduplicated by canonical path (`fs::canonicalize`) and by identical content (SHA-256 of the BOM-stripped text), so symlinks or identical copies of `AGENTS.md` and `CLAUDE.md` load only once. UTF-8 BOMs are stripped.
 
 ### On-demand nested context files (`NestedContext`)
 
-When `settings.nested_context_files` is `true`, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
+When project access is not `Ignore` and `settings.nested_context_files` is `true`, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
 - For a touched path inside `project_root`, `NestedContext` checks every directory from `project_root` down to the file's parent directory.
 - Any enabled context file whose canonical path and content are not already present in the startup `context_files` or in the active projection's tool results is appended to that tool result as `<project_instructions path="…">\n{content}\n</project_instructions>`.
 - `NestedContext::restore(&messages)` reconstructs the seen set from the current projected messages on session open, branch navigation, compaction, and `/shake`. If a tool result carrying a nested context file is elided or compacted away, the next file access in that directory reattaches it.
@@ -91,9 +91,9 @@ When `settings.nested_context_files` is `true`, successful `read`, `write`, and 
 3. `~/.agents/skills` (when `home_agents_dir` is `true`).
 
 Within each root:
-- Direct `*.md` files in the root and recursive subdirectories are scanned in sorted filename order.
+- Every `SKILL.md` under the root is a skill, visited in sorted file-name order. Dot-entries, `node_modules`, and `.gitignore`/`.ignore`/`.fdignore` matches are skipped, and symlinks are followed.
 - Once a directory contains `SKILL.md`, that file defines the skill and `load_skills` does not recurse deeper into that directory.
-- Symlink loops and duplicate files are skipped via `fs::canonicalize`.
+- The same `SKILL.md` reached twice (a symlink or overlapping roots) is skipped silently (compared by canonical path). Symlink loops are skipped by the walker.
 - First skill name wins; later skills with the same name are skipped with a `Diagnostic`.
 
 ### Frontmatter & validation
@@ -111,8 +111,8 @@ disable-model-invocation: false
 Skill body with optional $ARGUMENTS, $@, $1, ${@:2}, ${1:-default} placeholders.
 ```
 
-- `description` is required (missing or empty descriptions skip the skill with a `Diagnostic`).
-- `name` defaults to the parent directory name (or file stem). Names longer than 64 characters, not matching `[a-z0-9-]`, containing `--`, or not matching the parent directory name emit a `Diagnostic` but still load.
+- `description` is required (missing or empty descriptions skip the skill with a `Diagnostic`). An unreadable file or invalid YAML frontmatter also skips the skill with a `Diagnostic`.
+- `name` defaults to the parent directory name. Names longer than 64 characters, empty or outside `[a-z0-9-]`, starting or ending with `-`, or containing `--` emit a `Diagnostic` but still load, and so do descriptions longer than 1024 characters.
 - `argument-hint` is optional placeholder text an app shows after `/name` until arguments are typed (`Skill::argument_hint`, trimmed; empty or non-string values become `None`). It is the only skill-argument metadata: a skill takes one free-text argument and has no typed parameters.
 - `disable-model-invocation: true` omits the skill from the `<skills>` system-prompt section while keeping `/name` user expansion active.
 - A skill named like a [built-in command](#user-commands-cratesaxosrccommandsrs) (`compact`, `shake`, `model`, `thinking`, `navigate`) still loads, but session start logs the warning diagnostic `skill name "<name>" is reserved by the built-in /<name> command; the command catalog lists the built-in`, and the skill is left out of `Session::commands()`. Prompt text `/<name>` still expands the skill; a host that parses typed commands with `Command::parse` first runs the built-in instead.
@@ -133,44 +133,13 @@ References are relative to skill://my-skill/.
 
 A `/word` that names no skill stays ordinary prompt text (so `/etc/hosts is broken` reaches the model unchanged).
 
-If the skill body contains no `$` argument placeholders (`$ARGUMENTS`, `$@`, `$1`…`$9`, `${@:N}`, `${@:N:L}`, `${N:-default}`) and the user passed arguments after `/<skill-name>`, the arguments are appended after a blank line.
+If the skill body contains no `$` argument placeholders (`$ARGUMENTS`, `$@`, `$N` for any 1-based digit index, `${@:N}`, `${@:N:L}`, or `${N|@|ARGUMENTS:-default}`) and the user passed arguments after `/<skill-name>`, the arguments are appended after a blank line.
 
 The submission stores the original parts, not the expansion; the expansion exists only in the user message. Recovery re-renders requeued submissions, so their skills are expanded from the current `SKILL.md` (see [Crash Recovery](sessions-and-compaction.md#crash-recovery-cratesaxosrcrecoveryrs)).
 
 ## User Commands (`crates/axo/src/commands.rs`)
 
-`Session::commands()` returns the catalog a host may offer (`Vec<CommandInfo>`): the five built-ins in the order below, then every skill not shadowed by a built-in name, in skill-discovery order. Skills load once per session, so the catalog does not change while a session is open. The host picks which entries to expose and how (slash menu, buttons, its own pickers, or not at all); `axo` never runs a built-in on its own. A host runs one with `Session::run_command`, given a `Command` decoded from JSON arguments (`Command::decode(name, args)`), parsed from typed text (`Command::parse("/shake images")`, `None` for anything that is not `/<builtin>`), or built directly. Built-in commands are never saved as submissions, never sent as user prompts, and never deduplicated by `request_id`; `compact` and `navigate` with `summarize: true` may still make summary requests to the model.
-
-| Command | Policy | Arguments (positional order) | Runs |
-| :--- | :--- | :--- | :--- |
-| `compact` | `when_idle` | none | `Session::compact()` |
-| `shake` | `when_idle` | `mode`: `elide`, `images`, or `thinking` (required) | `Session::shake(mode)` |
-| `model` | `alongside` | `model`: `provider/id` (required, string format `model`) | `Models::find`, then `Session::set_model`; an unknown selector is `Error::ModelNotFound` |
-| `thinking` | `alongside` | `level`: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (required) | `Session::set_thinking(level)` |
-| `navigate` | `when_idle` | `entry` (required, string format `entry`), `summarize` (`true`/`false`, default `false`) | `Session::navigate(Some(entry), NavigateOptions { summarize })` |
-
-Each command has one fixed `CommandPolicy`, regardless of its arguments:
-- `Alongside` (`"alongside"`): runs during a turn and takes effect from the next request.
-- `WhenIdle` (`"when_idle"`): `Error::Busy` while a turn is running.
-- `Queued` (`"queued"`): every skill; expanded, then sent through whichever path the app used (`prompt`, `steer`, or `follow_up`).
-
-Running maintenance (compaction, `/shake`, branch summary) makes every built-in return `Error::Busy`, including alongside ones.
-
-`CommandInfo` serializes as camelCase JSON with its kind flattened in:
-
-```json
-[
-  {"name": "shake", "description": "Move large blocks, images, or thinking out of context into recoverable files", "policy": "when_idle", "kind": "builtin",
-   "parameters": {"type": "object", "properties": {"mode": {"description": "What to move out of context into recoverable files: large text blocks (elide), images, or thinking.", "type": "string", "enum": ["elide", "images", "thinking"]}}, "required": ["mode"], "additionalProperties": false}},
-  {"name": "review", "description": "Review a file", "policy": "queued", "kind": "skill", "argumentHint": "<file>"}
-]
-```
-
-- **`parameters`** is a JSON Schema object (draft 2020-12) with every subschema inlined: no `$ref`, `$defs`, `$schema`, or `title`. Unknown properties are rejected.
-- **Semantic formats:** a string property with `"format": "model"` takes a `provider/id` selector (hosts can offer their model list); `"format": "entry"` takes a session entry ID (hosts can offer a session-tree picker, or leave the command out when their transcript already navigates). There is no bare-ID model form and no path format.
-- **Text form (`Command::parse`):** words after `/name` are split like skill arguments (quotes group words) and map to the schema's properties in order. `boolean` properties accept only `true`/`false`, `integer` properties an `i64`; everything else is a string. Extra words fail with `takes no arguments` or `takes at most {n} arguments`.
-- **Errors:** missing, invalid, or extra arguments, or `Command::decode` with an unknown name, return `Error::InvalidCommand { command, message }`, displayed as `/{command}: {message}` (for example `/shake: unknown variant \`bogus\`, expected one of …`). `Value::Null` arguments count as `{}`.
-
+`Session::commands()` returns the catalog of built-in commands (`compact`, `shake`, `model`, `thinking`, `navigate`) and discovered skills. The command catalog, dispatch via `Session::run_command`, policies, JSON Schema argument schemas, and typed command text parsing are documented in [Commands](extending.md#commands).
 ## Prompt Parts (`crates/axo/src/input.rs`)
 
 `prompt`, `steer`, and `follow_up` take `impl Into<PromptInput>` (`PromptInput { parts: Vec<PromptPart> }`; `&str`, `String`, and `&String` convert to one `Text` part, and `Vec<PromptPart>` converts directly); `prompt_with` takes `PromptRequest { input: PromptInput, request_id: Option<String> }`. `PromptPart` serializes with a `type` tag and camelCase names:
@@ -186,7 +155,7 @@ Running maintenance (compaction, `/shake`, branch summary) makes every built-in 
 **`@` is reference only.** Files and saved content reach the model as `@path` (`@"path"` when it contains whitespace) inside the one text block; the model opens them itself with its tools, which strip the leading `@` and the quotes of `@"path"`. File contents are never inlined. Images are the one exception.
 
 **Preparation** runs before anything is written to the log; a failure saves nothing and returns `Error::InvalidInput`. A prompt refused afterwards (`Error::Busy`, a duplicate `request_id`, or a failed write) removes the content it saved; `Busy` and duplicates are checked before any content is saved or rendered.
-- `File`: the path must exist (`File not found: {path}`) or name a known scheme; virtual scheme URLs pass unchecked. The part is stored as typed.
+- `File`: plain paths and file-backed scheme URLs must exist (`File not found: {path}`). Virtual scheme URLs pass unchecked, and an unlocatable URL returns its locate error. The part is stored as typed.
 - `Content`: `name` must not be empty, `.`, `..`, or contain `/`, `\`, or NUL (`Invalid content name: {name}`). The bytes are written to `<session>/local/{name}` (the `local://` root), never overwriting: on collision axo tries `{stem}-2{.ext}`, `{stem}-3{.ext}`, … (split on the last `.`; dotfiles have no extension). The part becomes `Saved { url: "local://{final name}", image }`, where `image` is whether the bytes sniff as a supported image. IO failures are `Error::Io`.
 - `Saved`: must still resolve to an existing `local://` file (`File not found: {url}`), so apps can resubmit parts returned by `Session::fork`. `image` is re-derived from the file's bytes; the value sent is ignored.
 - `Text` / `Paste`: unchanged.
@@ -212,7 +181,7 @@ Environment resolution (dev-shell capture) stays in the foreground; the 60 s tim
 Command is still running in the background as bg_N. Full output: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with write proc://bg_N/kill.
 ```
 
-Its `details` are `{"job": "bg_N", "fullOutput": "artifact://<n>"}`. After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `write proc://bg_N/kill`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. Stopped by kill, the result reads `Command was stopped (proc://bg_N/kill)` with `is_error: true`.
+A truncated foreground `bash` result names `artifact://<n>` in its notice and has `details: {"fullOutput": "artifact://<n>"}`. Its `details` when promoted are `{"job": "bg_N", "fullOutput": "artifact://<n>"}`. After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `write proc://bg_N/kill`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. Stopped by kill, the result reads `Command was stopped (proc://bg_N/kill)` with `is_error: true`.
 
 **Retained helpers.** A result is the root shell's: it returns when the root exits plus a fixed 100 ms drain. If processes the command started are still alive in its container (for example backgrounded `&` or `nohup` children, which stay in the process group; under cgroup supervision also `setsid` descendants, which leave the process group and are invisible to process-group mode), the result, foreground or background, ends with `Processes started by this command are still running as bg_N (read proc://bg_N; stop with write proc://bg_N/kill). Their output continues in artifact://<n>.` They stay listed and killable as `bg_N` until they exit; no second result follows.
 
@@ -228,8 +197,8 @@ The session's `proc://` scheme (`Target::Virtual`; prompt doc `proc:// backgroun
 
 | Operation | Result |
 | :--- | :--- |
-| `read proc://` | One line per job, `bg_N  {status}  {command first line}`, status `running`, `helpers running`, `finished`, or `failed`; or `No background jobs.` |
-| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N` |
+| `read proc://` | One line per job, `bg_N  {status}  {command first line, max 120 chars}`, status `running`, `helpers running`, `finished`, or `failed`; or `No background jobs.` |
+| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://bg_N or proc://bg_N/kill.` |
 | `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
 
 Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside a session) has no `proc://`.

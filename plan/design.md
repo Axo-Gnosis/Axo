@@ -2,8 +2,8 @@
 
 This document holds axo's goals, non-goals, architecture, and settled core decisions. It changes only when goals or core decisions change.
 
-- **Implemented reference:** [`crates/axo/docs/README.md`](../crates/axo/docs/README.md) documents the live APIs, configuration, prompt assembly, session format, and compaction rules as built in M1–M5.
-- **Active planning:** [`plan.md`](plan.md) holds unbuilt work, design discussions in flight (codemode, subagents, background jobs, schemes, extensions, ACP), and open questions.
+- **Implemented reference:** [`crates/axo/docs/README.md`](../crates/axo/docs/README.md) documents the live APIs, configuration, prompt assembly, session format, schemes, supervision, and compaction rules as built.
+- **Active planning:** [`plan.md`](plan.md) holds unbuilt work, design discussions in flight (codemode, subagents, extensions, ACP), and open questions.
 - **Background studies:** [`pi/`](pi/README.md) (source notes on pi v1.3.0) and [`research/`](research/README.md) (comparative studies and measurements).
 
 ## Approach: a spiritual port of pi
@@ -14,7 +14,8 @@ axo deliberately goes beyond pi where an embedded, always-on Rust library needs 
 - **Durability from the start** (crash recovery, run markers, replay policies, single-writer locks, and `attach` catch-up).
 - **Scoped project access** (`ignore`, `read`, `trust`) instead of all-or-nothing project trust.
 - **First-class Nix and direnv dev-shell capture** behind an `ExecEnv` seam.
-- **Sandboxed script execution (codemode), subagents, URL schemes, and extensions** (planned in [`plan.md`](plan.md)).
+- **Per-session URL schemes** (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`, and host schemes) resolved by file tools and bash.
+- **Sandboxed script execution (codemode), subagents, and extensions** (planned in [`plan.md`](plan.md)).
 
 **The focus is embedding in Rust.** The ACP binary is a convenience for external programs, kept as thin as possible. Effort goes into the library.
 
@@ -47,26 +48,26 @@ axo deliberately goes beyond pi where an embedded, always-on Rust library needs 
 flowchart LR
   D[".agents/ & .axo/ files"] --> C
   subgraph C["axo (Rust crates)"]
-    L["axo-ai · axo-agent · axo (sessions, tools, sandbox)"]
+    L["axo-ai · axo-agent · axo (sessions, tools, schemes, jobs)"]
   end
   S["Rust hosts (e.g. Axome)"] --> C
-  X["External TS extensions"] <-->|JSON over stdio| H["Bun extension host"] <--> C
-  R["ACP clients (editors)"] -->|ACP over stdio| A["axo-acp binary"] --> C
+  X["External TS extensions"] <-->|JSON over stdio| H["Bun extension host (planned)"] -.-> C
+  R["ACP clients (editors)"] -.->|ACP over stdio| A["axo-acp binary (planned)"] -.-> C
 ```
 
 ### Layers and crates
 
 | Crate | Ports | Owns |
 |---|---|---|
-| `axo-ai` | pi `packages/ai` | Message model, streaming events, `Accumulator`, the provider `Api` trait, Anthropic / Chat Completions / Responses & Codex adapters, model registry, auth, retry, overflow detection, cost |
-| `axo-agent` | pi `packages/agent` | The agent loop, `Tool` trait with `Replay`, `AgentEvent`, `LoopHooks`, steering and follow-up queues, cancellation with reasons |
-| `axo` | pi `coding-agent/src/core` | `Axo` and `Session`, JSONL session storage and projection, recovery and `attach`, compaction and `/shake`, context assembly, built-in tools, `ExecEnv`, config |
-| `axo-acp` | — | The `axo` binary: ACP over stdio, mapped onto `Session` |
+| `axo-ai` | pi `packages/ai` | Message model, streaming events, `Accumulator`, the provider `Api` trait, Anthropic / Chat Completions / Codex adapters, model registry, auth, retry, overflow detection, cost |
+| `axo-agent` | pi `packages/agent` | The agent loop, `Tool` trait with `Replay`, `AgentEvent`, `LoopHooks`, `Persist` seam, steering and follow-up queues, cancellation with reasons |
+| `axo` | pi `coding-agent/src/core` | `Axo` and `Session`, JSONL session storage and projection, recovery and `attach`, compaction and `/shake`, context assembly, built-in tools, `ExecEnv`, command supervision, background jobs, URL schemes, config |
 
-Each crate depends only on the ones above it. Why four crates:
+A fourth crate, `axo-acp` (the `axo` binary speaking ACP over stdio), is planned (Track 6, on hold; see [`plan.md`](plan.md)).
+
+Each crate depends only on the ones above it. Why three crates (plus a planned binary):
 - **Enforced dependency direction.** `axo-agent` cannot see session files; `axo-ai` cannot see the loop. The loop stays testable with `ScriptedApi` and no disk; `axo-ai` stays usable alone for one-off model calls (titles, commit messages) without opening a session.
 - **The binary stays out of the library.** Hosts that embed `axo` never compile ACP code.
-- **Incremental builds.** `axo-ai` carries the HTTP stack and changes least once written.
 
 Tools, context, config, and the script sandbox stay modules inside `axo`. The Bun extension host gets a crate only when its contract is built.
 
@@ -96,13 +97,13 @@ Full operational details live in [`crates/axo/docs/`](../crates/axo/docs/README.
 - **The session tree is the source of truth.** Append-only JSONL (`FORMAT_VERSION = 1`) with an OS file lock (`File::try_lock`) enforcing one writer per session ([`research/durable.md`](research/durable.md)). `project(entries, leaf)` resolves `context_edit`s across the full root-to-leaf path before applying the latest compaction checkpoint, borrowing from the log.
 - **Crash recovery and `Replay`.** `run_start` and `run_end` bracket every run; prompts, steers, and follow-ups are persisted as `submission` entries (with optional `request_id` deduplication) before queuing. On reopen, unfinished tool calls with `Replay::Safe` (`read`, `grep`, `find`, `ask`, `wait`, and `write` to a plain path or `local://`) re-run under `RecoveryPolicy::Resume`; `Replay::Never` (`bash`, `edit`, and `write` to a scheme whose `write_replay` is `Never`) get an interrupted error result pointing to any spooled output. After 5 consecutive resumes with no progress, the run parks as `Interrupted`.
 - **Compaction and `/shake`.** Recoverable clearing writes elided tool outputs, images, and thinking blocks to `<session>/artifacts/<n>.shake.*` files, referenced as `artifact://<n>`, and replaces them via `Entry::ContextEdit` ([`research/compaction.md`](research/compaction.md), [`research/compaction-methods.md`](research/compaction-methods.md)). Automatic maintenance picks one action per pass (recoverable clearing when it reaches headroom, otherwise a live or separate model summary checkpoint), carries over recent whole user messages, and protects active skills.
-- **Bounded retry and one-shot overflow recovery.** Overflow is classified before transient errors. Overflow hides the failed turn and runs a separate-request compaction pass once per progress step. Transient provider errors and silent stops hide the failed turn and retry up to 3 times with exponential backoff (2/4/8 s or `Retry-After` ≤ 60 s). Retry and overflow state is reconstructed from log entries on reopen without a separate retry log.
+- **Bounded retry and one-shot overflow recovery.** Overflow is classified before transient errors. Overflow hides the failed turn and runs recoverable clearing followed by a separate-request compaction pass. Transient provider errors hide the failed turn and retry up to 3 times with exponential backoff (2/4/8 s or `Retry-After` ≤ 60 s); a context-overflow signal on a silent stop keeps the response and runs automatic compaction instead of retrying. Submissions store typed prompt parts (`PromptInput`, `PromptPart`) so hosts can redraw chips and forks can return them as `Fork::editable` for resubmission.
 
 ### Context, prompt policy, and project access (`axo`)
 
-- **Cache-stable prompt sections.** Ordered general-to-specific and stable-to-changing: `system`, `docs`, `tools`, `work`, `prose`, `project_context`, `skills`, `cwd`, `dev_shell`, `date`, then host sections. Subsequent updates emit diff `SystemMessage`s containing only changed or removed sections.
+- **Cache-stable prompt sections.** Ordered general-to-specific and stable-to-changing: `system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `cwd`, `dev_shell`, `date`, then host sections. Subsequent updates emit diff `SystemMessage`s containing only changed or removed sections.
 - **Hard-coded text policy.** Model-facing text that cannot be overridden through `prompts/` (`SYSTEM.md`, `WORK.md`, `PROSE.md`, and the summary prompts) must be a needed runtime fact or an indispensable positive instruction. Behavioral opinions live in the bundled prompt files; tool guidance belongs to each tool's `prompt_guidelines()`.
-- **Context files and skills.** `contextFiles` is an ordered map of relative paths walked from the git root to `cwd`, plus on-demand nested context attached to `read`/`write`/`edit` results when subdirectories are first touched. Skills follow the Agent Skills standard (`SKILL.md` in `.agents/skills` and `~/.axo/skills`, invoked by the model or via `/name args`). There is no separate `commands/` directory. axo owns the user command catalog (`Session::commands()`): five built-in session commands (`compact`, `shake`, `model`, `thinking`, `navigate`) with JSON Schema arguments and one fixed mid-run policy each, then skills. The catalog is an offer, not a UI contract: hosts expose whichever commands they want in whatever form, and a built-in runs only through `run_command` (prompt text never runs one; `Command::parse` is opt-in for hosts accepting typed commands). App-only commands (Axome's `/new-chat`, `/settings`) stay in the app ([`research/agents-dir.md`](research/agents-dir.md)).
+- **Context files and skills.** `contextFiles` is an ordered map of relative paths walked from the git root to `cwd`, plus on-demand nested context attached to `read`/`write`/`edit` results when subdirectories are first touched. Skills follow the Agent Skills standard (`SKILL.md` in `.agents/skills` and `~/.axo/skills`, plus `~/.agents/skills` and `~/.agents/AGENTS.md` when the user enables `homeAgentsDir`, invoked by the model or via `/name args`). There is no separate `commands/` directory. axo owns the user command catalog (`Session::commands()`): five built-in session commands (`compact`, `shake`, `model`, `thinking`, `navigate`) with JSON Schema arguments and one fixed mid-run policy each, then skills. The catalog is an offer, not a UI contract: hosts expose whichever commands they want in whatever form, and a built-in runs only through `run_command` (prompt text never runs one; `Command::parse` is opt-in for hosts accepting typed commands). App-only commands (Axome's `/new-chat`, `/settings`) stay in the app ([`research/agents-dir.md`](research/agents-dir.md)).
 - **Project access (`ignore`, `read`, `trust`).** Controlled by the user-only `project` settings block (`project.paths` globs and `project.access`, default `read`). `ignore` loads nothing from the repo; `read` loads markdown context, skills, prompt overrides, and safe settings while stripping code-running settings (`bash.devShell`, `!command` `defaultModel`); `trust` permits code-running project contributions.
 
 ### Built-in tools and execution environment (`axo`)
@@ -110,23 +111,24 @@ Full operational details live in [`crates/axo/docs/`](../crates/axo/docs/README.
 - **Default built-in set:** `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, and `ask` (when the host can answer questions).
 - **`edit` and the stale-file guard.** Exact replace with fuzzy fallback (whitespace, quotes, dashes), plus per-session content-hash tracking and a process-wide per-file lock ([`research/edit-formats.md`](research/edit-formats.md)). `edit` and `write` on an existing file require a prior read in the session and reject external modifications since that read.
 - **`bash` and `ExecEnv`.** Always runs real `bash` from `PATH`, never fish ([`research/shell-tool.md`](research/shell-tool.md)). Output strips ANSI escapes, caps lines at 768 B, keeps 20 KB head + 30 KB tail inline, and spools raw output to `<session>/artifacts/<n>.bash.<escaped-call-id>.log`, referenced as `artifact://<n>`. `DevShellEnv` captures a Nix flake dev shell or allowed direnv once, caches it with a GC root under `<AXO_DIR>/cache/devshell/`, and watches `.nix` files for invalidation ([`research/nix-shell.md`](research/nix-shell.md)). Environment resolution stays in the foreground.
-- **Host-selected command supervision (Track 3).** Every local command (bash and dev-shell capture) runs through `ProcessSupervisor` in its own **container**, whose kind the embedding host chooses with `AxoBuilder::supervision(Supervision)`; there is no settings key. The default, `Supervision::ProcessGroup`, needs no extra executable and no cgroup delegation: the command leads its own process group, a best-effort `sh` guard kills the group if axo dies, and descendants that leave the group (`setsid`, double fork) are not tracked. The explicit opt-in, `Supervision::Cgroup { program, args, cgroup_root }`, puts each command in its own cgroup v2 job directory under a guardian process the host provides: axo runs `program args… guard <dir>` and `program args… enter <dir> <command…>`, and the host routes those arguments to `axo::exec::supervisor::run` first in its own `main`. axo ships no companion binary and never assumes `current_exe` implements the supervisor. The supervisor inherits axo's trusted launch environment (a wrapped host executable may need it to start); the command's environment is applied only after cgroup entry, at `exec`. axo and the guardian watch each other, and whichever survives kills the cgroup; simultaneous death of both is the accepted boundary. A selected cgroup mode never downgrades: without a usable root (`cgroup_root` or axo's own cgroup) local execution fails with `Command supervision unavailable`, and there is no automatic process-group, systemd or PID-namespace fallback. Neither mode keeps jobs alive across a host restart. Stopping sends `SIGTERM` (to validated cgroup members or to the group), waits 1 s, then kills the container. A command's result returns at root exit plus a fixed 100 ms drain; surviving descendants stay supervised as a retained job. Details: [Track 3](plan.md#track-3-async-bash-background-jobs--wait).
-- **Background jobs and `wait` (Track 3).** Bash is promoted to a background job `bg_N` on `async: true`, after 60 s of foreground waiting, or when the user steers; the optional `timeout` keeps no default and promotion never resets it. Each Session has its own `JobRegistry`; forks get no running handles and navigation keeps jobs. Promotion and helper retention are journaled (`JobStart`, `JobEnd`), and admission and delivery receipts ride on the `Entry::Message` carrying the result, so each result reaches the model exactly once: through `wait` (no arguments) or an automatic `job_result` follow-up. `proc://` lists, shows and kills jobs. Stop ends only the foreground turn; an active Stop, or a run ending other than `Done`, pauses automatic continuation until the next user submission. Reopen marks admitted unfinished jobs interrupted once and never starts a model run on its own.
+- **Host-selected command supervision.** Every local command (bash and dev-shell capture) runs through `ProcessSupervisor` in its own container, chosen by the host with `AxoBuilder::supervision(Supervision)`. `Supervision::ProcessGroup` (default) needs no helper executable or privileges: commands lead their own process group, guarded best-effort by an `sh` watcher that kills the group if axo dies. `Supervision::Cgroup` runs each command in its own cgroup v2 job directory watched by a guardian process; the host routes arguments in `main` to `axo::exec::supervisor::run` and runs in a delegated cgroup subtree (`Delegate=yes`). Supervision fails closed with no downgrade. See [`configuration.md`](../crates/axo/docs/configuration.md#command-supervision-axosupervision) for failure messages and routing details.
+- **Background jobs and `wait`.** Bash is promoted to a background job `bg_N` on `async: true`, after 60 s of foreground waiting, or when the user steers; promotion and helper retention are journaled (`JobStart`, `JobEnd`), and admission and delivery receipts ride on the `Entry::Message` carrying the result, ensuring exactly-once delivery across navigation, crashes, and reopen. See [`sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#background-job-durability).
+- **URL schemes (`axo`).** Per-session URL scheme registry (`Schemes`) resolving `Target::File { path, writable }` (file tools run normally; bash rewrites matching word/flag/redirect URLs) or `Target::Virtual` (scheme handles `read`/`write`). Built-ins: `artifact://`, `skill://`, `local://`, `axo://`, and in-session `proc://`. Reserved names: `artifact` and `file`. `write_replay` defaults to `Replay::Never`. Hosts inject schemes via `SessionOptions::schemes`, and schemes define model prompt guidance via `Scheme::prompt_doc`.
 - **`ask`.** Emits `SessionEvent::QuestionPending` and waits for `session.answer(call_id, answers)` or `dismiss()`, with no UI trait (`Replay::Safe`).
 
 ## Ways to extend axo
 
 1. **Declarative files (`.agents/` and `.axo/`):** `AGENTS.md`, `SKILL.md`, prompt overrides, `models.jsonc`, and later agent role files (`.agents/agents/*.md`).
 2. **Rust traits (for hosts like Axome):** `Tool`, `LoopHooks`, `ExecEnv`, `SessionStore`, `Api`, `Streamer`, and `CredentialStore`.
-3. **Embedded script sandbox (`codemode`):** stateless JavaScript scripts running in an embedded engine (such as QuickJS) whose only powers are calling tools. Later, scripts may also define session tools and configure the harness of spawned subagents; see [`plan.md`](plan.md).
-4. **External TypeScript extensions (Bun host):** when third-party extensions need full runtime access (`fetch`, filesystem, processes, npm, OAuth callback servers), axo runs one shared Bun process over stdio against a typed `@axo/sdk`.
-5. **MCP servers:** external tool servers configured in `.mcp.json` / `mcp.json` / `~/.axo/mcp.json`, plugged into the tool registry.
+3. **Embedded script sandbox (`codemode`) (planned; see [`plan.md`](plan.md)):** stateless JavaScript scripts running in an embedded engine (such as QuickJS) whose only powers are calling tools.
+4. **External TypeScript extensions (Bun host) (planned; see [`plan.md`](plan.md)):** when third-party extensions need full runtime access (`fetch`, filesystem, processes, npm, OAuth callback servers), axo runs one shared Bun process over stdio against a typed `@axo/sdk`.
+5. **MCP servers (planned; see [`plan.md`](plan.md)):** external tool servers configured in `.mcp.json` / `mcp.json` / `~/.axo/mcp.json`, plugged into the tool registry.
 
 ## No approvals
 
 axo never prompts for permission to run a tool. Approval systems are a long tail of policy edge cases and UX that do not belong in the core.
 
-What the core provides is `LoopHooks::before_tool_call`, which may return `ToolCallDecision::Block { reason }`. That is general machinery: a host, an extension, or a subagent spec can enforce rules on top of it, while axo itself never asks.
+What the core provides is `LoopHooks::before_tool_call`, which may return `ToolCallDecision::Block { reason, terminate }`. That is general machinery: a host, an extension, or a subagent spec can enforce rules on top of it, while axo itself never asks.
 
 ## Milestones completed
 
@@ -134,6 +136,9 @@ What the core provides is `LoopHooks::before_tool_call`, which may return `ToolC
 |---|---|---|
 | M1 | `axo-ai`: types, events, `Accumulator`, Anthropic / Chat Completions / Responses & Codex adapters, auth, `models.dev` catalog, `ScriptedApi` | Done |
 | M2 | `axo-agent`: loop, `Tool` trait with `Replay`, `LoopHooks`, queues, cancellation reasons, `continue_run`, `recover_response`, split event delivery | Done |
-| M3 | `axo` tools & context: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ask`, `ExecEnv` + `DevShellEnv`, sectioned prompt, context files, skills, config | Done |
+| M3 | `axo` tools & context: `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `ask`, `ExecEnv` + `DevShellEnv`, sectioned prompt, context files, skills, config | Done |
 | M4 | `axo` sessions: `JsonlStore`, `Projection`, resume, `navigate`, `fork`, run markers, submissions, crash recovery, file lock, `attach`, PSS memory benchmark | Done |
 | M5 | Compaction with clearing and summaries, `/shake`, atomic branch summaries, bounded auto-retry, one-shot overflow recovery, crash reconstruction | Done |
+| Track 3 | Command supervision (process group & cgroup v2), background jobs, `proc://`, `wait` | Done |
+| Track 4 | Per-session URL scheme registry (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`), host schemes, bash rewriting | Done |
+| Post-M5 | User command catalog, typed `Command` parsing, `PromptInput` / `PromptPart` structured submissions | Done |

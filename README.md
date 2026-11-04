@@ -14,16 +14,16 @@ The workspace is split into three layered crates so hosts only recompile what ch
 
 | Crate | Purpose | Highlights |
 | :--- | :--- | :--- |
-| **[`axo-ai`](crates/axo-ai)** | LLM message model, streaming adapters, model catalog, and auth | Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and OpenAI Codex Responses (`auth.json` OAuth + refresh locking); `models.dev` catalog with `extendedContext` price-tier caps; delta `Accumulator`; transient retry and context-overflow classification |
+| **[`axo-ai`](crates/axo-ai)** | LLM message model, streaming adapters, model catalog, and auth | Anthropic Messages, OpenAI Chat Completions, and OpenAI Codex Responses (`auth.json` OAuth + refresh locking); `models.dev` catalog with `extendedContext` price-tier caps; delta `Accumulator`; transient retry and context-overflow classification |
 | **[`axo-agent`](crates/axo-agent)** | Generic tool-calling agent loop | Parallel and sequential `Tool` execution with a per-call `ToolContext` (cancellation, updates, pending-steer signal, invocation id), `Replay` crash-safety contracts (`Safe` vs `Never`), `LoopHooks`, steering and follow-up queues of identified `QueuedMessage`s, `MessageOrigin` provenance on persisted messages, `CancelReason` (`User` vs `Shutdown`), and split event delivery (ordered `Persist` subscriber + non-blocking broadcast) |
-| **[`axo`](crates/axo)** | Sessions, compaction, context assembly, config, and built-in tools | Durable `JsonlStore` with incremental `Projection` and `context_edit`s, single-writer OS locks, crash recovery, `attach` catch-up snapshots, recoverable `/shake` and live/separate compaction summaries, `DevShellEnv` Nix/direnv capture, host-selected command supervision (`Supervision`: process groups by default, opt-in cgroup v2 through an embedded supervisor entry point), background jobs with `proc://` and `wait`, and the built-in tool set |
+| **[`axo`](crates/axo)** | Sessions, compaction, context assembly, config, and built-in tools | Durable `JsonlStore` with incremental `Projection` and `context_edit`s, single-writer OS locks, crash recovery, `attach` catch-up snapshots, recoverable `/shake` and live/separate compaction summaries, `DevShellEnv` Nix/direnv capture, host-selected command supervision (`Supervision`: process groups by default, opt-in cgroup v2 through an embedded supervisor entry point), per-session URL schemes (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`, host `Scheme`s), background jobs with `proc://` and `wait`, and the built-in tool set |
 
 ### Built-in tools (`crates/axo/src/tools`)
 
 | Tool | Replay | Description |
 | :--- | :--- | :--- |
 | `read` | `Safe` | Reads UTF-8 text files (with `offset`/`limit` pagination) and images (`png`, `jpeg`, `gif`, `webp`, `bmp`), recording read hashes in the session's file ledger and loading nested directory `AGENTS.md` files on demand |
-| `write` | `Never` | Writes new files or complete rewrites, guarded by the read ledger when overwriting existing files |
+| `write` | `Safe` (plain paths / `local://`) / `Never` (action schemes) | Writes new files or complete rewrites, guarded by the read ledger when overwriting existing files |
 | `edit` | `Never` | Performs exact or whitespace/quote-fuzzy multi-hunk replacements against files recorded in the read ledger, rejecting stale external modifications |
 | `bash` | `Never` | Executes commands under the session's `ExecEnv` (host, `direnv`, or cached Nix flake dev shell) in a dedicated container (its own process group, or a cgroup v2 job when the host selects `Supervision::Cgroup`), with head+tail inline truncation and full output spooled under the session directory; long commands (60 s, a user steer, or `async: true`) continue as background jobs `bg_N` |
 | `wait` | `Safe` | Blocks until a background job's result is available (or a user message arrives) and returns it; returns immediately when no job is running |
@@ -40,7 +40,7 @@ The workspace is split into three layered crates so hosts only recompile what ch
 Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`) protected by an OS file lock (`File::try_lock`) so a second writer gets `Error::SessionBusy` and a crashed process releases the lock automatically.
 
 - **Durable intent:** Submissions (`prompt`, `steer`, `follow_up`, with optional `request_id` deduplication) store their prompt parts, so apps can redraw file and paste chips after reload; `run_start` / `run_end` markers and finished assistant messages are persisted before tool calls execute.
-- **Reopen recovery:** When a session with an unfinished run reopens under `RecoveryPolicy::Resume`, `Replay::Safe` tools (`read`, `grep`, `find`, `ask`, `wait`) re-run automatically and `Replay::Never` tools (`bash`, `write`, `edit`) receive an interrupted result pointing to any spooled output. Background jobs that were still running are marked interrupted once, with their partial-output reference. Five consecutive resumes without progress end the run as `Interrupted` with reason `restart_limit`.
+- **Reopen recovery:** When a session with an unfinished run reopens under `RecoveryPolicy::Resume`, `Replay::Safe` tools (`read`, `grep`, `find`, `ask`, `wait`, and `write` to plain paths or `local://`) re-run automatically and `Replay::Never` tools (`bash`, `edit`, and `write` to action schemes) receive an interrupted result pointing to any spooled output. Background jobs that were still running are marked interrupted once, with their partial-output reference. Five consecutive resumes without progress end the run as `Interrupted` with reason `restart_limit`.
 - **Live attach:** `session.attach(from_seq)` returns missed durable entries since `from_seq`, a `LiveSnapshot` of any run or maintenance in progress (partial reply, running tools, pending `ask` questions, queued submissions), and a live broadcast receiver.
 - **Branching & forking:** `session.navigate(target, options)` moves the persisted `leaf` pointer inside the tree (optionally summarizing the abandoned branch into a `branch_summary` entry); `session.fork(entry_id)` clones the path into a new session file and returns the forked user message's parts as `Fork::editable` for the client to edit and resubmit.
 
@@ -48,7 +48,7 @@ Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cw
 
 `axo` owns the user command catalog and the shape of a user message; hosts decide which commands to expose and how:
 
-- **Built-in commands:** `/compact`, `/shake <mode>`, `/model <provider/id>`, `/thinking <level>`, and `/navigate <entry> [summarize]`. `session.commands()` lists them (each with a JSON Schema for its arguments and a mid-run `CommandPolicy`) followed by the session's skills, for hosts to expose however they like: a slash menu, buttons, their own pickers, or not at all. A built-in runs only through `session.run_command(command)`, given a `Command` from JSON arguments (`Command::decode`), typed text (`Command::parse("/shake images")`), or a value; `prompt`, `steer`, and `follow_up` never run one. A command is never saved as a submission or sent as a user prompt. `/model` and `/thinking` run alongside a turn; `/compact`, `/shake`, and `/navigate` return `Error::Busy` during one; maintenance (compaction, shake, branch summary) blocks every command.
+- **Built-in commands:** `/compact`, `/shake <mode>`, `/model <provider/id>`, `/thinking <level>`, and `/navigate <entry> [true|false]`. `session.commands()` lists them (each with a JSON Schema for its arguments and a mid-run `CommandPolicy`) followed by the session's skills, for hosts to expose however they like: a slash menu, buttons, their own pickers, or not at all. A built-in runs only through `session.run_command(command)`, given a `Command` from JSON arguments (`Command::decode`), typed text (`Command::parse("/shake images")`), or a value; `prompt`, `steer`, and `follow_up` never run one. A command is never saved as a submission or sent as a user prompt. `/model` and `/thinking` run alongside a turn; `/compact`, `/shake`, and `/navigate` return `Error::Busy` during one; maintenance (compaction, shake, branch summary) blocks every command.
 - **Prompt parts:** `prompt`, `steer`, and `follow_up` take `impl Into<PromptInput>`: a plain string, or a list of `PromptPart`s (typed text, pastes, `@` file references that give the model only the path, and handed-over content that axo saves under the session's `local://` folder; saved images also reach the model as pixels).
 
 ### Supervised commands & background jobs
@@ -56,11 +56,11 @@ Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cw
 Every local command (`bash` and dev-shell capture) runs in its own container, chosen by the embedding host through `AxoBuilder::supervision(Supervision)`:
 
 - **`Supervision::ProcessGroup` (default):** the command leads its own process group; stopping or dropping it signals the group, and a best-effort `sh` guard kills the group if the host dies. It needs no extra executable and no cgroup delegation. Descendants that leave the group (`setsid`, double fork) are not tracked.
-- **`Supervision::Cgroup { program, args, cgroup_root }`:** the command runs in its own cgroup v2 job directory, entered before any user code runs and watched by a guardian process. axo and the guardian watch each other, and whichever survives kills every member of the cgroup, which includes the `setsid` and double-forked descendants that process groups lose. The guarantee is bounded: it covers processes still in the cgroup when the survivor acts, so the simultaneous death of axo and the guardian leaves a job behind, and processes that were authorized to migrate out of the cgroup, work handed to an external daemon (systemd, D-Bus activation, `at`), and tasks stuck in uninterruptible kernel sleep are outside it. The cgroup is lifecycle containment, not a sandbox. axo builds no companion binary: the host supplies the supervisor by routing one of its own command lines (`program args… guard <dir>` / `program args… enter <dir> <command…>`) to `axo::exec::supervisor::run(args)`, first thing in a synchronous `main`, before any runtime or thread starts. The supervisor inherits the host's launch environment; the command's own environment applies only after cgroup entry. `cgroup_root: None` uses axo's own cgroup. If no usable root exists, commands fail with `Command supervision unavailable` (for systemd services, set `Delegate=yes`); an explicit cgroup choice never falls back to process groups.
+- **`Supervision::Cgroup { program, args, cgroup_root }`:** the command runs in its own cgroup v2 job directory, entered before any user code runs and watched by a guardian process. It provides bounded lifecycle containment for detached descendants. The host supplies the supervisor by routing one of its own command lines in `main` to `axo::exec::supervisor::run(args)` and runs inside a delegated cgroup v2 (systemd: `Delegate=yes`); see [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision).
 
 - **Retained helpers:** A command's result returns when its root shell exits (plus a 100 ms drain); processes it left running in its container stay supervised as `bg_N`, keep spooling output, and can be inspected or killed.
 - **Promotion:** `bash` moves to the background after 60 s, when the user steers, or immediately with `async: true`, returning `bg_N` and its `artifact://` output. The optional `timeout` keeps no default and is never reset.
-- **Exactly-once results:** A finished job's result reaches the model once, through `wait` or an automatic `job_result` follow-up at the next turn boundary (an idle session starts a run for it). Promotion, results and delivery receipts are journaled, so results survive crashes and reopen; reopening never starts a run by itself.
+- **Exactly-once results:** A finished job's result reaches the model once, through `wait` or an automatic `job_result` message injected at the next turn boundary (an idle session starts a run for it). Promotion, results and delivery receipts are journaled, so results survive crashes and reopen; reopening never starts a run by itself.
 - **`proc://`:** `read proc://` lists jobs, `read proc://bg_N` shows one, and `write proc://bg_N/kill` stops it.
 - **Stop:** `session.abort()` stops the foreground turn only; background jobs keep running, and automatic delivery waits for the next user message.
 
@@ -77,8 +77,8 @@ Every local command (`bash` and dev-shell capture) runs in its own container, ch
 The system prompt lives in the transcript as named `<section>` blocks (`system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `cwd`, `dev_shell`, `date`, plus host sections). Mid-session updates emit a diff `SystemMessage` containing only changed sections.
 
 - **Replaceable prompt files:** `SYSTEM.md`, `WORK.md`, `PROSE.md`, and the five summarizer prompts can be overridden in `~/.axo/prompts/` or `<cwd>/.axo/prompts/`. Writing an empty `SYSTEM.md`, `WORK.md`, or `PROSE.md` disables that section.
-- **Ordered `contextFiles` & nested loading:** Startup loads `~/.axo/AGENTS.md` (and `~/.agents/AGENTS.md` when `homeAgentsDir: true`), then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, `.axo/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result without invalidating the system prompt cache.
-- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/` and user `~/.axo/skills/`. Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic and is left out of the catalog.
+- **Ordered `contextFiles` & nested loading:** Startup loads `~/.agents/AGENTS.md` (only when `homeAgentsDir: true`), then `~/.axo/AGENTS.md`, then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, `.axo/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result (when `settings.nestedContextFiles` is `true` and project access allows it) without invalidating the system prompt cache.
+- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/`, user `~/.axo/skills/`, and `~/.agents/skills/` (when `homeAgentsDir: true`). Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic and is left out of the catalog.
 
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 
@@ -115,7 +115,7 @@ Configured exclusively in the user's `~/.axo/settings.jsonc` (a project cannot e
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 use std::path::PathBuf;
-use axo::{Axo, PromptPart, RecoveryPolicy, SessionOptions};
+use axo::{Axo, PromptPart, SessionOptions};
 
 // Commands run in process groups by default; no supervisor executable or cgroup needed.
 let axo = Axo::builder().build().await?;
@@ -125,7 +125,7 @@ let session = axo
         cwd: PathBuf::from("/repo/rust/axo"),
         model: Some("anthropic/claude-sonnet-4-5".into()),
         ask_enabled: true,
-        recovery: RecoveryPolicy::Resume,
+        // recovery defaults to RecoveryPolicy::Resume
         ..SessionOptions::default()
     })
     .await?;
@@ -148,38 +148,7 @@ let outcome = session
 # }
 ```
 
-Durable server hosts can opt into cgroup supervision. The host's own executable becomes the supervisor: route a reserved first argument to `axo::exec::supervisor::run` before anything else in `main`, then point `Supervision::Cgroup` at that route. The host must then run inside a delegated cgroup v2 (systemd: `Delegate=yes`) or pass a delegated `cgroup_root`; otherwise commands fail closed rather than downgrading to process groups. `cargo run -p axo --example drive -- --cgroup …` does exactly this with the `drive` example as its own supervisor:
-
-```rust,no_run
-use std::ffi::OsStr;
-use std::process::ExitCode;
-use axo::{Axo, Supervision};
-
-const SUPERVISOR_ROUTE: &str = "my-host-supervisor";
-
-fn main() -> ExitCode {
-    // First statement: no runtime, threads, or host setup before routing. Only axo spawns
-    // this command line; the supervisor inherits the host's launch environment.
-    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(SUPERVISOR_ROUTE)) {
-        return axo::exec::supervisor::run(std::env::args_os().skip(2));
-    }
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    runtime.block_on(async {
-        let axo = Axo::builder()
-            .supervision(Supervision::Cgroup {
-                program: std::env::current_exe().expect("own executable"),
-                args: vec![SUPERVISOR_ROUTE.into()],
-                cgroup_root: None, // axo's own cgroup, or a delegated cgroup v2 directory
-            })
-            .build()
-            .await
-            .expect("axo");
-        // Create sessions as above; `bash` now runs in cgroup jobs.
-        drop(axo);
-    });
-    ExitCode::SUCCESS
-}
-```
+Durable server hosts can opt into cgroup supervision (`Supervision::Cgroup`), where commands run in cgroup v2 jobs and the host routes arguments in `main` to `axo::exec::supervisor::run`. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) for the synchronous routing `main` example and failure details.
 
 ---
 
@@ -215,6 +184,7 @@ Enter the Nix development shell for the Rust toolchain (`cargo`, `rustc`, `clipp
 
 ```sh
 nix develop
+cargo check --workspace --all-targets
 cargo test --workspace  # process-group mode: no cgroup delegation or helper binary needed
 systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 cargo test -p axo --test supervisor  # opt-in cgroup cases
 cargo clippy --workspace --all-targets -- -D warnings

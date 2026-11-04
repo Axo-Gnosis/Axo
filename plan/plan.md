@@ -3,12 +3,12 @@
 This is the live planning document for unbuilt work and active design discussions. It changes freely as we work.
 
 - **Goals & settled architecture:** [`design.md`](design.md)
-- **Implemented reference (M1–M5):** [`crates/axo/docs/README.md`](../crates/axo/docs/README.md)
+- **Implemented reference:** [`crates/axo/docs/README.md`](../crates/axo/docs/README.md)
 - **Background studies:** [`pi/`](pi/README.md) and [`research/`](research/README.md)
 
 ## Overview of tracks
 
-M1–M5 are complete. The remaining work splits into independent tracks (`axo-acp` is on hold):
+M1–M5 plus Tracks 3 and 4 are complete. The remaining work splits into independent tracks (`axo-acp` is on hold):
 
 ```mermaid
 flowchart LR
@@ -19,11 +19,6 @@ flowchart LR
   subgraph T2["Track 2: Subagents"]
     CS[Child sessions + durability links] --> TK[task tool + AgentSpec + roles]
   end
-  subgraph T3["Track 3: Async Bash & Jobs"]
-    SV[host-selected container supervisor + ProcessSupervisor] --> JB[Job registry + proc:// + job_result delivery]
-    JB --> WT[wait tool]
-  end
-  WT -.shared.-> TK
   TK --> DT
   N -.reused by.-> MCP[Track 5: MCP & Extensions]
 ```
@@ -32,8 +27,6 @@ flowchart LR
 |---|---|---|
 | **1. Codemode, script extensions & agent specs** | Embedded JS sandbox (`rquickjs`), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and child script hooks (rungs 2–5) | **Active focus.** Rungs 0–1 decided; rungs 2+ in discussion |
 | **2. Subagents (`task`) & `AgentSpec`** | In-process child sessions linked to parent tool calls, `.agents/agents` / `~/.axo/agents` role definitions, schema-validated outputs | Planned |
-| **3. Async `bash`, background jobs & `wait`** | Host-selected supervision (`Supervision`: default process groups, opt-in cgroup v2 through an embedded supervisor entry point), per-session `JobRegistry`, promotion (`async`, 60 s, steer), `proc://`, `job_result` follow-up delivery, `wait` tool | Implemented and verified: ordinary workspace gates, explicit cgroup failure/success, process-group crash cleanup and live drive checks in both modes pass |
-| **4. URL scheme registry** | Per-session `scheme://` handlers resolved by `read`/`write`/`edit`/`grep`/`find` (and bash arguments); first wave `artifact://`, `skill://`, `axo://`, `local://`; host-registered schemes | Implemented |
 | **5. Extensions (Bun host), MCP & `ast_edit`** | Extension contract, Bun stdio host & `@axo/sdk`, `.mcp.json` / `~/.axo/mcp.json` tool adapter, optional `ast_edit` | Planned |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | On hold |
 
@@ -271,7 +264,7 @@ Key risks to design around when building step 3 (script hooks):
 
 1. **`rquickjs` spike:** verify async/tokio bridging, memory and interrupt limits, and per-context memory overhead against the PSS target (`boa` fallback).
 2. **Core prerequisites (`axo-agent` & `axo`):**
-   - **Nested tool calls:** pass a call context into `Tool::execute` that runs nested calls through prepare, validate, `before_tool_call`, and `after_tool_call`. Assign `<parent>/<n>` IDs, tag `AgentEvent::ToolExecution*` with `parent_call_id`, and record nested calls on the parent `ToolResultMessage` so compaction still extracts file operations.
+   - **Nested tool calls:** extend `ToolContext` with a nested-call runner that goes through prepare, validate, `before_tool_call`, and `after_tool_call`. Assign `<parent>/<n>` IDs, tag `AgentEvent::ToolExecution*` with `parent_call_id`, and record nested calls on the parent `ToolResultMessage` so compaction still extracts file operations.
    - **Structured tool output:** add `output_schema` and `structured_content: Option<Value>` on `ToolOutput` (for `bash`: `{ output, truncated, full_output_path, exit_code, wall_time_seconds }` with a 1 MiB output cap; for `read`: text string or image object).
 3. **Sandbox module (`axo::script`):** standalone module (not buried inside the tool) that runs JS on a blocking worker thread with a memory cap, interrupt budget/timeout, concurrency semaphore, and channel bridge for async host functions.
 4. **`codemode` tool (`axo::tools::codemode`):**
@@ -283,182 +276,17 @@ Key risks to design around when building step 3 (script hooks):
 
 ## Track 2: Subagents (`task`) & `AgentSpec`
 
-- **In-process child sessions.** A subagent is a `Session` in the same process with `Header.parent_session` set.
-- **Durability links.** A child session is linked to the parent tool call ID that spawned it (`research/durable.md`). When a parent session recovers on reopen, `task` finds its existing child session instead of spawning a duplicate.
+- **In-process child sessions.** A subagent is a `Session` in the same process linked to the parent session and spawning tool call id (distinguished from forks by the absence of `forked_from`).
+- **Durability links.** A child session is linked to the parent tool call ID that spawned it ([`research/durable.md`](research/durable.md)). When a parent session recovers on reopen, `task` finds its existing child session instead of spawning a duplicate.
 - **Role definitions (`research/agents-dir.md`).** Walk `.agents/agents/*.md`, `~/.axo/agents/*.md`, and `~/.agents/agents/*.md` (when `homeAgentsDir` is enabled) using the shared discovery walk. Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `output` (JSON Schema); body is the system prompt. Tolerate omp keys (`blocking`, `spawns`) as ignored.
 - **`AgentSpec` and `task` tool.** Spawns one or more children (in parallel by default), validates structured outputs against `output` schema when present, and returns their results.
 
 ---
 
-## Track 3: Async `bash`, background jobs & `wait`
+## Shipped tracks
 
-**Implemented and verified.** A follow-up supervision plan replaced the mandatory supervisor binary and delegated cgroup with default process-group execution and explicit embedded cgroup supervision. Ordinary workspace tests (including doctests), all-target check, strict Clippy and formatting pass without delegation. Opt-in cgroup tests fail closed without delegation and pass inside a delegated scope; real process-group host-SIGKILL cleanup and live `drive` calls in both modes pass (evidence below). The job registry, promotion, delivery, `proc://`, Stop and reopen behavior is unchanged. Earlier cgroup-only verification also covered dev-shell capture success/timeout/failure and fixed an inherited-file-descriptor journal-lock race with explicit last-local-owner unlock and a regression test. Earlier live-model acceptance with `openai-codex/gpt-6-astra` promoted `sleep 70 && echo finished` after 60 s (`durationMs: 60006`), then `wait` delivered `finished` once without polling; evidence: `/home/toph/.axo/sessions/--tmp--/2026-11-03T20-39-22-767Z_01a1a323-4f8f-74a3-b015-c91cb536532f.jsonl`. Historical comparisons and measurements remain in [`research/track3-supervision.md`](research/track3-supervision.md).
-
-End state: every command runs in its own container, a process group by default or, when the host opts in, a cgroup v2 job directory watched by a supervisor process the host itself provides. Bash can be promoted to a background job (`async: true`, after 60 s, or when the user steers). Results come back exactly once, through `wait` or an automatic follow-up, survive crashes and reopen, and jobs are inspectable and killable through `proc://`.
-
-### Settled contract
-
-- **Host-selected supervision, two modes, no automatic fallback.** `AxoBuilder::supervision(Supervision)` picks the mode for every local command (bash, dev-shell capture, host tools using `SessionTools::supervisor`); it is not a settings key. `Supervision::ProcessGroup` (default) needs no extra executable and no cgroup delegation; it fits desktop hosts, where agents live only while the application runs. `Supervision::Cgroup { program, args, cgroup_root }` is the explicit opt-in for durable server hosts such as Axome Server. A selected mode is never downgraded: when cgroup prerequisites are missing, local execution fails closed with `Command supervision unavailable: …`. No systemd runtime API and no PID namespaces in either mode; systemd is one way for a host to provide delegation, not the supervisor implementation.
-- **Embedded supervisor, no companion binary.** In cgroup mode the host provides the supervisor process: axo runs `program args… guard <dir>` and `program args… enter <dir> <command…>`, and the host routes those arguments to `axo::exec::supervisor::run` as the first statement of its own `main`, before any runtime or host setup. `program` is a path or a bare name resolved on axo's own `PATH` at spawn; `args` is the host's routing prefix. An `exec`-only wrapper is fine; a forking wrapper breaks the guard's parent check. axo never assumes its own `current_exe` implements the supervisor. The supervisor inherits axo's trusted launch environment, so a wrapped host executable (for example a Nix `wrapProgram` with `LD_LIBRARY_PATH`) starts; the command's environment travels over stdin and is applied only after cgroup entry, at `exec`. The guardian and axo watch each other; whichever survives writes `cgroup.kill`.
-- **Cgroup root (cgroup mode only).** `cgroup_root` if the host supplies one, otherwise axo's own cgroup (from `/proc/self/cgroup`) when usable. If neither works, the error names the root and says: run the host in a delegated cgroup (systemd: `Delegate=yes`), set `cgroup_root`, or use `Supervision::ProcessGroup`. A host running axo in a root-owned `Delegate=no` cgroup (the current Axome service) needs `Delegate=yes` before cgroup mode works there; process-group mode works without it.
-- **Fail closed, before user code runs (cgroup mode).** The first command probes the root by creating and removing an `axo-probe-<uuidv7>` cgroup that must expose `cgroup.kill`; the result, success or failure, is cached. A guardian that fails to start or does not answer `ready` fails the spawn with a message naming the program and the routing contract. The entry wrapper verifies its own placement before `exec`. The probe never moves the embedding host. Process-group mode probes nothing.
-- **Process-group limits are documented, not hidden.** In-group descendants are tracked, signalled and killed with the group; descendants that leave the group (`setsid`, double fork) escape tracking and survive a host crash. The guard is best effort: if `sh` cannot be spawned, axo logs a warning and runs without it. A pgid freed and reused between the group emptying and `close` disarming the guard could be killed if the host dies in that window; cgroup mode has no such window. Neither mode keeps jobs running across a host restart; cgroup mode only guarantees cleanup after host death.
-- **Command completion and resource ownership differ.** A command's result returns when the root shell exits plus a fixed 100 ms drain ceiling. Surviving descendants stay supervised, inspectable and killable, and keep draining to the spool. Their later exit never creates a second result.
-- **Navigation keeps jobs.** Within a Session, results land on the selected branch and name the originating command. A fork gets no running handles.
-- **Stop matches omp.** `Session::abort` stops only the current turn/foreground command; background jobs continue. A Stop that interrupted an active run pauses automatic continuation until the next user submission; an idle Stop does not.
-- **Automatic continuation pauses** after an active Stop or any run that ends other than `Done`, including persist/journal failures. It resumes at the next user submission.
-- **Spool failure does not kill execution.** The command keeps running, keeps bounded partial output, and reports capture loss separately from its exit status. Journal failure stops further model progress.
-- **Promotion:** `async: true`, 60 s of foreground waiting, or a pending steer. The existing optional `timeout` keeps no default; promotion never resets it.
-- **Environment resolution stays in the foreground.** Dev-shell capture runs before any job exists; the 60 s timer and steer promotion start once the process runs, and Stop still cancels capture.
-- **`wait` takes no arguments.**
-- **Mid-run results** are injected at the next turn boundary, after the current tool batch. They never count as a steer, so they never interrupt `wait` or promote bash.
-- **Reopen never starts a model run** for pending or interrupted job results. They reach the model with the next prompt, the steering point of a resumed run, or `wait`.
-- **Guarantee boundary:** in cgroup mode cleanup holds if either axo or its guardian dies, not if both die together; in process-group mode it holds for in-group members if axo dies while the `sh` guard lives, and never for `setsid` escapees. Ordinary orphan reaping requires a functioning init/subreaper. Authorized cgroup migration, work requested from external daemons, and uninterruptible kernel tasks are outside the guarantee; this is containment, not a sandbox.
-
-### Files and types
-
-The three-crate dependency direction holds: `axo-agent` gains generic loop features and learns nothing about jobs.
-
-| Home | Responsibility |
-|---|---|
-| `crates/axo/src/exec/supervisor.rs` | The embedded supervisor entry point (sync std + rustix), not a binary target: `pub fn run(args) -> ExitCode` runs `guard <job-dir>` (the guardian) or `enter <job-dir> <program> [args…]` (enters the cgroup and becomes the command). Hosts that choose `Supervision::Cgroup` route one of their own command lines to it first in `main`; axo never assumes its own `current_exe` implements it. `crates/axo/tests/supervisor.rs` (`harness = false`) and `examples/drive.rs --cgroup` are the reference embeddings, each routing `axo-supervisor` as the first argument of its own executable. |
-| `crates/axo/src/exec/host.rs` | `Supervision { ProcessGroup (default), Cgroup { program, args, cgroup_root } }`, `ExecSpec { program, args, cwd, env }`, `ProcessSupervisor` (`new(supervision)`, `spawn`, `output`; the cgroup root probe is lazy, cached and cgroup-only), `Process` (`capture_output`, `wait`, `guardian_lost`, `container`, `close`; `Drop` kills the container), mode-agnostic `Container` (`kill`, `populated`, `terminate`) over a private `Scope { Cgroup(dir), Group(pgid) }`. The process-group spawn, best-effort `sh` guard and TERM → KILL group termination were restored from the pre-cgroup implementation with the guard disarm fixed. |
-| `crates/axo/src/axo.rs`, `exec/devshell.rs` | `AxoBuilder::supervision(Supervision)`, defaulting to `ProcessGroup`; `Axo` builds one shared `Arc<ProcessSupervisor>`, and `build()` never fails for supervision reasons. `SessionSetup` and `SessionTools` carry it, forks included. `DevShellEnv::new` takes it: `direnv`, `git ls-files`, `nix print-dev-env` and the capture `bash` run through `output`/`spawn`; supervision errors take the existing capture-failure path (host env plus a notice). |
-| `crates/axo-agent/src/{tool,agent,run,event,message}.rs` | `Tool::execute(&self, cx: ToolContext<'_>)` with `ToolContext { call, cancel, updates, steer, invocation }`; `ToolInvocationId`; `SteerSignal` (pending while steering input is queued and not yet drained); `QueuedMessage { message, id }` for prompt/steer/follow-up queues and `LoopHooks::{steering, follow_up}`; `MessageOrigin { Run, Input(Option<String>), Tool(ToolInvocationId) }` on `AgentEvent::MessageEnd`. |
-| `crates/axo/src/store/{entry,jsonl}.rs` | `Entry::JobStart { session_id, job_id, call_id, command, artifact }`, `Entry::JobEnd { job_id, text, is_error }`, and `admitted_jobs`/`delivered_jobs` receipts on `Entry::Message`; all of these are synced. Job records never enter model context. |
-| `crates/axo/src/jobs.rs` | `JobRegistry`, one per Session (forks get their own): phases (running, retained, closed), mode (foreground, promoted, done), admission and delivery state (not deliverable, pending, reserved, delivered), stop reasons and `proc://` views. No owner concept yet; Track 2 adds owner scopes to this registry rather than a second manager. |
-| `crates/axo/src/tools/bash.rs`, `tools/wait.rs` | Bash splits into a command task that owns the `Process`, readers and spool, and a foreground waiter that renders progress and promotes. `wait` is a built-in, `Replay::Safe`. |
-| `crates/axo/src/schemes/{proc,mod}.rs` | `ProcScheme` (`proc://`, `proc://bg_N`, `proc://bg_N/kill`) is registered per Session; `Axo::schemes` has no registry and omits it. Fork snapshots live spools by copy. |
-| `crates/axo/src/session.rs` | `SessionHooks` implements the registry's journal host, binds receipts from `MessageOrigin`, drives delivery and idle wake, holds the Stop latch, reconciles interrupted jobs on reopen, and shuts jobs down on `shutdown`/`Drop`. |
-
-Host infrastructure is supplied programmatically, not through project settings. The `axo-ai` auth/config `!command` resolver is not a Track 3 job and is not supervised; do not advertise supervision of every subprocess in the workspace.
-
-### Native execution ownership
-
-Both modes share `ProcessSupervisor::spawn`, `Process` and `Container`; callers (`bash`, the job registry, dev-shell capture, `Session` shutdown) see no mode.
-
-**Process-group mode (default):**
-
-1. `spawn` starts the command directly with `process_group(0)`, the command's environment, null stdin and piped stdout/stderr, and derives the pgid from the child's pid. A spawn error is `Failed to start {program}: {err}`. Nothing is awaited before `Process` exists, so cancellation cannot leak a child.
-2. It then starts the best-effort guard `sh -c 'read _; kill -KILL -- -"$0"' <pgid>` with a piped stdin that axo holds: pipe EOF (axo died or dropped the handle) kills the group. A guard that fails to spawn is a warning, not a spawn failure. There is a workload-before-guard startup interval; descendants that leave the group (`setsid`, double fork) are never tracked.
-3. `Process::wait` reaps the root; `guardian_lost` never fires, because losing a best-effort guard must not kill the job.
-4. Ordinary cancellation is TERM → 1 s → KILL on the group: `Container::terminate` sends `SIGTERM` to the group (ESRCH means it is already gone), polls `populated` every 20 ms for up to `KILL_GRACE`, then sends `SIGKILL`. `populated` treats EPERM members as present; the caller keeps reaping the leader meanwhile, since an unreaped zombie still counts as a member.
-5. Root exit does not release containment. `close` waits for the root, polls until the group is empty, then disarms the guard by `kill().await` while still holding its stdin, which sends `SIGKILL` and reaps it, so no zombie is left (the pre-cgroup `disarm` used `start_kill` plus one `try_wait` and leaked one). Only then is the stdin dropped. Known window: a pgid freed and reused between the group emptying and that disarm could be killed if the host dies in between.
-6. `Drop` of an unclosed `Process` sends the group `SIGKILL`; the guard's stdin EOF then kills the same, already-dying group, which is harmless, and tokio's orphan reaper collects the guard.
-
-**Cgroup mode (`Supervision::Cgroup`):**
-
-1. `spawn` probes the root once (cached), creates a never-reused `axo-job-<uuidv7>` cgroup under it, then starts the guardian as `program args… guard <dir>`, which stays in axo's cgroup. A guardian that fails to start is `Command supervisor {program} failed to start: {err}`; one that does not answer `ready` within 5 s is `Command supervisor {program} did not report ready; the host must route these arguments to axo::exec::supervisor::run`.
-2. The guardian pins axo with a pidfd (checking `getppid()` did not change) and polls that pidfd and its stdin control pipe. Pidfd readable (axo died) or pipe EOF/error (the handle was dropped while axo lives) → cleanup: `cgroup.kill`, wait for `populated 0`, remove the directory, retrying on EBUSY. `release` on the pipe means axo already removed the directory. No PDEATHSIG.
-3. The root is `program args… enter <dir> <command…>`, started with axo's own trusted launch environment so a wrapped host executable can start. It reads the command environment from stdin as `KEY=VALUE\0` records, so nothing like `LD_PRELOAD` runs before entry; writes itself into `cgroup.procs`; verifies `/proc/self/cgroup`; then `exec`s with exactly that environment and null stdin. Entry failures exit 125; exec failures 127 (not found) or 126. OS strings pass unchanged; stdout and stderr are real pipes. The root carries `kill_on_drop` for the window before it has entered the cgroup.
-4. `Process` owns the root child, the guardian child and the control pipe; each child has one reaper. If the guardian exits first, `Process::wait` kills the cgroup.
-5. Ordinary cancellation keeps TERM → 1 s → KILL: `Container::terminate` signals each member through a pidfd after checking that `/proc/<pid>/cgroup` names this container, so a reused pid fails with ESRCH; `cgroup.kill` finishes the subtree. No saved numeric PGID is ever ownership.
-6. Root exit does not release containment. `close` waits for the cgroup to empty, removes the directory, then releases the guardian. `Drop` of an unclosed `Process` writes `cgroup.kill`, and the dropped control pipe makes the guardian kill and remove the directory too.
-
-In both modes `output` (used for dev-shell capture) runs to completion or its deadline, kills leftovers and closes; these internal operations never become model-visible jobs.
-
-No service manager, restart policy, backend framework, quota system, named-service feature or cross-restart job survival is included.
-
-### Bash, promotion and delivery
-
-- **Command task.** Keeps today's URL rewriting, artifact allocation, noninteractive env, `CI`, output shaping and every existing output string. Root exit sets one fixed drain deadline (`EXIT_IDLE`, 100 ms) that chunks do not extend. A timeout or Stop calls `Container::terminate`. If the container (process group or cgroup) is still populated at the result, the job becomes **retained** and the result says `Processes started by this command are still running as bg_N …`; the task keeps spooling until the container empties, then closes. A kill through `proc://` reports `Command was stopped (proc://bg_N/kill)`.
-- **Promotion** (at most one attempt per call; an already finished command is preferred over promotion): journal `JobStart` first. If that append fails, the call stays in the foreground. Then promote and return `bg_N`, the current output snapshot and `artifact://N`, with details `{ job, fullOutput }`. The admission is bound to the tool result's invocation. After promotion the tool's cancel no longer reaches the job; only `proc://` kill, the original timeout and session shutdown stop it.
-- **Registry rules.** A result racing admission stays ineligible until the receipt commits. `JobEnd` is journaled for promoted jobs, except after shutdown (reconciled on reopen); if that append fails, the result is still kept and the receipt-bearing write surfaces any persistent journal failure. Never-promoted jobs leave no registry state after they close.
-- **`wait`.** Takes its subscription first, then loops: pending steer → `Wait interrupted by a new message; …`; reserved results under its invocation → rendered results; no running admitted job → `No background jobs are running.`; otherwise block on a registry change, steer or cancel.
-- **Automatic delivery** is a `CustomMessage` with `custom_type = "job_result"` (`Background job results:` + each `[bg_N] <first command line>` and its text, ascending id order), queued with id `delivery-<uuidv7>` after reserving under that input id. It is a follow-up, never a second ToolResult for the original call. Automatic delivery and `wait` reserve from one pending set; batching is whatever is pending at the boundary.
-- **One session driver.** `LoopHooks::steering` supplies a delivery at each steering drain point of an active run. Settle releases uncommitted reservations, rechecks pending results before releasing `running`, and starts the continuation itself unless paused or shutting down. An idle completion wakes the driver under the log lock. `prompt_with` puts pending results before the user's message.
-
-### Durability and recovery
-
-- **Jobs journal only on promotion.** Foreground commands write no new records; an interrupted foreground call still recovers through the existing bash spool scan with `Replay::Never`.
-- **Receipts.** `SessionHooks::persist` maps `MessageOrigin` to the reservation: `Tool(inv)` carries the promotion admission and any `wait` deliveries; `Input(id)` with reservations is a delivery, otherwise an ordinary submission id. The receipt rides on the same `Entry::Message` that carries the result. Append success commits admission and delivery; failure releases them and returns the error. A synthetic result has origin `Run`, so it never consumes a reservation. Submission ids now come from queued-input identity, not message equality.
-- **Rebuild** reads all raw entries, not the projection, so navigation and compaction never erase ledger state. The id counter starts above every `bg_N` in the file, copied history included, so forks never reuse ids. For this session's `JobStart`s: admitted and ended, not delivered → pending; delivered → done; unadmitted → ignored; admitted, not ended → reconciled.
-- **Reopen reconciliation** (when a recovery policy runs) writes one `JobEnd` per admitted unfinished job before recovery: `Command was interrupted when the session closed; it may have partially run. Output so far: artifact://N` (or `Its output is unavailable.`). A second open finds it and writes nothing. Recovery never signals a persisted pid or adopts an old handle.
-- **Shutdown and drop.** `Session::shutdown` waits for the run, then stops every open job and awaits its task; `Drop` kills every job container synchronously.
-- **Fork** copies each live spool's flushed bytes (no chmod or hard link of the live source) and marks only the copy read-only; finished artifacts keep the link-or-copy path. Copied parent job records are history, not ownership.
-- Exactly once means one committed session result, not exactly-once observation by a provider across a retried request. A torn final line is not a receipt.
-
-### Build order
-
-| Step | Deliverable | Status |
-|---|---|---|
-| 1. Native execution | `ProcessSupervisor`/`Process`/`Container`, builder wiring, dev-shell capture cutover; host-selected `Supervision` with embedded `exec::supervisor::run` and a process-group default | Complete; ordinary workspace gates, explicit cgroup fail-closed/delegated tests, process-group host-SIGKILL smoke and live drive checks in both modes pass. Earlier cgroup-only dev-shell success/timeout/failure evidence remains historical. |
-| 2. Generic provenance | `ToolContext`, `SteerSignal`, `QueuedMessage`, `MessageOrigin`; message-equality submission matching removed | Implementation complete; named `axo-agent` and submission-id targeted tests pass |
-| 3. Registry and supervised bash | `JobStart`/`JobEnd` and receipts, `JobRegistry`, bash command task, `proc://`, live-spool fork snapshots, old group guard deleted | Implementation complete; targeted lifecycle, journal, bash, and `proc://` tests pass |
-| 4. Promotion and delivery | `async`, 60 s/steer promotion, `wait`, receipts, delivery, idle wake, Stop latch, reopen reconciliation | Implementation complete; targeted promotion, `wait`, delivery, Stop, and reopen tests pass |
-
-### Acceptance
-
-- **No delegation for the default suite.** `cargo test --workspace` runs in an ordinary shell: session tests build `Axo` with the default `Supervision::ProcessGroup`, and `tests/supervisor.rs` (`harness = false`, routing `axo-supervisor` to `axo::exec::supervisor::run` in its own executable) always runs `unusable_root_fails_closed` (a `Cgroup` root of `/proc`, no delegation needed) and `dropping_a_group_process_kills_its_group`, then prints `supervisor: cgroup cases skipped (set AXO_TEST_CGROUP=1 inside a delegated cgroup to run them)`. **Verified:** workspace check and every ordinary workspace test including doctests pass this way.
-- **Opt-in cgroup acceptance passed.** `AXO_TEST_CGROUP=1 nix develop -c cargo test -p axo --test supervisor` exited 101 in the ordinary shell with `Command supervision unavailable` and permission denied under `/sys/fs/cgroup/system.slice/axome-server.service`, with no downgrade. The same command inside `systemd-run --user --scope --quiet -p Delegate=yes --` passed `dropping_a_process_kills_detached_descendants`, using the test executable itself as guard and entry process.
-- **Permanent invariant tests:** passing `axo-agent` steer-signal and message-origin tests; `supervisor.rs` group-kill, fail-closed and (opt-in) detached-descendant cleanup cases; `jobs.rs` delivery, wait, promotion and retained-helper tests (the retained helper now stays in the process group, no `setsid`); `jobs_lifecycle.rs` Stop-latch and idempotent reopen tests; and `schemes.rs` live-spool fork snapshots.
-- **Process-group crash smoke passed.** The throwaway `group_kill_smoke` example spawned an in-group sleeper and a `setsid` sleeper. After SIGKILL of the actual example host, the in-group PID was absent from `/proc` at the first observation within 44 ms; the detached PID remained alive, demonstrating the documented limit. It was explicitly killed and its `/proc` identity disappeared; the fixture was deleted. Earlier cgroup-only real-host cleanup and dev-shell success/timeout/failure probes were not repeated as part of this rework.
-- **Live drive checks passed** with `openai-codex/gpt-6-astra`, each making exactly `bash {"command":"cat /proc/self/cgroup"}`. Default mode returned `0::/system.slice/axome-server.service`; delegated `drive --cgroup` returned a path ending in `axo-job-01a1a35d-3602-7690-bc7f-e672218079f9`. Both runs ended `Done`. Sessions: `/home/toph/.axo/sessions/--tmp--/2026-11-03T21-42-34-991Z_01a1a35d-2cef-7657-901c-0001b142809a.jsonl` (default) and `/home/toph/.axo/sessions/--tmp--/2026-11-03T21-42-34-991Z_01a1a35d-2cef-745a-8931-d3e94de6da46.jsonl` (cgroup).
-- **Workspace gates passed** under `nix develop`: `cargo check --workspace --all-targets`, `cargo test --workspace` (doctests included), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`. `cargo build -p axo --examples` also passed.
-- **Docs:** `crates/axo/docs/`, built-in tool guidance, the root README and the design status describe the implemented behavior.
-
-Intentional differences from omp: stronger containment and reaping (in-group tracking by default, full descendant-tree containment in cgroup mode), restart-durable results, explicit capture-loss reporting, the bounded post-root drain, and axo's unchanged no-default timeout instead of omp's deadline/promotion arithmetic. Named services (`name`, readiness checks), persistent shell/PTY machinery, detached jobs surviving session shutdown, owner scopes and Track 2's task executor are not part of this track.
-
----
-
-## Track 4: URL scheme registry — implemented
-
-Schemes give the model short, stable names for things that are not project files. Tools are the verbs (`read`, `write`, `edit`, `grep`, `find`); schemes are the nouns. A new noun is one handler, not a new set of tools. Prior art: omp `internal-urls/` (v18.15.0, ~7.9k LOC, 21 schemes behind a process-global router).
-
-### Why axo wants them
-
-- **Host data is rarely files.** A host exposes its own nouns (Axome tasks, runs) through one trait; `read`/`grep` and later codemode and Bun extensions reach them through the same seam.
-- **Transcripts outlive paths.** Shake markers and bash truncation notices use URLs instead of absolute paths in the permanent transcript. A URL resolves against the current session at read time, survives moves and forks, and costs fewer tokens.
-- **Many tenants share one process.** A session resolves only its own resources: forks get their own files, and subagents will share their parent's (Track 2). Never unrelated sessions'. omp's `artifact://` scans every live session; axo does not. This is isolation, not a security boundary: `read` still accepts absolute paths.
-- **No approvals in the core.** Scheme calls run through the normal tool pipeline, so host hooks see the URL in the arguments and own any policy.
-
-### Settled
-
-- **Per-session handlers.** Each session builds its handlers; built-ins hold `Arc`s to session internals (as tools hold `Arc<SessionTools>`). No global router or context bag.
-- **Per-URL resolution, no static spec.** A handler resolves a URL to `File { path, writable }` (the normal file pipeline runs: images, truncation, stale-file guard, locks, ledger; `edit`/`write` refuse when not writable) or `Virtual` (handler renders text, paged by `read`'s `offset`/`limit`). No `:N-M` selector grammar.
-- **The trait.** What a scheme author writes:
-
-  ```rust
-  pub trait Scheme: Send + Sync {
-      fn name(&self) -> &str;        // "local"
-      fn prompt_doc(&self) -> &str;  // one line for the prompt section
-      async fn resolve(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<Target, ToolError>;
-      async fn read(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<String, ToolError>; // Virtual only
-      async fn write(&self, url: &SchemeUrl, content: &str, cx: &SchemeContext) -> Result<String, ToolError>; // Virtual only; default read-only
-      fn write_replay(&self) -> Replay; // default Never
-  }
-  pub enum Target { File { path: PathBuf, writable: bool }, Virtual }
-  ```
-
-  `resolve` is the only call bash's rewriter and `grep`/`find` make.
-- **`write` can act.** A handler may accept writes whose content is an instruction, not stored bytes (future `proc://bg_1/kill`, stdin, messages to a subagent). Content stays required; action writes receive `""` and keep `write_replay` at `Never`. Schemes that don't accept writes are read-only; file-backed schemes like `local://` keep normal write semantics.
-- **`grep`/`find` on file-backed URLs only** at first. Virtual URLs fail with "use `read`"; a virtual handler may still map a URL to a file (a job's log). A listing method arrives only when a host needs it.
-- **Host injection.** `SessionOptions` gained `tools: Vec<ToolFactory>` and `schemes: Vec<Arc<dyn Scheme>>`. Each tool factory is called with the session's `Arc<SessionTools>` at start and again for each fork, so host tools can use `locate`, `schemes` and `rewrite_urls`. Each scheme call gets `SchemeContext { session_id, session_dir, cwd }`, with no parent chain, so one handler can serve every session. Host tools replace built-ins by name or append.
-- **Host schemes.** Names must match `^[a-z][a-z0-9+.-]+$`; `artifact` and `file` are reserved. Other host schemes replace built-ins by name in place or append.
-- **Containment.** File roots reject absolute paths and `..` components. Only `local://` also checks realpaths; skills are often per-file symlinks into `/nix/store`.
-- **Kept from omp:** normalizing model typos (`/cwd/local://x`, `local:/x`); one-line prompt doc per scheme in a prompt section stored in the transcript.
-- **Dropped from omp:** approval tiers, write scopes, plan-mode sandbox roots; TUI parts (sync locate, OSC 8 links, autocomplete, render details); the virtual-filesystem layer for embedded shell, `grep` and `find`; MCP fallback routing; hashline unwrapping.
-
-### Built-in schemes
-
-`<session_dir>` is the session's `.jsonl` path without its extension. Side files live in `<session_dir>/artifacts/<n>.<tail>` and `<session_dir>/local/`. Old `context/` and `bash/` folders are ignored; no migration.
-
-| Scheme | Names | Backing | omp precedent | axo decision |
-|---|---|---|---|---|
-| `artifact://<n>` | Shake recovery text, full output of truncated bash commands | File, read-only | Per-session counter, seeded by scanning the dir; branching copies the dir | `<session_dir>/artifacts/<n>.bash.<callid>.log` for bash (call id escaped for filenames), `<n>.shake.<ext>` for shake. The URL uses only `<n>`; crash recovery finds bash logs by call id. Forks hard-link artifacts with a copy fallback and continue the counter. |
-| `skill://<name>[/<path>]` | A skill's `SKILL.md`, or a file in its directory | File, read-only, text-contained in the skill dir | Same forms, plus `skill://<plugin>/<name>` for plugin collisions | No namespaces: axo skill names are already unique (first wins, collisions diagnosed). Skill blocks use `location="skill://<name>"` and "References are relative to `skill://<name>/`". |
-| `axo://<file>.md` | axo's bundled docs | File, read-only, over `<AXO_DIR>/cache/docs` | `omp://` is virtual (docs embedded in the binary) | Keep the on-disk copy (`ensure_bundled_docs` writes only when changed) so `grep`, `find` and bash work on it. |
-| `local://<path>` | Per-session scratch folder (plans, notes, subagent handoffs) | File, writable, realpath-contained | `<artifacts>/local/`; subagents share the parent's root; branching and plan handoff copy it | `<session_dir>/local/`. Forks copy regular files and recreate directories, skipping symlinks; a fork's edits must not reach the parent. Subagents will share the parent's root (Track 2). |
-
-Later, with the features that use them: `proc://` (Track 3), `agent://` (Track 2: the only subagent scheme, covering output, transcript and messages, e.g. `agent://<id>` and `agent://<id>/history`; no separate `history://`), and ideas like `table://<name>` (session-scoped SQLite), `pr://`, `issue://`, `browser://`.
-
-### Schemes inside `bash`
-
-omp's embedded shell (`crates/pi-shell`, `pi-natives/src/shell/vfs.rs`) sees each command after parsing and expansion:
-- Redirections, globs, `cd` and its in-process utilities (`cat`, `find -exec`, `xargs`, …) open URLs through a virtual filesystem, virtual ones included.
-- For external programs, an argument that is exactly a backed URL, or `--flag=URL`, becomes the host path it aliases. Unknown schemes, URLs inside larger words (`https://x/?next=local://y`) and bare roots (`local://`) pass unchanged. A URL the handler rejects fails the command before it runs.
-
-axo runs real `bash -c`, so a hand-written scanner rewrites URLs before spawn. `brush-parser` was rejected: 0.4.0 pulls in insta+pest, bon, cached and peg. Whole-argument URLs (including wholly quoted URLs), `--flag=`/`NAME=` values and redirect targets become shell-quoted host paths, preserving unquoted globs. Heredoc bodies, comments, URLs embedded in quoted substrings or larger words, unknown schemes and bare roots stay unchanged. A rejected URL fails before spawn; virtual URLs fail with "use `read`", and read-only targets are refused as output redirects. URLs produced only by shell expansion are not seen (`f=local://x` itself is rewritten).
+- **Track 3 (Async `bash`, background jobs & `wait`):** Landed in code; settled decisions in [`design.md`](design.md#settled-core-decisions) and runtime reference in [`crates/axo/docs/configuration.md`](../crates/axo/docs/configuration.md#command-supervision-axosupervision) and [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#background-job-durability). Historical verification log preserved in [`research/track3-supervision.md`](research/track3-supervision.md).
+- **Track 4 (URL scheme registry):** Landed in code; settled decisions in [`design.md`](design.md#settled-core-decisions) and runtime reference in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#rust-extension-traits).
 
 ---
 
