@@ -18,6 +18,7 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 | [`nix-shell.md`](nix-shell.md) | Running agent commands inside Nix dev shells: techniques, timings, design |
 | [`compaction.md`](compaction.md) | When agents compact, how much reply headroom they reserve, and what they keep verbatim; provider limits and context-rot evidence |
 | [`compaction-methods.md`](compaction-methods.md) | How pi, omp, Claude Code, Codex, the Anthropic and OpenAI APIs and others actually compact; prompts, carried state, failure lessons, evaluation, ideas for axo |
+| [`subagents.md`](subagents.md) | How omp, dsh, Codex, Claude Code, pi, OpenCode, Gemini, Amp and ACP spawn, observe, steer, persist and scope subagents; what embedding changes for axo; the decisions Track 2 must make |
 
 **2026-11-03 follow-up:** [`track3-supervision.md`](track3-supervision.md) checks Track 3 against actual axo/omp code, session traces, kernel contracts and isolated process-failure probes. It supersedes the older shell study's supervision assumptions; its decisions are implemented; see Track 3 in [plan.md](../plan.md).
 

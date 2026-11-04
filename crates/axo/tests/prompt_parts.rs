@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use axo::store::Entry;
-use axo::{Error, PromptPart, PromptRequest, PromptResult, Session, Settings};
+use axo::{Error, PromptPart, PromptRequest, PromptResult, Session};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
@@ -18,7 +18,7 @@ async fn host(dir: &Path, turns: usize) -> common::Host {
     common::host(
         dir,
         json!([{"id": "m", "input": ["text", "image"]}]),
-        Settings::default(),
+        json!({}),
         (0..turns)
             .map(|turn| ScriptedTurn::Reply(reply_text(&format!("reply {turn}"))))
             .collect(),

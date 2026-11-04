@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axo::store::{Entry, SeqEntry};
-use axo::{Command, Error, PromptPart, Session, SessionEvent, Settings, ShakeMode};
+use axo::{Command, Error, PromptPart, Session, SessionEvent, ShakeMode};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
 use axo_ai::{Message, ProviderFailure, ScriptedTurn, StopReason, ThinkingLevel, UserBlock};
@@ -98,7 +98,7 @@ fn model(model: &str) -> Command {
 #[tokio::test]
 async fn run_command_records_no_submission_or_model_call() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(dir.path(), models(), Settings::default(), vec![]).await;
+    let host = host(dir.path(), models(), json!({}), vec![]).await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
 
     // The session records its initial selection lazily, so compare against a snapshot
@@ -124,7 +124,7 @@ async fn slash_text_is_always_a_prompt() {
     let host = host(
         dir.path(),
         models(),
-        Settings::default(),
+        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("one")),
             ScriptedTurn::Reply(reply_text("two")),
@@ -161,7 +161,7 @@ async fn pasted_slash_text_is_never_a_skill() {
     let host = host(
         dir.path(),
         models(),
-        Settings::default(),
+        json!({}),
         vec![ScriptedTurn::Reply(reply_text("one"))],
     )
     .await;
@@ -195,7 +195,7 @@ async fn commands_during_a_run_follow_their_policy() {
     let host = host(
         dir.path(),
         models(),
-        Settings::default(),
+        json!({}),
         vec![
             transient(),
             ScriptedTurn::Reply(reply_text("original done")),
@@ -285,9 +285,7 @@ async fn commands_during_a_run_follow_their_policy() {
 #[tokio::test]
 async fn maintenance_blocks_alongside_commands() {
     let dir = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.compaction.enabled = true;
-    settings.compaction.keep_recent_tokens = Some(0);
+    let settings = json!({"compaction": {"enabled": true, "keepRecentTokens": 0}});
     let host = host(
         dir.path(),
         models(),

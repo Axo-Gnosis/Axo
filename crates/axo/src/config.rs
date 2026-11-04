@@ -1,13 +1,14 @@
-//! The axo directory layout and `settings.jsonc`.
+//! Settings and the configuration contract hosts implement.
 
 use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
-use axo_ai::{ModelsConfig, ThinkingLevel};
+use axo_ai::ThinkingLevel;
 use indexmap::IndexMap;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
+use crate::context::project_root;
 use crate::error::Error;
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -16,76 +17,13 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The axo directory: `AXO_DIR`, else `$HOME/.axo`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AxoDir {
-    root: PathBuf,
-}
-
-impl AxoDir {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-
-    /// `AXO_DIR` when set and non-empty, else `$HOME/.axo`.
-    pub fn from_env() -> Result<Self, Error> {
-        if let Some(dir) = std::env::var_os("AXO_DIR").filter(|dir| !dir.is_empty()) {
-            return Ok(Self::new(PathBuf::from(dir)));
-        }
-        let home = home_dir().ok_or(Error::NoAxoDir)?;
-        Ok(Self::new(home.join(".axo")))
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn settings_path(&self) -> PathBuf {
-        self.root.join("settings.jsonc")
-    }
-
-    pub fn models_path(&self) -> PathBuf {
-        self.root.join("models.jsonc")
-    }
-
-    pub fn auth_path(&self) -> PathBuf {
-        self.root.join("auth.json")
-    }
-
-    pub fn cache_dir(&self) -> PathBuf {
-        self.root.join("cache")
-    }
-
-    pub fn sessions_dir(&self) -> PathBuf {
-        self.root.join("sessions")
-    }
-
-    pub fn skills_dir(&self) -> PathBuf {
-        self.root.join("skills")
-    }
-
-    /// Where axo materializes its bundled documentation: `<AXO_DIR>/cache/docs`.
-    pub fn docs_dir(&self) -> PathBuf {
-        self.cache_dir().join("docs")
-    }
-
-    /// A user prompt file, `<AXO_DIR>/prompts/<name>.md`: `SYSTEM`, `WORK`, `PROSE`, and the
-    /// summarizer's `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`,
-    /// `BRANCH_SUMMARY`.
-    pub fn prompt_path(&self, name: &str) -> PathBuf {
-        self.root.join("prompts").join(format!("{name}.md"))
-    }
-}
-
-/// `settings.jsonc`. Unknown keys are ignored; every field has a default.
+/// The settings object. Unknown keys are ignored; every field has a default.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// `provider/model-id`.
     pub default_model: Option<String>,
     pub default_thinking_level: ThinkingLevel,
-    /// User settings only: `Models` is built once per process.
-    pub extended_context: bool,
     /// User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`.
     pub home_agents_dir: bool,
     pub steering_mode: QueueMode,
@@ -103,7 +41,6 @@ impl Default for Settings {
         Self {
             default_model: None,
             default_thinking_level: ThinkingLevel::Medium,
-            extended_context: false,
             home_agents_dir: false,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
@@ -154,7 +91,6 @@ fn default_context_files() -> IndexMap<String, bool> {
         "CLAUDE.md",
         "CLAUDE.local.md",
         ".agents/AGENTS.md",
-        ".axo/AGENTS.md",
     ]
     .into_iter()
     .map(|name| (name.to_owned(), true))
@@ -202,17 +138,17 @@ impl ProjectSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectFiles {
-    /// `<cwd>/.axo/`: settings.jsonc and `prompts/` overrides.
-    pub axo_dir: bool,
     /// Project `.agents/skills`.
     pub skills: bool,
+    /// The host's project layer (`ConfigSource::project`): its settings and prompt overrides.
+    pub config: bool,
 }
 
 impl Default for ProjectFiles {
     fn default() -> Self {
         Self {
-            axo_dir: true,
             skills: true,
+            config: true,
         }
     }
 }
@@ -274,100 +210,209 @@ pub struct AskSettings {
     pub timeout_ms: Option<u64>,
 }
 
-impl Settings {
-    /// Loads `<AXO_DIR>/settings.jsonc`, then, for `Some((cwd, access))` with access other
-    /// than `Ignore`, `<cwd>/.axo/settings.jsonc`. Objects merge key by key with the
-    /// project winning; arrays replace. The project file never sets user-only keys,
-    /// and below `Trust` it never sets what runs code.
-    /// `defaultModel` resolves commands and environment variables after merging.
-    pub fn load(dir: &AxoDir, project: Option<(&Path, ProjectAccess)>) -> Result<Settings, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project", "extendedContext", "homeAgentsDir"];
+/// Overridable prompt names. Order is irrelevant.
+pub const PROMPT_NAMES: [&str; 8] = [
+    "SYSTEM",
+    "WORK",
+    "PROSE",
+    "SUMMARY",
+    "COMPACTION",
+    "COMPACTION_UPDATE",
+    "COMPACTION_SPLIT_TURN",
+    "BRANCH_SUMMARY",
+];
 
-        let mut path = dir.settings_path();
+/// One prompt override as the host holds it. `text` is untrimmed; axo trims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptOverride {
+    pub origin: String,
+    pub text: String,
+}
+
+/// One raw, unvalidated configuration contribution.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigLayer {
+    /// Names the layer in errors and warnings (a path, a URL, "host defaults", ...).
+    pub origin: String,
+    /// The settings object. `None` and `Some(Value::Null)` both mean "no settings".
+    pub settings: Option<Value>,
+    /// Overrides keyed by a `PROMPT_NAMES` entry. A missing key means no override; an empty text is an override.
+    pub prompts: IndexMap<String, PromptOverride>,
+}
+
+/// The user's configuration: the layer plus the user's filesystem resources.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserConfig {
+    pub layer: ConfigLayer,
+    /// Skill roots searched after project `.agents/skills` and before `~/.agents/skills`.
+    pub skill_roots: Vec<PathBuf>,
+    /// Context files loaded after `~/.agents/AGENTS.md` and before the project walk; missing files are skipped.
+    pub context_files: Vec<PathBuf>,
+}
+
+/// Hosts are trusted integration code; the project layer is untrusted data.
+/// Calls are blocking and run on the caller's async task. Hosts report an unreadable
+/// path as `Error::Io`, invalid content they parse as `Error::Config { origin, .. }`, and
+/// any other acquisition failure as `Error::Host(Box::new(err))`.
+// ponytail: blocking calls; make async if a host needs network-backed config
+pub trait ConfigSource: Send + Sync {
+    /// Called once per `create_session`, `open_session` and `Axo::schemes`, before anything else.
+    fn user(&self) -> Result<UserConfig, Error>;
+    /// The project contribution for a session in `cwd`. The project root is `axo::context::project_root(cwd)`.
+    /// Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust`
+    /// and the user's `project.files.config` is true.
+    fn project(&self, cwd: &Path) -> Result<ConfigLayer, Error>;
+}
+
+/// What one session runs with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveConfig {
+    pub access: ProjectAccess,
+    pub settings: Settings,
+    /// Trimmed. The project's override wins per name.
+    pub prompts: IndexMap<String, PromptOverride>,
+    pub skill_roots: Vec<PathBuf>,
+    pub context_files: Vec<PathBuf>,
+}
+
+impl EffectiveConfig {
+    /// Samples `source.user()`, derives access (`access` overrides the user policy), then,
+    /// unless access is `Ignore` or `project.files.config` is false, applies
+    /// `source.project(cwd)`. Objects merge key by key with the project winning; arrays
+    /// replace. The project never sets user-only keys, and below `Trust` it never sets
+    /// what runs code.
+    pub fn resolve(
+        source: &dyn ConfigSource,
+        cwd: &Path,
+        access: Option<ProjectAccess>,
+    ) -> Result<Self, Error> {
+        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir"];
+
+        let UserConfig {
+            layer: user,
+            skill_roots,
+            context_files,
+        } = source.user()?;
         let mut merged = json!({ "contextFiles": default_context_files() });
-        if let Some(user) = read_settings_value(&path)? {
-            deep_merge(&mut merged, user);
-        }
-        if let Some((cwd, access)) = project.filter(|(_, access)| *access != ProjectAccess::Ignore)
-        {
-            let project_path = cwd.join(".axo").join("settings.jsonc");
-            if let Some(mut project) = read_settings_value(&project_path)? {
-                path = project_path;
-                let object = project.as_object_mut().expect("validated settings object");
-                for key in USER_ONLY_KEYS {
-                    if object.remove(*key).is_some() {
-                        tracing::warn!(path = %path.display(), "\"{key}\" is a user setting; ignored in project settings");
-                    }
-                }
-                if access != ProjectAccess::Trust {
-                    if let Some(bash) = object.get_mut("bash").and_then(Value::as_object_mut)
-                        && bash.remove("devShell").is_some()
-                    {
-                        tracing::warn!(path = %path.display(), "bash.devShell needs a trusted project; ignored in project settings");
-                    }
-                    if object
-                        .get("defaultModel")
-                        .and_then(Value::as_str)
-                        .is_some_and(|model| model.starts_with('!'))
-                    {
-                        object.remove("defaultModel");
-                        tracing::warn!(path = %path.display(), "a \"!command\" defaultModel needs a trusted project; ignored in project settings");
-                    }
-                }
-                deep_merge(&mut merged, project);
+        let policy = match validate(&user.origin, user.settings)? {
+            Some((value, parsed)) => {
+                deep_merge(&mut merged, value);
+                parsed.project
             }
-        }
-        let mut settings: Settings =
-            serde_json::from_value(merged).map_err(|error| Error::Config {
-                path,
-                message: error.to_string(),
-            })?;
+            None => ProjectSettings::default(),
+        };
+        let mut prompts = prompt_overrides(user.prompts)?;
+        let access = access.unwrap_or_else(|| policy.access_for(&project_root(cwd)));
 
-        if let Some(model) = &settings.default_model {
-            let bytes = model.as_bytes();
-            let has_var = bytes.windows(2).any(|pair| {
-                pair[0] == b'$'
-                    && (pair[1] == b'{' || pair[1] == b'_' || pair[1].is_ascii_alphabetic())
-            });
-            if model.starts_with('!') || has_var {
-                settings.default_model = Some(axo_ai::resolve_config_value(model)?);
+        let mut origin = user.origin;
+        if access != ProjectAccess::Ignore && policy.files.config {
+            let project = source.project(cwd)?;
+            if let Some((mut value, _)) = validate(&project.origin, project.settings)? {
+                let object = value.as_object_mut().expect("validated settings object");
+                filter_project(object, access, USER_ONLY_KEYS, &project.origin);
+                deep_merge(&mut merged, value);
+                origin = project.origin;
             }
+            prompts.extend(prompt_overrides(project.prompts)?);
         }
-        Ok(settings)
+        let settings: Settings =
+            serde_json::from_value(merged).map_err(|error| config_error(&origin, error))?;
+        Ok(Self {
+            access,
+            settings,
+            prompts,
+            skill_roots,
+            context_files,
+        })
+    }
+
+    /// `settings.default_model` with a `!command` run and `$VAR` expanded. Sessions call
+    /// this only when neither `SessionOptions::model` nor the session's recorded model
+    /// selects one, so an unresolvable value fails only that selection.
+    pub fn default_model(&self) -> Result<Option<String>, Error> {
+        let Some(model) = &self.settings.default_model else {
+            return Ok(None);
+        };
+        let bytes = model.as_bytes();
+        let has_var = bytes.windows(2).any(|pair| {
+            pair[0] == b'$' && (pair[1] == b'{' || pair[1] == b'_' || pair[1].is_ascii_alphabetic())
+        });
+        if model.starts_with('!') || has_var {
+            Ok(Some(axo_ai::resolve_config_value(model)?))
+        } else {
+            Ok(Some(model.clone()))
+        }
     }
 }
 
-/// Reads and independently validates one settings file so a bad value is reported
-/// against the file that holds it. A missing or empty file is `None`.
-fn read_settings_value(path: &Path) -> Result<Option<Value>, Error> {
-    let Some(text) = read_optional(path)? else {
-        return Ok(None);
-    };
-    let config_error = |message: String| Error::Config {
-        path: path.to_owned(),
-        message,
-    };
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let value = match jsonc_parser::parse_to_serde_value(text, &Default::default())
-        .map_err(|error| config_error(error.to_string()))?
-    {
-        None | Some(Value::Null) => return Ok(None),
-        Some(value @ Value::Object(_)) => value,
-        Some(_) => return Err(config_error("expected a JSON object".to_owned())),
-    };
-    Settings::deserialize(&value).map_err(|error| config_error(error.to_string()))?;
-    Ok(Some(value))
+fn config_error(origin: &str, message: impl ToString) -> Error {
+    Error::Config {
+        origin: origin.to_owned(),
+        message: message.to_string(),
+    }
 }
 
-/// `Ok(None)` when the file does not exist.
-fn read_optional(path: &Path) -> Result<Option<String>, Error> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::Io {
-            path: path.to_owned(),
-            source,
-        }),
+/// Validates one layer's settings on their own so a bad value is reported against the
+/// origin that holds it, returning the object and its parse. `None` and `null` are no
+/// settings.
+fn validate(origin: &str, settings: Option<Value>) -> Result<Option<(Value, Settings)>, Error> {
+    match settings {
+        None | Some(Value::Null) => Ok(None),
+        Some(value @ Value::Object(_)) => {
+            let parsed =
+                Settings::deserialize(&value).map_err(|error| config_error(origin, error))?;
+            Ok(Some((value, parsed)))
+        }
+        Some(_) => Err(config_error(origin, "expected a JSON object")),
+    }
+}
+
+/// Trims each override and rejects names outside `PROMPT_NAMES`.
+fn prompt_overrides(
+    prompts: IndexMap<String, PromptOverride>,
+) -> Result<IndexMap<String, PromptOverride>, Error> {
+    prompts
+        .into_iter()
+        .map(|(name, PromptOverride { origin, text })| {
+            if !PROMPT_NAMES.contains(&name.as_str()) {
+                return Err(config_error(
+                    &origin,
+                    format!("unknown prompt override \"{name}\""),
+                ));
+            }
+            let text = text.trim().to_owned();
+            Ok((name, PromptOverride { origin, text }))
+        })
+        .collect()
+}
+
+/// Strips what a project layer may not set: user-only keys always, and below `Trust`
+/// whatever runs code.
+fn filter_project(
+    object: &mut Map<String, Value>,
+    access: ProjectAccess,
+    user_only_keys: &[&str],
+    origin: &str,
+) {
+    for key in user_only_keys {
+        if object.remove(*key).is_some() {
+            tracing::warn!(origin = %origin, "\"{key}\" is a user setting; ignored in project settings");
+        }
+    }
+    if access != ProjectAccess::Trust {
+        if let Some(bash) = object.get_mut("bash").and_then(Value::as_object_mut)
+            && bash.remove("devShell").is_some()
+        {
+            tracing::warn!(origin = %origin, "bash.devShell needs a trusted project; ignored in project settings");
+        }
+        if object
+            .get("defaultModel")
+            .and_then(Value::as_str)
+            .is_some_and(|model| model.starts_with('!'))
+        {
+            object.remove("defaultModel");
+            tracing::warn!(origin = %origin, "a \"!command\" defaultModel needs a trusted project; ignored in project settings");
+        }
     }
 }
 
@@ -386,18 +431,5 @@ fn deep_merge(base: &mut Value, overlay: Value) {
             }
         }
         (base, overlay) => *base = overlay,
-    }
-}
-
-/// Loads `<AXO_DIR>/models.jsonc` via `ModelsConfig::parse_jsonc`; a missing file means
-/// an empty config.
-pub fn load_models_config(dir: &AxoDir) -> Result<ModelsConfig, Error> {
-    let path = dir.models_path();
-    match read_optional(&path)? {
-        Some(text) => ModelsConfig::parse_jsonc(&text).map_err(|error| Error::Config {
-            path,
-            message: error.to_string(),
-        }),
-        None => Ok(ModelsConfig::default()),
     }
 }

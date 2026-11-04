@@ -48,7 +48,8 @@ static FLIGHTS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
 
 /// Resolves, per `cwd`, an allowed `.envrc` in `Direnv` mode or the nearest `flake.nix`
 /// up to the git root in `Nix` mode, falling back to `base`. Flake captures are cached in
-/// memory and under `cache_dir`, single-flight per key, and invalidated by the watch list.
+/// memory and under `cache_dir` (without one, `Nix` mode resolves to `base`), single-flight
+/// per key, and invalidated by the watch list.
 pub struct DevShellEnv {
     inner: Arc<Inner>,
 }
@@ -58,7 +59,7 @@ struct Inner {
     /// `base` without inherited `DIRENV_*` state: direnv diffs relative to the spawning env.
     direnv_base: EnvMap,
     settings: BashSettings,
-    cache_dir: PathBuf,
+    cache_dir: Option<PathBuf>,
     /// Runs every direnv, git, nix and capture subprocess in its own job container
     /// (process group or cgroup).
     supervisor: Arc<ProcessSupervisor>,
@@ -127,14 +128,15 @@ impl DevShellEnv {
     /// `base`: the host snapshot every resolution starts from and falls back to.
     /// `settings`: the effective bash settings after project access filtering;
     /// the session uses `HostEnv` instead when `dev_shell` is `Off`.
-    /// `cache_dir`: `<AXO_DIR>/cache/devshell`; each capture lives in
-    /// `<cache_dir>/<hex hash of (flake_dir, ref, system)>/{env.json, watches.json, gcroot}`.
+    /// `cache_dir`: where Nix captures persist (`<cache_dir>/<hash>/{env.json, watches.json, gcroot}`;
+    /// axo passes `<AxoBuilder::cache_dir>/devshell`); `None` makes `Nix` mode resolve to `base`.
+    /// `Direnv` never uses it.
     /// `supervisor`: runs every subprocess in its own container; when it is unavailable,
     /// resolution falls back to `base` (with the capture failure notice in `Nix` mode).
     pub fn new(
         base: Arc<EnvMap>,
         settings: BashSettings,
-        cache_dir: PathBuf,
+        cache_dir: Option<PathBuf>,
         supervisor: Arc<ProcessSupervisor>,
     ) -> Self {
         let direnv_base = base
@@ -192,14 +194,18 @@ impl ExecEnv for DevShellEnv {
                 inner.host()
             }
             DevShellMode::Nix => {
+                let Some(cache_dir) = inner.cache_dir.as_deref() else {
+                    return inner.host();
+                };
                 let Some(dir) = inner.lookup(cwd, mode).flake_dir else {
                     return inner.host();
                 };
-                if let Some(resolved) = inner.warm(&dir) {
+                let key_dir = inner.key_dir(cache_dir, &dir);
+                if let Some(resolved) = inner.warm(&dir, &key_dir) {
                     return resolved;
                 }
                 progress(&format!("Capturing Nix dev shell for {}…", dir.display()));
-                inner.flake(dir, cancel).await
+                inner.flake(dir, key_dir, cancel).await
             }
         }
     }
@@ -451,18 +457,23 @@ impl Inner {
     /// The captured dev shell of `dir`: warm from memory or disk when the watch list is
     /// unchanged, else one capture per key while concurrent callers wait for it. The caller
     /// checks the warm path first and reports progress.
-    async fn flake(self: &Arc<Self>, dir: PathBuf, cancel: &CancellationToken) -> Resolved {
+    async fn flake(
+        self: &Arc<Self>,
+        dir: PathBuf,
+        key_dir: PathBuf,
+        cancel: &CancellationToken,
+    ) -> Resolved {
         let flight = FLIGHTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(self.key_dir(&dir))
+            .entry(key_dir.clone())
             .or_default()
             .clone();
         let guard = tokio::select! {
             guard = flight.lock_owned() => guard,
             () = cancel.cancelled() => return self.host(),
         };
-        if let Some(resolved) = self.warm(&dir) {
+        if let Some(resolved) = self.warm(&dir, &key_dir) {
             return resolved;
         }
         // The capture outlives a cancelled caller, so an aborted command never wastes a
@@ -470,7 +481,7 @@ impl Inner {
         let this = self.clone();
         let capture = tokio::spawn(async move {
             let _guard = guard;
-            this.capture(dir).await
+            this.capture(dir, key_dir).await
         });
         tokio::select! {
             resolved = capture => resolved.unwrap_or_else(|err| {
@@ -481,7 +492,7 @@ impl Inner {
         }
     }
 
-    fn warm(&self, dir: &Path) -> Option<Resolved> {
+    fn warm(&self, dir: &Path, key_dir: &Path) -> Option<Resolved> {
         let cached = self
             .shells
             .lock()
@@ -498,7 +509,6 @@ impl Inner {
         if self.disk_stale.load(Ordering::Relaxed) {
             return None;
         }
-        let key_dir = self.key_dir(dir);
         let watches: Vec<Watch> =
             serde_json::from_slice(&std::fs::read(key_dir.join("watches.json")).ok()?).ok()?;
         // A dangling GC root means `nix-collect-garbage` may have removed the store paths.
@@ -525,7 +535,7 @@ impl Inner {
         Some(resolved)
     }
 
-    fn key_dir(&self, dir: &Path) -> PathBuf {
+    fn key_dir(&self, cache_dir: &Path, dir: &Path) -> PathBuf {
         // FNV-1a: stable across Rust releases, unlike `DefaultHasher`.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut parts = vec![
@@ -537,7 +547,7 @@ impl Inner {
         for byte in parts.join(&0u8) {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        self.cache_dir.join(format!("{hash:016x}"))
+        cache_dir.join(format!("{hash:016x}"))
     }
 
     /// The env a captured layer runs with, plus the stable prompt line.
@@ -583,8 +593,7 @@ impl Inner {
 
     /// Captures `dir`'s dev shell and caches the outcome (a failure too, so commands don't
     /// retry a broken flake until its watch list changes or the env is reloaded).
-    async fn capture(&self, dir: PathBuf) -> Resolved {
-        let key_dir = self.key_dir(&dir);
+    async fn capture(&self, dir: PathBuf, key_dir: PathBuf) -> Resolved {
         // Stat before capturing so an edit made during the capture invalidates it.
         let watches = self.watch_list(&dir).await;
         let resolved = match self.capture_layer(&dir, &key_dir).await {

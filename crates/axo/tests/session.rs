@@ -214,15 +214,13 @@ async fn navigation_host(
     dir: &std::path::Path,
     turns: Vec<ScriptedTurn>,
 ) -> (axo::Axo, std::sync::Arc<axo_ai::ScriptedApi>, axo_ai::Model) {
-    let mut settings = axo::Settings::default();
-    settings.compaction.enabled = false;
     let host = common::host(
         dir,
         json!([
             {"id":"m", "contextWindow":131072, "maxTokens":4096, "reasoning":true},
             {"id":"live", "contextWindow":131072, "maxTokens":4096, "reasoning":true},
         ]),
-        settings,
+        json!({"compaction": {"enabled": false}}),
         turns,
     )
     .await;

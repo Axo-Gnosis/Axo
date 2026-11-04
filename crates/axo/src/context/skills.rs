@@ -9,8 +9,7 @@ use std::sync::LazyLock;
 use ignore::WalkBuilder;
 use regex::{Captures, Regex};
 
-use crate::config::AxoDir;
-use crate::context::{Diagnostic, project_dirs, project_root};
+use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
 use crate::tools::files::{normalize_to_lf, split_bom};
 
 /// One discovered skill.
@@ -30,11 +29,11 @@ const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
 /// Discovers skills in order: `.agents/skills` from `cwd` up to the git root (skipped when
-/// `project` is false), `<AXO_DIR>/skills`, then `<home_agents>/skills`. The
+/// `project` is false), each of `user_roots`, then `<home_agents>/skills`. The
 /// first skill with a given name wins; later ones, name-rule violations and skills dropped
 /// for a missing `description` become diagnostics. Blocking filesystem I/O.
 pub fn load_skills(
-    dir: &AxoDir,
+    user_roots: &[PathBuf],
     home_agents: Option<&Path>,
     cwd: &Path,
     project: bool,
@@ -49,7 +48,7 @@ pub fn load_skills(
                 .map(|dir| dir.join(".agents").join("skills")),
         );
     }
-    roots.push(dir.skills_dir());
+    roots.extend(user_roots.iter().cloned());
     roots.extend(home_agents.map(|home| home.join("skills")));
 
     let mut skills: Vec<Skill> = Vec::new();
@@ -67,7 +66,7 @@ pub fn load_skills(
             if names.contains(&skill.name) {
                 collisions.push(Diagnostic {
                     message: format!("name \"{}\" collision", skill.name),
-                    path: Some(skill.path),
+                    origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
                 });
             } else {
                 names.insert(skill.name.clone());
@@ -121,7 +120,7 @@ fn load_skills_from_dir(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<S
 fn load_skill_file(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<Skill> {
     let mut warn = |message: String| {
         diagnostics.push(Diagnostic {
-            path: Some(path.to_path_buf()),
+            origin: Some(DiagnosticOrigin::Path(path.to_path_buf())),
             message,
         })
     };

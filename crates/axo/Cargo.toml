@@ -21,7 +21,6 @@ ignore.workspace = true
 image.workspace = true
 indexmap.workspace = true
 jiff.workspace = true
-jsonc-parser.workspace = true
 rand.workspace = true
 regex.workspace = true
 rustix.workspace = true
@@ -43,6 +42,7 @@ uuid.workspace = true
 [dev-dependencies]
 axo-agent = { path = "../axo-agent" }
 axo-ai = { path = "../axo-ai", features = ["testing"] }
+jsonc-parser.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

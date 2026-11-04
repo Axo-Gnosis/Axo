@@ -9,8 +9,8 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::context::Diagnostic;
 use crate::context::skills::{Skill, next_command_arg};
+use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::error::Error;
 use crate::session::{ShakeMode, normalize_focus};
 use crate::store::EntryId;
@@ -352,7 +352,7 @@ pub(crate) fn reserved_skill_diagnostics(skills: &[Skill]) -> Vec<Diagnostic> {
         .iter()
         .filter(|skill| builtin(&skill.name).is_some())
         .map(|skill| Diagnostic {
-            path: Some(skill.path.clone()),
+            origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
             message: format!(
                 "skill name \"{name}\" is reserved by the built-in /{name} command; the command catalog lists the built-in",
                 name = skill.name
@@ -615,8 +615,8 @@ mod tests {
         let diagnostics = reserved_skill_diagnostics(&skills);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
-            diagnostics[0].path,
-            Some(PathBuf::from("/skills/compact/SKILL.md"))
+            diagnostics[0].origin,
+            Some(DiagnosticOrigin::Path("/skills/compact/SKILL.md".into()))
         );
     }
 }

@@ -19,7 +19,7 @@ pub struct JsonlStore {
 }
 
 impl JsonlStore {
-    /// A store rooted at `root`, normally `<AXO_DIR>/sessions`.
+    /// A store rooted at the host-chosen directory `root`.
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
@@ -99,12 +99,12 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<(Header, Vec<SeqEntry>, u64), Erro
 /// through here so an empty or corrupt header reports the same error.
 fn parse_header(path: &Path, line: &[u8]) -> Result<Header, Error> {
     if line.is_empty() {
-        return Err(Error::Config {
+        return Err(Error::InvalidSessionHeader {
             path: path.to_path_buf(),
             message: "missing session header".into(),
         });
     }
-    serde_json::from_slice(line).map_err(|err| Error::Config {
+    serde_json::from_slice(line).map_err(|err| Error::InvalidSessionHeader {
         path: path.to_path_buf(),
         message: format!("invalid session header: {err}"),
     })

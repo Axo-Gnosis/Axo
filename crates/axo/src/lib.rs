@@ -19,10 +19,11 @@ pub mod tools;
 pub use axo::{Axo, AxoBuilder};
 pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
 pub use config::{
-    AskSettings, AxoDir, BashSettings, CompactionSettings, DevShellMode, ProjectAccess,
-    ProjectFiles, ProjectSettings, Settings, SummaryRequest,
+    AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
+    EffectiveConfig, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride,
+    Settings, SummaryRequest, UserConfig,
 };
-pub use context::Diagnostic;
+pub use context::{Diagnostic, DiagnosticOrigin};
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{OutputError, ProcessSupervisor, Supervision};

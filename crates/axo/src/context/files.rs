@@ -8,8 +8,7 @@ use axo_agent::AgentMessage;
 use axo_ai::{Message, UserBlock};
 use indexmap::IndexMap;
 
-use crate::config::AxoDir;
-use crate::context::{Diagnostic, project_dirs, project_root};
+use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
 use crate::tools::{FileLedger, file_key};
 
 /// One loaded context file.
@@ -54,7 +53,7 @@ pub fn context_file_names(map: &IndexMap<String, bool>) -> (Vec<PathBuf>, Vec<Di
                 .all(|part| matches!(part, Component::Normal(_)))
         {
             diagnostics.push(Diagnostic {
-                path: None,
+                origin: None,
                 message: format!(
                     "contextFiles key \"{key}\" ignored: must be a relative path without \"..\""
                 ),
@@ -113,13 +112,13 @@ impl Seen {
     }
 }
 
-/// Loads `<home_agents>/AGENTS.md` and `<AXO_DIR>/AGENTS.md`, then the enabled names in
+/// Loads `<home_agents>/AGENTS.md`, then each of `user_files`, then the enabled names in
 /// every directory from the project root towards `cwd`; the names never apply to user
-/// directories, and with `project` false only user files load. Blocking filesystem I/O;
-/// unreadable files become diagnostics. Canonical paths and BOM-stripped contents
-/// deduplicate.
+/// files, and with `project` false only user files load. Missing files are skipped.
+/// Blocking filesystem I/O; unreadable files become diagnostics. Canonical paths and
+/// BOM-stripped contents deduplicate.
 pub fn load_context_files(
-    dir: &AxoDir,
+    user_files: &[PathBuf],
     home_agents: Option<&Path>,
     cwd: &Path,
     project: bool,
@@ -129,7 +128,7 @@ pub fn load_context_files(
         .map(|home| home.join("AGENTS.md"))
         .into_iter()
         .collect();
-    paths.push(dir.root().join("AGENTS.md"));
+    paths.extend(user_files.iter().cloned());
     if project {
         for dir in project_dirs(&project_root(cwd), cwd) {
             paths.extend(names.iter().map(|name| dir.join(name)));
@@ -160,7 +159,7 @@ fn read_context_file(path: PathBuf) -> Result<ContextFile, Diagnostic> {
             Ok(ContextFile { path, content })
         }
         Err(error) => Err(Diagnostic {
-            path: Some(path),
+            origin: Some(DiagnosticOrigin::Path(path)),
             message: error.to_string(),
         }),
     }
@@ -236,7 +235,7 @@ impl NestedContext {
                         }
                         Err(diagnostic) => {
                             tracing::warn!(
-                                path = ?diagnostic.path,
+                                origin = ?diagnostic.origin,
                                 message = %diagnostic.message,
                                 "cannot read nested context file"
                             );

@@ -8,7 +8,7 @@ This is the live planning document for unbuilt work and active design discussion
 
 ## Overview of tracks
 
-M1–M5 plus Tracks 3 and 4 are complete. The remaining work splits into independent tracks (`axo-acp` is on hold):
+M1–M5 plus Tracks 3 and 4 are complete. The remaining work splits into independent tracks (`axo-acp` is deferred):
 
 ```mermaid
 flowchart LR
@@ -26,9 +26,9 @@ flowchart LR
 | Track | Scope | Status |
 |---|---|---|
 | **1. Codemode, script extensions & agent specs** | Embedded JS sandbox (`rquickjs`), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and child script hooks (rungs 2–5) | **Active focus.** Rungs 0–1 decided; rungs 2+ in discussion |
-| **2. Subagents (`task`) & `AgentSpec`** | In-process child sessions linked to parent tool calls, `.agents/agents` / `~/.axo/agents` role definitions, schema-validated outputs | Planned |
-| **5. Extensions (Bun host), MCP & `ast_edit`** | Extension contract, Bun stdio host & `@axo/sdk`, `.mcp.json` / `~/.axo/mcp.json` tool adapter, optional `ast_edit` | Planned |
-| **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | On hold |
+| **2. Subagents (`task`) & `AgentSpec`** | In-process child sessions linked to parent tool calls, `.agents/agents` / host-supplied role definitions, schema-validated outputs | Planned |
+| **5. Extensions (Bun host), MCP & `ast_edit`** | Extension contract, Bun stdio host & `@axo/sdk`, `.mcp.json` / host-supplied MCP tool adapter, optional `ast_edit` | Planned |
+| **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
 
 ---
 
@@ -278,8 +278,9 @@ Key risks to design around when building step 3 (script hooks):
 
 - **In-process child sessions.** A subagent is a `Session` in the same process linked to the parent session and spawning tool call id (distinguished from forks by the absence of `forked_from`).
 - **Durability links.** A child session is linked to the parent tool call ID that spawned it ([`research/durable.md`](research/durable.md)). When a parent session recovers on reopen, `task` finds its existing child session instead of spawning a duplicate.
-- **Role definitions (`research/agents-dir.md`).** Walk `.agents/agents/*.md`, `~/.axo/agents/*.md`, and `~/.agents/agents/*.md` (when `homeAgentsDir` is enabled) using the shared discovery walk. Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `output` (JSON Schema); body is the system prompt. Tolerate omp keys (`blocking`, `spawns`) as ignored.
+- **Role definitions (`research/agents-dir.md`).** Walk `.agents/agents/*.md` and `~/.agents/agents/*.md` (when `homeAgentsDir` is enabled) using the shared discovery walk, plus host-supplied agent-definition roots (axo has no configuration directory of its own). Frontmatter: `name`, `description`, `tools`, `model`, `thinking`, `output` (JSON Schema); body is the system prompt. Tolerate omp keys (`blocking`, `spawns`) as ignored.
 - **`AgentSpec` and `task` tool.** Spawns one or more children (in parallel by default), validates structured outputs against `output` schema when present, and returns their results.
+- **Prior art:** [`research/subagents.md`](research/subagents.md) (2026-11-03) compares omp, dsh, Codex, Claude Code, pi, OpenCode, Gemini, Amp and ACP and lists the open decisions (§16). The bullets above predate it and are not yet decisions.
 
 ---
 
@@ -294,14 +295,14 @@ Key risks to design around when building step 3 (script hooks):
 
 ### Extension contract & Bun host
 
-- **One shared Bun process (`design.md`).** Started only when at least one TS extension is enabled in `~/.axo/extensions/` or `<cwd>/.axo/extensions/` (project extensions require `ProjectAccess::Trust`).
+- **One shared Bun process (`design.md`).** Started only when at least one TS extension is enabled in a host-supplied user or project extension root (project extensions require `ProjectAccess::Trust`).
 - **Bidirectional JSON over stdio.** axo invokes extension tools and lifecycle hooks; extensions call back into axo (tools, session queries, child sessions). TypeScript types in `@axo/sdk` are generated from the Rust contract (`ts-rs` or `specta`).
 - **Provider & OAuth split.** Extensions can register providers and own OAuth login/refresh, handing `ModelAuth { api_key, headers, base_url }` to Rust so token streaming stays in `axo-ai` for standard wire formats. Custom wire formats stream through the extension.
 - **Tool description overrides.** The extension contract includes a hook over each tool's prompt-facing definition (description and guidelines) before requests are sent.
 
 ### MCP tool adapter
 
-- **Configuration files.** Read the first existing project-root file of `.mcp.json`, then `mcp.json`, plus user `~/.axo/mcp.json` (not `settings.jsonc`), using the `{ "mcpServers": { name: { command, args, env } | { url, headers } } }` format.
+- **Configuration files.** Read the first existing ecosystem project-root file of `.mcp.json`, then `mcp.json`, plus host-supplied user MCP configuration (separate from settings), using the `{ "mcpServers": { name: { command, args, env } | { url, headers } } }` format.
 - **Trust gate.** Project MCP servers require `ProjectAccess::Trust`; at `Read` access they emit a diagnostic rather than starting. Add `project.files.mcp` (default `true`) when MCP lands.
 - **Tool exposure.** Introduce per-tool exposure (`direct`, `codemode` / script-only, `deferred`, `hidden`) so large MCP servers can be callable from `codemode` scripts without flooding the system prompt's tool declarations.
 
@@ -311,7 +312,9 @@ Key risks to design around when building step 3 (script hooks):
 
 ---
 
-## Track 6: ACP binary (`axo-acp`, M6 — on hold)
+## Track 6: ACP binary (`axo-acp`, M6 — deferred)
+
+Deferred pending a rethink of whether axo itself should ship ACP or leave it to a host. The notes below record the mapping if it is resumed.
 
 Maps the [Agent Client Protocol](https://agentclientprotocol.com) over stdio onto `axo::Session`:
 
@@ -343,9 +346,10 @@ Decisions when resumed:
 1. **Are codemode rungs 2+ in scope?** From rung 2 up (`define_tool`, script hooks), the script API is a slice of the extension contract, making codemode its first consumer.
 2. **How do the embedded sandbox and the Bun host relate?** Is the embedded sandbox for session/role scripts and Bun for full-runtime extensions, or one extension contract with two runtimes?
 3. **Parent-and-children rule.** Adopt the rule strictly (scripts may add tools to the parent, but may only attach hooks/prompt changes to spawned children), or allow some parent hooks?
-4. **Where model-written tools/scripts live and how they promote.** Session-scoped (`custom` entries) by default; what is the file format and workflow for promoting a useful tool to `<cwd>/.axo/` or `~/.axo/`?
+4. **Where model-written tools/scripts live and how they promote.** Session-scoped (`custom` entries) by default; what is the file format and workflow for promoting a useful tool to a host-provided location?
 5. **Hook safety without approvals.** Since axo has no approval system (`design.md`), should child script hooks be restricted to a narrower host-function set (e.g. no network/write outside cwd), or rely strictly on the parent's inherited policy hooks running last?
 6. **Which stateful resources ship built-in:** a SQLite-backed `table` tool, subagents, browser? (Background `bash` jobs ship with Track 3.)
 7. **VM lifetime for script hooks:** fresh QuickJS context per hook invocation vs one retained context per child session (measure PSS impact).
 8. **Naming:** tool names (`codemode` vs `eval` vs `script`, `define_tool`) and module path (`axo::script`).
 9. **Orchestration in scripts:** expose subagents and one-shot completions strictly through `tools.task(...)` (preserving "no powers beyond tools"), or also as top-level helpers?
+10. **Per-host identity (follow-on):** should hosts rename the `axo://` scheme and the prompt's agent identity, now that hosts own configuration names and locations?

@@ -40,4 +40,4 @@ cargo fmt --check
 
 - **Offline deterministic tests**: All `cargo test` suites must run offline without API keys or network access. Use `crates/*/examples/` for live model smoke runs.
 - **Doc & supervision gates**: `cargo test -p axo --test doc_identifiers` rejects backticked identifiers in README.md, AGENTS.md, and `crates/axo/docs/` that do not exist in source. Cgroup supervision tests run only with `$AXO_TEST_CGROUP=1` in a delegated cgroup.
-- **Reuse test harnesses**: Use `axo_ai::testing::ScriptedApi` (under `features = ["testing"]`) for mocked model turns and `crates/axo/tests/common/mod.rs` (helpers `axo`, `host`, `options`, `bash_options`, `tool_text`, `dead`, `within`) for session tests in `tempfile::tempdir()`.
+- **Reuse test harnesses**: Use `axo_ai::testing::ScriptedApi` (under `features = ["testing"]`) for mocked model turns and `crates/axo/tests/common/mod.rs` (helpers `axo`, `host`, `options`, `bash_options`, `tool_text`, `dead`, `within`, and the in-memory `ConfigSource` fixture behind `Host::config`) for session tests in `tempfile::tempdir()`.

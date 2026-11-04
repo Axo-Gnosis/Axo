@@ -1,14 +1,15 @@
-//! The process-wide entry point: directory, settings, models, the session store and the
-//! host environment.
+//! The process-wide entry point: models, the session store, the host's configuration
+//! source and the host environment.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo_ai::thinking::clamp_level;
-use axo_ai::{FileCredentialStore, Models, ModelsOptions, Streamer};
+use axo_ai::{Models, Streamer};
 
-use crate::config::{self, AxoDir, DevShellMode, ProjectAccess, Settings};
-use crate::context::project_root;
+use crate::config::{
+    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
+};
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
@@ -16,19 +17,18 @@ use crate::exec::{EnvMap, ExecEnv, HostEnv};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::session::{RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes};
 use crate::store::{
-    Header, JsonlStore, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
+    Header, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
 };
 
 pub struct Axo {
-    dir: AxoDir,
-    settings: Settings,
-    /// `settings` came from `<AXO_DIR>/settings.jsonc` (not the builder), so sessions
-    /// reload it merged with their project's settings.
-    settings_from_dir: bool,
     models: Arc<Models>,
     /// What sessions stream through: `models` unless the builder overrode it.
     streamer: Arc<dyn Streamer>,
     store: Arc<dyn SessionStore>,
+    /// Sampled at every `create_session`, `open_session` and `schemes`.
+    config: Arc<dyn ConfigSource>,
+    /// Where axo materializes its docs (`axo://`) and dev-shell captures.
+    cache_dir: Option<PathBuf>,
     /// Host environment snapshot taken at `build`.
     base_env: Arc<EnvMap>,
     /// Supervises every local command (bash and dev-shell capture) in its own container
@@ -36,33 +36,43 @@ pub struct Axo {
     supervisor: Arc<ProcessSupervisor>,
 }
 
-/// Unset parts load from the axo directory: `settings.jsonc`, `models.jsonc`, `auth.json`,
-/// the catalog cache in `cache/` and the session store in `sessions/`.
-#[derive(Default)]
+/// Builds an [`Axo`]. Nothing here reads configuration: without [`AxoBuilder::config`]
+/// sessions run with default settings and no project layer; without
+/// [`AxoBuilder::cache_dir`] there is no `docs` prompt section, no `axo://` scheme, and
+/// `bash.devShell` `nix` falls back to the host environment.
 pub struct AxoBuilder {
-    dir: Option<PathBuf>,
-    settings: Option<Settings>,
-    models: Option<Arc<Models>>,
+    models: Arc<Models>,
+    store: Arc<dyn SessionStore>,
+    config: Option<Arc<dyn ConfigSource>>,
+    cache_dir: Option<PathBuf>,
     streamer: Option<Arc<dyn Streamer>>,
-    store: Option<Arc<dyn SessionStore>>,
     supervision: Option<Supervision>,
 }
 
+/// The configuration of a host that supplies none: defaults and an empty project layer.
+struct NoConfig;
+
+impl ConfigSource for NoConfig {
+    fn user(&self) -> Result<UserConfig, Error> {
+        Ok(UserConfig::default())
+    }
+
+    fn project(&self, _cwd: &Path) -> Result<ConfigLayer, Error> {
+        Ok(ConfigLayer::default())
+    }
+}
+
 impl AxoBuilder {
-    /// Defaults to `AXO_DIR`, else `$HOME/.axo`.
-    pub fn dir(mut self, dir: PathBuf) -> Self {
-        self.dir = Some(dir);
+    /// The host's configuration, sampled per session (see [`ConfigSource`]).
+    pub fn config(mut self, config: Arc<dyn ConfigSource>) -> Self {
+        self.config = Some(config);
         self
     }
 
-    /// User settings, used as given: project settings files are not merged in.
-    pub fn settings(mut self, settings: Settings) -> Self {
-        self.settings = Some(settings);
-        self
-    }
-
-    pub fn models(mut self, models: Arc<Models>) -> Self {
-        self.models = Some(models);
+    /// A directory axo owns for caches: bundled docs under `docs/`, dev-shell captures
+    /// under `devshell/`.
+    pub fn cache_dir(mut self, cache_dir: PathBuf) -> Self {
+        self.cache_dir = Some(cache_dir);
         self
     }
 
@@ -73,86 +83,53 @@ impl AxoBuilder {
         self
     }
 
-    /// Defaults to a [`JsonlStore`] rooted at `<AXO_DIR>/sessions`.
-    pub fn store(mut self, store: Arc<dyn SessionStore>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
     /// Defaults to [`Supervision::ProcessGroup`].
     pub fn supervision(mut self, supervision: Supervision) -> Self {
         self.supervision = Some(supervision);
         self
     }
 
-    pub async fn build(self) -> Result<Axo, Error> {
-        let dir = match self.dir {
-            Some(dir) => AxoDir::new(dir),
-            None => AxoDir::from_env()?,
-        };
-        let settings_from_dir = self.settings.is_none();
-        let settings = match self.settings {
-            Some(settings) => settings,
-            None => Settings::load(&dir, None)?,
-        };
-        let models = match self.models {
-            Some(models) => models,
-            None => Arc::new(
-                Models::load(ModelsOptions {
-                    cache_dir: Some(dir.cache_dir()),
-                    config: config::load_models_config(&dir)?,
-                    extended_context: settings.extended_context,
-                    credentials: Arc::new(FileCredentialStore::new(dir.auth_path())),
-                })
-                .await?,
-            ),
-        };
+    pub fn build(self) -> Axo {
         let streamer: Arc<dyn Streamer> = match self.streamer {
             Some(streamer) => streamer,
-            None => models.clone(),
-        };
-        let store: Arc<dyn SessionStore> = match self.store {
-            Some(store) => store,
-            None => Arc::new(JsonlStore::new(dir.sessions_dir())),
+            None => self.models.clone(),
         };
         let base_env = HostEnv::snapshot().0;
         // Never fails here: supervision is checked on the first command, so hosts that
         // never run commands keep working.
         let supervisor = ProcessSupervisor::new(self.supervision.unwrap_or_default());
-        Ok(Axo {
-            dir,
-            settings,
-            settings_from_dir,
-            models,
+        Axo {
+            models: self.models,
             streamer,
-            store,
+            store: self.store,
+            config: self.config.unwrap_or_else(|| Arc::new(NoConfig)),
+            cache_dir: self.cache_dir,
             base_env,
             supervisor,
-        })
+        }
     }
 }
 
 impl Axo {
-    pub fn builder() -> AxoBuilder {
-        AxoBuilder::default()
-    }
-
-    pub fn dir(&self) -> &AxoDir {
-        &self.dir
-    }
-
-    pub fn settings(&self) -> &Settings {
-        &self.settings
+    pub fn builder(models: Arc<Models>, store: Arc<dyn SessionStore>) -> AxoBuilder {
+        AxoBuilder {
+            models,
+            store,
+            config: None,
+            cache_dir: None,
+            streamer: None,
+            supervision: None,
+        }
     }
 
     pub fn models(&self) -> &Models {
         &self.models
     }
 
-    /// Resolves the model, thinking level, exec environment, tools and system prompt, and
-    /// returns an idle session. Its file is created on the first submission. Resolving
-    /// the exec environment may capture a Nix dev shell, which can take minutes on a
-    /// cold cache.
+    /// Samples the configuration source, resolves the model, thinking level, exec
+    /// environment, tools and system prompt, and returns an idle session. Its file is
+    /// created on the first submission. Resolving the exec environment may capture a Nix
+    /// dev shell, which can take minutes on a cold cache.
     pub async fn create_session(&self, options: SessionOptions) -> Result<Session, Error> {
         let header = Header::new(options.cwd.clone(), None, None);
         let session_id = header.id.clone();
@@ -169,11 +146,12 @@ impl Axo {
     }
 
     /// Opens a saved session for writing (`Error::SessionBusy` while another writer holds
-    /// it) in the cwd it was started in. The transcript, model and thinking level come
-    /// from the session; `options.model`/`thinking` override them. A run left unfinished,
-    /// or input submitted after the last run settled, is handled per `options.recovery`;
-    /// a resumed run (or one started for requeued prompts) continues in the background,
-    /// so this returns right away (watch for its `run_end` via `Session::attach`).
+    /// it) in the cwd it was started in, with configuration sampled afresh. The
+    /// transcript, model and thinking level come from the session; `options.model`/
+    /// `thinking` override them. A run left unfinished, or input submitted after the last
+    /// run settled, is handled per `options.recovery`; a resumed run (or one started for
+    /// requeued prompts) continues in the background, so this returns right away (watch
+    /// for its `run_end` via `Session::attach`).
     pub async fn open_session(
         &self,
         path: &Path,
@@ -208,11 +186,12 @@ impl Axo {
 
     /// The URL schemes of a saved session that is not open, for hosts resolving links in
     /// it: the file-backed schemes an open session has (`artifact://`, `local://`,
-    /// `skill://` over the skills on disk now, `axo://`), plus `host`. Reads only the
-    /// header: no lock, no recovery, no model. Resolve for display; write to a session's
-    /// files through an open `Session`. `project_access` is the
-    /// `SessionOptions::project_access` the host opens this session with (`None` uses
-    /// settings), so `skill://` sees the same skills as the open session.
+    /// `skill://` over the skills on disk now, `axo://` with a cache directory), plus
+    /// `host`. Reads only the header and samples the configuration source: no lock, no
+    /// recovery, no model. Resolve for display; write to a session's files through an
+    /// open `Session`. `project_access` is the `SessionOptions::project_access` the host
+    /// opens this session with (`None` uses the user policy), so `skill://` sees the same
+    /// skills as the open session.
     pub async fn schemes(
         &self,
         path: &Path,
@@ -220,11 +199,10 @@ impl Axo {
         host: &[Arc<dyn Scheme>],
     ) -> Result<Schemes, Error> {
         let header = self.store.read_header(path).await?;
-        let (access, settings) = self.settings_for(&header.cwd, project_access)?;
+        let config = EffectiveConfig::resolve(&*self.config, &header.cwd, project_access)?;
         let (schemes, _, _) = session_schemes(
-            &self.dir,
-            &settings,
-            access,
+            &config,
+            self.docs_dir().as_deref(),
             SchemeContext {
                 session_id: header.id,
                 session_dir: path.with_extension(""),
@@ -236,26 +214,13 @@ impl Axo {
         Ok(schemes)
     }
 
-    /// The project access and settings that apply in `cwd`; `access` forces the level.
-    fn settings_for(
-        &self,
-        cwd: &Path,
-        access: Option<ProjectAccess>,
-    ) -> Result<(ProjectAccess, Settings), Error> {
-        let access = access.unwrap_or_else(|| self.settings.project.access_for(&project_root(cwd)));
-        let settings = if self.settings_from_dir
-            && access != ProjectAccess::Ignore
-            && self.settings.project.files.axo_dir
-        {
-            Settings::load(&self.dir, Some((cwd, access)))?
-        } else {
-            self.settings.clone()
-        };
-        Ok((access, settings))
+    /// Where bundled docs are materialized; `None` without a cache directory.
+    fn docs_dir(&self) -> Option<PathBuf> {
+        self.cache_dir.as_ref().map(|cache| cache.join("docs"))
     }
 
-    /// Resolves settings, model, thinking level and exec environment for a session over
-    /// `entries` and starts it.
+    /// Resolves the effective configuration, model, thinking level and exec environment
+    /// for a session over `entries` and starts it.
     async fn start(
         &self,
         options: SessionOptions,
@@ -278,12 +243,17 @@ impl Axo {
             recovery: _,
         } = options;
 
-        let (access, settings) = self.settings_for(&cwd, project_access)?;
+        let config = Arc::new(EffectiveConfig::resolve(
+            &*self.config,
+            &cwd,
+            project_access,
+        )?);
+        let settings = &config.settings;
 
-        let selector = model
-            .or_else(|| projection.model.clone())
-            .or_else(|| settings.default_model.clone())
-            .ok_or(Error::NoModel)?;
+        let selector = match model.or_else(|| projection.model.clone()) {
+            Some(selector) => selector,
+            None => config.default_model()?.ok_or(Error::NoModel)?,
+        };
         let model = self
             .models
             .find(&selector)
@@ -296,36 +266,40 @@ impl Axo {
                 .unwrap_or(settings.default_thinking_level),
         );
 
+        let mode = settings.bash.dev_shell;
+        let host = || -> Arc<dyn ExecEnv> { Arc::new(HostEnv(self.base_env.clone())) };
         let exec: Arc<dyn ExecEnv> = match exec_env {
             Some(exec) => exec,
-            None if settings.bash.dev_shell != DevShellMode::Off
-                && access == ProjectAccess::Trust =>
-            {
-                Arc::new(DevShellEnv::new(
-                    self.base_env.clone(),
-                    settings.bash.clone(),
-                    self.dir.cache_dir().join("devshell"),
-                    self.supervisor.clone(),
-                ))
+            None if mode == DevShellMode::Off => host(),
+            None if config.access != ProjectAccess::Trust => {
+                tracing::warn!(
+                    mode = ?mode,
+                    concat!(
+                        "bash.devShell runs project code and needs a trusted project; ",
+                        "using the host environment"
+                    )
+                );
+                host()
             }
-            None => {
-                if settings.bash.dev_shell != DevShellMode::Off {
-                    tracing::warn!(
-                        mode = ?settings.bash.dev_shell,
-                        concat!(
-                            "bash.devShell runs project code and needs a trusted project; ",
-                            "using the host environment"
-                        )
-                    );
-                }
-                Arc::new(HostEnv(self.base_env.clone()))
+            None if mode == DevShellMode::Nix && self.cache_dir.is_none() => {
+                tracing::warn!(concat!(
+                    "bash.devShell \"nix\" needs a cache directory (AxoBuilder::cache_dir); ",
+                    "using the host environment"
+                ));
+                host()
             }
+            None => Arc::new(DevShellEnv::new(
+                self.base_env.clone(),
+                settings.bash.clone(),
+                self.cache_dir.as_ref().map(|cache| cache.join("devshell")),
+                self.supervisor.clone(),
+            )),
         };
 
         Session::start(SessionSetup {
-            dir: self.dir.clone(),
             cwd,
-            settings,
+            config,
+            docs_dir: self.docs_dir(),
             streamer: self.streamer.clone(),
             models: self.models.clone(),
             model,
@@ -333,7 +307,6 @@ impl Axo {
             exec,
             supervisor: self.supervisor.clone(),
             ask_enabled,
-            project_access: access,
             host_sections: sections,
             host_tools,
             host_schemes,

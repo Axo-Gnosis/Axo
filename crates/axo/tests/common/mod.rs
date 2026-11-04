@@ -1,13 +1,15 @@
 #![allow(dead_code)]
 //! Helpers shared by the session-level tests.
 
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axo::store::{Entry, SeqEntry};
-use axo::{Axo, ProjectAccess, SessionOptions, Settings, StaticEnv};
+use axo::store::{Entry, JsonlStore, SeqEntry};
+use axo::{
+    Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, SessionOptions, StaticEnv, UserConfig,
+};
 use axo_agent::AgentMessage;
 use axo_ai::{
     FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn,
@@ -17,16 +19,78 @@ use serde_json::json;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// An in-memory [`ConfigSource`] that logs every call (`"user"`, `"project:<cwd>"`).
+/// Acquiring a project for an unregistered cwd panics.
+#[derive(Default)]
+pub struct TestConfig {
+    pub user: Mutex<UserConfig>,
+    pub projects: Mutex<HashMap<PathBuf, ConfigLayer>>,
+    pub calls: Mutex<Vec<String>>,
+}
+
+impl ConfigSource for TestConfig {
+    fn user(&self) -> Result<UserConfig, Error> {
+        self.calls.lock().unwrap().push("user".to_owned());
+        Ok(self.user.lock().unwrap().clone())
+    }
+
+    fn project(&self, cwd: &Path) -> Result<ConfigLayer, Error> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("project:{}", cwd.display()));
+        Ok(self
+            .projects
+            .lock()
+            .unwrap()
+            .get(cwd)
+            .unwrap_or_else(|| panic!("project config acquired for {}", cwd.display()))
+            .clone())
+    }
+}
+
+impl TestConfig {
+    /// The user layer `settings` (origin `"user"`) with `<dir>/skills` and
+    /// `<dir>/AGENTS.md` as user resources, and no registered projects.
+    pub fn for_dir(dir: &Path, settings: serde_json::Value) -> Self {
+        Self {
+            user: Mutex::new(UserConfig {
+                layer: ConfigLayer {
+                    origin: "user".into(),
+                    settings: Some(settings),
+                    ..Default::default()
+                },
+                skill_roots: vec![dir.join("skills")],
+                context_files: vec![dir.join("AGENTS.md")],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Registers `layer` as the project contribution for sessions in `cwd`.
+    pub fn set_project(&self, cwd: impl Into<PathBuf>, layer: ConfigLayer) {
+        self.projects.lock().unwrap().insert(cwd.into(), layer);
+    }
+
+    /// The calls logged since the last take.
+    pub fn take_calls(&self) -> Vec<String> {
+        std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+}
+
 pub struct Host {
     pub axo: Axo,
     pub api: Arc<ScriptedApi>,
     pub models: Arc<Models>,
+    pub config: Arc<TestConfig>,
 }
 
+/// A host over `dir` with [`TestConfig::for_dir`] and `<dir>/cache` as its cache
+/// directory.
 pub async fn host(
     dir: &Path,
     models: serde_json::Value,
-    settings: Settings,
+    settings: serde_json::Value,
     turns: Vec<ScriptedTurn>,
 ) -> Host {
     let config = ModelsConfig::parse_jsonc(
@@ -48,23 +112,27 @@ pub async fn host(
         .await
         .unwrap(),
     );
+    let config = Arc::new(TestConfig::for_dir(dir, settings));
     let api = Arc::new(ScriptedApi::new(turns));
-    let axo = Axo::builder()
-        .dir(dir.to_path_buf())
-        .settings(settings)
-        .models(models.clone())
-        .streamer(api.clone())
-        .build()
-        .await
-        .unwrap();
-    Host { axo, api, models }
+    let axo = Axo::builder(
+        models.clone(),
+        Arc::new(JsonlStore::new(dir.join("sessions"))),
+    )
+    .config(config.clone())
+    .cache_dir(dir.join("cache"))
+    .streamer(api.clone())
+    .build();
+    Host {
+        axo,
+        api,
+        models,
+        config,
+    }
 }
 
 /// An `Axo` whose sessions stream from `turns`, with one model `test/m`.
 pub async fn axo(dir: &Path, turns: Vec<ScriptedTurn>) -> Axo {
-    host(dir, json!([{"id":"m"}]), Settings::default(), turns)
-        .await
-        .axo
+    host(dir, json!([{"id":"m"}]), json!({}), turns).await.axo
 }
 
 /// Options for a session in `<dir>/work` on `test/m`, without project resources or a

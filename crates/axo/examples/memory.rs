@@ -1,16 +1,19 @@
 //! Measures memory as PSS (proportional set size, `/proc/self/smaps_rollup`) with N sessions idle, then with all N mid-turn.
 //!
-//! `memory [--sessions <n>] [--dir <AXO_DIR>] [--model <provider/id>]`
+//! `memory [--sessions <n>] [--dir <dir> --model <provider/id>]`
 //!
-//! Without `--model`, sessions stream from the scripted test provider: no network; each turn streams one text delta, then waits until it is aborted. With `--model`, they stream from that model, configured in `<AXO_DIR>` (default `AXO_DIR`/`~/.axo`), and are sampled at their first text or thinking delta. Sessions run in a fresh temporary cwd with project files ignored. Run one process per session count, in a release build.
+//! Without `--model`, sessions stream from the scripted test provider with no configuration: no network; each turn streams one text delta, then waits until it is aborted. With `--model`, they stream from that model, configured in `--dir` (the examples' own layout, see `support/dir_host.rs`), and are sampled at their first text or thinking delta. Sessions run in a fresh temporary cwd with project files ignored. Run one process per session count, in a release build.
+
+#[path = "support/dir_host.rs"]
+mod dir_host;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axo::store::{Entry, SeqEntry};
-use axo::{Axo, ProjectAccess, SessionEvent, SessionOptions, Settings, StaticEnv};
+use axo::store::{Entry, JsonlStore, SeqEntry};
+use axo::{Axo, ProjectAccess, SessionEvent, SessionOptions, StaticEnv};
 use axo_agent::AgentEvent;
 use axo_ai::{
     AssistantEvent, FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi,
@@ -64,22 +67,19 @@ async fn main() -> Result<(), Error> {
             credentials: Arc::new(FileCredentialStore::new(temp.path().join("auth.json"))),
         })
         .await?;
-        Axo::builder()
-            .dir(temp.path().to_path_buf())
-            .settings(Settings::default())
-            .models(Arc::new(models))
-            .streamer(Arc::new(ScriptedApi::new(vec![
-                ScriptedTurn::HangUntilCancel;
-                n
-            ])))
-            .build()
-            .await?
+        Axo::builder(
+            Arc::new(models),
+            Arc::new(JsonlStore::new(temp.path().join("sessions"))),
+        )
+        .streamer(Arc::new(ScriptedApi::new(vec![
+            ScriptedTurn::HangUntilCancel;
+            n
+        ])))
+        .build()
     } else {
-        let mut builder = Axo::builder();
-        if let Some(dir) = dir {
-            builder = builder.dir(dir);
-        }
-        builder.build().await?
+        dir_host::builder(dir.ok_or("--model needs --dir")?)
+            .await?
+            .build()
     };
 
     println!("sessions: {n} ({})", model.as_deref().unwrap_or("scripted"));

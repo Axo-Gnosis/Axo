@@ -1,44 +1,90 @@
-# Configuration & Directories
+# Configuration
 
-`axo` loads configuration from the user directory (`~/.axo/`, overridden by `AXO_DIR`) and, when permitted by the user's project access settings, the project directory (`<cwd>/.axo/`) and `.agents/`. Settings passed through `AxoBuilder::settings` are used as given; project `settings.jsonc` files are merged only when settings load from `<AXO_DIR>`. Hosts embedding `axo` in Rust can also pass `Settings`, `Models`, `Streamer`, and `SessionStore` directly via `Axo::builder()` without reading config files. Command supervision (`Supervision`) is host-only: it has no settings key and is set only through `AxoBuilder::supervision` (see [Command supervision](#command-supervision-axosupervision)).
+`axo` is a library: it owns no configuration directory, no configuration file names, and no environment variable that locates either. It owns configuration **formats and semantics**: the settings schema, validation, merging, trust filtering, and value resolution, all in one evaluator (`EffectiveConfig::resolve`). Hosts own **names, locations, and acquisition**: they hand axo raw layers through the `ConfigSource` trait. axo does own the cross-tool `.agents` conventions (`~/.agents/AGENTS.md`, `~/.agents/skills`, project `.agents/skills`), each behind a user-only switch: `homeAgentsDir` (default `false`) and `project.files.skills`. `Models`, the `SessionStore`, and the cache directory are host-supplied too (see [Host-owned resources](#host-owned-resources)), so `Axo::builder(models, store)` and `AxoBuilder::build` perform no configuration I/O. Command supervision (`Supervision`) is host-only as well: it has no settings key and is set only through `AxoBuilder::supervision` (see [Command supervision](#command-supervision-axosupervision)).
 
-## Directory Layout
+## Configuration source (`axo::ConfigSource`)
 
-### User directory (`~/.axo/` or `$AXO_DIR`)
+A host implements `ConfigSource` and passes it to `AxoBuilder::config(Arc<dyn ConfigSource>)`. Both methods are blocking and run on the caller's async task.
 
-Resolved by `AxoDir::from_env()` (`AXO_DIR` when set and non-empty, else `$HOME/.axo`):
-
-| Path | Method on `AxoDir` | Purpose |
+| Method | Signature | Contract |
 | :--- | :--- | :--- |
-| `settings.jsonc` | `settings_path()` | User settings (model, thinking level, project access rules, context files, dev shells, `ask` timeout, compaction) |
-| `models.jsonc` | `models_path()` | Custom providers, API keys/commands, base URLs, and per-model patches |
-| `auth.json` | `auth_path()` | Machine-written OAuth and API key credentials (`FileCredentialStore`, mode `0600`, locked during refresh) |
-| `AGENTS.md` | `root().join("AGENTS.md")` | User-wide instructions loaded at the start of `project_context` |
-| `prompts/<NAME>.md` | `prompt_path(name)` | Prompt overrides: `SYSTEM.md`, `WORK.md`, `PROSE.md`, `SUMMARY.md`, `COMPACTION.md`, `COMPACTION_UPDATE.md`, `COMPACTION_SPLIT_TURN.md`, `BRANCH_SUMMARY.md` |
-| `skills/` | `skills_dir()` | User skills (`<skill>/SKILL.md`) |
-| `sessions/` | `sessions_dir()` | Default `JsonlStore` root (`--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`), per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` (`local://<path>`): model scratch files and content handed over in prompts (see [Prompt Parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs)). Forks copy both directories |
-| `cache/` | `cache_dir()` | Cached `models.dev` catalog (`cache/models.dev.json`), bundled documentation (`cache/docs/`, via `docs_dir()` and `axo://` URLs), and captured Nix dev-shell environments (`cache/devshell/`) |
+| `user` | `fn user(&self) -> Result<UserConfig, Error>` | Called once per `Axo::create_session`, `Axo::open_session`, and `Axo::schemes`, before anything else |
+| `project` | `fn project(&self, cwd: &Path) -> Result<ConfigLayer, Error>` | The project contribution for a session in `cwd`; the project root is `axo::context::project_root(cwd)` (the git root, or `cwd` outside a repository). Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust` and the user's `project.files.config` is `true` |
 
-When `homeAgentsDir` is `true` in `~/.axo/settings.jsonc`, `axo` also reads `~/.agents/AGENTS.md` (before `~/.axo/AGENTS.md`) and `~/.agents/skills/` (after `~/.axo/skills/`).
+An error from either method fails that `create_session`, `open_session`, or `schemes` call as returned. Hosts report an unreadable path as `Error::Io { path, source }`, invalid content they parse (for example malformed JSONC) as `Error::Config { origin, message }`, and any other acquisition failure as `Error::Host(Box::new(err))`, which carries the host's own error.
 
-### Project directories (`<cwd>/.axo/` and `.agents/`)
+| Type | Fields | Meaning |
+| :--- | :--- | :--- |
+| `ConfigLayer` | `origin: String`, `settings: Option<Value>`, `prompts: IndexMap<String, PromptOverride>` | One raw, unvalidated contribution. `origin` names the layer in errors and warnings (a path, a URL, `"host defaults"`, …). `settings` is the [settings](#settings-axosettings) object; `None` and `Some(Value::Null)` both mean no settings. `prompts` is keyed by a `PROMPT_NAMES` entry: a missing key means no override, an empty text is an override |
+| `PromptOverride` | `origin: String`, `text: String` | One prompt override as the host holds it; `text` is untrimmed, axo trims it |
+| `UserConfig` | `layer: ConfigLayer`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>` | The user's layer plus the user's filesystem resources: skill roots searched after project `.agents/skills` and before `~/.agents/skills`, and context files loaded after `~/.agents/AGENTS.md` and before the project walk (missing files are skipped) |
+| `EffectiveConfig` | `access: ProjectAccess`, `settings: Settings`, `prompts: IndexMap<String, PromptOverride>`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>` | What one session runs with: the effective access, the merged and filtered settings (`defaultModel` still unresolved; see `EffectiveConfig::default_model`), the trimmed prompt overrides (the project's wins per name), and the user's skill roots and context files |
 
-| Path | Access required | Gate in `project.files` | Purpose |
+`PROMPT_NAMES` lists the overridable prompts: `SYSTEM`, `WORK`, `PROSE` (system prompt sections; an empty override disables the section) and `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY` (summarizer prompts; an empty override records a `Diagnostic` and keeps the bundled prompt). See [`prompts-and-context.md`](prompts-and-context.md).
+
+### Evaluation (`EffectiveConfig::resolve`)
+
+`EffectiveConfig::resolve(source: &dyn ConfigSource, cwd: &Path, access: Option<ProjectAccess>) -> Result<EffectiveConfig, Error>` is the single evaluator. `Axo` calls it with `SessionOptions::project_access` as `access`; hosts may call it directly, for example to preview what a session would get.
+
+1. **Sample the user layer:** `source.user()`.
+2. **Validate the user settings on their own:** `None` or `null` is no settings; a non-object is `Error::Config { origin, message: "expected a JSON object" }`; a value that does not deserialize as `Settings` is `Error::Config` with the layer's `origin` and the deserializer's message. The valid object is merged over the defaults.
+3. **Validate the user prompt overrides:** a name outside `PROMPT_NAMES` is `Error::Config` with that override's `origin` and the message `unknown prompt override "<name>"`; texts are trimmed.
+4. **Derive access:** an explicit `access` wins; otherwise the `project` policy of this same user sample decides via `ProjectSettings::access_for(project_root(cwd))` (see [Project access](#project-access-project--axoprojectsettings)). A project layer can never raise its own access.
+5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project` and `homeAgentsDir`; below `Trust` also strip `bash.devShell` and a `defaultModel` starting with `!`. Each stripped key logs a `tracing` warning carrying the layer's `origin`. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project settings or prompt overrides apply.
+6. **Deserialize the merged object** into `Settings`; an error is attributed to the last applied origin (the project's when project settings were merged, else the user's).
+
+`defaultModel` is not resolved here: `EffectiveConfig::default_model` runs its `!command` or expands its `$VAR` at model selection, only when neither `SessionOptions::model` nor the session's recorded model selects one (see [Config values](#config-values)). Filtering already happened in step 5, so a stripped project `!command` never executes.
+
+Unknown keys are ignored in every layer.
+
+### Lifecycle
+
+- **Sampling:** every `Axo::create_session`, `Axo::open_session`, and `Axo::schemes` call samples `user()` afresh and computes access from that same sample, so a policy or settings change applies to the next session start without rebuilding `Axo`.
+- **Per session:** a session keeps the `EffectiveConfig` it started with. Settings, prompt overrides (including `SYSTEM`, `WORK`, and `PROSE` when the system prompt is rebuilt for a new date or dev-shell note), skill roots, and context-file paths are fixed at create or open.
+- **Forks:** `Session::fork` inherits the parent's resolved `EffectiveConfig` and never calls the source.
+- **Build:** `Axo::builder` and `AxoBuilder::build` call no source method.
+
+### Trust boundary
+
+Hosts are trusted integration code; project layers are untrusted data. axo enforces the rules above on whatever `ConfigSource::project` returns: it never calls `project` at `Ignore`, never lets a project layer set user-only keys or its own access, and below `Trust` never lets it set what runs code. A user layer is host-trusted, so its `!command` `defaultModel` runs. I/O the host performs before or while producing a layer (for example reading a project file inside `user`, or computing `project` eagerly) is outside axo's guarantee: a host that must not touch an ignored project must not read it on its own.
+
+### Absent inputs
+
+| Absent input | Effect |
+| :--- | :--- |
+| config (`AxoBuilder::config` unset) | Default settings and no project layer: `user` is an empty `UserConfig`, `project` an empty `ConfigLayer` |
+| `cache_dir` (`AxoBuilder::cache_dir` unset) | No `docs` system prompt section and no `axo://` scheme; Nix dev shells (`bash.devShell` `nix`) fall back to the host environment with a warning |
+| models / store | Compile-time required: `Axo::builder(models: Arc<Models>, store: Arc<dyn SessionStore>)` |
+
+## Host-owned resources
+
+| Resource | Supplied through | How axo uses it |
+| :--- | :--- | :--- |
+| Models and credentials | `Axo::builder(models, ..)` with an `Arc<Models>` | The host builds `Models` with `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials })`; see [Models & Credentials](#models-axo_aimodelsconfig--credentials) |
+| Session store | `Axo::builder(.., store)` with an `Arc<dyn SessionStore>` | `JsonlStore::new(root)` writes `<root>/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`, per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` (`local://<path>`): model scratch files and content handed over in prompts (see [Prompt Parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs)). Forks copy both directories |
+| Cache directory | `AxoBuilder::cache_dir(PathBuf)` | Bundled documentation materialized under `<cache_dir>/docs/` (the `docs` section and `axo://` URLs) and captured Nix dev-shell environments under `<cache_dir>/devshell/`. The `models.dev` catalog cache is separate: it lives wherever the host points `ModelsOptions::cache_dir` |
+| User skills and context files | `UserConfig::skill_roots`, `UserConfig::context_files` | Skill roots (`<root>/<skill>/SKILL.md`) and user-wide instruction files, in the order given |
+
+With `homeAgentsDir: true` in the user layer, axo also reads the ecosystem files `~/.agents/AGENTS.md` (before `UserConfig::context_files`) and `~/.agents/skills/` (after `UserConfig::skill_roots`).
+
+The `drive` and `memory` examples ship their own host under an explicit, required `--dir <dir>` (no default, no environment variable): a JSONC `settings.jsonc` user layer (whose `extendedContext` boolean the example itself reads for `ModelsOptions::extended_context`), `prompts/<NAME>.md` overrides, `skills/`, `AGENTS.md`, `models.jsonc`, `auth.json`, `sessions/`, and `cache/` (both `cache_dir`s). That layout belongs to the examples, not to axo.
+
+### Project resources
+
+| Resource | Access required | Gate | Purpose |
 | :--- | :--- | :--- | :--- |
-| `<cwd>/.axo/settings.jsonc` | `read` (`trust` for code-running keys) | `axoDir: true` | Project settings merged on top of user settings |
-| `<cwd>/.axo/prompts/<NAME>.md` | `read` | `axoDir: true` | Project overrides for `SYSTEM.md`, `WORK.md`, `PROSE.md`, and summarizer prompts |
-| `.agents/skills/` | `read` | `skills: true` | Project skills discovered from `cwd` up to the git root |
+| Project layer (`ConfigSource::project`) | `read` (`trust` for code-running keys) | `project.files.config` | Project settings merged on top of user settings, and project prompt overrides |
+| `.agents/skills/` | `read` | `project.files.skills` | Project skills discovered from `cwd` up to the git root |
 | `AGENTS.md`, `CLAUDE.md`, … | `read` | `contextFiles` map | Context files loaded from the git root to `cwd` at startup and on demand in subdirectories |
 
-## `settings.jsonc` (`axo::Settings`)
+## Settings (`axo::Settings`)
 
-Settings files use JSON with Comments (JSONC), parsed with `jsonc-parser` (UTF-8 BOM, comments, and trailing commas are accepted). Each file is validated individually before merging so syntax or type errors identify the offending path. User and allowed project objects deep-merge key by key with the project winning; arrays replace. Unknown keys are ignored.
+A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores or produces it is the host's business. Each layer is validated on its own before merging, so a type error names the offending layer's `origin`. User and allowed project objects deep-merge key by key with the project winning; arrays replace. Unknown keys are ignored. Every field has a default:
 
-```jsonc
+```json
 {
   "defaultModel": "anthropic/claude-sonnet-4-5",
   "defaultThinkingLevel": "medium",
-  "extendedContext": false,
   "homeAgentsDir": false,
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
@@ -48,8 +94,7 @@ Settings files use JSON with Comments (JSONC), parsed with `jsonc-parser` (UTF-8
     "AGENTS.local.md": true,
     "CLAUDE.md": true,
     "CLAUDE.local.md": true,
-    ".agents/AGENTS.md": true,
-    ".axo/AGENTS.md": true
+    ".agents/AGENTS.md": true
   },
   "bash": {
     "devShell": "off",
@@ -70,8 +115,8 @@ Settings files use JSON with Comments (JSONC), parsed with `jsonc-parser` (UTF-8
   },
   "project": {
     "files": {
-      "axoDir": true,
-      "skills": true
+      "skills": true,
+      "config": true
     },
     "access": "read",
     "paths": {
@@ -86,31 +131,30 @@ Settings files use JSON with Comments (JSONC), parsed with `jsonc-parser` (UTF-8
 
 | Key | Rust field | Default | Scope | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `defaultModel` | `default_model` | `None` | User or project | Model selector `provider/id` (the ID may itself contain `/`); a bare ID is not looked up. Accepts `$ENV` and `!command` (see [Config values](#config-values)); resolved only when starting with `!` or referencing `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged); a `!command` in project settings requires `ProjectAccess::Trust` |
+| `defaultModel` | `default_model` | `None` | User or project | Model selector `provider/id` (the ID may itself contain `/`); a bare ID is not looked up. Accepts `$ENV` and `!command` (see [Config values](#config-values)); resolved by `EffectiveConfig::default_model` only when a session falls back to it, and only when starting with `!` or referencing `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged); a `!command` in project settings requires `ProjectAccess::Trust` |
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
-| `extendedContext` | `extended_context` | `false` | User only | When `false`, catalog and built-in model context windows are capped at the lowest `cost.tiers` threshold (`CostTier`). Ignored with a warning in project settings because `Models` is loaded once per `Axo` instance |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |
 | `steeringMode` | `steering_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
 | `followUpMode` | `follow_up_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
-| `contextFiles` | `context_files` | 6 built-in names | User or project | Ordered map of relative paths to booleans merged onto the built-in default map |
+| `contextFiles` | `context_files` | 5 built-in names | User or project | Ordered map of relative paths to booleans merged onto the built-in default map |
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
 
 ### Project access (`project` / `axo::ProjectSettings`)
 
-The `project` block is **user-only** (`~/.axo/settings.jsonc`). If present in `<cwd>/.axo/settings.jsonc`, it is stripped before merging and logged as a warning.
+The `project` block is **user-only**: it is honored only in the user layer. In a project layer it is stripped before merging and logged as a warning, so a project can never choose its own access.
 
-- `project.files.axoDir` (`true`): read `<cwd>/.axo/settings.jsonc` and `<cwd>/.axo/prompts/`.
 - `project.files.skills` (`true`): read project `.agents/skills/`.
+- `project.files.config` (`true`): request the host's project layer (`ConfigSource::project`): its settings and prompt overrides. `false` keeps project access for context files and skills while never calling `project`.
 - `project.access` (`"read"`): default `ProjectAccess` when no glob in `project.paths` matches the project root (the git root, or `cwd` outside a repository).
 - `project.paths` (`{}`): ordered map of globs over the project root to `"ignore"`, `"read"`, or `"trust"`. Evaluated in map order with the last matching pattern winning. `~/` expands to `$HOME` (skipped if `HOME` is unset), and `/` is matched literally (`literal_separator(true)`).
 
 | `ProjectAccess` | Effect |
 | :--- | :--- |
-| `Ignore` (`"ignore"`) | Loads no project settings, prompt overrides, context files, or skills |
-| `Read` (`"read"`) | Loads enabled markdown context files, skills, prompt overrides, and safe settings; strips `bash.devShell` and `!command` `defaultModel` from project settings with a warning. Dev shells remain disabled even if enabled in user settings |
-| `Trust` (`"trust"`) | Permits all project settings, including `!command` `defaultModel`, and lets `bash.devShell` take effect regardless of which settings file enabled it |
+| `Ignore` (`"ignore"`) | `ConfigSource::project` is not called. Loads no project settings, prompt overrides, context files, or skills |
+| `Read` (`"read"`) | Applies the project layer's safe settings and its prompt overrides, and loads enabled markdown context files and skills; strips `bash.devShell` and `!command` `defaultModel` from project settings with a warning. Dev shells remain disabled even if enabled in user settings |
+| `Trust` (`"trust"`) | Permits all project settings, including `!command` `defaultModel`, and lets `bash.devShell` take effect regardless of which layer enabled it |
 
-A Rust host can override the resolved access level per session via `SessionOptions::project_access`.
+A Rust host can override the resolved access level per session via `SessionOptions::project_access`; it takes precedence over the user policy.
 
 ### Execution environment (`bash` / `axo::BashSettings`)
 
@@ -122,7 +166,9 @@ A Rust host can override the resolved access level per session via `SessionOptio
 | `bash.devShellTimeoutMs` | `dev_shell_timeout_ms` | `600000` | Timeout in milliseconds for `nix print-dev-env` or `direnv export json` |
 | `bash.ci` | `ci` | `true` | Set `CI=true` in the command environment |
 
-In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<AXO_DIR>/cache/devshell/<hash>/gcroot`, where `<hash>` is a 16-hex-digit key of flake dir, ref and system), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
+In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<cache_dir>/devshell/<hash>/gcroot` under the host's `AxoBuilder::cache_dir`, where `<hash>` is a 16-hex-digit key of flake dir, ref and system), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
+
+Nix mode needs a cache directory: without `AxoBuilder::cache_dir` it logs `bash.devShell "nix" needs a cache directory (AxoBuilder::cache_dir); using the host environment` and uses `HostEnv`. Direnv mode needs none.
 
 In `DevShellMode::Direnv`, `DevShellEnv` searches for the nearest `.envrc` from `cwd` up to the filesystem root `/` and executes `direnv export json` bounded by `devShellTimeoutMs`. An unallowed or failing `.envrc`, or a missing `direnv` executable, falls back silently to the host environment. Lookups and exports are cached for 5 s.
 
@@ -132,7 +178,7 @@ Every subprocess `DevShellEnv` runs (`direnv export json`, `git ls-files`, `nix 
 
 Every local command, `bash` tool calls and dev-shell capture alike, runs in its own container through the session's `ProcessSupervisor`. The host picks the container kind with the `Supervision` enum; there are two modes and no third: no PID namespaces, no `unsafe` or in-process fork path, and no silent downgrade from one mode to the other.
 
-`Supervision` is host configuration, not a settings key; project or user `settings.jsonc` cannot change it. Hosts pass it to `AxoBuilder::supervision`; without one, `Supervision::default()` (`ProcessGroup`) applies:
+`Supervision` is host configuration, not a settings key; no configuration layer can change it. Hosts pass it to `AxoBuilder::supervision`; without one, `Supervision::default()` (`ProcessGroup`) applies:
 
 | Variant | Fields | Meaning and limits |
 | :--- | :--- | :--- |
@@ -143,9 +189,13 @@ No supervisor binary is distributed: the supervisor is the host's own executable
 
 ```rust,no_run
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use axo::store::JsonlStore;
 use axo::{Axo, Supervision};
+use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 
 const SUPERVISOR_ROUTE: &str = "__axo-supervisor";
 
@@ -156,22 +206,34 @@ fn main() -> ExitCode {
     }
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
+        let state = PathBuf::from("/var/lib/my-host");
+        let models = Models::load(ModelsOptions {
+            cache_dir: None,
+            extended_context: false,
+            config: ModelsConfig::default(),
+            credentials: Arc::new(FileCredentialStore::new(state.join("credentials.json"))),
+        })
+        .await
+        .expect("models");
+        let store = Arc::new(JsonlStore::new(state.join("sessions")));
         let supervision = Supervision::Cgroup {
             program: std::env::current_exe().expect("current executable"),
             args: vec![OsString::from(SUPERVISOR_ROUTE)],
             cgroup_root: None,
         };
-        let _axo = Axo::builder().supervision(supervision).build().await.expect("axo");
+        let _axo = Axo::builder(Arc::new(models), store)
+            .supervision(supervision)
+            .build();
         // ... run sessions ...
     });
     ExitCode::SUCCESS
 }
 ```
 
-Hosts that keep the default need no routing at all: `Axo::builder().build().await?` runs commands in process groups.
+Hosts that keep the default need no routing at all: `Axo::builder(models, store).build()` runs commands in process groups.
 
 - **Delegated cgroup (cgroup mode only):** the root must be a cgroup v2 directory the axo process can create subdirectories in, with `cgroup.kill` available (Linux 5.14+). Under systemd that means running the host in a unit or scope with `Delegate=yes` (for example `systemd-run --user --scope -p Delegate=yes …`), or creating a delegated subtree and passing it as `cgroup_root`. Systemd only provides the delegation; axo never calls systemd at runtime and needs no systemd API.
-- **When it is checked:** `Axo::build` never fails for supervision reasons. In cgroup mode, the first command probes the root by creating and removing `axo-probe-<uuidv7>` and checking for `cgroup.kill`; the result, success or failure, is cached for the lifetime of that `Axo`. Process-group mode has nothing to probe.
+- **When it is checked:** `AxoBuilder::build` is synchronous and infallible, so supervision never fails it. In cgroup mode, the first command probes the root by creating and removing `axo-probe-<uuidv7>` and checking for `cgroup.kill`; the result, success or failure, is cached for the lifetime of that `Axo`. Process-group mode has nothing to probe.
 - **Cgroup root:** whether explicit (`cgroup_root`) or derived from `/proc/self/cgroup`, the root is canonicalized (symlinks resolved) before the probe and must lie under `/sys/fs/cgroup`; one that does not fails with the reason `it is not inside the cgroup v2 hierarchy at /sys/fs/cgroup`.
 - **Failures (cgroup mode only):** an unusable root reports `Command supervision unavailable: cannot create a job cgroup under {root}: {err}. Run the host in a delegated cgroup (systemd: Delegate=yes), set cgroup_root in Supervision::Cgroup, or use Supervision::ProcessGroup.` (where `{err}` is the OS error, `/proc/self/cgroup names no cgroup v2 path`, `it is not inside the cgroup v2 hierarchy at /sys/fs/cgroup`, or `it has no cgroup.kill (cgroup v2 on Linux 5.14+ required)`); a supervisor that cannot start reports `Command supervisor {program} failed to start: {err}`; one that starts but does not report `ready` within 5 s reports `Command supervisor {program} did not report ready; the host must route these arguments to axo::exec::supervisor::run`. The `bash` tool returns the message as its error and runs nothing; dev-shell resolution falls back as described above. axo never switches to process groups on its own.
 - **Per command, process-group mode:** the command starts with `process_group(0)`, so its pgid is its pid. The guard is `sh -c 'read _; kill -KILL -- -"$0"' <pgid>` holding a pipe from axo, started in its own process group as well: if axo dies, the pipe closes and the guard kills the group; when the job closes normally axo kills the guard first. The guard is best effort (if `sh` cannot start, a warning is logged and the command still runs), and losing the guard never kills the job. Because neither the command nor the guard shares the host's foreground process group, a Ctrl-C or SIGTSTP at the host's terminal reaches no job and no watcher.
@@ -189,16 +251,16 @@ Hosts that keep the default need no routing at all: `Axo::builder().build().awai
 | Key | Rust field | Default | Meaning |
 | :--- | :--- | :--- | :--- |
 | `compaction.enabled` | `enabled` | `true` | Enable automatic threshold maintenance and one-shot overflow recovery. Manual `Session::compact()` and `Session::shake()` work even when `false` |
-| `compaction.maxContext` | `max_context` | `Some(400_000)` | Cap on the effective context window `W`; explicit `null` in JSONC clears the cap (`None`) |
+| `compaction.maxContext` | `max_context` | `Some(400_000)` | Cap on the effective context window `W`; an explicit `null` clears the cap (`None`) |
 | `compaction.reserveTokens` | `reserve_tokens` | `None` | Explicit token reserve; when `null` or omitted, derived (see [Window and trigger math](sessions-and-compaction.md#window-and-trigger-math-limitsresolve)) |
 | `compaction.keepRecentTokens` | `keep_recent_tokens` | `None` | Explicit retained-tail and user-carryover budget; when `null` or omitted, derived (see [Window and trigger math](sessions-and-compaction.md#window-and-trigger-math-limitsresolve)) |
 | `compaction.summaryRequest` | `summary_request` | `"live"` | `SummaryRequest::Live` (`"live"`) or `SummaryRequest::Separate` (`"separate"`) |
 
-## `models.jsonc` (`axo_ai::ModelsConfig`) & Credentials
+## Models (`axo_ai::ModelsConfig`) & Credentials
 
-`Models::load` combines the built-in catalog, the cached or fetched `models.dev` catalog (`<AXO_DIR>/cache/models.dev.json`), and `<AXO_DIR>/models.jsonc`:
+The host builds `Models` and passes it to `Axo::builder`; axo never loads models itself. `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials })` combines the built-in catalog, the `models.dev` catalog (cached as `<cache_dir>/models.dev.json` and fetched when needed; `cache_dir: None` runs without the catalog and does no catalog I/O), and the host's `ModelsConfig`. A host that keeps its `ModelsConfig` as JSONC text can parse it with `ModelsConfig::parse_jsonc` (UTF-8 BOM, comments, and trailing commas accepted; empty text is the default config). Its JSON shape:
 
-```jsonc
+```json
 {
   "providers": {
     "zebes": {
@@ -229,17 +291,17 @@ Hosts that keep the default need no routing at all: `Axo::builder().build().awai
 
 - **`ApiKind` (`api`):** `"anthropic-messages"`, `"openai-completions"`, `"openai-responses"`, or `"openai-codex-responses"`.
 - **Auto-discovery:** If a custom `"openai-completions"` provider omits `models` (`None`) and supplies `baseUrl`, `Models::load` queries `<baseUrl>/models` to populate its model list.
-- **Price-tier window caps:** For catalog and built-in models with `cost.tiers`, `extendedContext: false` caps `context_window` at the lowest `inputTokensAbove` threshold in `cost.tiers`. Models defined in `models.jsonc` or patched via `modelOverrides.contextWindow` keep their explicit window.
-- **Credentials (`auth.json` and environment):** `Models` resolves credentials in order:
+- **Price-tier window caps:** For catalog and built-in models with `cost.tiers`, `ModelsOptions::extended_context` set to `false` caps `context_window` at the lowest `inputTokensAbove` threshold in `cost.tiers`. Models defined in the `ModelsConfig` or patched via `modelOverrides.contextWindow` keep their explicit window. `Models` is built once per host, so this is a host choice, not a settings key.
+- **Credentials (credential store and environment):** `Models` resolves credentials in order:
   0. An explicit override key passed to `Models::auth`.
-  1. `ProviderConfig::api_key` in `models.jsonc` (a [config value](#config-values): `!command`, `$ENV`, or literal).
-  2. Stored credentials in `<AXO_DIR>/auth.json` (`Credential::ApiKey` or `Credential::Oauth`, refreshed for Codex OAuth only under the store's exclusive `auth.json.lock` file lock and persisted with mode `0600`).
+  1. `ProviderConfig::api_key` in the `ModelsConfig` (a [config value](#config-values): `!command`, `$ENV`, or literal).
+  2. Stored credentials in `ModelsOptions::credentials` (`Credential::ApiKey` or `Credential::Oauth`). `FileCredentialStore::new(path)` keeps them in one JSON file the host names, replaced by rename with mode `0600`; every write, including a Codex OAuth refresh, holds an exclusive lock on the `<path>.lock` sidecar.
   3. The provider's `env` variable names from the models.dev catalog (for example `$ANTHROPIC_API_KEY`).
   4. Custom providers absent from the catalog may run without an API key.
 
 ## Config values
 
-Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of being used as written: `apiKey` and `headers` values in `models.jsonc` (on providers, models, and `modelOverrides`), and `defaultModel` in settings.
+Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of being used as written: `apiKey` and `headers` values in the `ModelsConfig` (on providers, models, and `modelOverrides`), and `defaultModel` in settings.
 
 | Form | Result |
 | :--- | :--- |
@@ -248,7 +310,7 @@ Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of b
 | `$$` / `$!` | A literal `$` / `!` (start a literal value that begins with `!` with `$!`) |
 | anything else | Used as written |
 
-```jsonc
+```json
 {
   "providers": {
     "zebes": {
@@ -261,7 +323,7 @@ Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of b
 }
 ```
 
-- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves once when settings load.
+- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves through `EffectiveConfig::default_model` only when a session create or open falls back to it (no `SessionOptions::model` and no recorded model), after project filtering; `Axo::schemes` never resolves it.
 - **Caching:** each distinct `!command` runs at most once per process; its output (or failure) is reused until the process restarts, so a rotated secret needs a restart.
 - **Failures:** a command that cannot start, exits non-zero, prints nothing, or runs past 10 seconds is a `Config` error, as is an unset or empty environment variable. stdin is closed and stderr is discarded.
-- **Trust:** a `!command` runs code. A project `defaultModel` starting with `!` is stripped below `Trust` (see [Project access](#project-access-project--axoprojectsettings)); `models.jsonc` is user-only.
+- **Trust:** a `!command` runs code. A project `defaultModel` starting with `!` is stripped below `Trust` (see [Project access](#project-access-project--axoprojectsettings)); the `ModelsConfig` comes only from the trusted host.

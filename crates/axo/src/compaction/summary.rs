@@ -1,6 +1,5 @@
 //! Transient summary requests; persistence and operation ownership stay in SessionHooks.
 use std::borrow::Cow;
-use std::path::Path;
 
 use axo_agent::AgentMessage;
 use axo_ai::estimate::{estimate_message_tokens, estimate_text_tokens};
@@ -10,11 +9,11 @@ use axo_ai::{
     UserMessage, drop_failed_turns, is_context_overflow, now_ms, retry_delay,
 };
 use futures::StreamExt;
+use indexmap::IndexMap;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AxoDir, SummaryRequest};
-use crate::context::prompt::prompt_override;
-use crate::context::{Diagnostic, lower_messages};
+use crate::config::{PromptOverride, SummaryRequest};
+use crate::context::{Diagnostic, DiagnosticOrigin, lower_messages};
 
 pub(super) const TOO_LARGE: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
 const NOT_FINISHED: &str = "Summary response must finish normally without tool calls";
@@ -48,21 +47,15 @@ pub(crate) struct SummaryPrompts {
 }
 
 impl SummaryPrompts {
-    /// Resolves each prompt through [`prompt_override`]. An empty override would make every
-    /// summary fail, so it is reported and the bundled prompt is kept.
-    pub(crate) fn load(dir: &AxoDir, cwd: &Path, project: bool) -> (Self, Vec<Diagnostic>) {
+    /// Takes each prompt from the session's trimmed overrides. An empty override would
+    /// make every summary fail, so it is reported and the bundled prompt is kept.
+    pub(crate) fn load(prompts: &IndexMap<String, PromptOverride>) -> (Self, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
-        let mut load = |name: &str, bundled: &str| match prompt_override(
-            dir,
-            cwd,
-            project,
-            name,
-            &mut diagnostics,
-        ) {
-            Some((_, text)) if !text.is_empty() => text,
-            Some((path, _)) => {
+        let mut load = |name: &str, bundled: &str| match prompts.get(name) {
+            Some(prompt) if !prompt.text.is_empty() => prompt.text.clone(),
+            Some(prompt) => {
                 diagnostics.push(Diagnostic {
-                    path: Some(path),
+                    origin: Some(DiagnosticOrigin::Host(prompt.origin.clone())),
                     message: "empty summary prompt ignored; using the bundled prompt".into(),
                 });
                 bundled.trim().to_owned()

@@ -8,12 +8,12 @@
 
 | # | Section | Source |
 | :--- | :--- | :--- |
-| 1 | `system` | `SYSTEM.md` override, else bundled `crates/axo/prompts/SYSTEM.md` |
-| 2 | `docs` | `"axo's documentation, including how to extend it: axo://README.md"` (materialized from the bundled docs) |
+| 1 | `system` | `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
+| 2 | `docs` | `"axo's documentation, including how to extend it: axo://README.md"` (materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
 | 3 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the active tools, formatted as `- {rule}` bullets |
 | 4 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
-| 5 | `work` | `WORK.md` override (no bundled default; omitted unless provided) |
-| 6 | `prose` | `PROSE.md` override, else bundled `crates/axo/prompts/PROSE.md` |
+| 5 | `work` | `WORK` override (no bundled default; omitted unless provided) |
+| 6 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
 | 7 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
 | 8 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
 | 9 | `cwd` | `inputs.cwd.display()` |
@@ -23,7 +23,7 @@
 
 ### Bundled documentation (`docs`)
 
-`build_sections` materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<AXO_DIR>/cache/docs/` (`AxoDir::docs_dir()`), updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If `<AXO_DIR>/cache/docs/` cannot be written, `build_sections` records a `Diagnostic` and omits the `docs` section.
+When the host sets `AxoBuilder::cache_dir`, `build_sections` materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<cache_dir>/docs/`, updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If that directory cannot be written, `build_sections` records a `Diagnostic` and omits the `docs` section. Without a cache directory, axo writes nothing, omits the `docs` section without a diagnostic, and registers no `axo://` scheme.
 
 ### Built-in tool guidelines (`tools`)
 
@@ -37,37 +37,41 @@ Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the bui
 
 Host section names in `SessionOptions::sections` must start with an ASCII lowercase letter (`a-z`) and contain only `a-z`, `0-9`, `_`, or `-`. Invalid names emit a `Diagnostic` and are skipped. Overriding an existing section name updates its value at its original position in `IndexMap` rather than moving it to the end.
 
-## Prompt Overrides (`prompts/`)
+## Prompt Overrides (`EffectiveConfig::prompts`)
 
-`prompt_override` checks `<cwd>/.axo/prompts/<NAME>.md` first (when project access is not `Ignore` and `project.files.axoDir` is `true`), then `<AXO_DIR>/prompts/<NAME>.md`.
+axo reads no prompt files of its own. The host supplies overrides through `ConfigSource` as `ConfigLayer::prompts`, keyed by a `PROMPT_NAMES` entry (`SYSTEM`, `WORK`, `PROSE`, `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`), each a `PromptOverride { origin, text }`:
+- `EffectiveConfig::resolve` trims every text and applies the user layer's overrides, then the project layer's when project access is `Read` or `Trust` and the user's `project.files.config` is `true`; the project wins per name. Under `Ignore`, or with `project.files.config: false`, the project layer is never requested.
+- A key outside `PROMPT_NAMES` fails session start with `Error::Config` naming that override's `origin`.
+- A missing key means no override. An unreadable prompt is the host's error to report from `ConfigSource`; axo never sees a file.
+- Overrides are a snapshot: they are sampled once per `create_session` or `open_session` and held for the session's lifetime (later rebuilds of the system prompt, such as a date rollover or a dev-shell note change, reuse that snapshot). A fork inherits its parent's snapshot.
 
-### System-prompt files
+### System-prompt overrides
 
-| File | Section | Bundled default | Empty / whitespace-only override |
+| Name | Section | Bundled default | Empty / whitespace-only override |
 | :--- | :--- | :--- | :--- |
-| `SYSTEM.md` | `system` | `crates/axo/prompts/SYSTEM.md` | Omitted from the prompt |
-| `WORK.md` | `work` | None | Omitted from the prompt |
-| `PROSE.md` | `prose` | `crates/axo/prompts/PROSE.md` | Omitted from the prompt |
+| `SYSTEM` | `system` | `crates/axo/prompts/SYSTEM.md` | Omitted from the prompt |
+| `WORK` | `work` | None | Omitted from the prompt |
+| `PROSE` | `prose` | `crates/axo/prompts/PROSE.md` | Omitted from the prompt |
 
-### Summarizer prompt files (`SummaryPrompts::load`)
+### Summarizer prompts (`SummaryPrompts::load`)
 
-Loaded when a session starts (`crates/axo/src/compaction/summary.rs`):
+Taken from the session's override snapshot when a session starts (`crates/axo/src/compaction/summary.rs`):
 
-| File | Bundled default | Used for |
+| Name | Bundled default | Used for |
 | :--- | :--- | :--- |
-| `SUMMARY.md` | `crates/axo/prompts/SUMMARY.md` | System prompt for separate summary requests; prepended to the checkpoint instructions in the user message appended to the live conversation |
-| `COMPACTION.md` | `crates/axo/prompts/COMPACTION.md` | First compaction checkpoint |
-| `COMPACTION_UPDATE.md` | `crates/axo/prompts/COMPACTION_UPDATE.md` | Subsequent compaction checkpoints updating a previous summary |
-| `COMPACTION_SPLIT_TURN.md` | `crates/axo/prompts/COMPACTION_SPLIT_TURN.md` | Summarizing the prefix of a split turn |
-| `BRANCH_SUMMARY.md` | `crates/axo/prompts/BRANCH_SUMMARY.md` | Summarizing an abandoned branch during `Session::navigate` with `summarize: true` |
+| `SUMMARY` | `crates/axo/prompts/SUMMARY.md` | System prompt for separate summary requests; prepended to the checkpoint instructions in the user message appended to the live conversation |
+| `COMPACTION` | `crates/axo/prompts/COMPACTION.md` | First compaction checkpoint |
+| `COMPACTION_UPDATE` | `crates/axo/prompts/COMPACTION_UPDATE.md` | Subsequent compaction checkpoints updating a previous summary |
+| `COMPACTION_SPLIT_TURN` | `crates/axo/prompts/COMPACTION_SPLIT_TURN.md` | Summarizing the prefix of a split turn |
+| `BRANCH_SUMMARY` | `crates/axo/prompts/BRANCH_SUMMARY.md` | Summarizing an abandoned branch during `Session::navigate` with `summarize: true` |
 
-If a summarizer override file is empty or whitespace-only, `SummaryPrompts::load` records a `Diagnostic` (`"empty summary prompt ignored; using the bundled prompt"`) and keeps the bundled prompt.
+If a summarizer override is empty or whitespace-only, `SummaryPrompts::load` records a `Diagnostic` whose `origin` is `DiagnosticOrigin::Host` with the override's origin label (`"empty summary prompt ignored; using the bundled prompt"`) and keeps the bundled prompt. Diagnostics about files axo read (context files, skills, the docs directory) carry `DiagnosticOrigin::Path` instead; `origin` is `None` when the problem has no location.
 
 ## Context Files (`crates/axo/src/context/files.rs`)
 
 ### Startup discovery (`load_context_files`)
 
-1. **User files:** `~/.agents/AGENTS.md` (when `home_agents_dir` is `true`), then `<AXO_DIR>/AGENTS.md`.
+1. **User files:** `~/.agents/AGENTS.md` (when `home_agents_dir` is `true`), then the host's `UserConfig::context_files` in order. Missing files are skipped.
 2. **Project walk:** When `project` is `true` (`project_access != ProjectAccess::Ignore`), `axo` walks every directory from `project_root(cwd)` (the git root, or `cwd` outside a repository) down to `cwd`.
 3. **File selection & ordering (`context_file_names`):**
    - Keys in `settings.context_files` must be non-empty relative paths with only `Component::Normal` segments; absolute paths or paths containing `..` or `.` emit a `Diagnostic` and are skipped.
@@ -87,7 +91,7 @@ When project access is not `Ignore` and `settings.nested_context_files` is `true
 
 `load_skills` scans roots in this order:
 1. `<dir>/.agents/skills` for each directory from `cwd` up to `project_root(cwd)` (when `project` is `true` and `project.files.skills` is `true`).
-2. `<AXO_DIR>/skills`.
+2. The host's `UserConfig::skill_roots`, in order.
 3. `~/.agents/skills` (when `home_agents_dir` is `true`).
 
 Within each root:

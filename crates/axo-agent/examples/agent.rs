@@ -1,7 +1,7 @@
 //! Live check of the agent loop: a real model with two chained tools, printing every
 //! event of the run.
 //!
-//! `agent --dir <AXO_DIR> --model <provider/id> [--thinking <level>] <prompt>`
+//! `agent --dir <dir> --model <provider/id> [--thinking <level>] <prompt>`
 
 use std::io::Write;
 use std::path::PathBuf;

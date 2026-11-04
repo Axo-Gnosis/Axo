@@ -11,7 +11,7 @@ use axo::recovery::{RecoveryPlan, plan_recovery};
 use axo::store::{
     self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind,
 };
-use axo::{Axo, PromptPart, Session, SessionEvent, Settings};
+use axo::{Axo, PromptPart, Session, SessionEvent};
 use axo_agent::{AgentEvent, AgentMessage, Replay, RunOutcome};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
@@ -522,7 +522,7 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
         let host = common::host(
             dir.path(),
             json!([{"id":"m", "contextWindow":100000, "maxTokens":4096}]),
-            Settings::default(),
+            json!({}),
             Vec::new(),
         )
         .await;
@@ -593,7 +593,7 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
     let host = common::host(
         dir.path(),
         json!([{"id":"m", "contextWindow":100000, "maxTokens":4096, "input":["text","image"]}]),
-        Settings::default(),
+        json!({}),
         vec![ScriptedTurn::Reply(reply_text("reviewed"))],
     )
     .await;
@@ -827,9 +827,7 @@ async fn setup(dir: &Path, turns: Vec<ScriptedTurn>, enabled: bool) -> (Axo, Arc
         {"id":"m", "contextWindow":100000, "maxTokens":4096},
         {"id":"other", "contextWindow":100000, "maxTokens":4096},
     ]);
-    let mut settings = Settings::default();
-    settings.compaction.enabled = enabled;
-    settings.compaction.keep_recent_tokens = Some(0);
+    let settings = json!({"compaction": {"enabled": enabled, "keepRecentTokens": 0}});
     let host = common::host(dir, models, settings, turns).await;
     (host.axo, host.api)
 }

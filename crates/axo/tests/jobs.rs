@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axo::store::{Entry, SeqEntry};
-use axo::{Axo, Session, SessionEvent, Settings};
+use axo::{Axo, Session, SessionEvent};
 use axo_agent::{AgentEvent, RunOutcome};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 
 /// An `Axo` streaming from `turns`, plus the API that records every request.
 async fn scripted(dir: &Path, turns: Vec<ScriptedTurn>) -> (Axo, Arc<ScriptedApi>) {
-    let host = common::host(dir, json!([{"id":"m"}]), Settings::default(), turns).await;
+    let host = common::host(dir, json!([{"id":"m"}]), json!({}), turns).await;
     (host.axo, host.api)
 }
 

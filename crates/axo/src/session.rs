@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
-use crate::config::{AxoDir, CompactionSettings, ProjectAccess, Settings, SummaryRequest};
+use crate::config::{CompactionSettings, EffectiveConfig, ProjectAccess, SummaryRequest};
 use crate::context::files::{ContextFile, NestedContext, context_file_names, load_context_files};
 use crate::context::prompt::{PromptInputs, Sections, build_sections, system_message};
 use crate::context::skills::{Skill, load_skills};
@@ -225,10 +225,12 @@ pub struct Fork {
 
 /// Everything `Axo` resolved for a new, opened or forked session.
 pub(crate) struct SessionSetup {
-    pub(crate) dir: AxoDir,
     pub(crate) cwd: PathBuf,
-    /// User settings merged with the project's.
-    pub(crate) settings: Settings,
+    /// Resolved once by `Axo` for this session; a fork inherits its parent's.
+    pub(crate) config: Arc<EffectiveConfig>,
+    /// Where bundled docs are materialized for the `docs` section and `axo://`; `None`
+    /// omits both.
+    pub(crate) docs_dir: Option<PathBuf>,
     pub(crate) streamer: Arc<dyn Streamer>,
     /// Where `/model` looks up models.
     pub(crate) models: Arc<Models>,
@@ -239,7 +241,6 @@ pub(crate) struct SessionSetup {
     /// Runs every local command in its own supervised container (process group or cgroup).
     pub(crate) supervisor: Arc<ProcessSupervisor>,
     pub(crate) ask_enabled: bool,
-    pub(crate) project_access: ProjectAccess,
     pub(crate) host_sections: Vec<(String, Option<String>)>,
     pub(crate) host_tools: Vec<ToolFactory>,
     pub(crate) host_schemes: Vec<Arc<dyn Scheme>>,
@@ -268,12 +269,10 @@ pub struct Session {
     path: PathBuf,
     // Kept to fork.
     store: Arc<dyn SessionStore>,
-    settings: Settings,
+    config: Arc<EffectiveConfig>,
     streamer: Arc<dyn Streamer>,
     models: Arc<Models>,
     ask_enabled: bool,
-    // Kept to fork; the prompt inputs live in `SessionHooks::prompt`.
-    project_access: ProjectAccess,
     host_tools: Vec<ToolFactory>,
     host_schemes: Vec<Arc<dyn Scheme>>,
 }
@@ -288,10 +287,10 @@ struct PromptState {
 
 /// The session's system prompt: its inputs and its last build.
 struct SessionPrompt {
-    dir: AxoDir,
     cwd: PathBuf,
-    /// `project_access != Ignore && settings.project.files.axo_dir`.
-    project_prompts: bool,
+    /// The session's resolved config; prompt overrides are read from it.
+    config: Arc<EffectiveConfig>,
+    docs_dir: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
     /// Fixed at start: `Schemes` cannot change after `Schemes::new`.
     scheme_docs: Vec<String>,
@@ -314,9 +313,9 @@ impl SessionPrompt {
             return None;
         }
         let (sections, diagnostics) = build_sections(&PromptInputs {
-            dir: &self.dir,
+            prompts: &self.config.prompts,
+            docs_dir: self.docs_dir.as_deref(),
             cwd: &self.cwd,
-            project_prompts: self.project_prompts,
             tools: &self.tools,
             scheme_docs: &self.scheme_docs,
             context_files: &self.context_files,
@@ -1807,31 +1806,33 @@ impl JobHost for SessionHooks {
 
 /// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
 /// `artifact://` and `local://` in the side folders beside the session file `path`,
-/// `skill://`, `axo://` docs, `proc://` over `jobs` when given, then `host` schemes. Open
-/// sessions and `Axo::schemes` both build them here, so given the same project access a
-/// file-backed URL resolves alike whether its session is open or not; only open sessions
-/// get `proc://` (`Axo::schemes` passes no `jobs`), since a closed session has no live
-/// jobs.
+/// `skill://`, `axo://` docs when `docs_dir` is given, `proc://` over `jobs` when given,
+/// then `host` schemes. Open sessions and `Axo::schemes` both build them here, so given
+/// the same effective config a file-backed URL resolves alike whether its session is open
+/// or not; only open sessions get `proc://` (`Axo::schemes` passes no `jobs`), since a
+/// closed session has no live jobs.
 pub(crate) fn session_schemes(
-    dir: &AxoDir,
-    settings: &Settings,
-    access: ProjectAccess,
+    config: &EffectiveConfig,
+    docs_dir: Option<&Path>,
     cx: SchemeContext,
     host: &[Arc<dyn Scheme>],
     jobs: Option<Arc<JobRegistry>>,
 ) -> Result<(Schemes, Vec<Skill>, Vec<Diagnostic>), Error> {
+    let settings = &config.settings;
     let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
     let (skills, diagnostics) = load_skills(
-        dir,
+        &config.skill_roots,
         home_agents.as_deref(),
         &cx.cwd,
-        access != ProjectAccess::Ignore && settings.project.files.skills,
+        config.access != ProjectAccess::Ignore && settings.project.files.skills,
     );
     let mut builtins: Vec<Arc<dyn Scheme>> = vec![
         Arc::new(SkillScheme::new(&skills)),
         Arc::new(DirScheme::local(cx.session_dir.join(LOCAL_DIR))),
-        Arc::new(DirScheme::docs(dir.docs_dir())),
     ];
+    if let Some(docs_dir) = docs_dir {
+        builtins.push(Arc::new(DirScheme::docs(docs_dir.to_path_buf())));
+    }
     if let Some(jobs) = jobs {
         builtins.push(Arc::new(ProcScheme { jobs }));
     }
@@ -1847,9 +1848,9 @@ impl Session {
     /// prompts, run in a spawned task.
     pub(crate) async fn start(setup: SessionSetup) -> Result<Session, Error> {
         let SessionSetup {
-            dir,
             cwd,
-            settings,
+            config,
+            docs_dir,
             streamer,
             models,
             model,
@@ -1857,7 +1858,6 @@ impl Session {
             exec,
             supervisor,
             ask_enabled,
-            project_access,
             host_sections,
             host_tools,
             host_schemes,
@@ -1872,11 +1872,17 @@ impl Session {
         let path = writer.planned_path().to_path_buf();
         let (events, _) = broadcast::channel(1024);
         let questions = Arc::new(PendingQuestions::new(events.clone()));
-        let project = project_access != ProjectAccess::Ignore;
+        let settings = &config.settings;
+        let project = config.access != ProjectAccess::Ignore;
         let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
         let (names, name_diagnostics) = context_file_names(&settings.context_files);
-        let (context_files, file_diagnostics) =
-            load_context_files(&dir, home_agents.as_deref(), &cwd, project, &names);
+        let (context_files, file_diagnostics) = load_context_files(
+            &config.context_files,
+            home_agents.as_deref(),
+            &cwd,
+            project,
+            &names,
+        );
         let context = NestedContext::new(
             (project && settings.nested_context_files).then(|| project_root(&cwd)),
             names,
@@ -1884,9 +1890,8 @@ impl Session {
         );
         let (jobs, unfinished) = JobRegistry::new(session_id.clone(), &entries);
         let (schemes, skills, skill_diagnostics) = session_schemes(
-            &dir,
-            &settings,
-            project_access,
+            &config,
+            docs_dir.as_deref(),
             SchemeContext {
                 session_id: session_id.clone(),
                 session_dir: path.with_extension(""),
@@ -1895,11 +1900,8 @@ impl Session {
             &host_schemes,
             Some(jobs.clone()),
         )?;
-        let (summary_prompts, summary_diagnostics) = compaction::summary::SummaryPrompts::load(
-            &dir,
-            &cwd,
-            project && settings.project.files.axo_dir,
-        );
+        let (summary_prompts, summary_diagnostics) =
+            compaction::summary::SummaryPrompts::load(&config.prompts);
         for diagnostic in name_diagnostics
             .iter()
             .chain(&file_diagnostics)
@@ -1972,9 +1974,9 @@ impl Session {
             jobs,
             preparing: AtomicUsize::new(0),
             prompt: SessionPrompt {
-                dir,
                 cwd,
-                project_prompts: project && settings.project.files.axo_dir,
+                config: config.clone(),
+                docs_dir,
                 tools: tools.clone(),
                 scheme_docs: session_tools.schemes.prompt_docs(),
                 context_files,
@@ -2015,11 +2017,10 @@ impl Session {
             id: session_id,
             path,
             store,
-            settings,
+            config,
             streamer,
             models,
             ask_enabled,
-            project_access,
             host_tools,
             host_schemes,
         };
@@ -2849,8 +2850,9 @@ impl Session {
     }
 
     /// Copies the root→`entry_id` path into a new session file that records this one as
-    /// its parent. Forking at a user message copies the path to its parent and returns
-    /// the message's parts to edit and resubmit.
+    /// its parent. The fork runs with this session's resolved configuration. Forking at a
+    /// user message copies the path to its parent and returns the message's parts to edit
+    /// and resubmit.
     pub async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error> {
         let (path, editable, model, thinking) = {
             let log = self.hooks.log.lock().await;
@@ -2969,9 +2971,10 @@ impl Session {
 
         let projection = project(&entries, None);
         let session = Session::start(SessionSetup {
-            dir: self.hooks.prompt.dir.clone(),
             cwd: self.hooks.prompt.cwd.clone(),
-            settings: self.settings.clone(),
+            // The parent's resolved config: a fork never samples the configuration source.
+            config: self.config.clone(),
+            docs_dir: self.hooks.prompt.docs_dir.clone(),
             streamer: self.streamer.clone(),
             models: self.models.clone(),
             model,
@@ -2979,7 +2982,6 @@ impl Session {
             exec: self.exec.clone(),
             supervisor: self.hooks.maintenance.tools.supervisor.clone(),
             ask_enabled: self.ask_enabled,
-            project_access: self.project_access,
             host_sections: self.hooks.prompt.host_sections.clone(),
             host_tools: self.host_tools.clone(),
             host_schemes: self.host_schemes.clone(),

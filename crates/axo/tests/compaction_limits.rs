@@ -3,7 +3,7 @@ mod common;
 use std::{path::Path, sync::Arc};
 
 use axo::store::{self, Entry, EntryBase, EntryId, JsonlStore, SessionStore};
-use axo::{Axo, CompactionSettings, Error, Settings, ShakeMode};
+use axo::{Axo, Error, ShakeMode};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
 use axo_ai::{AssistantBlock, Message, Model, ScriptedApi, ScriptedTurn, UserBlock, UserMessage};
@@ -12,7 +12,7 @@ use serde_json::json;
 
 async fn harness(
     dir: &Path,
-    compaction: CompactionSettings,
+    compaction: serde_json::Value,
     window: u64,
     output: u64,
     turns: Vec<ScriptedTurn>,
@@ -20,10 +20,7 @@ async fn harness(
     let host = common::host(
         dir,
         json!([{"id":"m", "contextWindow":window, "maxTokens":output}]),
-        Settings {
-            compaction,
-            ..Settings::default()
-        },
+        json!({ "compaction": compaction }),
         turns,
     )
     .await;
@@ -73,13 +70,12 @@ async fn invalid_limits_reject_compaction_but_not_session_lifecycle() {
         let path = history(dir.path()).await;
         let (axo, api, _) = harness(
             dir.path(),
-            CompactionSettings {
-                enabled: false,
-                max_context: cap,
-                reserve_tokens: reserve,
-                keep_recent_tokens: tail,
-                ..CompactionSettings::default()
-            },
+            json!({
+                "enabled": false,
+                "maxContext": cap,
+                "reserveTokens": reserve,
+                "keepRecentTokens": tail,
+            }),
             window,
             output,
             vec![],
@@ -107,13 +103,12 @@ async fn model_switch_validates_limits_only_when_compacting() {
     let dir = tempfile::tempdir().unwrap();
     let (axo, api, model) = harness(
         dir.path(),
-        CompactionSettings {
-            enabled: false,
-            max_context: None,
-            reserve_tokens: Some(1000),
-            keep_recent_tokens: Some(2000),
-            ..CompactionSettings::default()
-        },
+        json!({
+            "enabled": false,
+            "maxContext": null,
+            "reserveTokens": 1000,
+            "keepRecentTokens": 2000,
+        }),
         100_000,
         4096,
         vec![ScriptedTurn::Reply(reply_text("still on the valid model"))],
@@ -168,13 +163,12 @@ async fn disabled_automatic_maintenance_still_allows_explicit_compact_and_shake_
     reply.usage.total_tokens = 120_000;
     let (axo, api, _) = harness(
         dir.path(),
-        CompactionSettings {
-            enabled: false,
-            max_context: None,
-            reserve_tokens: Some(0),
-            keep_recent_tokens: Some(0),
-            ..CompactionSettings::default()
-        },
+        json!({
+            "enabled": false,
+            "maxContext": null,
+            "reserveTokens": 0,
+            "keepRecentTokens": 0,
+        }),
         100_000,
         4096,
         vec![
@@ -230,10 +224,7 @@ async fn disabled_automatic_maintenance_does_not_recover_overflow() {
     let dir = tempfile::tempdir().unwrap();
     let (axo, api, _) = harness(
         dir.path(),
-        CompactionSettings {
-            enabled: false,
-            ..CompactionSettings::default()
-        },
+        json!({ "enabled": false }),
         100_000,
         4096,
         vec![ScriptedTurn::Error(

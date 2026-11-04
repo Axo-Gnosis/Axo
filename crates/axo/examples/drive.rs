@@ -1,7 +1,7 @@
 //! The dev client until the ACP binary: runs one prompt in a session with the `ask` tool,
 //! printing every event and answering questions automatically.
 //!
-//! `drive [--dir <AXO_DIR>] [--cwd <path>] [--model <provider/id>] [--thinking <level>]
+//! `drive --dir <dir> [--cwd <path>] [--model <provider/id>] [--thinking <level>]
 //! [--answer recommended|first] [--resume <session.jsonl> [--fork <entry-id>]]
 //! [--navigate <entry-id|root> [--summarize]] [--request-id <id>] [--commands]
 //! [--attach <path>]... [--cgroup] [<prompt>]`
@@ -15,6 +15,12 @@
 //! cgroup supervision with drive itself as the supervisor process (it routes
 //! `drive axo-supervisor …` to `axo::exec::supervisor::run`) and needs a delegated cgroup;
 //! the default is process-group supervision, which needs nothing extra.
+//!
+//! `--dir` holds the examples' own layout (see `support/dir_host.rs`): settings, prompt
+//! overrides, skills, `AGENTS.md`, models, credentials, sessions and caches.
+
+#[path = "support/dir_host.rs"]
+mod dir_host;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,7 +29,7 @@ use std::sync::Arc;
 
 use axo::store::{self, Entry, EntryId, SeqEntry};
 use axo::{
-    Answer, Axo, Command, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult,
+    Answer, Command, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult,
     Session, SessionEvent, SessionOptions, Supervision,
 };
 use axo_agent::AgentEvent;
@@ -110,6 +116,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => prompt.push(arg),
         }
     }
+    let dir = dir.ok_or("--dir is required")?;
     let text = prompt.join(" ");
     let command = Command::parse(&text).transpose()?;
     if command.is_some() && !attachments.is_empty() {
@@ -150,7 +157,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("a prompt is required".into());
     }
 
-    let mut builder = Axo::builder();
+    let mut builder = dir_host::builder(dir).await?;
     if cgroup {
         builder = builder.supervision(Supervision::Cgroup {
             program: std::env::current_exe()?,
@@ -158,10 +165,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cgroup_root: None,
         });
     }
-    if let Some(dir) = dir {
-        builder = builder.dir(dir);
-    }
-    let axo = builder.build().await?;
+    let axo = builder.build();
     let options = || SessionOptions {
         cwd: cwd.clone(),
         model: model.clone(),

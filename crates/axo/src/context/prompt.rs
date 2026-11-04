@@ -1,30 +1,30 @@
 //! The sectioned system prompt (pi `core/system-prompt.ts`, `plan/pi/context.md` §1).
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use axo_agent::Tool;
 use axo_ai::{SystemMessage, now_ms};
 use indexmap::IndexMap;
 
-use crate::config::AxoDir;
-use crate::context::Diagnostic;
+use crate::config::PromptOverride;
 use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
+use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
 /// `system, docs, tools, schemes, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
-/// Everything one prompt build reads besides the prompt files.
+/// Everything one prompt build reads.
 pub struct PromptInputs<'a> {
-    pub dir: &'a AxoDir,
     pub cwd: &'a Path,
-    /// Read `<cwd>/.axo/prompts/<NAME>.md` overrides.
-    pub project_prompts: bool,
+    /// The session's trimmed prompt overrides, keyed by prompt name.
+    pub prompts: &'a IndexMap<String, PromptOverride>,
+    /// Where to materialize the bundled docs; `None` omits the `docs` section.
+    pub docs_dir: Option<&'a Path>,
     /// Active tools; their guidelines make the `tools` section.
     pub tools: &'a [Arc<dyn Tool>],
     /// Scheme prompt docs: the schemes section.
@@ -60,9 +60,8 @@ const BUNDLED_DOCS: &[(&str, &str)] = &[
     ("extending.md", include_str!("../../docs/extending.md")),
 ];
 
-fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<()> {
-    let docs_dir = dir.docs_dir();
-    std::fs::create_dir_all(&docs_dir)?;
+fn ensure_bundled_docs(docs_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(docs_dir)?;
     for &(name, content) in BUNDLED_DOCS {
         let path = docs_dir.join(name);
         let unchanged = std::fs::read(&path).is_ok_and(|bytes| bytes == content.as_bytes());
@@ -73,66 +72,39 @@ fn ensure_bundled_docs(dir: &AxoDir) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The first existing `<NAME>.md` override, trimmed: `<cwd>/.axo/prompts/` (when `project`),
-/// then `<AXO_DIR>/prompts/`. Unreadable files become diagnostics. Blocking filesystem I/O.
-pub(crate) fn prompt_override(
-    dir: &AxoDir,
-    cwd: &Path,
-    project: bool,
-    name: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<(PathBuf, String)> {
-    let project = project.then(|| cwd.join(".axo/prompts").join(format!("{name}.md")));
-    for path in project.into_iter().chain([dir.prompt_path(name)]) {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => return Some((path, text.trim().to_owned())),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => diagnostics.push(Diagnostic {
-                path: Some(path),
-                message: error.to_string(),
-            }),
-        }
-    }
-    None
-}
-
-/// Builds the sections. `system`, `work` and `prose` come from [`prompt_override`], else
-/// the bundled file (none for `WORK.md`); an existing empty or whitespace-only file
-/// disables the section. Blocking filesystem I/O.
+/// Builds the sections. `system`, `work` and `prose` come from the overrides, else the
+/// bundled file (none for `WORK.md`); an empty override disables the section. Blocking
+/// filesystem I/O when `docs_dir` is set.
 pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     // Bodies first; rendering into tags happens at the end, after host overrides.
     let mut bodies: IndexMap<String, String> = IndexMap::new();
 
-    let mut prompt_file = |name: &str, bundled: Option<&str>| -> String {
-        prompt_override(
-            inputs.dir,
-            inputs.cwd,
-            inputs.project_prompts,
-            name,
-            &mut diagnostics,
-        )
-        .map_or_else(
-            || bundled.unwrap_or_default().trim().to_owned(),
-            |(_, text)| text,
-        )
+    let prompt_file = |name: &str, bundled: &str| -> String {
+        inputs
+            .prompts
+            .get(name)
+            .map_or(bundled.trim(), |prompt| prompt.text.as_str())
+            .to_owned()
     };
-    let system = prompt_file("SYSTEM", Some(BUNDLED_SYSTEM));
-    let work = prompt_file("WORK", None);
-    let prose = prompt_file("PROSE", Some(BUNDLED_PROSE));
+    let system = prompt_file("SYSTEM", BUNDLED_SYSTEM);
+    let work = prompt_file("WORK", "");
+    let prose = prompt_file("PROSE", BUNDLED_PROSE);
 
     bodies.insert("system".into(), system);
-    match ensure_bundled_docs(inputs.dir) {
-        Ok(()) => {
-            bodies.insert(
-                "docs".into(),
-                "axo's documentation, including how to extend it: axo://README.md".into(),
-            );
+    if let Some(docs_dir) = inputs.docs_dir {
+        match ensure_bundled_docs(docs_dir) {
+            Ok(()) => {
+                bodies.insert(
+                    "docs".into(),
+                    "axo's documentation, including how to extend it: axo://README.md".into(),
+                );
+            }
+            Err(error) => diagnostics.push(Diagnostic {
+                origin: Some(DiagnosticOrigin::Path(docs_dir.to_path_buf())),
+                message: error.to_string(),
+            }),
         }
-        Err(error) => diagnostics.push(Diagnostic {
-            path: Some(inputs.dir.docs_dir()),
-            message: error.to_string(),
-        }),
     }
 
     bodies.insert("tools".into(), render_guidelines(inputs.tools));
@@ -202,7 +174,7 @@ pub fn build_sections(inputs: &PromptInputs<'_>) -> (Sections, Vec<Diagnostic>) 
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
         if !valid {
             diagnostics.push(Diagnostic {
-                path: None,
+                origin: None,
                 message: format!("Invalid system prompt section name: {name}"),
             });
             continue;
@@ -283,14 +255,15 @@ pub fn system_message(prev: Option<&Sections>, next: &Sections) -> Option<System
 mod tests {
     use super::*;
 
-    #[test]
-    fn docs_section_materializes_bundled_docs_after_system() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = AxoDir::new(temp.path().join("axo"));
-        let (sections, diagnostics) = build_sections(&PromptInputs {
-            dir: &dir,
-            cwd: temp.path(),
-            project_prompts: false,
+    fn inputs<'a>(
+        prompts: &'a IndexMap<String, PromptOverride>,
+        docs_dir: Option<&'a Path>,
+        cwd: &'a Path,
+    ) -> PromptInputs<'a> {
+        PromptInputs {
+            prompts,
+            docs_dir,
+            cwd,
             tools: &[],
             scheme_docs: &[],
             context_files: &[],
@@ -298,7 +271,16 @@ mod tests {
             dev_shell: None,
             date: "2026-10-22",
             host_sections: &[],
-        });
+        }
+    }
+
+    #[test]
+    fn docs_section_materializes_bundled_docs_after_system() {
+        let temp = tempfile::tempdir().unwrap();
+        let docs_dir = temp.path().join("cache/docs");
+        let prompts = IndexMap::new();
+        let (sections, diagnostics) =
+            build_sections(&inputs(&prompts, Some(&docs_dir), temp.path()));
         assert!(diagnostics.is_empty());
         let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
         assert_eq!(&keys[..2], &["system", "docs"]);
@@ -308,9 +290,26 @@ mod tests {
         );
         for &(name, expected) in BUNDLED_DOCS {
             assert_eq!(
-                std::fs::read_to_string(dir.docs_dir().join(name)).unwrap(),
+                std::fs::read_to_string(docs_dir.join(name)).unwrap(),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn overrides_replace_or_disable_sections_and_no_docs_dir_omits_docs() {
+        let override_ = |text: &str| PromptOverride {
+            origin: "host".into(),
+            text: text.into(),
+        };
+        let prompts = IndexMap::from([
+            ("SYSTEM".to_owned(), override_("Host system.")),
+            ("PROSE".to_owned(), override_("")),
+        ]);
+        let (sections, diagnostics) = build_sections(&inputs(&prompts, None, Path::new("/w")));
+        assert!(diagnostics.is_empty());
+        assert_eq!(sections["system"], "<system>\nHost system.\n</system>");
+        assert!(!sections.contains_key("docs"));
+        assert!(!sections.contains_key("prose"));
     }
 }

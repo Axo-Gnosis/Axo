@@ -71,7 +71,7 @@ async fn stop_latch_defers_delivery_to_the_next_prompt() {
     let host = common::host(
         dir.path(),
         json!([{"id":"m"}]),
-        axo::Settings::default(),
+        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c1",
@@ -170,7 +170,7 @@ async fn reopen_marks_admitted_jobs_interrupted_once() {
     let host = common::host(
         dir.path(),
         json!([{"id":"m"}]),
-        axo::Settings::default(),
+        json!({}),
         vec![ScriptedTurn::Reply(reply_text("ancestor"))],
     )
     .await;
@@ -297,7 +297,7 @@ async fn job_ids_skip_every_recorded_id() {
     let host = common::host(
         dir.path(),
         json!([{"id":"m"}]),
-        axo::Settings::default(),
+        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("ancestor")),
             ScriptedTurn::Reply(reply_tool_calls(&[(

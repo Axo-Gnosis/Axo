@@ -12,15 +12,18 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// A config file (`settings.jsonc`, `models.jsonc`) could not be parsed.
+    /// A configuration value is invalid; `origin` names the layer or prompt override that holds it.
+    #[error("{origin}: {message}")]
+    Config { origin: String, message: String },
+    /// A host integration such as a `ConfigSource` failed; carries the host's own error.
+    #[error(transparent)]
+    Host(Box<dyn std::error::Error + Send + Sync>),
+    /// A session file's header line is missing or does not parse.
     #[error("{}: {message}", path.display())]
-    Config { path: PathBuf, message: String },
+    InvalidSessionHeader { path: PathBuf, message: String },
     /// A host scheme has an invalid or reserved name.
     #[error("{0}")]
     Scheme(String),
-    /// Neither `AXO_DIR` nor `HOME` is set.
-    #[error("Cannot locate the axo directory: set AXO_DIR or HOME")]
-    NoAxoDir,
     #[error("No model configured")]
     NoModel,
     #[error("Model not found: {0}")]

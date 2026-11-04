@@ -1,37 +1,72 @@
 # Embedding & Extending axo
 
-`axo` can be customized declaratively through files in `~/.axo/`, `<cwd>/.axo/`, and `.agents/`, or extended in Rust by embedding `axo`, `axo-agent`, and `axo-ai`.
+`axo` is a library with no configuration directory of its own. Hosts customize it by supplying configuration through `ConfigSource` and resources through `Axo::builder`, and extend it in Rust by embedding `axo`, `axo-agent`, and `axo-ai`. Repositories and users customize sessions through the ecosystem `.agents/` and `AGENTS.md` conventions and whatever the host exposes.
 
-## 1. Declarative Customization
+## 1. Configuration and Declarative Files
 
-Without writing Rust code, users and repositories can customize an agent session through four file mechanisms:
+axo reads the ecosystem files itself; everything else arrives from the host, in whatever names, locations, and formats the host chooses (see [`configuration.md`](configuration.md#configuration-source-axoconfigsource)):
 
-- **Context files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, `.axo/AGENTS.md`, plus any path enabled in `settings.contextFiles`):** Add persona, architecture notes, and coding rules at `~/.axo/AGENTS.md`, the repository root, or subdirectories (loaded on demand when `read`, `write`, or `edit` touches that subtree). See [`prompts-and-context.md`](prompts-and-context.md#context-files-cratesaxosrccontextfilesrs).
-- **Prompt overrides (`~/.axo/prompts/<NAME>.md` and `<cwd>/.axo/prompts/<NAME>.md`):** Override `SYSTEM.md`, `WORK.md`, `PROSE.md`, or the summarizer prompts (`SUMMARY.md`, `COMPACTION.md`, `COMPACTION_UPDATE.md`, `COMPACTION_SPLIT_TURN.md`, `BRANCH_SUMMARY.md`). Writing an empty `SYSTEM.md`, `WORK.md`, or `PROSE.md` disables that prompt section.
-- **Skills (`.agents/skills/<name>/SKILL.md`, `~/.axo/skills/<name>/SKILL.md`, and `~/.agents/skills/<name>/SKILL.md`):** Package task instructions and reference files that the model reads on demand from `<available_skills>` or the user invokes inline with `/<name> [args]` (`~/.agents/skills` only with `homeAgentsDir: true`; project skills need project access). Optional `argument-hint` frontmatter is the placeholder apps show after `/<name>`; a skill named like a built-in command (`compact`, `shake`, `model`, `thinking`, `navigate`) gets a warning diagnostic and is left out of the command catalog. See [`prompts-and-context.md`](prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
-- **Custom providers and model patches (`~/.axo/models.jsonc`):** Register OpenAI- or Anthropic-compatible endpoints, custom headers, `$ENV` or `!command` API key resolvers, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `cost`, `compat`). See [`configuration.md`](configuration.md#modelsjsonc-axo_aimodelsconfig--credentials).
+- **Context files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, plus any path enabled in `settings.contextFiles`):** Add persona, architecture notes, and coding rules at the repository root or in subdirectories (loaded on demand when `read`, `write`, or `edit` touches that subtree). User-wide files come from the host as `UserConfig::context_files`, and `~/.agents/AGENTS.md` with `homeAgentsDir: true`. See [`prompts-and-context.md`](prompts-and-context.md#context-files-cratesaxosrccontextfilesrs).
+- **Prompt overrides (`ConfigLayer::prompts`):** The user and project layers may override `SYSTEM`, `WORK`, `PROSE`, or the summarizer prompts (`SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`); the project's override wins per name. An empty `SYSTEM`, `WORK`, or `PROSE` override disables that prompt section, an empty summarizer override keeps the bundled prompt with a `Diagnostic`, and a name outside `PROMPT_NAMES` is an `Error::Config`.
+- **Skills (`.agents/skills/<name>/SKILL.md`, host skill roots, and `~/.agents/skills/<name>/SKILL.md`):** Package task instructions and reference files that the model reads on demand from `<available_skills>` or the user invokes inline with `/<name> [args]`. Roots are searched in order: project `.agents/skills` (needs project access and `project.files.skills`), each `UserConfig::skill_roots` entry, then `~/.agents/skills` (only with `homeAgentsDir: true`). Optional `argument-hint` frontmatter is the placeholder apps show after `/<name>`; a skill named like a built-in command (`compact`, `shake`, `model`, `thinking`, `navigate`) gets a warning diagnostic and is left out of the command catalog. See [`prompts-and-context.md`](prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
+- **Custom providers and model patches (`axo_ai::ModelsConfig`):** The host's `ModelsConfig` registers OpenAI- or Anthropic-compatible endpoints, custom headers, `$ENV` or `!command` API key resolvers, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `cost`, `compat`). See [`configuration.md`](configuration.md#models-axo_aimodelsconfig--credentials).
 
 ## 2. Embedding `axo` in a Rust Host
 
-Hosts link the `axo` crate to manage `Models`, `Settings`, `JsonlStore`, and `Session` instances in a single process.
+Hosts link the `axo` crate to manage `Models`, a `SessionStore`, a `ConfigSource`, and `Session` instances in a single process. `Axo::builder(models, store)` takes the two required inputs; `AxoBuilder::config` and `AxoBuilder::cache_dir` are optional (see [Absent inputs](configuration.md#absent-inputs)), and `AxoBuilder::build` is synchronous, infallible, and performs no configuration I/O. The user layer is sampled at every `create_session`, `open_session`, and `Axo::schemes` call; a fork inherits its parent's resolved configuration.
 
 ### Building `Axo` and running a `Session`
 
 ```rust,no_run
 # async fn example() -> Result<(), axo::Error> {
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use axo::store::JsonlStore;
 use axo::{
-    Answer, Axo, Command, CommandInfo, NavigateOptions, PromptPart, PromptRequest, PromptResult,
-    RecoveryPolicy, SessionEvent, SessionOptions, ShakeMode,
+    Answer, Axo, Command, CommandInfo, ConfigLayer, ConfigSource, NavigateOptions, PromptPart,
+    PromptRequest, PromptResult, RecoveryPolicy, SessionEvent, SessionOptions, ShakeMode,
+    UserConfig,
 };
+use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 use serde_json::json;
 
-let axo = Axo::builder()
-    .dir(PathBuf::from("/var/lib/my-host/axo"))
+/// The host's configuration: names, locations, and formats are its own choice.
+struct HostConfig;
+
+impl ConfigSource for HostConfig {
+    fn user(&self) -> Result<UserConfig, axo::Error> {
+        Ok(UserConfig {
+            layer: ConfigLayer {
+                origin: "my-host user settings".into(),
+                settings: Some(json!({ "project": { "access": "read" } })),
+                ..ConfigLayer::default()
+            },
+            skill_roots: vec![PathBuf::from("/var/lib/my-host/skills")],
+            context_files: vec![PathBuf::from("/var/lib/my-host/AGENTS.md")],
+        })
+    }
+
+    fn project(&self, _cwd: &Path) -> Result<ConfigLayer, axo::Error> {
+        // Untrusted data: axo validates and filters whatever is returned here.
+        Ok(ConfigLayer::default())
+    }
+}
+
+let state = PathBuf::from("/var/lib/my-host");
+let models = Models::load(ModelsOptions {
+    cache_dir: Some(state.join("cache")),
+    extended_context: false,
+    config: ModelsConfig::default(),
+    credentials: Arc::new(FileCredentialStore::new(state.join("credentials.json"))),
+})
+.await?;
+let axo = Axo::builder(Arc::new(models), Arc::new(JsonlStore::new(state.join("sessions"))))
+    .config(Arc::new(HostConfig))
+    // Bundled docs (`axo://`) and dev-shell captures; omit to run without them.
+    .cache_dir(state.join("cache"))
     // Commands run in process groups by default (`Supervision::ProcessGroup`); see below
     // for the opt-in cgroup mode.
-    .build()
-    .await?;
+    .build();
 
 let session = axo
     .create_session(SessionOptions {
@@ -160,14 +195,15 @@ Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
 
 | Trait | Crate | Purpose |
 | :--- | :--- | :--- |
-| `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `HostEnv`, `DevShellEnv`, and `StaticEnv`. Passed via `SessionOptions::exec_env`. `DevShellEnv::new(base, settings, cache_dir, supervisor: Arc<ProcessSupervisor>)` runs its direnv, git, nix and capture subprocesses through that supervisor; `ExecEnv` only resolves the environment, and every command still runs supervised |
-| `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites whole-word, `--flag=`/`NAME=`, and redirect-target URLs to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it). `edit`/`write` refuse non-writable files (`{url} is read-only`); bash refuses virtual URLs (`Cannot use {url} in bash: no file backs it. Use read {url}.`) and output redirects onto read-only files. `prompt_doc` (default empty) is the one-line bullet listed in the model's `schemes` prompt section. Host scheme names must match `^[a-z][a-z0-9+.-]+$` (lowercase, two or more characters); `artifact` and `file` are reserved (`Error::Scheme`). `write_replay` defaults to `Replay::Never`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://`, and in open sessions `proc://` (background jobs; see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)). Passed via `SessionOptions::schemes`; a host scheme named like a built-in replaces it. Hosts resolve URLs they display through `Session::schemes()` or `Axo::schemes(path, project_access, host_schemes)` |
-| `SessionStore` / `SessionWriter` | `axo::store::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading (whole sessions or just the header), listing, and appending session entries. Default implementation: `JsonlStore`. Passed via `AxoBuilder::store` |
+| `ConfigSource` | `axo::ConfigSource` | Supplies configuration: `user()` returns the trusted `UserConfig` (sampled at every `create_session`, `open_session`, and `Axo::schemes`), `project(cwd)` the untrusted project `ConfigLayer` (called only at `Read` or `Trust`, and only when the user's `project.files.config` is `true`). axo validates, merges, and filters both through `EffectiveConfig::resolve`. Passed via `AxoBuilder::config`; without one, sessions use default settings and no project layer. See [Configuration source](configuration.md#configuration-source-axoconfigsource) |
+| `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `HostEnv`, `DevShellEnv`, and `StaticEnv`. Passed via `SessionOptions::exec_env`. `DevShellEnv::new(base, settings, cache_dir: Option<PathBuf>, supervisor: Arc<ProcessSupervisor>)` runs its direnv, git, nix and capture subprocesses through that supervisor (a `None` `cache_dir` makes Nix mode resolve to `base`); `ExecEnv` only resolves the environment, and every command still runs supervised |
+| `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites whole-word, `--flag=`/`NAME=`, and redirect-target URLs to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it). `edit`/`write` refuse non-writable files (`{url} is read-only`); bash refuses virtual URLs (`Cannot use {url} in bash: no file backs it. Use read {url}.`) and output redirects onto read-only files. `prompt_doc` (default empty) is the one-line bullet listed in the model's `schemes` prompt section. Host scheme names must match `^[a-z][a-z0-9+.-]+$` (lowercase, two or more characters); `artifact` and `file` are reserved (`Error::Scheme`). `write_replay` defaults to `Replay::Never`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://` (only when the host set `AxoBuilder::cache_dir`), and in open sessions `proc://` (background jobs; see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)). Passed via `SessionOptions::schemes`; a host scheme named like a built-in replaces it. Hosts resolve URLs they display through `Session::schemes()` or `Axo::schemes(path, project_access, host_schemes)` |
+| `SessionStore` / `SessionWriter` | `axo::store::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading (whole sessions or just the header), listing, and appending session entries. Bundled implementation: `JsonlStore`. Passed as the required `store` argument of `Axo::builder` |
 | `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, and `execute(cx: ToolContext<'_>)`) for `axo_agent::Agent`. `execution_mode` defaults to `Parallel`, `replay` to `Never`, `prompt_guidelines` to empty. Tools hold their own session handles; `cx` carries per-call state. Pass host tools as `SessionOptions::tools` `ToolFactory` closures; axo calls each with the session's `Arc<SessionTools>` (again per fork), so the tool can use `locate`, `schemes`, `rewrite_urls`, the ledger, the `exec` environment, and the `supervisor` for subprocesses. One named like a built-in replaces it in place |
 | `LoopHooks` | `axo_agent::LoopHooks` | Lifecycle hooks on `axo_agent::Agent`: `transform_context` (per-request message rewrite), `convert_to_llm` (lowers `Custom` messages; default drops them), `prepare_request` (returns `RequestUpdate { context, model, thinking }`), `should_skip_tools` (intercepts unusable responses before tools run), `before_tool_call` (can return `ToolCallDecision::Block { reason, terminate }`; a hook error blocks the call), `after_tool_call` (returns `AfterToolCallResult` overrides; a hook error is logged and ignored), `finish_turn` (returns `TurnFinish { decision: Option<TurnDecision>, context }` where `TurnDecision` is `Continue` or `End`), `prepare_next_turn` (returns `TurnUpdate` with messages getting `MessageOrigin::Run`), and `steering` / `follow_up` (host-supplied `Vec<QueuedMessage>` drained after agent queues; see [Queued inputs and message origins](#queued-inputs-and-message-origins)) |
 | `Persist` | `axo_agent::Persist` | Ordered async subscriber on `axo_agent::Agent` awaited before the next model request (used by `Session` to persist `Entry::Message` on `MessageEnd { message, origin }`) |
 | `Api` / `Streamer` | `axo_ai::{Api, Streamer}` | Streaming LLM wire adapter (`AnthropicApi`, `CompletionsApi`, `CodexApi`, or `ScriptedApi` behind the `testing` feature). Custom streamers can be injected via `AxoBuilder::streamer` |
-| `CredentialStore` | `axo_ai::CredentialStore` | Loads and saves per-provider `Credential`s (`FileCredentialStore` by default). Supports `get`, `set`, `remove`, and `update` (runs a transform under the store's cross-process file lock). Injected via `ModelsOptions::credentials` and `AxoBuilder::models` |
+| `CredentialStore` | `axo_ai::CredentialStore` | Loads and saves per-provider `Credential`s (`FileCredentialStore` over a host-named file is bundled). Supports `get`, `set`, `remove`, and `update` (runs a transform under the store's cross-process file lock). Injected via `ModelsOptions::credentials` into the `Models` the host passes to `Axo::builder` |
 
 ### Implementing `axo_agent::Tool`
 
@@ -326,7 +362,7 @@ The supervision API (`axo::exec::host`, with `OutputError`, `ProcessSupervisor` 
 | :--- | :--- | :--- |
 | `Supervision` | `enum { ProcessGroup, Cgroup { program: PathBuf, args: Vec<OsString>, cgroup_root: Option<PathBuf> } }` | How commands are contained; `Default` is `ProcessGroup`. In `Cgroup`, axo runs `program args… guard <dir>` and `program args… enter <dir> <command…>`, which the host must route to `axo::exec::supervisor::run`; a bare `program` resolves on axo's own PATH at spawn |
 | `ExecSpec` | `{ program: PathBuf, args: Vec<OsString>, cwd: PathBuf, env: EnvMap }` | One command. `env` is the complete environment (`env_clear` semantics); a bare `program` resolves on its `PATH` |
-| `ProcessSupervisor::new` | `fn new(supervision: Supervision) -> Arc<Self>` | Checks nothing yet, so hosts that never run commands need no delegated cgroup even in `Cgroup` mode. `Axo::build` creates one per `Axo` with the builder's `Supervision` (default `ProcessGroup`) |
+| `ProcessSupervisor::new` | `fn new(supervision: Supervision) -> Arc<Self>` | Checks nothing yet, so hosts that never run commands need no delegated cgroup even in `Cgroup` mode. `AxoBuilder::build` creates one per `Axo` with the builder's `Supervision` (default `ProcessGroup`) |
 | `ProcessSupervisor::spawn` | `async fn spawn(&self, spec: ExecSpec) -> Result<Process, String>` | Starts `spec` in a fresh container (process group or cgroup job) with stdin closed and stdout/stderr piped. In process-group mode an unstartable program returns `Err`; in cgroup mode `spawn` succeeds and the root exits 127 with `axo supervisor: cannot run …` on stderr (fails closed when supervision is unavailable; see [Command supervision](configuration.md#command-supervision-axosupervision)). Cancelling leaves nothing behind |
 | `ProcessSupervisor::output` | `async fn output(&self, spec: ExecSpec, deadline: Option<tokio::time::Instant>) -> Result<std::process::Output, OutputError>` | Like `Command::output`: reads stdout and stderr while waiting for the root, then kills anything left in the container and closes it. Reaching `deadline` kills the job and returns `OutputError::TimedOut`; a spawn or wait failure returns `OutputError::Failed(message)`. `OutputError` implements `Display` (`timed out`, or the message) and `std::error::Error` |
 | `Process` | `pub stdout: Option<ChildStdout>`, `pub stderr: Option<ChildStderr>` | A running job. `capture_output()` merges both pipes into one `mpsc::Receiver<Vec<u8>>` (plus the reader `JoinSet`); `wait()` waits for the root (cancel-safe; in cgroup mode a guardian that dies first takes the job with it); `guardian_lost().await` resolves once the cgroup guardian has died, after killing the job (for watching leftovers after the root exited; cancel-safe, resolves at most once, and never in process-group mode, whose guard is best effort); `container()` returns a cloneable `Container`; `close().await` waits until the container is empty, removes the cgroup directory in cgroup mode, and stands the watcher down (call `container().kill()` first to end leftovers). Dropping an unclosed `Process` kills the whole container |

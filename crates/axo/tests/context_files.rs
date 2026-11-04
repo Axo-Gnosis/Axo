@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use axo::config::{AxoDir, Settings};
+use axo::config::Settings;
 use axo::context::files::{ContextFile, NestedContext, context_file_names, load_context_files};
 use axo_agent::AgentMessage;
 use axo_ai::{Message, ToolResultMessage, UserBlock};
@@ -9,6 +9,11 @@ use indexmap::IndexMap;
 
 fn names() -> Vec<PathBuf> {
     context_file_names(&Settings::default().context_files).0
+}
+
+/// The user context files a host registers under `temp`.
+fn user_files(temp: &Path) -> [PathBuf; 1] {
+    [temp.join("axo/AGENTS.md")]
 }
 
 fn put(path: &Path, text: &str) {
@@ -38,7 +43,7 @@ fn enabled_names_validate_and_place_tagged_variants() {
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.path.is_none())
+            .all(|diagnostic| diagnostic.origin.is_none())
     );
 
     let map = ["", ".", "./X.md", "sub/./X.md", "sub/.", "sub/../X.md"]
@@ -79,18 +84,18 @@ fn enabled_names_validate_and_place_tagged_variants() {
 #[test]
 fn startup_deduplicates_copies_and_places_local_after_base() {
     let temp = tempfile::tempdir().unwrap();
-    let dir = AxoDir::new(temp.path().join("axo"));
+    let user = user_files(temp.path());
     let root = temp.path().join("project");
     fs::create_dir_all(root.join(".git")).unwrap();
     put(&root.join("AGENTS.md"), "\u{feff}A");
     put(&root.join("CLAUDE.md"), "A");
-    let (files, diagnostics) = load_context_files(&dir, None, &root, true, &names());
+    let (files, diagnostics) = load_context_files(&user, None, &root, true, &names());
     assert!(diagnostics.is_empty());
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].content, "A");
 
     put(&root.join("AGENTS.local.md"), "L");
-    let (files, diagnostics) = load_context_files(&dir, None, &root, true, &names());
+    let (files, diagnostics) = load_context_files(&user, None, &root, true, &names());
     assert!(diagnostics.is_empty());
     assert_eq!(
         files
@@ -106,12 +111,12 @@ fn startup_deduplicates_copies_and_places_local_after_base() {
 #[test]
 fn startup_deduplicates_symlinked_files() {
     let temp = tempfile::tempdir().unwrap();
-    let dir = AxoDir::new(temp.path().join("axo"));
+    let user = user_files(temp.path());
     let root = temp.path().join("project");
     fs::create_dir_all(root.join(".git")).unwrap();
     put(&root.join("AGENTS.md"), "A");
     std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
-    let (files, diagnostics) = load_context_files(&dir, None, &root, true, &names());
+    let (files, diagnostics) = load_context_files(&user, None, &root, true, &names());
     assert!(diagnostics.is_empty());
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, root.join("AGENTS.md"));
@@ -120,7 +125,7 @@ fn startup_deduplicates_symlinked_files() {
 #[test]
 fn startup_walk_is_user_files_then_root_to_cwd_and_reports_bad_text() {
     let temp = tempfile::tempdir().unwrap();
-    let dir = AxoDir::new(temp.path().join("axo"));
+    let user = user_files(temp.path());
     let root = temp.path().join("project");
     let cwd = root.join("sub/deep");
     fs::create_dir_all(root.join(".git")).unwrap();
@@ -128,8 +133,8 @@ fn startup_walk_is_user_files_then_root_to_cwd_and_reports_bad_text() {
     // User AGENTS.md files load regardless of the map, which never applies to user dirs.
     let home_agents = temp.path().join("home/.agents");
     put(&home_agents.join("AGENTS.md"), "home");
-    put(&dir.root().join("AGENTS.md"), "global");
-    put(&dir.root().join("SOUL.md"), "not project scope");
+    put(&user[0], "global");
+    put(&temp.path().join("axo/SOUL.md"), "not project scope");
     put(&root.join("SOUL.md"), "root");
     put(&root.join("sub/SOUL.md"), "sub");
     put(&cwd.join("SOUL.md"), "cwd");
@@ -137,7 +142,7 @@ fn startup_walk_is_user_files_then_root_to_cwd_and_reports_bad_text() {
     // No built-in candidate may load unless named by the map.
     put(&root.join("AGENTS.md"), "not enabled");
     let names = [PathBuf::from("SOUL.md"), PathBuf::from("BAD.md")];
-    let (files, diagnostics) = load_context_files(&dir, Some(&home_agents), &cwd, true, &names);
+    let (files, diagnostics) = load_context_files(&user, Some(&home_agents), &cwd, true, &names);
     assert_eq!(
         files
             .iter()
@@ -147,11 +152,11 @@ fn startup_walk_is_user_files_then_root_to_cwd_and_reports_bad_text() {
     );
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
-        diagnostics[0].path.as_deref(),
-        Some(cwd.join("BAD.md").as_path())
+        diagnostics[0].origin,
+        Some(axo::DiagnosticOrigin::Path(cwd.join("BAD.md")))
     );
     // Without homeAgentsDir, ~/.agents stays unread.
-    let (files, diagnostics) = load_context_files(&dir, None, &cwd, false, &names);
+    let (files, diagnostics) = load_context_files(&user, None, &cwd, false, &names);
     assert!(diagnostics.is_empty());
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].content, "global");
@@ -160,7 +165,7 @@ fn startup_walk_is_user_files_then_root_to_cwd_and_reports_bad_text() {
 #[tokio::test]
 async fn nested_context_tracks_model_visible_results_and_reattaches_after_restore() {
     let temp = tempfile::tempdir().unwrap();
-    let dir = AxoDir::new(temp.path().join("axo"));
+    let user = user_files(temp.path());
     let root = temp.path().join("project");
     fs::create_dir_all(root.join(".git")).unwrap();
     put(&root.join("AGENTS.md"), "startup");
@@ -168,7 +173,7 @@ async fn nested_context_tracks_model_visible_results_and_reattaches_after_restor
     put(&nested_path, "\u{feff}feature\nsecond line");
     // Copies of startup context must not reach the model a second time.
     put(&root.join("sub/CLAUDE.md"), "startup");
-    let (startup, diagnostics) = load_context_files(&dir, None, &root, true, &names());
+    let (startup, diagnostics) = load_context_files(&user, None, &root, true, &names());
     assert!(diagnostics.is_empty());
     let context = NestedContext::new(Some(root.clone()), names(), &startup);
     let touched = root.join("sub/feature/x.txt");

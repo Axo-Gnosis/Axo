@@ -1,7 +1,7 @@
 //! ChatGPT (Codex) OAuth login: prints the authorize URL, then completes on the local
 //! callback or on a redirect URL / code pasted into stdin.
 //!
-//! `login --dir <AXO_DIR> openai-codex`
+//! `login --dir <dir> openai-codex`
 
 use std::path::PathBuf;
 

@@ -8,7 +8,7 @@ use axo::schemes::artifact::Artifacts;
 use axo::store::{
     self, CompactionReason, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore,
 };
-use axo::{Axo, CompactionSettings, NavigateOptions, Session, Settings, ShakeMode, SummaryRequest};
+use axo::{Axo, ConfigLayer, NavigateOptions, PromptOverride, Session, ShakeMode};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::estimate::estimate_message_tokens;
 use axo_ai::testing::{reply_text, reply_tool_calls};
@@ -18,27 +18,32 @@ use axo_ai::{
     ReasoningReplay, ScriptedApi, ScriptedTurn, ToolChoice, ToolResultMessage, UserBlock,
     UserMessage,
 };
-use common::{options, within};
+use common::{TestConfig, options, within};
 use serde_json::json;
 
 const OVERSIZED: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
 
-fn settings(tail: u64) -> Settings {
-    Settings {
-        compaction: CompactionSettings {
-            enabled: false,
-            max_context: None,
-            reserve_tokens: Some(1024),
-            keep_recent_tokens: Some(tail),
-            summary_request: SummaryRequest::Live,
-        },
-        ..Settings::default()
-    }
+fn settings(tail: u64) -> serde_json::Value {
+    json!({"compaction": {
+        "enabled": false,
+        "maxContext": null,
+        "reserveTokens": 1024,
+        "keepRecentTokens": tail,
+        "summaryRequest": "live",
+    }})
+}
+
+fn prompt(origin: &str, name: &str, text: &str) -> (String, PromptOverride) {
+    let prompt = PromptOverride {
+        origin: origin.to_owned(),
+        text: text.to_owned(),
+    };
+    (name.to_owned(), prompt)
 }
 
 async fn harness(
     dir: &Path,
-    settings: Settings,
+    settings: serde_json::Value,
     window: u64,
     turns: Vec<ScriptedTurn>,
 ) -> (Axo, Arc<ScriptedApi>) {
@@ -367,7 +372,7 @@ async fn image_and_thinking_shakes_are_recoverable_and_idempotent() {
 async fn oversized_separate_input_is_not_sent_or_truncated() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = settings(0);
-    config.compaction.summary_request = SummaryRequest::Separate;
+    config["compaction"]["summaryRequest"] = json!("separate");
     let (axo, api) = harness(dir.path(), config, 8192, vec![]).await;
     let (session, _) = seed(
         &axo,
@@ -395,7 +400,7 @@ async fn oversized_separate_input_is_not_sent_or_truncated() {
 async fn separate_provider_overflow_has_the_same_error_and_no_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = settings(0);
-    config.compaction.summary_request = SummaryRequest::Separate;
+    config["compaction"]["summaryRequest"] = json!("separate");
     let (axo, api) = harness(
         dir.path(),
         config,
@@ -545,21 +550,11 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
     let dir = tempfile::tempdir().unwrap();
     let mut opts = options(dir.path());
     opts.project_access = Some(axo::ProjectAccess::Read);
-    // Project beats user; an empty override keeps the bundled rules.
-    std::fs::create_dir_all(dir.path().join("prompts")).unwrap();
-    std::fs::write(dir.path().join("prompts/COMPACTION.md"), "User task.").unwrap();
-    std::fs::write(dir.path().join("prompts/SUMMARY.md"), " \n").unwrap();
-    std::fs::create_dir_all(opts.cwd.join(".axo/prompts")).unwrap();
-    std::fs::write(
-        opts.cwd.join(".axo/prompts/COMPACTION.md"),
-        "Project task.\n",
-    )
-    .unwrap();
     let rules = include_str!("../prompts/SUMMARY.md").trim();
-    let (axo, api) = harness(
+    let host = common::host(
         dir.path(),
+        json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
         settings(0),
-        100_000,
         vec![
             // Rejected live attempt, so the same compaction also sends a separate request.
             ScriptedTurn::Reply(reply_tool_calls(&[("bad", "read", json!({"path":"x"}))])),
@@ -567,6 +562,28 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
         ],
     )
     .await;
+    // Project beats user; an empty override keeps the bundled rules.
+    host.config.user.lock().unwrap().layer.prompts = [
+        prompt("user COMPACTION", "COMPACTION", "User task."),
+        prompt("user SUMMARY", "SUMMARY", " \n"),
+    ]
+    .into_iter()
+    .collect();
+    host.config.set_project(
+        &opts.cwd,
+        ConfigLayer {
+            origin: "project".into(),
+            prompts: [prompt(
+                "project COMPACTION",
+                "COMPACTION",
+                "Project task.\n",
+            )]
+            .into_iter()
+            .collect(),
+            ..ConfigLayer::default()
+        },
+    );
+    let (axo, api) = (host.axo, host.api);
     let messages = vec![
         user("Remember cedar"),
         assistant("old history ".repeat(1000)),
@@ -646,8 +663,8 @@ async fn manual_focus_reaches_every_summary_request_and_is_recorded() {
 async fn large_tool_history_crosses_threshold_then_continues_with_a_real_tool() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = settings(0);
-    config.compaction.enabled = true;
-    config.compaction.max_context = Some(10_000);
+    config["compaction"]["enabled"] = json!(true);
+    config["compaction"]["maxContext"] = json!(10_000);
     let (axo, api) = harness(
         dir.path(),
         config,
@@ -936,8 +953,8 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
         session.shutdown().await;
         drop(session);
         let mut config = settings(0);
-        config.compaction.enabled = true;
-        config.compaction.max_context = Some(candidate + 20_000 + 1024 - u64::from(above));
+        config["compaction"]["enabled"] = json!(true);
+        config["compaction"]["maxContext"] = json!(candidate + 20_000 + 1024 - u64::from(above));
         let turns = if above {
             vec![
                 ScriptedTurn::Reply(reply_text("summarized old work")),
@@ -1060,13 +1077,13 @@ async fn http_provider_ignoring_none_cannot_execute_summary_tools() {
             "models":[{"id":"m","contextWindow":100000,"maxTokens":4096}]
         }}}).to_string()).unwrap(),
     }).await.unwrap();
-    let axo = Axo::builder()
-        .dir(dir.path().to_path_buf())
-        .settings(settings(0))
-        .models(Arc::new(models))
-        .build()
-        .await
-        .unwrap();
+    let axo = Axo::builder(
+        Arc::new(models),
+        Arc::new(JsonlStore::new(dir.path().join("sessions"))),
+    )
+    .config(Arc::new(TestConfig::for_dir(dir.path(), settings(0))))
+    .cache_dir(dir.path().join("cache"))
+    .build();
     let (session, _) = seed(
         &axo,
         dir.path(),
@@ -1101,8 +1118,8 @@ async fn http_provider_ignoring_none_cannot_execute_summary_tools() {
 async fn three_valid_but_insufficient_summaries_cannot_commit_over_budget() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = settings(0);
-    config.compaction.enabled = true;
-    config.compaction.max_context = Some(8000);
+    config["compaction"]["enabled"] = json!(true);
+    config["compaction"]["maxContext"] = json!(8000);
     let (axo, api) = harness(
         dir.path(),
         config,
@@ -1294,8 +1311,10 @@ async fn eliding_a_real_read_reattaches_nested_instructions_on_the_next_touch() 
     let instructions = "NESTED-CONTRACT: preserve cedar.\n".repeat(100);
     std::fs::write(opts.cwd.join("sub/AGENTS.md"), &instructions).unwrap();
     std::fs::write(opts.cwd.join("sub/data.txt"), "payload\n".repeat(1200)).unwrap();
-    let axo = common::axo(
+    let host = common::host(
         dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "first-read",
@@ -1312,6 +1331,9 @@ async fn eliding_a_real_read_reattaches_nested_instructions_on_the_next_touch() 
         ],
     )
     .await;
+    // Read access acquires the project; it contributes nothing.
+    host.config.set_project(&opts.cwd, ConfigLayer::default());
+    let axo = host.axo;
     let session = axo.create_session(opts).await.unwrap();
     assert_eq!(
         within(session.prompt("Read sub/data.txt")).await.unwrap(),

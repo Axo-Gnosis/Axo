@@ -17,15 +17,25 @@ pub use skills::{parse_command_args, substitute_args};
 /// A non-fatal problem found while loading context resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
-    /// The file the problem is about, if any.
-    pub path: Option<PathBuf>,
+    /// Where the problem is, if anywhere.
+    pub origin: Option<DiagnosticOrigin>,
     pub message: String,
+}
+
+/// Where a diagnostic points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticOrigin {
+    /// A file axo read.
+    Path(PathBuf),
+    /// A host-supplied origin label (`ConfigLayer::origin`, `PromptOverride::origin`).
+    Host(String),
 }
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.path {
-            Some(path) => write!(f, "{}: {}", path.display(), self.message),
+        match &self.origin {
+            Some(DiagnosticOrigin::Path(path)) => write!(f, "{}: {}", path.display(), self.message),
+            Some(DiagnosticOrigin::Host(label)) => write!(f, "{label}: {}", self.message),
             None => f.write_str(&self.message),
         }
     }

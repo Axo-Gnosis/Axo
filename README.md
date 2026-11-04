@@ -14,7 +14,7 @@ The workspace is split into three layered crates so hosts only recompile what ch
 
 | Crate | Purpose | Highlights |
 | :--- | :--- | :--- |
-| **[`axo-ai`](crates/axo-ai)** | LLM message model, streaming adapters, model catalog, and auth | Anthropic Messages, OpenAI Chat Completions, and OpenAI Codex Responses (`auth.json` OAuth + refresh locking); `models.dev` catalog with `extendedContext` price-tier caps; delta `Accumulator`; transient retry and context-overflow classification |
+| **[`axo-ai`](crates/axo-ai)** | LLM message model, streaming adapters, model catalog, and auth | Anthropic Messages, OpenAI Chat Completions, and OpenAI Codex Responses (`auth.json` OAuth + refresh locking); `models.dev` catalog with price-tier caps (lifted by `ModelsOptions::extended_context`); delta `Accumulator`; transient retry and context-overflow classification |
 | **[`axo-agent`](crates/axo-agent)** | Generic tool-calling agent loop | Parallel and sequential `Tool` execution with a per-call `ToolContext` (cancellation, updates, pending-steer signal, invocation id), `Replay` crash-safety contracts (`Safe` vs `Never`), `LoopHooks`, steering and follow-up queues of identified `QueuedMessage`s, `MessageOrigin` provenance on persisted messages, `CancelReason` (`User` vs `Shutdown`), and split event delivery (ordered `Persist` subscriber + non-blocking broadcast) |
 | **[`axo`](crates/axo)** | Sessions, compaction, context assembly, config, and built-in tools | Durable `JsonlStore` with incremental `Projection` and `context_edit`s, single-writer OS locks, crash recovery, `attach` catch-up snapshots, recoverable `/shake` and live/separate compaction summaries, `DevShellEnv` Nix/direnv capture, host-selected command supervision (`Supervision`: process groups by default, opt-in cgroup v2 through an embedded supervisor entry point), per-session URL schemes (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`, host `Scheme`s), background jobs with `proc://` and `wait`, and the built-in tool set |
 
@@ -37,7 +37,7 @@ The workspace is split into three layered crates so hosts only recompile what ch
 
 ### Durable sessions & crash recovery
 
-Every session is an append-only JSONL entry tree (`~/.axo/sessions/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`) protected by an OS file lock (`File::try_lock`) so a second writer gets `Error::SessionBusy` and a crashed process releases the lock automatically.
+Every session is an append-only JSONL entry tree (with the bundled `JsonlStore`: `<root>/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl` under the root the host chooses) protected by an OS file lock (`File::try_lock`) so a second writer gets `Error::SessionBusy` and a crashed process releases the lock automatically.
 
 - **Durable intent:** Submissions (`prompt`, `steer`, `follow_up`, with optional `request_id` deduplication) store their prompt parts, so apps can redraw file and paste chips after reload; `run_start` / `run_end` markers and finished assistant messages are persisted before tool calls execute.
 - **Reopen recovery:** When a session with an unfinished run reopens under `RecoveryPolicy::Resume`, `Replay::Safe` tools (`read`, `grep`, `find`, `ask`, `wait`, and `write` to plain paths or `local://`) re-run automatically and `Replay::Never` tools (`bash`, `edit`, and `write` to action schemes) receive an interrupted result pointing to any spooled output. Background jobs that were still running are marked interrupted once, with their partial-output reference. Five consecutive resumes without progress end the run as `Interrupted` with reason `restart_limit`.
@@ -76,17 +76,17 @@ Every local command (`bash` and dev-shell capture) runs in its own container, ch
 
 The system prompt lives in the transcript as named `<section>` blocks (`system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `cwd`, `dev_shell`, `date`, plus host sections). Mid-session updates emit a diff `SystemMessage` containing only changed sections.
 
-- **Replaceable prompt files:** `SYSTEM.md`, `WORK.md`, `PROSE.md`, and the five summarizer prompts can be overridden in `~/.axo/prompts/` or `<cwd>/.axo/prompts/`. Writing an empty `SYSTEM.md`, `WORK.md`, or `PROSE.md` disables that section.
-- **Ordered `contextFiles` & nested loading:** Startup loads `~/.agents/AGENTS.md` (only when `homeAgentsDir: true`), then `~/.axo/AGENTS.md`, then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, `.axo/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result (when `settings.nestedContextFiles` is `true` and project access allows it) without invalidating the system prompt cache.
-- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/`, user `~/.axo/skills/`, and `~/.agents/skills/` (when `homeAgentsDir: true`). Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic and is left out of the catalog.
+- **Replaceable prompts:** `SYSTEM`, `WORK`, `PROSE`, and the five summarizer prompts can be overridden by the host's user layer or, at `read` and `trust` access with `project.files.config` on (the default), the project layer it supplies (the project wins per name). Overrides are sampled once when a session is created or opened. An empty `SYSTEM`, `WORK`, or `PROSE` override disables that section.
+- **Ordered `contextFiles` & nested loading:** Startup loads `~/.agents/AGENTS.md` (only when `homeAgentsDir: true`), then the host's `UserConfig::context_files` in order, then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result (when `settings.nestedContextFiles` is `true` and project access allows it) without invalidating the system prompt cache.
+- **Skills (`SKILL.md`):** Discovered from project `.agents/skills/`, the host's `UserConfig::skill_roots`, and `~/.agents/skills/` (when `homeAgentsDir: true`). Listed in `<available_skills>` for on-demand model reads, or expanded inline when the user types `/name args` (through `prompt`, `steer`, or `follow_up`). Skills appear in `session.commands()` with their optional `argument-hint` frontmatter; a skill named like a built-in command gets a warning diagnostic and is left out of the catalog.
 
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 
-When `bash.devShell` is set to `"nix"` or `"direnv"` in a trusted project, `axo` captures the project's environment once (via `nix print-dev-env` or an approved `.envrc`), caches Nix captures under `~/.axo/cache/devshell/` with a GC root, and runs every subsequent `bash` command directly against the captured environment (~3 ms overhead per command instead of ~460 ms for `nix develop -c`). Captures invalidate automatically when `flake.nix`, `flake.lock`, tracked `.nix` files, or `bash.devShellWatch` globs change.
+When `bash.devShell` is set to `"nix"` or `"direnv"` in a trusted project, `axo` captures the project's environment once (via `nix print-dev-env` or an approved `.envrc`), caches Nix captures under `<cache_dir>/devshell/` (the directory the host passes to `AxoBuilder::cache_dir`) with a GC root, and runs every subsequent `bash` command directly against the captured environment (~3 ms overhead per command instead of ~460 ms for `nix develop -c`). Captures invalidate automatically when `flake.nix`, `flake.lock`, tracked `.nix` files, or `bash.devShellWatch` globs change. Nix mode needs a cache directory: without one, axo logs a warning and uses the host environment. Direnv mode needs none.
 
 ### Project access levels (`ignore` | `read` | `trust`)
 
-Configured exclusively in the user's `~/.axo/settings.jsonc` (a project cannot elevate its own access):
+Configured exclusively in the user layer the host supplies through `ConfigSource::user` (a project cannot elevate its own access):
 
 ```jsonc
 {
@@ -106,19 +106,59 @@ Configured exclusively in the user's `~/.axo/settings.jsonc` (a project cannot e
 
 - `"ignore"` loads nothing from the repository.
 - `"read"` (default) loads markdown context files, skills, prompt overrides, and safe settings, while dropping code-running project settings (`bash.devShell` and `!command` `defaultModel`). Dev shells remain disabled even if enabled in user settings.
-- `"trust"` permits all project settings, including `!command` `defaultModel`, and is required for dev shells regardless of which settings file enables `bash.devShell`.
+- `"trust"` permits all project settings, including `!command` `defaultModel`, and is required for dev shells regardless of which layer enables `bash.devShell`.
 
 ---
 
 ## Embedding in Rust
 
+axo owns no configuration directory and reads no configuration files of its own. The host supplies models and a session store, and optionally a `ConfigSource` (user and project settings layers, prompt overrides, skill roots, context files) and a cache directory. `Axo::builder(models, store)...build()` does no configuration I/O; axo samples the source on each `create_session`, `open_session`, and `Axo::schemes` call, and calls `ConfigSource::project` only when the session's project access is `read` or `trust`.
+
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-use std::path::PathBuf;
-use axo::{Axo, PromptPart, SessionOptions};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use axo::store::JsonlStore;
+use axo::{Axo, ConfigLayer, ConfigSource, PromptPart, SessionOptions, UserConfig};
+use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
+
+/// The host decides where configuration comes from; axo validates, merges and trust-filters it.
+struct HostConfig;
+
+impl ConfigSource for HostConfig {
+    fn user(&self) -> Result<UserConfig, axo::Error> {
+        Ok(UserConfig {
+            layer: ConfigLayer {
+                origin: "host defaults".into(),
+                settings: Some(serde_json::json!({"project": {"paths": {"/repo/**": "trust"}}})),
+                ..ConfigLayer::default()
+            },
+            skill_roots: vec![PathBuf::from("/var/lib/my-host/skills")],
+            ..UserConfig::default()
+        })
+    }
+
+    fn project(&self, _cwd: &Path) -> Result<ConfigLayer, axo::Error> {
+        Ok(ConfigLayer::default())
+    }
+}
+
+let models = Models::load(ModelsOptions {
+    cache_dir: Some(PathBuf::from("/var/lib/my-host/cache")),
+    extended_context: false,
+    config: ModelsConfig::default(),
+    credentials: Arc::new(FileCredentialStore::new(PathBuf::from("/var/lib/my-host/auth.json"))),
+})
+.await?;
 
 // Commands run in process groups by default; no supervisor executable or cgroup needed.
-let axo = Axo::builder().build().await?;
+let axo = Axo::builder(
+    Arc::new(models),
+    Arc::new(JsonlStore::new(PathBuf::from("/var/lib/my-host/sessions"))),
+)
+.config(Arc::new(HostConfig))
+.cache_dir(PathBuf::from("/var/lib/my-host/cache"))
+.build();
 
 let session = axo
     .create_session(SessionOptions {
@@ -148,6 +188,8 @@ let outcome = session
 # }
 ```
 
+Without `.config(..)`, sessions run on default settings with no project layer. Without `.cache_dir(..)`, the `docs` prompt section and the `axo://` scheme are absent, and Nix dev shells fall back to the host environment with a warning.
+
 Durable server hosts can opt into cgroup supervision (`Supervision::Cgroup`), where commands run in cgroup v2 jobs and the host routes arguments in `main` to `axo::exec::supervisor::run`. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) for the synchronous routing `main` example and failure details.
 
 ---
@@ -162,10 +204,10 @@ axo/
 │   └── axo/                        # Axo & Session APIs, JsonlStore, compaction, context, DevShellEnv, supervision, jobs, tools
 │       ├── src/exec/supervisor.rs  # Embedded guard/enter entry point hosts route to for cgroup supervision
 │       ├── prompts/                # Bundled SYSTEM.md, PROSE.md, and summarizer markdown prompts
-│       ├── examples/               # `drive` (CLI session driver) and `memory` (PSS benchmark)
+│       ├── examples/               # `drive` (CLI session driver) and `memory` (PSS benchmark); their own config layout under `--dir`
 │       └── docs/                   # Bundled implementation reference for the `<docs>` system-prompt section
 │           ├── README.md           # Documentation index
-│           ├── configuration.md    # ~/.axo/ and .axo/ layout, settings.jsonc, models.jsonc, project access
+│           ├── configuration.md    # ConfigSource and EffectiveConfig, settings, models, project access, dev shells, supervision
 │           ├── prompts-and-context.md     # System prompt sections, prompt overrides, contextFiles, skills, prompt parts
 │           ├── sessions-and-compaction.md # JsonlStore, projection, recovery, attach, /shake, and compaction
 │           └── extending.md        # Declarative files, Rust embedding (Session, commands), and extension traits
@@ -194,13 +236,13 @@ cargo fmt --check
 Drive a live or resumed session from the command line with the `drive` example:
 
 ```sh
-cargo run -p axo --example drive -- --cwd . --model zebes/qwen3.8-27b "Inspect @crates/axo/src/lib.rs"
-cargo run -p axo --example drive -- --cwd . --attach /tmp/shot.png "What is in this image?"
-cargo run -p axo --example drive -- --cwd . --commands
-cargo run -p axo --example drive -- --resume ~/.axo/sessions/.../session.jsonl "/model openai-codex/gpt-6-luna"
-cargo run -p axo --example drive -- --resume ~/.axo/sessions/.../session.jsonl "/shake elide"
+cargo run -p axo --example drive -- --dir <dir> --cwd . --model zebes/qwen3.8-27b "Inspect @crates/axo/src/lib.rs"
+cargo run -p axo --example drive -- --dir <dir> --cwd . --attach /tmp/shot.png "What is in this image?"
+cargo run -p axo --example drive -- --dir <dir> --cwd . --commands
+cargo run -p axo --example drive -- --dir <dir> --resume <dir>/sessions/.../session.jsonl "/model openai-codex/gpt-6-luna"
+cargo run -p axo --example drive -- --dir <dir> --resume <dir>/sessions/.../session.jsonl "/shake elide"
 # cgroup supervision with drive itself as the supervisor; needs a delegated cgroup
-systemd-run --user --scope -p Delegate=yes -- cargo run -p axo --example drive -- --cgroup --cwd . "Run bash: cat /proc/self/cgroup"
+systemd-run --user --scope -p Delegate=yes -- cargo run -p axo --example drive -- --dir <dir> --cgroup --cwd . "Run bash: cat /proc/self/cgroup"
 ```
 
 Measure idle and mid-turn proportional set size (PSS) across N concurrent sessions in one process:

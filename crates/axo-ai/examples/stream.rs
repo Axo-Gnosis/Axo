@@ -1,7 +1,7 @@
 //! Live check of one model: streams a request with a `get_weather` tool and prints every
 //! event. With `--roundtrip`, answers the tool calls and streams the follow-up request.
 //!
-//! `stream --dir <AXO_DIR> --model <provider/id> [--thinking <level>] [--roundtrip] <prompt>`
+//! `stream --dir <dir> --model <provider/id> [--thinking <level>] [--roundtrip] <prompt>`
 
 use std::io::Write;
 use std::path::PathBuf;
