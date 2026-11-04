@@ -209,7 +209,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let target = (target != "root").then(|| EntryId::from(target));
         run_maintenance(
             &session,
-            session.navigate(target, NavigateOptions { summarize }),
+            session.navigate(
+                target,
+                NavigateOptions {
+                    summarize,
+                    focus: None,
+                },
+            ),
         )
         .await?;
     }

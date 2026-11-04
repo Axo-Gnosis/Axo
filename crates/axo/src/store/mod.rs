@@ -10,8 +10,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 pub use entry::{
-    ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header, RunOutcome, SeqEntry,
-    SessionInfo, SubmissionKind, TIMESTAMP_FORMAT,
+    CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
+    RunOutcome, SeqEntry, SessionInfo, SubmissionKind, TIMESTAMP_FORMAT,
 };
 pub use jsonl::JsonlStore;
 pub use project::{ProjectedSource, Projection, project};

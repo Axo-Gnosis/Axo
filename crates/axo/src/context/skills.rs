@@ -278,13 +278,23 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
 
 /// Splits command arguments bash-style, honoring single and double quotes (pi
 /// `parseCommandArgs`).
-pub fn parse_command_args(input: &str) -> Vec<String> {
+pub fn parse_command_args(mut input: &str) -> Vec<String> {
     let mut args = Vec::new();
+    while let Some((arg, rest)) = next_command_arg(input) {
+        args.push(arg);
+        input = rest;
+    }
+    args
+}
+
+/// The first [`parse_command_args`] argument of `input` and the raw text after it;
+/// `None` when only whitespace remains.
+pub(crate) fn next_command_arg(input: &str) -> Option<(String, &str)> {
     let mut current = String::new();
     // A quoted empty string ("" or '') still counts as an argument.
     let mut has_token = false;
     let mut in_quote: Option<char> = None;
-    for c in input.chars() {
+    for (index, c) in input.char_indices() {
         match in_quote {
             Some(quote) if c == quote => in_quote = None,
             Some(_) => current.push(c),
@@ -294,8 +304,7 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
             }
             None if c.is_whitespace() => {
                 if has_token {
-                    args.push(std::mem::take(&mut current));
-                    has_token = false;
+                    return Some((current, &input[index..]));
                 }
             }
             None => {
@@ -304,10 +313,7 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
             }
         }
     }
-    if has_token {
-        args.push(current);
-    }
-    args
+    has_token.then(|| (current, &input[input.len()..]))
 }
 
 static ARG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {

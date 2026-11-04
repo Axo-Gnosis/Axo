@@ -1,4 +1,5 @@
 //! Transient summary requests; persistence and operation ownership stay in SessionHooks.
+use std::borrow::Cow;
 use std::path::Path;
 
 use axo_agent::AgentMessage;
@@ -19,6 +20,17 @@ pub(super) const TOO_LARGE: &str = "Separate compaction cannot fit this model's 
 const NOT_FINISHED: &str = "Summary response must finish normally without tool calls";
 const NOT_SMALLER: &str =
     "Summary is empty, exceeds its output allowance, or does not shrink the replaced content";
+
+/// The format template, then the user's focus when there is one. The focus sits outside
+/// the data tags: it is an instruction, unlike the conversation it steers.
+fn with_focus<'a>(template: &'a str, focus: Option<&str>) -> Cow<'a, str> {
+    match focus {
+        Some(focus) => Cow::Owned(format!(
+            "{template}\n\nFocus from the user: {focus}\nGive it priority, but keep every section of the format."
+        )),
+        None => Cow::Borrowed(template),
+    }
+}
 
 /// Summarizer instructions: bundled defaults, each replaceable by a `<NAME>.md` prompt file.
 #[derive(Debug)]
@@ -460,18 +472,29 @@ pub(crate) async fn generate(
     context: &SummaryContext<'_>,
     input: &SummaryInput,
     method: SummaryRequest,
+    focus: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<GeneratedSummary, SummaryFailure> {
     if input.branch {
-        return branch(context, &input.history, input.replaced_tokens, cancel).await;
+        return branch(
+            context,
+            &input.history,
+            input.replaced_tokens,
+            focus,
+            cancel,
+        )
+        .await;
     }
     let history = lowered(&input.history);
     let prompts = context.prompts;
-    let instructions = if input.previous_summary.is_some() {
-        &prompts.update
-    } else {
-        &prompts.initial
-    };
+    let instructions = with_focus(
+        if input.previous_summary.is_some() {
+            &prompts.update
+        } else {
+            &prompts.initial
+        },
+        focus,
+    );
     let mut combined = if history.is_empty() {
         GeneratedSummary {
             text: input
@@ -497,7 +520,7 @@ pub(crate) async fn generate(
                 &history,
                 input.previous_summary.as_deref(),
                 &prompts.rules,
-                instructions,
+                &instructions,
             )
         };
         request(context, transcript, live, input.history_tokens, cancel).await?
@@ -507,7 +530,8 @@ pub(crate) async fn generate(
             &lowered(&input.turn_prefix),
             None,
             &prompts.rules,
-            &prompts.split_turn,
+            // The split turn can be all the new content (pi #11058), so it gets the focus too.
+            &with_focus(&prompts.split_turn, focus),
         );
         let result = request(context, prefix, false, input.prefix_tokens, cancel).await;
         match result {
@@ -545,10 +569,11 @@ pub(crate) async fn generate(
     clippy::result_large_err,
     reason = "Failures retain billable usage inline; boxing adds an unnecessary allocation"
 )]
-pub(super) async fn branch(
+async fn branch(
     context: &SummaryContext<'_>,
     messages: &[AgentMessage],
     replaced_tokens: u64,
+    focus: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<GeneratedSummary, SummaryFailure> {
     let mut messages = lowered(messages);
@@ -559,7 +584,7 @@ pub(super) async fn branch(
             &messages,
             None,
             &context.prompts.rules,
-            &context.prompts.branch,
+            &with_focus(&context.prompts.branch, focus),
         ),
         false,
         replaced_tokens,

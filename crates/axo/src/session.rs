@@ -43,8 +43,8 @@ use crate::schemes::proc::ProcScheme;
 use crate::schemes::skill::SkillScheme;
 use crate::schemes::{ARTIFACTS_DIR, LOCAL_DIR, Scheme, SchemeContext, Schemes};
 use crate::store::{
-    self, Entry, EntryBase, EntryId, Header, Projection, SeqEntry, SessionStore, SessionWriter,
-    SubmissionKind, project,
+    self, CompactionReason, Entry, EntryBase, EntryId, Header, Projection, SeqEntry, SessionStore,
+    SessionWriter, SubmissionKind, project,
 };
 use crate::tools::ask::{Answer, PendingQuestions, Question};
 use crate::tools::{self, SessionTools, ToolFactory};
@@ -121,9 +121,20 @@ pub enum ShakeMode {
     Thinking,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NavigateOptions {
     pub summarize: bool,
+    /// What the branch summary should prioritize (trimmed; blank counts as none); requires `summarize`.
+    pub focus: Option<String>,
+}
+
+/// Trims a user's summary focus in place; blank counts as none.
+pub(crate) fn normalize_focus(focus: Option<String>) -> Option<String> {
+    let mut text = focus?;
+    text.truncate(text.trim_end().len());
+    let start = text.len() - text.trim_start().len();
+    text.drain(..start);
+    (!text.is_empty()).then_some(text)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,11 +393,14 @@ impl Drop for Preparing {
 }
 
 enum MaintenanceOperation {
-    Compact,
+    Compact {
+        focus: Option<String>,
+    },
     Shake(ShakeMode),
     Navigate {
         target: Option<EntryId>,
         sections: Option<Sections>,
+        focus: Option<String>,
     },
 }
 
@@ -797,14 +811,17 @@ impl SessionHooks {
 
     async fn compact_inner(
         &self,
-        automatic: bool,
-        force: bool,
+        reason: CompactionReason,
+        focus: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
+        let automatic = reason != CompactionReason::Manual;
         let limits = {
             let log = self.log.lock().await;
             let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            if automatic && !force && compaction::estimate(&log.projection) <= limits.trigger {
+            if reason == CompactionReason::Threshold
+                && compaction::estimate(&log.projection) <= limits.trigger
+            {
                 return Ok(false);
             }
             limits
@@ -816,7 +833,7 @@ impl SessionHooks {
         {
             return Ok(true);
         }
-        let mut method = if force {
+        let mut method = if reason == CompactionReason::Overflow {
             SummaryRequest::Separate
         } else {
             self.maintenance.settings.summary_request
@@ -859,7 +876,9 @@ impl SessionHooks {
                 reply: limits.reply,
                 prompts: &self.maintenance.prompts,
             };
-            match compaction::summary::generate(&context, &prepared.summary, method, cancel).await {
+            match compaction::summary::generate(&context, &prepared.summary, method, focus, cancel)
+                .await
+            {
                 Err(failure) => {
                     self.save_usage(&model, failure.usage, failure.message.clone())
                         .await?;
@@ -892,6 +911,8 @@ impl SessionHooks {
                             details: Some(prepared.files.details()),
                             usage: Some(generated.usage.clone()),
                             from_hook: None,
+                            reason: Some(reason),
+                            focus: focus.map(str::to_owned),
                             system_message: system,
                         };
                         Self::candidate(
@@ -923,19 +944,25 @@ impl SessionHooks {
         Err(Error::Compaction(last_error))
     }
 
-    async fn automatic(&self, force: bool, cancel: &CancellationToken) -> Result<bool, Error> {
+    async fn automatic(
+        &self,
+        reason: CompactionReason,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Error> {
         if !self.maintenance.settings.enabled {
             return Ok(false);
         }
         {
             let mut log = self.log.lock().await;
             let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            if !force && compaction::estimate(&log.projection) <= limits.trigger {
+            if reason == CompactionReason::Threshold
+                && compaction::estimate(&log.projection) <= limits.trigger
+            {
                 return Ok(false);
             }
             self.reserve(&mut log, MaintenanceKind::Compact, false, cancel.clone())?;
         }
-        let result = std::panic::AssertUnwindSafe(self.compact_inner(true, force, cancel))
+        let result = std::panic::AssertUnwindSafe(self.compact_inner(reason, None, cancel))
             .catch_unwind()
             .await;
         let (error, aborted) = match &result {
@@ -1016,6 +1043,7 @@ impl SessionHooks {
         &self,
         target: Option<EntryId>,
         sections: Option<Sections>,
+        focus: Option<String>,
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
         let (prepared, model, thinking, revision, from_id, limits) = {
@@ -1053,6 +1081,7 @@ impl SessionHooks {
                     &context,
                     &input,
                     SummaryRequest::Separate,
+                    focus.as_deref(),
                     cancel,
                 )
                 .await
@@ -1096,6 +1125,7 @@ impl SessionHooks {
                 details: Some(files.details()),
                 usage: Some(summary.usage),
                 from_hook: None,
+                focus,
             },
             None => Entry::Leaf { base },
         };
@@ -1129,8 +1159,9 @@ impl SessionHooks {
     ) -> Result<(), Error> {
         let result = std::panic::AssertUnwindSafe(async {
             match operation {
-                MaintenanceOperation::Compact => {
-                    self.compact_inner(false, false, &cancel).await?;
+                MaintenanceOperation::Compact { focus } => {
+                    self.compact_inner(CompactionReason::Manual, focus.as_deref(), &cancel)
+                        .await?;
                 }
                 MaintenanceOperation::Shake(mode) => {
                     let mode = match mode {
@@ -1140,8 +1171,13 @@ impl SessionHooks {
                     };
                     self.elide(mode, &cancel).await?;
                 }
-                MaintenanceOperation::Navigate { target, sections } => {
-                    self.navigate_inner(target, sections, &cancel).await?
+                MaintenanceOperation::Navigate {
+                    target,
+                    sections,
+                    focus,
+                } => {
+                    self.navigate_inner(target, sections, focus, &cancel)
+                        .await?
                 }
             }
             Ok::<(), Error>(())
@@ -1497,7 +1533,7 @@ impl LoopHooks for SessionHooks {
         cancel: &CancellationToken,
     ) -> Result<Option<RequestUpdate>, HookError> {
         if self
-            .automatic(false, cancel)
+            .automatic(CompactionReason::Threshold, cancel)
             .await
             .map_err(|error| HookError(error.to_string()))?
         {
@@ -1541,7 +1577,7 @@ impl LoopHooks for SessionHooks {
                 && response.stop_reason == StopReason::Stop
                 && response.tool_calls().next().is_none();
             if silent_success {
-                let changed = self.automatic(true, cancel).await?;
+                let changed = self.automatic(CompactionReason::Overflow, cancel).await?;
                 let context = if changed {
                     Some(self.context(&turn.context.tools).await)
                 } else {
@@ -1589,7 +1625,7 @@ impl LoopHooks for SessionHooks {
                         }
                     }
                     if shrink {
-                        self.automatic(true, cancel).await?;
+                        self.automatic(CompactionReason::Overflow, cancel).await?;
                     }
                     return Ok(TurnFinish {
                         decision: Some(TurnDecision::Continue),
@@ -1599,7 +1635,7 @@ impl LoopHooks for SessionHooks {
                 return Ok(TurnFinish::default());
             }
             if response.tool_calls().next().is_none() {
-                let changed = self.automatic(false, cancel).await?;
+                let changed = self.automatic(CompactionReason::Threshold, cancel).await?;
                 let context = if changed {
                     Some(self.context(&turn.context.tools).await)
                 } else {
@@ -2417,7 +2453,7 @@ impl Session {
     /// `compact`/`shake`/`navigate` only when idle (`Error::Busy` otherwise).
     pub async fn run_command(&self, command: Command) -> Result<(), Error> {
         match command {
-            Command::Compact => self.compact().await,
+            Command::Compact { focus } => self.compact(focus).await,
             Command::Shake { mode } => self.shake(mode).await,
             Command::Model { model } => {
                 let model = self
@@ -2428,8 +2464,12 @@ impl Session {
                 self.set_model(model).await
             }
             Command::Thinking { level } => self.set_thinking(level).await.map(drop),
-            Command::Navigate { entry, summarize } => {
-                self.navigate(Some(entry), NavigateOptions { summarize })
+            Command::Navigate {
+                entry,
+                summarize,
+                focus,
+            } => {
+                self.navigate(Some(entry), NavigateOptions { summarize, focus })
                     .await
             }
         }
@@ -2736,10 +2776,16 @@ impl Session {
         }
     }
 
-    /// Summarizes eligible history without submitting an ordinary user turn.
-    pub async fn compact(&self) -> Result<(), Error> {
-        self.start_maintenance(MaintenanceKind::Compact, MaintenanceOperation::Compact)
-            .await
+    /// Summarizes eligible history without submitting an ordinary user turn; `focus` tells
+    /// the summary what to prioritize (blank focus counts as none).
+    pub async fn compact(&self, focus: Option<String>) -> Result<(), Error> {
+        self.start_maintenance(
+            MaintenanceKind::Compact,
+            MaintenanceOperation::Compact {
+                focus: normalize_focus(focus),
+            },
+        )
+        .await
     }
 
     /// Removes eligible blocks into recoverable session artifacts, without model calls.
@@ -2750,22 +2796,32 @@ impl Session {
 
     /// Moves the session's position to `target` (`None` = before the first entry). Without
     /// `options.summarize` this appends a `leaf` entry; with it, the abandoned branch is
-    /// summarized first and a `branch_summary` entry at `target` replaces the leaf. The next
-    /// prompt continues from there with the live model and thinking level, recorded on the
-    /// branch when it implies others.
+    /// summarized first (steered by `options.focus`) and a `branch_summary` entry at `target`
+    /// replaces the leaf. The next prompt continues from there with the live model and
+    /// thinking level, recorded on the branch when it implies others.
     pub async fn navigate(
         &self,
         target: Option<EntryId>,
         options: NavigateOptions,
     ) -> Result<(), Error> {
+        let focus = normalize_focus(options.focus);
         if options.summarize {
             let sections = self.hooks.prompt.sections();
             return self
                 .start_maintenance(
                     MaintenanceKind::BranchSummary,
-                    MaintenanceOperation::Navigate { target, sections },
+                    MaintenanceOperation::Navigate {
+                        target,
+                        sections,
+                        focus,
+                    },
                 )
                 .await;
+        }
+        if focus.is_some() {
+            return Err(Error::InvalidInput(
+                "navigate focus requires summarize".into(),
+            ));
         }
         let mut log = self.hooks.log.lock().await;
         if *self.hooks.running.borrow() {

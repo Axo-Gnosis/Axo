@@ -442,6 +442,8 @@ fn checkpoint_absorbed_answer_finishes_but_later_consumed_input_continues() {
         details: None,
         usage: None,
         from_hook: None,
+        reason: None,
+        focus: None,
         system_message: None,
     });
     assert_eq!(
@@ -1167,7 +1169,7 @@ async fn aborting_hanging_summary_has_no_checkpoint_and_no_stuck_busy_state() {
     let session = axo.create_session(options(dir.path())).await.unwrap();
     session.prompt("remember history").await.unwrap();
     let mut events = session.attach(None).await.events;
-    let compact = session.compact();
+    let compact = session.compact(None);
     tokio::pin!(compact);
     tokio::select! { result = &mut compact => panic!("summary unexpectedly settled: {result:?}"), _ = async { loop { if matches!(events.recv().await.unwrap(), SessionEvent::MaintenanceStart { .. }) { break; } } } => {} }
     // MaintenanceStart precedes the actual provider call; wait until the hanging stream exists.

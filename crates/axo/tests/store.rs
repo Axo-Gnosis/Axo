@@ -136,6 +136,8 @@ fn branched_tree() -> Vec<SeqEntry> {
             details: None,
             usage: None,
             from_hook: None,
+            reason: None,
+            focus: None,
             system_message: None,
         },
         user_entry("uY", Some("comp"), "after compaction"),
@@ -245,6 +247,8 @@ fn checkpoint(id: &str, parent: &str, kept: &str, users: &[&str]) -> Entry {
         details: None,
         usage: None,
         from_hook: None,
+        reason: None,
+        focus: None,
         system_message: None,
     }
 }

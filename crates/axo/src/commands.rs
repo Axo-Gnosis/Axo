@@ -10,19 +10,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::context::Diagnostic;
-use crate::context::skills::{Skill, parse_command_args};
+use crate::context::skills::{Skill, next_command_arg};
 use crate::error::Error;
-use crate::session::ShakeMode;
+use crate::session::{ShakeMode, normalize_focus};
 use crate::store::EntryId;
 
 /// A built-in session command, decoded and validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Compact,
-    Shake { mode: ShakeMode },
-    Model { model: String },
-    Thinking { level: ThinkingLevel },
-    Navigate { entry: EntryId, summarize: bool },
+    Compact {
+        focus: Option<String>,
+    },
+    Shake {
+        mode: ShakeMode,
+    },
+    Model {
+        model: String,
+    },
+    Thinking {
+        level: ThinkingLevel,
+    },
+    Navigate {
+        entry: EntryId,
+        summarize: bool,
+        focus: Option<String>,
+    },
 }
 
 /// How a command behaves while a turn is running.
@@ -44,7 +56,8 @@ pub enum CommandPolicy {
     rename_all_fields = "camelCase"
 )]
 pub enum CommandKind {
-    /// `parameters`: JSON Schema object; the text form maps positional words to its properties in order.
+    /// `parameters`: JSON Schema object; the text form maps positional words to its properties
+    /// in order, and a final `"format": "text"` property takes the rest of the line verbatim.
     Builtin { parameters: Value },
     /// One free-text argument.
     Skill { argument_hint: Option<String> },
@@ -63,7 +76,14 @@ pub struct CommandInfo {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct NoArgs {}
+struct CompactArgs {
+    /// What the summary should prioritize.
+    // `with = "String"` and `skip_serializing_if` (here and in `NavigateArgs`) give hosts a
+    // plain optional string: no `null` type, no `"default": null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", extend("format" = "text"))]
+    focus: Option<String>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +116,10 @@ struct NavigateArgs {
     /// Summarize the abandoned branch first.
     #[serde(default)]
     summarize: bool,
+    /// What the branch summary should prioritize; requires `summarize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", extend("format" = "text"))]
+    focus: Option<String>,
 }
 
 /// `ThinkingLevel` as a plain string enum, built from `ThinkingLevel::ALL` so `axo-ai`
@@ -124,8 +148,10 @@ fn parameters<T: JsonSchema>() -> Value {
 }
 
 fn decode_compact(args: Value) -> Result<Command, serde_json::Error> {
-    serde_json::from_value::<NoArgs>(args)?;
-    Ok(Command::Compact)
+    let CompactArgs { focus } = serde_json::from_value(args)?;
+    Ok(Command::Compact {
+        focus: normalize_focus(focus),
+    })
 }
 
 fn decode_shake(args: Value) -> Result<Command, serde_json::Error> {
@@ -144,10 +170,19 @@ fn decode_thinking(args: Value) -> Result<Command, serde_json::Error> {
 }
 
 fn decode_navigate(args: Value) -> Result<Command, serde_json::Error> {
-    let NavigateArgs { entry, summarize } = serde_json::from_value(args)?;
+    let NavigateArgs {
+        entry,
+        summarize,
+        focus,
+    } = serde_json::from_value(args)?;
+    let focus = normalize_focus(focus);
+    if focus.is_some() && !summarize {
+        return Err(serde::de::Error::custom("focus requires summarize true"));
+    }
     Ok(Command::Navigate {
         entry: EntryId(entry),
         summarize,
+        focus,
     })
 }
 
@@ -165,7 +200,7 @@ static BUILTINS: [Builtin; 5] = [
         name: "compact",
         description: "Summarize older history to free context",
         policy: CommandPolicy::WhenIdle,
-        parameters: LazyLock::new(parameters::<NoArgs>),
+        parameters: LazyLock::new(parameters::<CompactArgs>),
         decode: decode_compact,
     },
     Builtin {
@@ -219,23 +254,26 @@ impl Builtin {
     }
 
     /// Maps positional words to the schema's properties in order: `boolean` takes only
-    /// `true`/`false`, `integer` an `i64`, everything else stays a string.
-    fn parse(&self, args: &str) -> Result<Command, Error> {
-        let properties: Vec<(&String, &Value)> = self
-            .parameters
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|properties| properties.iter().collect())
-            .unwrap_or_default();
-        let tokens = parse_command_args(args);
-        if tokens.len() > properties.len() {
-            return Err(self.invalid(match properties.len() {
-                0 => "takes no arguments".to_owned(),
-                n => format!("takes at most {n} arguments"),
-            }));
-        }
+    /// `true`/`false`, `integer` an `i64`, a `"format": "text"` string the rest of the line
+    /// verbatim (quotes and apostrophes included), everything else one word.
+    fn parse(&self, mut args: &str) -> Result<Command, Error> {
+        let properties = self.parameters.get("properties").and_then(Value::as_object);
         let mut object = Map::new();
-        for (token, (key, property)) in tokens.into_iter().zip(properties) {
+        for (key, property) in properties.into_iter().flatten() {
+            let token = if property.get("format").and_then(Value::as_str) == Some("text") {
+                let rest = args.trim();
+                args = "";
+                if rest.is_empty() {
+                    break;
+                }
+                rest.to_owned()
+            } else {
+                let Some((token, rest)) = next_command_arg(args) else {
+                    break;
+                };
+                args = rest;
+                token
+            };
             let value = match property.get("type").and_then(Value::as_str) {
                 Some("boolean") => match token.as_str() {
                     "true" => Value::Bool(true),
@@ -249,6 +287,12 @@ impl Builtin {
                 _ => Value::String(token),
             };
             object.insert(key.clone(), value);
+        }
+        if next_command_arg(args).is_some() {
+            return Err(self.invalid(match properties.map_or(0, Map::len) {
+                0 => "takes no arguments".to_owned(),
+                n => format!("takes at most {n} arguments"),
+            }));
         }
         self.decode(Value::Object(object))
     }
@@ -368,17 +412,41 @@ mod tests {
             parse("/navigate e1 true").unwrap().unwrap(),
             Command::Navigate {
                 entry: EntryId("e1".into()),
-                summarize: true
+                summarize: true,
+                focus: None,
             }
         );
         assert_eq!(
             parse("/navigate e1").unwrap().unwrap(),
             Command::Navigate {
                 entry: EntryId("e1".into()),
-                summarize: false
+                summarize: false,
+                focus: None,
             }
         );
-        assert_eq!(parse("/compact").unwrap().unwrap(), Command::Compact);
+        assert_eq!(
+            parse("/navigate e1 true why the \"cache\" idea failed")
+                .unwrap()
+                .unwrap(),
+            Command::Navigate {
+                entry: EntryId("e1".into()),
+                summarize: true,
+                focus: Some("why the \"cache\" idea failed".into()),
+            }
+        );
+        assert_eq!(
+            parse("/compact").unwrap().unwrap(),
+            Command::Compact { focus: None }
+        );
+        // The rest of the line stays verbatim: an apostrophe is not an opening quote.
+        assert_eq!(
+            parse("/compact   don't drop the  auth tests ")
+                .unwrap()
+                .unwrap(),
+            Command::Compact {
+                focus: Some("don't drop the  auth tests".into())
+            }
+        );
         assert_eq!(
             parse("/model   'my provider/m 1'").unwrap().unwrap(),
             Command::Model {
@@ -392,16 +460,13 @@ mod tests {
         for (text, name) in [
             ("/shake", "shake"),
             ("/shake loud", "shake"),
-            ("/compact now", "compact"),
+            ("/shake elide now", "shake"),
             ("/navigate e1 maybe", "navigate"),
+            ("/navigate e1 false keep the logs", "navigate"),
             ("/model a b", "model"),
         ] {
             assert_eq!(invalid_command(parse(text)).0, name, "{text}");
         }
-        assert_eq!(
-            invalid_command(parse("/compact now")).1,
-            "takes no arguments"
-        );
         assert_eq!(
             invalid_command(parse("/model a b")).1,
             "takes at most 1 arguments"
@@ -409,6 +474,10 @@ mod tests {
         assert_eq!(
             invalid_command(parse("/navigate e1 maybe")).1,
             "summarize must be true or false"
+        );
+        assert_eq!(
+            invalid_command(parse("/navigate e1 false keep the logs")).1,
+            "focus requires summarize true"
         );
     }
 
@@ -435,8 +504,16 @@ mod tests {
         );
         assert_eq!(
             Command::decode("compact", Value::Null).unwrap(),
-            Command::Compact
+            Command::Compact { focus: None }
         );
+        assert_eq!(
+            Command::decode("compact", json!({"focus": "  "})).unwrap(),
+            Command::Compact { focus: None }
+        );
+        assert!(matches!(
+            Command::decode("navigate", json!({"entry": "e1", "focus": "logs"})),
+            Err(Error::InvalidCommand { command, .. }) if command == "navigate"
+        ));
         assert!(matches!(
             Command::decode("nope", json!({})),
             Err(Error::InvalidCommand { command, message })
@@ -458,7 +535,19 @@ mod tests {
             let text = builtin.parameters.to_string();
             assert!(!text.contains("$ref") && !text.contains("$defs"), "{text}");
             assert!(!text.contains("$schema"), "{text}");
+            // The parser hands a text property the rest of the line, so only the last may be one.
+            let properties = builtin.parameters["properties"].as_object().unwrap();
+            let texts = properties.values().map(|p| p["format"] == "text");
+            assert!(
+                texts.rev().skip(1).all(|text| !text),
+                "{}: only the last property may be text",
+                builtin.name
+            );
         }
+        let focus = &builtin_parameters("compact")["properties"]["focus"];
+        assert_eq!(focus["type"], "string");
+        assert_eq!(focus["format"], "text");
+        assert!(focus.get("default").is_none(), "{focus}");
         let shake = builtin_parameters("shake");
         let mode = &shake["properties"]["mode"];
         assert_eq!(mode["type"], "string");
@@ -483,9 +572,10 @@ mod tests {
                 .unwrap()
                 .keys()
                 .collect::<Vec<_>>(),
-            ["entry", "summarize"]
+            ["entry", "summarize", "focus"]
         );
         assert_eq!(navigate["required"], json!(["entry"]));
+        assert_eq!(navigate["properties"]["focus"]["format"], "text");
     }
 
     #[test]

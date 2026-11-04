@@ -187,6 +187,12 @@ pub enum Entry {
         usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_hook: Option<bool>,
+        /// Why the checkpoint ran; `None` in entries written before axo recorded it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<CompactionReason>,
+        /// The user's focus for a manual `/compact`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
         /// Complete prompt and tool state at this boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_message: Option<SystemMessage>,
@@ -203,6 +209,9 @@ pub enum Entry {
         usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_hook: Option<bool>,
+        /// The user's focus for the summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
     },
     /// Host state; never in context.
     Custom {
@@ -366,6 +375,18 @@ pub enum RunOutcome {
     Aborted,
     Failed,
     Interrupted,
+}
+
+/// What started a compaction checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    /// `Session::compact` or `/compact`.
+    Manual,
+    /// Context crossed the automatic compaction threshold.
+    Threshold,
+    /// Overflow recovery after a context-pressure response.
+    Overflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

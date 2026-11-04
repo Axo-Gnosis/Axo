@@ -320,7 +320,10 @@ async fn summarized_navigation_uses_effective_branch_and_preserves_live_selectio
     let old_leaf = before.last().unwrap().entry.id().unwrap().to_owned();
     within(session.navigate(
         Some(destination.clone()),
-        axo::NavigateOptions { summarize: true },
+        axo::NavigateOptions {
+            summarize: true,
+            focus: None,
+        },
     ))
     .await
     .unwrap();
@@ -391,9 +394,15 @@ async fn summarized_navigation_uses_effective_branch_and_preserves_live_selectio
     );
     assert_eq!(projection.model.as_deref(), Some("test/live"));
     assert_eq!(projection.thinking, Some(thinking));
-    within(reopened.navigate(Some(destination.clone()), axo::NavigateOptions::default()))
-        .await
-        .unwrap();
+    within(reopened.navigate(
+        Some(destination.clone()),
+        axo::NavigateOptions {
+            summarize: false,
+            focus: Some(" \n".into()),
+        },
+    ))
+    .await
+    .unwrap();
     let plain = reopened.attach(None).await.missed;
     assert!(plain.iter().any(|seq| matches!(&seq.entry, Entry::Leaf { base } if base.parent_id.as_ref() == Some(&destination))));
     assert_eq!(api.requests().len(), 2, "plain navigation never summarizes");
@@ -418,8 +427,13 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
         }
         let before = session.attach(None).await.missed;
         let messages = store::project(&before, None).messages;
-        let operation =
-            session.navigate(Some(destination), axo::NavigateOptions { summarize: true });
+        let operation = session.navigate(
+            Some(destination),
+            axo::NavigateOptions {
+                summarize: true,
+                focus: None,
+            },
+        );
         let result = if scenario == "cancel" {
             let cancel = async {
                 within(async {

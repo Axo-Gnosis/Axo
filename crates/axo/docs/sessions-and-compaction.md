@@ -22,8 +22,8 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"…","timestamp":"�
 | `thinking_level_change` | `Entry::ThinkingLevelChange { base, thinking_level }` | Updates `Projection::thinking` |
 | `model_change` | `Entry::ModelChange { base, provider, model_id }` | Updates `Projection::model` (`"{provider}/{model_id}"`) |
 | `usage` | `Entry::Usage { base, kind, provider, model, usage, note }` | Recorded for accounting (such as summary requests); never enters model context |
-| `compaction` | `Entry::Compaction { base, summary, first_kept_entry_id, preserved_user_ids, tokens_before, details, usage, from_hook, system_message }` | Replaces messages before `first_kept_entry_id` with the checkpoint `system_message`, preserved user messages, and a `compactionSummary` custom message wrapping the summary in `<summary>…</summary>` (lowered to a user message) |
-| `branch_summary` | `Entry::BranchSummary { base, from_id, summary, details, usage, from_hook }` | Injects a `branchSummary` custom message wrapping the summary in `<summary>…</summary>` (lowered to a user message) |
+| `compaction` | `Entry::Compaction { base, summary, first_kept_entry_id, preserved_user_ids, tokens_before, details, usage, from_hook, reason, focus, system_message }` | Replaces messages before `first_kept_entry_id` with the checkpoint `system_message`, preserved user messages, and a `compactionSummary` custom message wrapping the summary in `<summary>…</summary>` (lowered to a user message). `reason` (`CompactionReason`: `manual`, `threshold`, or `overflow`; absent in older files) records what started it and `focus` the user's focus for a manual compaction |
+| `branch_summary` | `Entry::BranchSummary { base, from_id, summary, details, usage, from_hook, focus }` | Injects a `branchSummary` custom message wrapping the summary in `<summary>…</summary>` (lowered to a user message); `focus` records the user's focus for the summary |
 | `custom` | `Entry::Custom { base, custom_type, data }` | Host metadata; never enters model context |
 | `custom_message` | `Entry::CustomMessage { base, custom_type, content, details, display }` | Lowered to a user message in model requests |
 | `context_edit` | `Entry::ContextEdit { base, target_id, replacement }` | Replaces `target_id`'s content (`Some(ContextReplacement)`) or hides `target_id` from the projection (`None`) |
@@ -69,10 +69,10 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
   - `missed`: all `SeqEntry` items with `seq > from_seq` (or all entries when `from_seq` is `None`).
   - `live`: `LiveSnapshot` containing `run_id`, active `maintenance` (`Compact`, `Shake`, `BranchSummary`), `agent` (`AgentSnapshot` with `running`, partial `streaming` message from `Accumulator`, `pending_tool_calls`, `queued_steering`, `queued_follow_up`), projected `messages`, and `pending_questions`.
   - `events`: a `tokio::sync::broadcast::Receiver<SessionEvent>`. If a slow receiver lags (`RecvError::Lagged`), it can call `session.attach(Some(last_seen_seq))` to catch up without stalling the agent loop.
-- **`session.navigate(target, NavigateOptions { summarize })`:**
+- **`session.navigate(target, NavigateOptions { summarize, focus })`:**
   - Appends `Entry::Leaf { base: EntryBase { parent_id: target, .. } }`, records `ModelChange` / `ThinkingLevelChange` if the live selection differs from the target branch's historical selection, restores the file ledger and nested context tracker to the new projection, and updates the agent's transcript.
   - Running background jobs keep running. Their results are delivered on whichever branch is selected when they finish; the delivery names the originating command (`[bg_N] <command>`), so it reads correctly away from the branch that started it.
-  - With `summarize: true`, first summarizes the abandoned branch with a separate tool-free request (`BRANCH_SUMMARY.md`) and appends `Entry::BranchSummary` at `target` in place of the `leaf` entry.
+  - With `summarize: true`, first summarizes the abandoned branch with a separate tool-free request (`BRANCH_SUMMARY.md`, plus the [focus](#focus) when given) and appends `Entry::BranchSummary` at `target` in place of the `leaf` entry. `focus` without `summarize` returns `Error::InvalidInput`.
 - **`session.fork(entry_id)`:**
   - Copies the root-to-`entry_id` ancestor chain into a new session file whose `Header` records `parent_session` and `forked_from`.
   - Copies the parent's side files into the fork's session directory: `artifacts/` (hard-linked read-only, copy fallback) and `local/` (copied), so `artifact://` and `local://` URLs, including saved prompt content, resolve in the fork. The output spool of a job that is still running (or retaining helpers) is never hard-linked: the fork gets a read-only snapshot copy, so later output appended by the parent's job does not show up in the fork. Copying is best effort; an entry that cannot be carried over is logged and skipped.
@@ -104,6 +104,21 @@ A `bash` call promoted to the background (see [Background Jobs](prompts-and-cont
 | `ShakeMode::Thinking` | Replaces each `AssistantBlock::Thinking` with `[shaken thinking; full thinking: artifact://<n>]`, saving that block's JSON to `<session>/artifacts/<n>.shake.json` (skipped in messages containing a skill span) |
 
 Each modified message receives one `Entry::ContextEdit`. Because edits are append-only, navigating to the entry before the shake restores the unshaken view.
+
+## Manual Compaction & Focus (`Session::compact`)
+
+`session.compact(focus)` (the built-in command `/compact [focus…]`) runs a summary checkpoint right away, without checking the automatic trigger and even with `compaction.enabled: false`. It never takes the clearing shortcut, so it always asks the model for a summary (live or separate per `compaction.summaryRequest`), and commits an `Entry::Compaction` with `reason: manual`.
+
+### Focus
+
+`focus` is the user's plain-text direction for what a summary should prioritize (`/compact keep the auth decisions; drop the exploratory logs`). It goes after the format template in every summary request of that pass (the first or update checkpoint, a split turn's prefix, or a branch summary), outside the `<conversation>` and `<previous-summary>` data tags, because it is an instruction rather than data:
+
+```text
+Focus from the user: <focus>
+Give it priority, but keep every section of the format.
+```
+
+The focus is saved on the committed entry's `focus` field. Automatic and overflow compaction never have one.
 
 ## Automatic Compaction (`crates/axo/src/compaction/`)
 

@@ -238,7 +238,7 @@ async fn commands_during_a_run_follow_their_policy() {
     session.run_command(model("test/other")).await.unwrap();
     // When idle: refused mid-turn.
     assert!(matches!(
-        session.run_command(Command::Compact).await,
+        session.run_command(Command::Compact { focus: None }).await,
         Err(Error::Busy)
     ));
     assert!(matches!(
@@ -302,7 +302,7 @@ async fn maintenance_blocks_alongside_commands() {
     within(session.prompt("remember history")).await.unwrap();
     let before = model_changes(&entries(&session).await);
 
-    let compact = session.compact();
+    let compact = session.compact(None);
     tokio::pin!(compact);
     // Wait until the summary request hangs, so maintenance is certainly in progress.
     tokio::select! {

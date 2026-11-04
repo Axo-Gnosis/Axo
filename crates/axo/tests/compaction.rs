@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo::schemes::artifact::Artifacts;
-use axo::store::{self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore};
+use axo::store::{
+    self, CompactionReason, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore,
+};
 use axo::{Axo, CompactionSettings, NavigateOptions, Session, Settings, ShakeMode, SummaryRequest};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::estimate::estimate_message_tokens;
@@ -378,7 +380,7 @@ async fn oversized_separate_input_is_not_sent_or_truncated() {
     )
     .await;
     let before = llm(&entries(&axo, &session).await);
-    let error = session.compact().await.unwrap_err();
+    let error = session.compact(None).await.unwrap_err();
     assert!(
         matches!(&error, axo::Error::Compaction(s) if s == OVERSIZED),
         "{error}"
@@ -414,7 +416,7 @@ async fn separate_provider_overflow_has_the_same_error_and_no_checkpoint() {
     )
     .await;
     let before = llm(&entries(&axo, &session).await);
-    let error = session.compact().await.unwrap_err();
+    let error = session.compact(None).await.unwrap_err();
     assert!(
         matches!(&error, axo::Error::Compaction(s) if s == OVERSIZED),
         "{error}"
@@ -458,7 +460,7 @@ async fn three_rejected_summary_actions_never_checkpoint_or_execute_calls() {
     )
     .await;
     let before = llm(&entries(&axo, &session).await);
-    assert!(session.compact().await.is_err());
+    assert!(session.compact(None).await.is_err());
     let raw = entries(&axo, &session).await;
     assert!(checkpoints(&raw).is_empty());
     assert_eq!(llm(&raw), before);
@@ -504,7 +506,7 @@ async fn live_tool_rejection_falls_back_to_separate_without_side_effects() {
         ],
     )
     .await;
-    session.compact().await.unwrap();
+    session.compact(None).await.unwrap();
     let requests = api.requests();
     assert_eq!(requests.len(), 2);
     let live = &requests[0];
@@ -571,7 +573,7 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
         user("retained"),
     ];
     let (session, _) = seed_with_options(&axo, dir.path(), messages, opts).await;
-    session.compact().await.unwrap();
+    session.compact(None).await.unwrap();
     let requests = api.requests();
     assert_eq!(requests.len(), 2);
     let last_user = |request: &axo_ai::RecordedRequest| {
@@ -588,6 +590,56 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
     let separate = requests[1].transcript.messages();
     assert_eq!(axo_ai::transcript::current_system_prompt(separate), rules);
     assert!(last_user(&requests[1]).ends_with("</conversation>\n\nProject task."));
+}
+
+#[tokio::test]
+async fn manual_focus_reaches_every_summary_request_and_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, api) = harness(
+        dir.path(),
+        settings(0),
+        100_000,
+        vec![
+            // Rejected live attempt, so the same compaction also sends a separate request.
+            ScriptedTurn::Reply(reply_tool_calls(&[("bad", "read", json!({"path":"x"}))])),
+            ScriptedTurn::Reply(reply_text("Remember cedar.")),
+        ],
+    )
+    .await;
+    let (session, _) = seed(
+        &axo,
+        dir.path(),
+        vec![
+            user("Remember cedar"),
+            assistant("old history ".repeat(1000)),
+            user("retained"),
+        ],
+    )
+    .await;
+    let focus = "keep the cedar codeword; drop the logs";
+    session.compact(Some(format!("  {focus}\n"))).await.unwrap();
+    let requests = api.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let last_user = request
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::User(_)))
+            .unwrap();
+        assert!(
+            text(last_user).ends_with(&format!(
+                "\n\nFocus from the user: {focus}\nGive it priority, but keep every section of the format."
+            )),
+            "{}",
+            text(last_user)
+        );
+    }
+    let raw = entries(&axo, &session).await;
+    assert!(raw.iter().any(|s| matches!(
+        &s.entry,
+        Entry::Compaction { reason: Some(CompactionReason::Manual), focus: Some(f), .. } if f == focus
+    )));
 }
 
 #[tokio::test]
@@ -745,7 +797,7 @@ async fn split_turn_is_combined_sequentially_and_carries_whole_users_and_file_li
         Some("<test-section>\neffective current instruction\n</test-section>")
     );
     assert!(!current.tools_added.iter().any(|t| t.name == "retired-tool"));
-    session.compact().await.unwrap();
+    session.compact(None).await.unwrap();
     let raw = entries(&axo, &session).await;
     let cps = checkpoints(&raw);
     assert_eq!(cps.len(), 1);
@@ -816,7 +868,7 @@ async fn split_turn_is_combined_sequentially_and_carries_whole_users_and_file_li
             .unwrap(),
         RunOutcome::Done
     );
-    session.compact().await.unwrap();
+    session.compact(None).await.unwrap();
     let raw = entries(&axo, &session).await;
     let cps = checkpoints(&raw);
     assert_eq!(cps.len(), 2);
@@ -1025,7 +1077,7 @@ async fn http_provider_ignoring_none_cannot_execute_summary_tools() {
         ],
     )
     .await;
-    within(session.compact()).await.unwrap();
+    within(session.compact(None)).await.unwrap();
     server.join().unwrap();
     {
         let requests = bodies.lock().unwrap();
@@ -1105,7 +1157,7 @@ async fn compaction_retains_an_oversized_call_result_group_as_a_unit() {
         ],
     )
     .await;
-    session.compact().await.unwrap();
+    session.compact(None).await.unwrap();
     let raw = entries(&axo, &session).await;
     let cps = checkpoints(&raw);
     let Entry::Compaction {
@@ -1157,7 +1209,7 @@ async fn user_carryover_stops_at_the_first_whole_message_that_will_not_fit() {
         ],
     )
     .await;
-    session.compact().await.unwrap();
+    session.compact(None).await.unwrap();
     let raw = entries(&axo, &session).await;
     let cps = checkpoints(&raw);
     let Entry::Compaction {
@@ -1208,7 +1260,10 @@ async fn branch_tool_results_neither_require_a_summary_nor_inflate_its_budget() 
         let result = session
             .navigate(
                 tool_only.then(|| ids[1].clone()),
-                NavigateOptions { summarize: true },
+                NavigateOptions {
+                    summarize: true,
+                    focus: None,
+                },
             )
             .await;
         if tool_only {

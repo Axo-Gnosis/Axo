@@ -94,7 +94,7 @@ async fn invalid_limits_reject_compaction_but_not_session_lifecycle() {
             .unwrap();
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(
-            within(session.compact()).await,
+            within(session.compact(None)).await,
             Err(Error::Compaction(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -128,7 +128,7 @@ async fn model_switch_validates_limits_only_when_compacting() {
         session.set_model(invalid).await.unwrap();
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(
-            within(session.compact()).await,
+            within(session.compact(None)).await,
             Err(Error::Compaction(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -138,7 +138,7 @@ async fn model_switch_validates_limits_only_when_compacting() {
     let mut valid = model.clone();
     valid.context_window = 3001;
     session.set_model(valid).await.unwrap();
-    if let Err(Error::Compaction(message)) = within(session.compact()).await {
+    if let Err(Error::Compaction(message)) = within(session.compact(None)).await {
         assert!(!message.contains("must be positive"));
         assert!(!message.contains("reserve must be smaller"));
         assert!(!message.contains("retained-tail budget must be smaller"));
@@ -213,7 +213,7 @@ async fn disabled_automatic_maintenance_still_allows_explicit_compact_and_shake_
             .any(|seq| matches!(seq.entry, Entry::ContextEdit { .. }))
     );
     assert_eq!(api.requests().len(), 1);
-    within(session.compact()).await.unwrap();
+    within(session.compact(None)).await.unwrap();
     assert!(
         session
             .attach(None)
