@@ -665,6 +665,8 @@ async fn large_tool_history_crosses_threshold_then_continues_with_a_real_tool() 
     let mut config = settings(0);
     config["compaction"]["enabled"] = json!(true);
     config["compaction"]["maxContext"] = json!(10_000);
+    // Pin the tool-free serializer so its truncation of the large result is observable.
+    config["compaction"]["summaryRequest"] = json!("separate");
     let (axo, api) = harness(
         dir.path(),
         config,
@@ -707,8 +709,8 @@ async fn large_tool_history_crosses_threshold_then_continues_with_a_real_tool() 
     );
     let requests = api.requests();
     assert_eq!(requests.len(), 3);
-    // There is no completed earlier turn: only the split-turn prefix needs
-    // summarizing, so it uses the tool-free separate serializer.
+    // The cut lands at the new prompt, so the completed seeded turn is plain
+    // history: one tool-free separate request, no split-turn prefix.
     let summary_request = &requests[0];
     assert_eq!(summary_request.options.tool_choice, None);
     assert!(
@@ -955,6 +957,8 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
         let mut config = settings(0);
         config["compaction"]["enabled"] = json!(true);
         config["compaction"]["maxContext"] = json!(candidate + 20_000 + 1024 - u64::from(above));
+        // Pin the tool-free serializer so its truncation of both results is observable.
+        config["compaction"]["summaryRequest"] = json!("separate");
         let turns = if above {
             vec![
                 ScriptedTurn::Reply(reply_text("summarized old work")),
@@ -1383,4 +1387,50 @@ async fn eliding_a_real_read_reattaches_nested_instructions_on_the_next_touch() 
         1
     );
     assert!(second.details.as_ref().unwrap().get("ledger").is_some());
+}
+
+// Real runs journal run_start/submission/run_end entries with no model
+// messages right before each user. A tail that ends exactly at a user must
+// still be a complete-turn boundary: one history summary, no split-turn prefix.
+#[tokio::test]
+async fn run_bookkeeping_before_a_user_cut_does_not_split_the_previous_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, api) = harness(
+        dir.path(),
+        settings(50),
+        100_000,
+        vec![
+            ScriptedTurn::Reply(reply_text(&"first answer ".repeat(400))),
+            ScriptedTurn::Reply(reply_text(&"second answer ".repeat(400))),
+            ScriptedTurn::Reply(reply_text("ok")),
+            ScriptedTurn::Reply(reply_text("Both earlier turns were answered.")),
+        ],
+    )
+    .await;
+    let session = axo.create_session(options(dir.path())).await.unwrap();
+    let latest = "latest question ".repeat(25);
+    for text in ["first question", "second question", latest.as_str()] {
+        assert_eq!(
+            within(session.prompt(text)).await.unwrap(),
+            RunOutcome::Done
+        );
+    }
+    session.compact(None).await.unwrap();
+    let requests = api.requests();
+    // The single summary request covers both completed turns and stops before
+    // the kept user; a split turn would need a second turn-prefix request.
+    assert_eq!(requests.len(), 4);
+    let summarized: Vec<String> = requests[3].transcript.iter().map(text).collect();
+    assert!(summarized.iter().any(|t| t == "first question"));
+    assert!(summarized.iter().any(|t| t == "second question"));
+    assert!(!summarized.contains(&latest));
+    let raw = entries(&axo, &session).await;
+    assert_eq!(checkpoints(&raw).len(), 1);
+    let kept = ordinary(&raw);
+    assert!(
+        kept.iter()
+            .all(|m| !text(m).contains("question") || text(m) == latest)
+    );
+    assert_eq!(kept.iter().filter(|m| text(m) == latest).count(), 1);
+    assert!(kept.iter().any(|m| text(m) == "ok"));
 }

@@ -320,13 +320,16 @@ pub(crate) fn prepare_compaction(
     if recovery_suffix {
         cut += 1;
     }
+    // Rewinding pulls empty bookkeeping (run/submission records) into the kept
+    // tail; whether the cut starts a turn is decided by the content cut itself.
+    let content = cut;
     while cut > start
         && messages(cut - 1).is_empty()
         && !matches!(entry(cut - 1), Entry::Compaction { .. })
     {
         cut -= 1;
     }
-    let turn = if cut < sources.len() && messages(cut).iter().any(turn_start) {
+    let turn = if content < sources.len() && messages(content).iter().any(turn_start) {
         None
     } else {
         (start..cut)
