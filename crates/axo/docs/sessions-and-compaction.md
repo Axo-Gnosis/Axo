@@ -68,7 +68,7 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
 
 - **`session.attach(from_seq)`:** Atomically snapshots `Attach { missed, live, events }`:
   - `missed`: all `SeqEntry` items with `seq > from_seq` (or all entries when `from_seq` is `None`).
-  - `live`: `LiveSnapshot` containing `run_id`, active `maintenance` (`Compact`, `Shake`, `BranchSummary`), `agent` (`AgentSnapshot` with `running`, partial `streaming` message from `Accumulator`, `pending_tool_calls`, `queued_steering`, `queued_follow_up`), projected `messages`, and `pending_questions`.
+  - `live`: `LiveSnapshot` containing `run_id`, active `maintenance` (`Compact`, `Shake`, `BranchSummary`), `agent` (`AgentSnapshot` with `running`, partial `streaming` message from `Accumulator`, `pending_tool_calls`, `queued_steering`, `queued_follow_up`), projected `messages`, `pending_questions`, and `jobs` (`Vec<JobInfo>`).
   - `events`: a `tokio::sync::broadcast::Receiver<SessionEvent>`. If a slow receiver lags (`RecvError::Lagged`), it can call `session.attach(Some(last_seen_seq))` to catch up without stalling the agent loop.
 - **`session.navigate(target, NavigateOptions { summarize, focus })`:**
   - Appends `Entry::Leaf { base: EntryBase { parent_id: target, .. } }`, records `ModelChange` / `ThinkingLevelChange` if the live selection differs from the target branch's historical selection, restores the file ledger and nested context tracker to the new projection, and updates the agent's transcript.

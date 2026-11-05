@@ -107,14 +107,58 @@ impl JobControl {
     }
 }
 
+/// A background job's state, as `proc://` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Running,
+    /// The command exited; processes it started are still running.
+    HelpersRunning,
+    Finished,
+    /// Exited with an error, was stopped, or was interrupted when the session closed.
+    Failed,
+}
+
+impl JobStatus {
+    /// The `proc://` label: `"running"`, `"helpers running"`, `"finished"` or `"failed"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::HelpersRunning => "helpers running",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One background job, for hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobInfo {
+    /// The job name, `bg_N`.
+    pub id: String,
+    pub command: String,
+    /// The artifact id holding the job's full output.
+    pub artifact: u64,
+    pub status: JobStatus,
+}
+
 /// One job as `proc://` shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JobView {
     pub id: u64,
     pub command: String,
     pub artifact: u64,
-    /// `"running"`, `"helpers running"`, `"finished"` or `"failed"`.
-    pub status: &'static str,
+    pub status: JobStatus,
+}
+
+impl JobView {
+    pub(crate) fn info(&self) -> JobInfo {
+        JobInfo {
+            id: job_name(self.id),
+            command: self.command.clone(),
+            artifact: self.artifact,
+            status: self.status,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,17 +212,17 @@ struct Job {
 impl Job {
     fn view(&self, id: u64) -> JobView {
         let status = match (self.phase, &self.result) {
-            (Phase::Retained, _) => "helpers running",
+            (Phase::Retained, _) => JobStatus::HelpersRunning,
             (
                 _,
                 Some(JobResult {
                     is_error: false, ..
                 }),
-            ) => "finished",
-            (_, Some(JobResult { is_error: true, .. })) => "failed",
-            (Phase::Running, None) => "running",
+            ) => JobStatus::Finished,
+            (_, Some(JobResult { is_error: true, .. })) => JobStatus::Failed,
+            (Phase::Running, None) => JobStatus::Running,
             // A rebuilt job that never ended and is not reconciled yet.
-            (Phase::Closed, None) => "failed",
+            (Phase::Closed, None) => JobStatus::Failed,
         };
         JobView {
             id,

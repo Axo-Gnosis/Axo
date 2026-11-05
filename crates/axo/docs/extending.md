@@ -147,7 +147,7 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `set_model` | `async fn set_model(&self, model: Model) -> Result<(), Error>` | Returns `Error::Busy` during maintenance; appends `Entry::ModelChange` (and `ThinkingLevelChange` if clamped), and switches the model for the next request |
 | `set_thinking` | `async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error>` | Clamps `level` to the current model, appends `Entry::ThinkingLevelChange` when changed, and returns the applied level |
 | `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles the pending question; `dismiss` drops it and stops the run like `abort` (`CancelReason::User`). Both return `Error::NoPendingQuestion` for an unknown call id |
-| `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot`, and a live `broadcast::Receiver<SessionEvent>` |
+| `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot` (including `jobs`, the same list as `Session::jobs`), and a live `broadcast::Receiver<SessionEvent>` |
 | `compact` | `async fn compact(&self, focus: Option<String>) -> Result<(), Error>` | Runs a standalone compaction summary checkpoint in a session-owned task; `focus` tells the summary what to prioritize and is recorded on the `Entry::Compaction`; blank focus counts as none |
 | `shake` | `async fn shake(&self, mode: ShakeMode) -> Result<(), Error>` | Runs recoverable artifact elision (`Elide`, `Images`, or `Thinking`) without model calls |
 | `navigate` | `async fn navigate(&self, target: Option<EntryId>, options: NavigateOptions) -> Result<(), Error>` | Moves the leaf to `target` (`None` = root), optionally summarizing the abandoned branch into an `Entry::BranchSummary` (`NavigateOptions { summarize, focus }`; `focus` without `summarize` is `Error::InvalidInput` (blank counts as none)). Running jobs keep running; their results are delivered on whichever branch is selected when they finish, naming the originating command |
@@ -157,6 +157,8 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `run_command` | `async fn run_command(&self, command: Command) -> Result<(), Error>` | Runs a built-in `Command` under its policy; the only way a built-in runs. `Command::Model` takes `provider/id` only (otherwise `Error::ModelNotFound`) |
 | `id` / `path` / `skills` | `fn id(&self) -> &str`<br>`fn path(&self) -> &Path`<br>`fn skills(&self) -> &[Skill]` | The header UUIDv7 (known before the file exists); the session file, created lazily on the first submission; the skills loaded at start, which feed the prompt catalog and `/name` commands |
 | `schemes` | `fn schemes(&self) -> &Schemes` | This session's URL schemes for hosts resolving URLs they display: `exact`, then `resolve`, then `read` for `Target::Virtual`; a fork resolves to its own files |
+| `jobs` | `fn jobs(&self) -> Vec<JobInfo>` | This session's background jobs, ascending: promoted, retained and rebuilt jobs, finished ones included, exactly the jobs `read proc://` lists. See [Background jobs for hosts](#background-jobs-for-hosts) |
+| `kill_job` | `fn kill_job(&self, id: &str) -> bool` | Stops job `id` (`bg_N`) like `write proc://bg_N/kill`: `true` when a running job (or its retained helpers) was signalled; `false` for an unknown or invalid id, or a job whose processes have all exited |
 
 Prompt input is a `PromptInput`; see [`prompts-and-context.md`](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs) for each `PromptPart` and how parts reach the model.
 
@@ -173,6 +175,17 @@ Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
 | `MaintenanceStart` | `kind: MaintenanceKind` | Compaction, `/shake`, or branch summary started |
 | `MaintenanceEnd` | `kind: MaintenanceKind`, `error: Option<String>`, `aborted: bool` | Maintenance task finished |
 | `Retry` | `attempt: usize`, `delay_ms: u64` | Transient model error backoff retry (see [Transient Retry & Overflow Recovery](sessions-and-compaction.md#transient-retry--overflow-recovery)) |
+| `Jobs` | `jobs: Vec<JobInfo>` | The full `Session::jobs` list after any background job changed (promoted, retained, ended, helpers exited, or killed) |
+
+### Background jobs for hosts
+
+`bash` commands that move to the background become jobs `bg_N` (see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)). The model reaches them through `proc://`; hosts get the same state as data, so they can list, stop, or keep a session alive while jobs run, without parsing `proc://` text:
+
+- **State:** `Session::jobs()` returns `Vec<JobInfo>`, and `attach().live` carries the same list as `LiveSnapshot::jobs`.
+- **Changes:** every change emits `SessionEvent::Jobs { jobs }` with the full list; replace the previous snapshot rather than patching it.
+- **Stop:** `Session::kill_job(id)` stops a job; the result is then journaled and delivered like any other job result.
+
+`JobInfo` (`axo::JobInfo`) has `id: String` (`bg_N`), `command: String` (the full command), `artifact: u64` (its output, readable as `artifact://<artifact>`), and `status: JobStatus`. `JobStatus` (`axo::JobStatus`) is `Running`, `HelpersRunning` (the command exited but processes it started are still supervised), `Finished`, or `Failed` (exited with an error, was stopped, or was interrupted when the session closed); `JobStatus::label` returns the `proc://` wording (`running`, `helpers running`, `finished`, `failed`). Only open sessions have jobs: `Axo::schemes` has no `proc://`, and `Session::shutdown` or dropping the `Session` stops every running job.
 
 ### Commands
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axo::store::{Entry, SeqEntry};
-use axo::{Axo, Session, SessionEvent};
+use axo::{Axo, JobInfo, JobStatus, Session, SessionEvent};
 use axo_agent::{AgentEvent, RunOutcome};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
@@ -144,6 +144,26 @@ async fn await_run_end(session: &Session, after: u64) {
         }
     })
     .await;
+}
+
+/// Waits for a `SessionEvent::Jobs` whose snapshot equals `want`.
+async fn await_jobs(events: &mut broadcast::Receiver<SessionEvent>, want: &[JobInfo]) {
+    within(async {
+        loop {
+            match events.recv().await {
+                Ok(SessionEvent::Jobs { jobs }) if jobs == want => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
+            }
+        }
+    })
+    .await;
+}
+
+/// `read`s `url` through the session's own schemes, as a host displaying it would.
+async fn read_url(session: &Session, url: &str) -> String {
+    let url = session.schemes().exact(url).expect("registered scheme");
+    session.schemes().read(&url).await.unwrap()
 }
 
 #[tokio::test]
@@ -458,5 +478,82 @@ async fn retained_helpers_return_promptly_and_are_killable() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_job_api_reports_and_kills() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, _api) = scripted(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "sleep 30", "async": true}),
+            )])),
+            ScriptedTurn::Reply(reply_text("started it")),
+            // The stopped job's result wakes the idle session once.
+            ScriptedTurn::Reply(reply_text("it was stopped")),
+        ],
+    )
+    .await;
+    let session = axo.create_session(bash_options(dir.path())).await.unwrap();
+    let mut events = session.attach(None).await.events;
+
+    assert_eq!(
+        within(session.prompt("Run it in the background."))
+            .await
+            .unwrap(),
+        RunOutcome::Done
+    );
+    let jobs = session.jobs();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let artifact = jobs[0].artifact;
+    let running = vec![JobInfo {
+        id: "bg_1".into(),
+        command: "sleep 30".into(),
+        artifact,
+        status: JobStatus::Running,
+    }];
+    assert_eq!(jobs, running);
+    assert_eq!(session.attach(None).await.live.jobs, running);
+    await_jobs(&mut events, &running).await;
+    assert_eq!(
+        read_url(&session, "proc://").await,
+        "bg_1  running  sleep 30"
+    );
+
+    let before_kill = last_seq(&session).await;
+    assert!(session.kill_job("bg_1"));
+    let failed = vec![JobInfo {
+        status: JobStatus::Failed,
+        ..running[0].clone()
+    }];
+    await_jobs(&mut events, &failed).await;
+    assert_eq!(session.jobs(), failed);
+    // The result lands before the container closes; once closed, nothing is left to stop.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while session.kill_job("bg_1") {
+        assert!(Instant::now() < deadline, "bg_1 never closed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!session.kill_job("bg_9"), "unknown job");
+    assert!(!session.kill_job("x"), "invalid id");
+
+    // `proc://` renders the same states as before the host API existed.
+    assert_eq!(
+        read_url(&session, "proc://").await,
+        "bg_1  failed  sleep 30"
+    );
+    let detail = read_url(&session, "proc://bg_1").await;
+    assert!(
+        detail.starts_with(&format!(
+            "Job: bg_1\nCommand: sleep 30\nStatus: failed\nOutput: artifact://{artifact}"
+        )),
+        "{detail}"
+    );
+
+    await_run_end(&session, before_kill).await;
     session.shutdown().await;
 }

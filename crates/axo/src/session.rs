@@ -35,7 +35,9 @@ use crate::error::Error;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
-use crate::jobs::{DeliveryKey, JobEntry, JobHost, JobRegistry, job_name, render_results};
+use crate::jobs::{
+    DeliveryKey, JobEntry, JobHost, JobInfo, JobRegistry, job_name, parse_job_id, render_results,
+};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::Artifacts;
 use crate::schemes::dir::DirScheme;
@@ -171,6 +173,10 @@ pub enum SessionEvent {
         attempt: u32,
         delay_ms: u64,
     },
+    /// The background jobs changed; the full list, as [`Session::jobs`] returns it.
+    Jobs {
+        jobs: Vec<JobInfo>,
+    },
 }
 
 /// A prompt with an optional client id that makes resubmission idempotent.
@@ -214,6 +220,8 @@ pub struct LiveSnapshot {
     /// Unanswered `ask` calls by tool-call id. A question raised while attaching can
     /// also arrive as a `QuestionPending` event (duplicated, never missed).
     pub pending_questions: Vec<(String, Vec<Question>)>,
+    /// The background jobs, as [`Session::jobs`] returns them.
+    pub jobs: Vec<JobInfo>,
 }
 
 /// A new session copied from a point of another.
@@ -1804,6 +1812,23 @@ impl JobHost for SessionHooks {
     }
 }
 
+/// Sends a `SessionEvent::Jobs` snapshot on each registry change; ends once the registry
+/// is gone. Weak, so the relay never keeps a closed session's jobs alive.
+async fn relay_jobs(
+    registry: Weak<JobRegistry>,
+    mut changed: watch::Receiver<u64>,
+    events: broadcast::Sender<SessionEvent>,
+) {
+    while changed.changed().await.is_ok() {
+        let Some(live) = registry.upgrade() else {
+            return;
+        };
+        let jobs = live.list().iter().map(|job| job.info()).collect();
+        drop(live);
+        let _ = events.send(SessionEvent::Jobs { jobs });
+    }
+}
+
 /// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
 /// `artifact://` and `local://` in the side folders beside the session file `path`,
 /// `skill://`, `axo://` docs when `docs_dir` is given, `proc://` over `jobs` when given,
@@ -1996,6 +2021,11 @@ impl Session {
             .jobs
             .attach(Arc::downgrade(&hooks) as Weak<dyn JobHost>);
         let _ = hooks.this.set(Arc::downgrade(&hooks));
+        tokio::spawn(relay_jobs(
+            Arc::downgrade(&hooks.jobs),
+            hooks.jobs.subscribe(),
+            hooks.events.clone(),
+        ));
         let agent = Arc::new(Agent::new(AgentConfig {
             thinking,
             tools: tools.clone(),
@@ -2438,6 +2468,23 @@ impl Session {
         &self.hooks.prompt.skills
     }
 
+    /// The background jobs `read proc://` lists (promoted, retained and rebuilt,
+    /// finished ones included), ascending.
+    pub fn jobs(&self) -> Vec<JobInfo> {
+        self.hooks
+            .jobs
+            .list()
+            .iter()
+            .map(|job| job.info())
+            .collect()
+    }
+
+    /// Stops job `id` (`bg_N`), like `write proc://bg_N/kill`; false when it is unknown
+    /// or no longer running.
+    pub fn kill_job(&self, id: &str) -> bool {
+        parse_job_id(id).is_some_and(|id| self.hooks.jobs.kill(id))
+    }
+
     /// This session's URL schemes, for hosts resolving URLs they display: recognize with
     /// `exact`, then `resolve`, and `read` a `Target::Virtual`. A fork resolves to its own files.
     pub fn schemes(&self) -> &Schemes {
@@ -2751,6 +2798,7 @@ impl Session {
                 agent,
                 messages: log.projection.messages.clone(),
                 pending_questions: self.questions.pending(),
+                jobs: self.jobs(),
             },
             events,
         }

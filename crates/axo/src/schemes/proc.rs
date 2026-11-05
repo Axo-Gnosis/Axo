@@ -69,7 +69,7 @@ impl Scheme for ProcScheme {
                         format!(
                             "{}  {}  {}",
                             job_name(job.id),
-                            job.status,
+                            job.status.label(),
                             headline(&job.command)
                         )
                     })
@@ -85,7 +85,7 @@ impl Scheme for ProcScheme {
                     "Job: {}\nCommand: {}\nStatus: {}\nOutput: artifact://{}",
                     job_name(job.id),
                     job.command,
-                    job.status,
+                    job.status.label(),
                     job.artifact
                 );
                 if let Some(result) = &result {

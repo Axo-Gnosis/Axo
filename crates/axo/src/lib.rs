@@ -29,6 +29,7 @@ pub use exec::devshell::DevShellEnv;
 pub use exec::host::{OutputError, ProcessSupervisor, Supervision};
 pub use exec::{EnvMap, ExecEnv, HostEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
+pub use jobs::{JobInfo, JobStatus};
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     Attach, Fork, LiveSnapshot, MaintenanceKind, NavigateOptions, PromptRequest, PromptResult,
