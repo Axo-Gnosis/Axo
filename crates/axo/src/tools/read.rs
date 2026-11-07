@@ -74,7 +74,7 @@ impl Tool for ReadTool {
         GUIDELINES
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext { call, cancel, .. } = cx;
         let ReadArgs {
             path,

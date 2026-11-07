@@ -2,13 +2,13 @@
 //! background jobs (`bg_N`) until their results are delivered, and helpers a command left
 //! running in its container (process group or cgroup). The registry owns its journal
 //! format, job records and the receipts on messages: it rebuilds itself from them on
-//! open, and a [`JobHost`] appends the records it produces under the session log lock.
+//! open. A job's `job_start` rides the tool result that starts it (the session writes
+//! both in one batch); its `job_end` is appended by the command's own task.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
-use async_trait::async_trait;
 use axo_agent::ToolInvocationId;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -16,61 +16,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 use crate::exec::host::Container;
-use crate::store::{Entry, EntryBase, SeqEntry};
-
-/// A journal record the registry asks its host to append.
-pub(crate) enum JobEntry {
-    Start {
-        job_id: String,
-        call_id: String,
-        command: String,
-        artifact: u64,
-    },
-    End {
-        job_id: String,
-        text: String,
-        is_error: bool,
-    },
-}
-
-impl JobEntry {
-    /// The journal entry for this record, owned by `session_id`.
-    pub(crate) fn into_entry(self, base: EntryBase, session_id: &str) -> Entry {
-        match self {
-            JobEntry::Start {
-                job_id,
-                call_id,
-                command,
-                artifact,
-            } => Entry::JobStart {
-                base,
-                session_id: session_id.to_owned(),
-                job_id,
-                call_id,
-                command,
-                artifact,
-            },
-            JobEntry::End {
-                job_id,
-                text,
-                is_error,
-            } => Entry::JobEnd {
-                base,
-                job_id,
-                text,
-                is_error,
-            },
-        }
-    }
-}
+use crate::session::journal::{self, WeakJournal};
+use crate::store::{Entry, SeqEntry};
 
 /// The session side of a registry.
-#[async_trait]
 pub(crate) trait JobHost: Send + Sync {
-    /// Appends `entry` under the session log lock.
-    async fn journal(&self, entry: JobEntry) -> Result<(), Error>;
     /// Results became pending; start delivery if the session is idle.
     fn results_ready(&self);
+}
+
+/// A job's `job_start`, written with the tool result of the call that started it.
+pub(crate) struct JobStarted {
+    pub id: u64,
+    /// The result carries the `admittedJobs` receipt (a promoted job). A retained
+    /// foreground command's start only reserves its id.
+    pub admits: bool,
+    /// `Entry::JobStart`, its base left to the journal.
+    pub entry: Entry,
 }
 
 /// Who holds a reservation of pending results: a `wait` call or a queued delivery message.
@@ -247,7 +209,7 @@ impl Job {
 struct State {
     jobs: BTreeMap<u64, Job>,
     next_id: u64,
-    admissions: HashMap<ToolInvocationId, u64>,
+    admissions: HashMap<ToolInvocationId, JobStarted>,
     /// Spools created for commands not registered yet.
     starting: HashSet<PathBuf>,
     shut_down: bool,
@@ -255,9 +217,14 @@ struct State {
 
 /// One per session; forks get their own. Nothing awaits while `state` is locked.
 pub struct JobRegistry {
+    /// The session that starts this registry's jobs, recorded on each `job_start`.
+    session_id: String,
     state: Mutex<State>,
     changed: watch::Sender<u64>,
     host: OnceLock<Weak<dyn JobHost>>,
+    /// Where command tasks append `job_end`; weak, so a job outliving its session
+    /// cannot keep the session file open.
+    journal: OnceLock<WeakJournal>,
 }
 
 /// Keeps a spool in [`JobRegistry::live_spools`] until its command is registered.
@@ -402,6 +369,7 @@ impl JobRegistry {
             );
         }
         let registry = Arc::new(Self {
+            session_id,
             state: Mutex::new(State {
                 jobs,
                 next_id: max_id + 1,
@@ -409,12 +377,14 @@ impl JobRegistry {
             }),
             changed: watch::Sender::new(0),
             host: OnceLock::new(),
+            journal: OnceLock::new(),
         });
         (registry, unended)
     }
 
-    pub(crate) fn attach(&self, host: Weak<dyn JobHost>) {
+    pub(crate) fn attach(&self, host: Weak<dyn JobHost>, journal: WeakJournal) {
         let _ = self.host.set(host);
+        let _ = self.journal.set(journal);
     }
 
     /// Bumped on every state change.
@@ -490,39 +460,63 @@ impl JobRegistry {
         }
     }
 
-    /// Journals the job's `JobStart`: before [`JobRegistry::promote`], or when a
-    /// foreground command leaves helpers running, so its `bg_N` stays reserved.
-    pub(crate) async fn journal_start(&self, id: u64, call_id: &str) -> Result<(), Error> {
-        let entry = {
-            let state = self.lock();
-            let job = state
-                .jobs
-                .get(&id)
-                .ok_or_else(|| Error::Job(job_name(id)))?;
-            JobEntry::Start {
-                job_id: job_name(id),
-                call_id: call_id.to_owned(),
-                command: job.command.clone(),
-                artifact: job.artifact,
-            }
-        };
-        let host = self.host().ok_or_else(|| Error::Job(job_name(id)))?;
-        host.journal(entry).await
+    /// The `job_start` of job `id`, started by tool call `call_id`.
+    fn start_entry(&self, id: u64, job: &Job, call_id: &str) -> Entry {
+        Entry::JobStart {
+            base: journal::base(),
+            session_id: self.session_id.clone(),
+            job_id: job_name(id),
+            call_id: call_id.to_owned(),
+            command: job.command.clone(),
+            artifact: job.artifact,
+        }
     }
 
     /// Moves a foreground command to the background; false once it already finished.
-    pub(crate) fn promote(&self, id: u64) -> bool {
-        let promoted = match self.lock().jobs.get_mut(&id) {
-            Some(job) if job.mode == Mode::Foreground => {
-                job.mode = Mode::Promoted;
-                true
+    /// The tool result of `invocation` then admits the job: its batch writes the
+    /// `job_start` and the `admittedJobs` receipt together.
+    pub(crate) fn promote(&self, id: u64, invocation: ToolInvocationId, call_id: &str) -> bool {
+        let promoted = {
+            let mut state = self.lock();
+            match state.jobs.get_mut(&id) {
+                Some(job) if job.mode == Mode::Foreground => {
+                    job.mode = Mode::Promoted;
+                    let entry = self.start_entry(id, job, call_id);
+                    state.admissions.insert(
+                        invocation,
+                        JobStarted {
+                            id,
+                            admits: true,
+                            entry,
+                        },
+                    );
+                    true
+                }
+                _ => false,
             }
-            _ => false,
         };
         if promoted {
             self.bump();
         }
         promoted
+    }
+
+    /// A foreground command of `invocation` left helpers running: its tool result's batch
+    /// writes the job's `job_start` without a receipt, so its `bg_N` stays reserved.
+    pub(crate) fn retain_on_commit(&self, invocation: ToolInvocationId, id: u64, call_id: &str) {
+        let mut state = self.lock();
+        let Some(job) = state.jobs.get(&id) else {
+            return;
+        };
+        let entry = self.start_entry(id, job, call_id);
+        state.admissions.insert(
+            invocation,
+            JobStarted {
+                id,
+                admits: false,
+                entry,
+            },
+        );
     }
 
     /// Fixes who owns the command's result, before the command task renders it (and
@@ -547,28 +541,42 @@ impl JobRegistry {
         }
     }
 
-    /// The command's result. A promoted job's `JobEnd` is journaled first (unless the
-    /// registry shut down: reopen reconciles it as interrupted); only then is the result
-    /// stored and, once admitted, pending, so it is never deliverable before its terminal
-    /// record. A foreground (retained) job's result is only stored for `proc://`; the
-    /// foreground waiter returns it, so it is never journaled or delivered.
+    /// The command's result. A promoted job first waits for its admitting receipt to be
+    /// decided, so its `job_end` always follows its `job_start`; an admitted job's
+    /// `job_end` is then journaled (unless the registry shut down: reopen reconciles it
+    /// as interrupted), and only after that is the result stored and pending, so it is
+    /// never deliverable before its terminal record. A job whose receipt was never
+    /// written journals nothing. A foreground (retained) job's result is only stored for
+    /// `proc://`; the foreground waiter returns it, so it is never journaled or delivered.
     pub(crate) async fn command_done(&self, id: u64, text: String, is_error: bool) {
-        let journal = {
-            let state = self.lock();
-            !state.shut_down
-                && state
-                    .jobs
-                    .get(&id)
-                    .is_some_and(|job| job.mode == Mode::Promoted)
+        let mut changes = self.changed.subscribe();
+        let journal = loop {
+            {
+                let state = self.lock();
+                let Some(job) = state.jobs.get(&id) else {
+                    return;
+                };
+                if state.shut_down || job.mode != Mode::Promoted || job.delivery == Delivery::Never
+                {
+                    break false;
+                }
+                if job.admitted {
+                    break true;
+                }
+            }
+            // The receipt commits with its tool result, or fails at the latest when the
+            // run settles; both bump. The registry owns the sender, so this never errors.
+            let _ = changes.changed().await;
         };
         if journal {
-            let entry = JobEntry::End {
+            let entry = Entry::JobEnd {
+                base: journal::base(),
                 job_id: job_name(id),
                 text: text.clone(),
                 is_error,
             };
-            let journaled = match self.host() {
-                Some(host) => host.journal(entry).await,
+            let journaled = match self.journal.get() {
+                Some(journal) => journal.append(vec![entry]).await.map(drop),
                 None => Err(Error::Job(job_name(id))),
             };
             if let Err(err) = journaled {
@@ -667,12 +675,8 @@ impl JobRegistry {
         }
     }
 
-    /// The tool result of `invocation` admits job `id` once it is committed.
-    pub(crate) fn admit_on_commit(&self, invocation: ToolInvocationId, id: u64) {
-        self.lock().admissions.insert(invocation, id);
-    }
-
-    pub(crate) fn take_admission(&self, invocation: ToolInvocationId) -> Option<u64> {
+    /// The `job_start` the tool result of `invocation` carries, if its call started a job.
+    pub(crate) fn take_start(&self, invocation: ToolInvocationId) -> Option<JobStarted> {
         self.lock().admissions.remove(&invocation)
     }
 
@@ -696,7 +700,7 @@ impl JobRegistry {
     /// `proc://`.
     pub(crate) fn admission_failed(&self, id: u64) {
         let mut state = self.lock();
-        state.admissions.retain(|_, job| *job != id);
+        state.admissions.retain(|_, admission| admission.id != id);
         fail_admission(&mut state, id);
         drop(state);
         self.bump();
@@ -765,10 +769,16 @@ impl JobRegistry {
     }
 
     /// At settle: every reservation goes back to pending, and admissions whose receipt was
-    /// never written are dropped as failed.
+    /// never written are dropped as failed (a retained start that never rode its result
+    /// is simply dropped).
     pub(crate) fn release_uncommitted(&self) {
         let mut state = self.lock();
-        let dropped: Vec<u64> = state.admissions.drain().map(|(_, id)| id).collect();
+        let dropped: Vec<u64> = state
+            .admissions
+            .drain()
+            .filter(|(_, admission)| admission.admits)
+            .map(|(_, admission)| admission.id)
+            .collect();
         for &id in &dropped {
             fail_admission(&mut state, id);
         }
@@ -854,6 +864,8 @@ impl JobRegistry {
                 })
                 .collect()
         };
+        // Wakes command tasks waiting on an admission: they journal nothing now.
+        self.bump();
         for task in tasks {
             let _ = task.await;
         }
@@ -870,6 +882,8 @@ impl JobRegistry {
                 control.container.kill();
             }
         }
+        drop(state);
+        self.bump();
     }
 }
 

@@ -1,5 +1,6 @@
 //! The loop itself (pi `agent/src/agent-loop.ts`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -11,10 +12,10 @@ use axo_ai::{
     UserBlock, drop_failed_turns, now_ms,
 };
 use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use jsonschema::error::ValidationErrorKind;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, QueueMode, RunOutcome};
@@ -27,7 +28,8 @@ use crate::hooks::{
 };
 use crate::message::{AgentMessage, QueuedMessage, unanswered_calls};
 use crate::tool::{
-    ExecutionMode, SteerSignal, Tool, ToolContext, ToolInvocationId, ToolOutput, ToolUpdate,
+    ExecutionMode, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
+    ToolUpdate, ToolUpdates,
 };
 
 /// How a run starts.
@@ -107,6 +109,34 @@ enum Prepared {
     /// Not executed: unknown tool, invalid arguments, blocked, or aborted.
     Immediate(ToolOutput),
     Ready(Arc<dyn Tool>),
+}
+
+/// The spawned calls of one batch and the channel their updates arrive on.
+struct Batch {
+    tasks: JoinSet<(Result<ToolOutput, ToolError>, u64)>,
+    calls: HashMap<Id, Spawned>,
+    sender: mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>,
+    updates: mpsc::UnboundedReceiver<(Arc<str>, ToolUpdate)>,
+}
+
+impl Batch {
+    fn new() -> Self {
+        let (sender, updates) = mpsc::unbounded_channel();
+        Self {
+            tasks: JoinSet::new(),
+            calls: HashMap::new(),
+            sender,
+            updates,
+        }
+    }
+}
+
+/// One running call, keyed by its task id.
+struct Spawned {
+    index: usize,
+    call: Arc<ToolCall>,
+    invocation: ToolInvocationId,
+    started: Instant,
 }
 
 /// The state of one run (pi `runLoop`'s locals).
@@ -543,11 +573,9 @@ impl Run<'_> {
                         outcome
                     }
                     Prepared::Ready(tool) => {
-                        let (updates, receiver) = mpsc::unbounded_channel();
-                        let running = FuturesUnordered::from_iter([
-                            self.execute_call(0, tool, message, call, updates)
-                        ]);
-                        let Some((_, outcome)) = self.drive(running, receiver).await?.pop() else {
+                        let mut batch = Batch::new();
+                        self.spawn_call(&mut batch, 0, tool, call);
+                        let Some((_, outcome)) = self.drive(message, batch).await?.pop() else {
                             continue;
                         };
                         outcome
@@ -561,9 +589,9 @@ impl Run<'_> {
             }
         } else {
             let mut slots: Vec<Option<Outcome>> = calls.iter().map(|_| None).collect();
-            let (updates, receiver) = mpsc::unbounded_channel();
-            let running = FuturesUnordered::new();
-            // Preparation, including `before_tool_call`, runs in source order.
+            let mut batch = Batch::new();
+            // Preparation, including `before_tool_call`, runs in source order; each
+            // cleared call starts on its own task at once.
             for (index, call) in calls.iter().enumerate() {
                 self.emit_start(call).await?;
                 match self.prepare(message, call).await {
@@ -578,22 +606,13 @@ impl Run<'_> {
                         self.emit_end(&outcome).await?;
                         slots[index] = Some(outcome);
                     }
-                    Prepared::Ready(tool) => {
-                        running.push(self.execute_call(
-                            index,
-                            tool,
-                            message,
-                            call,
-                            updates.clone(),
-                        ));
-                    }
+                    Prepared::Ready(tool) => self.spawn_call(&mut batch, index, tool, call),
                 }
                 if self.cancel.is_cancelled() {
                     break;
                 }
             }
-            drop(updates);
-            for (index, outcome) in self.drive(running, receiver).await? {
+            for (index, outcome) in self.drive(message, batch).await? {
                 slots[index] = Some(outcome);
             }
             // Result messages follow the order the model issued the calls.
@@ -647,45 +666,121 @@ impl Run<'_> {
         }
     }
 
-    /// Executes one prepared call and applies `after_tool_call`.
-    async fn execute_call(
-        &self,
-        index: usize,
-        tool: Arc<dyn Tool>,
-        message: &AssistantMessage,
-        call: &ToolCall,
-        updates: mpsc::UnboundedSender<(String, ToolUpdate)>,
-    ) -> (usize, Outcome) {
-        let mut outcome = Outcome {
-            call_id: call.id.clone(),
-            name: call.name.clone(),
-            output: error_output("Operation aborted"),
-            duration_ms: None,
-            invocation: None,
-        };
-        if self.cancel.is_cancelled() {
-            return (index, outcome);
-        }
-        let call_id = call.id.clone();
-        let on_update = move |update: ToolUpdate| {
-            let _ = updates.send((call_id.clone(), update));
-        };
+    /// Starts one prepared call on its own task, so the loop never polls tool futures:
+    /// a tool waiting on something the loop's `Persist` holds cannot stall the loop.
+    fn spawn_call(&self, batch: &mut Batch, index: usize, tool: Arc<dyn Tool>, call: &ToolCall) {
+        let call = Arc::new(call.clone());
         let invocation =
             ToolInvocationId(self.agent.next_invocation.fetch_add(1, Ordering::Relaxed));
         let cx = ToolContext {
-            call,
+            call: Arc::clone(&call),
             cancel: self.cancel.child_token(),
-            updates: &on_update,
+            updates: ToolUpdates::new(Arc::from(call.id.as_str()), batch.sender.clone()),
             steer: SteerSignal(self.agent.steer_pending.subscribe()),
             invocation,
         };
-        outcome.invocation = Some(invocation);
         let started = Instant::now();
-        let result = tool.execute(cx).await;
-        outcome.duration_ms =
-            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        outcome.output = result.unwrap_or_else(|error| error_output(error.0));
+        let task = batch.tasks.spawn(async move {
+            let result = tool.execute(cx).await;
+            (result, elapsed_ms(started))
+        });
+        batch.calls.insert(
+            task.id(),
+            Spawned {
+                index,
+                call,
+                invocation,
+                started,
+            },
+        );
+    }
 
+    /// Awaits the batch's tasks, forwarding their updates, and emits each
+    /// `ToolExecutionEnd` (after `after_tool_call`, on this task) as its call completes.
+    /// Cancellation aborts unfinished calls, which end as aborted; a panicked call ends
+    /// as an error. Returns the outcomes in completion order.
+    async fn drive(
+        &self,
+        message: &AssistantMessage,
+        batch: Batch,
+    ) -> Result<Vec<(usize, Outcome)>, Error> {
+        let Batch {
+            mut tasks,
+            mut calls,
+            sender,
+            mut updates,
+        } = batch;
+        drop(sender);
+        let mut finished = Vec::with_capacity(calls.len());
+        let mut aborted = false;
+        loop {
+            let joined = tokio::select! {
+                biased;
+                Some((call_id, update)) = updates.recv() => {
+                    self.emit_update(call_id, update).await?;
+                    continue;
+                }
+                () = self.cancel.cancelled(), if !aborted => {
+                    tasks.abort_all();
+                    aborted = true;
+                    continue;
+                }
+                joined = tasks.join_next_with_id() => joined,
+            };
+            let Some(joined) = joined else { break };
+            let (id, result) = match joined {
+                Ok((id, result)) => (id, Ok(result)),
+                Err(error) => (error.id(), Err(error)),
+            };
+            let Some(spawned) = calls.remove(&id) else {
+                continue;
+            };
+            let (output, duration_ms, executed) = match result {
+                Ok((result, duration_ms)) => (
+                    result.unwrap_or_else(|error| error_output(error.0)),
+                    duration_ms,
+                    true,
+                ),
+                // Aborted by the cancellation above: the call never returned.
+                Err(error) if error.is_cancelled() => (
+                    error_output("Operation aborted"),
+                    elapsed_ms(spawned.started),
+                    false,
+                ),
+                Err(error) => (
+                    error_output(format!("Tool {} crashed: {error}", spawned.call.name)),
+                    elapsed_ms(spawned.started),
+                    true,
+                ),
+            };
+            let mut outcome = Outcome {
+                call_id: spawned.call.id.clone(),
+                name: spawned.call.name.clone(),
+                output,
+                duration_ms: Some(duration_ms),
+                invocation: Some(spawned.invocation),
+            };
+            if executed {
+                self.after_tool_call(message, &spawned.call, &mut outcome.output)
+                    .await;
+            }
+            // Updates sent before the call returned precede its end.
+            while let Ok((call_id, update)) = updates.try_recv() {
+                self.emit_update(call_id, update).await?;
+            }
+            self.emit_end(&outcome).await?;
+            finished.push((spawned.index, outcome));
+        }
+        Ok(finished)
+    }
+
+    /// Applies `after_tool_call` overrides to an executed call's output.
+    async fn after_tool_call(
+        &self,
+        message: &AssistantMessage,
+        call: &ToolCall,
+        output: &mut ToolOutput,
+    ) {
         let overrides = self
             .agent
             .hooks
@@ -693,7 +788,7 @@ impl Run<'_> {
                 AfterToolCallContext {
                     assistant_message: message,
                     tool_call: call,
-                    result: &outcome.output,
+                    result: &*output,
                     context: &self.context,
                 },
                 &self.cancel,
@@ -701,7 +796,6 @@ impl Run<'_> {
             .await;
         match overrides {
             Ok(Some(overrides)) => {
-                let output = &mut outcome.output;
                 if let Some(content) = overrides.content {
                     output.content = content;
                 }
@@ -720,38 +814,14 @@ impl Run<'_> {
                 tracing::warn!(tool = %call.name, %error, "after_tool_call failed; keeping the executed result");
             }
         }
-        (index, outcome)
     }
 
-    /// Polls running calls, forwarding their updates, and emits each `ToolExecutionEnd`
-    /// as its call completes. Returns the outcomes in completion order.
-    async fn drive<F>(
-        &self,
-        mut running: FuturesUnordered<F>,
-        mut updates: mpsc::UnboundedReceiver<(String, ToolUpdate)>,
-    ) -> Result<Vec<(usize, Outcome)>, Error>
-    where
-        F: Future<Output = (usize, Outcome)>,
-    {
-        let mut finished = Vec::with_capacity(running.len());
-        loop {
-            tokio::select! {
-                biased;
-                Some((call_id, update)) = updates.recv() => {
-                    self.emit(AgentEvent::ToolExecutionUpdate { call_id, update }).await?;
-                }
-                next = running.next() => {
-                    let Some((index, outcome)) = next else { break };
-                    // Updates sent before the call returned precede its end.
-                    while let Ok((call_id, update)) = updates.try_recv() {
-                        self.emit(AgentEvent::ToolExecutionUpdate { call_id, update }).await?;
-                    }
-                    self.emit_end(&outcome).await?;
-                    finished.push((index, outcome));
-                }
-            }
-        }
-        Ok(finished)
+    async fn emit_update(&self, call_id: Arc<str>, update: ToolUpdate) -> Result<(), Error> {
+        self.emit(AgentEvent::ToolExecutionUpdate {
+            call_id: call_id.as_ref().to_owned(),
+            update,
+        })
+        .await
     }
 
     /// Produces ordered nonexecuted results; ordinary Length keeps its diagnostic.
@@ -1012,6 +1082,10 @@ impl Run<'_> {
         }
         Ok(true)
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// An error result with one text block (pi `createErrorToolResult`).

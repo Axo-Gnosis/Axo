@@ -22,5 +22,5 @@ pub use hooks::{
 pub use message::{AgentMessage, CustomMessage, QueuedMessage, Unanswered, unanswered_calls};
 pub use tool::{
     ExecutionMode, Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
-    ToolUpdate,
+    ToolUpdate, ToolUpdates,
 };

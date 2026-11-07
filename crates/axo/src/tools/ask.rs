@@ -138,6 +138,37 @@ impl PendingQuestions {
         });
         Some(entry)
     }
+
+    /// Withdraws `call_id`'s registration once its receiver is gone, so a call that
+    /// ends unsettled (cancelled or aborted) leaves no question behind. A newer
+    /// registration under the same id still has its receiver and is kept.
+    fn withdraw(&self, call_id: &str) {
+        let removed = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            match pending.get(call_id) {
+                Some((_, tx)) if tx.is_closed() => pending.remove(call_id).is_some(),
+                _ => false,
+            }
+        };
+        if removed {
+            let _ = self.events.send(SessionEvent::QuestionResolved {
+                call_id: call_id.to_owned(),
+            });
+        }
+    }
+}
+
+/// Withdraws a call's question when the call ends, however it ends. Declared before
+/// the receiver so the receiver drops first.
+struct Withdraw<'a> {
+    registry: &'a PendingQuestions,
+    call_id: &'a str,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        self.registry.withdraw(self.call_id);
+    }
 }
 
 /// Labels the client UI reserves for its own rows.
@@ -238,7 +269,7 @@ impl Tool for AskTool {
         Replay::Safe
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext { call, cancel, .. } = cx;
         let AskParams { questions } = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
@@ -276,6 +307,10 @@ impl Tool for AskTool {
         }
 
         let registry = &self.tools.questions;
+        let _withdraw = Withdraw {
+            registry,
+            call_id: &call.id,
+        };
         let mut rx = registry.ask(&call.id, questions.clone());
         let timeout = async {
             match self.tools.ask_timeout {
@@ -288,10 +323,7 @@ impl Tool for AskTool {
         let closed = |_: oneshot::error::RecvError| ToolError("Ask input was cancelled".into());
         let outcome = tokio::select! {
             outcome = &mut rx => Some(outcome.map_err(closed)?),
-            () = cancel.cancelled() => {
-                registry.take(&call.id);
-                return Err(ToolError("Ask input was cancelled".into()));
-            }
+            () = cancel.cancelled() => return Err(ToolError("Ask input was cancelled".into())),
             () = timeout => {
                 if registry.take(&call.id).is_some() {
                     None

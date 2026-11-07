@@ -34,7 +34,7 @@ impl Tool for Where {
         &PARAMETERS
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         if cx.cancel.is_cancelled() {
             return Err(ToolError("Operation aborted".into()));
         }

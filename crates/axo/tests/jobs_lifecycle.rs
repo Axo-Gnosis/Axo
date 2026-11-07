@@ -19,7 +19,7 @@ use common::{options, tool_text, within};
 use serde_json::{Value, json};
 
 /// Covers the gap between `job_end` and an idle-wake delivery run starting, which is
-/// a lock and a spawned task, not a timer.
+/// a spawned task, not a timer.
 const DELIVERY_GRACE: Duration = Duration::from_millis(250);
 
 /// Runs until its call is cancelled.
@@ -41,7 +41,7 @@ impl Tool for Hang {
         &PARAMETERS
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         cx.cancel.cancelled().await;
         Err(ToolError("Operation aborted".into()))
     }

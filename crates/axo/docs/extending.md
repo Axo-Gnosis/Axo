@@ -212,7 +212,7 @@ Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
 | `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `HostEnv`, `DevShellEnv`, and `StaticEnv`. Passed via `SessionOptions::exec_env`. `DevShellEnv::new(base, settings, cache_dir: Option<PathBuf>, supervisor: Arc<ProcessSupervisor>)` runs its direnv, git, nix and capture subprocesses through that supervisor (a `None` `cache_dir` makes Nix mode resolve to `base`); `ExecEnv` only resolves the environment, and every command still runs supervised |
 | `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites whole-word, `--flag=`/`NAME=`, and redirect-target URLs to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it). `edit`/`write` refuse non-writable files (`{url} is read-only`); bash refuses virtual URLs (`Cannot use {url} in bash: no file backs it. Use read {url}.`) and output redirects onto read-only files. `prompt_doc` (default empty) is the one-line bullet listed in the model's `schemes` prompt section. Host scheme names must match `^[a-z][a-z0-9+.-]+$` (lowercase, two or more characters); `artifact` and `file` are reserved (`Error::Scheme`). `write_replay` defaults to `Replay::Never`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://` (only when the host set `AxoBuilder::cache_dir`), and in open sessions `proc://` (background jobs; see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)). Passed via `SessionOptions::schemes`; a host scheme named like a built-in replaces it. Hosts resolve URLs they display through `Session::schemes()` or `Axo::schemes(path, project_access, host_schemes)` |
 | `SessionStore` / `SessionWriter` | `axo::store::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading (whole sessions or just the header), listing, and appending session entries. Bundled implementation: `JsonlStore`. Passed as the required `store` argument of `Axo::builder` |
-| `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, and `execute(cx: ToolContext<'_>)`) for `axo_agent::Agent`. `execution_mode` defaults to `Parallel`, `replay` to `Never`, `prompt_guidelines` to empty. Tools hold their own session handles; `cx` carries per-call state. Pass host tools as `SessionOptions::tools` `ToolFactory` closures; axo calls each with the session's `Arc<SessionTools>` (again per fork), so the tool can use `locate`, `schemes`, `rewrite_urls`, the ledger, the `exec` environment, and the `supervisor` for subprocesses. One named like a built-in replaces it in place |
+| `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, and `execute(cx: ToolContext)`) for `axo_agent::Agent`. `execution_mode` defaults to `Parallel`, `replay` to `Never`, `prompt_guidelines` to empty. Tools hold their own session handles; `cx` carries per-call state. Pass host tools as `SessionOptions::tools` `ToolFactory` closures; axo calls each with the session's `Arc<SessionTools>` (again per fork), so the tool can use `locate`, `schemes`, `rewrite_urls`, the ledger, the `exec` environment, and the `supervisor` for subprocesses. One named like a built-in replaces it in place |
 | `LoopHooks` | `axo_agent::LoopHooks` | Lifecycle hooks on `axo_agent::Agent`: `transform_context` (per-request message rewrite), `convert_to_llm` (lowers `Custom` messages; default drops them), `prepare_request` (returns `RequestUpdate { context, model, thinking }`), `should_skip_tools` (intercepts unusable responses before tools run), `before_tool_call` (can return `ToolCallDecision::Block { reason, terminate }`; a hook error blocks the call), `after_tool_call` (returns `AfterToolCallResult` overrides; a hook error is logged and ignored), `finish_turn` (returns `TurnFinish { decision: Option<TurnDecision>, context }` where `TurnDecision` is `Continue` or `End`), `prepare_next_turn` (returns `TurnUpdate` with messages getting `MessageOrigin::Run`), and `steering` / `follow_up` (host-supplied `Vec<QueuedMessage>` drained after agent queues; see [Queued inputs and message origins](#queued-inputs-and-message-origins)) |
 | `Persist` | `axo_agent::Persist` | Ordered async subscriber on `axo_agent::Agent` awaited before the next model request (used by `Session` to persist `Entry::Message` on `MessageEnd { message, origin }`) |
 | `Api` / `Streamer` | `axo_ai::{Api, Streamer}` | Streaming LLM wire adapter (`AnthropicApi`, `CompletionsApi`, `CodexApi`, or `ScriptedApi` behind the `testing` feature). Custom streamers can be injected via `AxoBuilder::streamer` |
@@ -270,14 +270,14 @@ impl Tool for PingTool {
         &["Use ping to check target reachability before opening a connection."]
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let target = cx
             .call
             .arguments
             .get("target")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError("missing target".into()))?;
-        (cx.updates)(ToolUpdate {
+        cx.updates.send(ToolUpdate {
             content: vec![UserBlock::Text { text: format!("pinging {target}…") }],
             details: None,
         });
@@ -294,7 +294,9 @@ impl Tool for PingTool {
 }
 ```
 
-- **`ToolContext<'a>`:** `call: &ToolCall` (the validated call), `cancel: CancellationToken` (the tool must honor it), `updates: &(dyn Fn(ToolUpdate) + Send + Sync)` (partial results while the call runs), `steer: SteerSignal`, and `invocation: ToolInvocationId`.
+- **`ToolContext`:** owned per-call state, because each call runs on its own Tokio task: `call: Arc<ToolCall>` (the validated call), `cancel: CancellationToken` (the tool should honor it), `updates: ToolUpdates` (partial results while the call runs), `steer: SteerSignal`, and `invocation: ToolInvocationId`.
+- **Task lifecycle:** the loop never polls a tool future itself, so a tool may await anything, including state the host's `Persist` holds. When the run is stopped or shut down, the loop aborts every unfinished call's task and answers it with an `Operation aborted` error result; a panicking call becomes an error result. Cleanup that must happen however the call ends belongs in a `Drop` guard. `after_tool_call` runs on the loop after the task returns.
+- **`ToolUpdates`:** `send(update)` never blocks; updates sent before `execute` returns are emitted before that call's `ToolExecutionEnd`. Clonable, so spawned helpers can stream too. `ToolUpdates::sink()` discards updates, for calling `execute` outside an `Agent`.
 - **`SteerSignal`:** `is_pending()` is true while steering input is queued and not yet drained into the transcript; `pending().await` resolves when it becomes so (and never if the agent is gone). The built-in `bash` uses it to move a foreground command to the background and `wait` uses it to return early. Results the host injects through `LoopHooks::steering` never set it. `SteerSignal::never()` gives a signal that never fires, for calling `execute` outside an `Agent`.
 - **`ToolInvocationId(u64)`:** unique per execution within one `Agent`, assigned right before `execute`. It is the identity reported back as `MessageOrigin::Tool` for that call's persisted result.
 - **`ToolOutput`:** `content` (model-facing), `details: Option<Value>` (host/log data, never sent to the model), `is_error` (a failure with output, e.g. a failing command; an `Err(ToolError)` also becomes an error result), and `terminate` (stop after this batch, honored only when every result in the batch sets it).
@@ -340,7 +342,7 @@ impl Tool for HeadTool {
     fn description(&self) -> &str { "Print the current git commit." }
     fn parameters(&self) -> &serde_json::Value { &self.schema }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let tools = &self.tools;
         let resolved = tools.exec.resolve(&tools.cwd, &cx.cancel, &|_| {}).await;
         let spec = ExecSpec {
@@ -396,7 +398,7 @@ Subprocesses a host tool runs this way are not `bash` jobs: they are never promo
 | `MessageOrigin` | Assigned to |
 | :--- | :--- |
 | `Input(Option<String>)` | A prompted or queued input (including hook-supplied ones), with the id it was queued under |
-| `Tool(ToolInvocationId)` | The result returned by executing a tool with that invocation, `Ok` or `Err`, even if cancellation arrived meanwhile |
-| `Run` | Everything else: assistant replies, tool-change declarations, `prepare_next_turn` (`TurnUpdate::messages`) messages, and synthetic tool results (blocked, failed-preparation, unanswered or aborted calls) |
+| `Tool(ToolInvocationId)` | The result of a tool call that started executing with that invocation: what it returned (`Ok` or `Err`), even if cancellation arrived meanwhile, or the aborted result when Stop ended its task |
+| `Run` | Everything else: assistant replies, tool-change declarations, `prepare_next_turn` (`TurnUpdate::messages`) messages, and synthetic tool results (blocked, failed-preparation, unanswered, or aborted before they started) |
 
 An executed result keeps its `Tool` origin exactly when it is the result persisted. `Session`'s `Persist` maps `Input(Some(id))` to the submission id (or, for a job delivery message, to the jobs it delivers) and `Tool(invocation)` to the jobs that call delivered or started, so receipts never depend on comparing message text (see [Background Job Durability](sessions-and-compaction.md#background-job-durability)).

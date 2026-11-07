@@ -1,10 +1,12 @@
 //! The tool contract (pi `agent/src/types.ts:423-499`). Tools hold their own session
 //! handles; the per-call state arrives in a [`ToolContext`].
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -24,10 +26,11 @@ pub trait Tool: Send + Sync {
     fn prompt_guidelines(&self) -> &[&str] {
         &[]
     }
-    /// Runs one validated call. An `Err` becomes an error result the model sees; a tool
-    /// that reports a failure with output (e.g. a failing command) returns `Ok` with
-    /// `is_error: true`. Must honor `cx.cancel`.
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError>;
+    /// Runs one validated call on its own task. An `Err` becomes an error result the
+    /// model sees; a tool that reports a failure with output (e.g. a failing command)
+    /// returns `Ok` with `is_error: true`. Should honor `cx.cancel`; a run that is
+    /// stopped also aborts the task, so cleanup must not depend on returning.
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
 /// Identifies one execution of a tool within an agent; unique per [`crate::Agent`].
@@ -56,14 +59,49 @@ impl SteerSignal {
     }
 }
 
-/// Per-call state handed to [`Tool::execute`].
-pub struct ToolContext<'a> {
-    pub call: &'a ToolCall,
+/// Per-call state handed to [`Tool::execute`]. Owned, so the call runs on its own task.
+pub struct ToolContext {
+    pub call: Arc<ToolCall>,
     pub cancel: CancellationToken,
     /// Streams partial results while the call runs.
-    pub updates: &'a (dyn Fn(ToolUpdate) + Send + Sync),
+    pub updates: ToolUpdates,
     pub steer: SteerSignal,
     pub invocation: ToolInvocationId,
+}
+
+/// Streams one call's partial results to the loop, which emits them as
+/// `ToolExecutionUpdate`s; updates sent before the call returns precede its end.
+#[derive(Clone)]
+pub struct ToolUpdates {
+    call_id: Arc<str>,
+    sender: Option<mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>>,
+}
+
+impl ToolUpdates {
+    pub(crate) fn new(
+        call_id: Arc<str>,
+        sender: mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>,
+    ) -> Self {
+        Self {
+            call_id,
+            sender: Some(sender),
+        }
+    }
+
+    /// Discards every update; for calling `execute` outside an `Agent`.
+    pub fn sink() -> Self {
+        Self {
+            call_id: Arc::from(""),
+            sender: None,
+        }
+    }
+
+    /// Sends one update; never blocks. Updates after the run moved on are dropped.
+    pub fn send(&self, update: ToolUpdate) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send((Arc::clone(&self.call_id), update));
+        }
+    }
 }
 
 /// How the tool calls of one assistant message run. A batch runs sequentially when the

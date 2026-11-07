@@ -57,7 +57,7 @@ impl Tool for WaitTool {
         Replay::Safe
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext {
             cancel,
             mut steer,

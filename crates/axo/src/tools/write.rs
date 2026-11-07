@@ -78,7 +78,7 @@ impl Tool for WriteTool {
         GUIDELINES
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext { call, cancel, .. } = cx;
         let WriteArgs { path, content } =
             serde_json::from_value(Value::Object(call.arguments.clone()))

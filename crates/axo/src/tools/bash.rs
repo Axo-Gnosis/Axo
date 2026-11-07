@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput, ToolUpdate};
+use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -163,7 +163,7 @@ impl Tool for BashTool {
         Replay::Never
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext {
             call,
             cancel,
@@ -200,7 +200,7 @@ impl Tool for BashTool {
         let script = tools.rewrite_urls(&args.command).await?;
 
         let progress = |line: &str| {
-            updates(ToolUpdate {
+            updates.send(ToolUpdate {
                 content: vec![UserBlock::Text {
                     text: line.to_owned(),
                 }],
@@ -287,6 +287,7 @@ impl Tool for BashTool {
             CommandTask {
                 jobs: jobs.clone(),
                 id,
+                invocation,
                 call_id: call.id.clone(),
                 control,
                 shared: shared.clone(),
@@ -331,14 +332,11 @@ impl Tool for BashTool {
                     }
                 }, if promotable && !aborting => {
                     promotable = false;
-                    // Journal first: a promoted job always has its `JobStart`.
-                    if let Err(err) = jobs.journal_start(id, &call.id).await {
-                        tracing::error!("cannot journal the start of {}: {err}", job_name(id));
-                    } else if jobs.promote(id) {
+                    // Refused once the command finished meanwhile: it stays in the foreground.
+                    if jobs.promote(id, invocation, &call.id) {
                         // The call's cancel no longer reaches the job; the timeout keeps its
                         // deadline, and proc:// kill or session shutdown stop it.
                         abandon.0 = None;
-                        jobs.admit_on_commit(invocation, id);
                         let snapshot = lock(&shared.shaper).render(None);
                         let snapshot = if snapshot.is_empty() {
                             "(no output yet)".to_owned()
@@ -360,8 +358,6 @@ impl Tool for BashTool {
                             terminate: false,
                         });
                     }
-                    // Otherwise the command finished meanwhile (its orphan `JobStart` is
-                    // never admitted) or the journal failed: it stays in the foreground.
                 },
                 _ = changes.changed(), if update_at.is_none() => {
                     update_at = Some(last_update + UPDATE_THROTTLE);
@@ -372,7 +368,7 @@ impl Tool for BashTool {
                     changes.mark_unchanged();
                     let text = lock(&shared.shaper).render(None);
                     if !text.is_empty() {
-                        updates(ToolUpdate {
+                        updates.send(ToolUpdate {
                             content: vec![UserBlock::Text { text }],
                             details: None,
                         });
@@ -438,7 +434,8 @@ impl Drop for StopOnDrop<'_> {
 struct CommandTask {
     jobs: Arc<JobRegistry>,
     id: u64,
-    /// Journaled with a retained job's `JobStart`.
+    /// The call whose tool result carries a retained job's `job_start`.
+    invocation: ToolInvocationId,
     call_id: String,
     control: Arc<JobControl>,
     shared: Arc<CommandShared>,
@@ -454,6 +451,7 @@ impl CommandTask {
         let Self {
             jobs,
             id,
+            invocation,
             call_id,
             control,
             shared,
@@ -594,8 +592,9 @@ impl CommandTask {
         }
         if retained {
             jobs.retained(id);
-            if !promoted && let Err(err) = jobs.journal_start(id, &call_id).await {
-                tracing::error!("cannot journal the start of {}: {err}", job_name(id));
+            if !promoted {
+                // Before the waiter gets the result, so the result's batch carries it.
+                jobs.retain_on_commit(invocation, id, &call_id);
             }
             let name = job_name(id);
             text.push_str(&format!(

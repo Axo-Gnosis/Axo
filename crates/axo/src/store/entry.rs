@@ -341,6 +341,31 @@ impl Entry {
         }
     }
 
+    /// The shared fields, mutably; `None` for [`Entry::Unknown`].
+    pub(crate) fn base_mut(&mut self) -> Option<&mut EntryBase> {
+        match self {
+            Entry::Message { base, .. }
+            | Entry::ThinkingLevelChange { base, .. }
+            | Entry::ModelChange { base, .. }
+            | Entry::Usage { base, .. }
+            | Entry::Compaction { base, .. }
+            | Entry::BranchSummary { base, .. }
+            | Entry::Custom { base, .. }
+            | Entry::CustomMessage { base, .. }
+            | Entry::ContextEdit { base, .. }
+            | Entry::Label { base, .. }
+            | Entry::SessionInfo { base, .. }
+            | Entry::Leaf { base }
+            | Entry::RunStart { base, .. }
+            | Entry::RunEnd { base, .. }
+            | Entry::RunResumed { base, .. }
+            | Entry::Submission { base, .. }
+            | Entry::JobStart { base, .. }
+            | Entry::JobEnd { base, .. } => Some(base),
+            Entry::Unknown(_) => None,
+        }
+    }
+
     /// The entry's id, read from the raw object for [`Entry::Unknown`].
     pub fn id(&self) -> Option<&str> {
         match self {

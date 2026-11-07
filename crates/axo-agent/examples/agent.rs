@@ -40,7 +40,7 @@ impl Tool for FnTool {
         &self.parameters
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             content: vec![UserBlock::Text {
                 text: (self.run)(&cx.call.arguments).to_string(),

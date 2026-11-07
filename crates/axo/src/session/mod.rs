@@ -1,9 +1,11 @@
 //! A conversation with one agent in one working directory, saved as it happens.
 
-use std::collections::{HashMap, HashSet};
+pub(crate) mod journal;
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
+use self::journal::{Journal, View};
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
 use crate::config::{CompactionSettings, EffectiveConfig, ProjectAccess, SummaryRequest};
@@ -34,9 +37,9 @@ use crate::context::{Diagnostic, home_agents_dir, project_root};
 use crate::error::Error;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
-use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
+use crate::input::{Prepared, PromptInput, PromptPart, prepare, render};
 use crate::jobs::{
-    DeliveryKey, JobEntry, JobHost, JobInfo, JobRegistry, job_name, parse_job_id, render_results,
+    DeliveryKey, JobHost, JobInfo, JobRegistry, job_name, parse_job_id, render_results,
 };
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::Artifacts;
@@ -215,7 +218,7 @@ pub struct LiveSnapshot {
     pub run_id: Option<String>,
     pub maintenance: Option<MaintenanceKind>,
     pub agent: AgentSnapshot,
-    /// The projected conversation at this point in the append order, from the log-owned cache.
+    /// The projected conversation at this point in the append order, from the journal's view.
     pub messages: Vec<AgentMessage>,
     /// Unanswered `ask` calls by tool-call id. A question raised while attaching can
     /// also arrive as a `QuestionPending` event (duplicated, never missed).
@@ -359,20 +362,25 @@ fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
 
-/// The session's loop hooks, durable log and event relay.
+/// The session's loop hooks, journal and event relay.
 struct SessionHooks {
     events: broadcast::Sender<SessionEvent>,
     /// System-message diffs not yet in the transcript: they go in before the next turn of
     /// an active run, or ahead of the next prompt.
     system: Mutex<Vec<AgentMessage>>,
-    /// Every append, and every event relay, happens under this lock, so `attach` sees one
-    /// consistent point.
-    log: tokio::sync::Mutex<Log>,
-    /// A run is active or about to start; guards against a second one. Changed only
-    /// while holding the log lock.
-    running: watch::Sender<bool>,
+    /// Owns the session file: every entry is appended through it, and every reader takes
+    /// its snapshots.
+    journal: Journal,
+    /// The open run's live state; `persist` updates it without awaiting.
+    live: Mutex<LiveRun>,
+    /// The live model and thinking level.
+    selection: watch::Sender<Selection>,
+    /// Who owns the session; `shutdown` waits on it going idle.
+    activity: watch::Sender<Activity>,
+    /// Held across a steer or follow-up's write, so the agent queues them in journal order.
+    queue_order: tokio::sync::Mutex<()>,
     maintenance: Maintenance,
-    /// The session's command jobs; their records are appended through `JobHost`.
+    /// The session's command jobs; they append their own records through the journal.
     jobs: Arc<JobRegistry>,
     /// Prompts between their fast-path admission and their run start; idle-wake delivery
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
@@ -385,6 +393,43 @@ struct SessionHooks {
     agent: OnceLock<Weak<Agent>>,
     /// These hooks, for tasks that deliver job results.
     this: OnceLock<Weak<SessionHooks>>,
+}
+
+/// The open run's live state as relayed so far. The agent's own copy updates after
+/// `persist` returns, so `attach` reads this instead.
+#[derive(Default)]
+struct LiveRun {
+    /// The open run's id, set by its `run_start` (or by recovery).
+    run_id: Option<String>,
+    streaming: Option<Accumulator>,
+    tool_calls: Vec<ToolCall>,
+}
+
+/// Who owns the session. A run, standalone maintenance or a navigation sets `running`;
+/// maintenance also names itself. Only compare-and-set transitions claim it, so two
+/// owners never both win.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Activity {
+    running: bool,
+    maintenance: Option<MaintenanceKind>,
+}
+
+/// The live model and thinking level; `model_change` / `thinking_level_change` entries
+/// record each change in the order it took effect.
+#[derive(Clone)]
+struct Selection {
+    model: Model,
+    thinking: ThinkingLevel,
+}
+
+/// A `running` claim outside a run; dropping it releases the session (or starts pending
+/// delivery).
+struct Claim<'a>(&'a SessionHooks);
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.release_or_deliver();
+    }
 }
 
 /// Counts one prompt in [`SessionHooks::preparing`]; the last to drop re-triggers
@@ -423,36 +468,6 @@ struct Maintenance {
     skill_paths: Vec<PathBuf>,
     cancel: Mutex<Option<CancellationToken>>,
     shutdown: AtomicBool,
-}
-
-struct Log {
-    writer: Box<dyn SessionWriter>,
-    entries: Vec<SeqEntry>,
-    projection: Projection,
-    ids: HashSet<String>,
-    model: Model,
-    thinking: ThinkingLevel,
-    /// The open run's id, set by its `run_start` (or by recovery).
-    run_id: Option<String>,
-    // The live state as relayed so far; the agent's own copy updates after `persist`
-    // returns, so `attach` reads these instead.
-    streaming: Option<Accumulator>,
-    tool_calls: Vec<ToolCall>,
-    maintenance: Option<MaintenanceKind>,
-    revision: u64,
-}
-
-impl Log {
-    /// A base for the next entry: a fresh id, parented on the last entry (the current
-    /// position, through a trailing `leaf` entry).
-    fn next_base(&self) -> EntryBase {
-        let parent = self
-            .entries
-            .last()
-            .and_then(|last| last.entry.id())
-            .map(|id| EntryId(id.to_owned()));
-        EntryBase::new(EntryId::generate(|id| self.ids.contains(id)), parent)
-    }
 }
 
 struct FailureState {
@@ -511,7 +526,7 @@ async fn run_to_settle(
     .await;
     // A fallible hook may have committed an omission or a prefix of edits before
     // failing. Reconcile even then; the next prompt must not resurrect raw failures.
-    agent.set_messages(hooks.log.lock().await.projection.messages.clone());
+    agent.set_messages(hooks.journal.view().projection.messages.clone());
     match result {
         Ok(result) => hooks.settle(result).await,
         Err(panic) => {
@@ -527,6 +542,18 @@ async fn run_to_settle(
 }
 
 impl SessionHooks {
+    fn live(&self) -> MutexGuard<'_, LiveRun> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn selection(&self) -> Selection {
+        self.selection.borrow().clone()
+    }
+
+    fn model(&self) -> Model {
+        self.selection.borrow().model.clone()
+    }
+
     fn cancel_maintenance(&self, shutdown: bool) {
         if shutdown {
             self.maintenance.shutdown.store(true, Ordering::Release);
@@ -544,70 +571,127 @@ impl SessionHooks {
 
     fn reserve(
         &self,
-        log: &mut Log,
         kind: MaintenanceKind,
         standalone: bool,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
-        if log.maintenance.is_some() || (standalone && *self.running.borrow()) {
-            return Err(Error::Busy);
-        }
-        if self.maintenance.shutdown.load(Ordering::Acquire) {
-            return Err(Error::MaintenanceAborted);
-        }
-        log.maintenance = Some(kind);
-        *self
-            .maintenance
-            .cancel
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(cancel);
-        if standalone {
-            self.running.send_replace(true);
-        }
+        let mut reserved = Ok(());
+        self.activity.send_if_modified(|activity| {
+            if activity.maintenance.is_some() || (standalone && activity.running) {
+                reserved = Err(Error::Busy);
+                return false;
+            }
+            if self.maintenance.shutdown.load(Ordering::Acquire) {
+                reserved = Err(Error::MaintenanceAborted);
+                return false;
+            }
+            activity.maintenance = Some(kind);
+            activity.running |= standalone;
+            *self
+                .maintenance
+                .cancel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(cancel);
+            true
+        });
+        reserved?;
         let _ = self.events.send(SessionEvent::MaintenanceStart { kind });
         Ok(())
     }
 
-    async fn end_maintenance(&self, standalone: bool, error: Option<String>, aborted: bool) {
-        let mut log = self.log.lock().await;
+    fn end_maintenance(&self, standalone: bool, error: Option<String>, aborted: bool) {
         *self
             .maintenance
             .cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
-        if let Some(kind) = log.maintenance.take() {
+        let mut ended = None;
+        self.activity.send_if_modified(|activity| {
+            ended = activity.maintenance.take();
+            ended.is_some()
+        });
+        if let Some(kind) = ended {
             let _ = self.events.send(SessionEvent::MaintenanceEnd {
                 kind,
                 error,
                 aborted,
             });
             if standalone {
-                self.release_or_deliver(&mut log);
+                self.release_or_deliver();
             }
         }
     }
 
-    /// Ends the session's busy state, unless pending job results start a delivery run
-    /// first: then `running` stays true and the run settles like any other. Called under
-    /// the log lock wherever the session would go idle.
-    fn release_or_deliver(&self, log: &mut Log) {
-        if !self.auto_paused.load(Ordering::Acquire)
+    /// The agent and these hooks, while the session lives.
+    fn owners(&self) -> Option<(Arc<Agent>, Arc<SessionHooks>)> {
+        Some((
+            self.agent.get().and_then(Weak::upgrade)?,
+            self.this.get().and_then(Weak::upgrade)?,
+        ))
+    }
+
+    /// Whether finished job results may start a run of their own.
+    fn may_deliver(&self) -> bool {
+        !self.auto_paused.load(Ordering::Acquire)
             && !self.maintenance.shutdown.load(Ordering::Acquire)
-            && log.maintenance.is_none()
             && self.preparing.load(Ordering::Acquire) == 0
-            && let Some(agent) = self.agent.get().and_then(Weak::upgrade)
-            && let Some(hooks) = self.this.get().and_then(Weak::upgrade)
-            && let Some(delivery) = self.reserve_delivery()
+            && self.activity.borrow().maintenance.is_none()
+    }
+
+    /// Claims the idle session; false while a run, maintenance or navigation owns it.
+    fn claim_idle(&self) -> bool {
+        self.activity.send_if_modified(|activity| {
+            let idle = !activity.running && activity.maintenance.is_none();
+            activity.running |= idle;
+            idle
+        })
+    }
+
+    /// For the owner of `running`: starts a run delivering every pending job result;
+    /// false when nothing is pending.
+    fn start_delivery(&self, agent: Arc<Agent>, hooks: Arc<SessionHooks>) -> bool {
+        let Some(delivery) = self.reserve_delivery() else {
+            return false;
+        };
+        let messages = self.run_input(Some(delivery), None);
+        tokio::spawn(async move {
+            if let Err(err) = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await {
+                warn!(%err, "job result delivery run failed");
+            }
+        });
+        true
+    }
+
+    /// Ends the busy state its caller owns, unless pending job results start a delivery
+    /// run first: then `running` stays set and the run settles like any other. Called
+    /// wherever the session would go idle.
+    fn release_or_deliver(&self) {
+        if self.may_deliver()
+            && let Some((agent, hooks)) = self.owners()
+            && self.start_delivery(agent, hooks)
         {
-            self.running.send_replace(true);
-            let messages = self.run_input(Some(delivery), None);
-            tokio::spawn(async move {
-                if let Err(err) = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await {
-                    warn!(%err, "job result delivery run failed");
-                }
-            });
-        } else {
-            self.running.send_replace(false);
+            return;
+        }
+        self.activity
+            .send_modify(|activity| activity.running = false);
+        // A result that became pending meanwhile found `running` set and left its
+        // delivery to this transition.
+        self.deliver_if_idle();
+    }
+
+    /// Starts delivery when the session is idle and pending results may start a run.
+    /// While a run or maintenance owns the session, its steering hook or its idle
+    /// transition delivers instead.
+    fn deliver_if_idle(&self) {
+        let Some((agent, hooks)) = self.owners() else {
+            return;
+        };
+        while self.may_deliver() && self.jobs.has_pending() && self.claim_idle() {
+            if self.start_delivery(agent.clone(), hooks.clone()) {
+                return;
+            }
+            self.activity
+                .send_modify(|activity| activity.running = false);
         }
     }
 
@@ -664,79 +748,125 @@ impl SessionHooks {
         })
     }
 
-    fn check_commit(
-        &self,
-        log: &Log,
-        revision: u64,
-        cancel: &CancellationToken,
-    ) -> Result<(), Error> {
+    /// Fails once maintenance was cancelled or the session shuts down.
+    fn check_live(&self, cancel: &CancellationToken) -> Result<(), Error> {
         if cancel.is_cancelled() || self.maintenance.shutdown.load(Ordering::Acquire) {
             return Err(Error::MaintenanceAborted);
-        }
-        if log.revision != revision {
-            return Err(Error::ContextChanged);
         }
         Ok(())
     }
 
-    fn restore(&self, log: &Log) {
-        self.maintenance
-            .tools
-            .ledger
-            .restore(&log.projection.messages);
-        self.maintenance
-            .tools
-            .context
-            .restore(&log.projection.messages);
+    /// Refuses writes once a shutdown aborts the running maintenance.
+    fn check_writable(&self) -> Result<(), Error> {
+        if self.activity.borrow().maintenance.is_some()
+            && self.maintenance.shutdown.load(Ordering::Acquire)
+        {
+            return Err(Error::MaintenanceAborted);
+        }
+        Ok(())
     }
 
+    /// Appends `entries` as one journal batch (see [`Journal::append`]), queued before
+    /// this returns.
+    fn append(
+        &self,
+        entries: Vec<Entry>,
+    ) -> impl Future<Output = Result<Vec<SeqEntry>, Error>> + Send + '_ {
+        let queued = self.check_writable().map(|()| self.journal.append(entries));
+        async move {
+            let appended = queued?.await?;
+            self.after_append(&appended);
+            Ok(appended)
+        }
+    }
+
+    /// [`SessionHooks::append`], only if the journal is still at `revision`.
+    fn append_if(
+        &self,
+        revision: u64,
+        entries: Vec<Entry>,
+    ) -> impl Future<Output = Result<Vec<SeqEntry>, Error>> + Send + '_ {
+        let queued = self
+            .check_writable()
+            .map(|()| self.journal.append_if(revision, entries));
+        async move {
+            let appended = queued?.await?;
+            self.after_append(&appended);
+            Ok(appended)
+        }
+    }
+
+    /// Re-derives the file ledger and context tracker once a batch moved or rewrote the
+    /// transcript.
+    fn after_append(&self, appended: &[SeqEntry]) {
+        if appended.iter().any(|seq| {
+            matches!(
+                seq.entry,
+                Entry::ContextEdit { .. }
+                    | Entry::Compaction { .. }
+                    | Entry::BranchSummary { .. }
+                    | Entry::Leaf { .. }
+            )
+        }) {
+            let view = self.journal.view();
+            self.maintenance
+                .tools
+                .ledger
+                .restore(&view.projection.messages);
+            self.maintenance
+                .tools
+                .context
+                .restore(&view.projection.messages);
+        }
+    }
+
+    /// Validates `pending` as the next entries after `view` without writing them.
     fn candidate(
-        log: &mut Log,
+        view: &View,
         pending: &[Entry],
         before: u64,
         limits: &Limits,
         require_trigger: bool,
     ) -> Result<u64, Error> {
-        // Projection owns no raw entries. Borrow a prospective suffix without duplicating
-        // the log; remove it before any await, publication or durable write.
-        let len = log.entries.len();
-        let seq = log.entries.last().map_or(0, |entry| entry.seq);
-        log.entries
-            .extend(pending.iter().enumerate().map(|(at, entry)| SeqEntry {
+        // ponytail: copies the entries once per maintenance commit; projecting over a
+        // borrowed prefix plus suffix would avoid it if commits ever become frequent.
+        let mut entries = view.entries.clone();
+        let seq = entries.last().map_or(0, |entry| entry.seq);
+        let mut parent = entries
+            .last()
+            .and_then(|last| last.entry.id())
+            .map(|id| EntryId(id.to_owned()));
+        for (at, entry) in pending.iter().enumerate() {
+            let mut entry = entry.clone();
+            // The journal assigns the real ids and parents; the projection needs a chain.
+            if let Some(base) = entry.base_mut() {
+                if base.id.0.is_empty() {
+                    base.id = EntryId(format!("candidate-{at}"));
+                }
+                base.parent_id = parent.take();
+                parent = Some(base.id.clone());
+            }
+            entries.push(SeqEntry {
                 seq: seq + at as u64 + 1,
-                entry: entry.clone(),
-            }));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let projected = project(&log.entries, None);
-            compaction::validate_projection(&projected, before, limits, require_trigger)
-        }));
-        log.entries.truncate(len);
-        match result {
-            Ok(result) => result,
-            Err(panic) => std::panic::resume_unwind(panic),
+                entry,
+            });
         }
+        let projected = project(&entries, None);
+        compaction::validate_projection(&projected, before, limits, require_trigger)
     }
 
     async fn save_usage(&self, model: &Model, usage: Usage, note: String) -> Result<(), Error> {
         if usage == Usage::default() || self.maintenance.shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut log = self.log.lock().await;
-        if self.maintenance.shutdown.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let base = log.next_base();
-        self.write(
-            &mut log,
-            Entry::Usage {
-                base,
-                kind: "compaction".into(),
-                provider: model.provider.clone(),
-                model: model.id.clone(),
-                usage,
-                note: Some(note),
-            },
-        )
+        self.append(vec![Entry::Usage {
+            base: journal::base(),
+            kind: "compaction".into(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            usage,
+            note: Some(note),
+        }])
         .await?;
         Ok(())
     }
@@ -746,14 +876,14 @@ impl SessionHooks {
         mode: compaction::elide::ElisionMode,
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
-        let (messages, sources, revision, before) = {
-            let log = self.log.lock().await;
-            let sources = log
+        let (artifacts, pending, revision) = {
+            let view = self.journal.view();
+            let sources = view
                 .projection
                 .sources
                 .iter()
                 .filter_map(|source| {
-                    let entry = &log.entries[source.entry_index].entry;
+                    let entry = &view.entries[source.entry_index].entry;
                     matches!(entry, Entry::Message { .. } | Entry::CustomMessage { .. })
                         .then(|| {
                             entry
@@ -763,56 +893,44 @@ impl SessionHooks {
                         .flatten()
                 })
                 .collect::<Vec<_>>();
-            (
-                log.projection.messages.clone(),
-                sources,
-                log.revision,
-                compaction::estimate(&log.projection),
-            )
-        };
-        let elision = compaction::elide::prepare(
-            &messages,
-            &sources,
-            self.maintenance.tools.schemes.artifacts(),
-            &self.maintenance.skill_paths,
-            mode,
-        )?;
-        let Some(elision) = elision.filter(|elision| !elision.edits.is_empty()) else {
-            return Ok(false);
-        };
-        let mut log = self.log.lock().await;
-        self.check_commit(&log, revision, cancel)?;
-        let mut parent = log.next_base().parent_id;
-        let mut reserved_ids = HashSet::new();
-        let pending: Vec<_> = elision
-            .edits
-            .into_iter()
-            .map(|(target_id, replacement)| {
-                let id = EntryId::generate(|id| log.ids.contains(id) || reserved_ids.contains(id));
-                reserved_ids.insert(id.0.clone());
-                let base = EntryBase::new(id.clone(), parent.take());
-                parent = Some(id);
-                Entry::ContextEdit {
-                    base,
-                    target_id,
-                    replacement: Some(replacement),
-                }
-            })
-            .collect();
-        if let compaction::elide::ElisionMode::Clearing { limits } = mode {
-            let Ok(after) = Self::candidate(&mut log, &pending, before, &limits, true) else {
+            let before = compaction::estimate(&view.projection);
+            let elision = compaction::elide::prepare(
+                &view.projection.messages,
+                &sources,
+                self.maintenance.tools.schemes.artifacts(),
+                &self.maintenance.skill_paths,
+                mode,
+            )?;
+            let Some(elision) = elision.filter(|elision| !elision.edits.is_empty()) else {
                 return Ok(false);
             };
-            if limits.trigger < 20_000 || after > limits.trigger - 20_000 || after >= before {
-                return Ok(false);
+            self.check_live(cancel)?;
+            let pending: Vec<_> = elision
+                .edits
+                .into_iter()
+                .map(|(target_id, replacement)| Entry::ContextEdit {
+                    base: journal::base(),
+                    target_id,
+                    replacement: Some(replacement),
+                })
+                .collect();
+            if let compaction::elide::ElisionMode::Clearing { limits } = mode {
+                let Ok(after) = Self::candidate(&view, &pending, before, &limits, true) else {
+                    return Ok(false);
+                };
+                if limits.trigger < 20_000 || after > limits.trigger - 20_000 || after >= before {
+                    return Ok(false);
+                }
             }
-        }
+            (elision.artifacts, pending, view.revision)
+        };
         compaction::elide::write_artifacts(
             self.maintenance.tools.schemes.artifacts().dir(),
-            &elision.artifacts,
+            &artifacts,
         )
         .await?;
-        self.write_all(&mut log, pending).await?;
+        self.check_live(cancel)?;
+        self.append_if(revision, pending).await?;
         Ok(true)
     }
 
@@ -823,16 +941,12 @@ impl SessionHooks {
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
         let automatic = reason != CompactionReason::Manual;
-        let limits = {
-            let log = self.log.lock().await;
-            let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            if reason == CompactionReason::Threshold
-                && compaction::estimate(&log.projection) <= limits.trigger
-            {
-                return Ok(false);
-            }
-            limits
-        };
+        let limits = Limits::resolve(&self.model(), &self.maintenance.settings)?;
+        if reason == CompactionReason::Threshold
+            && compaction::estimate(&self.journal.view().projection) <= limits.trigger
+        {
+            return Ok(false);
+        }
         if automatic
             && self
                 .elide(compaction::elide::ElisionMode::Clearing { limits }, cancel)
@@ -847,18 +961,20 @@ impl SessionHooks {
         };
         let mut last_error = String::new();
         for _ in 0..3 {
-            let (prepared, model, thinking, revision, checkpoint, system) = {
-                let log = self.log.lock().await;
-                self.check_commit(&log, log.revision, cancel)?;
-                let checkpoint = log.next_base();
+            self.check_live(cancel)?;
+            let Selection { model, thinking } = self.selection();
+            let (prepared, revision, checkpoint, system) = {
+                let view = self.journal.view();
+                // Named by the summary before it is written: the journal keeps this id.
+                let checkpoint = EntryId::generate(|id| view.has(id));
                 let prepared = compaction::prepare_compaction(
-                    &log.projection,
-                    &log.entries,
+                    &view.projection,
+                    &view.entries,
                     &limits,
-                    checkpoint.id.clone(),
+                    checkpoint.clone(),
                 )?;
                 let system = axo_ai::transcript::replay_system_message(
-                    log.projection
+                    view.projection
                         .messages
                         .iter()
                         .filter_map(|message| match message {
@@ -866,14 +982,7 @@ impl SessionHooks {
                             _ => None,
                         }),
                 );
-                (
-                    prepared,
-                    log.model.clone(),
-                    log.thinking,
-                    log.revision,
-                    checkpoint.id,
-                    system,
-                )
+                (prepared, view.revision, checkpoint, system)
             };
             let context = compaction::summary::SummaryContext {
                 streamer: self.maintenance.streamer.as_ref(),
@@ -906,11 +1015,9 @@ impl SessionHooks {
                         &prepared.files,
                     );
                     let committed: Result<(), Error> = async {
-                        let mut log = self.log.lock().await;
-                        self.check_commit(&log, revision, cancel)?;
-                        let base = EntryBase::new(checkpoint, log.next_base().parent_id);
+                        self.check_live(cancel)?;
                         let entry = Entry::Compaction {
-                            base,
+                            base: journal::base_with_id(checkpoint),
                             summary,
                             first_kept_entry_id: prepared.first_kept_entry_id,
                             preserved_user_ids: prepared.preserved_user_ids,
@@ -922,14 +1029,20 @@ impl SessionHooks {
                             focus: focus.map(str::to_owned),
                             system_message: system,
                         };
-                        Self::candidate(
-                            &mut log,
-                            std::slice::from_ref(&entry),
-                            prepared.tokens_before,
-                            &limits,
-                            automatic,
-                        )?;
-                        self.write(&mut log, entry).await?;
+                        {
+                            let view = self.journal.view();
+                            if view.revision != revision {
+                                return Err(Error::ContextChanged);
+                            }
+                            Self::candidate(
+                                &view,
+                                std::slice::from_ref(&entry),
+                                prepared.tokens_before,
+                                &limits,
+                                automatic,
+                            )?;
+                        }
+                        self.append_if(revision, vec![entry]).await?;
                         Ok(())
                     }
                     .await;
@@ -959,16 +1072,13 @@ impl SessionHooks {
         if !self.maintenance.settings.enabled {
             return Ok(false);
         }
+        let limits = Limits::resolve(&self.model(), &self.maintenance.settings)?;
+        if reason == CompactionReason::Threshold
+            && compaction::estimate(&self.journal.view().projection) <= limits.trigger
         {
-            let mut log = self.log.lock().await;
-            let limits = Limits::resolve(&log.model, &self.maintenance.settings)?;
-            if reason == CompactionReason::Threshold
-                && compaction::estimate(&log.projection) <= limits.trigger
-            {
-                return Ok(false);
-            }
-            self.reserve(&mut log, MaintenanceKind::Compact, false, cancel.clone())?;
+            return Ok(false);
         }
+        self.reserve(MaintenanceKind::Compact, false, cancel.clone())?;
         let result = std::panic::AssertUnwindSafe(self.compact_inner(reason, None, cancel))
             .catch_unwind()
             .await;
@@ -977,73 +1087,74 @@ impl SessionHooks {
             Ok(Err(error)) => (Some(error.to_string()), cancel.is_cancelled()),
             Err(_) => (Some("Maintenance task panicked".into()), false),
         };
-        self.end_maintenance(false, error, aborted).await;
+        self.end_maintenance(false, error, aborted);
         match result {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 
-    async fn sync_sections(
-        &self,
-        log: &mut Log,
-        current: &Sections,
-    ) -> Result<Option<AgentMessage>, Error> {
-        let mut effective: Option<Sections> = None;
-        for message in &log.projection.messages {
-            if let AgentMessage::Llm(Message::System(system)) = message {
-                let Some(patch) = &system.sections else {
-                    continue;
-                };
-                let sections = effective.get_or_insert_with(Sections::new);
-                for (name, text) in patch {
-                    match text {
-                        Some(text) => {
-                            sections.insert(name.clone(), text.clone());
-                        }
-                        None => {
-                            sections.shift_remove(name);
+    /// Appends the system message that moves the transcript's effective prompt to
+    /// `current`, if they differ.
+    async fn sync_sections(&self, current: &Sections) -> Result<(), Error> {
+        let message = {
+            let view = self.journal.view();
+            let messages = &view.projection.messages;
+            let mut effective: Option<Sections> = None;
+            for message in messages {
+                if let AgentMessage::Llm(Message::System(system)) = message {
+                    let Some(patch) = &system.sections else {
+                        continue;
+                    };
+                    let sections = effective.get_or_insert_with(Sections::new);
+                    for (name, text) in patch {
+                        match text {
+                            Some(text) => {
+                                sections.insert(name.clone(), text.clone());
+                            }
+                            None => {
+                                sections.shift_remove(name);
+                            }
                         }
                     }
                 }
             }
-        }
-        let changes = axo_ai::transcript::tool_state_changes(
-            &axo_ai::transcript::replay_tools(log.projection.messages.iter().filter_map(
-                |message| match message {
-                    AgentMessage::Llm(Message::System(system)) => Some(system),
-                    _ => None,
-                },
-            )),
-            &self.maintenance.tool_specs,
-        );
-        let system = system_message(effective.as_ref(), current);
-        if system.is_none() && changes.tools_added.is_empty() && changes.tools_removed.is_empty() {
-            return Ok(None);
-        }
-        let mut system = system.unwrap_or_else(|| SystemMessage {
-            content: Vec::new(),
-            sections: None,
-            tools_added: Vec::new(),
-            tools_removed: Vec::new(),
-            timestamp: now_ms(),
-        });
-        system.tools_added = changes.tools_added;
-        system.tools_removed = changes.tools_removed;
-        let message = AgentMessage::Llm(Message::System(system));
-        let base = log.next_base();
-        self.write(
-            log,
-            Entry::Message {
-                base,
-                message: message.clone(),
-                submission_id: None,
-                admitted_jobs: Vec::new(),
-                delivered_jobs: Vec::new(),
-            },
-        )
+            let changes = axo_ai::transcript::tool_state_changes(
+                &axo_ai::transcript::replay_tools(messages.iter().filter_map(
+                    |message| match message {
+                        AgentMessage::Llm(Message::System(system)) => Some(system),
+                        _ => None,
+                    },
+                )),
+                &self.maintenance.tool_specs,
+            );
+            let system = system_message(effective.as_ref(), current);
+            if system.is_none()
+                && changes.tools_added.is_empty()
+                && changes.tools_removed.is_empty()
+            {
+                return Ok(());
+            }
+            let mut system = system.unwrap_or_else(|| SystemMessage {
+                content: Vec::new(),
+                sections: None,
+                tools_added: Vec::new(),
+                tools_removed: Vec::new(),
+                timestamp: now_ms(),
+            });
+            system.tools_added = changes.tools_added;
+            system.tools_removed = changes.tools_removed;
+            AgentMessage::Llm(Message::System(system))
+        };
+        self.append(vec![Entry::Message {
+            base: journal::base(),
+            message,
+            submission_id: None,
+            admitted_jobs: Vec::new(),
+            delivered_jobs: Vec::new(),
+        }])
         .await?;
-        Ok(Some(message))
+        Ok(())
     }
 
     async fn navigate_inner(
@@ -1053,24 +1164,23 @@ impl SessionHooks {
         focus: Option<String>,
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
-        let (prepared, model, thinking, revision, from_id, limits) = {
-            let log = self.log.lock().await;
+        let Selection { model, thinking } = self.selection();
+        let limits = Limits::resolve(&model, &self.maintenance.settings)?;
+        let (prepared, revision, from_id) = {
+            let view = self.journal.view();
             if let Some(target) = &target
-                && !log.ids.contains(target.as_str())
+                && !view.has(target.as_str())
             {
                 return Err(Error::EntryNotFound(target.to_string()));
             }
             (
-                compaction::prepare_branch(&log.projection, &log.entries, target.as_ref()),
-                log.model.clone(),
-                log.thinking,
-                log.revision,
-                log.entries
+                compaction::prepare_branch(&view.projection, &view.entries, target.as_ref()),
+                view.revision,
+                view.entries
                     .last()
                     .and_then(|seq| seq.entry.id())
                     .unwrap_or("root")
                     .to_owned(),
-                Limits::resolve(&log.model, &self.maintenance.settings)?,
             )
         };
         let generated = if let Some((input, files)) = prepared {
@@ -1114,46 +1224,40 @@ impl SessionHooks {
         } else {
             None
         };
-        let mut log = self.log.lock().await;
-        if let Err(error) = self.check_commit(&log, revision, cancel) {
-            drop(log);
-            if let Some((summary, _)) = generated {
-                self.save_usage(&model, summary.usage, error.to_string())
-                    .await?;
-            }
-            return Err(error);
-        }
-        let base = EntryBase::new(EntryId::generate(|id| log.ids.contains(id)), target);
-        let entry = match generated {
-            Some((summary, files)) => Entry::BranchSummary {
-                base,
-                from_id,
-                summary: compaction::history_summary(&summary.text, &self.maintenance.path, &files),
-                details: Some(files.details()),
-                usage: Some(summary.usage),
-                from_hook: None,
-                focus,
-            },
-            None => Entry::Leaf { base },
+        let base = journal::base_at(target);
+        let (entry, usage) = match generated {
+            Some((summary, files)) => (
+                Entry::BranchSummary {
+                    base,
+                    from_id,
+                    summary: compaction::history_summary(
+                        &summary.text,
+                        &self.maintenance.path,
+                        &files,
+                    ),
+                    details: Some(files.details()),
+                    usage: Some(summary.usage.clone()),
+                    from_hook: None,
+                    focus,
+                },
+                Some(summary.usage),
+            ),
+            None => (Entry::Leaf { base }, None),
         };
-        let usage = match &entry {
-            Entry::BranchSummary { usage, .. } => usage.clone(),
-            _ => None,
+        let committed = match self.check_live(cancel) {
+            Ok(()) => self.append_if(revision, vec![entry]).await.map(drop),
+            Err(error) => Err(error),
         };
-        if let Err(error) = self.write(&mut log, entry).await {
-            drop(log);
+        if let Err(error) = committed {
             if let Some(usage) = usage {
                 self.save_usage(&model, usage, error.to_string()).await?;
             }
             return Err(error);
         }
-        let model = log.projection.model.clone();
-        let thinking = log.projection.thinking;
-        self.record_selection(&mut log, model.as_deref(), thinking)
-            .await?;
+        self.record_current_selection().await?;
         self.take_system();
         if let Some(sections) = sections {
-            self.sync_sections(&mut log, &sections).await?;
+            self.sync_sections(&sections).await?;
         }
         Ok(())
     }
@@ -1191,7 +1295,7 @@ impl SessionHooks {
         })
         .catch_unwind()
         .await;
-        agent.set_messages(self.log.lock().await.projection.messages.clone());
+        agent.set_messages(self.journal.view().projection.messages.clone());
         let (error, aborted) = match &result {
             Ok(Ok(())) => (None, false),
             Ok(Err(error)) => (
@@ -1200,7 +1304,7 @@ impl SessionHooks {
             ),
             Err(_) => (Some("Maintenance task panicked".into()), false),
         };
-        self.end_maintenance(true, error, aborted).await;
+        self.end_maintenance(true, error, aborted);
         match result {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -1208,8 +1312,7 @@ impl SessionHooks {
     }
 
     fn failure_state(
-        &self,
-        log: &Log,
+        log: &View,
         response: &AssistantMessage,
         model: &Model,
     ) -> Result<FailureState, Error> {
@@ -1291,8 +1394,8 @@ impl SessionHooks {
         })
     }
 
-    fn checkpoint_completed(&self, log: &Log, state: &FailureState) -> bool {
-        let Ok(limits) = Limits::resolve(&log.model, &self.maintenance.settings) else {
+    fn checkpoint_completed(&self, log: &View, state: &FailureState, model: &Model) -> bool {
+        let Ok(limits) = Limits::resolve(model, &self.maintenance.settings) else {
             return false;
         };
         let end = if state.hidden { state.at } else { state.at + 1 };
@@ -1317,126 +1420,58 @@ impl SessionHooks {
                 || (clearing && limits.trigger >= 20_000 && after <= limits.trigger - 20_000))
     }
 
-    async fn omit_response(
-        &self,
-        log: &mut Log,
-        at: usize,
-        response: &AssistantMessage,
-    ) -> Result<(), Error> {
-        let path = log.projection.path();
-        let mut targets = Vec::new();
-        for index in path.iter().copied().filter(|&index| index >= at) {
-            if index > at
-                && matches!(
-                    &log.entries[index].entry,
-                    Entry::Message {
-                        message: AgentMessage::Llm(Message::Assistant(_)),
-                        ..
-                    }
-                )
-            {
-                break;
+    /// Hides the failed response at entry `at` and its tool results from the context.
+    async fn omit_response(&self, at: usize, response: &AssistantMessage) -> Result<(), Error> {
+        let edits: Vec<Entry> = {
+            let view = self.journal.view();
+            let path = view.projection.path();
+            let mut targets = Vec::new();
+            for index in path.iter().copied().filter(|&index| index >= at) {
+                if index > at
+                    && matches!(
+                        &view.entries[index].entry,
+                        Entry::Message {
+                            message: AgentMessage::Llm(Message::Assistant(_)),
+                            ..
+                        }
+                    )
+                {
+                    break;
+                }
+                let entry = &view.entries[index].entry;
+                if (index == at
+                    || matches!(entry,
+                        Entry::Message { message: AgentMessage::Llm(Message::ToolResult(result)), .. }
+                            if response.tool_calls().any(|call| call.id == result.tool_call_id)))
+                    && let Some(id) = entry.id()
+                    && !view.projection.is_omitted(id)
+                {
+                    targets.push(EntryId(id.to_owned()));
+                }
             }
-            let entry = &log.entries[index].entry;
-            if (index == at
-                || matches!(entry,
-                    Entry::Message { message: AgentMessage::Llm(Message::ToolResult(result)), .. }
-                        if response.tool_calls().any(|call| call.id == result.tool_call_id)))
-                && let Some(id) = entry.id()
-                && !log.projection.is_omitted(id)
-            {
-                targets.push(EntryId(id.to_owned()));
-            }
-        }
-        let mut parent = log.next_base().parent_id;
-        let mut reserved_ids = HashSet::new();
-        let edits = targets
-            .into_iter()
-            .map(|target_id| {
-                let id = EntryId::generate(|id| log.ids.contains(id) || reserved_ids.contains(id));
-                reserved_ids.insert(id.0.clone());
-                let base = EntryBase::new(id.clone(), parent.take());
-                parent = Some(id);
-                Entry::ContextEdit {
-                    base,
+            targets
+                .into_iter()
+                .map(|target_id| Entry::ContextEdit {
+                    base: journal::base(),
                     target_id,
                     replacement: None,
-                }
-            })
-            .collect();
-        self.write_all(log, edits).await
+                })
+                .collect()
+        };
+        // Only this run's own loop changes its transcript meanwhile, so the targets hold.
+        self.append(edits).await?;
+        Ok(())
     }
 
-    async fn context(&self, tools: &[Arc<dyn Tool>]) -> AgentContext {
+    fn context(&self, tools: &[Arc<dyn Tool>]) -> AgentContext {
         AgentContext {
-            messages: self.log.lock().await.projection.messages.clone(),
+            messages: self.journal.view().projection.messages.clone(),
             tools: tools.to_vec(),
         }
     }
 
     fn take_system(&self) -> Vec<AgentMessage> {
         std::mem::take(&mut *self.system.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    /// Appends `entry` and records it without refreshing or broadcasting it.
-    async fn append(&self, log: &mut Log, entry: Entry) -> Result<SeqEntry, Error> {
-        if log.maintenance.is_some() && self.maintenance.shutdown.load(Ordering::Acquire) {
-            return Err(Error::MaintenanceAborted);
-        }
-        let appended = log.writer.append(entry).await?;
-        if let Some(id) = appended.entry.id() {
-            log.ids.insert(id.to_owned());
-        }
-        if !matches!(
-            &appended.entry,
-            Entry::Submission { .. } | Entry::Usage { .. }
-        ) {
-            log.revision = log.revision.wrapping_add(1);
-        }
-        log.entries.push(appended.clone());
-        Ok(appended)
-    }
-
-    fn refresh(&self, log: &mut Log, appended: &Entry) {
-        log.projection.apply(&log.entries);
-        if matches!(
-            appended,
-            Entry::ContextEdit { .. }
-                | Entry::Compaction { .. }
-                | Entry::BranchSummary { .. }
-                | Entry::Leaf { .. }
-        ) {
-            self.restore(log);
-        }
-    }
-
-    /// Appends `entry`, refreshes derived state and broadcasts it.
-    async fn write(&self, log: &mut Log, entry: Entry) -> Result<SeqEntry, Error> {
-        let appended = self.append(log, entry).await?;
-        self.refresh(log, &appended.entry);
-        let _ = self.events.send(SessionEvent::Entry(appended.clone()));
-        Ok(appended)
-    }
-
-    async fn write_all(&self, log: &mut Log, entries: Vec<Entry>) -> Result<(), Error> {
-        let mut appended = Vec::with_capacity(entries.len());
-        let mut result = Ok(());
-        for entry in entries {
-            match self.append(log, entry).await {
-                Ok(entry) => appended.push(entry),
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
-        if let Some(last) = appended.last() {
-            self.refresh(log, &last.entry);
-        }
-        for entry in appended {
-            let _ = self.events.send(SessionEvent::Entry(entry));
-        }
-        result
     }
 
     /// Closes the run with `run_end` (none after a shutdown) and releases the session
@@ -1447,15 +1482,18 @@ impl SessionHooks {
         &self,
         result: Result<RunOutcome, axo_agent::Error>,
     ) -> Result<RunOutcome, Error> {
-        let mut log = self.log.lock().await;
         self.jobs.release_uncommitted();
         if !matches!(result, Ok(RunOutcome::Done)) {
             self.auto_paused.store(true, Ordering::Release);
         }
-        log.streaming = None;
-        log.tool_calls.clear();
+        let run_id = {
+            let mut live = self.live();
+            live.streaming = None;
+            live.tool_calls.clear();
+            live.run_id.take()
+        };
         let mut closed = Ok(());
-        if let Some(run_id) = log.run_id.take() {
+        if let Some(run_id) = run_id {
             let end = match &result {
                 Ok(RunOutcome::Done) => Some((store::RunOutcome::Done, None)),
                 Ok(RunOutcome::Aborted(CancelReason::User)) => {
@@ -1468,17 +1506,13 @@ impl SessionHooks {
                 Err(error) => Some((store::RunOutcome::Failed, Some(error.to_string()))),
             };
             if let Some((outcome, reason)) = end {
-                let base = log.next_base();
                 closed = self
-                    .write(
-                        &mut log,
-                        Entry::RunEnd {
-                            base,
-                            run_id,
-                            outcome,
-                            reason,
-                        },
-                    )
+                    .append(vec![Entry::RunEnd {
+                        base: journal::base(),
+                        run_id,
+                        outcome,
+                        reason,
+                    }])
                     .await
                     .map(drop);
             }
@@ -1486,38 +1520,54 @@ impl SessionHooks {
         if closed.is_err() {
             self.auto_paused.store(true, Ordering::Release);
         }
-        self.release_or_deliver(&mut log);
+        self.release_or_deliver();
         closed?;
         result.map_err(Error::Agent)
     }
 
     /// Appends `model_change` / `thinking_level_change` when the current branch records a
-    /// different selection than the live one in `log` (pi `_recordSelection`), so reopening
+    /// different selection than the live one (pi `_recordSelection`), so reopening
     /// restores what is live.
     async fn record_selection(
         &self,
-        log: &mut Log,
         model: Option<&str>,
         thinking: Option<ThinkingLevel>,
     ) -> Result<(), Error> {
-        if model != Some(format!("{}/{}", log.model.provider, log.model.id).as_str()) {
-            let base = log.next_base();
-            let entry = Entry::ModelChange {
-                base,
-                provider: log.model.provider.clone(),
-                model_id: log.model.id.clone(),
-            };
-            self.write(log, entry).await?;
-        }
-        if thinking != Some(log.thinking) {
-            let base = log.next_base();
-            let entry = Entry::ThinkingLevelChange {
-                base,
-                thinking_level: log.thinking,
-            };
-            self.write(log, entry).await?;
-        }
+        let queued = {
+            // Queued under the selection lock, ordered with `Session::set_model`.
+            let selection = self.selection.borrow();
+            let mut entries = Vec::new();
+            if model
+                != Some(format!("{}/{}", selection.model.provider, selection.model.id).as_str())
+            {
+                entries.push(Entry::ModelChange {
+                    base: journal::base(),
+                    provider: selection.model.provider.clone(),
+                    model_id: selection.model.id.clone(),
+                });
+            }
+            if thinking != Some(selection.thinking) {
+                entries.push(Entry::ThinkingLevelChange {
+                    base: journal::base(),
+                    thinking_level: selection.thinking,
+                });
+            }
+            if entries.is_empty() {
+                return Ok(());
+            }
+            self.append(entries)
+        };
+        queued.await?;
         Ok(())
+    }
+
+    /// [`SessionHooks::record_selection`] against the current position.
+    async fn record_current_selection(&self) -> Result<(), Error> {
+        let (model, thinking) = {
+            let view = self.journal.view();
+            (view.projection.model.clone(), view.projection.thinking)
+        };
+        self.record_selection(model.as_deref(), thinking).await
     }
 }
 
@@ -1545,7 +1595,7 @@ impl LoopHooks for SessionHooks {
             .map_err(|error| HookError(error.to_string()))?
         {
             Ok(Some(RequestUpdate {
-                context: Some(self.context(&request.context.tools).await),
+                context: Some(self.context(&request.context.tools)),
                 ..RequestUpdate::default()
             }))
         } else {
@@ -1560,24 +1610,19 @@ impl LoopHooks for SessionHooks {
     ) -> Result<TurnFinish, HookError> {
         let result: Result<TurnFinish, Error> = async {
             let response = turn.message;
-            {
-                let mut log = self.log.lock().await;
-                self.check_commit(&log, log.revision, cancel)?;
-                if !recovery::served_by(response, &log.model) {
-                    let state = self.failure_state(&log, response, turn.model)?;
-                    let unusable = state.hidden || recovery::foreign_unusable(response, &log.model);
-                    if unusable {
-                        self.omit_response(&mut log, state.at, response).await?;
-                        return Ok(TurnFinish {
-                            decision: Some(TurnDecision::Continue),
-                            context: Some(AgentContext {
-                                messages: log.projection.messages.clone(),
-                                tools: turn.context.tools.clone(),
-                            }),
-                        });
-                    }
-                    return Ok(TurnFinish::default());
+            self.check_live(cancel)?;
+            let model = self.model();
+            if !recovery::served_by(response, &model) {
+                let state = Self::failure_state(&self.journal.view(), response, turn.model)?;
+                let unusable = state.hidden || recovery::foreign_unusable(response, &model);
+                if unusable {
+                    self.omit_response(state.at, response).await?;
+                    return Ok(TurnFinish {
+                        decision: Some(TurnDecision::Continue),
+                        context: Some(self.context(&turn.context.tools)),
+                    });
                 }
+                return Ok(TurnFinish::default());
             }
             let pressure = recovery::is_pressure(response, turn.model);
             let silent_success = pressure
@@ -1585,11 +1630,7 @@ impl LoopHooks for SessionHooks {
                 && response.tool_calls().next().is_none();
             if silent_success {
                 let changed = self.automatic(CompactionReason::Overflow, cancel).await?;
-                let context = if changed {
-                    Some(self.context(&turn.context.tools).await)
-                } else {
-                    None
-                };
+                let context = changed.then(|| self.context(&turn.context.tools));
                 return Ok(TurnFinish {
                     decision: None,
                     context,
@@ -1598,56 +1639,51 @@ impl LoopHooks for SessionHooks {
             let faulty =
                 pressure || matches!(response.stop_reason, StopReason::Error | StopReason::Length);
             if faulty {
-                let (delay, shrink, retry) = {
-                    let mut log = self.log.lock().await;
-                    self.check_commit(&log, log.revision, cancel)?;
-                    let state = self.failure_state(&log, response, turn.model)?;
-                    let switched = !recovery::served_by(response, &log.model);
-                    if switched {
-                        self.omit_response(&mut log, state.at, response).await?;
-                        (None, false, true)
+                self.check_live(cancel)?;
+                let model = self.model();
+                // `Some((delay, shrink))` retries after omitting the response.
+                let (at, retries, retry) = {
+                    let view = self.journal.view();
+                    let state = Self::failure_state(&view, response, turn.model)?;
+                    let retry = if !recovery::served_by(response, &model) {
+                        Some((None, false))
                     } else if pressure {
                         if !self.maintenance.settings.enabled || state.overflow_used {
                             return Ok(TurnFinish::default());
                         }
-                        let completed = self.checkpoint_completed(&log, &state);
-                        self.omit_response(&mut log, state.at, response).await?;
-                        (None, !(state.hidden && completed), true)
-                    } else if let Some(delay) = axo_ai::retry_delay(response, state.retries) {
-                        self.omit_response(&mut log, state.at, response).await?;
-                        let _ = self.events.send(SessionEvent::Retry {
-                            attempt: state.retries + 1,
-                            delay_ms: delay.as_millis() as u64,
-                        });
-                        (Some(delay), false, true)
+                        let completed = self.checkpoint_completed(&view, &state, &model);
+                        Some((None, !(state.hidden && completed)))
                     } else {
-                        (None, false, false)
-                    }
+                        axo_ai::retry_delay(response, state.retries)
+                            .map(|delay| (Some(delay), false))
+                    };
+                    (state.at, state.retries, retry)
                 };
-                if retry {
-                    if let Some(delay) = delay {
-                        tokio::select! {
-                            _ = cancel.cancelled() => return Err(Error::MaintenanceAborted),
-                            _ = tokio::time::sleep(delay) => {}
-                        }
-                    }
-                    if shrink {
-                        self.automatic(CompactionReason::Overflow, cancel).await?;
-                    }
-                    return Ok(TurnFinish {
-                        decision: Some(TurnDecision::Continue),
-                        context: Some(self.context(&turn.context.tools).await),
+                let Some((delay, shrink)) = retry else {
+                    return Ok(TurnFinish::default());
+                };
+                self.omit_response(at, response).await?;
+                if let Some(delay) = delay {
+                    let _ = self.events.send(SessionEvent::Retry {
+                        attempt: retries + 1,
+                        delay_ms: delay.as_millis() as u64,
                     });
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::MaintenanceAborted),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                 }
-                return Ok(TurnFinish::default());
+                if shrink {
+                    self.automatic(CompactionReason::Overflow, cancel).await?;
+                }
+                return Ok(TurnFinish {
+                    decision: Some(TurnDecision::Continue),
+                    context: Some(self.context(&turn.context.tools)),
+                });
             }
             if response.tool_calls().next().is_none() {
                 let changed = self.automatic(CompactionReason::Threshold, cancel).await?;
-                let context = if changed {
-                    Some(self.context(&turn.context.tools).await)
-                } else {
-                    None
-                };
+                let context = changed.then(|| self.context(&turn.context.tools));
                 return Ok(TurnFinish {
                     decision: None,
                     context,
@@ -1681,35 +1717,39 @@ impl LoopHooks for SessionHooks {
 #[async_trait]
 impl Persist for SessionHooks {
     /// Saves the run's start and every finished message before the loop goes on, then
-    /// relays the event onto the session channel.
+    /// relays the event onto the session channel. Only the writes await, and they await
+    /// only the journal task; live state changes under a lock that is never held across
+    /// an await.
     async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
-        let mut log = self.log.lock().await;
         match &*event {
             // A resumed run keeps the id of the run it continues.
-            AgentEvent::AgentStart if log.run_id.is_none() => {
+            AgentEvent::AgentStart if self.live().run_id.is_none() => {
                 let run_id = Uuid::now_v7().to_string();
-                let base = log.next_base();
-                self.write(
-                    &mut log,
-                    Entry::RunStart {
-                        base,
-                        run_id: run_id.clone(),
-                    },
-                )
+                self.append(vec![Entry::RunStart {
+                    base: journal::base(),
+                    run_id: run_id.clone(),
+                }])
                 .await
                 .map_err(|err| PersistError(err.to_string()))?;
-                log.run_id = Some(run_id);
+                self.live().run_id = Some(run_id);
             }
-            AgentEvent::MessageUpdate { event } => {
-                log.streaming
+            AgentEvent::MessageUpdate { event: update } => {
+                let mut live = self.live();
+                live.streaming
                     .get_or_insert_with(Accumulator::new)
-                    .apply(event);
+                    .apply(update);
+                // Relayed under the live lock: see `Session::attach`.
+                let _ = self.events.send(SessionEvent::Agent(event.clone()));
+                return Ok(());
             }
             AgentEvent::MessageEnd { message, origin } => {
-                log.streaming = None;
+                // Cleared before the entry lands: an attach in between sees neither and
+                // receives the entry.
+                self.live().streaming = None;
                 // Receipts: a queued delivery or a `wait` result commits the job results
-                // reserved under its key; a promoting `bash` result admits its job.
-                let (submission_id, key, admission) = match origin {
+                // reserved under its key; a promoting `bash` result admits its job, and
+                // carries the job's `job_start` in the same batch.
+                let (submission_id, key, started) = match origin {
                     MessageOrigin::Input(Some(id)) => {
                         let key = DeliveryKey::Input(id.clone());
                         if self.jobs.reserved_ids(&key).is_empty() {
@@ -1722,33 +1762,33 @@ impl Persist for SessionHooks {
                     MessageOrigin::Tool(invocation) => (
                         None,
                         Some(DeliveryKey::Invocation(*invocation)),
-                        self.jobs.take_admission(*invocation),
+                        self.jobs.take_start(*invocation),
                     ),
                 };
                 let delivered_jobs = key
                     .as_ref()
                     .map(|key| self.jobs.reserved_ids(key))
                     .unwrap_or_default();
-                let admitted_jobs = admission.map(job_name).into_iter().collect();
-                let base = log.next_base();
-                let written = self
-                    .write(
-                        &mut log,
-                        Entry::Message {
-                            base,
-                            message: message.clone(),
-                            submission_id,
-                            admitted_jobs,
-                            delivered_jobs,
-                        },
-                    )
-                    .await;
-                match written {
+                let admitted = started
+                    .as_ref()
+                    .filter(|started| started.admits)
+                    .map(|started| started.id);
+                let mut batch = Vec::with_capacity(2);
+                // The start first: a receipt never names a job whose start is not on disk.
+                batch.extend(started.map(|started| started.entry));
+                batch.push(Entry::Message {
+                    base: journal::base(),
+                    message: message.clone(),
+                    submission_id,
+                    admitted_jobs: admitted.map(job_name).into_iter().collect(),
+                    delivered_jobs,
+                });
+                match self.append(batch).await {
                     Ok(_) => {
                         if let Some(key) = &key {
                             self.jobs.commit(key);
                         }
-                        if let Some(id) = admission {
+                        if let Some(id) = admitted {
                             self.jobs.admitted(id);
                         }
                     }
@@ -1756,7 +1796,7 @@ impl Persist for SessionHooks {
                         if let Some(key) = &key {
                             self.jobs.release(key);
                         }
-                        if let Some(id) = admission {
+                        if let Some(id) = admitted {
                             self.jobs.admission_failed(id);
                         }
                         return Err(PersistError(err.to_string()));
@@ -1767,18 +1807,29 @@ impl Persist for SessionHooks {
                 call_id,
                 name,
                 args,
-            } => log.tool_calls.push(ToolCall {
-                id: call_id.clone(),
-                name: name.clone(),
-                arguments: args.clone(),
-                arguments_error: None,
-            }),
+            } => {
+                let mut live = self.live();
+                live.tool_calls.push(ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: args.clone(),
+                    arguments_error: None,
+                });
+                let _ = self.events.send(SessionEvent::Agent(event.clone()));
+                return Ok(());
+            }
             AgentEvent::ToolExecutionEnd { call_id, .. } => {
-                log.tool_calls.retain(|call| &call.id != call_id);
+                let mut live = self.live();
+                live.tool_calls.retain(|call| &call.id != call_id);
+                let _ = self.events.send(SessionEvent::Agent(event.clone()));
+                return Ok(());
             }
             AgentEvent::AgentEnd { .. } => {
-                log.streaming = None;
-                log.tool_calls.clear();
+                let mut live = self.live();
+                live.streaming = None;
+                live.tool_calls.clear();
+                let _ = self.events.send(SessionEvent::Agent(event.clone()));
+                return Ok(());
             }
             _ => {}
         }
@@ -1787,28 +1838,9 @@ impl Persist for SessionHooks {
     }
 }
 
-#[async_trait]
 impl JobHost for SessionHooks {
-    /// Appends a job record under the log lock, like every other entry.
-    async fn journal(&self, entry: JobEntry) -> Result<(), Error> {
-        let mut log = self.log.lock().await;
-        let entry = entry.into_entry(log.next_base(), &self.maintenance.session_id);
-        self.write(&mut log, entry).await?;
-        Ok(())
-    }
-
-    /// Starts delivery when the session is idle. While a run or maintenance is active,
-    /// the steering hook or the idle transition's `release_or_deliver` delivers instead.
     fn results_ready(&self) {
-        let Some(hooks) = self.this.get().and_then(Weak::upgrade) else {
-            return;
-        };
-        tokio::spawn(async move {
-            let mut log = hooks.log.lock().await;
-            if !*hooks.running.borrow() && log.maintenance.is_none() {
-                hooks.release_or_deliver(&mut log);
-            }
-        });
+        self.deliver_if_idle();
     }
 }
 
@@ -1955,28 +1987,18 @@ impl Session {
             .collect();
         let tools = tools::merge_tools(tools::builtin(&session_tools, ask_enabled), &host);
 
-        let ids = entries
-            .iter()
-            .filter_map(|entry| entry.entry.id())
-            .map(str::to_owned)
-            .collect();
+        let journal = Journal::start(writer, entries, projection.clone(), events.clone());
         let hooks = Arc::new(SessionHooks {
             events,
             system: Mutex::new(Vec::new()),
-            log: tokio::sync::Mutex::new(Log {
-                writer,
-                entries,
-                projection: projection.clone(),
-                ids,
+            journal,
+            live: Mutex::new(LiveRun::default()),
+            selection: watch::Sender::new(Selection {
                 model: model.clone(),
                 thinking,
-                run_id: None,
-                streaming: None,
-                tool_calls: Vec::new(),
-                maintenance: None,
-                revision: 0,
             }),
-            running: watch::channel(false).0,
+            activity: watch::Sender::new(Activity::default()),
+            queue_order: tokio::sync::Mutex::new(()),
             maintenance: Maintenance {
                 streamer: streamer.clone(),
                 settings: settings.compaction.clone(),
@@ -2017,9 +2039,10 @@ impl Session {
             agent: OnceLock::new(),
             this: OnceLock::new(),
         });
-        hooks
-            .jobs
-            .attach(Arc::downgrade(&hooks) as Weak<dyn JobHost>);
+        hooks.jobs.attach(
+            Arc::downgrade(&hooks) as Weak<dyn JobHost>,
+            hooks.journal.downgrade(),
+        );
         let _ = hooks.this.set(Arc::downgrade(&hooks));
         tokio::spawn(relay_jobs(
             Arc::downgrade(&hooks.jobs),
@@ -2064,36 +2087,30 @@ impl Session {
             .await;
         session.hooks.prompt.rebuild(resolved.prompt_note, today());
 
-        let resume = {
-            let mut log = session.hooks.log.lock().await;
-            session
-                .hooks
-                .record_selection(&mut log, projection.model.as_deref(), projection.thinking)
-                .await?;
-            let mut messages = projection.messages;
-            session.sync_prompt(&mut log, &mut messages).await?;
-            if recovery.is_some() {
-                session.reconcile_jobs(&mut log, unfinished).await?;
+        // Nothing else runs on the session yet: these writes go in order.
+        session
+            .hooks
+            .record_selection(projection.model.as_deref(), projection.thinking)
+            .await?;
+        session.sync_prompt().await?;
+        if recovery.is_some() {
+            session.reconcile_jobs(unfinished).await?;
+        }
+        let resume = match recovery {
+            Some(policy) => {
+                session
+                    .recover(policy, session.tool_state.schemes.artifacts().dir())
+                    .await?
             }
-            let resume = match recovery {
-                Some(policy) => {
-                    session
-                        .recover(
-                            &mut log,
-                            policy,
-                            session.tool_state.schemes.artifacts().dir(),
-                            &mut messages,
-                        )
-                        .await?
-                }
-                None => None,
-            };
-            // After recovery's results, so a replayed `write` finds the file it saw.
-            session.tool_state.ledger.restore(&messages);
-            session.tool_state.context.restore(&messages);
-            session.agent.set_messages(messages);
-            resume
+            None => None,
         };
+        {
+            // After recovery's results, so a replayed `write` finds the file it saw.
+            let messages = &session.hooks.journal.view().projection.messages;
+            session.tool_state.ledger.restore(messages);
+            session.tool_state.context.restore(messages);
+            session.agent.set_messages(messages.clone());
+        }
 
         let agent = &session.agent;
         let request = match resume {
@@ -2162,7 +2179,7 @@ impl Session {
     /// Ends each admitted job a closed session left unfinished: writes its `JobEnd` once
     /// and makes the interrupted result pending. Delivery waits for the next prompt, a
     /// resumed run's steering, or `wait`; opening never starts a run for it.
-    async fn reconcile_jobs(&self, log: &mut Log, unfinished: Vec<u64>) -> Result<(), Error> {
+    async fn reconcile_jobs(&self, unfinished: Vec<u64>) -> Result<(), Error> {
         let artifacts = self.tool_state.schemes.artifacts();
         for id in unfinished {
             let Some((job, _)) = self.hooks.jobs.get(id) else {
@@ -2176,30 +2193,24 @@ impl Session {
             } else {
                 "Command was interrupted when the session closed; it may have partially run. Its output is unavailable.".to_owned()
             };
-            let entry = JobEntry::End {
-                job_id: job_name(id),
-                text: text.clone(),
-                is_error: true,
-            }
-            .into_entry(log.next_base(), &self.id);
-            self.hooks.write(log, entry).await?;
+            self.hooks
+                .append(vec![Entry::JobEnd {
+                    base: journal::base(),
+                    job_id: job_name(id),
+                    text: text.clone(),
+                    is_error: true,
+                }])
+                .await?;
             self.hooks.jobs.recovered_end(id, text);
         }
         Ok(())
     }
 
-    /// Appends the system message that moves `messages`' effective prompt to the current
-    /// sections, if they differ.
-    async fn sync_prompt(
-        &self,
-        log: &mut Log,
-        messages: &mut Vec<AgentMessage>,
-    ) -> Result<(), Error> {
-        let current = self.hooks.prompt.sections();
-        if let Some(current) = current
-            && let Some(message) = self.hooks.sync_sections(log, &current).await?
-        {
-            messages.push(message);
+    /// Appends the system message that moves the transcript's effective prompt to the
+    /// current sections, if they differ.
+    async fn sync_prompt(&self) -> Result<(), Error> {
+        if let Some(current) = self.hooks.prompt.sections() {
+            self.hooks.sync_sections(&current).await?;
         }
         Ok(())
     }
@@ -2237,11 +2248,11 @@ impl Session {
     /// input is left.
     async fn recover(
         &self,
-        log: &mut Log,
         policy: RecoveryPolicy,
         artifacts_dir: &Path,
-        messages: &mut Vec<AgentMessage>,
     ) -> Result<Option<Resumption>, Error> {
+        let log = self.hooks.journal.view();
+        let model = self.hooks.model();
         let replay_of = |call: &ToolCall| {
             self.hooks
                 .prompt
@@ -2253,7 +2264,7 @@ impl Session {
         let (run_id, outcome, reason) = match plan_recovery(
             &log.entries,
             &log.projection,
-            &log.model,
+            &model,
             &replay_of,
             artifacts_dir,
         ) {
@@ -2267,7 +2278,9 @@ impl Session {
                     .iter()
                     .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt))
                 {
-                    self.hooks.running.send_replace(true);
+                    self.hooks
+                        .activity
+                        .send_modify(|activity| activity.running = true);
                 }
                 return Ok(Some(Resumption::Requeue(queued)));
             }
@@ -2306,8 +2319,8 @@ impl Session {
                         && response.tool_calls().next().is_none()
                         && requeue.is_empty()
                     {
-                        let state = self.hooks.failure_state(log, &response, &log.model)?;
-                        let completed = self.hooks.checkpoint_completed(log, &state);
+                        let state = SessionHooks::failure_state(&log, &response, &model)?;
+                        let completed = self.hooks.checkpoint_completed(&log, &state, &model);
                         let later_input = log.projection.path().iter().any(|&index| {
                             index > at
                                 && matches!(
@@ -2320,17 +2333,13 @@ impl Session {
                                 )
                         });
                         if !state.hidden && completed && !later_input {
-                            let base = log.next_base();
                             self.hooks
-                                .write(
-                                    log,
-                                    Entry::RunEnd {
-                                        base,
-                                        run_id,
-                                        outcome: store::RunOutcome::Done,
-                                        reason: None,
-                                    },
-                                )
+                                .append(vec![Entry::RunEnd {
+                                    base: journal::base(),
+                                    run_id,
+                                    outcome: store::RunOutcome::Done,
+                                    reason: None,
+                                }])
                                 .await?;
                             return Ok(None);
                         }
@@ -2359,20 +2368,18 @@ impl Session {
                             _ => None,
                         })
                         .collect();
-                    let model = log.model.clone();
-                    let base = log.next_base();
+                    drop(log);
                     self.hooks
-                        .write(
-                            log,
-                            Entry::RunResumed {
-                                base,
-                                run_id: run_id.clone(),
-                                attempt,
-                            },
-                        )
+                        .append(vec![Entry::RunResumed {
+                            base: journal::base(),
+                            run_id: run_id.clone(),
+                            attempt,
+                        }])
                         .await?;
-                    log.run_id = Some(run_id);
-                    self.hooks.running.send_replace(true);
+                    self.hooks.live().run_id = Some(run_id);
+                    self.hooks
+                        .activity
+                        .send_modify(|activity| activity.running = true);
                     return Ok(Some(Resumption::RecoverResponse {
                         response,
                         model,
@@ -2415,41 +2422,42 @@ impl Session {
                         timestamp: now_ms(),
                         duration_ms: None,
                     }));
-                    let base = log.next_base();
-                    let entry = Entry::Message {
-                        base,
-                        message: message.clone(),
-                        submission_id: None,
-                        admitted_jobs: Vec::new(),
-                        delivered_jobs: Vec::new(),
-                    };
-                    self.hooks.write(log, entry).await?;
-                    messages.push(message);
+                    self.hooks
+                        .append(vec![Entry::Message {
+                            base: journal::base(),
+                            message,
+                            submission_id: None,
+                            admitted_jobs: Vec::new(),
+                            delivered_jobs: Vec::new(),
+                        }])
+                        .await?;
                 }
                 if policy == RecoveryPolicy::MarkInterrupted {
                     (run_id, store::RunOutcome::Interrupted, None)
                 } else {
-                    let base = log.next_base();
-                    let entry = Entry::RunResumed {
-                        base,
-                        run_id: run_id.clone(),
-                        attempt,
-                    };
-                    self.hooks.write(log, entry).await?;
-                    log.run_id = Some(run_id);
-                    self.hooks.running.send_replace(true);
+                    self.hooks
+                        .append(vec![Entry::RunResumed {
+                            base: journal::base(),
+                            run_id: run_id.clone(),
+                            attempt,
+                        }])
+                        .await?;
+                    self.hooks.live().run_id = Some(run_id);
+                    self.hooks
+                        .activity
+                        .send_modify(|activity| activity.running = true);
                     return Ok(Some(Resumption::Continue(self.requeued(requeue).await)));
                 }
             }
         };
-        let base = log.next_base();
-        let entry = Entry::RunEnd {
-            base,
-            run_id,
-            outcome,
-            reason,
-        };
-        self.hooks.write(log, entry).await?;
+        self.hooks
+            .append(vec![Entry::RunEnd {
+                base: journal::base(),
+                run_id,
+                outcome,
+                reason,
+            }])
+            .await?;
         Ok(None)
     }
 
@@ -2543,37 +2551,56 @@ impl Session {
     /// `prompt`, deduplicated by `request_id`: a request id that was already submitted
     /// returns its earlier submission and starts nothing, even while that run is active.
     pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
+        let request_id = request.request_id.as_deref();
         // Fast path: a duplicate or busy prompt does no file or image work.
-        let preparing = {
-            let log = self.hooks.log.lock().await;
-            if let Some(existing) = self.admit(&log, request.request_id.as_deref())? {
-                return Ok(PromptResult::Duplicate(existing));
-            }
-            self.hooks.preparing.fetch_add(1, Ordering::AcqRel);
-            Preparing(self.hooks.clone())
-        };
+        if let Some(existing) = self.admit(request_id).await? {
+            return Ok(PromptResult::Duplicate(existing));
+        }
+        self.hooks.preparing.fetch_add(1, Ordering::AcqRel);
+        let preparing = Preparing(self.hooks.clone());
         let (Prepared { parts, saved }, content) = self.prepare(request.input.parts).await?;
-        let (submission, message) = {
-            let mut log = self.hooks.log.lock().await;
-            // Checked again: another prompt may have started while this one prepared.
-            if let Some(existing) = self.admit(&log, request.request_id.as_deref())? {
-                return Ok(PromptResult::Duplicate(existing));
+        let (entry, message) = submission(
+            SubmissionKind::Prompt,
+            parts,
+            content,
+            request.request_id.clone(),
+        );
+        let mut entry = Some(entry);
+        let mut duplicate = None;
+        let mut queued = None;
+        self.hooks.activity.send_if_modified(|activity| {
+            // Checked again: another prompt may have been submitted while this one prepared.
+            duplicate = submitted(&self.hooks.journal.view(), request_id);
+            if duplicate.is_some() || activity.running {
+                return false;
             }
-            let submitted = self
-                .submit(
-                    &mut log,
-                    SubmissionKind::Prompt,
-                    parts,
-                    saved,
-                    content,
-                    request.request_id,
-                )
-                .await?;
-            self.hooks.running.send_replace(true);
-            drop(preparing);
-            self.hooks.auto_paused.store(false, Ordering::Release);
-            submitted
+            activity.running = true;
+            // Queued while claiming, so a racing prompt's barrier (`busy_or_duplicate`)
+            // lands after it. No maintenance runs here: the session was idle.
+            queued = entry
+                .take()
+                .map(|entry| self.hooks.journal.append(vec![entry]));
+            true
+        });
+        let Some(queued) = queued else {
+            return match duplicate {
+                Some(existing) => Ok(PromptResult::Duplicate(existing)),
+                None => self
+                    .busy_or_duplicate(request_id)
+                    .await
+                    .map(PromptResult::Duplicate),
+            };
         };
+        let submission = match queued.await {
+            Ok(mut appended) => appended.remove(0),
+            Err(error) => {
+                self.hooks.release_or_deliver();
+                return Err(error);
+            }
+        };
+        saved.keep();
+        drop(preparing);
+        self.hooks.auto_paused.store(false, Ordering::Release);
         // Pending job results precede the user's message.
         let messages = self
             .hooks
@@ -2595,62 +2622,34 @@ impl Session {
     }
 
     /// `Some(existing)` when `request_id` was already submitted; `Error::Busy` while a run is active.
-    fn admit(&self, log: &Log, request_id: Option<&str>) -> Result<Option<SeqEntry>, Error> {
-        if let Some(request_id) = request_id
-            && let Some(existing) = log.entries.iter().find(|seq| {
-                matches!(&seq.entry, Entry::Submission { request_id: Some(id), .. } if id == request_id)
-            })
-        {
-            return Ok(Some(existing.clone()));
+    async fn admit(&self, request_id: Option<&str>) -> Result<Option<SeqEntry>, Error> {
+        if let Some(existing) = submitted(&self.hooks.journal.view(), request_id) {
+            return Ok(Some(existing));
         }
-        if *self.hooks.running.borrow() {
+        if !self.hooks.activity.borrow().running {
+            return Ok(None);
+        }
+        self.busy_or_duplicate(request_id).await.map(Some)
+    }
+
+    /// While something else owns the session: the submission of `request_id` if the
+    /// owner is a prompt that carries it, else `Error::Busy`.
+    async fn busy_or_duplicate(&self, request_id: Option<&str>) -> Result<SeqEntry, Error> {
+        let Some(request_id) = request_id else {
             return Err(Error::Busy);
-        }
-        Ok(None)
+        };
+        // An empty batch: once it returns, every submission queued before it is written
+        // (or failed).
+        let _ = self.hooks.journal.append(Vec::new()).await;
+        submitted(&self.hooks.journal.view(), Some(request_id)).ok_or(Error::Busy)
     }
 
     /// Validates `parts`, saves handed-over content, and renders the model blocks; runs
-    /// before the log lock so file and image work never stalls a running turn.
+    /// before anything is written so file and image work never stalls a running turn.
     async fn prepare(&self, parts: Vec<PromptPart>) -> Result<(Prepared, Vec<UserBlock>), Error> {
         let prepared = prepare(parts, &self.tool_state).await?;
         let content = render(&prepared.parts, &self.hooks.prompt.skills, &self.tool_state).await;
         Ok((prepared, content))
-    }
-
-    /// Saves a `submission` entry for `parts` and returns it with the user message of
-    /// `content`, queued under the submission id so its `message` entry carries it.
-    /// `saved` files stay only once the entry is written.
-    async fn submit(
-        &self,
-        log: &mut Log,
-        kind: SubmissionKind,
-        parts: Vec<PromptPart>,
-        saved: SavedFiles,
-        content: Vec<UserBlock>,
-        request_id: Option<String>,
-    ) -> Result<(SeqEntry, QueuedMessage), Error> {
-        let submission_id = Uuid::now_v7().to_string();
-        let base = log.next_base();
-        let entry = Entry::Submission {
-            base,
-            submission_id: submission_id.clone(),
-            kind,
-            parts,
-            request_id,
-        };
-        let submission = self.hooks.write(log, entry).await?;
-        saved.keep();
-        let message = AgentMessage::Llm(Message::User(UserMessage {
-            content,
-            timestamp: now_ms(),
-        }));
-        Ok((
-            submission,
-            QueuedMessage {
-                message,
-                id: Some(submission_id),
-            },
-        ))
     }
 
     /// Saves and queues a user message delivered after the current tool calls finish.
@@ -2664,13 +2663,14 @@ impl Session {
     }
 
     /// `steer`/`follow_up`: saves the submission and hands its message to the agent's
-    /// queue for `kind`.
+    /// queue for `kind`. `saved` files stay only once the entry is written.
     async fn queue(&self, kind: SubmissionKind, input: PromptInput) -> Result<(), Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
-        let mut log = self.hooks.log.lock().await;
-        let (_, message) = self
-            .submit(&mut log, kind, parts, saved, content, None)
-            .await?;
+        let (entry, message) = submission(kind, parts, content, None);
+        // Awaits only the journal, which never waits on the session.
+        let _order = self.hooks.queue_order.lock().await;
+        self.hooks.append(vec![entry]).await?;
+        saved.keep();
         self.hooks.auto_paused.store(false, Ordering::Release);
         match kind {
             SubmissionKind::FollowUp => self.agent.follow_up(message),
@@ -2683,7 +2683,7 @@ impl Session {
     /// automatic delivery of job results until the user's next input; an idle Stop
     /// changes nothing.
     pub async fn abort(&self) {
-        if *self.hooks.running.borrow() {
+        if self.hooks.activity.borrow().running {
             self.hooks.auto_paused.store(true, Ordering::Release);
         }
         self.hooks.cancel_maintenance(false);
@@ -2700,46 +2700,44 @@ impl Session {
         self.hooks.cancel_maintenance(true);
         let _ = self
             .hooks
-            .running
+            .activity
             .subscribe()
-            .wait_for(|running| !*running)
+            .wait_for(|activity| !activity.running)
             .await;
         self.hooks.jobs.shutdown().await;
     }
 
     /// Switches the model from the next request; the thinking level is clamped to it.
     pub async fn set_model(&self, model: Model) -> Result<(), Error> {
-        let mut log = self.hooks.log.lock().await;
-        if log.maintenance.is_some() {
+        if self.hooks.activity.borrow().maintenance.is_some() {
             return Err(Error::Busy);
         }
-        let level = clamp_level(&model, log.thinking);
-        let base = log.next_base();
-        self.hooks
-            .write(
-                &mut log,
-                Entry::ModelChange {
-                    base,
-                    provider: model.provider.clone(),
-                    model_id: model.id.clone(),
-                },
-            )
-            .await?;
-        self.agent.set_model(model.clone());
-        log.model = model;
-        if level != log.thinking {
-            let base = log.next_base();
-            self.hooks
-                .write(
-                    &mut log,
-                    Entry::ThinkingLevelChange {
-                        base,
-                        thinking_level: level,
-                    },
-                )
-                .await?;
-            self.agent.set_thinking(level);
-            log.thinking = level;
+        let mut queued = None;
+        // Queued under the selection lock, so the journal records changes in the order
+        // they took effect.
+        self.hooks.selection.send_modify(|selection| {
+            let level = clamp_level(&model, selection.thinking);
+            let mut entries = vec![Entry::ModelChange {
+                base: journal::base(),
+                provider: model.provider.clone(),
+                model_id: model.id.clone(),
+            }];
+            if level != selection.thinking {
+                entries.push(Entry::ThinkingLevelChange {
+                    base: journal::base(),
+                    thinking_level: level,
+                });
+                self.agent.set_thinking(level);
+            }
+            queued = Some(self.hooks.append(entries));
+            self.agent.set_model(model.clone());
+            *selection = Selection {
+                model,
+                thinking: level,
+            };
+        });
+        if let Some(queued) = queued {
+            queued.await?;
         }
         Ok(())
     }
@@ -2747,22 +2745,28 @@ impl Session {
     /// Sets the thinking level from the next request, clamped to the model; returns the
     /// level applied.
     pub async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error> {
-        let mut log = self.hooks.log.lock().await;
-        if log.maintenance.is_some() {
+        if self.hooks.activity.borrow().maintenance.is_some() {
             return Err(Error::Busy);
         }
-        let level = clamp_level(&log.model, level);
-        if level != log.thinking {
-            let base = log.next_base();
-            let entry = Entry::ThinkingLevelChange {
-                base,
-                thinking_level: level,
-            };
-            self.hooks.write(&mut log, entry).await?;
-            self.agent.set_thinking(level);
-            log.thinking = level;
+        let mut applied = level;
+        let mut queued = None;
+        self.hooks.selection.send_if_modified(|selection| {
+            applied = clamp_level(&selection.model, level);
+            if applied == selection.thinking {
+                return false;
+            }
+            queued = Some(self.hooks.append(vec![Entry::ThinkingLevelChange {
+                base: journal::base(),
+                thinking_level: applied,
+            }]));
+            self.agent.set_thinking(applied);
+            selection.thinking = applied;
+            true
+        });
+        if let Some(queued) = queued {
+            queued.await?;
         }
-        Ok(level)
+        Ok(applied)
     }
 
     /// Settles the pending question of tool call `call_id`.
@@ -2779,29 +2783,36 @@ impl Session {
     }
 
     /// The entries after `from` (all with `None`), the live state and an event receiver,
-    /// all taken at one point of the append order: nothing is missed or duplicated.
+    /// all taken at one point of the append order: no entry is missed or duplicated.
+    /// Never waits on a write in flight.
     pub async fn attach(&self, from: Option<u64>) -> Attach {
-        let log = self.hooks.log.lock().await;
-        let events = self.hooks.events.subscribe();
-        let start = from.map_or(0, |seq| {
-            log.entries.partition_point(|entry| entry.seq <= seq)
-        });
+        let activity = *self.hooks.activity.borrow();
         let mut agent = self.agent.snapshot();
-        agent.running = *self.hooks.running.borrow();
-        agent.streaming = log.streaming.as_ref().and_then(Accumulator::snapshot);
-        agent.pending_tool_calls = log.tool_calls.clone();
-        Attach {
-            missed: log.entries[start..].to_vec(),
-            live: LiveSnapshot {
-                run_id: log.run_id.clone(),
-                maintenance: log.maintenance,
-                agent,
-                messages: log.projection.messages.clone(),
-                pending_questions: self.questions.pending(),
-                jobs: self.jobs(),
-            },
-            events,
-        }
+        agent.running = activity.running;
+        // Entries publish, and live updates relay, under these two locks: subscribing
+        // inside both splits every event into before (in the snapshot) or after
+        // (received).
+        self.hooks.journal.read(|view| {
+            let live = self.hooks.live();
+            let events = self.hooks.events.subscribe();
+            let start = from.map_or(0, |seq| {
+                view.entries.partition_point(|entry| entry.seq <= seq)
+            });
+            agent.streaming = live.streaming.as_ref().and_then(Accumulator::snapshot);
+            agent.pending_tool_calls = live.tool_calls.clone();
+            Attach {
+                missed: view.entries[start..].to_vec(),
+                live: LiveSnapshot {
+                    run_id: live.run_id.clone(),
+                    maintenance: activity.maintenance,
+                    agent,
+                    messages: view.projection.messages.clone(),
+                    pending_questions: self.questions.pending(),
+                    jobs: self.jobs(),
+                },
+                events,
+            }
+        })
     }
 
     async fn start_maintenance(
@@ -2810,10 +2821,7 @@ impl Session {
         operation: MaintenanceOperation,
     ) -> Result<(), Error> {
         let cancel = CancellationToken::new();
-        {
-            let mut log = self.hooks.log.lock().await;
-            self.hooks.reserve(&mut log, kind, true, cancel.clone())?;
-        }
+        self.hooks.reserve(kind, true, cancel.clone())?;
         let task = tokio::spawn(self.hooks.clone().standalone(
             self.agent.clone(),
             operation,
@@ -2872,28 +2880,27 @@ impl Session {
                 "navigate focus requires summarize".into(),
             ));
         }
-        let mut log = self.hooks.log.lock().await;
-        if *self.hooks.running.borrow() {
+        // Owns the session like a run, so no prompt starts from the old position.
+        if !self.hooks.claim_idle() {
             return Err(Error::Busy);
         }
+        let _claim = Claim(&self.hooks);
         if let Some(target) = &target
-            && !log.ids.contains(target.as_str())
+            && !self.hooks.journal.view().has(target.as_str())
         {
             return Err(Error::EntryNotFound(target.to_string()));
         }
-        let base = EntryBase::new(EntryId::generate(|id| log.ids.contains(id)), target);
-        self.hooks.write(&mut log, Entry::Leaf { base }).await?;
-        let projection = log.projection.clone();
         self.hooks
-            .record_selection(&mut log, projection.model.as_deref(), projection.thinking)
+            .append(vec![Entry::Leaf {
+                base: journal::base_at(target),
+            }])
             .await?;
+        self.hooks.record_current_selection().await?;
         // Pending diffs were relative to the old position; `sync_prompt` recomputes them.
         self.hooks.take_system();
-        let mut messages = projection.messages;
-        self.sync_prompt(&mut log, &mut messages).await?;
-        self.tool_state.ledger.restore(&messages);
-        self.tool_state.context.restore(&messages);
-        self.agent.set_messages(messages);
+        self.sync_prompt().await?;
+        self.agent
+            .set_messages(self.hooks.journal.view().projection.messages.clone());
         Ok(())
     }
 
@@ -2902,8 +2909,9 @@ impl Session {
     /// user message copies the path to its parent and returns the message's parts to edit
     /// and resubmit.
     pub async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error> {
-        let (path, editable, model, thinking) = {
-            let log = self.hooks.log.lock().await;
+        let Selection { model, thinking } = self.hooks.selection();
+        let (path, editable) = {
+            let log = self.hooks.journal.view();
             let index: HashMap<&str, &SeqEntry> = log
                 .entries
                 .iter()
@@ -2958,7 +2966,7 @@ impl Session {
                         .map(|index| log.entries[index].entry.clone())
                         .collect()
                 });
-            (path, editable, log.model.clone(), log.thinking)
+            (path, editable)
         };
 
         let header = Header::new(
@@ -3064,4 +3072,44 @@ impl Drop for Session {
         self.hooks.cancel_maintenance(true);
         self.hooks.jobs.kill_all();
     }
+}
+
+/// The `submission` entry for `parts` and the user message of `content`, queued under the
+/// submission id so its `message` entry carries it.
+fn submission(
+    kind: SubmissionKind,
+    parts: Vec<PromptPart>,
+    content: Vec<UserBlock>,
+    request_id: Option<String>,
+) -> (Entry, QueuedMessage) {
+    let submission_id = Uuid::now_v7().to_string();
+    let entry = Entry::Submission {
+        base: journal::base(),
+        submission_id: submission_id.clone(),
+        kind,
+        parts,
+        request_id,
+    };
+    let message = AgentMessage::Llm(Message::User(UserMessage {
+        content,
+        timestamp: now_ms(),
+    }));
+    (
+        entry,
+        QueuedMessage {
+            message,
+            id: Some(submission_id),
+        },
+    )
+}
+
+/// The submission of `request_id` in `view`, if any.
+fn submitted(view: &View, request_id: Option<&str>) -> Option<SeqEntry> {
+    let request_id = request_id?;
+    view.entries
+        .iter()
+        .find(|seq| {
+            matches!(&seq.entry, Entry::Submission { request_id: Some(id), .. } if id == request_id)
+        })
+        .cloned()
 }

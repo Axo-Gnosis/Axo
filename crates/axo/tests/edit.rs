@@ -17,7 +17,7 @@ use axo::schemes::dir::DirScheme;
 use axo::schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 use axo::tools::{FileAccess, FileLedger};
 use axo::{PendingQuestions, ProcessSupervisor, SessionTools, StaticEnv, Supervision};
-use axo_agent::{Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolUpdate};
+use axo_agent::{Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolUpdates};
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -100,18 +100,17 @@ impl Fixture {
         let Value::Object(arguments) = args else {
             panic!("arguments must be an object");
         };
-        let call = ToolCall {
+        let call = Arc::new(ToolCall {
             id: format!("call-{}", tool.name()),
             name: tool.name().to_owned(),
             arguments,
             arguments_error: None,
-        };
-        let updates = |_: ToolUpdate| {};
+        });
         match tool
             .execute(ToolContext {
-                call: &call,
+                call,
                 cancel: CancellationToken::new(),
-                updates: &updates,
+                updates: ToolUpdates::sink(),
                 steer: SteerSignal::never(),
                 invocation: ToolInvocationId(0),
             })

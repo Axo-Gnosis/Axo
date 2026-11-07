@@ -97,7 +97,7 @@ impl Tool for EditTool {
         GUIDELINES
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext { call, cancel, .. } = cx;
         let EditArgs { path, edits } =
             serde_json::from_value(Value::Object(call.arguments.clone()))

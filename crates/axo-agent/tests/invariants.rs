@@ -381,7 +381,7 @@ impl Tool for ProbeTool {
         self.mode
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let call = cx.call;
         self.probe.started.lock().unwrap().push(call.id.clone());
         let running = self.probe.running.fetch_add(1, Ordering::SeqCst) + 1;
@@ -425,7 +425,7 @@ impl Tool for FailTool {
         &self.schema
     }
 
-    async fn execute(&self, _cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, _cx: ToolContext) -> Result<ToolOutput, ToolError> {
         Err(ToolError("tool failed".into()))
     }
 }
@@ -465,7 +465,7 @@ impl Tool for GateTool {
         ExecutionMode::Sequential
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         cx.cancel.cancelled().await;
@@ -506,7 +506,7 @@ impl Tool for QueueTool {
         &self.schema
     }
 
-    async fn execute(&self, _cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, _cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let agent = self
             .agent
             .get()
@@ -549,7 +549,7 @@ impl Tool for SteerTool {
         &self.schema
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let mut steer = cx.steer.clone();
         self.seen.lock().unwrap().push(steer.is_pending());
         if cx.call.arguments.get("wait").and_then(Value::as_bool) == Some(true) {
@@ -600,7 +600,7 @@ impl Tool for OriginTool {
         ExecutionMode::Sequential
     }
 
-    async fn execute(&self, cx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         self.invocations
             .lock()
             .unwrap()
@@ -1669,4 +1669,282 @@ async fn message_end_origins_follow_the_persisted_result() {
             .all(|(_, origin)| *origin == MessageOrigin::Run),
         "{origins:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Tool calls run on their own tasks
+// ---------------------------------------------------------------------------------------
+
+/// A hang fails the test instead of stalling the suite.
+const SETTLE: Duration = Duration::from_secs(5);
+
+fn bare_agent(
+    turns: Vec<ScriptedTurn>,
+    tools: Vec<Arc<dyn Tool>>,
+    persist: Arc<dyn Persist>,
+) -> Arc<Agent> {
+    let mut config = AgentConfig::new(Arc::new(ScriptedApi::new(turns)), model());
+    config.tools = tools;
+    config.persist = Some(persist);
+    Arc::new(Agent::new(config))
+}
+
+/// Shared state of the lock-inversion scenario.
+#[derive(Default)]
+struct Inversion {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// `b` is about to queue on `lock`.
+    b_queued: Notify,
+    /// `persist` is about to queue on `lock`.
+    persist_waiting: Notify,
+}
+
+/// Persists `ToolExecutionEnd` under `lock`, like a session journal behind one mutex.
+struct LockedPersist(Arc<Inversion>);
+
+#[async_trait]
+impl Persist for LockedPersist {
+    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+        if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
+            self.0.persist_waiting.notify_one();
+            let _guard = self.0.lock.lock().await;
+        }
+        Ok(())
+    }
+}
+
+/// `{"role": "b"}` queues on the persist lock; `{"role": "a"}` returns once `b` has.
+struct InversionTool {
+    state: Arc<Inversion>,
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for InversionTool {
+    fn name(&self) -> &str {
+        "inversion"
+    }
+
+    fn description(&self) -> &str {
+        "Waits on the persist lock."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        if cx.call.arguments.get("role").and_then(Value::as_str) == Some("b") {
+            self.state.b_queued.notify_one();
+            let _guard = self.state.lock.lock().await;
+        } else {
+            self.state.b_queued.notified().await;
+        }
+        Ok(ToolOutput::default())
+    }
+}
+
+/// A tool queued on the lock `Persist` needs, granted it while a sibling's end
+/// persists, must not wedge the run: the loop never polls tool futures itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_waiting_on_the_persist_lock_does_not_wedge_the_run() {
+    let state = Arc::new(Inversion::default());
+    let agent = bare_agent(
+        vec![
+            turn(&[
+                ("a", "inversion", json!({ "role": "a" })),
+                ("b", "inversion", json!({ "role": "b" })),
+            ]),
+            text("done"),
+        ],
+        vec![Arc::new(InversionTool {
+            state: state.clone(),
+            schema: json!({ "type": "object" }),
+        })],
+        Arc::new(LockedPersist(state.clone())),
+    );
+    // Hold the lock so `b` queues on it; release it once `a`'s end is persisting, so
+    // the fair mutex hands the permit to `b`, ahead of `persist`.
+    let held = state.lock.clone().lock_owned().await;
+    let release = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state.persist_waiting.notified().await;
+            drop(held);
+        })
+    };
+    let outcome = tokio::time::timeout(SETTLE, agent.prompt(vec![user("go").into()]))
+        .await
+        .expect("run settles")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Done);
+    release.await.unwrap();
+}
+
+/// Never returns and ignores its cancellation token.
+struct ParkedTool {
+    started: Notify,
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for ParkedTool {
+    fn name(&self) -> &str {
+        "parked"
+    }
+
+    fn description(&self) -> &str {
+        "Parks forever."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, _cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// Records persisted tool events as `update:<id>` / `end:<id>`.
+#[derive(Default)]
+struct ToolEvents(Mutex<Vec<String>>);
+
+impl ToolEvents {
+    fn names(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Persist for ToolEvents {
+    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+        let name = match event {
+            AgentEvent::ToolExecutionUpdate { call_id, .. } => format!("update:{call_id}"),
+            AgentEvent::ToolExecutionEnd { call_id, .. } => format!("end:{call_id}"),
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Llm(Message::ToolResult(result)),
+                ..
+            } => format!(
+                "result:{}:{}",
+                result.tool_call_id,
+                first_text(&result.content)
+            ),
+            _ => return Ok(()),
+        };
+        self.0.lock().unwrap().push(name);
+        Ok(())
+    }
+}
+
+/// Stopping a batch whose tools ignore cancellation still settles: unfinished calls
+/// are aborted and answered as such.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_aborts_parked_tools() {
+    let tool = Arc::new(ParkedTool {
+        started: Notify::new(),
+        schema: json!({ "type": "object" }),
+    });
+    let events = Arc::new(ToolEvents::default());
+    let agent = bare_agent(
+        vec![turn(&[
+            ("p1", "parked", json!({})),
+            ("p2", "parked", json!({})),
+        ])],
+        vec![tool.clone() as Arc<dyn Tool>],
+        events.clone(),
+    );
+    let run = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.prompt(vec![user("go").into()]).await }
+    });
+    for _ in 0..2 {
+        tokio::time::timeout(SETTLE, tool.started.notified())
+            .await
+            .expect("tool started");
+    }
+    agent.cancel(CancelReason::User);
+    let outcome = tokio::time::timeout(SETTLE, run)
+        .await
+        .expect("run settles")
+        .expect("task joins")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Aborted(CancelReason::User));
+    let names = events.names();
+    for id in ["p1", "p2"] {
+        assert!(names.contains(&format!("end:{id}")), "{names:?}");
+        assert!(
+            names.contains(&format!("result:{id}:Operation aborted")),
+            "{names:?}"
+        );
+    }
+}
+
+/// Sends three updates, then returns.
+struct ChattyTool {
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for ChattyTool {
+    fn name(&self) -> &str {
+        "chatty"
+    }
+
+    fn description(&self) -> &str {
+        "Streams updates."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        for step in 0..3 {
+            cx.updates.send(axo_agent::ToolUpdate {
+                content: vec![UserBlock::Text {
+                    text: format!("step {step}"),
+                }],
+                details: None,
+            });
+            tokio::task::yield_now().await;
+        }
+        Ok(ToolOutput::default())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_sent_before_return_precede_the_end() {
+    let events = Arc::new(ToolEvents::default());
+    let agent = bare_agent(
+        vec![
+            turn(&[("u1", "chatty", json!({})), ("u2", "chatty", json!({}))]),
+            text("done"),
+        ],
+        vec![Arc::new(ChattyTool {
+            schema: json!({ "type": "object" }),
+        })],
+        events.clone(),
+    );
+    let outcome = tokio::time::timeout(SETTLE, agent.prompt(vec![user("go").into()]))
+        .await
+        .expect("run settles")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Done);
+    let names = events.names();
+    for id in ["u1", "u2"] {
+        let end = names
+            .iter()
+            .position(|name| *name == format!("end:{id}"))
+            .unwrap_or_else(|| panic!("no end for {id}: {names:?}"));
+        let updates: Vec<usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| **name == format!("update:{id}"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(updates.len(), 3, "{names:?}");
+        assert!(updates.iter().all(|&index| index < end), "{names:?}");
+    }
 }
