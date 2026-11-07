@@ -2,7 +2,7 @@
 //! exercised through the public `Agent` API with a scripted provider.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -1675,8 +1675,8 @@ async fn message_end_origins_follow_the_persisted_result() {
 // Tool calls run on their own tasks
 // ---------------------------------------------------------------------------------------
 
-/// A hang fails the test instead of stalling the suite.
-const SETTLE: Duration = Duration::from_secs(5);
+/// A hang fails the test instead of stalling the suite; covers the 3 s stop grace.
+const SETTLE: Duration = Duration::from_secs(10);
 
 fn bare_agent(
     turns: Vec<ScriptedTurn>,
@@ -1947,4 +1947,222 @@ async fn updates_sent_before_return_precede_the_end() {
         assert_eq!(updates.len(), 3, "{names:?}");
         assert!(updates.iter().all(|&index| index < end), "{names:?}");
     }
+}
+
+/// Returns its own result once its call is cancelled.
+struct GracefulTool {
+    started: Notify,
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for GracefulTool {
+    fn name(&self) -> &str {
+        "graceful"
+    }
+
+    fn description(&self) -> &str {
+        "Stops cleanly when cancelled."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.started.notify_one();
+        cx.cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(ToolOutput {
+            content: vec![UserBlock::Text {
+                text: "stopped cleanly".into(),
+            }],
+            ..ToolOutput::default()
+        })
+    }
+}
+
+/// Stop is cooperative: a call that honors its token keeps the result it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_keeps_a_cooperative_tools_own_result() {
+    let tool = Arc::new(GracefulTool {
+        started: Notify::new(),
+        schema: json!({ "type": "object" }),
+    });
+    let events = Arc::new(ToolEvents::default());
+    let agent = bare_agent(
+        vec![turn(&[("g1", "graceful", json!({}))])],
+        vec![tool.clone() as Arc<dyn Tool>],
+        events.clone(),
+    );
+    let run = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.prompt(vec![user("go").into()]).await }
+    });
+    tokio::time::timeout(SETTLE, tool.started.notified())
+        .await
+        .expect("tool started");
+    agent.cancel(CancelReason::User);
+    tokio::time::timeout(SETTLE, run)
+        .await
+        .expect("run settles")
+        .expect("task joins")
+        .expect("run succeeds");
+    let names = events.names();
+    assert!(
+        names.contains(&"result:g1:stopped cleanly".to_owned()),
+        "{names:?}"
+    );
+    assert!(
+        !names.contains(&"result:g1:Operation aborted".to_owned()),
+        "{names:?}"
+    );
+}
+
+/// Marks that it ran.
+struct MarkTool {
+    ran: Arc<AtomicBool>,
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for MarkTool {
+    fn name(&self) -> &str {
+        "mark"
+    }
+
+    fn description(&self) -> &str {
+        "Marks that it ran."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, _cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.ran.store(true, Ordering::SeqCst);
+        Ok(ToolOutput::default())
+    }
+}
+
+/// Delays clearing call `b`, then records whether any call already ran.
+struct SlowClearance {
+    ran: Arc<AtomicBool>,
+    seen: Mutex<Option<bool>>,
+}
+
+#[async_trait]
+impl LoopHooks for SlowClearance {
+    async fn before_tool_call(
+        &self,
+        call: BeforeToolCallContext<'_>,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolCallDecision, ToolError> {
+        if call.tool_call.id == "b" {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            *self.seen.lock().unwrap() = Some(self.ran.load(Ordering::SeqCst));
+        }
+        Ok(ToolCallDecision::Allow)
+    }
+}
+
+/// A parallel batch starts executing only once every call passed `before_tool_call`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_call_starts_before_the_batch_is_cleared() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let hooks = Arc::new(SlowClearance {
+        ran: ran.clone(),
+        seen: Mutex::new(None),
+    });
+    let mut config = AgentConfig::new(
+        Arc::new(ScriptedApi::new(vec![
+            turn(&[("a", "mark", json!({})), ("b", "mark", json!({}))]),
+            text("done"),
+        ])),
+        model(),
+    );
+    config.tools = vec![Arc::new(MarkTool {
+        ran: ran.clone(),
+        schema: json!({ "type": "object" }),
+    })];
+    config.hooks = hooks.clone();
+    let agent = Agent::new(config);
+    let outcome = tokio::time::timeout(SETTLE, agent.prompt(vec![user("go").into()]))
+        .await
+        .expect("run settles")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Done);
+    assert_eq!(*hooks.seen.lock().unwrap(), Some(false));
+    assert!(ran.load(Ordering::SeqCst));
+}
+
+/// Fails persisting the end of call `fast`.
+struct FailFastEnd;
+
+#[async_trait]
+impl Persist for FailFastEnd {
+    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+        match event {
+            AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "fast" => {
+                Err(PersistError("disk full".into()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `{"slow": true}` waits for its cancellation, then finishes after a delay; otherwise
+/// returns at once.
+struct SettleTool {
+    done: AtomicBool,
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for SettleTool {
+    fn name(&self) -> &str {
+        "settle"
+    }
+
+    fn description(&self) -> &str {
+        "Finishes after its cancellation when slow."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        if cx.call.arguments.get("slow").and_then(Value::as_bool) == Some(true) {
+            cx.cancel.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.done.store(true, Ordering::SeqCst);
+        }
+        Ok(ToolOutput::default())
+    }
+}
+
+/// A persistence failure mid-batch stops the other calls and returns only after
+/// every call was joined, so no tool task outlives the loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_persist_joins_every_call_first() {
+    let tool = Arc::new(SettleTool {
+        done: AtomicBool::new(false),
+        schema: json!({ "type": "object" }),
+    });
+    let agent = bare_agent(
+        vec![
+            turn(&[
+                ("slow", "settle", json!({ "slow": true })),
+                ("fast", "settle", json!({})),
+            ]),
+            text("done"),
+        ],
+        vec![tool.clone() as Arc<dyn Tool>],
+        Arc::new(FailFastEnd),
+    );
+    let _ = tokio::time::timeout(SETTLE, agent.prompt(vec![user("go").into()]))
+        .await
+        .expect("run settles");
+    assert!(tool.done.load(Ordering::SeqCst));
 }

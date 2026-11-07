@@ -12,7 +12,7 @@ use axo::{Axo, JobInfo, JobStatus, Session, SessionEvent};
 use axo_agent::{AgentEvent, RunOutcome};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
-use common::{axo, bash_options, dead, tool_text, within};
+use common::{axo, bash_options, dead, journal, only, tool_text, within};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -41,23 +41,6 @@ fn user_texts(request: &RecordedRequest) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-/// The session file's entries as raw JSON, header excluded.
-fn journal(session: &Session) -> Vec<Value> {
-    std::fs::read_to_string(session.path())
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|value| value["type"] != "session")
-        .collect()
-}
-
-/// The index of the only entry matching `pred`.
-fn only(lines: &[Value], what: &str, pred: impl Fn(&Value) -> bool) -> usize {
-    let found: Vec<usize> = (0..lines.len()).filter(|&i| pred(&lines[i])).collect();
-    assert_eq!(found.len(), 1, "expected exactly one {what}: {lines:#?}");
-    found[0]
 }
 
 fn count(lines: &[Value], kind: &str) -> usize {

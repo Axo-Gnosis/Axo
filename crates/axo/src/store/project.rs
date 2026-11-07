@@ -51,36 +51,46 @@ impl Projection {
         self.omitted.contains(id)
     }
 
-    /// Updates the projection for one newly appended entry, which becomes the
-    /// current position. A child of the current leaf that is not a `leaf`,
-    /// `context_edit` or `compaction` entry extends the projection in place;
-    /// anything else rebuilds it.
+    /// Updates the projection for the entries appended since it last ran. A chain of
+    /// children of the current leaf with no `leaf`, `context_edit` or `compaction`
+    /// among them extends it in place; anything else rebuilds it once.
     pub fn apply(&mut self, entries: &[SeqEntry]) {
-        let Some(entry) = entries.last() else {
+        if entries.is_empty() {
             *self = Self::default();
             return;
-        };
-        let extends =
-            entries.len() == self.processed + 1 && entry.entry.parent_id() == self.leaf.as_deref();
-        if !extends
-            || matches!(
-                entry.entry,
-                Entry::Leaf { .. } | Entry::ContextEdit { .. } | Entry::Compaction { .. }
-            )
-        {
-            *self = build(entries, None);
-            return;
         }
-        self.leaf = entry.entry.id().map(str::to_owned);
+        let new = match entries.get(self.processed..) {
+            Some(new) if !new.is_empty() => new,
+            _ => {
+                *self = build(entries, None);
+                return;
+            }
+        };
+        let mut leaf = self.leaf.as_deref();
+        for entry in new {
+            if entry.entry.parent_id() != leaf
+                || matches!(
+                    entry.entry,
+                    Entry::Leaf { .. } | Entry::ContextEdit { .. } | Entry::Compaction { .. }
+                )
+            {
+                *self = build(entries, None);
+                return;
+            }
+            leaf = entry.entry.id();
+        }
+        for (index, entry) in entries.iter().enumerate().skip(self.processed) {
+            self.leaf = entry.entry.id().map(str::to_owned);
+            self.path.push(index);
+            self.track(&entry.entry);
+            let start = self.messages.len();
+            self.messages.extend(entry_messages(&entry.entry));
+            self.sources.push(ProjectedSource {
+                entry_index: index,
+                messages: start..self.messages.len(),
+            });
+        }
         self.processed = entries.len();
-        self.path.push(entries.len() - 1);
-        self.track(&entry.entry);
-        let start = self.messages.len();
-        self.messages.extend(entry_messages(&entry.entry));
-        self.sources.push(ProjectedSource {
-            entry_index: entries.len() - 1,
-            messages: start..self.messages.len(),
-        });
     }
 
     /// Follows the settings a path entry changes (pi `getSessionContextSettings`).

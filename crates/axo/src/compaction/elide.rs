@@ -337,6 +337,13 @@ pub(crate) async fn write_artifacts(dir: &Path, artifacts: &[Artifact]) -> Resul
     Ok(())
 }
 
+/// Best-effort removal of artifacts no committed entry names.
+pub(crate) async fn remove_artifacts(artifacts: &[Artifact]) {
+    for artifact in artifacts {
+        let _ = tokio::fs::remove_file(&artifact.path).await;
+    }
+}
+
 /// Exclude skill regions before looking for nested markup. An open skill
 /// protects the entire remainder, even if it contains apparently closed fences.
 fn skill_spans(text: &str) -> Vec<Range<usize>> {

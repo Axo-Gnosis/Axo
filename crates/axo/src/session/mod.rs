@@ -379,8 +379,11 @@ struct SessionHooks {
     activity: watch::Sender<Activity>,
     /// Held across a steer or follow-up's write, so the agent queues them in journal order.
     queue_order: tokio::sync::Mutex<()>,
+    /// Held across a selection change's write and its apply, so changes take effect in
+    /// journal order and only once durable.
+    selection_order: tokio::sync::Mutex<()>,
     maintenance: Maintenance,
-    /// The session's command jobs; they append their own records through the journal.
+    /// The session's command jobs; they write their records through `JobHost::journal`.
     jobs: Arc<JobRegistry>,
     /// Prompts between their fast-path admission and their run start; idle-wake delivery
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
@@ -492,6 +495,14 @@ enum Resumption {
     },
 }
 
+/// What recovering a terminal response read from the journal.
+struct RecoveredResponse {
+    response: AssistantMessage,
+    results: Vec<ToolResultMessage>,
+    /// The run is settled and only its `run_end` is missing.
+    finished: bool,
+}
+
 /// How `run_to_settle` starts its run.
 #[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 enum RunRequest {
@@ -537,6 +548,20 @@ async fn run_to_settle(
             };
             let _ = hooks.settle(Ok(outcome)).await;
             std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+/// Starts `work` on its own task now and returns its result, so dropping the caller's
+/// future never cuts a state change off between its journal write and what follows.
+fn detached<T: Send + 'static>(
+    work: impl Future<Output = T> + Send + 'static,
+) -> impl Future<Output = T> {
+    let task = tokio::spawn(work);
+    async move {
+        match task.await {
+            Ok(value) => value,
+            Err(join) => std::panic::resume_unwind(join.into_panic()),
         }
     }
 }
@@ -924,14 +949,25 @@ impl SessionHooks {
             }
             (elision.artifacts, pending, view.revision)
         };
-        compaction::elide::write_artifacts(
-            self.maintenance.tools.schemes.artifacts().dir(),
-            &artifacts,
-        )
-        .await?;
-        self.check_live(cancel)?;
-        self.append_if(revision, pending).await?;
-        Ok(true)
+        let dir = self.maintenance.tools.schemes.artifacts().dir();
+        if let Err(error) = compaction::elide::write_artifacts(dir, &artifacts).await {
+            compaction::elide::remove_artifacts(&artifacts).await;
+            return Err(error);
+        }
+        let committed = match self.check_live(cancel) {
+            Ok(()) => self.append_if(revision, pending).await.map(drop),
+            Err(error) => Err(error),
+        };
+        match committed {
+            Ok(()) => Ok(true),
+            // Refused before anything was written: nothing names these artifacts.
+            Err(error @ (Error::ContextChanged | Error::MaintenanceAborted)) => {
+                compaction::elide::remove_artifacts(&artifacts).await;
+                Err(error)
+            }
+            // A failed write may have kept entries that name them.
+            Err(error) => Err(error),
+        }
     }
 
     async fn compact_inner(
@@ -1533,32 +1569,78 @@ impl SessionHooks {
         model: Option<&str>,
         thinking: Option<ThinkingLevel>,
     ) -> Result<(), Error> {
-        let queued = {
-            // Queued under the selection lock, ordered with `Session::set_model`.
-            let selection = self.selection.borrow();
-            let mut entries = Vec::new();
-            if model
-                != Some(format!("{}/{}", selection.model.provider, selection.model.id).as_str())
-            {
-                entries.push(Entry::ModelChange {
-                    base: journal::base(),
-                    provider: selection.model.provider.clone(),
-                    model_id: selection.model.id.clone(),
-                });
-            }
-            if thinking != Some(selection.thinking) {
-                entries.push(Entry::ThinkingLevelChange {
-                    base: journal::base(),
-                    thinking_level: selection.thinking,
-                });
-            }
-            if entries.is_empty() {
-                return Ok(());
-            }
-            self.append(entries)
-        };
-        queued.await?;
+        let _order = self.selection_order.lock().await;
+        let selection = self.selection();
+        let mut entries = Vec::new();
+        if model != Some(format!("{}/{}", selection.model.provider, selection.model.id).as_str()) {
+            entries.push(Entry::ModelChange {
+                base: journal::base(),
+                provider: selection.model.provider.clone(),
+                model_id: selection.model.id.clone(),
+            });
+        }
+        if thinking != Some(selection.thinking) {
+            entries.push(Entry::ThinkingLevelChange {
+                base: journal::base(),
+                thinking_level: selection.thinking,
+            });
+        }
+        if !entries.is_empty() {
+            self.append(entries).await?;
+        }
         Ok(())
+    }
+
+    /// Records `model` (and the thinking level it clamps to), then applies it once written.
+    async fn select_model(&self, agent: &Agent, model: Model) -> Result<(), Error> {
+        let _order = self.selection_order.lock().await;
+        let current = self.selection();
+        let level = clamp_level(&model, current.thinking);
+        let mut entries = vec![Entry::ModelChange {
+            base: journal::base(),
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+        }];
+        if level != current.thinking {
+            entries.push(Entry::ThinkingLevelChange {
+                base: journal::base(),
+                thinking_level: level,
+            });
+        }
+        self.append(entries).await?;
+        if level != current.thinking {
+            agent.set_thinking(level);
+        }
+        agent.set_model(model.clone());
+        self.selection.send_replace(Selection {
+            model,
+            thinking: level,
+        });
+        Ok(())
+    }
+
+    /// Records `level`, clamped to the model, then applies it once written; returns the
+    /// level applied.
+    async fn select_thinking(
+        &self,
+        agent: &Agent,
+        level: ThinkingLevel,
+    ) -> Result<ThinkingLevel, Error> {
+        let _order = self.selection_order.lock().await;
+        let current = self.selection();
+        let applied = clamp_level(&current.model, level);
+        if applied == current.thinking {
+            return Ok(applied);
+        }
+        self.append(vec![Entry::ThinkingLevelChange {
+            base: journal::base(),
+            thinking_level: applied,
+        }])
+        .await?;
+        agent.set_thinking(applied);
+        self.selection
+            .send_modify(|selection| selection.thinking = applied);
+        Ok(applied)
     }
 
     /// [`SessionHooks::record_selection`] against the current position.
@@ -1788,8 +1870,10 @@ impl Persist for SessionHooks {
                         if let Some(key) = &key {
                             self.jobs.commit(key);
                         }
-                        if let Some(id) = admitted {
-                            self.jobs.admitted(id);
+                        if let Some(id) = admitted
+                            && let Some(end) = self.jobs.admitted(id)
+                        {
+                            self.jobs.write_end(end).await;
                         }
                     }
                     Err(err) => {
@@ -1838,9 +1922,14 @@ impl Persist for SessionHooks {
     }
 }
 
+#[async_trait]
 impl JobHost for SessionHooks {
     fn results_ready(&self) {
         self.deliver_if_idle();
+    }
+
+    async fn journal(&self, entry: Entry) -> Result<(), Error> {
+        self.append(vec![entry]).await.map(drop)
     }
 }
 
@@ -1999,6 +2088,7 @@ impl Session {
             }),
             activity: watch::Sender::new(Activity::default()),
             queue_order: tokio::sync::Mutex::new(()),
+            selection_order: tokio::sync::Mutex::new(()),
             maintenance: Maintenance {
                 streamer: streamer.clone(),
                 settings: settings.compaction.clone(),
@@ -2039,10 +2129,9 @@ impl Session {
             agent: OnceLock::new(),
             this: OnceLock::new(),
         });
-        hooks.jobs.attach(
-            Arc::downgrade(&hooks) as Weak<dyn JobHost>,
-            hooks.journal.downgrade(),
-        );
+        hooks
+            .jobs
+            .attach(Arc::downgrade(&hooks) as Weak<dyn JobHost>);
         let _ = hooks.this.set(Arc::downgrade(&hooks));
         tokio::spawn(relay_jobs(
             Arc::downgrade(&hooks.jobs),
@@ -2244,6 +2333,82 @@ impl Session {
         queued
     }
 
+    /// Reads what replaying the terminal response `response_id` needs from `log`.
+    /// `finished` means a silent successful Stop whose maintenance checkpoint committed
+    /// just before the crash, but not its `run_end`.
+    fn recovered_response(
+        &self,
+        log: &View,
+        response_id: &EntryId,
+        requeue_empty: bool,
+        model: &Model,
+    ) -> Result<RecoveredResponse, Error> {
+        let at = log
+            .entries
+            .iter()
+            .position(|seq| seq.entry.id() == Some(response_id.as_str()))
+            .ok_or_else(|| Error::EntryNotFound(response_id.to_string()))?;
+        let Entry::Message {
+            message: AgentMessage::Llm(Message::Assistant(response)),
+            ..
+        } = &log.entries[at].entry
+        else {
+            return Err(Error::InvalidHistory(
+                "Recovery response is not an assistant".into(),
+            ));
+        };
+        let response = response.clone();
+        let finished = if response.stop_reason == StopReason::Stop
+            && response.tool_calls().next().is_none()
+            && requeue_empty
+        {
+            let state = SessionHooks::failure_state(log, &response, model)?;
+            let completed = self.hooks.checkpoint_completed(log, &state, model);
+            let later_input = log.projection.path().iter().any(|&index| {
+                index > at
+                    && matches!(
+                        &log.entries[index].entry,
+                        Entry::Message {
+                            message: AgentMessage::Llm(Message::User(_)) | AgentMessage::Custom(_),
+                            ..
+                        }
+                    )
+            });
+            !state.hidden && completed && !later_input
+        } else {
+            false
+        };
+        let results = log.entries[at + 1..]
+            .iter()
+            .take_while(|seq| {
+                !matches!(
+                    &seq.entry,
+                    Entry::Message {
+                        message: AgentMessage::Llm(Message::Assistant(_)),
+                        ..
+                    }
+                )
+            })
+            .filter_map(|seq| match &seq.entry {
+                Entry::Message {
+                    message: AgentMessage::Llm(Message::ToolResult(result)),
+                    ..
+                } if response
+                    .tool_calls()
+                    .any(|call| call.id == result.tool_call_id) =>
+                {
+                    Some(result.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(RecoveredResponse {
+            response,
+            results,
+            finished,
+        })
+    }
+
     /// Acts on the recovery plan; returns what to run when a run resumes or requeued
     /// input is left.
     async fn recover(
@@ -2261,13 +2426,26 @@ impl Session {
                 .find(|tool| tool.name() == call.name)
                 .map_or(Replay::Never, |tool| tool.replay(call))
         };
-        let (run_id, outcome, reason) = match plan_recovery(
+        let plan = plan_recovery(
             &log.entries,
             &log.projection,
             &model,
             &replay_of,
             artifacts_dir,
-        ) {
+        );
+        let recovered = match &plan {
+            RecoveryPlan::RecoverResponse {
+                response_id,
+                requeue,
+                ..
+            } if policy == RecoveryPolicy::Resume => {
+                Some(self.recovered_response(&log, response_id, requeue.is_empty(), &model)?)
+            }
+            _ => None,
+        };
+        // Nothing below reads the snapshot, so no write copies it.
+        drop(log);
+        let (run_id, outcome, reason) = match plan {
             RecoveryPlan::None => return Ok(None),
             RecoveryPlan::Requeue { requeue } => {
                 if policy == RecoveryPolicy::MarkInterrupted {
@@ -2292,83 +2470,16 @@ impl Session {
             RecoveryPlan::RecoverResponse {
                 run_id,
                 attempt,
-                response_id,
                 requeue,
-            } => {
-                if policy == RecoveryPolicy::MarkInterrupted {
-                    (run_id, store::RunOutcome::Interrupted, None)
-                } else {
-                    let at = log
-                        .entries
-                        .iter()
-                        .position(|seq| seq.entry.id() == Some(response_id.as_str()))
-                        .ok_or_else(|| Error::EntryNotFound(response_id.to_string()))?;
-                    let Entry::Message {
-                        message: AgentMessage::Llm(Message::Assistant(response)),
-                        ..
-                    } = &log.entries[at].entry
-                    else {
-                        return Err(Error::InvalidHistory(
-                            "Recovery response is not an assistant".into(),
-                        ));
-                    };
-                    let response = response.clone();
-                    // A silent successful Stop may have committed its maintenance
-                    // checkpoint just before the crash, but not its run_end.
-                    if response.stop_reason == StopReason::Stop
-                        && response.tool_calls().next().is_none()
-                        && requeue.is_empty()
-                    {
-                        let state = SessionHooks::failure_state(&log, &response, &model)?;
-                        let completed = self.hooks.checkpoint_completed(&log, &state, &model);
-                        let later_input = log.projection.path().iter().any(|&index| {
-                            index > at
-                                && matches!(
-                                    &log.entries[index].entry,
-                                    Entry::Message {
-                                        message: AgentMessage::Llm(Message::User(_))
-                                            | AgentMessage::Custom(_),
-                                        ..
-                                    }
-                                )
-                        });
-                        if !state.hidden && completed && !later_input {
-                            self.hooks
-                                .append(vec![Entry::RunEnd {
-                                    base: journal::base(),
-                                    run_id,
-                                    outcome: store::RunOutcome::Done,
-                                    reason: None,
-                                }])
-                                .await?;
-                            return Ok(None);
-                        }
-                    }
-                    let results = log.entries[at + 1..]
-                        .iter()
-                        .take_while(|seq| {
-                            !matches!(
-                                &seq.entry,
-                                Entry::Message {
-                                    message: AgentMessage::Llm(Message::Assistant(_)),
-                                    ..
-                                }
-                            )
-                        })
-                        .filter_map(|seq| match &seq.entry {
-                            Entry::Message {
-                                message: AgentMessage::Llm(Message::ToolResult(result)),
-                                ..
-                            } if response
-                                .tool_calls()
-                                .any(|call| call.id == result.tool_call_id) =>
-                            {
-                                Some(result.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    drop(log);
+                ..
+            } => match recovered {
+                None => (run_id, store::RunOutcome::Interrupted, None),
+                Some(RecoveredResponse { finished: true, .. }) => {
+                    (run_id, store::RunOutcome::Done, None)
+                }
+                Some(RecoveredResponse {
+                    response, results, ..
+                }) => {
                     self.hooks
                         .append(vec![Entry::RunResumed {
                             base: journal::base(),
@@ -2387,7 +2498,7 @@ impl Session {
                         queued: self.requeued(requeue).await,
                     }));
                 }
-            }
+            },
             RecoveryPlan::Park { run_id } => (
                 run_id,
                 store::RunOutcome::Interrupted,
@@ -2405,32 +2516,35 @@ impl Session {
                     // Calls that would have been rerun are not run either.
                     calls.extend(rerun.into_iter().map(|call| (call, None)));
                 }
-                for (call, artifact) in calls {
-                    let mut text = format!(
-                        "Tool {} was interrupted and may have partially run.",
-                        call.name
-                    );
-                    if let Some(n) = artifact {
-                        text.push_str(&format!(" Output so far: artifact://{n}"));
-                    }
-                    let message = AgentMessage::Llm(Message::ToolResult(ToolResultMessage {
-                        tool_call_id: call.id,
-                        tool_name: call.name,
-                        content: vec![UserBlock::Text { text }],
-                        details: None,
-                        is_error: true,
-                        timestamp: now_ms(),
-                        duration_ms: None,
-                    }));
-                    self.hooks
-                        .append(vec![Entry::Message {
+                let results: Vec<Entry> = calls
+                    .into_iter()
+                    .map(|(call, artifact)| {
+                        let mut text = format!(
+                            "Tool {} was interrupted and may have partially run.",
+                            call.name
+                        );
+                        if let Some(n) = artifact {
+                            text.push_str(&format!(" Output so far: artifact://{n}"));
+                        }
+                        Entry::Message {
                             base: journal::base(),
-                            message,
+                            message: AgentMessage::Llm(Message::ToolResult(ToolResultMessage {
+                                tool_call_id: call.id,
+                                tool_name: call.name,
+                                content: vec![UserBlock::Text { text }],
+                                details: None,
+                                is_error: true,
+                                timestamp: now_ms(),
+                                duration_ms: None,
+                            })),
                             submission_id: None,
                             admitted_jobs: Vec::new(),
                             delivered_jobs: Vec::new(),
-                        }])
-                        .await?;
+                        }
+                    })
+                    .collect();
+                if !results.is_empty() {
+                    self.hooks.append(results).await?;
                 }
                 if policy == RecoveryPolicy::MarkInterrupted {
                     (run_id, store::RunOutcome::Interrupted, None)
@@ -2591,34 +2705,29 @@ impl Session {
                     .map(PromptResult::Duplicate),
             };
         };
-        let submission = match queued.await {
-            Ok(mut appended) => appended.remove(0),
-            Err(error) => {
-                self.hooks.release_or_deliver();
-                return Err(error);
-            }
-        };
-        saved.keep();
-        drop(preparing);
-        self.hooks.auto_paused.store(false, Ordering::Release);
-        // Pending job results precede the user's message.
-        let messages = self
-            .hooks
-            .run_input(self.hooks.reserve_delivery(), Some(message));
-        // Spawned so that dropping this future leaves the run to settle on its own.
-        let run = tokio::spawn(run_to_settle(
-            self.agent.clone(),
-            self.hooks.clone(),
-            RunRequest::Prompt(messages),
-        ));
-        let outcome = match run.await {
-            Ok(result) => result?,
-            Err(join) => std::panic::resume_unwind(join.into_panic()),
-        };
-        Ok(PromptResult::Settled {
-            submission,
-            outcome,
+        // From the claim on, the submission, its run and the release belong to one task:
+        // a dropped caller cannot strand the session busy.
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move {
+            let submission = match queued.await {
+                Ok(mut appended) => appended.remove(0),
+                Err(error) => {
+                    hooks.release_or_deliver();
+                    return Err(error);
+                }
+            };
+            saved.keep();
+            drop(preparing);
+            hooks.auto_paused.store(false, Ordering::Release);
+            // Pending job results precede the user's message.
+            let messages = hooks.run_input(hooks.reserve_delivery(), Some(message));
+            let outcome = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await?;
+            Ok(PromptResult::Settled {
+                submission,
+                outcome,
+            })
         })
+        .await
     }
 
     /// `Some(existing)` when `request_id` was already submitted; `Error::Busy` while a run is active.
@@ -2667,16 +2776,20 @@ impl Session {
     async fn queue(&self, kind: SubmissionKind, input: PromptInput) -> Result<(), Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
         let (entry, message) = submission(kind, parts, content, None);
-        // Awaits only the journal, which never waits on the session.
-        let _order = self.hooks.queue_order.lock().await;
-        self.hooks.append(vec![entry]).await?;
-        saved.keep();
-        self.hooks.auto_paused.store(false, Ordering::Release);
-        match kind {
-            SubmissionKind::FollowUp => self.agent.follow_up(message),
-            SubmissionKind::Prompt | SubmissionKind::Steer => self.agent.steer(message),
-        }
-        Ok(())
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move {
+            // Awaits only the journal, which never waits on the session.
+            let _order = hooks.queue_order.lock().await;
+            hooks.append(vec![entry]).await?;
+            saved.keep();
+            hooks.auto_paused.store(false, Ordering::Release);
+            match kind {
+                SubmissionKind::FollowUp => agent.follow_up(message),
+                SubmissionKind::Prompt | SubmissionKind::Steer => agent.steer(message),
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Stops the active run (`CancelReason::User`). Stopping an active run pauses
@@ -2709,64 +2822,15 @@ impl Session {
 
     /// Switches the model from the next request; the thinking level is clamped to it.
     pub async fn set_model(&self, model: Model) -> Result<(), Error> {
-        if self.hooks.activity.borrow().maintenance.is_some() {
-            return Err(Error::Busy);
-        }
-        let mut queued = None;
-        // Queued under the selection lock, so the journal records changes in the order
-        // they took effect.
-        self.hooks.selection.send_modify(|selection| {
-            let level = clamp_level(&model, selection.thinking);
-            let mut entries = vec![Entry::ModelChange {
-                base: journal::base(),
-                provider: model.provider.clone(),
-                model_id: model.id.clone(),
-            }];
-            if level != selection.thinking {
-                entries.push(Entry::ThinkingLevelChange {
-                    base: journal::base(),
-                    thinking_level: level,
-                });
-                self.agent.set_thinking(level);
-            }
-            queued = Some(self.hooks.append(entries));
-            self.agent.set_model(model.clone());
-            *selection = Selection {
-                model,
-                thinking: level,
-            };
-        });
-        if let Some(queued) = queued {
-            queued.await?;
-        }
-        Ok(())
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move { hooks.select_model(&agent, model).await }).await
     }
 
     /// Sets the thinking level from the next request, clamped to the model; returns the
     /// level applied.
     pub async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error> {
-        if self.hooks.activity.borrow().maintenance.is_some() {
-            return Err(Error::Busy);
-        }
-        let mut applied = level;
-        let mut queued = None;
-        self.hooks.selection.send_if_modified(|selection| {
-            applied = clamp_level(&selection.model, level);
-            if applied == selection.thinking {
-                return false;
-            }
-            queued = Some(self.hooks.append(vec![Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: applied,
-            }]));
-            self.agent.set_thinking(applied);
-            selection.thinking = applied;
-            true
-        });
-        if let Some(queued) = queued {
-            queued.await?;
-        }
-        Ok(applied)
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move { hooks.select_thinking(&agent, level).await }).await
     }
 
     /// Settles the pending question of tool call `call_id`.
@@ -2822,15 +2886,12 @@ impl Session {
     ) -> Result<(), Error> {
         let cancel = CancellationToken::new();
         self.hooks.reserve(kind, true, cancel.clone())?;
-        let task = tokio::spawn(self.hooks.clone().standalone(
-            self.agent.clone(),
-            operation,
-            cancel,
-        ));
-        match task.await {
-            Ok(result) => result,
-            Err(join) => std::panic::resume_unwind(join.into_panic()),
-        }
+        detached(
+            self.hooks
+                .clone()
+                .standalone(self.agent.clone(), operation, cancel),
+        )
+        .await
     }
 
     /// Summarizes eligible history without submitting an ordinary user turn; `focus` tells
@@ -2880,28 +2941,33 @@ impl Session {
                 "navigate focus requires summarize".into(),
             ));
         }
-        // Owns the session like a run, so no prompt starts from the old position.
-        if !self.hooks.claim_idle() {
-            return Err(Error::Busy);
-        }
-        let _claim = Claim(&self.hooks);
-        if let Some(target) = &target
-            && !self.hooks.journal.view().has(target.as_str())
-        {
-            return Err(Error::EntryNotFound(target.to_string()));
-        }
-        self.hooks
-            .append(vec![Entry::Leaf {
-                base: journal::base_at(target),
-            }])
-            .await?;
-        self.hooks.record_current_selection().await?;
-        // Pending diffs were relative to the old position; `sync_prompt` recomputes them.
-        self.hooks.take_system();
-        self.sync_prompt().await?;
-        self.agent
-            .set_messages(self.hooks.journal.view().projection.messages.clone());
-        Ok(())
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move {
+            // Owns the session like a run, so no prompt starts from the old position.
+            if !hooks.claim_idle() {
+                return Err(Error::Busy);
+            }
+            let _claim = Claim(&hooks);
+            if let Some(target) = &target
+                && !hooks.journal.view().has(target.as_str())
+            {
+                return Err(Error::EntryNotFound(target.to_string()));
+            }
+            hooks
+                .append(vec![Entry::Leaf {
+                    base: journal::base_at(target),
+                }])
+                .await?;
+            hooks.record_current_selection().await?;
+            // Pending diffs were relative to the old position; they are recomputed below.
+            hooks.take_system();
+            if let Some(current) = hooks.prompt.sections() {
+                hooks.sync_sections(&current).await?;
+            }
+            agent.set_messages(hooks.journal.view().projection.messages.clone());
+            Ok(())
+        })
+        .await
     }
 
     /// Copies the root→`entry_id` path into a new session file that records this one as

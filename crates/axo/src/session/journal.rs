@@ -17,8 +17,9 @@ use crate::store::{Entry, EntryBase, EntryId, Projection, SeqEntry, SessionWrite
 pub(crate) struct View {
     pub(crate) entries: Vec<SeqEntry>,
     pub(crate) projection: Projection,
-    /// Bumped by every entry except `submission` and `usage`, so work prepared from one
-    /// view commits only while the transcript it read is unchanged.
+    /// Bumped by every entry except `submission`, `usage`, `model_change` and
+    /// `thinking_level_change`, so work prepared from one view commits only while the
+    /// transcript it read is unchanged.
     pub(crate) revision: u64,
     pub(crate) ids: HashSet<String>,
 }
@@ -80,19 +81,17 @@ fn closed(path: &std::path::Path) -> Error {
 /// Sends one request now, so its place in the append order is fixed before the caller
 /// awaits the result.
 fn request(
-    requests: Option<mpsc::UnboundedSender<Append>>,
+    requests: &mpsc::UnboundedSender<Append>,
     revision: Option<u64>,
     entries: Vec<Entry>,
     path: &std::path::Path,
 ) -> impl Future<Output = Result<Vec<SeqEntry>, Error>> + Send + 'static {
     let (done, reply) = oneshot::channel();
-    if let Some(requests) = requests {
-        let _ = requests.send(Append {
-            revision,
-            entries,
-            done,
-        });
-    }
+    let _ = requests.send(Append {
+        revision,
+        entries,
+        done,
+    });
     let path = path.to_path_buf();
     async move { reply.await.unwrap_or_else(|_| Err(closed(&path))) }
 }
@@ -103,23 +102,6 @@ pub(crate) struct Journal {
     view: watch::Receiver<Arc<View>>,
     slot: Arc<Mutex<Slot>>,
     path: PathBuf,
-}
-
-/// A handle that does not keep the journal open (for job tasks that may outlive it).
-#[derive(Clone)]
-pub(crate) struct WeakJournal {
-    requests: mpsc::WeakUnboundedSender<Append>,
-    path: PathBuf,
-}
-
-impl WeakJournal {
-    /// [`Journal::append`]; fails once the session is gone.
-    pub(crate) fn append(
-        &self,
-        entries: Vec<Entry>,
-    ) -> impl Future<Output = Result<Vec<SeqEntry>, Error>> + Send + 'static {
-        request(self.requests.upgrade(), None, entries, &self.path)
-    }
 }
 
 impl Journal {
@@ -164,7 +146,7 @@ impl Journal {
         &self,
         entries: Vec<Entry>,
     ) -> impl Future<Output = Result<Vec<SeqEntry>, Error>> + Send + 'static {
-        request(Some(self.requests.clone()), None, entries, &self.path)
+        request(&self.requests, None, entries, &self.path)
     }
 
     /// [`Journal::append`], only if the journal is still at `revision`.
@@ -173,12 +155,7 @@ impl Journal {
         revision: u64,
         entries: Vec<Entry>,
     ) -> impl Future<Output = Result<Vec<SeqEntry>, Error>> + Send + 'static {
-        request(
-            Some(self.requests.clone()),
-            Some(revision),
-            entries,
-            &self.path,
-        )
+        request(&self.requests, Some(revision), entries, &self.path)
     }
 
     /// The latest committed view. Never waits on a write.
@@ -190,13 +167,6 @@ impl Journal {
     /// subscribed inside sees exactly the entries after it.
     pub(crate) fn read<T>(&self, read: impl FnOnce(&View) -> T) -> T {
         read(&self.view.borrow())
-    }
-
-    pub(crate) fn downgrade(&self) -> WeakJournal {
-        WeakJournal {
-            requests: self.requests.downgrade(),
-            path: self.path.clone(),
-        }
     }
 }
 
@@ -266,8 +236,8 @@ async fn commit(
                 continue;
             };
             if base.id.0.is_empty() {
-                base.id = EntryId::generate(|id| view.ids.contains(id) || batch.contains(id));
-            } else if view.ids.contains(base.id.as_str()) || batch.contains(base.id.as_str()) {
+                base.id = EntryId::generate(|id| view.has(id) || batch.contains(id));
+            } else if view.has(base.id.as_str()) || batch.contains(base.id.as_str()) {
                 return Err(Error::ContextChanged);
             }
             batch.insert(base.id.0.clone());
@@ -297,14 +267,20 @@ async fn commit(
                 if let Some(id) = seq.entry.id() {
                     view.ids.insert(id.to_owned());
                 }
-                if !matches!(seq.entry, Entry::Submission { .. } | Entry::Usage { .. }) {
+                if !matches!(
+                    seq.entry,
+                    Entry::Submission { .. }
+                        | Entry::Usage { .. }
+                        | Entry::ModelChange { .. }
+                        | Entry::ThinkingLevelChange { .. }
+                ) {
                     view.revision = view.revision.wrapping_add(1);
                 }
                 view.entries.push(seq.clone());
-                view.projection.apply(&view.entries);
                 // Under the publication lock: see `Journal::read`.
                 let _ = events.send(SessionEvent::Entry(seq.clone()));
             }
+            view.projection.apply(&view.entries);
         });
     }
     match failure {

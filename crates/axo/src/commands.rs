@@ -41,7 +41,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandPolicy {
-    /// Runs during a turn and takes effect from the next request.
+    /// Runs during a turn or maintenance and takes effect from the next request.
     Alongside,
     /// `Error::Busy` during a turn or maintenance.
     WhenIdle,

@@ -12,14 +12,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axo::store::{Entry, Header, JsonlStore, SeqEntry, SessionInfo, SessionStore, SessionWriter};
-use axo::{Axo, Session, SessionEvent};
+use axo::{Axo, Command, JobStatus, Session, SessionEvent};
 use axo_agent::RunOutcome;
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
-    AssistantEvent, FileCredentialStore, Message, Model, Models, ModelsConfig, ModelsOptions,
-    ScriptedApi, ScriptedTurn, SimpleStreamOptions, Streamer, Transcript, UserBlock,
+    AssistantEvent, Message, Model, ScriptedApi, ScriptedTurn, SimpleStreamOptions, Streamer,
+    Transcript, UserBlock,
 };
-use common::{TestConfig, bash_options, within};
+use common::{bash_options, journal, only, within};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -140,35 +140,22 @@ impl Streamer for GatedStreamer {
     }
 }
 
-/// An `Axo` over `<dir>/sessions` with one model `test/m`.
+/// An `Axo` over `store` with one model `test/m`.
 async fn build(
     dir: &Path,
     settings: Value,
     streamer: Arc<dyn Streamer>,
     store: Arc<dyn SessionStore>,
 ) -> Axo {
-    let config = ModelsConfig::parse_jsonc(
-        &json!({"providers": {"test": {
-            "api": "openai-completions",
-            "baseUrl": "http://127.0.0.1:9/v1",
-            "models": [{"id": "m", "contextWindow": 100_000, "maxTokens": 4096}],
-        }}})
-        .to_string(),
+    common::axo_with(
+        dir,
+        json!([{"id": "m", "contextWindow": 100_000, "maxTokens": 4096}]),
+        settings,
+        store,
+        streamer,
     )
-    .unwrap();
-    let models = Models::load(ModelsOptions {
-        cache_dir: None,
-        config,
-        extended_context: false,
-        credentials: Arc::new(FileCredentialStore::new(dir.join("auth.json"))),
-    })
     .await
-    .unwrap();
-    Axo::builder(Arc::new(models), store)
-        .config(Arc::new(TestConfig::for_dir(dir, settings)))
-        .cache_dir(dir.join("cache"))
-        .streamer(streamer)
-        .build()
+    .0
 }
 
 /// An `Axo` streaming `turns` whose writers stop at `gate`.
@@ -187,23 +174,6 @@ async fn gated_writes(
 
 fn admits(entry: &Entry) -> bool {
     matches!(entry, Entry::Message { admitted_jobs, .. } if !admitted_jobs.is_empty())
-}
-
-/// The session file's entries as raw JSON, header excluded.
-fn journal(session: &Session) -> Vec<Value> {
-    std::fs::read_to_string(session.path())
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|value| value["type"] != "session")
-        .collect()
-}
-
-/// The index of the only entry matching `pred`.
-fn only(lines: &[Value], what: &str, pred: impl Fn(&Value) -> bool) -> usize {
-    let found: Vec<usize> = (0..lines.len()).filter(|&i| pred(&lines[i])).collect();
-    assert_eq!(found.len(), 1, "expected exactly one {what}: {lines:#?}");
-    found[0]
 }
 
 fn names(value: &Value) -> Vec<String> {
@@ -408,6 +378,15 @@ async fn a_job_ending_while_its_admission_persists_journals_after_it() {
             .iter()
             .any(|seq| matches!(seq.entry, Entry::JobEnd { .. } | Entry::JobStart { .. })),
         "nothing of the job is visible before its batch commits: {missed:#?}"
+    );
+    // The result is visible at once, though its `job_end` waits for the admission.
+    assert!(
+        session
+            .jobs()
+            .iter()
+            .any(|job| job.id == "bg_1" && job.status == JobStatus::Finished),
+        "{:?}",
+        session.jobs()
     );
 
     gate.release.notify_one();
@@ -628,4 +607,81 @@ async fn compaction_commits_while_a_job_keeps_running() {
         "the job is still running"
     );
     session.shutdown().await;
+}
+
+/// A selection change is not a transcript change: compaction summarizing meanwhile
+/// commits its first summary.
+#[tokio::test]
+async fn a_model_change_during_compaction_does_not_invalidate_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, api, entered, release, _go) =
+        compaction_with_running_job(dir.path(), ["Summary one.", "Summary two."]).await;
+    let session = Arc::new(session);
+    let compact = tokio::spawn({
+        let session = session.clone();
+        async move { session.compact(None).await }
+    });
+
+    within(entered.notified()).await;
+    within(session.run_command(Command::Model {
+        model: "test/m".into(),
+    }))
+    .await
+    .unwrap();
+    release.notify_one();
+    within(compact).await.unwrap().unwrap();
+
+    assert_eq!(api.requests().len(), 3, "one summary attempt, no retry");
+    let compactions = compactions(&session);
+    assert_eq!(compactions.len(), 1, "{compactions:#?}");
+    let summary = compactions[0]["summary"].as_str().unwrap();
+    assert!(summary.contains("Summary one."), "{summary}");
+    let lines = journal(&session);
+    let change = lines
+        .iter()
+        .position(|v| v["type"] == "model_change")
+        .unwrap();
+    let checkpoint = lines
+        .iter()
+        .position(|v| v["type"] == "compaction")
+        .unwrap();
+    assert!(change < checkpoint, "{lines:#?}");
+    session.shutdown().await;
+}
+
+/// Dropping `prompt` while its submission is being written leaves the run to settle on
+/// its own, so the session takes the next prompt.
+#[tokio::test]
+async fn dropping_a_prompt_mid_submission_never_wedges_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = WriteGate::new(|entry| matches!(entry, Entry::Submission { .. }));
+    let (axo, _api) = gated_writes(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_text("first")),
+            ScriptedTurn::Reply(reply_text("second")),
+        ],
+        &gate,
+    )
+    .await;
+    let session = Arc::new(axo.create_session(bash_options(dir.path())).await.unwrap());
+    let task = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("one").await }
+    });
+    within(gate.entered.notified()).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    gate.release.notify_one();
+    await_settled(&session).await;
+
+    assert_eq!(
+        within(session.prompt("two")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let submissions = journal(&session)
+        .iter()
+        .filter(|v| v["type"] == "submission")
+        .count();
+    assert_eq!(submissions, 2);
 }

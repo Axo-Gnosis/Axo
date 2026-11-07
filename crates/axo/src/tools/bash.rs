@@ -607,11 +607,13 @@ impl CommandTask {
             }
         }
         if promoted {
-            jobs.command_done(id, text, is_error).await;
+            if let Some(end) = jobs.command_done(id, text, is_error) {
+                jobs.write_end(end).await;
+            }
         } else {
             if retained {
-                // `proc://bg_N` shows the result while the helpers run.
-                jobs.command_done(id, text.clone(), is_error).await;
+                // `proc://bg_N` shows the result while the helpers run; never journaled.
+                let _ = jobs.command_done(id, text.clone(), is_error);
             }
             if let Some(done) = lock(&shared.done).take() {
                 let _ = done.send(CommandEnd {

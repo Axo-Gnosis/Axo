@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -28,8 +28,9 @@ pub trait Tool: Send + Sync {
     }
     /// Runs one validated call on its own task. An `Err` becomes an error result the
     /// model sees; a tool that reports a failure with output (e.g. a failing command)
-    /// returns `Ok` with `is_error: true`. Should honor `cx.cancel`; a run that is
-    /// stopped also aborts the task, so cleanup must not depend on returning.
+    /// returns `Ok` with `is_error: true`. Must honor `cx.cancel`: on Stop the loop
+    /// waits up to 3 s for the call to return, then aborts its task, so cleanup must
+    /// not depend on returning.
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -72,34 +73,23 @@ pub struct ToolContext {
 /// Streams one call's partial results to the loop, which emits them as
 /// `ToolExecutionUpdate`s; updates sent before the call returns precede its end.
 #[derive(Clone)]
-pub struct ToolUpdates {
-    call_id: Arc<str>,
-    sender: Option<mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>>,
-}
+pub struct ToolUpdates(Option<Arc<dyn Fn(ToolUpdate) + Send + Sync>>);
 
 impl ToolUpdates {
-    pub(crate) fn new(
-        call_id: Arc<str>,
-        sender: mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>,
-    ) -> Self {
-        Self {
-            call_id,
-            sender: Some(sender),
-        }
+    /// Streams updates to `send`, for calling `execute` outside an `Agent` too.
+    pub fn new(send: impl Fn(ToolUpdate) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(send)))
     }
 
     /// Discards every update; for calling `execute` outside an `Agent`.
     pub fn sink() -> Self {
-        Self {
-            call_id: Arc::from(""),
-            sender: None,
-        }
+        Self(None)
     }
 
     /// Sends one update; never blocks. Updates after the run moved on are dropped.
     pub fn send(&self, update: ToolUpdate) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.send((Arc::clone(&self.call_id), update));
+        if let Some(send) = &self.0 {
+            send(update);
         }
     }
 }

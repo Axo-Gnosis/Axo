@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axo_ai::transcript::{current_tools, tool_state_changes};
 use axo_ai::{
@@ -111,20 +111,29 @@ enum Prepared {
     Ready(Arc<dyn Tool>),
 }
 
-/// The spawned calls of one batch and the channel their updates arrive on.
+/// How long a stopped call may take to return on its own before its task is aborted.
+/// Covers bash's SIGTERM→SIGKILL grace (1 s) plus its drain.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// The spawned calls of one batch, their shared cancellation, and the channel their
+/// updates arrive on.
+// ponytail: a loop panic drops the batch unjoined; stragglers are bounded by the job registry's settle-time cleanup
 struct Batch {
     tasks: JoinSet<(Result<ToolOutput, ToolError>, u64)>,
     calls: HashMap<Id, Spawned>,
+    /// A child of the run's token; also fired when persisting the batch fails.
+    cancel: CancellationToken,
     sender: mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>,
     updates: mpsc::UnboundedReceiver<(Arc<str>, ToolUpdate)>,
 }
 
 impl Batch {
-    fn new() -> Self {
+    fn new(run_cancel: &CancellationToken) -> Self {
         let (sender, updates) = mpsc::unbounded_channel();
         Self {
             tasks: JoinSet::new(),
             calls: HashMap::new(),
+            cancel: run_cancel.child_token(),
             sender,
             updates,
         }
@@ -573,7 +582,7 @@ impl Run<'_> {
                         outcome
                     }
                     Prepared::Ready(tool) => {
-                        let mut batch = Batch::new();
+                        let mut batch = Batch::new(&self.cancel);
                         self.spawn_call(&mut batch, 0, tool, call);
                         let Some((_, outcome)) = self.drive(message, batch).await?.pop() else {
                             continue;
@@ -589,9 +598,9 @@ impl Run<'_> {
             }
         } else {
             let mut slots: Vec<Option<Outcome>> = calls.iter().map(|_| None).collect();
-            let mut batch = Batch::new();
-            // Preparation, including `before_tool_call`, runs in source order; each
-            // cleared call starts on its own task at once.
+            let mut ready = Vec::with_capacity(calls.len());
+            // Preparation, including `before_tool_call`, runs in source order and clears
+            // the whole batch before any call starts.
             for (index, call) in calls.iter().enumerate() {
                 self.emit_start(call).await?;
                 match self.prepare(message, call).await {
@@ -606,14 +615,32 @@ impl Run<'_> {
                         self.emit_end(&outcome).await?;
                         slots[index] = Some(outcome);
                     }
-                    Prepared::Ready(tool) => self.spawn_call(&mut batch, index, tool, call),
+                    Prepared::Ready(tool) => ready.push((index, tool, call)),
                 }
                 if self.cancel.is_cancelled() {
                     break;
                 }
             }
-            for (index, outcome) in self.drive(message, batch).await? {
-                slots[index] = Some(outcome);
+            if self.cancel.is_cancelled() {
+                for (index, _, call) in ready {
+                    let outcome = Outcome {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: error_output("Operation aborted"),
+                        duration_ms: None,
+                        invocation: None,
+                    };
+                    self.emit_end(&outcome).await?;
+                    slots[index] = Some(outcome);
+                }
+            } else {
+                let mut batch = Batch::new(&self.cancel);
+                for (index, tool, call) in ready {
+                    self.spawn_call(&mut batch, index, tool, call);
+                }
+                for (index, outcome) in self.drive(message, batch).await? {
+                    slots[index] = Some(outcome);
+                }
             }
             // Result messages follow the order the model issued the calls.
             for outcome in slots.into_iter().flatten() {
@@ -667,15 +694,20 @@ impl Run<'_> {
     }
 
     /// Starts one prepared call on its own task, so the loop never polls tool futures:
-    /// a tool waiting on something the loop's `Persist` holds cannot stall the loop.
+    /// a tool waiting on something the loop's `Persist` holds cannot stall the loop. The
+    /// call's token is a child of the batch's, so Stop and a failed persist both reach it.
     fn spawn_call(&self, batch: &mut Batch, index: usize, tool: Arc<dyn Tool>, call: &ToolCall) {
         let call = Arc::new(call.clone());
         let invocation =
             ToolInvocationId(self.agent.next_invocation.fetch_add(1, Ordering::Relaxed));
+        let call_id: Arc<str> = Arc::from(call.id.as_str());
+        let sender = batch.sender.clone();
         let cx = ToolContext {
             call: Arc::clone(&call),
-            cancel: self.cancel.child_token(),
-            updates: ToolUpdates::new(Arc::from(call.id.as_str()), batch.sender.clone()),
+            cancel: batch.cancel.child_token(),
+            updates: ToolUpdates::new(move |update| {
+                let _ = sender.send((Arc::clone(&call_id), update));
+            }),
             steer: SteerSignal(self.agent.steer_pending.subscribe()),
             invocation,
         };
@@ -697,51 +729,64 @@ impl Run<'_> {
 
     /// Awaits the batch's tasks, forwarding their updates, and emits each
     /// `ToolExecutionEnd` (after `after_tool_call`, on this task) as its call completes.
-    /// Cancellation aborts unfinished calls, which end as aborted; a panicked call ends
-    /// as an error. Returns the outcomes in completion order.
+    /// Cancellation is cooperative: each call's token fires and the loop keeps joining;
+    /// calls still running `STOP_GRACE` later are aborted and end as aborted. A
+    /// persistence failure stops the batch the same way and is returned only after every
+    /// call was joined. A panicked call ends as an error. Returns the outcomes in
+    /// completion order.
     async fn drive(
         &self,
         message: &AssistantMessage,
-        batch: Batch,
+        mut batch: Batch,
     ) -> Result<Vec<(usize, Outcome)>, Error> {
-        let Batch {
-            mut tasks,
-            mut calls,
-            sender,
-            mut updates,
-        } = batch;
-        drop(sender);
-        let mut finished = Vec::with_capacity(calls.len());
+        drop(batch.sender);
+        let mut finished = Vec::with_capacity(batch.calls.len());
+        let mut stopping: Option<Instant> = None;
         let mut aborted = false;
+        let mut failure: Option<Error> = None;
         loop {
             let joined = tokio::select! {
                 biased;
-                Some((call_id, update)) = updates.recv() => {
-                    self.emit_update(call_id, update).await?;
+                Some((call_id, update)) = batch.updates.recv() => {
+                    if failure.is_none()
+                        && let Err(error) = self.emit_update(call_id, update).await
+                    {
+                        failure = Some(error);
+                        batch.cancel.cancel();
+                    }
                     continue;
                 }
-                () = self.cancel.cancelled(), if !aborted => {
-                    tasks.abort_all();
+                () = batch.cancel.cancelled(), if stopping.is_none() => {
+                    stopping = Some(Instant::now() + STOP_GRACE);
+                    continue;
+                }
+                () = tokio::time::sleep_until(stopping.unwrap_or_else(Instant::now).into()),
+                    if stopping.is_some() && !aborted =>
+                {
+                    batch.tasks.abort_all();
                     aborted = true;
                     continue;
                 }
-                joined = tasks.join_next_with_id() => joined,
+                joined = batch.tasks.join_next_with_id() => joined,
             };
             let Some(joined) = joined else { break };
             let (id, result) = match joined {
                 Ok((id, result)) => (id, Ok(result)),
                 Err(error) => (error.id(), Err(error)),
             };
-            let Some(spawned) = calls.remove(&id) else {
+            let Some(spawned) = batch.calls.remove(&id) else {
                 continue;
             };
+            if failure.is_some() {
+                continue;
+            }
             let (output, duration_ms, executed) = match result {
                 Ok((result, duration_ms)) => (
                     result.unwrap_or_else(|error| error_output(error.0)),
                     duration_ms,
                     true,
                 ),
-                // Aborted by the cancellation above: the call never returned.
+                // Aborted after the grace above: the call never returned.
                 Err(error) if error.is_cancelled() => (
                     error_output("Operation aborted"),
                     elapsed_ms(spawned.started),
@@ -764,14 +809,26 @@ impl Run<'_> {
                 self.after_tool_call(message, &spawned.call, &mut outcome.output)
                     .await;
             }
-            // Updates sent before the call returned precede its end.
-            while let Ok((call_id, update)) = updates.try_recv() {
-                self.emit_update(call_id, update).await?;
+            let emitted = async {
+                // Updates sent before the call returned precede its end.
+                while let Ok((call_id, update)) = batch.updates.try_recv() {
+                    self.emit_update(call_id, update).await?;
+                }
+                self.emit_end(&outcome).await
             }
-            self.emit_end(&outcome).await?;
-            finished.push((spawned.index, outcome));
+            .await;
+            match emitted {
+                Ok(()) => finished.push((spawned.index, outcome)),
+                Err(error) => {
+                    failure = Some(error);
+                    batch.cancel.cancel();
+                }
+            }
         }
-        Ok(finished)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(finished),
+        }
     }
 
     /// Applies `after_tool_call` overrides to an executed call's output.

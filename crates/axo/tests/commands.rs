@@ -282,8 +282,9 @@ async fn commands_during_a_run_follow_their_policy() {
     assert_eq!(requests[2].model.id, "other");
 }
 
+/// Selection changes run alongside maintenance; the maintenance still aborts normally.
 #[tokio::test]
-async fn maintenance_blocks_alongside_commands() {
+async fn selection_changes_during_maintenance_apply() {
     let dir = tempfile::tempdir().unwrap();
     let settings = json!({"compaction": {"enabled": true, "keepRecentTokens": 0}});
     let host = host(
@@ -311,22 +312,21 @@ async fn maintenance_blocks_alongside_commands() {
             }
         }) => {}
     }
-    assert!(matches!(
-        session.run_command(model("test/other")).await,
-        Err(Error::Busy)
-    ));
-    assert!(matches!(
-        session
-            .run_command(Command::Thinking {
-                level: ThinkingLevel::Off
-            })
-            .await,
-        Err(Error::Busy)
-    ));
+    within(session.run_command(model("test/other")))
+        .await
+        .unwrap();
+    within(session.run_command(Command::Thinking {
+        level: ThinkingLevel::Off,
+    }))
+    .await
+    .unwrap();
     session.abort().await;
     assert!(matches!(
         within(compact).await,
         Err(Error::MaintenanceAborted)
     ));
-    assert_eq!(model_changes(&entries(&session).await), before);
+    assert_eq!(
+        model_changes(&entries(&session).await).len(),
+        before.len() + 1
+    );
 }

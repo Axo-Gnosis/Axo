@@ -6,16 +6,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axo::store::{Entry, JsonlStore, SeqEntry};
+use axo::store::{Entry, JsonlStore, SeqEntry, SessionStore};
 use axo::{
-    Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, SessionOptions, StaticEnv, UserConfig,
+    Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, Session, SessionOptions, StaticEnv,
+    UserConfig,
 };
 use axo_agent::AgentMessage;
 use axo_ai::{
     FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn,
-    UserBlock,
+    Streamer, UserBlock,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -93,6 +94,32 @@ pub async fn host(
     settings: serde_json::Value,
     turns: Vec<ScriptedTurn>,
 ) -> Host {
+    let api = Arc::new(ScriptedApi::new(turns));
+    let (axo, models, config) = axo_with(
+        dir,
+        models,
+        settings,
+        Arc::new(JsonlStore::new(dir.join("sessions"))),
+        api.clone(),
+    )
+    .await;
+    Host {
+        axo,
+        api,
+        models,
+        config,
+    }
+}
+
+/// An `Axo` over `store` streaming from `streamer`, with provider `test` serving `models`,
+/// [`TestConfig::for_dir`] and `<dir>/cache` as its cache directory.
+pub async fn axo_with(
+    dir: &Path,
+    models: serde_json::Value,
+    settings: serde_json::Value,
+    store: Arc<dyn SessionStore>,
+    streamer: Arc<dyn Streamer>,
+) -> (Axo, Arc<Models>, Arc<TestConfig>) {
     let config = ModelsConfig::parse_jsonc(
         &json!({"providers": {"test": {
             "api": "openai-completions",
@@ -113,21 +140,29 @@ pub async fn host(
         .unwrap(),
     );
     let config = Arc::new(TestConfig::for_dir(dir, settings));
-    let api = Arc::new(ScriptedApi::new(turns));
-    let axo = Axo::builder(
-        models.clone(),
-        Arc::new(JsonlStore::new(dir.join("sessions"))),
-    )
-    .config(config.clone())
-    .cache_dir(dir.join("cache"))
-    .streamer(api.clone())
-    .build();
-    Host {
-        axo,
-        api,
-        models,
-        config,
-    }
+    let axo = Axo::builder(models.clone(), store)
+        .config(config.clone())
+        .cache_dir(dir.join("cache"))
+        .streamer(streamer)
+        .build();
+    (axo, models, config)
+}
+
+/// The session file's entries as raw JSON, header excluded.
+pub fn journal(session: &Session) -> Vec<Value> {
+    std::fs::read_to_string(session.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|value| value["type"] != "session")
+        .collect()
+}
+
+/// The index of the only entry matching `pred`.
+pub fn only(lines: &[Value], what: &str, pred: impl Fn(&Value) -> bool) -> usize {
+    let found: Vec<usize> = (0..lines.len()).filter(|&i| pred(&lines[i])).collect();
+    assert_eq!(found.len(), 1, "expected exactly one {what}: {lines:#?}");
+    found[0]
 }
 
 /// An `Axo` whose sessions stream from `turns`, with one model `test/m`.

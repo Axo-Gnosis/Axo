@@ -377,6 +377,12 @@ fn equal_timestamp_edits_invalidate_only_earlier_projected_usage_and_apply_borro
         projection.apply(&entries[..end]);
         assert_eq!(projection, project(&entries[..end], None));
     }
+    // Batches: a plain chain extends in place; one holding an edit rebuilds.
+    let mut batched = axo::store::Projection::default();
+    batched.apply(&entries[..2]);
+    assert_eq!(batched, project(&entries[..2], None));
+    batched.apply(&entries);
+    assert_eq!(batched, project(&entries, None));
     let usage = |message: &AgentMessage| match message {
         AgentMessage::Llm(Message::Assistant(a)) => a.usage.clone(),
         _ => panic!("expected assistant"),
