@@ -3,20 +3,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::error::Error;
 use crate::session::SessionEvent;
-use crate::tools::SessionTools;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Question {
     pub id: String,
@@ -32,7 +31,7 @@ pub struct Question {
     pub recommended: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionOption {
     pub label: String,
@@ -57,7 +56,7 @@ pub struct Answer {
 
 /// How a pending `ask` call was settled by the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AskOutcome {
+pub(crate) enum AskOutcome {
     Answered(Vec<Answer>),
     Dismissed,
 }
@@ -68,7 +67,7 @@ type PendingEntry = (Vec<Question>, oneshot::Sender<AskOutcome>);
 /// Questions waiting for the client, keyed by tool-call id. `ask` registers one and
 /// broadcasts `SessionEvent::QuestionPending`; the session's `answer`/`dismiss` settle it
 /// and broadcast `SessionEvent::QuestionResolved`.
-pub struct PendingQuestions {
+pub(crate) struct PendingQuestions {
     events: broadcast::Sender<SessionEvent>,
     pending: Mutex<HashMap<String, PendingEntry>>,
 }
@@ -171,9 +170,6 @@ impl Drop for Withdraw<'_> {
     }
 }
 
-/// Labels the client UI reserves for its own rows.
-const OTHER_OPTION: &str = "Other (type your own)";
-
 const DESCRIPTION: &str = "Ask the user structured questions when a decision only they can make blocks you. Default: act using the code, config, docs, history and conventions; when several choices are viable, pick the conservative one, proceed, and say which you picked.
 - Batch related questions; 2–5 distinct options each; short labels, tradeoffs in `description`.
 - `recommended` marks the default option (0-based); `multi: true` permits several selections.
@@ -200,12 +196,13 @@ struct QuestionResult {
 }
 
 pub struct AskTool {
-    tools: Arc<SessionTools>,
+    questions: Arc<PendingQuestions>,
+    timeout: Option<Duration>,
     parameters: Value,
 }
 
 impl AskTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(questions: Arc<PendingQuestions>, timeout: Option<Duration>) -> Self {
         let parameters = json!({
             "type": "object",
             "properties": {
@@ -247,7 +244,11 @@ impl AskTool {
             "required": ["questions"],
             "additionalProperties": false
         });
-        Self { tools, parameters }
+        Self {
+            questions,
+            timeout,
+            parameters,
+        }
     }
 }
 
@@ -274,16 +275,6 @@ impl Tool for AskTool {
         let AskParams { questions } = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
 
-        if let Some(option) = questions
-            .iter()
-            .flat_map(|question| &question.options)
-            .find(|option| option.label == OTHER_OPTION)
-        {
-            return Err(ToolError(format!(
-                "option labels must not collide with reserved runtime labels: {}",
-                option.label
-            )));
-        }
         let mut seen_ids = HashSet::new();
         for question in &questions {
             if !seen_ids.insert(question.id.as_str()) {
@@ -306,14 +297,14 @@ impl Tool for AskTool {
             return Err(ToolError("questions must not be empty".into()));
         }
 
-        let registry = &self.tools.questions;
+        let registry = &self.questions;
         let _withdraw = Withdraw {
             registry,
             call_id: &call.id,
         };
         let mut rx = registry.ask(&call.id, questions.clone());
         let timeout = async {
-            match self.tools.ask_timeout {
+            match self.timeout {
                 Some(duration) => tokio::time::sleep(duration).await,
                 None => std::future::pending().await,
             }

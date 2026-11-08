@@ -321,18 +321,7 @@ impl SessionWriter for JsonlWriter {
                 file
             }
         };
-        let sync = match &entry {
-            Entry::RunStart { .. }
-            | Entry::RunEnd { .. }
-            | Entry::JobStart { .. }
-            | Entry::JobEnd { .. } => true,
-            Entry::Message {
-                admitted_jobs,
-                delivered_jobs,
-                ..
-            } => !admitted_jobs.is_empty() || !delivered_jobs.is_empty(),
-            _ => false,
-        };
+        let sync = entry.requires_sync();
         blocking(&self.path, move || {
             let mut writer = &file.0;
             writer
@@ -349,11 +338,7 @@ impl SessionWriter for JsonlWriter {
         Ok(SeqEntry { seq, entry })
     }
 
-    fn path(&self) -> Option<&Path> {
-        self.file.as_ref().map(|_| self.path.as_path())
-    }
-
-    fn planned_path(&self) -> &Path {
+    fn path(&self) -> &Path {
         &self.path
     }
 }

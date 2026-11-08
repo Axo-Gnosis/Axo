@@ -34,6 +34,7 @@ pub struct Settings {
     pub ask: AskSettings,
     pub project: ProjectSettings,
     pub compaction: CompactionSettings,
+    pub retry: RetrySettings,
 }
 
 impl Default for Settings {
@@ -50,6 +51,25 @@ impl Default for Settings {
             ask: AskSettings::default(),
             project: ProjectSettings::default(),
             compaction: CompactionSettings::default(),
+            retry: RetrySettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RetrySettings {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay_ms: 2_000,
+            max_delay_ms: 60_000,
         }
     }
 }
@@ -158,7 +178,7 @@ impl Default for ProjectFiles {
 pub enum ProjectAccess {
     /// Nothing from the project is read.
     Ignore,
-    /// Read project files, dropping settings that run code.
+    /// Read project files; dev-shell execution remains disabled.
     #[default]
     Read,
     /// Everything, including what runs code.
@@ -176,6 +196,8 @@ pub struct BashSettings {
     pub dev_shell_timeout_ms: u64,
     /// Set `CI=true` in the command environment.
     pub ci: bool,
+    /// Milliseconds before a foreground command becomes a background job; zero disables it.
+    pub promote_after_ms: u64,
 }
 
 impl Default for BashSettings {
@@ -186,6 +208,7 @@ impl Default for BashSettings {
             dev_shell_watch: Vec::new(),
             dev_shell_timeout_ms: 600_000,
             ci: true,
+            promote_after_ms: 60_000,
         }
     }
 }
@@ -279,8 +302,8 @@ impl EffectiveConfig {
     /// Samples `source.user()`, derives access (`access` overrides the user policy), then,
     /// unless access is `Ignore` or `project.files.config` is false, applies
     /// `source.project(cwd)`. Objects merge key by key with the project winning; arrays
-    /// replace. The project never sets user-only keys, and below `Trust` it never sets
-    /// what runs code.
+    /// replace. The project never sets user-only keys, and below `Trust` the effective
+    /// dev shell is always off, regardless of its source.
     pub fn resolve(
         source: &dyn ConfigSource,
         cwd: &Path,
@@ -304,19 +327,31 @@ impl EffectiveConfig {
         let mut prompts = prompt_overrides(user.prompts)?;
         let access = access.unwrap_or_else(|| policy.access_for(&project_root(cwd)));
 
-        let mut origin = user.origin;
+        let mut project_origin = None;
+        let mut dev_shell_from_project = false;
         if access != ProjectAccess::Ignore && policy.files.config {
             let project = source.project(cwd)?;
             if let Some((mut value, _)) = validate(&project.origin, project.settings)? {
                 let object = value.as_object_mut().expect("validated settings object");
-                filter_project(object, access, USER_ONLY_KEYS, &project.origin);
+                filter_project(object, USER_ONLY_KEYS, &project.origin);
+                dev_shell_from_project = value.pointer("/bash/devShell").is_some();
                 deep_merge(&mut merged, value);
-                origin = project.origin;
+                project_origin = Some(project.origin);
             }
             prompts.extend(prompt_overrides(project.prompts)?);
         }
-        let settings: Settings =
-            serde_json::from_value(merged).map_err(|error| config_error(&origin, error))?;
+        let origin = project_origin.as_deref().unwrap_or(&user.origin);
+        let mut settings: Settings =
+            serde_json::from_value(merged).map_err(|error| config_error(origin, error))?;
+        if access != ProjectAccess::Trust && settings.bash.dev_shell != DevShellMode::Off {
+            let dev_shell_origin = if dev_shell_from_project {
+                origin
+            } else {
+                &user.origin
+            };
+            tracing::warn!(origin = %dev_shell_origin, "bash.devShell needs a trusted project; resolved to off");
+            settings.bash.dev_shell = DevShellMode::Off;
+        }
         Ok(Self {
             access,
             settings,
@@ -326,8 +361,8 @@ impl EffectiveConfig {
         })
     }
 
-    /// `settings.default_model` with a `!command` run and `$VAR` expanded. Sessions call
-    /// this only when neither `SessionOptions::model` nor the session's recorded model
+    /// `settings.default_model` with `$VAR` expanded and `!command` values rejected.
+    /// Sessions call this only when neither `SessionOptions::model` nor the session's recorded model
     /// selects one, so an unresolvable value fails only that selection.
     pub fn default_model(&self) -> Result<Option<String>, Error> {
         let Some(model) = &self.settings.default_model else {
@@ -386,32 +421,11 @@ fn prompt_overrides(
         .collect()
 }
 
-/// Strips what a project layer may not set: user-only keys always, and below `Trust`
-/// whatever runs code.
-fn filter_project(
-    object: &mut Map<String, Value>,
-    access: ProjectAccess,
-    user_only_keys: &[&str],
-    origin: &str,
-) {
+/// Strips user-only keys that a project layer may not set.
+fn filter_project(object: &mut Map<String, Value>, user_only_keys: &[&str], origin: &str) {
     for key in user_only_keys {
         if object.remove(*key).is_some() {
             tracing::warn!(origin = %origin, "\"{key}\" is a user setting; ignored in project settings");
-        }
-    }
-    if access != ProjectAccess::Trust {
-        if let Some(bash) = object.get_mut("bash").and_then(Value::as_object_mut)
-            && bash.remove("devShell").is_some()
-        {
-            tracing::warn!(origin = %origin, "bash.devShell needs a trusted project; ignored in project settings");
-        }
-        if object
-            .get("defaultModel")
-            .and_then(Value::as_str)
-            .is_some_and(|model| model.starts_with('!'))
-        {
-            object.remove("defaultModel");
-            tracing::warn!(origin = %origin, "a \"!command\" defaultModel needs a trusted project; ignored in project settings");
         }
     }
 }

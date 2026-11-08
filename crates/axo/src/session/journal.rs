@@ -113,7 +113,7 @@ impl Journal {
         projection: Projection,
         events: broadcast::Sender<SessionEvent>,
     ) -> Self {
-        let path = writer.planned_path().to_path_buf();
+        let path = writer.path().to_path_buf();
         let ids = entries
             .iter()
             .filter_map(|entry| entry.entry.id())

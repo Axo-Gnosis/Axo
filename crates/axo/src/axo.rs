@@ -13,9 +13,11 @@ use crate::config::{
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
-use crate::exec::{EnvMap, ExecEnv, HostEnv};
+use crate::exec::{EnvMap, ExecEnv, StaticEnv};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
-use crate::session::{RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes};
+use crate::session::{
+    Inherited, RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes,
+};
 use crate::store::{
     Header, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
 };
@@ -94,7 +96,7 @@ impl AxoBuilder {
             Some(streamer) => streamer,
             None => self.models.clone(),
         };
-        let base_env = HostEnv::snapshot().0;
+        let base_env = StaticEnv::host().0;
         // Never fails here: supervision is checked on the first command, so hosts that
         // never run commands keep working.
         let supervisor = ProcessSupervisor::new(self.supervision.unwrap_or_default());
@@ -120,10 +122,6 @@ impl Axo {
             streamer: None,
             supervision: None,
         }
-    }
-
-    pub fn models(&self) -> &Models {
-        &self.models
     }
 
     /// Samples the configuration source, resolves the model, thinking level, exec
@@ -187,9 +185,10 @@ impl Axo {
     /// The URL schemes of a saved session that is not open, for hosts resolving links in
     /// it: the file-backed schemes an open session has (`artifact://`, `local://`,
     /// `skill://` over the skills on disk now, `axo://` with a cache directory), plus
-    /// `host`. Reads only the header and samples the configuration source: no lock, no
-    /// recovery, no model. Resolve for display; write to a session's files through an
-    /// open `Session`. `project_access` is the `SessionOptions::project_access` the host
+    /// `host`. Reads only the header, samples the configuration source, and materializes
+    /// bundled docs when a cache directory is configured: no lock, recovery, or model.
+    /// Resolve for display; write to a session's files through an open `Session`.
+    /// `project_access` is the `SessionOptions::project_access` the host
     /// opens this session with (`None` uses the user policy), so `skill://` sees the same
     /// skills as the open session.
     pub async fn schemes(
@@ -200,7 +199,7 @@ impl Axo {
     ) -> Result<Schemes, Error> {
         let header = self.store.read_header(path).await?;
         let config = EffectiveConfig::resolve(&*self.config, &header.cwd, project_access)?;
-        let (schemes, _, _) = session_schemes(
+        let (schemes, _, diagnostics, _) = session_schemes(
             &config,
             self.docs_dir().as_deref(),
             SchemeContext {
@@ -211,6 +210,9 @@ impl Axo {
             host,
             None,
         )?;
+        for diagnostic in diagnostics {
+            tracing::warn!("{diagnostic}");
+        }
         Ok(schemes)
     }
 
@@ -239,6 +241,7 @@ impl Axo {
             exec_env,
             sections,
             tools: host_tools,
+            tool_hooks,
             schemes: host_schemes,
             recovery: _,
         } = options;
@@ -267,20 +270,10 @@ impl Axo {
         );
 
         let mode = settings.bash.dev_shell;
-        let host = || -> Arc<dyn ExecEnv> { Arc::new(HostEnv(self.base_env.clone())) };
+        let host = || -> Arc<dyn ExecEnv> { Arc::new(StaticEnv(self.base_env.clone())) };
         let exec: Arc<dyn ExecEnv> = match exec_env {
             Some(exec) => exec,
             None if mode == DevShellMode::Off => host(),
-            None if config.access != ProjectAccess::Trust => {
-                tracing::warn!(
-                    mode = ?mode,
-                    concat!(
-                        "bash.devShell runs project code and needs a trusted project; ",
-                        "using the host environment"
-                    )
-                );
-                host()
-            }
             None if mode == DevShellMode::Nix && self.cache_dir.is_none() => {
                 tracing::warn!(concat!(
                     "bash.devShell \"nix\" needs a cache directory (AxoBuilder::cache_dir); ",
@@ -297,20 +290,23 @@ impl Axo {
         };
 
         Session::start(SessionSetup {
-            cwd,
-            config,
-            docs_dir: self.docs_dir(),
-            streamer: self.streamer.clone(),
-            models: self.models.clone(),
+            inherited: Arc::new(Inherited {
+                cwd,
+                config,
+                docs_dir: self.docs_dir(),
+                streamer: self.streamer.clone(),
+                models: self.models.clone(),
+                exec,
+                supervisor: self.supervisor.clone(),
+                ask_enabled,
+                host_sections: sections,
+                host_tools,
+                host_schemes,
+                tool_hooks,
+                store: self.store.clone(),
+            }),
             model,
             thinking,
-            exec,
-            supervisor: self.supervisor.clone(),
-            ask_enabled,
-            host_sections: sections,
-            host_tools,
-            host_schemes,
-            store: self.store.clone(),
             session_id,
             writer,
             entries,

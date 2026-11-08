@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axo_ai::{
-    AssistantBlock, AssistantEvent, AssistantMessage, Context, FileCredentialStore, Message, Model,
-    Models, ModelsConfig, ModelsOptions, SimpleStreamOptions, Streamer, ThinkingLevel,
-    ToolResultMessage, ToolSpec, Transcript, UserBlock, UserMessage, now_ms,
+    AssistantBlock, AssistantEvent, AssistantMessage, FileCredentialStore, Message, Model, Models,
+    ModelsConfig, ModelsOptions, SimpleStreamOptions, Streamer, SystemMessage, TextBlock,
+    ThinkingLevel, ToolResultMessage, ToolSpec, Transcript, UserBlock, UserMessage, now_ms,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(err.into()),
     };
     let models = Models::load(ModelsOptions {
+        http_client: None,
         cache_dir: Some(dir.join("cache")),
         config,
         extended_context: false,
@@ -122,11 +123,16 @@ async fn stream_once(
     tool: &ToolSpec,
     opts: &SimpleStreamOptions,
 ) -> Option<AssistantMessage> {
-    let transcript = Transcript::normalize(Context {
-        system_prompt: Some("You are a helpful assistant. Use tools when asked.".into()),
-        messages: messages.to_vec(),
-        tools: vec![tool.clone()],
-    });
+    let mut request = Vec::with_capacity(messages.len() + 1);
+    request.push(Message::System(SystemMessage {
+        content: vec![TextBlock {
+            text: "You are a helpful assistant. Use tools when asked.".into(),
+        }],
+        tools_added: vec![tool.clone()],
+        ..Default::default()
+    }));
+    request.extend_from_slice(messages);
+    let transcript = Transcript::new(request);
     let mut events = Streamer::stream(
         models,
         model,

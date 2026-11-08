@@ -1,5 +1,5 @@
 //! Terminal provider-failure classification; sleeping and attempt ownership belong to callers.
-use std::{sync::LazyLock, time::Duration};
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -56,11 +56,7 @@ pub fn is_retryable_error(message: &AssistantMessage) -> bool {
         .unwrap_or_default();
     if EXCLUDED.is_match(diagnostic)
         || EXCLUDED.is_match(code)
-        || failure.is_some_and(|failure| {
-            failure.should_retry == Some(false)
-                || failure.retry_after_ms.is_some_and(|delay| delay > 60_000)
-        })
-        || (diagnostic.contains("Server requested") && diagnostic.contains("retry delay (max:"))
+        || failure.is_some_and(|failure| failure.should_retry == Some(false))
     {
         return false;
     }
@@ -72,17 +68,4 @@ pub fn is_retryable_error(message: &AssistantMessage) -> bool {
                 Some(429 | 500 | 502 | 503 | 504 | 520 | 524)
             ) || failure.should_retry == Some(true)
         })
-}
-
-pub fn retry_delay(message: &AssistantMessage, retry_index: u32) -> Option<Duration> {
-    if retry_index >= 3 || !is_retryable_error(message) {
-        return None;
-    }
-    Some(Duration::from_millis(
-        message
-            .failure
-            .as_ref()
-            .and_then(|failure| failure.retry_after_ms)
-            .unwrap_or(2_000 << retry_index),
-    ))
 }

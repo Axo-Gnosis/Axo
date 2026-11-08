@@ -7,15 +7,14 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::auth::codex;
 use crate::auth::resolve::resolve_config_value;
 use crate::model::{ApiKind, Compat, Cost, CostTier, InputKind, Model};
 use crate::types::ThinkingLevel;
 
 use super::catalog::{Catalog, DevCost, DevModel, DevProvider};
 
-pub(crate) const CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_MAX_TOKENS: u64 = 128_000;
 const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
 
@@ -80,7 +79,6 @@ pub(crate) fn build(catalog: Option<&Catalog>) -> (Vec<Model>, HashMap<String, V
                     })
                     .unwrap_or(4096),
                 max_tokens: limit.output.filter(|&output| output > 0).unwrap_or(4096),
-                headers: Default::default(),
                 compat: Compat::default(),
             });
             if let Some(reasoning_options) = dev.reasoning_options {
@@ -89,7 +87,7 @@ pub(crate) fn build(catalog: Option<&Catalog>) -> (Vec<Model>, HashMap<String, V
         }
     }
 
-    envs.insert(CODEX_PROVIDER.to_owned(), Vec::new());
+    envs.insert(codex::PROVIDER.to_owned(), Vec::new());
     models.extend(codex_models());
 
     for model in &mut models {
@@ -134,7 +132,7 @@ fn endpoint(id: &str, provider: &DevProvider) -> Option<(ApiKind, String)> {
     };
     let raw = provider.api.as_deref()?;
     // Some rows template the host from the environment, e.g. `https://${DATABRICKS_HOST}/v1`.
-    let url = if raw.contains('$') {
+    let url = if raw.contains('$') || raw.starts_with('!') {
         match resolve_config_value(raw) {
             Ok(url) => url,
             Err(error) => {
@@ -222,8 +220,8 @@ fn codex_models() -> Vec<Model> {
             id: id.to_owned(),
             name: name.to_owned(),
             api: ApiKind::OpenAiCodexResponses,
-            provider: CODEX_PROVIDER.to_owned(),
-            base_url: CODEX_BASE_URL.to_owned(),
+            provider: codex::PROVIDER.to_owned(),
+            base_url: codex::BASE_URL.to_owned(),
             reasoning: true,
             thinking_level_map: None,
             input: vec![InputKind::Text, InputKind::Image],
@@ -242,7 +240,6 @@ fn codex_models() -> Vec<Model> {
             },
             context_window,
             max_tokens: CODEX_MAX_TOKENS,
-            headers: Default::default(),
             compat: Compat::default(),
         },
     )
@@ -547,7 +544,33 @@ fn apply_thinking_level_metadata(model: &mut Model) {
             ],
         );
     }
-    if model.provider == CODEX_PROVIDER && openai_xhigh {
+    if model.provider == codex::PROVIDER && openai_xhigh {
         merge_map(model, &[(ThinkingLevel::Minimal, Some("low"))]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_command_endpoints_are_skipped() {
+        for api in ["!${X}", "!echo https://example.invalid"] {
+            let catalog: Catalog = serde_json::from_value(serde_json::json!({
+                "command-provider": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "api": api,
+                    "models": {"model": {"tool_call": true}}
+                }
+            }))
+            .unwrap();
+            let (models, envs) = build(Some(&catalog));
+            assert!(
+                models
+                    .iter()
+                    .all(|model| model.provider != "command-provider")
+            );
+            assert!(!envs.contains_key("command-provider"));
+        }
     }
 }

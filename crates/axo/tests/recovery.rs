@@ -1,46 +1,23 @@
-//! Recovery plans for runs a crash left open: replay split, finishing, the restart limit and requeued input.
+//! Session recovery preserves durable results, interrupted output, and queued input.
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axo::recovery::{RecoveryPlan, plan_recovery};
-use axo::store::{
-    self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind,
-};
-use axo::{Axo, PromptPart, Session, SessionEvent};
-use axo_agent::{AgentEvent, AgentMessage, Replay, RunOutcome};
-use axo_ai::testing::{reply_text, reply_tool_calls};
+use axo::{Axo, PromptPart, RecoveryPolicy, Session, SessionEvent};
+use axo::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind};
+use axo_agent::{AgentEvent, AgentMessage, RunOutcome};
+use axo_ai::testing::{reply_text, reply_tool_calls, scripted_model};
 use axo_ai::{
-    ApiKind, AssistantBlock, AssistantMessage, Compat, Cost, InputKind, JsonMap, Message, Model,
-    ProviderFailure, ScriptedApi, ScriptedTurn, StopReason, ToolCall, ToolResultMessage, UserBlock,
-    UserMessage, now_ms,
+    AssistantBlock, AssistantMessage, JsonMap, Message, ScriptedApi, ScriptedTurn, StopReason,
+    ToolCall, UserBlock, UserMessage, now_ms,
 };
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use common::{bash_options, options, within};
-
-fn model() -> Model {
-    Model {
-        id: "scripted-model".into(),
-        name: "Scripted".into(),
-        api: ApiKind::AnthropicMessages,
-        provider: "scripted".into(),
-        base_url: String::new(),
-        reasoning: false,
-        thinking_level_map: None,
-        input: vec![InputKind::Text],
-        cost: Cost::default(),
-        context_window: 100_000,
-        max_tokens: 4096,
-        headers: BTreeMap::new(),
-        compat: Compat::default(),
-    }
-}
+use common::{bash_options, options, transient, within};
 
 fn call(id: &str, name: &str) -> ToolCall {
     ToolCall {
@@ -48,13 +25,6 @@ fn call(id: &str, name: &str) -> ToolCall {
         name: name.into(),
         arguments: JsonMap::new(),
         arguments_error: None,
-    }
-}
-
-fn replay_of(call: &ToolCall) -> Replay {
-    match call.name.as_str() {
-        "read" => Replay::Safe,
-        _ => Replay::Never,
     }
 }
 
@@ -127,7 +97,7 @@ impl Log {
                 .map(AssistantBlock::ToolCall)
                 .collect(),
             stop_reason: StopReason::ToolUse,
-            ..AssistantMessage::empty(&model())
+            ..AssistantMessage::empty(&scripted_model())
         });
         self.message(message, None);
     }
@@ -138,20 +108,7 @@ impl Log {
                 text: text.into(),
                 text_signature: None,
             }],
-            ..AssistantMessage::empty(&model())
-        });
-        self.message(message, None);
-    }
-
-    fn tool_result(&mut self, call: &ToolCall) {
-        let message = Message::ToolResult(ToolResultMessage {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: vec![UserBlock::Text { text: "ok".into() }],
-            details: None,
-            is_error: false,
-            timestamp: now_ms(),
-            duration_ms: None,
+            ..AssistantMessage::empty(&scripted_model())
         });
         self.message(message, None);
     }
@@ -167,340 +124,91 @@ impl Log {
         self.push(|base| Entry::RunEnd {
             base,
             run_id: run_id.into(),
-            outcome: store::RunOutcome::Done,
+            outcome: axo::RunOutcome::Done,
             reason: None,
         });
     }
+}
 
-    fn run_resumed(&mut self, run_id: &str, attempt: u32) {
-        self.push(|base| Entry::RunResumed {
-            base,
-            run_id: run_id.into(),
-            attempt,
-        });
-    }
-
-    fn plan(&self, artifacts_dir: &Path) -> RecoveryPlan {
-        plan_recovery(
-            &self.entries,
-            &axo::store::project(&self.entries, None),
-            &model(),
-            &replay_of,
-            artifacts_dir,
+#[tokio::test]
+async fn reopening_crashed_bash_preserves_partial_output_under_both_policies() {
+    for policy in [RecoveryPolicy::Resume, RecoveryPolicy::MarkInterrupted] {
+        let dir = tempfile::tempdir().unwrap();
+        let (axo, api) = setup(
+            dir.path(),
+            vec![ScriptedTurn::Reply(reply_text("recovered"))],
+            false,
         )
-    }
-}
-
-#[test]
-fn safe_calls_rerun_and_never_calls_are_interrupted() {
-    let artifacts = tempfile::tempdir().unwrap();
-    std::fs::write(
-        artifacts.path().join("0.bash.c-bash.log"),
-        "partial output\n",
-    )
-    .unwrap();
-
-    let done = call("c-done", "bash");
-    let read = call("c-read", "read");
-    let bash = call("c-bash", "bash");
-    let bash_no_log = call("c-bash2", "bash");
-
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "do things");
-    log.run_start("r1");
-    log.assistant_calls(&[
-        done.clone(),
-        read.clone(),
-        bash.clone(),
-        bash_no_log.clone(),
-    ]);
-    log.tool_result(&done);
-
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Resume {
-            run_id: "r1".into(),
-            attempt: 1,
-            interrupted: vec![(bash, Some(0)), (bash_no_log, None)],
-            rerun: vec![read],
-            requeue: Vec::new(),
+        .await;
+        let mut options = bash_options(dir.path());
+        options.recovery = policy;
+        let side_effect = options.cwd.join("replayed");
+        let mut bash = call("crashed", "bash");
+        bash.arguments
+            .insert("command".into(), json!("printf repeated > replayed"));
+        let mut log = Log::default();
+        log.user("s1", SubmissionKind::Prompt, "run the command once");
+        log.run_start("r1");
+        log.assistant_calls(&[bash]);
+        let store = JsonlStore::new(dir.path().join("sessions"));
+        let mut writer = store
+            .create(axo::Header::new(options.cwd.clone(), None, None))
+            .await
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        for entry in log.entries {
+            writer.append(entry.entry).await.unwrap();
         }
-    );
-}
+        drop(writer);
+        let artifacts = path.with_extension("").join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("0.bash.crashed.log"), "partial output\n").unwrap();
 
-#[test]
-fn settled_but_unclosed_run_is_finished() {
-    let artifacts = tempfile::tempdir().unwrap();
-    let read = call("c1", "read");
-
-    let mut log = Log::default();
-    log.user("s0", SubmissionKind::Prompt, "earlier");
-    log.run_start("r0");
-    log.assistant_text("earlier answer");
-    log.run_end("r0");
-    log.user("s1", SubmissionKind::Prompt, "read a file");
-    log.run_start("r1");
-    log.assistant_calls(std::slice::from_ref(&read));
-    log.tool_result(&read);
-    log.assistant_text("done reading");
-
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Finish {
-            run_id: "r1".into(),
-            outcome: store::RunOutcome::Done,
-            reason: None,
-        }
-    );
-
-    log.run_end("r1");
-    assert_eq!(log.plan(artifacts.path()), RecoveryPlan::None);
-}
-
-#[test]
-fn fifth_consecutive_resume_parks_the_run() {
-    let artifacts = tempfile::tempdir().unwrap();
-
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "loop forever");
-    log.run_start("r1");
-    log.assistant_calls(&[call("c1", "bash")]);
-    for attempt in 1..=4 {
-        log.run_resumed("r1", attempt);
-    }
-
-    assert!(
-        matches!(
-            &log.plan(artifacts.path()),
-            RecoveryPlan::Resume { run_id, attempt: 5, .. } if run_id == "r1"
-        ),
-        "four resumes still resume"
-    );
-
-    log.run_resumed("r1", 5);
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Park {
-            run_id: "r1".into()
-        }
-    );
-}
-
-#[test]
-fn a_message_between_resumes_resets_the_restart_limit() {
-    let artifacts = tempfile::tempdir().unwrap();
-    let first = call("c1", "read");
-
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "make progress");
-    log.run_start("r1");
-    for attempt in 1..=4 {
-        log.run_resumed("r1", attempt);
-    }
-    log.assistant_calls(std::slice::from_ref(&first));
-    log.run_resumed("r1", 5);
-
-    assert!(matches!(
-        &log.plan(artifacts.path()),
-        RecoveryPlan::Resume { run_id, .. } if run_id == "r1"
-    ));
-}
-
-#[test]
-fn unconsumed_steer_is_requeued() {
-    let artifacts = tempfile::tempdir().unwrap();
-    let first = call("c1", "read");
-    let second = call("c2", "read");
-
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "start");
-    log.run_start("r1");
-    log.assistant_calls(std::slice::from_ref(&first));
-    log.tool_result(&first);
-    log.user("s2", SubmissionKind::Steer, "consumed steer");
-    log.assistant_calls(std::slice::from_ref(&second));
-    log.tool_result(&second);
-    let pending = log.submission("s3", SubmissionKind::Steer, "pending steer");
-
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Resume {
-            run_id: "r1".into(),
-            attempt: 1,
-            interrupted: Vec::new(),
-            rerun: Vec::new(),
-            requeue: vec![pending],
-        }
-    );
-}
-
-#[test]
-fn prompt_submitted_before_its_run_started_is_requeued() {
-    let artifacts = tempfile::tempdir().unwrap();
-
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "first");
-    log.run_start("r1");
-    log.assistant_text("first answer");
-    log.run_end("r1");
-    let stranded = log.submission("s2", SubmissionKind::Prompt, "second");
-
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Requeue {
-            requeue: vec![stranded]
-        }
-    );
-}
-
-#[test]
-fn follow_up_left_after_a_settled_reply_resumes_the_run() {
-    let artifacts = tempfile::tempdir().unwrap();
-
-    let mut log = Log::default();
-    log.submission("s1", SubmissionKind::Prompt, "start");
-    log.run_start("r1");
-    log.message(
-        Message::User(UserMessage {
-            content: vec![UserBlock::Text {
-                text: "start".into(),
-            }],
-            timestamp: now_ms(),
-        }),
-        Some("s1"),
-    );
-    log.assistant_text("answer");
-    let follow_up = log.submission("s2", SubmissionKind::FollowUp, "and then");
-
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Resume {
-            run_id: "r1".into(),
-            attempt: 1,
-            interrupted: Vec::new(),
-            rerun: Vec::new(),
-            requeue: vec![follow_up],
-        }
-    );
-}
-
-#[test]
-fn hidden_transient_response_is_recovered_before_any_tool_replay() {
-    let artifacts = tempfile::tempdir().unwrap();
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "start");
-    log.run_start("r1");
-    let failed = log.message(
-        Message::Assistant(AssistantMessage {
-            content: vec![AssistantBlock::ToolCall(call("danger", "bash"))],
-            stop_reason: StopReason::Error,
-            error_message: Some("503 service unavailable".into()),
-            ..AssistantMessage::empty(&model())
-        }),
-        None,
-    );
-    let response_id = failed.entry.base().unwrap().id.clone();
-    log.push(|base| Entry::ContextEdit {
-        base,
-        target_id: response_id.clone(),
-        replacement: None,
-    });
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::RecoverResponse {
-            run_id: "r1".into(),
-            attempt: 1,
-            response_id: response_id.clone(),
-            requeue: vec![],
-        }
-    );
-    for attempt in 1..=5 {
-        log.run_resumed("r1", attempt);
-    }
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Park {
-            run_id: "r1".into()
-        }
-    );
-}
-
-#[test]
-fn checkpoint_absorbed_answer_finishes_but_later_consumed_input_continues() {
-    let artifacts = tempfile::tempdir().unwrap();
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "start");
-    let user_id = log.entries.last().unwrap().entry.base().unwrap().id.clone();
-    log.run_start("r1");
-    log.assistant_text("completed");
-    log.push(|base| Entry::Compaction {
-        first_kept_entry_id: base.id.clone(),
-        base,
-        preserved_user_ids: vec![user_id],
-        summary: "completed work".into(),
-        tokens_before: 500,
-        details: None,
-        usage: None,
-        from_hook: None,
-        reason: None,
-        focus: None,
-        system_message: None,
-    });
-    assert_eq!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Finish {
-            run_id: "r1".into(),
-            outcome: store::RunOutcome::Done,
-            reason: None,
-        }
-    );
-    log.user("s2", SubmissionKind::FollowUp, "next task");
-    assert!(matches!(
-        log.plan(artifacts.path()),
-        RecoveryPlan::Resume { .. }
-    ));
-}
-
-#[test]
-fn terminal_fault_outcomes_are_not_reported_as_success_or_replayed() {
-    let artifacts = tempfile::tempdir().unwrap();
-    for (stop_reason, outcome) in [
-        (StopReason::Error, store::RunOutcome::Failed),
-        (StopReason::Aborted, store::RunOutcome::Aborted),
-    ] {
-        for with_call in [true, false] {
-            let mut log = Log::default();
-            log.user("s1", SubmissionKind::Prompt, "start");
-            log.run_start("r1");
-            log.message(
-                Message::Assistant(AssistantMessage {
-                    content: if with_call {
-                        vec![AssistantBlock::ToolCall(call("unsafe", "bash"))]
-                    } else {
-                        Vec::new()
-                    },
-                    stop_reason,
-                    error_message: Some("permission denied".into()),
-                    ..AssistantMessage::empty(&model())
-                }),
-                None,
-            );
-            if with_call {
-                assert!(matches!(
-                    log.plan(artifacts.path()),
-                    RecoveryPlan::RecoverResponse { .. }
-                ));
-                log.tool_result(&call("unsafe", "bash"));
+        let session = axo.open_session(&path, options).await.unwrap();
+        within(wait_end(&session)).await;
+        let (_, entries) = store.open_read(&path).await.unwrap();
+        let results: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                Entry::Message {
+                    message: AgentMessage::Llm(Message::ToolResult(result)),
+                    ..
+                } if result.tool_call_id == "crashed" => Some((entry.seq, result)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1);
+        let (result_seq, result) = results[0];
+        assert!(result.is_error);
+        assert!(result.content.iter().any(|block| {
+            matches!(block, UserBlock::Text { text } if text.contains("Output so far: artifact://0"))
+        }));
+        let ends: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                Entry::RunEnd {
+                    run_id, outcome, ..
+                } if run_id == "r1" => Some((entry.seq, *outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert!(result_seq < ends[0].0);
+        assert_eq!(
+            ends[0].1,
+            match policy {
+                RecoveryPolicy::Resume => axo::RunOutcome::Done,
+                RecoveryPolicy::MarkInterrupted => axo::RunOutcome::Interrupted,
             }
-            assert_eq!(
-                log.plan(artifacts.path()),
-                RecoveryPlan::Finish {
-                    run_id: "r1".into(),
-                    outcome,
-                    reason: Some("permission denied".into()),
-                }
-            );
-        }
+        );
+        assert_eq!(
+            api.requests().len(),
+            usize::from(policy == RecoveryPolicy::Resume)
+        );
+        assert!(
+            !side_effect.exists(),
+            "interrupted command must not run again"
+        );
     }
 }
 
@@ -509,12 +217,12 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
     for (stop_reason, outcome, diagnostic) in [
         (
             StopReason::Error,
-            store::RunOutcome::Failed,
+            axo::RunOutcome::Failed,
             "Tool call was not executed because the model response could not be used.",
         ),
         (
             StopReason::Aborted,
-            store::RunOutcome::Aborted,
+            axo::RunOutcome::Aborted,
             "Operation aborted",
         ),
     ] {
@@ -527,7 +235,7 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
         )
         .await;
         let options = options(dir.path());
-        let mut selected = model();
+        let mut selected = scripted_model();
         selected.provider = "test".into();
         selected.id = "m".into();
         let mut log = Log::default();
@@ -544,10 +252,10 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
         );
         let store = JsonlStore::new(dir.path().join("sessions"));
         let mut writer = store
-            .create(store::Header::new(options.cwd.clone(), None, None))
+            .create(axo::Header::new(options.cwd.clone(), None, None))
             .await
             .unwrap();
-        let path = writer.planned_path().to_path_buf();
+        let path = writer.path().to_path_buf();
         for entry in log.entries {
             writer.append(entry.entry).await.unwrap();
         }
@@ -619,10 +327,10 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
     );
     let store = JsonlStore::new(dir.path().join("sessions"));
     let mut writer = store
-        .create(store::Header::new(options.cwd.clone(), None, None))
+        .create(axo::Header::new(options.cwd.clone(), None, None))
         .await
         .unwrap();
-    let path = writer.planned_path().to_path_buf();
+    let path = writer.path().to_path_buf();
     for entry in log.entries {
         writer.append(entry.entry).await.unwrap();
     }
@@ -651,10 +359,7 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
     let ended =
         |seq: &SeqEntry| matches!(&seq.entry, Entry::RunEnd { run_id, .. } if run_id != "r1");
     if !attach.missed.iter().any(ended) {
-        assert!(
-            attach.live.agent.running,
-            "recovery did not requeue the prompt"
-        );
+        assert!(attach.live.running, "recovery did not requeue the prompt");
         within(async {
             loop {
                 if let SessionEvent::Entry(seq) = attach.events.recv().await.unwrap()
@@ -700,109 +405,6 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
     }
 }
 
-#[test]
-fn foreign_tool_use_with_provider_overflow_recovers_before_replay() {
-    let mut selected = model();
-    selected.provider = "test".into();
-    selected.id = "m".into();
-    let mut response = AssistantMessage::empty(&selected);
-    response.provider = "other".into();
-    response.model = "x".into();
-    response.stop_reason = StopReason::ToolUse;
-    response.content = vec![AssistantBlock::ToolCall(call("unsafe", "bash"))];
-    response.raw_stop_reason = Some("model_context_window_exceeded".into());
-    let mut log = Log::default();
-    log.run_start("r1");
-    log.message(Message::Assistant(response), None);
-    assert!(matches!(
-        plan_recovery(
-            &log.entries,
-            &store::project(&log.entries, None),
-            &selected,
-            &replay_of,
-            Path::new("/unused"),
-        ),
-        RecoveryPlan::RecoverResponse { .. }
-    ));
-}
-
-#[test]
-fn hidden_successful_reply_cannot_settle_a_run() {
-    let artifacts = tempfile::tempdir().unwrap();
-    let mut log = Log::default();
-    log.user("s1", SubmissionKind::Prompt, "start");
-    log.run_start("r1");
-    log.assistant_text("answer");
-    let target_id = log.entries.last().unwrap().entry.base().unwrap().id.clone();
-    log.push(|base| Entry::ContextEdit {
-        base,
-        target_id,
-        replacement: None,
-    });
-    assert!(
-        matches!(log.plan(artifacts.path()), RecoveryPlan::Resume { rerun, interrupted, .. }
-        if rerun.is_empty() && interrupted.is_empty())
-    );
-}
-
-#[test]
-fn recovery_length_uses_actual_output_limit_not_summary_ceiling() {
-    let mut selected = model();
-    selected.max_tokens = 65_536;
-    let mut response = AssistantMessage::empty(&selected);
-    response.stop_reason = StopReason::Length;
-    response.usage.output = 40_000;
-    let mut log = Log::default();
-    log.run_start("r1");
-    log.message(Message::Assistant(response), None);
-    assert!(matches!(
-        plan_recovery(
-            &log.entries,
-            &axo::store::project(&log.entries, None),
-            &selected,
-            &replay_of,
-            Path::new("/unused"),
-        ),
-        RecoveryPlan::RecoverResponse { .. }
-    ));
-}
-
-#[test]
-fn model_switch_precedes_reopen_numeric_classification() {
-    for stop_reason in [StopReason::Error, StopReason::Length, StopReason::Stop] {
-        let mut response = AssistantMessage::empty(&model());
-        response.stop_reason = stop_reason;
-        response.usage.input = 50_000;
-        response.usage.output = 4_096;
-        response.error_message =
-            (stop_reason == StopReason::Error).then(|| "permission denied".into());
-        let mut log = Log::default();
-        log.run_start("r1");
-        log.message(Message::Assistant(response), None);
-        let mut selected = model();
-        selected.id = "replacement".into();
-        selected.context_window = 10_000;
-        let plan = plan_recovery(
-            &log.entries,
-            &axo::store::project(&log.entries, None),
-            &selected,
-            &replay_of,
-            Path::new("/unused"),
-        );
-        if stop_reason == StopReason::Stop {
-            assert!(matches!(
-                plan,
-                RecoveryPlan::Finish {
-                    outcome: store::RunOutcome::Done,
-                    ..
-                }
-            ));
-        } else {
-            assert!(matches!(plan, RecoveryPlan::RecoverResponse { .. }));
-        }
-    }
-}
-
 fn assert_once_succeeded(entries: &[SeqEntry]) {
     let results: Vec<_> = entries
         .iter()
@@ -830,19 +432,6 @@ async fn setup(dir: &Path, turns: Vec<ScriptedTurn>, enabled: bool) -> (Axo, Arc
     let settings = json!({"compaction": {"enabled": enabled, "keepRecentTokens": 0}});
     let host = common::host(dir, models, settings, turns).await;
     (host.axo, host.api)
-}
-
-fn transient(delay: Option<u64>) -> ScriptedTurn {
-    let mut message = reply_text("");
-    message.stop_reason = StopReason::Error;
-    message.error_message = Some("503 service unavailable".into());
-    message.failure = Some(ProviderFailure {
-        status: Some(503),
-        code: None,
-        retry_after_ms: delay,
-        should_retry: None,
-    });
-    ScriptedTurn::Reply(message)
 }
 
 fn overflow(calls: bool, silent: bool) -> ScriptedTurn {
@@ -900,7 +489,7 @@ fn markers(entries: &[SeqEntry]) -> (usize, usize) {
     )
 }
 fn failed_visible(entries: &[SeqEntry]) -> usize {
-    store::project(entries, None).messages.iter().filter(|m| matches!(m, AgentMessage::Llm(Message::Assistant(a)) if a.stop_reason == StopReason::Error)).count()
+    axo::project(entries, None).messages.iter().filter(|m| matches!(m, AgentMessage::Llm(Message::Assistant(a)) if a.stop_reason == StopReason::Error)).count()
 }
 async fn wait_end(session: &Session) {
     let mut attach = session.attach(None).await;
@@ -1009,13 +598,13 @@ async fn dropping_prompt_future_then_aborting_backoff_releases_the_run() {
         tokio::pin!(prompt);
         tokio::select! { result = &mut prompt => panic!("settled before retry: {result:?}"), event = retry(&mut events) => assert_eq!(event, (1, 2000)) }
     }
-    session.abort().await;
+    session.abort();
     wait_end(&session).await;
     assert_eq!(api.requests().len(), 1);
     assert!(raw(&session).await.iter().any(|s| matches!(
         s.entry,
         Entry::RunEnd {
-            outcome: store::RunOutcome::Aborted,
+            outcome: axo::RunOutcome::Aborted,
             ..
         }
     )));
@@ -1177,7 +766,7 @@ async fn aborting_hanging_summary_has_no_checkpoint_and_no_stuck_busy_state() {
         }
     })
     .await;
-    session.abort().await;
+    session.abort();
     assert!(matches!(
         compact.await.unwrap_err(),
         axo::Error::MaintenanceAborted
@@ -1238,7 +827,7 @@ async fn shutdown_after_hide_resumes_pending_retry_without_refreshing_budget_or_
     assert!(entries.iter().any(|s| matches!(
         s.entry,
         Entry::RunEnd {
-            outcome: store::RunOutcome::Failed,
+            outcome: axo::RunOutcome::Failed,
             ..
         }
     )));
@@ -1504,7 +1093,7 @@ async fn reopening_silent_stop_reuses_only_completed_maintenance() {
         assert!(entries.iter().any(|seq| matches!(
             seq.entry,
             Entry::RunEnd {
-                outcome: store::RunOutcome::Done,
+                outcome: axo::RunOutcome::Done,
                 ..
             }
         )));
@@ -1560,7 +1149,7 @@ async fn reopening_old_terminal_response_uses_new_identity_before_classification
         assert!(entries.iter().any(|seq| matches!(
             seq.entry,
             Entry::RunEnd {
-                outcome: store::RunOutcome::Done,
+                outcome: axo::RunOutcome::Done,
                 ..
             }
         )));

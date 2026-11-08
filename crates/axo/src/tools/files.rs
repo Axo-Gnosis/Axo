@@ -1,20 +1,17 @@
 //! Helpers shared by the file tools: BOM and line-ending handling (pi `edit-diff.ts`,
-//! `utils/text.ts`), the stale-file guard, Node-style filesystem error text, and image
-//! detection and resizing (pi `utils/mime.ts`, `image-process.ts`, `image-resize-core.ts`).
+//! `utils/text.ts`), Node-style filesystem error text, and image detection and resizing
+//! (pi `utils/mime.ts`, `image-process.ts`, `image-resize-core.ts`).
 
 use std::borrow::Cow;
 use std::io::{self, Cursor, ErrorKind};
 use std::path::Path;
 
-use axo_agent::ToolError;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
-
-use crate::tools::{FileLedger, SessionTools};
 
 /// The UTF-8 byte order mark.
 pub const BOM: &str = "\u{FEFF}";
@@ -46,26 +43,6 @@ pub fn restore_line_endings<'a>(text: &'a str, ending: &str) -> Cow<'a, str> {
         Cow::Owned(text.replace('\n', "\r\n"))
     } else {
         Cow::Borrowed(text)
-    }
-}
-
-/// The stale-file guard for `edit` and `write` on an existing file: the session must have
-/// recorded `current` (the bytes on disk) when it last read or wrote `absolute`. `path` is
-/// the argument as the model gave it.
-pub fn check_fresh(
-    tools: &SessionTools,
-    absolute: &Path,
-    path: &str,
-    current: &[u8],
-) -> Result<(), ToolError> {
-    match tools.ledger.recorded(absolute) {
-        None => Err(ToolError(format!(
-            "File has not been read in this session: {path}. Read it first."
-        ))),
-        Some(hash) if hash != FileLedger::hash(current) => Err(ToolError(format!(
-            "File changed since it was last read: {path}. Read it again before editing."
-        ))),
-        Some(_) => Ok(()),
     }
 }
 

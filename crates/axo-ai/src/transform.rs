@@ -6,58 +6,19 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{ApiKind, InputKind, Model};
 use crate::transcript::Transcript;
 use crate::types::{
-    AssistantBlock, AssistantMessage, Message, StopReason, ToolCall, ToolResultMessage, UserBlock,
-    now_ms,
+    AssistantBlock, AssistantMessage, Message, ToolCall, ToolResultMessage, UserBlock, now_ms,
 };
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str =
     "(tool image omitted: model does not support images)";
-const ERROR_TOOL_IMAGE_PLACEHOLDER: &str = "(image attached after the tool results)";
 
 /// Providers whose Responses `call_id|item_id` tool-call ids the Codex adapter replays
 /// as-is (pi `CODEX_TOOL_CALL_PROVIDERS`).
 const CODEX_TOOL_CALL_PROVIDERS: [&str; 3] = ["openai", "openai-codex", "opencode"];
 
-/// An error tool result split into a text-only result and the images to send after the
-/// tool results.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SplitErrorToolResult {
-    /// The result content with each run of images replaced by a note.
-    pub content: Vec<UserBlock>,
-    /// Text naming the tool call, to send before `images`.
-    pub caption: String,
-    /// The image blocks.
-    pub images: Vec<UserBlock>,
-}
-
-/// Split the images out of an error tool result, for APIs that reject images in error
-/// results (Anthropic). Returns `None` for results that need no split.
-pub fn split_error_tool_result_images(message: &ToolResultMessage) -> Option<SplitErrorToolResult> {
-    if !message.is_error {
-        return None;
-    }
-    let images: Vec<UserBlock> = message
-        .content
-        .iter()
-        .filter(|block| matches!(block, UserBlock::Image { .. }))
-        .cloned()
-        .collect();
-    if images.is_empty() {
-        return None;
-    }
-    Some(SplitErrorToolResult {
-        content: replace_images(&message.content, ERROR_TOOL_IMAGE_PLACEHOLDER),
-        caption: format!(
-            "Images from the error result of tool call {} ({}):",
-            message.tool_call_id, message.tool_name
-        ),
-        images,
-    })
-}
-
 /// Replace each run of images with one placeholder text block.
-fn replace_images(content: &[UserBlock], placeholder: &str) -> Vec<UserBlock> {
+pub(crate) fn replace_images(content: &[UserBlock], placeholder: &str) -> Vec<UserBlock> {
     let mut result = Vec::with_capacity(content.len());
     let mut previous_was_placeholder = false;
     for block in content {
@@ -86,16 +47,13 @@ fn replace_images(content: &[UserBlock], placeholder: &str) -> Vec<UserBlock> {
 /// - text signatures from another model are dropped;
 /// - tool-call ids from another model are normalized for the target API, and the
 ///   matching tool results follow;
-/// - errored and aborted assistant turns are left out, with their tool results
-///   ([`drop_failed_turns`]);
 /// - a tool call without a result gets a `"No result provided"` error result before the
 ///   next assistant or user message (system messages between a call and its results are
 ///   held until after the results).
 pub fn transform_messages(transcript: Transcript, model: &Model) -> Transcript {
     let vision = model.input.contains(&InputKind::Image);
     let mut id_map: HashMap<String, String> = HashMap::new();
-    let mut messages = transcript.into_messages();
-    drop_failed_turns(&mut messages);
+    let messages = transcript.into_messages();
     let len = messages.len();
 
     // First pass: image downgrade, thinking/text filtering, tool-call id normalization.
@@ -172,30 +130,6 @@ pub fn transform_messages(transcript: Transcript, model: &Model) -> Transcript {
     }
     close_pending(&mut result, &mut pending, &mut answered, &mut held);
     Transcript(result)
-}
-
-/// Removes assistant messages that ended `Error` or `Aborted`, with the tool results
-/// answering their calls: failed turns stay in the transcript but are never sent.
-pub fn drop_failed_turns(messages: &mut Vec<Message>) {
-    // Results answer the calls of the latest assistant, so ids are matched per turn: a
-    // provider that reuses call ids across turns keeps later results.
-    let mut failed: HashSet<String> = HashSet::new();
-    messages.retain(|message| match message {
-        Message::Assistant(assistant) => {
-            let keep = !matches!(
-                assistant.stop_reason,
-                StopReason::Error | StopReason::Aborted
-            );
-            failed = if keep {
-                HashSet::new()
-            } else {
-                assistant.tool_calls().map(|call| call.id.clone()).collect()
-            };
-            keep
-        }
-        Message::ToolResult(result) => !failed.contains(&result.tool_call_id),
-        Message::System(_) | Message::User(_) => true,
-    });
 }
 
 fn transform_assistant(

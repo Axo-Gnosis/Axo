@@ -2,52 +2,23 @@
 //! Port of pi `utils/transcript.ts` (plus the system-message text helpers of `utils/text.ts`).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ops::Deref;
 
 use indexmap::IndexMap;
 
-use crate::types::{Message, SystemMessage, TextBlock, ToolSpec};
+use crate::types::{Message, StopReason, SystemMessage, TextBlock, ToolSpec};
 
-/// Request input: `system_prompt` and `tools` are shorthand for a leading system message.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Context {
-    pub system_prompt: Option<String>,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolSpec>,
-}
-
-/// A normalized message list: the prompt and tools are carried by system messages.
-/// Only [`Transcript::normalize`] (and crate-internal transforms) construct one, so raw
-/// input cannot reach provider code by accident.
+/// Request messages with failed assistant turns and their tool results removed.
+/// The prompt and tools are carried by system messages.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Transcript(pub(crate) Vec<Message>);
 
 impl Transcript {
-    /// Fold `Context::system_prompt` and `Context::tools` into a leading system message.
-    /// Nothing is added when both are empty, so an empty transcript stays empty.
-    pub fn normalize(context: Context) -> Self {
-        let has_prompt = context
-            .system_prompt
-            .as_ref()
-            .is_some_and(|prompt| !prompt.is_empty());
-        if !has_prompt && context.tools.is_empty() {
-            return Transcript(context.messages);
-        }
-        let initial = SystemMessage {
-            content: context
-                .system_prompt
-                .filter(|prompt| !prompt.is_empty())
-                .map(|text| vec![TextBlock { text }])
-                .unwrap_or_default(),
-            sections: None,
-            tools_added: context.tools,
-            tools_removed: Vec::new(),
-            timestamp: 0,
-        };
-        let mut messages = Vec::with_capacity(context.messages.len() + 1);
-        messages.push(Message::System(initial));
-        messages.extend(context.messages);
-        Transcript(messages)
+    /// Remove failed assistant turns and their tool results before sending a request.
+    pub fn new(mut messages: Vec<Message>) -> Self {
+        drop_failed_turns(&mut messages);
+        Self(messages)
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -59,7 +30,7 @@ impl Transcript {
     }
 
     /// The leading system message, if the transcript starts with one.
-    pub fn initial_system_message(&self) -> Option<&SystemMessage> {
+    pub(crate) fn initial_system_message(&self) -> Option<&SystemMessage> {
         match self.0.first() {
             Some(Message::System(system)) => Some(system),
             _ => None,
@@ -68,7 +39,7 @@ impl Transcript {
 
     /// The messages after the leading system message, for APIs that carry the prompt
     /// outside the message list.
-    pub fn without_initial_system_message(&self) -> &[Message] {
+    pub(crate) fn without_initial_system_message(&self) -> &[Message] {
         match self.initial_system_message() {
             Some(_) => &self.0[1..],
             None => &self.0,
@@ -77,7 +48,7 @@ impl Transcript {
 
     /// Rebuild the transcript for APIs without mid-conversation system messages: the
     /// replayed system message leads, and every later system message is dropped.
-    pub fn collapse_system_messages(&self) -> Transcript {
+    pub(crate) fn collapse_system_messages(&self) -> Transcript {
         let head = current_system_message(&self.0);
         let mut messages = Vec::with_capacity(self.0.len() + 1);
         messages.extend(head.map(Message::System));
@@ -91,7 +62,7 @@ impl Transcript {
     }
 
     /// Keep later system messages in place when the model accepts them; otherwise collapse them.
-    pub fn resolve(&self, supports_mid_convo_system_messages: bool) -> Cow<'_, Transcript> {
+    pub(crate) fn resolve(&self, supports_mid_convo_system_messages: bool) -> Cow<'_, Transcript> {
         if supports_mid_convo_system_messages {
             Cow::Borrowed(self)
         } else {
@@ -116,7 +87,7 @@ fn system_messages(messages: &[Message]) -> impl Iterator<Item = &SystemMessage>
 }
 
 /// The text blocks of a system message joined with `\n`.
-pub fn system_content_text(message: &SystemMessage) -> String {
+pub(crate) fn system_content_text(message: &SystemMessage) -> String {
     message
         .content
         .iter()
@@ -126,7 +97,7 @@ pub fn system_content_text(message: &SystemMessage) -> String {
 }
 
 /// Render a system message as a complete prompt: its content followed by its sections.
-pub fn system_message_text(message: &SystemMessage) -> String {
+pub(crate) fn system_message_text(message: &SystemMessage) -> String {
     let content = system_content_text(message);
     let mut parts = vec![content.as_str()];
     if let Some(sections) = &message.sections {
@@ -141,7 +112,7 @@ pub fn system_message_text(message: &SystemMessage) -> String {
 
 /// Render a later system message for APIs that accept system messages mid-conversation.
 /// Section changes are framed by name so the model can relate them to the leading prompt.
-pub fn render_system_message_update(message: &SystemMessage) -> String {
+pub(crate) fn render_system_message_update(message: &SystemMessage) -> String {
     let mut parts = Vec::new();
     let text = system_content_text(message);
     if !text.is_empty() {
@@ -157,7 +128,7 @@ pub fn render_system_message_update(message: &SystemMessage) -> String {
 }
 
 /// The tools available after applying every system message's tool changes in order.
-pub fn current_tools(messages: &[Message]) -> Vec<ToolSpec> {
+pub(crate) fn current_tools(messages: &[Message]) -> Vec<ToolSpec> {
     replay_tools(system_messages(messages))
 }
 
@@ -177,7 +148,7 @@ pub fn replay_tools<'a>(systems: impl IntoIterator<Item = &'a SystemMessage>) ->
 
 /// Replay every system message into one system message holding the current prompt and
 /// tools: later `content` is appended to the base prompt, `sections` are patched by
-/// name, and tools are resolved with [`current_tools`].
+/// name, and tools are resolved with [`replay_tools`].
 pub fn current_system_message(messages: &[Message]) -> Option<SystemMessage> {
     replay_system_message(system_messages(messages))
 }
@@ -258,25 +229,6 @@ pub fn tool_state_changes(previous: &[ToolSpec], current: &[ToolSpec]) -> ToolSt
     }
 }
 
-/// Every definition referenced by transcript tool state, in first-declaration order
-/// (a later same-name declaration replaces the definition in place).
-pub fn declared_tools(messages: &[Message]) -> Vec<ToolSpec> {
-    let mut definitions: IndexMap<String, ToolSpec> = IndexMap::new();
-    for system in system_messages(messages) {
-        for tool in &system.tools_added {
-            definitions.insert(tool.name.clone(), tool.clone());
-        }
-    }
-    definitions.into_values().collect()
-}
-
-/// Whether tool history contains a removal or same-name redeclaration that an
-/// addition-only transport cannot replay.
-pub fn has_non_additive_tool_changes(messages: &[Message]) -> bool {
-    let systems: Vec<&SystemMessage> = system_messages(messages).collect();
-    last_non_additive_tool_change(&systems).is_some()
-}
-
 /// Index (among system messages) of the last one with a removal or same-name
 /// redeclaration. A name declared before counts as a redeclaration even after its removal.
 fn last_non_additive_tool_change(systems: &[&SystemMessage]) -> Option<usize> {
@@ -297,7 +249,7 @@ fn last_non_additive_tool_change(systems: &[&SystemMessage]) -> Option<usize> {
 
 /// How a transport can express tool changes after the first request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptToolSupport {
+pub(crate) enum TranscriptToolSupport {
     /// Only the top-level tool list exists; it always holds the current tools.
     None,
     /// Tools can be added at a later message, but not removed or redefined.
@@ -308,7 +260,7 @@ pub enum TranscriptToolSupport {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct TranscriptTools {
+pub(crate) struct TranscriptTools {
     /// Tools sent in the top-level request field.
     pub request_tools: Vec<ToolSpec>,
     /// Number of leading system messages whose tool changes `request_tools` already
@@ -317,7 +269,7 @@ pub struct TranscriptTools {
 }
 
 /// Split tool declarations between the top-level request field and in-place changes.
-pub fn resolve_transcript_tools(
+pub(crate) fn resolve_transcript_tools(
     messages: &[Message],
     support: TranscriptToolSupport,
 ) -> TranscriptTools {
@@ -337,4 +289,25 @@ pub fn resolve_transcript_tools(
             }
         }
     }
+}
+
+fn drop_failed_turns(messages: &mut Vec<Message>) {
+    // Match results per turn: providers can reuse call ids in later turns.
+    let mut failed: HashSet<String> = HashSet::new();
+    messages.retain(|message| match message {
+        Message::Assistant(assistant) => {
+            let keep = !matches!(
+                assistant.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            );
+            failed = if keep {
+                HashSet::new()
+            } else {
+                assistant.tool_calls().map(|call| call.id.clone()).collect()
+            };
+            keep
+        }
+        Message::ToolResult(result) => !failed.contains(&result.tool_call_id),
+        Message::System(_) | Message::User(_) => true,
+    });
 }

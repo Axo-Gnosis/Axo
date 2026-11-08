@@ -1,10 +1,7 @@
-//! Config-value resolution (`!cmd`, `$NAME`) and the per-request auth lookup.
+//! Config-value interpolation and the per-request auth lookup.
 
-use std::collections::HashMap;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use futures::FutureExt;
 
@@ -13,8 +10,8 @@ use crate::error::Error;
 use crate::types::now_ms;
 
 /// What `resolve_auth` needs to know about one provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderAuthInfo {
+#[derive(Debug)]
+pub(crate) struct ProviderAuth {
     pub id: String,
     /// The raw `apiKey` from `models.jsonc`; resolved here with [`resolve_config_value`].
     pub config_api_key: Option<String>,
@@ -22,49 +19,20 @@ pub struct ProviderAuthInfo {
     pub env: Vec<String>,
     /// `false` lets the provider run without any key (`api_key: None`).
     pub requires_key: bool,
-    pub oauth: Option<OAuthKind>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OAuthKind {
-    Codex,
 }
 
 /// OAuth tokens are refreshed when they expire within this window.
 const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// `!cmd` results for the process lifetime (`None` = the command failed).
-static COMMAND_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-    LazyLock::new(Default::default);
 
 /// Resolves a config value (API key, header value):
-/// - `!cmd` runs `cmd` with `bash -c` (10 s timeout) and uses its trimmed stdout, cached per process;
-/// - otherwise `$NAME` / `${NAME}` interpolate environment variables, `$$` is a literal `$` and
+/// - values starting with `!` are rejected; the host must resolve commands;
+/// - `$NAME` / `${NAME}` interpolate environment variables, `$$` is a literal `$` and
 ///   `$!` a literal `!`; anything else is literal.
 pub fn resolve_config_value(value: &str) -> Result<String, Error> {
-    if let Some(command) = value.strip_prefix('!') {
-        let cached = COMMAND_CACHE
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(value)
-            .cloned();
-        let output = match cached {
-            Some(output) => output,
-            None => {
-                let output = run_command(command);
-                COMMAND_CACHE
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .insert(value.to_owned(), output.clone());
-                output
-            }
-        };
-        return output.ok_or_else(|| {
-            Error::Config(format!(
-                "Failed to resolve config value from shell command: {command}"
-            ))
-        });
+    if value.starts_with('!') {
+        return Err(Error::Config(
+            "command config values starting with '!' are not supported; the host resolves them before passing configuration".into(),
+        ));
     }
 
     let mut resolved = String::new();
@@ -134,105 +102,74 @@ fn env_name_prefix_len(text: &str) -> usize {
         .count()
 }
 
-/// Runs `bash -c <command>`; `None` on spawn failure, non-zero exit, timeout or empty output.
-fn run_command(command: &str) -> Option<String> {
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Drain stdout on a thread so a chatty command cannot block on a full pipe.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    if !status.success() {
-        return None;
-    }
-    let output = reader.join().ok()?.ok()?;
-    let value = String::from_utf8_lossy(&output).trim().to_owned();
-    (!value.is_empty()).then_some(value)
-}
-
-/// Resolves the key for one request, in order: `override_key`, the `models.jsonc` `apiKey`, the
-/// stored credential (refreshing OAuth tokens that expire within 5 minutes), the first set env var,
-/// then no key for providers that do not require one.
-pub async fn resolve_auth(
-    info: &ProviderAuthInfo,
-    store: &Arc<dyn CredentialStore>,
-    http: &reqwest::Client,
-    override_key: Option<&str>,
+/// Resolves config keys and headers together, then falls back to stored credentials
+/// (refreshing OAuth tokens that expire within 5 minutes) and provider environment variables.
+pub(crate) async fn resolve_auth(
+    info: Arc<ProviderAuth>,
+    store: Arc<dyn CredentialStore>,
+    http: reqwest::Client,
+    headers: BTreeMap<String, String>,
 ) -> Result<ModelAuth, Error> {
-    let with_key = |api_key: String| ModelAuth {
-        api_key: Some(api_key),
-        ..ModelAuth::default()
+    let mut auth = if info.config_api_key.is_some() || !headers.is_empty() {
+        let info = Arc::clone(&info);
+        tokio::task::spawn_blocking(move || {
+            Ok::<_, Error>(ModelAuth {
+                api_key: info
+                    .config_api_key
+                    .as_deref()
+                    .map(resolve_config_value)
+                    .transpose()?,
+                headers: headers
+                    .into_iter()
+                    .map(|(name, value)| resolve_config_value(&value).map(|value| (name, value)))
+                    .collect::<Result<_, _>>()?,
+                ..ModelAuth::default()
+            })
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))??
+    } else {
+        ModelAuth::default()
     };
-    if let Some(key) = override_key {
-        return Ok(with_key(key.to_owned()));
-    }
-    if let Some(raw) = &info.config_api_key {
-        let raw = raw.clone();
-        let key = tokio::task::spawn_blocking(move || resolve_config_value(&raw))
-            .await
-            .map_err(|error| Error::Config(error.to_string()))??;
-        return Ok(with_key(key));
+    if auth.api_key.is_some() {
+        return Ok(auth);
     }
     let stored = match store.get(&info.id).await? {
         Some(Credential::Oauth { expires, .. }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
-            refresh(info, store, http).await?
+            refresh(&info, &store, &http).await?
         }
         other => other,
     };
-    match stored {
-        Some(Credential::ApiKey { key }) => return Ok(with_key(key)),
-        Some(Credential::Oauth { access, .. }) => return Ok(with_key(access)),
-        None => {}
+    auth.api_key = match stored {
+        Some(Credential::ApiKey { key }) => Some(key),
+        Some(Credential::Oauth { access, .. }) => Some(access),
+        None => info
+            .env
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty())),
+    };
+    if auth.api_key.is_none() && info.requires_key {
+        return Err(Error::NoApiKey {
+            provider: info.id.clone(),
+        });
     }
-    if let Some(key) = info
-        .env
-        .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
-    {
-        return Ok(with_key(key));
-    }
-    if !info.requires_key {
-        return Ok(ModelAuth::default());
-    }
-    Err(Error::NoApiKey {
-        provider: info.id.clone(),
-    })
+    Ok(auth)
 }
 
 /// Refreshes the provider's OAuth credential under the store's exclusive lock. The store is
 /// re-read under the lock, so a refresh another request or process finished is reused (and a
 /// logout is respected). Returns the current credential.
 async fn refresh(
-    info: &ProviderAuthInfo,
+    info: &ProviderAuth,
     store: &Arc<dyn CredentialStore>,
     http: &reqwest::Client,
 ) -> Result<Option<Credential>, Error> {
-    let Some(OAuthKind::Codex) = info.oauth else {
+    if info.id != codex::PROVIDER {
         return Err(Error::Auth(format!(
             "OAuth credential for provider {} has expired and cannot be refreshed",
             info.id
         )));
-    };
+    }
     // The lock and the rotated token live together in one spawned update: a cancelled request
     // can neither release the lock mid-refresh nor drop the new credential before it is saved.
     let (store, http, provider) = (Arc::clone(store), http.clone(), info.id.clone());

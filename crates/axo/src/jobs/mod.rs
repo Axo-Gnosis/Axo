@@ -6,18 +6,21 @@
 //! both in one batch); its `job_end` is written by whichever comes second, the command's
 //! end or its admission's commit.
 
+pub(crate) mod command;
+
+use command::{CommandRun, JobControl, Phase, Stop};
+
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use async_trait::async_trait;
-use axo_agent::ToolInvocationId;
+use axo_agent::{AgentMessage, CustomMessage, MessageOrigin, QueuedMessage, ToolInvocationId};
+use axo_ai::UserBlock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
-use crate::exec::host::Container;
+use crate::schemes::artifact::Artifacts;
 use crate::session::journal;
 use crate::store::{Entry, SeqEntry};
 
@@ -30,14 +33,8 @@ pub(crate) trait JobHost: Send + Sync {
     async fn journal(&self, entry: Entry) -> Result<(), Error>;
 }
 
-/// A `job_end` that is due: the job has its result and its admission committed.
-pub(crate) struct PendingEnd {
-    id: u64,
-    entry: Entry,
-}
-
 /// A job's `job_start`, written with the tool result of the call that started it.
-pub(crate) struct JobStarted {
+struct JobStarted {
     pub id: u64,
     /// The result carries the `admittedJobs` receipt (a promoted job). A retained
     /// foreground command's start only reserves its id.
@@ -48,36 +45,9 @@ pub(crate) struct JobStarted {
 
 /// Who holds a reservation of pending results: a `wait` call or a queued delivery message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum DeliveryKey {
+enum DeliveryKey {
     Invocation(ToolInvocationId),
     Input(String),
-}
-
-/// Why a command was stopped before it finished.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Stop {
-    Aborted,
-    TimedOut(f64),
-    Killed,
-}
-
-/// Shared between the registry and a command's task.
-pub(crate) struct JobControl {
-    pub cancel: CancellationToken,
-    /// The first stop reason; later ones are ignored.
-    pub stop: Mutex<Option<Stop>>,
-    pub container: Container,
-}
-
-impl JobControl {
-    /// Records `reason` unless one is already set, then cancels.
-    fn stop(&self, reason: Stop) {
-        self.stop
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert(reason);
-        self.cancel.cancel();
-    }
 }
 
 /// A background job's state, as `proc://` shows it.
@@ -114,34 +84,6 @@ pub struct JobInfo {
     pub status: JobStatus,
 }
 
-/// One job as `proc://` shows it.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JobView {
-    pub id: u64,
-    pub command: String,
-    pub artifact: u64,
-    pub status: JobStatus,
-}
-
-impl JobView {
-    pub(crate) fn info(&self) -> JobInfo {
-        JobInfo {
-            id: job_name(self.id),
-            command: self.command.clone(),
-            artifact: self.artifact,
-            status: self.status,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Running,
-    /// The root exited; its container is still populated.
-    Retained,
-    Closed,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Foreground,
@@ -168,22 +110,17 @@ struct JobResult {
 }
 
 struct Job {
-    command: String,
-    artifact: u64,
-    spool: PathBuf,
-    phase: Phase,
+    run: CommandRun,
     mode: Mode,
     admitted: bool,
     /// Stored when the command ends; deliverable only after its `job_end` attempt.
     result: Option<JobResult>,
     delivery: Delivery,
-    control: Option<Arc<JobControl>>,
-    task: Option<JoinHandle<()>>,
 }
 
 impl Job {
-    fn view(&self, id: u64) -> JobView {
-        let status = match (self.phase, &self.result) {
+    fn view(&self, id: u64) -> JobInfo {
+        let status = match (self.run.phase, &self.result) {
             (Phase::Retained, _) => JobStatus::HelpersRunning,
             (
                 _,
@@ -196,10 +133,10 @@ impl Job {
             // A rebuilt job that never ended and is not reconciled yet.
             (Phase::Closed, None) => JobStatus::Failed,
         };
-        JobView {
-            id,
-            command: self.command.clone(),
-            artifact: self.artifact,
+        JobInfo {
+            id: job_name(id),
+            command: self.run.command.clone(),
+            artifact: self.run.artifact,
             status,
         }
     }
@@ -220,8 +157,6 @@ struct State {
     jobs: BTreeMap<u64, Job>,
     next_id: u64,
     admissions: HashMap<ToolInvocationId, JobStarted>,
-    /// Spools created for commands not registered yet.
-    starting: HashSet<PathBuf>,
     shut_down: bool,
 }
 
@@ -232,18 +167,6 @@ pub struct JobRegistry {
     state: Mutex<State>,
     changed: watch::Sender<u64>,
     host: OnceLock<Weak<dyn JobHost>>,
-}
-
-/// Keeps a spool in [`JobRegistry::live_spools`] until its command is registered.
-pub(crate) struct StartingSpool<'a> {
-    jobs: &'a JobRegistry,
-    path: PathBuf,
-}
-
-impl Drop for StartingSpool<'_> {
-    fn drop(&mut self) {
-        self.jobs.lock().starting.remove(&self.path);
-    }
 }
 
 /// The display name of job `id`.
@@ -274,6 +197,16 @@ pub(crate) struct ReservedResult {
     pub text: String,
 }
 
+/// Journal metadata reserved for one message; settled only after its append completes.
+pub(crate) struct Receipts {
+    pub start: Option<Entry>,
+    pub admitted_jobs: Vec<String>,
+    pub delivered_jobs: Vec<String>,
+    pub submission_id: Option<String>,
+    key: Option<DeliveryKey>,
+    admitted: Option<u64>,
+}
+
 /// Renders reserved results as `[bg_N] {headline}\n{text}`, joined by blank lines.
 pub(crate) fn render_results(results: &[ReservedResult]) -> String {
     results
@@ -284,6 +217,123 @@ pub(crate) fn render_results(results: &[ReservedResult]) -> String {
 }
 
 impl JobRegistry {
+    /// Reserves the journal metadata carried by a message before its atomic append.
+    pub(crate) fn receipts(&self, origin: &MessageOrigin) -> Receipts {
+        let (submission_id, key, started) = match origin {
+            MessageOrigin::Input(Some(id)) => {
+                let key = DeliveryKey::Input(id.clone());
+                if self.reserved_ids(&key).is_empty() {
+                    (Some(id.clone()), None, None)
+                } else {
+                    (None, Some(key), None)
+                }
+            }
+            MessageOrigin::Input(None) | MessageOrigin::Run => (None, None, None),
+            MessageOrigin::Tool(invocation) => (
+                None,
+                Some(DeliveryKey::Invocation(*invocation)),
+                self.take_start(*invocation),
+            ),
+        };
+        let delivered_jobs = key
+            .as_ref()
+            .map(|key| self.reserved_ids(key))
+            .unwrap_or_default();
+        let admitted = started
+            .as_ref()
+            .filter(|started| started.admits)
+            .map(|started| started.id);
+        Receipts {
+            start: started.map(|started| started.entry),
+            admitted_jobs: admitted.map(job_name).into_iter().collect(),
+            delivered_jobs,
+            submission_id,
+            key,
+            admitted,
+        }
+    }
+
+    /// Settles receipts after their message append, awaiting any newly due `job_end`.
+    pub(crate) async fn settle(&self, receipts: Receipts, committed: bool) {
+        if committed {
+            if let Some(key) = &receipts.key {
+                self.commit(key);
+            }
+            if let Some(id) = receipts.admitted
+                && let Some((text, is_error)) = self.admitted(id)
+            {
+                self.command_done(id, text, is_error).await;
+            }
+        } else {
+            if let Some(key) = &receipts.key {
+                self.release(key);
+            }
+            if let Some(id) = receipts.admitted {
+                self.admission_failed(id);
+            }
+        }
+    }
+
+    /// Reserves pending results for one queued delivery message.
+    pub(crate) fn delivery_message(&self) -> Option<QueuedMessage> {
+        if !self.has_pending() {
+            return None;
+        }
+        let id = format!("delivery-{}", uuid::Uuid::now_v7());
+        let results = self.reserve(DeliveryKey::Input(id.clone()));
+        if results.is_empty() {
+            return None;
+        }
+        let jobs: Vec<String> = results.iter().map(|r| job_name(r.id)).collect();
+        Some(QueuedMessage {
+            message: AgentMessage::Custom(CustomMessage {
+                custom_type: "job_result".into(),
+                content: vec![UserBlock::Text {
+                    text: format!("Background job results:\n\n{}", render_results(&results)),
+                }],
+                display: true,
+                details: Some(serde_json::json!({ "jobs": jobs })),
+                timestamp: axo_ai::now_ms(),
+            }),
+            id: Some(id),
+        })
+    }
+
+    /// Reserves pending results for a wait call; its result carries the receipt.
+    pub(crate) fn reserve_for(&self, invocation: ToolInvocationId) -> Vec<ReservedResult> {
+        self.reserve(DeliveryKey::Invocation(invocation))
+    }
+
+    /// Ends interrupted admitted jobs without starting delivery during session open.
+    pub(crate) async fn reconcile(
+        &self,
+        unfinished: Vec<u64>,
+        artifacts: &Artifacts,
+        host: &dyn JobHost,
+    ) -> Result<(), Error> {
+        for id in unfinished {
+            let Some((job, _)) = self.get(id) else {
+                continue;
+            };
+            let text = if artifacts.find(job.artifact).is_some() {
+                format!(
+                    "Command was interrupted when the session closed; it may have partially run. Output so far: artifact://{}",
+                    job.artifact
+                )
+            } else {
+                "Command was interrupted when the session closed; it may have partially run. Its output is unavailable.".to_owned()
+            };
+            host.journal(Entry::JobEnd {
+                base: journal::base(),
+                job_id: job_name(id),
+                text: text.clone(),
+                is_error: true,
+            })
+            .await?;
+            self.recovered_end(id, text);
+        }
+        Ok(())
+    }
     /// Rebuilds from every raw entry (not the projection). Returns the registry and the
     /// admitted jobs of this session that never ended, for reconciliation.
     pub fn new(session_id: String, entries: &[SeqEntry]) -> (Arc<Self>, Vec<u64>) {
@@ -362,16 +412,17 @@ impl JobRegistry {
             jobs.insert(
                 id,
                 Job {
-                    command: command.clone(),
-                    artifact,
-                    spool: PathBuf::new(),
-                    phase: Phase::Closed,
+                    run: CommandRun {
+                        command: command.clone(),
+                        artifact,
+                        phase: Phase::Closed,
+                        control: None,
+                        task: None,
+                    },
                     mode: Mode::Promoted,
                     admitted: true,
                     result,
                     delivery,
-                    control: None,
-                    task: None,
                 },
             );
         }
@@ -401,13 +452,6 @@ impl JobRegistry {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Lists `path` among [`JobRegistry::live_spools`] until the guard drops: from just
-    /// before its file is created until its command is registered.
-    pub(crate) fn starting_spool(&self, path: PathBuf) -> StartingSpool<'_> {
-        self.lock().starting.insert(path.clone());
-        StartingSpool { jobs: self, path }
-    }
-
     fn host(&self) -> Option<Arc<dyn JobHost>> {
         self.host.get().and_then(Weak::upgrade)
     }
@@ -423,13 +467,7 @@ impl JobRegistry {
     }
 
     /// A newly started foreground command.
-    pub(crate) fn register(
-        &self,
-        command: String,
-        artifact: u64,
-        spool: PathBuf,
-        control: Arc<JobControl>,
-    ) -> u64 {
+    fn register(&self, command: String, artifact: u64, control: Arc<JobControl>) -> u64 {
         let mut state = self.lock();
         let id = state.next_id;
         state.next_id += 1;
@@ -439,16 +477,17 @@ impl JobRegistry {
         state.jobs.insert(
             id,
             Job {
-                command,
-                artifact,
-                spool,
-                phase: Phase::Running,
+                run: CommandRun {
+                    command,
+                    artifact,
+                    phase: Phase::Running,
+                    control: Some(control),
+                    task: None,
+                },
                 mode: Mode::Foreground,
                 admitted: false,
                 result: None,
                 delivery: Delivery::NotDeliverable,
-                control: Some(control),
-                task: None,
             },
         );
         drop(state);
@@ -457,11 +496,11 @@ impl JobRegistry {
     }
 
     /// The command task; a job already closed lets it run detached.
-    pub(crate) fn set_task(&self, id: u64, task: JoinHandle<()>) {
+    fn set_task(&self, id: u64, task: JoinHandle<()>) {
         if let Some(job) = self.lock().jobs.get_mut(&id)
-            && job.phase != Phase::Closed
+            && job.run.phase != Phase::Closed
         {
-            job.task = Some(task);
+            job.run.task = Some(task);
         }
     }
 
@@ -472,15 +511,15 @@ impl JobRegistry {
             session_id: self.session_id.clone(),
             job_id: job_name(id),
             call_id: call_id.to_owned(),
-            command: job.command.clone(),
-            artifact: job.artifact,
+            command: job.run.command.clone(),
+            artifact: job.run.artifact,
         }
     }
 
     /// Moves a foreground command to the background; false once it already finished.
     /// The tool result of `invocation` then admits the job: its batch writes the
     /// `job_start` and the `admittedJobs` receipt together.
-    pub(crate) fn promote(&self, id: u64, invocation: ToolInvocationId, call_id: &str) -> bool {
+    fn promote(&self, id: u64, invocation: ToolInvocationId, call_id: &str) -> bool {
         let promoted = {
             let mut state = self.lock();
             match state.jobs.get_mut(&id) {
@@ -508,7 +547,7 @@ impl JobRegistry {
 
     /// A foreground command of `invocation` left helpers running: its tool result's batch
     /// writes the job's `job_start` without a receipt, so its `bg_N` stays reserved.
-    pub(crate) fn retain_on_commit(&self, invocation: ToolInvocationId, id: u64, call_id: &str) {
+    fn retain_on_commit(&self, invocation: ToolInvocationId, id: u64, call_id: &str) {
         let mut state = self.lock();
         let Some(job) = state.jobs.get(&id) else {
             return;
@@ -529,7 +568,7 @@ impl JobRegistry {
     /// foreground waiter owns the result and promotion is refused from now on. True: it
     /// was promoted. Either way [`JobRegistry::command_done`] follows when the job stays
     /// visible (promoted or retained).
-    pub(crate) fn finishing(&self, id: u64) -> bool {
+    fn finishing(&self, id: u64) -> bool {
         let mut state = self.lock();
         let Some(job) = state.jobs.get_mut(&id) else {
             return false;
@@ -546,30 +585,26 @@ impl JobRegistry {
         }
     }
 
-    /// The command's result, stored at once so `proc://` shows it. Returns the job's
-    /// `job_end` when it is due now: the job is promoted and its admitting receipt
-    /// committed; otherwise [`JobRegistry::admitted`] returns it once the receipt commits.
-    /// A job whose receipt was never written journals nothing. After shutdown nothing is
-    /// journaled (reopen reconciles it as interrupted) and the result is released at
-    /// once. A foreground (retained) job's result is only stored for `proc://`; the
-    /// foreground waiter returns it, so it is never journaled or delivered.
-    pub(crate) fn command_done(&self, id: u64, text: String, is_error: bool) -> Option<PendingEnd> {
+    /// Stores the command result and journals its end once admission has committed.
+    /// Whichever arrives second (the result or its receipt) completes this protocol.
+    /// Retained foreground results are visible only through `proc://`; shutdown leaves
+    /// reconciliation to reopen and releases admitted results without another append.
+    async fn command_done(&self, id: u64, text: String, is_error: bool) {
         let (end, ready) = {
             let mut state = self.lock();
             let shut_down = state.shut_down;
-            let job = state.jobs.get_mut(&id)?;
+            let Some(job) = state.jobs.get_mut(&id) else {
+                return;
+            };
             let end = (!shut_down
                 && job.mode == Mode::Promoted
                 && job.admitted
                 && job.delivery != Delivery::Never)
-                .then(|| PendingEnd {
-                    id,
-                    entry: Entry::JobEnd {
-                        base: journal::base(),
-                        job_id: job_name(id),
-                        text: text.clone(),
-                        is_error,
-                    },
+                .then(|| Entry::JobEnd {
+                    base: journal::base(),
+                    job_id: job_name(id),
+                    text: text.clone(),
+                    is_error,
                 });
             job.result = Some(JobResult {
                 is_error,
@@ -581,21 +616,17 @@ impl JobRegistry {
         if ready {
             self.results_ready();
         }
-        end
-    }
-
-    /// Appends a due `job_end` through the session, then makes the result deliverable.
-    /// A failed append is logged: the receipt-bearing message write surfaces a persistent
-    /// journal failure.
-    pub(crate) async fn write_end(&self, end: PendingEnd) {
-        let PendingEnd { id, entry } = end;
+        let Some(entry) = end else {
+            return;
+        };
         if !self.lock().shut_down {
-            let journaled = match self.host() {
-                Some(host) => host.journal(entry).await,
-                None => Err(Error::Job(job_name(id))),
-            };
-            if let Err(err) = journaled {
-                tracing::error!("cannot journal the end of {}: {err}", job_name(id));
+            match self.host() {
+                Some(host) => {
+                    if let Err(err) = host.journal(entry).await {
+                        tracing::error!("cannot journal the end of {}: {err}", job_name(id));
+                    }
+                }
+                None => tracing::error!("cannot journal the end of {}: session gone", job_name(id)),
             }
         }
         let ready = self
@@ -611,7 +642,7 @@ impl JobRegistry {
 
     /// The reconciled end of a rebuilt job that never ended; already journaled by the
     /// caller. Never starts delivery: opening a session never starts a run.
-    pub(crate) fn recovered_end(&self, id: u64, text: String) {
+    fn recovered_end(&self, id: u64, text: String) {
         if let Some(job) = self.lock().jobs.get_mut(&id) {
             job.result = Some(JobResult {
                 is_error: true,
@@ -623,21 +654,21 @@ impl JobRegistry {
     }
 
     /// The root exited while processes stay in the container.
-    pub(crate) fn retained(&self, id: u64) {
+    fn retained(&self, id: u64) {
         if let Some(job) = self.lock().jobs.get_mut(&id) {
-            job.phase = Phase::Retained;
+            job.run.phase = Phase::Retained;
         }
         self.bump();
     }
 
     /// The container is empty and closed. A never-promoted command leaves no state behind.
-    pub(crate) fn closed(&self, id: u64) {
+    fn closed(&self, id: u64) {
         let mut state = self.lock();
         let promoted = match state.jobs.get_mut(&id) {
             Some(job) => {
-                job.phase = Phase::Closed;
-                job.control = None;
-                job.task = None;
+                job.run.phase = Phase::Closed;
+                job.run.control = None;
+                job.run.task = None;
                 job.mode == Mode::Promoted
             }
             None => return,
@@ -650,12 +681,16 @@ impl JobRegistry {
     }
 
     /// Stops an open job; the first reason wins. False if it is closed or unknown.
-    pub(crate) fn stop(&self, id: u64, reason: Stop) -> bool {
+    fn stop(&self, id: u64, reason: Stop) -> bool {
         let state = self.lock();
         match state.jobs.get(&id) {
             Some(Job {
-                phase: Phase::Running | Phase::Retained,
-                control: Some(control),
+                run:
+                    CommandRun {
+                        phase: Phase::Running | Phase::Retained,
+                        control: Some(control),
+                        ..
+                    },
                 ..
             }) => {
                 control.stop(reason);
@@ -671,8 +706,12 @@ impl JobRegistry {
         match state.jobs.get(&id) {
             Some(
                 job @ Job {
-                    phase: Phase::Running | Phase::Retained,
-                    control: Some(control),
+                    run:
+                        CommandRun {
+                            phase: Phase::Running | Phase::Retained,
+                            control: Some(control),
+                            ..
+                        },
                     ..
                 },
             ) if listed(job) => {
@@ -684,13 +723,12 @@ impl JobRegistry {
     }
 
     /// The `job_start` the tool result of `invocation` carries, if its call started a job.
-    pub(crate) fn take_start(&self, invocation: ToolInvocationId) -> Option<JobStarted> {
+    fn take_start(&self, invocation: ToolInvocationId) -> Option<JobStarted> {
         self.lock().admissions.remove(&invocation)
     }
 
-    /// The admitting receipt was committed. Returns the job's `job_end` when its command
-    /// already ended; otherwise [`JobRegistry::command_done`] returns it.
-    pub(crate) fn admitted(&self, id: u64) -> Option<PendingEnd> {
+    /// Commits admission, returning an already-ended command for `command_done`.
+    fn admitted(&self, id: u64) -> Option<(String, bool)> {
         let (end, ready) = {
             let mut state = self.lock();
             let shut_down = state.shut_down;
@@ -703,15 +741,7 @@ impl JobRegistry {
                 .result
                 .as_ref()
                 .filter(|_| job.mode == Mode::Promoted && !shut_down)
-                .map(|result| PendingEnd {
-                    id,
-                    entry: Entry::JobEnd {
-                        base: journal::base(),
-                        job_id: job_name(id),
-                        text: result.text.clone().unwrap_or_default(),
-                        is_error: result.is_error,
-                    },
-                });
+                .map(|result| (result.text.clone().unwrap_or_default(), result.is_error));
             // After shutdown nothing is journaled, as in `command_done`.
             (end, shut_down && job.release_result())
         };
@@ -725,7 +755,7 @@ impl JobRegistry {
     /// The admitting receipt was never written: the job is never admitted, so it never
     /// becomes deliverable (nor awaited by `wait`) and stays visible only through
     /// `proc://`.
-    pub(crate) fn admission_failed(&self, id: u64) {
+    fn admission_failed(&self, id: u64) {
         let mut state = self.lock();
         state.admissions.retain(|_, admission| admission.id != id);
         fail_admission(&mut state, id);
@@ -734,7 +764,7 @@ impl JobRegistry {
     }
 
     /// Reserves every pending result under `key`, in ascending id order.
-    pub(crate) fn reserve(&self, key: DeliveryKey) -> Vec<ReservedResult> {
+    fn reserve(&self, key: DeliveryKey) -> Vec<ReservedResult> {
         let mut state = self.lock();
         let reserved: Vec<_> = state
             .jobs
@@ -745,7 +775,7 @@ impl JobRegistry {
                 job.delivery = Delivery::Reserved(key.clone());
                 Some(ReservedResult {
                     id: *id,
-                    command: job.command.clone(),
+                    command: job.run.command.clone(),
                     text,
                 })
             })
@@ -758,7 +788,7 @@ impl JobRegistry {
     }
 
     /// The `bg_N` names reserved under `key`, ascending.
-    pub(crate) fn reserved_ids(&self, key: &DeliveryKey) -> Vec<String> {
+    fn reserved_ids(&self, key: &DeliveryKey) -> Vec<String> {
         self.lock()
             .jobs
             .iter()
@@ -786,12 +816,12 @@ impl JobRegistry {
     }
 
     /// The delivering message was committed.
-    pub(crate) fn commit(&self, key: &DeliveryKey) {
+    fn commit(&self, key: &DeliveryKey) {
         self.move_reserved(Some(key), Delivery::Delivered);
     }
 
     /// The delivering message was not written; its results are pending again.
-    pub(crate) fn release(&self, key: &DeliveryKey) {
+    fn release(&self, key: &DeliveryKey) {
         self.move_reserved(Some(key), Delivery::Pending);
     }
 
@@ -834,26 +864,14 @@ impl JobRegistry {
                 job.mode == Mode::Promoted
                     && job.admitted
                     && job.delivery == Delivery::NotDeliverable
-                    && (job.phase != Phase::Closed || job.result.is_some())
+                    && (job.run.phase != Phase::Closed || job.result.is_some())
             })
             .map(|(id, _)| *id)
             .collect()
     }
 
-    /// Spools still being written, which a fork must copy rather than link.
-    pub(crate) fn live_spools(&self) -> HashSet<PathBuf> {
-        let state = self.lock();
-        state
-            .jobs
-            .values()
-            .filter(|job| job.phase != Phase::Closed)
-            .map(|job| job.spool.clone())
-            .chain(state.starting.iter().cloned())
-            .collect()
-    }
-
     /// Promoted (including rebuilt) and retained jobs, ascending.
-    pub(crate) fn list(&self) -> Vec<JobView> {
+    pub(crate) fn list(&self) -> Vec<JobInfo> {
         self.lock()
             .jobs
             .iter()
@@ -863,7 +881,7 @@ impl JobRegistry {
     }
 
     /// A listed job and its result text, if it has one not yet delivered.
-    pub(crate) fn get(&self, id: u64) -> Option<(JobView, Option<String>)> {
+    pub(crate) fn get(&self, id: u64) -> Option<(JobInfo, Option<String>)> {
         self.lock()
             .jobs
             .get(&id)
@@ -884,12 +902,12 @@ impl JobRegistry {
                 .jobs
                 .values_mut()
                 .filter_map(|job| {
-                    if job.phase != Phase::Closed
-                        && let Some(control) = &job.control
+                    if job.run.phase != Phase::Closed
+                        && let Some(control) = &job.run.control
                     {
                         control.stop(Stop::Killed);
                     }
-                    job.task.take()
+                    job.run.task.take()
                 })
                 .collect()
         };
@@ -905,8 +923,8 @@ impl JobRegistry {
         let mut state = self.lock();
         state.shut_down = true;
         for job in state.jobs.values() {
-            if job.phase != Phase::Closed
-                && let Some(control) = &job.control
+            if job.run.phase != Phase::Closed
+                && let Some(control) = &job.run.control
             {
                 control.container.kill();
             }
@@ -917,7 +935,7 @@ impl JobRegistry {
 }
 
 fn listed(job: &Job) -> bool {
-    job.mode == Mode::Promoted || job.phase == Phase::Retained
+    job.mode == Mode::Promoted || job.run.phase == Phase::Retained
 }
 
 /// Job `id`'s admitting receipt was never written; it is never admitted or delivered.

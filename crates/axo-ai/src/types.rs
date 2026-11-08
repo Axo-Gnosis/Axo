@@ -42,7 +42,7 @@ pub enum Message {
 /// `content` adds instructions from that point on, `sections` replace or remove named
 /// prompt sections (`None` removes one), and `tools_added`/`tools_removed` change the
 /// tool set. Replaying every system message in order yields the current prompt and tools.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemMessage {
     #[serde(deserialize_with = "content_vec")]
@@ -101,9 +101,6 @@ pub struct AssistantMessage {
     pub failure: Option<ProviderFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_stop_reason: Option<String>,
-    /// Provider indication of whether the model explicitly ended its turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_turn: Option<bool>,
     /// Milliseconds since the epoch when the request started.
     pub timestamp: i64,
     /// Milliseconds from `timestamp` until the response ended (monotonic clock).
@@ -129,7 +126,6 @@ impl AssistantMessage {
             error_message: None,
             failure: None,
             raw_stop_reason: None,
-            end_turn: None,
             timestamp: now_ms(),
             duration_ms: None,
         }
@@ -184,6 +180,15 @@ pub enum UserBlock {
         /// e.g. `image/png`.
         mime_type: String,
     },
+}
+
+impl UserBlock {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            Self::Image { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

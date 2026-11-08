@@ -4,6 +4,18 @@
 use crate::model::Model;
 use crate::types::ThinkingLevel;
 
+/// Tokens always left for the answer when a thinking budget shares the response ceiling.
+pub(crate) const MIN_ANSWER_TOKENS: u64 = 1024;
+
+pub(crate) fn default_thinking_budget(level: ThinkingLevel) -> u64 {
+    match level {
+        ThinkingLevel::Minimal => 1024,
+        ThinkingLevel::Low => 2048,
+        ThinkingLevel::Medium => 8192,
+        _ => 16384,
+    }
+}
+
 /// Levels the model accepts, lowest first. Non-reasoning models support only `Off`.
 /// A level mapped to `null` is unsupported; `XHigh` and `Max` need an explicit mapping.
 pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
@@ -49,7 +61,7 @@ pub fn clamp_level(model: &Model, level: ThinkingLevel) -> ThinkingLevel {
 /// The provider value to send for `level`: the mapped string, the level's own name
 /// when the map has no entry, or `None` when the level is unsupported (`null`).
 /// For `Off`, an unmapped level yields `None` (send nothing).
-pub fn provider_value(model: &Model, level: ThinkingLevel) -> Option<String> {
+pub(crate) fn provider_value(model: &Model, level: ThinkingLevel) -> Option<String> {
     match model
         .thinking_level_map
         .as_ref()

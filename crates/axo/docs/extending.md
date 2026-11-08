@@ -9,7 +9,9 @@ axo reads the ecosystem files itself; everything else arrives from the host, in 
 - **Context files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, plus any path enabled in `settings.contextFiles`):** Add persona, architecture notes, and coding rules at the repository root or in subdirectories (loaded on demand when `read`, `write`, or `edit` touches that subtree). User-wide files come from the host as `UserConfig::context_files`, and `~/.agents/AGENTS.md` with `homeAgentsDir: true`. See [`prompts-and-context.md`](prompts-and-context.md#context-files-cratesaxosrccontextfilesrs).
 - **Prompt overrides (`ConfigLayer::prompts`):** The user and project layers may override `SYSTEM`, `WORK`, `PROSE`, or the summarizer prompts (`SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`); the project's override wins per name. An empty `SYSTEM`, `WORK`, or `PROSE` override disables that prompt section, an empty summarizer override keeps the bundled prompt with a `Diagnostic`, and a name outside `PROMPT_NAMES` is an `Error::Config`.
 - **Skills (`.agents/skills/<name>/SKILL.md`, host skill roots, and `~/.agents/skills/<name>/SKILL.md`):** Package task instructions and reference files that the model reads on demand from `<available_skills>` or the user invokes inline with `/<name> [args]`. Roots are searched in order: project `.agents/skills` (needs project access and `project.files.skills`), each `UserConfig::skill_roots` entry, then `~/.agents/skills` (only with `homeAgentsDir: true`). Optional `argument-hint` frontmatter is the placeholder apps show after `/<name>`; a skill named like a built-in command (`compact`, `shake`, `model`, `thinking`, `navigate`) gets a warning diagnostic and is left out of the command catalog. See [`prompts-and-context.md`](prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
-- **Custom providers and model patches (`axo_ai::ModelsConfig`):** The host's `ModelsConfig` registers OpenAI- or Anthropic-compatible endpoints, custom headers, `$ENV` or `!command` API key resolvers, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `cost`, `compat`). See [`configuration.md`](configuration.md#models-axo_aimodelsconfig--credentials).
+- **Custom providers and model patches (`axo_ai::ModelsConfig`):** The host's `ModelsConfig` registers OpenAI- or Anthropic-compatible endpoints, custom headers, literal or `$ENV` API keys, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `cost`, `compat`). Config values starting with `!` are rejected; hosts resolve command-based secrets before passing configuration. See [`configuration.md`](configuration.md#models-axo_aimodelsconfig--credentials).
+
+Start-time diagnostics for context files, skills, schemes and bundled docs, prompt overrides, host sections, and reserved command names are available through `session.diagnostics()` and still logged as warnings. Runtime `NestedContext` read errors are only logged; they are not added to that startup snapshot.
 
 ## 2. Embedding `axo` in a Rust Host
 
@@ -21,7 +23,7 @@ Hosts link the `axo` crate to manage `Models`, a `SessionStore`, a `ConfigSource
 # async fn example() -> Result<(), axo::Error> {
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use axo::store::JsonlStore;
+use axo::JsonlStore;
 use axo::{
     Answer, Axo, Command, CommandInfo, ConfigLayer, ConfigSource, NavigateOptions, PromptPart,
     PromptRequest, PromptResult, RecoveryPolicy, SessionEvent, SessionOptions, ShakeMode,
@@ -54,6 +56,7 @@ impl ConfigSource for HostConfig {
 
 let state = PathBuf::from("/var/lib/my-host");
 let models = Models::load(ModelsOptions {
+    http_client: None,
     cache_dir: Some(state.join("cache")),
     extended_context: false,
     config: ModelsConfig::default(),
@@ -81,6 +84,7 @@ let session = axo
             Some("Running inside my-host.".into()),
         )],
         tools: Vec::new(),
+        tool_hooks: Vec::new(),
         schemes: Vec::new(),
         recovery: RecoveryPolicy::Resume,
     })
@@ -142,10 +146,14 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `prompt_with` | `async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error>` | `PromptRequest { input: PromptInput, request_id: Option<String> }`. Like `prompt`, but deduplicates by `request.request_id`: if a submission with the same `request_id` is already in the log, returns `PromptResult::Duplicate(existing)` without starting a second run |
 | `steer` | `async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error>` | Persists a `Steer` submission and queues it to be injected after the current batch of tool calls finishes, before the next model request. While it is queued, tools see `ToolContext::steer` pending: a foreground `bash` command moves to the background and `wait` returns. Skills expand here too |
 | `follow_up` | `async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error>` | Persists a `FollowUp` submission and queues it to run when the active run would otherwise finish. Skills expand here too |
-| `abort` | `async fn abort(&self)` | Stop: cancels active maintenance and stops the current run with `CancelReason::User` (persisting an `Aborted` outcome), including its foreground tool calls and foreground `bash` command. Background jobs keep running. A Stop that interrupted an active run pauses automatic delivery of finished job results until the next `prompt`, `steer`, or `follow_up`; a Stop while idle changes nothing (see [Background Job Durability](sessions-and-compaction.md#background-job-durability)) |
+| `abort` | `fn abort(&self)` | Stop (`session.abort()`, without awaiting): cancels active maintenance and stops the current run with `CancelReason::User` (persisting an `Aborted` outcome), including its foreground tool calls and foreground `bash` command. Background jobs keep running. A Stop that interrupted an active run pauses automatic delivery of finished job results until the next `prompt`, `steer`, or `follow_up`; a Stop while idle changes nothing (see [Background Job Durability](sessions-and-compaction.md#background-job-durability)) |
 | `shutdown` | `async fn shutdown(&self)` | Cancels with `CancelReason::Shutdown`, waits for the active run task to settle without recording it as user-aborted (so reopening the session can resume it), then stops every open job (SIGTERM to its container, SIGKILL after 1 s) and waits for each job's task. A job stopped this way records no result; the next open marks it interrupted. Dropping a `Session` without `shutdown` cancels the run and synchronously kills every open job's container |
 | `set_model` | `async fn set_model(&self, model: Model) -> Result<(), Error>` | Appends `Entry::ModelChange` (and `ThinkingLevelChange` if clamped) and, once written, switches the model for the next request; allowed during maintenance, which it never invalidates |
 | `set_thinking` | `async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error>` | Clamps `level` to the current model, appends `Entry::ThinkingLevelChange` when changed (applied once written), and returns the applied level |
+| `set_name` | `async fn set_name(&self, name: Option<String>) -> Result<SeqEntry, Error>` | Appends `Entry::SessionInfo` at the current position; replaces newlines with spaces, trims, and treats an empty name as `None`. May run at any time; adds no model-context messages |
+| `name` | `fn name(&self) -> Option<String>` | Returns the latest session name in file order, globally rather than scoped to the current branch |
+| `append_custom` | `async fn append_custom(&self, custom_type: &str, data: Option<Value>) -> Result<SeqEntry, Error>` | Appends `Entry::Custom` at the current position. May run at any time; adds no model-context messages. Rejects an empty `custom_type` with `Error::InvalidInput` |
+| `custom` | `fn custom(&self, custom_type: &str) -> Option<Value>` | Returns the latest data of that type on the current root-to-leaf path (branch-scoped), or `None` if absent or the latest entry has no data |
 | `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles the pending question; `dismiss` drops it and stops the run like `abort` (`CancelReason::User`). Both return `Error::NoPendingQuestion` for an unknown call id |
 | `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot` (including `jobs`, the same list as `Session::jobs`), and a live `broadcast::Receiver<SessionEvent>` |
 | `compact` | `async fn compact(&self, focus: Option<String>) -> Result<(), Error>` | Runs a standalone compaction summary checkpoint in a session-owned task; `focus` tells the summary what to prioritize and is recorded on the `Entry::Compaction`; blank focus counts as none |
@@ -156,6 +164,7 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `commands` | `fn commands(&self) -> Vec<CommandInfo>` | The command catalog a host may offer: the five built-ins, then each skill whose name is not reserved. See [Commands](#commands) |
 | `run_command` | `async fn run_command(&self, command: Command) -> Result<(), Error>` | Runs a built-in `Command` under its policy; the only way a built-in runs. `Command::Model` takes `provider/id` only (otherwise `Error::ModelNotFound`) |
 | `id` / `path` / `skills` | `fn id(&self) -> &str`<br>`fn path(&self) -> &Path`<br>`fn skills(&self) -> &[Skill]` | The header UUIDv7 (known before the file exists); the session file, created lazily on the first submission; the skills loaded at start, which feed the prompt catalog and `/name` commands |
+| `diagnostics` | `fn diagnostics(&self) -> &[Diagnostic]` | Start-time diagnostics retained for the host and still logged as warnings; excludes runtime `NestedContext` read errors, which are only logged |
 | `schemes` | `fn schemes(&self) -> &Schemes` | This session's URL schemes for hosts resolving URLs they display: `exact`, then `resolve`, then `read` for `Target::Virtual`; a fork resolves to its own files |
 | `jobs` | `fn jobs(&self) -> Vec<JobInfo>` | This session's background jobs, ascending: promoted, retained and rebuilt jobs, finished ones included, exactly the jobs `read proc://` lists. See [Background jobs for hosts](#background-jobs-for-hosts) |
 | `kill_job` | `fn kill_job(&self, id: &str) -> bool` | Stops job `id` (`bg_N`) like `write proc://bg_N/kill`: `true` when a running job (or its retained helpers) was signalled; `false` for an unknown or invalid id, or a job whose processes have all exited |
@@ -174,7 +183,7 @@ Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
 | `QuestionResolved` | `call_id: String` | A pending question was answered or dismissed |
 | `MaintenanceStart` | `kind: MaintenanceKind` | Compaction, `/shake`, or branch summary started |
 | `MaintenanceEnd` | `kind: MaintenanceKind`, `error: Option<String>`, `aborted: bool` | Maintenance task finished |
-| `Retry` | `attempt: usize`, `delay_ms: u64` | Transient model error backoff retry (see [Transient Retry & Overflow Recovery](sessions-and-compaction.md#transient-retry--overflow-recovery)) |
+| `Retry` | `attempt: u32`, `delay_ms: u64` | Transient model error backoff retry (see [Transient Retry & Overflow Recovery](sessions-and-compaction.md#transient-retry--overflow-recovery)) |
 | `Jobs` | `jobs: Vec<JobInfo>` | The full `Session::jobs` list after any background job changed (promoted, retained, ended, helpers exited, or killed) |
 
 ### Background jobs for hosts
@@ -209,13 +218,15 @@ Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
 | Trait | Crate | Purpose |
 | :--- | :--- | :--- |
 | `ConfigSource` | `axo::ConfigSource` | Supplies configuration: `user()` returns the trusted `UserConfig` (sampled at every `create_session`, `open_session`, and `Axo::schemes`), `project(cwd)` the untrusted project `ConfigLayer` (called only at `Read` or `Trust`, and only when the user's `project.files.config` is `true`). axo validates, merges, and filters both through `EffectiveConfig::resolve`. Passed via `AxoBuilder::config`; without one, sessions use default settings and no project layer. See [Configuration source](configuration.md#configuration-source-axoconfigsource) |
-| `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `HostEnv`, `DevShellEnv`, and `StaticEnv`. Passed via `SessionOptions::exec_env`. `DevShellEnv::new(base, settings, cache_dir: Option<PathBuf>, supervisor: Arc<ProcessSupervisor>)` runs its direnv, git, nix and capture subprocesses through that supervisor (a `None` `cache_dir` makes Nix mode resolve to `base`); `ExecEnv` only resolves the environment, and every command still runs supervised |
+| `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `DevShellEnv` and `StaticEnv`; `StaticEnv::host()` snapshots the host environment. An `Arc<EnvMap>` converts to `Resolved` with no notice or prompt note. Passed via `SessionOptions::exec_env`. `DevShellEnv::new(base, settings, cache_dir: Option<PathBuf>, supervisor: Arc<ProcessSupervisor>)` runs its direnv, git, nix and capture subprocesses through that supervisor (a `None` `cache_dir` makes Nix mode resolve to `base`); `ExecEnv` only resolves the environment, and every command still runs supervised |
 | `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites whole-word, `--flag=`/`NAME=`, and redirect-target URLs to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it). `edit`/`write` refuse non-writable files (`{url} is read-only`); bash refuses virtual URLs (`Cannot use {url} in bash: no file backs it. Use read {url}.`) and output redirects onto read-only files. `prompt_doc` (default empty) is the one-line bullet listed in the model's `schemes` prompt section. Host scheme names must match `^[a-z][a-z0-9+.-]+$` (lowercase, two or more characters); `artifact` and `file` are reserved (`Error::Scheme`). `write_replay` defaults to `Replay::Never`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://` (only when the host set `AxoBuilder::cache_dir`), and in open sessions `proc://` (background jobs; see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)). Passed via `SessionOptions::schemes`; a host scheme named like a built-in replaces it. Hosts resolve URLs they display through `Session::schemes()` or `Axo::schemes(path, project_access, host_schemes)` |
-| `SessionStore` / `SessionWriter` | `axo::store::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading (whole sessions or just the header), listing, and appending session entries. Bundled implementation: `JsonlStore`. Passed as the required `store` argument of `Axo::builder` |
+| `SessionStore` / `SessionWriter` | `axo::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading (whole sessions or just the header), listing, and appending session entries. `SessionWriter::path` is known before the file exists; `append` must complete durable storage for `Entry::requires_sync` entries before returning. Bundled implementation: `JsonlStore`. Passed as the required `store` argument of `Axo::builder` |
 | `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, and `execute(cx: ToolContext)`) for `axo_agent::Agent`. `execution_mode` defaults to `Parallel`, `replay` to `Never`, `prompt_guidelines` to empty. Tools hold their own session handles; `cx` carries per-call state. Pass host tools as `SessionOptions::tools` `ToolFactory` closures; axo calls each with the session's `Arc<SessionTools>` (again per fork), so the tool can use `locate`, `schemes`, `rewrite_urls`, the ledger, the `exec` environment, and the `supervisor` for subprocesses. One named like a built-in replaces it in place |
-| `LoopHooks` | `axo_agent::LoopHooks` | Lifecycle hooks on `axo_agent::Agent`: `transform_context` (per-request message rewrite), `convert_to_llm` (lowers `Custom` messages; default drops them), `prepare_request` (returns `RequestUpdate { context, model, thinking }`), `should_skip_tools` (intercepts unusable responses before tools run), `before_tool_call` (can return `ToolCallDecision::Block { reason, terminate }`; a hook error blocks the call), `after_tool_call` (returns `AfterToolCallResult` overrides; a hook error is logged and ignored), `finish_turn` (returns `TurnFinish { decision: Option<TurnDecision>, context }` where `TurnDecision` is `Continue` or `End`), `prepare_next_turn` (returns `TurnUpdate` with messages getting `MessageOrigin::Run`), and `steering` / `follow_up` (host-supplied `Vec<QueuedMessage>` drained after agent queues; see [Queued inputs and message origins](#queued-inputs-and-message-origins)) |
-| `Persist` | `axo_agent::Persist` | Ordered async subscriber on `axo_agent::Agent` awaited before the next model request (used by `Session` to persist `Entry::Message` on `MessageEnd { message, origin }`) |
-| `Api` / `Streamer` | `axo_ai::{Api, Streamer}` | Streaming LLM wire adapter (`AnthropicApi`, `CompletionsApi`, `CodexApi`, or `ScriptedApi` behind the `testing` feature). Custom streamers can be injected via `AxoBuilder::streamer` |
+| `ToolHooks` | `axo_agent::ToolHooks` | Host tool policy, supplied as an ordered `Vec<Arc<dyn ToolHooks>>` via `SessionOptions::tool_hooks` (empty by default; inherited by forks), or directly via `AgentConfig::tool_hooks`. `before_tool_call` receives `BeforeToolCallContext` and returns `ToolCallDecision`; the first `Block { reason, terminate }` or hook error blocks the call and skips later hooks. `after_tool_call` receives `AfterToolCallContext` and returns `AfterToolCallResult` overrides; each hook sees the result after earlier overrides, and errors are logged and skipped |
+| `LoopHooks` | `axo_agent::LoopHooks` | The loop driver's contract, implemented by `Session` itself rather than supplied through session options. `prepare_request(&AgentContext, cancel)` returns `Result<Option<Vec<AgentMessage>>, HookError>` to optionally replace messages; `convert_to_llm` lowers `Custom` messages (default drops them); `should_skip_tools` intercepts unusable responses; `finish_turn` returns `TurnFinish { continue_turn: bool, messages: Option<Vec<AgentMessage>> }`; `prepare_next_turn` returns `Vec<AgentMessage>` appended with normal events and `MessageOrigin::Run`; `steering` supplies queued host input (see [Queued inputs and message origins](#queued-inputs-and-message-origins)). Model, thinking, and tools remain controlled through `Agent::set_model`, `Agent::set_thinking`, and `Agent::set_tools` |
+| `Persist` | `axo_agent::Persist` | The agent's only event sink: ordered, awaited `persist(&self, event: &AgentEvent)` observes immutable events and cannot rewrite messages. `Session` uses it to persist `Entry::Message` on `MessageEnd { message, origin }` before the next request, maintain live run state, and relay session events. The agent has no broadcast or snapshot API; clients attach to `Session` |
+| `Streamer` | `axo_ai::Streamer` | Host streaming extension, injected via `AxoBuilder::streamer` for tests and custom transports. `Models` implements it with provider dispatch; `ScriptedApi` implements it behind the `testing` feature |
+| `Api` | `axo_ai::Api` | Wire adapter contract that `Models` dispatches to: `AnthropicApi`, `CompletionsApi`, or `CodexApi` |
 | `CredentialStore` | `axo_ai::CredentialStore` | Loads and saves per-provider `Credential`s (`FileCredentialStore` over a host-named file is bundled). Supports `get`, `set`, `remove`, and `update` (runs a transform under the store's cross-process file lock). Injected via `ModelsOptions::credentials` into the `Models` the host passes to `Axo::builder` |
 
 ### Implementing `axo_agent::Tool`
@@ -295,41 +306,40 @@ impl Tool for PingTool {
 ```
 
 - **`ToolContext`:** owned per-call state, because each call runs on its own Tokio task: `call: Arc<ToolCall>` (the validated call), `cancel: CancellationToken` (the tool must honor it; see the task lifecycle below), `updates: ToolUpdates` (partial results while the call runs), `steer: SteerSignal`, and `invocation: ToolInvocationId`.
-- **Task lifecycle:** the loop never polls a tool future itself, so a tool may await anything, including state the host's `Persist` holds. Calls start only after every call of the batch passed `before_tool_call`. When the run is stopped or shut down, every unfinished call's `cancel` fires and the loop keeps waiting; a call still running 3 s later is aborted and answered with an `Operation aborted` error result. A panicking call becomes an error result. Cleanup that must happen however the call ends belongs in a `Drop` guard. `after_tool_call` runs on the loop after the task returns.
-- **`ToolUpdates`:** `send(update)` never blocks; updates sent before `execute` returns are emitted before that call's `ToolExecutionEnd`. Clonable, so spawned helpers can stream too. `ToolUpdates::new(f)` streams to a closure and `ToolUpdates::sink()` discards updates, for calling `execute` outside an `Agent`.
+- **Task lifecycle:** the loop never polls a tool future itself, so a tool may await anything, including state the host's `Persist` holds. Calls start only after the batch's preparation and `ToolHooks::before_tool_call` decisions complete. When the run is stopped or shut down, every unfinished call's `cancel` fires and the loop keeps waiting; a call still running 3 s later is aborted and answered with an `Operation aborted` error result. A panicking call becomes an error result. Cleanup that must happen however the call ends belongs in a `Drop` guard. `ToolHooks::after_tool_call` runs on the loop after the task returns.
+- **`ToolUpdates`:** `send(update)` never blocks; updates sent before `execute` returns are emitted before that call's `ToolExecutionEnd`, whose `result.is_error` reports failure. Clonable, so spawned helpers can stream too. `ToolUpdates::new(f)` streams to a closure and `ToolUpdates::sink()` discards updates, for calling `execute` outside an `Agent`.
 - **`SteerSignal`:** `is_pending()` is true while steering input is queued and not yet drained into the transcript; `pending().await` resolves when it becomes so (and never if the agent is gone). The built-in `bash` uses it to move a foreground command to the background and `wait` uses it to return early. Results the host injects through `LoopHooks::steering` never set it. `SteerSignal::never()` gives a signal that never fires, for calling `execute` outside an `Agent`.
 - **`ToolInvocationId(u64)`:** unique per execution within one `Agent`, assigned right before `execute`. It is the identity reported back as `MessageOrigin::Tool` for that call's persisted result.
 - **`ToolOutput`:** `content` (model-facing), `details: Option<Value>` (host/log data, never sent to the model), `is_error` (a failure with output, e.g. a failing command; an `Err(ToolError)` also becomes an error result), and `terminate` (stop after this batch, honored only when every result in the batch sets it).
-- **`ExecutionMode::Parallel` vs `ExecutionMode::Sequential`:** `Agent` runs a turn's tool batch concurrently when `AgentConfig::tool_execution` is `Parallel` and every tool in the batch returns `ExecutionMode::Parallel` (preparation and `before_tool_call` always run sequentially in call order, and `ToolResult` messages are always emitted in call order). If any tool in the batch returns `ExecutionMode::Sequential`, the batch runs one call at a time.
+- **`ExecutionMode::Parallel` vs `ExecutionMode::Sequential`:** `Agent` runs a turn's tool batch concurrently when every tool in the batch returns `ExecutionMode::Parallel` (preparation and `ToolHooks::before_tool_call` always run sequentially in call order, and `ToolResult` messages are always emitted in call order). If any tool in the batch returns `ExecutionMode::Sequential`, the batch runs one call at a time. Execution mode is controlled only by tools, not by agent configuration.
 - **`Replay::Safe` vs `Replay::Never`:** Controls whether an unfinished tool call is re-executed (`Safe`) or marked interrupted (`Never`) when `Session` recovers a crashed run. `replay(&self, call: &ToolCall)` decides per call; `write`, for example, is `Safe` for plain paths and defers to the scheme's `write_replay` for scheme URLs.
 
 ### Session tools and supervised subprocesses
 
 A `ToolFactory` (`Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>`) receives the session's `SessionTools`:
 
-| Field | Type | Meaning |
+| Field or method | Type | Meaning |
 | :--- | :--- | :--- |
 | `cwd` | `PathBuf` | Relative paths and commands resolve against it |
 | `exec` | `Arc<dyn ExecEnv>` | The command environment (host or dev shell) |
 | `ledger` | `FileLedger` | Content hashes of files this session has read or written (the stale-file guard) |
 | `context` | `NestedContext` | Nested project instructions attached once to file tool results |
 | `schemes` | `Schemes` | The session's scheme registry |
-| `questions` | `Arc<PendingQuestions>` | Pending `ask` questions |
-| `ask_timeout` | `Option<Duration>` | `ask` auto-selection timeout |
-| `ci_env` | `bool` | Whether `bash` sets `CI=true` |
 | `supervisor` | `Arc<ProcessSupervisor>` | Runs local commands in supervised containers, process groups or cgroup jobs per the host's `Supervision` (shared by every session of one `Axo`) |
-| `jobs` | `Arc<JobRegistry>` | The session's command jobs; every `bash` command registers here while it runs, and background jobs stay listed for `proc://` and result delivery. Its job-mutating methods are crate-internal |
+| `run_command` | `async fn run_command(&self, cx: ToolContext, request: CommandRequest) -> Result<ToolOutput, ToolError>` | Runs a supervised command with output capture, background promotion, retained helpers, and exactly-once result delivery; background jobs are listed by `Session::jobs` and `proc://` |
 
-File-mutating host tools must follow the same invariants as built-ins: resolve targets with `SessionTools::locate` (`Located::Plain`, `Located::File { url, path, writable }`, or `Located::Virtual { url }`), verify `writable` on file schemes, check `SessionTools::ledger` (`FileLedger::recorded`), hold `axo::tools::lock_file(path)` during writes, and record the written hash via `ledger.record`.
-Host tools that run subprocesses should go through `supervisor`, never `std::process::Command`/`tokio::process::Command` directly, so their descendants are contained and killed with the job exactly like `bash` (to the extent the selected mode tracks them):
+`axo::tools::CommandRequest` has `spec: ExecSpec`, `label: String` (the command shown in job listings), `timeout: Option<Duration>` (no default deadline), and `run_async: bool` (promote immediately). The runner applies the non-interactive environment overlay and, when `bash.ci` is enabled, `CI=true` after the environment supplied in `spec`. Output is spooled as `<n>.<tool>.<escaped call id>.log`, using `ToolContext::call` for the tool name and call id.
+
+File-mutating host tools must follow the same invariants as built-ins: resolve targets with `SessionTools::locate` (`Located::File { url, path, writable }` or `Located::Virtual { url }`; plain filesystem paths have no URL and are writable), verify `writable`, hold `axo::tools::lock_file(path)` throughout the read-modify-write cycle, check existing bytes with `FileLedger::check_fresh` on `SessionTools::ledger`, and record the written hash via `ledger.record`.
+Host tools that run commands should use `SessionTools::run_command` to share `bash`'s job lifecycle. All subprocesses must go through the session's `ProcessSupervisor`, directly or via this runner, never `std::process::Command`/`tokio::process::Command` directly, so descendants stay contained to the extent the selected supervision mode tracks them:
 
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
 use axo::exec::host::ExecSpec;
+use axo::tools::CommandRequest;
 use axo::{SessionTools, ToolFactory};
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
-use axo_ai::UserBlock;
 
 pub struct HeadTool {
     tools: Arc<SessionTools>,
@@ -351,17 +361,12 @@ impl Tool for HeadTool {
             cwd: tools.cwd.clone(),
             env: (*resolved.env).clone(),
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        // Dropping the future on cancel drops the `Process`, which kills its container.
-        let output = tokio::select! {
-            output = tools.supervisor.output(spec, Some(deadline)) => output.map_err(|err| ToolError(err.to_string()))?,
-            () = cx.cancel.cancelled() => return Err(ToolError("Operation aborted".into())),
-        };
-        Ok(ToolOutput {
-            content: vec![UserBlock::Text { text: String::from_utf8_lossy(&output.stdout).into_owned() }],
-            is_error: !output.status.success(),
-            ..ToolOutput::default()
-        })
+        tools.run_command(cx, CommandRequest {
+            spec,
+            label: "git rev-parse HEAD".into(),
+            timeout: Some(Duration::from_secs(10)),
+            run_async: false,
+        }).await
     }
 }
 
@@ -383,22 +388,22 @@ The supervision API (`axo::exec::host`, with `OutputError`, `ProcessSupervisor` 
 | `Process` | `pub stdout: Option<ChildStdout>`, `pub stderr: Option<ChildStderr>` | A running job. `capture_output()` merges both pipes into one `mpsc::Receiver<Vec<u8>>` (plus the reader `JoinSet`); `wait()` waits for the root (cancel-safe; in cgroup mode a guardian that dies first takes the job with it); `guardian_lost().await` resolves once the cgroup guardian has died, after killing the job (for watching leftovers after the root exited; cancel-safe, resolves at most once, and never in process-group mode, whose guard is best effort); `container()` returns a cloneable `Container`; `close().await` waits until the container is empty, removes the cgroup directory in cgroup mode, and stands the watcher down (call `container().kill()` first to end leftovers). Dropping an unclosed `Process` kills the whole container |
 | `Container` | `kill(&self)`, `populated(&self) -> bool`, `async terminate(&self)` | Handle to one job's container: `kill` sends SIGKILL to the process group or writes `cgroup.kill` (errors ignored); `populated` reports whether any process remains (a cgroup that is unreadable counts as empty; a group member that refuses a signal still counts as present); `terminate` sends SIGTERM (to the group, or to each cgroup member through a pidfd), waits up to `KILL_GRACE` (1 s) for the container to empty, then kills it |
 | `KILL_GRACE` | `const KILL_GRACE: Duration` | Fixed 1 s grace period between SIGTERM and SIGKILL used by `Container::terminate` |
-| `find_on_path` | `fn find_on_path(name: &Path, env: &EnvMap, cwd: &Path) -> Option<PathBuf>` | Path search helper resolving a command against `env["PATH"]` and `cwd` |
+| `find_on_path` | `fn find_on_path(name: &str, env: &EnvMap, cwd: &Path) -> Option<PathBuf>` | Path search helper resolving a command against `env["PATH"]` and `cwd` |
 
-Subprocesses a host tool runs this way are not `bash` jobs: they are never promoted to the background, listed under `proc://`, or delivered later; the tool owns them for the duration of its call.
+Commands run through `SessionTools::run_command` have the same background behavior as `bash`: immediate promotion with `run_async`, timed promotion controlled by `bash.promoteAfterMs`, or promotion when a steer is pending; retained helpers remain supervised. Their jobs appear in `Session::jobs` and `proc://`, and results are delivered exactly once through `wait` or a later message. Hosts needing a strictly call-scoped subprocess can use `ProcessSupervisor::output` directly; those subprocesses are not registered as session jobs or promoted.
 
 ### Queued inputs and message origins
 
 `axo_agent` knows nothing about jobs; it offers two generic primitives that `Session` builds job delivery on.
 
 - **`QueuedMessage { message: AgentMessage, id: Option<String> }`:** an input waiting to enter the transcript, with the host's id for it (`From<AgentMessage>` gives `id: None`). `Agent::prompt(Vec<QueuedMessage>)`, `Agent::steer(QueuedMessage)`, and `Agent::follow_up(QueuedMessage)` take it; `agent.prompt(vec![message.into()])` keeps the id-less form short. `Agent::steer` also sets the steer signal until the steering queue is drained.
-- **`LoopHooks::steering` / `LoopHooks::follow_up`:** `async fn steering(&self) -> Vec<QueuedMessage>` and `async fn follow_up(&self) -> Vec<QueuedMessage>` (both default to empty) supply host messages drained after the agent's own steering or follow-up queue at each drain point: steering after the current tool batch, before the next model request; follow-up when the run would otherwise end. They never set the steer signal. `Session` uses `steering` to inject finished background job results into an active run.
+- **`LoopHooks::steering`:** `async fn steering(&self) -> Vec<QueuedMessage>` (default empty) supplies host messages drained after the agent's own steering queue, after the current tool batch and before the next model request. It never sets the steer signal. `Session` uses it to inject finished background job results into an active run. Follow-up input comes only from the agent's follow-up queue, drained when the run would otherwise end. `Agent::queued()` returns the queued messages as `(Vec<AgentMessage>, Vec<AgentMessage>)` in steering, follow-up order.
 - **`AgentEvent::MessageEnd { message, origin: MessageOrigin }`:** every finished message carries its provenance:
 
 | `MessageOrigin` | Assigned to |
 | :--- | :--- |
 | `Input(Option<String>)` | A prompted or queued input (including hook-supplied ones), with the id it was queued under |
 | `Tool(ToolInvocationId)` | The result of a tool call that started executing with that invocation: what it returned (`Ok` or `Err`), even if cancellation arrived meanwhile, or the aborted result when Stop ended its task |
-| `Run` | Everything else: assistant replies, tool-change declarations, `prepare_next_turn` (`TurnUpdate::messages`) messages, and synthetic tool results (blocked, failed-preparation, unanswered, or aborted before they started) |
+| `Run` | Everything else: assistant replies, tool-change declarations, messages returned by `prepare_next_turn`, and synthetic tool results (blocked, failed-preparation, unanswered, or aborted before they started) |
 
 An executed result keeps its `Tool` origin exactly when it is the result persisted. `Session`'s `Persist` maps `Input(Some(id))` to the submission id (or, for a job delivery message, to the jobs it delivers) and `Tool(invocation)` to the jobs that call delivered or started, so receipts never depend on comparing message text (see [Background Job Durability](sessions-and-compaction.md#background-job-durability)).

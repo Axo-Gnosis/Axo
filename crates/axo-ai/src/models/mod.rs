@@ -18,7 +18,7 @@ use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
 use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions, Streamer};
-use crate::auth::resolve::{OAuthKind, ProviderAuthInfo, resolve_auth, resolve_config_value};
+use crate::auth::resolve::{ProviderAuth, resolve_auth};
 use crate::auth::{CredentialStore, ModelAuth};
 use crate::error::Error;
 use crate::event::{AssistantEvent, timed};
@@ -36,19 +36,13 @@ pub struct ModelsOptions {
     pub extended_context: bool,
     pub config: ModelsConfig,
     pub credentials: Arc<dyn CredentialStore>,
-}
-
-/// Auth facts of one provider.
-struct ProviderEntry {
-    env: Vec<String>,
-    /// Raw `models.jsonc` `apiKey`; `resolve_auth` resolves it at request time.
-    config_api_key: Option<String>,
-    requires_key: bool,
+    /// Client shared by catalog, discovery, streaming and OAuth refresh requests.
+    pub http_client: Option<reqwest::Client>,
 }
 
 pub struct Models {
     models: Vec<Model>,
-    providers: HashMap<String, ProviderEntry>,
+    providers: HashMap<String, Arc<ProviderAuth>>,
     /// Raw `models.jsonc` header values per (provider, model id), resolved at request time.
     config_headers: HashMap<(String, String), BTreeMap<String, String>>,
     credentials: Arc<dyn CredentialStore>,
@@ -60,7 +54,7 @@ pub struct Models {
 
 impl Models {
     pub async fn load(opts: ModelsOptions) -> Result<Models, Error> {
-        let http = crate::api::http::client();
+        let http = opts.http_client.unwrap_or_else(crate::api::http::client);
         let catalog = match &opts.cache_dir {
             Some(dir) => catalog::load(dir, &http).await,
             None => None,
@@ -69,15 +63,20 @@ impl Models {
         if !opts.extended_context {
             models.iter_mut().for_each(rules::cap_at_price_tier);
         }
-        let mut providers: HashMap<String, ProviderEntry> = envs
+        let mut providers: HashMap<String, Arc<ProviderAuth>> = envs
             .into_iter()
             .map(|(id, env)| {
-                let entry = ProviderEntry {
+                let info = ProviderAuth {
+                    id: id.clone(),
                     env,
-                    config_api_key: None,
+                    config_api_key: opts
+                        .config
+                        .providers
+                        .get(&id)
+                        .and_then(|p| p.api_key.clone()),
                     requires_key: true,
                 };
-                (id, entry)
+                (id, Arc::new(info))
             })
             .collect();
 
@@ -88,13 +87,29 @@ impl Models {
                 && !providers.contains_key(id.as_str())
         };
         let to_discover: Vec<_> = opts.config.providers.iter().filter(discoverable).collect();
+        for (id, provider) in &opts.config.providers {
+            providers.entry(id.clone()).or_insert_with(|| {
+                Arc::new(ProviderAuth {
+                    id: id.clone(),
+                    config_api_key: provider.api_key.clone(),
+                    env: Vec::new(),
+                    requires_key: false,
+                })
+            });
+        }
         let discovered: HashMap<&str, Vec<String>> = to_discover
             .iter()
             .map(|(id, _)| id.as_str())
             .zip(
                 futures::future::join_all(to_discover.iter().map(|(id, provider)| {
                     let base_url = provider.base_url.as_deref().unwrap_or_default();
-                    discover::discover(&http, id, base_url, provider)
+                    discover::discover(
+                        &http,
+                        Arc::clone(&providers[id.as_str()]),
+                        Arc::clone(&opts.credentials),
+                        base_url,
+                        provider.headers.clone(),
+                    )
                 }))
                 .await,
             )
@@ -103,15 +118,6 @@ impl Models {
         let mut config_headers: HashMap<(String, String), BTreeMap<String, String>> =
             HashMap::new();
         for (provider_id, provider) in &opts.config.providers {
-            let entry = providers
-                .entry(provider_id.clone())
-                .or_insert_with(|| ProviderEntry {
-                    env: Vec::new(),
-                    config_api_key: None,
-                    requires_key: false,
-                });
-            entry.config_api_key = provider.api_key.clone();
-
             // Provider-level fields patch every model the provider already has.
             for model in models
                 .iter_mut()
@@ -155,7 +161,6 @@ impl Models {
                     cost: Cost::default(),
                     context_window: 128_000,
                     max_tokens: 16_384,
-                    headers: BTreeMap::new(),
                     compat: Compat::default(),
                 };
                 merge_compat(&mut model, provider.compat.as_ref())?;
@@ -239,31 +244,28 @@ impl Models {
     }
 
     /// Resolve the key, headers and base-URL override for a request to `model`.
-    /// `override_key` wins over every other key source.
-    pub async fn auth(
-        &self,
-        model: &Model,
-        override_key: Option<&str>,
-    ) -> Result<ModelAuth, Error> {
-        resolve_model_auth(
-            self.auth_info(model),
+    pub async fn auth(&self, model: &Model) -> Result<ModelAuth, Error> {
+        resolve_auth(
+            self.provider_auth(model),
             self.credentials.clone(),
             self.http.clone(),
             self.headers_of(model),
-            override_key.map(str::to_owned),
         )
         .await
     }
 
-    fn auth_info(&self, model: &Model) -> ProviderAuthInfo {
-        let entry = self.providers.get(&model.provider);
-        ProviderAuthInfo {
-            id: model.provider.clone(),
-            config_api_key: entry.and_then(|entry| entry.config_api_key.clone()),
-            env: entry.map(|entry| entry.env.clone()).unwrap_or_default(),
-            requires_key: entry.is_none_or(|entry| entry.requires_key),
-            oauth: (model.provider == rules::CODEX_PROVIDER).then_some(OAuthKind::Codex),
-        }
+    fn provider_auth(&self, model: &Model) -> Arc<ProviderAuth> {
+        self.providers
+            .get(&model.provider)
+            .cloned()
+            .unwrap_or_else(|| {
+                Arc::new(ProviderAuth {
+                    id: model.provider.clone(),
+                    config_api_key: None,
+                    env: Vec::new(),
+                    requires_key: true,
+                })
+            })
     }
 
     fn headers_of(&self, model: &Model) -> BTreeMap<String, String> {
@@ -272,31 +274,6 @@ impl Models {
             .cloned()
             .unwrap_or_default()
     }
-}
-
-/// `resolve_auth` plus the model's `models.jsonc` headers (resolved here, off the async
-/// workers since a value may run a command). Auth-provided headers win on conflict.
-async fn resolve_model_auth(
-    info: ProviderAuthInfo,
-    credentials: Arc<dyn CredentialStore>,
-    http: reqwest::Client,
-    headers: BTreeMap<String, String>,
-    override_key: Option<String>,
-) -> Result<ModelAuth, Error> {
-    let mut auth = resolve_auth(&info, &credentials, &http, override_key.as_deref()).await?;
-    if !headers.is_empty() {
-        let mut resolved = tokio::task::spawn_blocking(move || {
-            headers
-                .into_iter()
-                .map(|(name, value)| resolve_config_value(&value).map(|value| (name, value)))
-                .collect::<Result<BTreeMap<_, _>, Error>>()
-        })
-        .await
-        .map_err(|error| Error::Config(error.to_string()))??;
-        resolved.append(&mut auth.headers);
-        auth.headers = resolved;
-    }
-    Ok(auth)
 }
 
 impl Streamer for Models {
@@ -314,12 +291,11 @@ impl Streamer for Models {
             ApiKind::OpenAiCompletions => self.completions.clone(),
             ApiKind::OpenAiCodexResponses => self.codex.clone(),
         };
-        let auth = resolve_model_auth(
-            self.auth_info(&model),
+        let auth = resolve_auth(
+            self.provider_auth(&model),
             self.credentials.clone(),
             self.http.clone(),
             self.headers_of(&model),
-            opts.api_key.clone(),
         );
         stream::once(async move {
             // A refresh in progress keeps running in its own spawned task.

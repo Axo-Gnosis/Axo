@@ -7,7 +7,7 @@ use crate::types::{Usage, UsageCost};
 ///
 /// The highest pricing tier whose input threshold the request exceeds applies to the
 /// whole request. 1h cache writes cost twice the base input price (Anthropic).
-pub fn calculate_cost(model: &Model, usage: &mut Usage) -> UsageCost {
+pub(crate) fn calculate_cost(model: &Model, usage: &mut Usage) -> UsageCost {
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
     let cost = &model.cost;
     let (mut input, mut output, mut cache_read, mut cache_write) =

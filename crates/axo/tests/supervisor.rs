@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use axo::HostEnv;
+use axo::StaticEnv;
 use axo::exec::host::{ExecSpec, ProcessSupervisor, Supervision, find_on_path};
 use common::dead;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -45,7 +45,7 @@ fn main() -> ExitCode {
 }
 
 fn bash(script: &str, cwd: &Path) -> ExecSpec {
-    let env = HostEnv::snapshot().0;
+    let env = StaticEnv::host().0;
     ExecSpec {
         program: find_on_path("bash", &env, Path::new("/")).expect("bash on PATH"),
         args: vec!["-c".into(), script.into()],

@@ -7,7 +7,7 @@ use crate::types::JsonMap;
 
 /// Repair malformed JSON string literals: escape raw control characters inside strings
 /// and double backslashes before invalid escape characters.
-pub fn repair_json(json: &str) -> String {
+pub(crate) fn repair_json(json: &str) -> String {
     let chars: Vec<char> = json.chars().collect();
     let mut repaired = String::with_capacity(json.len());
     let mut in_string = false;
@@ -57,7 +57,7 @@ pub fn repair_json(json: &str) -> String {
 }
 
 /// Parse JSON, retrying once with [`repair_json`] when the first attempt fails.
-pub fn parse_with_repair(json: &str) -> Result<Value, serde_json::Error> {
+pub(crate) fn parse_with_repair(json: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(json).or_else(|error| {
         let repaired = repair_json(json);
         if repaired == json {
@@ -303,5 +303,32 @@ impl Partial<'_> {
             Err(_) if self.at == self.bytes.len() => Ok(None),
             Err(_) => Err(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_streaming_closes_truncated_prefixes() {
+        let object = |value: Value| value.as_object().unwrap().clone();
+        assert_eq!(parse_streaming(r#"{"a": "x"#), object(json!({ "a": "x" })));
+        assert_eq!(
+            parse_streaming(r#"{"a": [1, 2"#),
+            object(json!({ "a": [1, 2] }))
+        );
+        assert_eq!(parse_streaming(r#"{"a":"#), object(json!({})));
+    }
+
+    #[test]
+    fn parse_tool_arguments_reports_non_object_json() {
+        let (arguments, error) = parse_tool_arguments("[1, 2]");
+        assert!(arguments.is_empty());
+        assert_eq!(
+            error.as_deref(),
+            Some("Tool arguments must be a JSON object\n\nReceived arguments:\n[1, 2]")
+        );
     }
 }

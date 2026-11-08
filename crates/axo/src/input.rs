@@ -10,7 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::context::skills::{Skill, expand_skill_command};
 use crate::error::Error;
-use crate::schemes::LOCAL_DIR;
 use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, process_image};
 use crate::tools::{Located, SessionTools};
 
@@ -164,8 +163,11 @@ pub(crate) async fn prepare(
                     .await
                     .map_err(|error| Error::InvalidInput(error.0))?
                 {
-                    Located::Plain => Some(tools.resolve_read_path(&path)),
-                    Located::File { path, .. } => Some(path),
+                    Located::File { path, url, .. } => Some(if url.is_none() {
+                        crate::tools::existing_variant(path)
+                    } else {
+                        path
+                    }),
                     Located::Virtual { .. } => None,
                 };
                 if let Some(target) = target
@@ -227,7 +229,16 @@ async fn save(
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
         return Err(Error::InvalidInput(format!("Invalid content name: {name}")));
     }
-    let dir = tools.schemes.context().session_dir.join(LOCAL_DIR);
+    let Ok(Located::File {
+        path: dir,
+        writable: true,
+        ..
+    }) = tools.locate("local://").await
+    else {
+        return Err(Error::InvalidInput(
+            "local:// must resolve to a writable directory".into(),
+        ));
+    };
     let io = |path: &std::path::Path| {
         let path = path.to_path_buf();
         move |source: std::io::Error| Error::Io { path, source }

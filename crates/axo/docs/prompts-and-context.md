@@ -2,6 +2,10 @@
 
 `axo` represents the system prompt and tool set as `SystemMessage` entries inside the transcript (`crates/axo/src/context/prompt.rs`). Replaying the transcript reconstructs the exact prompt and tool definitions at any point in a session, and mid-session updates emit a diff `SystemMessage` containing only changed sections (`Some(rendered)`) or removed sections (`None`).
 
+Provider requests use `Transcript::new` with the system prompt and tool declarations already carried by `Message::System` entries. Construction removes failed or aborted assistant turns and their tool results from the request; the persisted session history retains them.
+
+Start-time diagnostics for context files, skills, schemes and bundled docs, prompt overrides, host sections, and reserved command names remain available to the host through `session.diagnostics()` (`&[Diagnostic]`) and are still logged as warnings. Runtime `NestedContext` read errors are only logged, not retained in this startup snapshot.
+
 ## System Prompt Sections
 
 `build_sections` produces an `IndexMap<String, String>` where each non-empty body is wrapped in `<name>\n{body}\n</name>` in this exact order:
@@ -23,7 +27,7 @@
 
 ### Bundled documentation (`docs`)
 
-When the host sets `AxoBuilder::cache_dir`, `build_sections` materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<cache_dir>/docs/`, updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If that directory cannot be written, `build_sections` records a `Diagnostic` and omits the `docs` section. Without a cache directory, axo writes nothing, omits the `docs` section without a diagnostic, and registers no `axo://` scheme.
+When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (including through `Axo::schemes` for a closed session) materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<cache_dir>/docs/`, updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If that directory cannot be written, scheme construction records a `Diagnostic` and omits both the `docs` section and the built-in `axo://` scheme. Prompt refreshes only render the already-loaded sources; they perform no filesystem I/O. Without a cache directory, axo writes nothing, omits the `docs` section without a diagnostic, and registers no `axo://` scheme.
 
 ### Built-in tool guidelines (`tools`)
 
@@ -35,7 +39,7 @@ Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the bui
 
 ### Host section validation
 
-Host section names in `SessionOptions::sections` must start with an ASCII lowercase letter (`a-z`) and contain only `a-z`, `0-9`, `_`, or `-`. Invalid names emit a `Diagnostic` and are skipped. Overriding an existing section name updates its value at its original position in `IndexMap` rather than moving it to the end.
+Host section names in `SessionOptions::sections` must start with an ASCII lowercase letter (`a-z`) and contain only `a-z`, `0-9`, `_`, or `-`. Names are validated once at session start; invalid names emit a `Diagnostic` and are skipped. Overriding an existing section name updates its value at its original position in `IndexMap` rather than moving it to the end.
 
 ## Prompt Overrides (`EffectiveConfig::prompts`)
 
@@ -84,6 +88,7 @@ When project access is not `Ignore` and `settings.nested_context_files` is `true
 - For a touched path inside `project_root`, `NestedContext` checks every directory from `project_root` down to the file's parent directory.
 - Any enabled context file whose canonical path and content are not already present in the startup `context_files` or in the active projection's tool results is appended to that tool result as `<project_instructions path="…">\n{content}\n</project_instructions>`.
 - `NestedContext::restore(&messages)` reconstructs the seen set from the current projected messages on session open, branch navigation, compaction, and `/shake`. If a tool result carrying a nested context file is elided or compacted away, the next file access in that directory reattaches it.
+- Read errors encountered by `NestedContext` at runtime are only logged; they do not appear in `Session::diagnostics`.
 
 ## Skills (`crates/axo/src/context/skills.rs`)
 
@@ -168,18 +173,18 @@ The submission stores the original parts, not the expansion; the expansion exist
 
 The `submission` entry stores the prepared parts (with `Saved`, never `Content`), so apps can redraw chips after reload or fork; see [JSONL format](sessions-and-compaction.md#jsonl-format-format_version--1).
 
-## Background Jobs (`crates/axo/src/jobs.rs`)
+## Background Jobs (`crates/axo/src/jobs/mod.rs`, `crates/axo/src/jobs/command.rs`)
 
-Every `bash` command runs in its own container under the session's `ProcessSupervisor`: a process group by default, or a cgroup v2 job directory when the host selects `Supervision::Cgroup` through `AxoBuilder::supervision` (see [Command supervision](configuration.md#command-supervision-axosupervision)). A command can move to the background as job `bg_N`; its result reaches the model later as a message. How results are journaled and delivered exactly once is in [Background Job Durability](sessions-and-compaction.md#background-job-durability).
+Every `bash` command and host command submitted through `SessionTools::run_command` runs in its own container under the session's `ProcessSupervisor`: a process group by default, or a cgroup v2 job directory when the host selects `Supervision::Cgroup` through `AxoBuilder::supervision` (see [Command supervision](configuration.md#command-supervision-axosupervision)). The shared command runner owns execution and output capture; the job registry owns admission and delivery. A command can move to the background as job `bg_N`; its result reaches the model later as a message. How results are journaled and delivered exactly once is in [Background Job Durability](sessions-and-compaction.md#background-job-durability).
 
-### Promotion (`bash`)
+### Promotion (`bash` and host commands)
 
-A running `bash` call is promoted to a background job when the first of these happens:
-- `async: true` is set in its arguments (immediately);
-- it is still running after 60 seconds (`PROMOTE_AFTER`);
+A running command is promoted to a background job when the first of these happens:
+- `async: true` is set in `bash` arguments, or a host's `CommandRequest` sets `run_async: true` (immediately);
+- it is still running after `bash.promoteAfterMs` milliseconds (default `60000`, or 60 seconds; `0` disables timed promotion);
 - a steer is pending: the user sent a message while it ran (`ToolContext::steer`).
 
-Environment resolution (dev-shell capture) stays in the foreground; the 60 s timer and steer promotion start only once the process runs. A command that already finished is never promoted, and promotion is attempted at most once per call. The tool result then returns at once with the output so far (or `(no output yet)`) followed by:
+Environment resolution (dev-shell capture) stays in the foreground; the promotion timer and steer promotion start only once the process runs. A command that already finished is never promoted, and promotion is attempted at most once per call. The tool result then returns at once with the output so far (or `(no output yet)`) followed by:
 
 ```text
 Command is still running in the background as bg_N. Full output: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with write proc://bg_N/kill.

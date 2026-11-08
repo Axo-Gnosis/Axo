@@ -11,7 +11,7 @@ use axo_ai::{ToolCall, UserBlock};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tools::files::{check_fresh, fs_error};
+use crate::tools::files::fs_error;
 use crate::tools::{FileAccess, Located, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &["Use write only for new files or complete rewrites."];
@@ -63,7 +63,7 @@ impl Tool for WriteTool {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("");
-        match self.tools.schemes.parse(&super::clean_path(path)) {
+        match self.tools.parse_url(path) {
             Ok(Some(url)) => self
                 .tools
                 .schemes
@@ -84,13 +84,19 @@ impl Tool for WriteTool {
             serde_json::from_value(Value::Object(call.arguments.clone()))
                 .map_err(|error| ToolError(error.to_string()))?;
         let (absolute, label) = match self.tools.locate(&path).await? {
-            Located::Plain => (self.tools.resolve_path(&path), None),
             Located::File {
                 url,
+                path,
                 writable: false,
                 ..
-            } => return Err(ToolError(format!("{url} is read-only"))),
-            Located::File { url, path, .. } => (path, Some(url.to_string())),
+            } => {
+                return Err(ToolError(format!(
+                    "{} is read-only",
+                    super::shown(&path, url.as_ref().map(|url| url.to_string()).as_deref())
+                        .display()
+                )));
+            }
+            Located::File { url, path, .. } => (path, url.map(|url| url.to_string())),
             Located::Virtual { url } => {
                 if cancel.is_cancelled() {
                     return Err(ToolError("Operation aborted".into()));
@@ -102,7 +108,8 @@ impl Tool for WriteTool {
                 });
             }
         };
-        let (path, shown) = super::shown(label.as_deref(), &path, &absolute);
+        let shown = super::shown(&absolute, label.as_deref());
+        let path = label.as_deref().unwrap_or(&path);
         let _guard = lock_file(&absolute).await;
         // Checked after each step rather than racing the step, so the lock is held until
         // an in-flight filesystem operation has settled.
@@ -121,7 +128,7 @@ impl Tool for WriteTool {
         // read failure is reported rather than overwriting a file the session cannot see.
         match tokio::fs::read(&absolute).await {
             Ok(current) if current == content.as_bytes() => {}
-            Ok(current) => check_fresh(&self.tools, &absolute, path, &current)?,
+            Ok(current) => self.tools.ledger.check_fresh(&absolute, path, &current)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(ToolError(fs_error(&error, "open", shown))),
         }

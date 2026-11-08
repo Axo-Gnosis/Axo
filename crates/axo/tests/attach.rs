@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::Arc;
 
-use axo::store::{Entry, SeqEntry};
+use axo::{Entry, SeqEntry};
 use axo::{PromptRequest, PromptResult, SessionEvent};
 use axo_agent::{AgentEvent, AgentMessage, CancelReason, RunOutcome};
 use axo_ai::testing::reply_text;
@@ -47,13 +47,13 @@ async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
     assert_eq!(attach.missed, expected);
 
     assert!(attach.live.run_id.is_some());
-    let streaming = attach.live.agent.streaming.expect("a partial message");
+    let streaming = attach.live.streaming.expect("a partial message");
     assert!(
         matches!(streaming.content.as_slice(), [AssistantBlock::Text { text, .. }] if text == "partial"),
         "{streaming:?}"
     );
 
-    session.abort().await;
+    session.abort();
     let mut events = attach.events;
     let next = within(async {
         loop {

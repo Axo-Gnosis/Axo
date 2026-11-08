@@ -38,10 +38,8 @@ impl ModelsConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
     pub base_url: Option<String>,
-    /// Raw config value (`!cmd`, `$NAME`, literal), resolved at request time.
+    /// Raw config value (`$NAME` or literal), resolved at request time; leading `!` is rejected.
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]

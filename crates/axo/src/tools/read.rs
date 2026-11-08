@@ -86,8 +86,14 @@ impl Tool for ReadTool {
             return Err(ToolError("Operation aborted".into()));
         }
         let (absolute, label) = match self.tools.locate(&path).await? {
-            Located::Plain => (self.tools.resolve_read_path(&path), None),
-            Located::File { url, path, .. } => (path, Some(url.to_string())),
+            Located::File { url, path, .. } => {
+                let path = if url.is_none() {
+                    super::existing_variant(path)
+                } else {
+                    path
+                };
+                (path, url.map(|url| url.to_string()))
+            }
             Located::Virtual { url } => {
                 let text = self.tools.schemes.read(&url).await?;
                 if cancel.is_cancelled() {
@@ -101,7 +107,8 @@ impl Tool for ReadTool {
                 });
             }
         };
-        let (path, shown) = super::shown(label.as_deref(), &path, &absolute);
+        let shown = super::shown(&absolute, label.as_deref());
+        let path = label.as_deref().unwrap_or(&path);
         let bytes = tokio::fs::read(&absolute).await.map_err(|error| {
             let syscall = if error.kind() == ErrorKind::IsADirectory {
                 "read"

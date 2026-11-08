@@ -1,46 +1,32 @@
-//! Shared HTTP client and request-level retry. Port of pi `utils/provider-retry.ts`.
+//! Shared HTTP client and fixed request-level transport retry.
 //!
 //! Retry covers only the request, up to the response headers: once a response with a
-//! success status arrives, its body is the caller's. Turn-level retry lives above this.
+//! success status arrives, its body is the caller's. Host-configurable turn retry lives above this.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
+
+use futures::StreamExt;
 
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Response};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Error;
+use super::sse::{SseDecoder, SseEvent};
+use super::{ABORTED, Reply};
 
 /// The shared client: rustls, HTTP/2, no global timeout (streams can run long), idle
 /// pooled connections closed after 90 s.
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(concat!("axo/", env!("CARGO_PKG_VERSION")))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
         .expect("TLS backend initialization failed")
 }
 
-/// Retry policy of [`send_with_retry`], mirroring the OpenAI/Anthropic SDK policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetryPolicy {
-    /// Retries after the first attempt.
-    pub max_retries: u32,
-    /// A server-requested delay above this fails at once; zero disables the limit.
-    pub max_retry_delay: Duration,
-    /// Statuses that fail at once although the default policy would retry them.
-    pub no_retry_statuses: Vec<u16>,
-}
-
-impl Default for RetryPolicy {
-    /// The SDK default of 2 retries, and pi's 60 s cap on server-requested delays.
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            max_retry_delay: Duration::from_secs(60),
-            no_retry_statuses: Vec::new(),
-        }
-    }
-}
+const MAX_REQUEST_RETRIES: u32 = 2;
+const MAX_SERVER_DELAY: Duration = Duration::from_secs(60);
 
 /// Send the request built by `request`, retrying connection failures and retryable
 /// statuses (`x-should-retry`, else 408, 409, 429 and ≥500) with the SDKs' backoff or
@@ -48,18 +34,17 @@ impl Default for RetryPolicy {
 ///
 /// Returns the last response whatever its status, so the adapter can turn an error
 /// status and body into its own error message. Connection errors after the last retry
-/// are returned as `Error::Http`; cancellation as `Error::Aborted`; a server-requested
-/// delay above the cap as `Error::Provider("Server requested Ns retry delay (max: Ms). <status> <body>")`.
-pub async fn send_with_retry(
+/// are returned as strings; cancellation as `ABORTED`. A server-requested
+/// delay above 60 seconds returns the response without sleeping, preserving its failure metadata.
+pub(crate) async fn send_with_retry(
     request: impl Fn() -> RequestBuilder,
-    policy: &RetryPolicy,
     cancel: &CancellationToken,
-) -> Result<Response, Error> {
+) -> Result<Response, String> {
     let mut retry_index = 0;
     loop {
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(Error::Aborted),
+            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
             result = request().send() => result,
         };
         let retryable = match &result {
@@ -70,34 +55,22 @@ pub async fn send_with_retry(
                     .headers()
                     .get("x-should-retry")
                     .and_then(|value| value.to_str().ok());
-                let retryable = match should_retry {
+                match should_retry {
                     Some("true") => true,
                     Some("false") => false,
                     _ => matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error(),
-                };
-                retryable && !policy.no_retry_statuses.contains(&status.as_u16())
+                }
             }
             Err(error) => error.is_connect() || error.is_timeout() || error.is_request(),
         };
-        if !retryable || retry_index >= policy.max_retries {
-            return result.map_err(Error::from);
+        if !retryable || retry_index >= MAX_REQUEST_RETRIES {
+            return result.map_err(|error| error.to_string());
         }
 
         let delay = match result {
             Ok(response) => match server_delay(response.headers()) {
-                Some(seconds)
-                    if !policy.max_retry_delay.is_zero()
-                        && seconds > policy.max_retry_delay.as_secs_f64() =>
-                {
-                    let status = response.status().as_u16();
-                    let Some(body) = error_body(response, cancel).await else {
-                        return Err(Error::Aborted);
-                    };
-                    return Err(Error::Provider(format!(
-                        "Server requested {}s retry delay (max: {}s). {status} {body}",
-                        seconds.ceil(),
-                        policy.max_retry_delay.as_secs_f64().ceil(),
-                    )));
+                Some(seconds) if seconds > MAX_SERVER_DELAY.as_secs_f64() => {
+                    return Ok(response);
                 }
                 Some(seconds) => Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX),
                 None => backoff(retry_index),
@@ -111,8 +84,64 @@ pub async fn send_with_retry(
         retry_index += 1;
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(Error::Aborted),
+            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
             _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+/// Send and capture failure metadata before each adapter formats its own error.
+pub(crate) async fn send(
+    build: impl Fn() -> RequestBuilder,
+    cancel: &CancellationToken,
+    reply: &mut Reply,
+    describe: impl FnOnce(u16, &str, Option<&serde_json::Value>) -> String,
+) -> Result<Response, String> {
+    let response = send_with_retry(build, cancel).await?;
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status().as_u16();
+    reply.message.failure = Some(response_failure(&response));
+    let text = error_body(response, cancel)
+        .await
+        .ok_or_else(|| ABORTED.to_owned())?;
+    let body = serde_json::from_str::<serde_json::Value>(&text).ok();
+    if let Some(body) = body.as_ref() {
+        record_failure(&mut reply.message, body);
+    }
+    Err(describe(status, &text, body.as_ref()))
+}
+
+/// Decode through EOF, unless the protocol explicitly terminates first.
+pub(crate) async fn read_sse(
+    response: Response,
+    cancel: &CancellationToken,
+    mut on_event: impl FnMut(&SseEvent) -> Result<ControlFlow<()>, String>,
+) -> Result<(), String> {
+    let mut body = std::pin::pin!(response.bytes_stream());
+    let mut decoder = SseDecoder::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
+            chunk = body.next() => chunk,
+        };
+        match chunk {
+            Some(Ok(bytes)) => {
+                for event in decoder.push(&bytes) {
+                    if on_event(&event)?.is_break() {
+                        return Ok(());
+                    }
+                }
+            }
+            Some(Err(error)) => return Err(error.to_string()),
+            None => {
+                if let Some(event) = decoder.finish() {
+                    let _ = on_event(&event)?;
+                }
+                return Ok(());
+            }
         }
     }
 }

@@ -3,7 +3,7 @@
 //! Loaders never fail: problems become [`Diagnostic`]s that the session logs.
 
 pub mod files;
-pub mod prompt;
+pub(crate) mod prompt;
 pub mod skills;
 
 use std::fmt;
@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 use axo_agent::AgentMessage;
 use axo_ai::{Message, UserMessage};
-
-pub use skills::{parse_command_args, substitute_args};
 
 /// A non-fatal problem found while loading context resources.
 #[derive(Debug, Clone, PartialEq, Eq)]

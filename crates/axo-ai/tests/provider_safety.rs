@@ -5,8 +5,8 @@ use std::thread::JoinHandle;
 use axo_ai::testing::read_http_request;
 use axo_ai::{
     AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, Compat, CompletionsApi,
-    Context, Cost, InputKind, Model, ModelAuth, SimpleStreamOptions, StreamOptions, ToolChoice,
-    ToolSpec, Transcript,
+    Cost, InputKind, Message, Model, ModelAuth, SimpleStreamOptions, StreamOptions, SystemMessage,
+    TextBlock, ToolChoice, ToolSpec, Transcript,
 };
 use base64::Engine;
 use futures::StreamExt;
@@ -43,7 +43,6 @@ fn model(api: ApiKind, base_url: String) -> Model {
         cost: Cost::default(),
         context_window: 200_000,
         max_tokens: 4096,
-        headers: Default::default(),
         compat: Compat::default(),
     }
 }
@@ -60,15 +59,17 @@ async fn request(api: ApiKind, url: String, choice: Option<ToolChoice>) -> Assis
     let events: Vec<_> = adapter
         .stream(
             &model(api, url),
-            Transcript::normalize(Context {
-                system_prompt: Some("test".into()),
-                messages: vec![],
-                tools: vec![ToolSpec {
+            Transcript::new(vec![Message::System(SystemMessage {
+                content: vec![TextBlock {
+                    text: "test".into(),
+                }],
+                tools_added: vec![ToolSpec {
                     name: "read".into(),
                     description: "Read".into(),
                     parameters: json!({"type":"object","properties":{}}),
                 }],
-            }),
+                ..Default::default()
+            })]),
             StreamOptions {
                 simple: SimpleStreamOptions {
                     tool_choice: choice,

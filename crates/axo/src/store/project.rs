@@ -52,8 +52,8 @@ impl Projection {
     }
 
     /// Updates the projection for the entries appended since it last ran. A chain of
-    /// children of the current leaf with no `leaf`, `context_edit` or `compaction`
-    /// among them extends it in place; anything else rebuilds it once.
+    /// children of the current leaf with no context-rewriting entry among them
+    /// extends it in place; anything else rebuilds it once.
     pub fn apply(&mut self, entries: &[SeqEntry]) {
         if entries.is_empty() {
             *self = Self::default();
@@ -68,12 +68,7 @@ impl Projection {
         };
         let mut leaf = self.leaf.as_deref();
         for entry in new {
-            if entry.entry.parent_id() != leaf
-                || matches!(
-                    entry.entry,
-                    Entry::Leaf { .. } | Entry::ContextEdit { .. } | Entry::Compaction { .. }
-                )
-            {
+            if entry.entry.parent_id() != leaf || entry.entry.rewrites_context() {
                 *self = build(entries, None);
                 return;
             }
@@ -114,15 +109,19 @@ pub fn project(entries: &[SeqEntry], leaf: Option<&EntryId>) -> Projection {
     build(entries, leaf.map(EntryId::as_str))
 }
 
-/// Follows parents from `start`, with later duplicate ids winning.
-pub(crate) fn path_to(entries: &[SeqEntry], start: usize) -> Vec<usize> {
+/// Follows parents from `id`, with later duplicate ids winning.
+pub(crate) fn path_to(entries: &[SeqEntry], id: &str) -> Vec<usize> {
     let index: HashMap<&str, usize> = entries
         .iter()
         .enumerate()
         .filter_map(|(at, entry)| entry.entry.id().map(|id| (id, at)))
         .collect();
+    walk(entries, &index, index.get(id).copied())
+}
+
+fn walk(entries: &[SeqEntry], index: &HashMap<&str, usize>, start: Option<usize>) -> Vec<usize> {
     let mut path = Vec::new();
-    let mut current = Some(start);
+    let mut current = start;
     while let Some(at) = current {
         if path.len() == entries.len() {
             tracing::warn!("session entries form a parent cycle; path cut");
@@ -147,7 +146,7 @@ fn build(entries: &[SeqEntry], leaf: Option<&str>) -> Projection {
     let start = leaf
         .and_then(|id| index.get(id).copied())
         .or(entries.len().checked_sub(1));
-    let path = start.map_or_else(Vec::new, |at| path_to(entries, at));
+    let path = walk(entries, &index, start);
 
     let mut projection = Projection {
         leaf: start.and_then(|at| entries[at].entry.id().map(str::to_owned)),

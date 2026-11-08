@@ -6,19 +6,33 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axo::store::{Entry, JsonlStore, SeqEntry, SessionStore};
 use axo::{
     Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, Session, SessionOptions, StaticEnv,
     UserConfig,
 };
+use axo::{Entry, JsonlStore, SeqEntry, SessionStore};
 use axo_agent::AgentMessage;
+use axo_ai::testing::reply_text;
 use axo_ai::{
-    FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi, ScriptedTurn,
-    Streamer, UserBlock,
+    FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ProviderFailure,
+    ScriptedApi, ScriptedTurn, StopReason, Streamer, UserBlock,
 };
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn transient(delay: Option<u64>) -> ScriptedTurn {
+    let mut message = reply_text("");
+    message.stop_reason = StopReason::Error;
+    message.error_message = Some("503 service unavailable".into());
+    message.failure = Some(ProviderFailure {
+        status: Some(503),
+        code: None,
+        retry_after_ms: delay,
+        should_retry: None,
+    });
+    ScriptedTurn::Reply(message)
+}
 
 /// An in-memory [`ConfigSource`] that logs every call (`"user"`, `"project:<cwd>"`).
 /// Acquiring a project for an unregistered cwd panics.
@@ -131,6 +145,7 @@ pub async fn axo_with(
     .unwrap();
     let models = Arc::new(
         Models::load(ModelsOptions {
+            http_client: None,
             cache_dir: None,
             config,
             extended_context: false,
@@ -215,10 +230,7 @@ pub fn tool_text(entries: &[SeqEntry], call_id: &str) -> String {
     result
         .content
         .iter()
-        .filter_map(|block| match block {
-            UserBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
+        .filter_map(UserBlock::as_text)
         .collect::<Vec<_>>()
         .join("\n")
 }

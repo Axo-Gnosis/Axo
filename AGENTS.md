@@ -13,7 +13,7 @@ Architecture, active plans, and runtime reference docs live in dedicated files�
 Dependency flow is strictly downward (`axo` -> `axo-agent` -> `axo-ai`):
 
 - **`crates/axo-ai`**: LLM wire layer—message/transcript model, streaming adapters, model catalog, auth, cross-model transforms, error/overflow classification.
-- **`crates/axo-agent`**: Stateful turn loop, tool execution (`Tool`), lifecycle hooks (`LoopHooks`), persistence seam (`Persist`), queues, and cancellation.
+- **`crates/axo-agent`**: Stateful turn loop, tool execution (`Tool`), host tool-policy hooks (`ToolHooks`), loop-driver contract (`LoopHooks`), immutable event sink (`Persist`), queues, and cancellation.
 - **`crates/axo`**: Coding-agent harness—`Axo` host, `Session`, JSONL tree store & projection, recovery, compaction, context/skills, `ExecEnv`, command supervision (`ProcessSupervisor`), background jobs, the command catalog, URL `schemes`, and built-in tools.
 
 ## Code Invariants

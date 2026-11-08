@@ -13,25 +13,22 @@ use std::collections::HashMap;
 use indexmap::IndexSet;
 use serde_json::{Value, json};
 
+use crate::api::Reply;
 use crate::cost::calculate_cost;
 use crate::event::AssistantEvent;
-use crate::json::{parse_streaming, parse_tool_arguments};
+use crate::json::parse_tool_arguments;
 use crate::model::{InputKind, Model};
 use crate::transcript::{
     TranscriptToolSupport, render_system_message_update, resolve_transcript_tools,
-    system_message_text,
 };
 use crate::transform::short_hash;
 use crate::types::{
-    AssistantBlock, AssistantMessage, Message, ReasoningReplay, StopReason, ToolCall, ToolSpec,
-    Usage, UserBlock,
+    AssistantBlock, Message, ReasoningReplay, StopReason, ToolCall, ToolSpec, Usage, UserBlock,
 };
 
 /// Options of [`convert_messages`] (pi `ConvertResponsesMessagesOptions`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConvertOptions {
-    /// Send the leading system message as an input item (Codex sends it as `instructions`).
-    pub include_system_prompt: bool,
     /// Later system messages are sent in place; otherwise the caller collapsed them.
     pub supports_mid_convo_system_messages: bool,
     pub supports_additional_tools: bool,
@@ -122,7 +119,7 @@ pub(crate) fn convert_messages(
                                     .map(|tool| tool.name.as_str())
                                     .collect();
                                 let call_id = format!(
-                                    "pi_tool_load_{}",
+                                    "tool_load_{}",
                                     short_hash(&format!("system:{msg_index}:{}", names.join(",")))
                                 );
                                 input.push(json!({
@@ -144,12 +141,8 @@ pub(crate) fn convert_messages(
                         }
                     }
                 }
-                if !leading || options.include_system_prompt {
-                    let mut parts = vec![if leading {
-                        system_message_text(system)
-                    } else {
-                        render_system_message_update(system)
-                    }];
+                if !leading {
+                    let mut parts = vec![render_system_message_update(system)];
                     if anchors_tool_changes {
                         // A redefinition is a removal plus an addition of the same name; only
                         // true removals are announced.
@@ -217,9 +210,9 @@ pub(crate) fn convert_messages(
                         } => {
                             let signature = parse_text_signature(text_signature.as_deref());
                             let fallback_id = if text_block_index == 0 {
-                                format!("msg_pi_{msg_index}")
+                                format!("msg_{msg_index}")
                             } else {
-                                format!("msg_pi_{msg_index}_{text_block_index}")
+                                format!("msg_{msg_index}_{text_block_index}")
                             };
                             text_block_index += 1;
                             // OpenAI requires ids of at most 64 characters.
@@ -273,10 +266,7 @@ pub(crate) fn convert_messages(
                 let text = result
                     .content
                     .iter()
-                    .filter_map(|block| match block {
-                        UserBlock::Text { text } => Some(text.as_str()),
-                        UserBlock::Image { .. } => None,
-                    })
+                    .filter_map(UserBlock::as_text)
                     .collect::<Vec<_>>()
                     .join("\n");
                 let images: Vec<_> = result
@@ -383,49 +373,29 @@ struct Slot {
     content_index: usize,
 }
 
-/// Scales `usage.cost` for the service tier the response reports.
-pub(crate) type ServiceTierPricing = fn(&Model, Option<&str>, &mut Usage);
-
 /// Applies Responses stream events to an assistant message (pi `processResponsesStream`).
 /// Feed every decoded event to [`ResponsesStream::handle`], then call
 /// [`ResponsesStream::finish`] once the stream ends.
 pub(crate) struct ResponsesStream<'a> {
     model: &'a Model,
-    pub output: &'a mut AssistantMessage,
-    service_tier_pricing: Option<ServiceTierPricing>,
     slots: HashMap<u64, Slot>,
-    /// Raw arguments text of function calls whose `output_item.done` has not arrived, by
-    /// content index.
-    tool_args: HashMap<usize, String>,
     /// Content index of each finished reasoning item, by item id.
     reasoning_by_id: HashMap<String, usize>,
     saw_terminal: bool,
 }
 
 impl<'a> ResponsesStream<'a> {
-    pub fn new(
-        model: &'a Model,
-        output: &'a mut AssistantMessage,
-        service_tier_pricing: Option<ServiceTierPricing>,
-    ) -> Self {
+    pub fn new(model: &'a Model) -> Self {
         Self {
             model,
-            output,
-            service_tier_pricing,
             slots: HashMap::new(),
-            tool_args: HashMap::new(),
             reasoning_by_id: HashMap::new(),
             saw_terminal: false,
         }
     }
 
-    /// Apply one event, appending the resulting [`AssistantEvent`]s to `events`. An `Err`
-    /// is the error message the response fails with.
-    pub fn handle(
-        &mut self,
-        event: &Value,
-        events: &mut Vec<AssistantEvent>,
-    ) -> Result<(), String> {
+    /// Apply one event to the reply. An `Err` is the error message the response fails with.
+    pub fn handle(&mut self, event: &Value, reply: &mut Reply) -> Result<(), String> {
         let output_index = event.get("output_index").and_then(Value::as_u64);
         let delta = event
             .get("delta")
@@ -437,41 +407,30 @@ impl<'a> ResponsesStream<'a> {
             .unwrap_or_default()
         {
             "response.created" => {
-                self.output.response_id = event
+                reply.message.response_id = event
                     .pointer("/response/id")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
             "response.output_item.added" => {
                 if let (Some(output_index), Some(item)) = (output_index, event.get("item")) {
-                    self.create_slot(output_index, item, events);
+                    self.create_slot(output_index, item, reply);
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                self.push_delta(output_index, SlotKind::Thinking, delta, events);
+                self.push_delta(output_index, SlotKind::Thinking, delta, reply);
             }
             "response.reasoning_summary_part.done" => {
-                self.push_delta(output_index, SlotKind::Thinking, "\n\n", events);
+                self.push_delta(output_index, SlotKind::Thinking, "\n\n", reply);
             }
             "response.output_text.delta" | "response.refusal.delta" => {
-                self.push_delta(output_index, SlotKind::Text, delta, events);
+                self.push_delta(output_index, SlotKind::Text, delta, reply);
             }
             "response.function_call_arguments.delta" => {
                 let Some(index) = self.slot(output_index, SlotKind::ToolCall) else {
                     return Ok(());
                 };
-                let Some(buffer) = self.tool_args.get_mut(&index) else {
-                    return Ok(());
-                };
-                buffer.push_str(delta);
-                let arguments = parse_streaming(buffer);
-                if let Some(AssistantBlock::ToolCall(call)) = self.output.content.get_mut(index) {
-                    call.arguments = arguments;
-                }
-                events.push(AssistantEvent::ToolCallDelta {
-                    content_index: index,
-                    delta: delta.to_owned(),
-                });
+                reply.push_tool_args(index, delta);
             }
             "response.function_call_arguments.done" => {
                 let Some(index) = self.slot(output_index, SlotKind::ToolCall) else {
@@ -481,17 +440,12 @@ impl<'a> ResponsesStream<'a> {
                     .get("arguments")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let Some(previous) = self.tool_args.insert(index, text.to_owned()) else {
-                    self.tool_args.remove(&index);
-                    return Ok(());
-                };
-                if let Some(AssistantBlock::ToolCall(call)) = self.output.content.get_mut(index) {
-                    call.arguments = parse_streaming(text);
-                }
+                let previous = reply.take_tool_args(index);
+                reply.set_tool_args(index, text.to_owned());
                 if let Some(rest) = text.strip_prefix(previous.as_str())
                     && !rest.is_empty()
                 {
-                    events.push(AssistantEvent::ToolCallDelta {
+                    reply.emit(AssistantEvent::ToolCallDelta {
                         content_index: index,
                         delta: rest.to_owned(),
                     });
@@ -499,57 +453,11 @@ impl<'a> ResponsesStream<'a> {
             }
             "response.output_item.done" => {
                 if let (Some(output_index), Some(item)) = (output_index, event.get("item")) {
-                    self.finish_item(output_index, item, events);
+                    self.finish_item(output_index, item, reply);
                 }
             }
-            "response.completed" | "response.incomplete" => {
-                self.finalize(event.get("response").unwrap_or(&Value::Null))?;
-            }
-            "error" => {
-                super::http::record_failure(self.output, event);
-                let js_text = |value: Option<&Value>| match value {
-                    None => "undefined".to_owned(),
-                    Some(Value::String(text)) => text.clone(),
-                    Some(other) => other.to_string(),
-                };
-                return Err(format!(
-                    "Error Code {}: {}",
-                    js_text(event.get("code")),
-                    js_text(event.get("message"))
-                ));
-            }
-            "response.failed" => {
-                super::http::record_failure(self.output, event);
-                self.saw_terminal = true;
-                let response = event.get("response");
-                self.output.raw_stop_reason = response
-                    .and_then(|response| response.get("status"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let error = response
-                    .and_then(|response| response.get("error"))
-                    .filter(|error| error.is_object());
-                let reason = response
-                    .and_then(|response| response.pointer("/incomplete_details/reason"))
-                    .and_then(Value::as_str)
-                    .filter(|reason| !reason.is_empty());
-                return Err(match (error, reason) {
-                    (Some(error), _) => {
-                        let field = |key: &str| {
-                            error
-                                .get(key)
-                                .and_then(Value::as_str)
-                                .filter(|text| !text.is_empty())
-                        };
-                        format!(
-                            "{}: {}",
-                            field("code").unwrap_or("unknown"),
-                            field("message").unwrap_or("no message")
-                        )
-                    }
-                    (None, Some(reason)) => format!("incomplete: {reason}"),
-                    (None, None) => "Unknown error (no error details in response)".to_owned(),
-                });
+            "response.completed" => {
+                self.finalize(event.get("response").unwrap_or(&Value::Null), reply)?;
             }
             _ => {}
         }
@@ -558,17 +466,15 @@ impl<'a> ResponsesStream<'a> {
 
     /// Check the stream ended properly: a terminal response event arrived, and no tool
     /// call the agent would run is unfinished (its arguments may be cut off).
-    pub fn finish(&self) -> Result<(), String> {
+    pub fn finish(&self, reply: &Reply) -> Result<(), String> {
         if !self.saw_terminal {
             return Err(
                 "OpenAI Responses stream ended before a terminal response event".to_owned(),
             );
         }
-        if self.output.stop_reason == StopReason::ToolUse {
-            for (index, block) in self.output.content.iter().enumerate() {
-                if let AssistantBlock::ToolCall(call) = block
-                    && self.tool_args.contains_key(&index)
-                {
+        if reply.message.stop_reason == StopReason::ToolUse {
+            for slot in self.slots.values() {
+                if let AssistantBlock::ToolCall(call) = &reply.message.content[slot.content_index] {
                     return Err(format!(
                         "OpenAI Responses stream completed with an unfinished tool call: {} ({})",
                         call.name, call.id
@@ -591,22 +497,22 @@ impl<'a> ResponsesStream<'a> {
         output_index: Option<u64>,
         kind: SlotKind,
         delta: &str,
-        events: &mut Vec<AssistantEvent>,
+        reply: &mut Reply,
     ) {
         let Some(index) = self.slot(output_index, kind) else {
             return;
         };
-        match self.output.content.get_mut(index) {
+        match reply.message.content.get_mut(index) {
             Some(AssistantBlock::Thinking { thinking, .. }) => {
                 thinking.push_str(delta);
-                events.push(AssistantEvent::ThinkingDelta {
+                reply.emit(AssistantEvent::ThinkingDelta {
                     content_index: index,
                     delta: delta.to_owned(),
                 });
             }
             Some(AssistantBlock::Text { text, .. }) => {
                 text.push_str(delta);
-                events.push(AssistantEvent::TextDelta {
+                reply.emit(AssistantEvent::TextDelta {
                     content_index: index,
                     delta: delta.to_owned(),
                 });
@@ -615,13 +521,8 @@ impl<'a> ResponsesStream<'a> {
         }
     }
 
-    fn create_slot(
-        &mut self,
-        output_index: u64,
-        item: &Value,
-        events: &mut Vec<AssistantEvent>,
-    ) -> Option<Slot> {
-        let content_index = self.output.content.len();
+    fn create_slot(&mut self, output_index: u64, item: &Value, reply: &mut Reply) -> Option<Slot> {
+        let content_index = reply.message.content.len();
         let (kind, block, event) = match item.get("type").and_then(Value::as_str)? {
             "reasoning" => (
                 SlotKind::Thinking,
@@ -644,8 +545,7 @@ impl<'a> ResponsesStream<'a> {
                 let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
                 let id = format!("{}|{}", text("call_id"), text("id"));
                 let name = text("name").to_owned();
-                self.tool_args
-                    .insert(content_index, text("arguments").to_owned());
+                reply.set_tool_args(content_index, text("arguments").to_owned());
                 (
                     SlotKind::ToolCall,
                     AssistantBlock::ToolCall(ToolCall {
@@ -663,27 +563,32 @@ impl<'a> ResponsesStream<'a> {
             }
             _ => return None,
         };
-        self.output.content.push(block);
+        reply.message.content.push(block);
         let slot = Slot {
             kind,
             content_index,
         };
         self.slots.insert(output_index, slot);
-        events.push(event);
+        reply.emit(event);
         Some(slot)
     }
 
-    fn finish_item(&mut self, output_index: u64, item: &Value, events: &mut Vec<AssistantEvent>) {
+    fn finish_item(&mut self, output_index: u64, item: &Value, reply: &mut Reply) {
         let slot = match self.slots.get(&output_index) {
             Some(slot) => *slot,
-            None => match self.create_slot(output_index, item, events) {
+            None => match self.create_slot(output_index, item, reply) {
                 Some(slot) => slot,
                 None => return,
             },
         };
         let index = slot.content_index;
         let item_type = item.get("type").and_then(Value::as_str);
-        let event = match (item_type, slot.kind, self.output.content.get_mut(index)) {
+        let partial = if slot.kind == SlotKind::ToolCall && item_type == Some("function_call") {
+            reply.take_tool_args(index)
+        } else {
+            String::new()
+        };
+        match (item_type, slot.kind, reply.message.content.get_mut(index)) {
             (
                 Some("reasoning"),
                 SlotKind::Thinking,
@@ -715,10 +620,6 @@ impl<'a> ResponsesStream<'a> {
                 *replay = Some(ReasoningReplay::OpenAiReasoningItem(item.clone()));
                 if let Some(id) = item.get("id").and_then(Value::as_str) {
                     self.reasoning_by_id.insert(id.to_owned(), index);
-                }
-                AssistantEvent::ThinkingEnd {
-                    content_index: index,
-                    block: self.output.content[index].clone(),
                 }
             }
             (
@@ -761,33 +662,22 @@ impl<'a> ResponsesStream<'a> {
                     signature["phase"] = json!(phase);
                 }
                 *text_signature = Some(signature.to_string());
-                AssistantEvent::TextEnd {
-                    content_index: index,
-                    block: self.output.content[index].clone(),
-                }
             }
             (Some("function_call"), SlotKind::ToolCall, Some(AssistantBlock::ToolCall(call))) => {
-                let Some(partial) = self.tool_args.remove(&index) else {
-                    return;
-                };
                 let text = item
                     .get("arguments")
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                     .unwrap_or(partial.as_str());
                 (call.arguments, call.arguments_error) = parse_tool_arguments(text);
-                AssistantEvent::ToolCallEnd {
-                    content_index: index,
-                    block: self.output.content[index].clone(),
-                }
             }
             _ => return,
         };
         self.slots.remove(&output_index);
-        events.push(event);
+        reply.end_block(index);
     }
 
-    fn finalize(&mut self, response: &Value) -> Result<(), String> {
+    fn finalize(&mut self, response: &Value, reply: &mut Reply) -> Result<(), String> {
         self.saw_terminal = true;
 
         // Some servers omit `encrypted_content` from `output_item.done` and send it only in
@@ -814,7 +704,7 @@ impl<'a> ResponsesStream<'a> {
             if let Some(AssistantBlock::Thinking {
                 replay: Some(ReasoningReplay::OpenAiReasoningItem(Value::Object(stored))),
                 ..
-            }) = self.output.content.get_mut(index)
+            }) = reply.message.content.get_mut(index)
                 && !stored
                     .get("encrypted_content")
                     .and_then(Value::as_str)
@@ -825,13 +715,13 @@ impl<'a> ResponsesStream<'a> {
         }
 
         if let Some(id) = response.get("id").and_then(Value::as_str) {
-            self.output.response_id = Some(id.to_owned());
+            reply.message.response_id = Some(id.to_owned());
         }
         if let Some(usage) = response.get("usage").filter(|usage| usage.is_object()) {
             let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
             let cached = count("/input_tokens_details/cached_tokens");
             let cache_write = count("/input_tokens_details/cache_write_tokens");
-            self.output.usage = Usage {
+            reply.message.usage = Usage {
                 // OpenAI counts cached and cache-write tokens in input_tokens.
                 input: count("/input_tokens").saturating_sub(cached + cache_write),
                 output: count("/output_tokens"),
@@ -843,14 +733,7 @@ impl<'a> ResponsesStream<'a> {
                 cost: Default::default(),
             };
         }
-        calculate_cost(self.model, &mut self.output.usage);
-        if let Some(apply) = self.service_tier_pricing {
-            apply(
-                self.model,
-                response.get("service_tier").and_then(Value::as_str),
-                &mut self.output.usage,
-            );
-        }
+        calculate_cost(self.model, &mut reply.message.usage);
 
         // Incomplete responses keep the provider's reason so max-output truncation and
         // content filtering stay distinct.
@@ -859,7 +742,7 @@ impl<'a> ResponsesStream<'a> {
             .pointer("/incomplete_details/reason")
             .and_then(Value::as_str)
             .filter(|reason| !reason.is_empty());
-        self.output.raw_stop_reason = match reason {
+        reply.message.raw_stop_reason = match reason {
             Some(reason) => Some(format!("{}.{reason}", status.unwrap_or("undefined"))),
             None => status.map(str::to_owned),
         };
@@ -876,12 +759,12 @@ impl<'a> ResponsesStream<'a> {
             Some("failed" | "cancelled") => (StopReason::Error, None),
             Some(other) => return Err(format!("Unhandled stop reason: {other}")),
         };
-        self.output.stop_reason = stop_reason;
+        reply.message.stop_reason = stop_reason;
         // Error metadata can also arrive on a normalized Codex terminal event.
         if stop_reason == StopReason::Error {
-            super::http::record_failure(self.output, response);
+            super::http::record_failure(&mut reply.message, response);
         }
-        self.output.error_message = error_message.or_else(|| {
+        reply.message.error_message = error_message.or_else(|| {
             (stop_reason == StopReason::Error)
                 .then(|| {
                     response
@@ -891,8 +774,8 @@ impl<'a> ResponsesStream<'a> {
                 })
                 .flatten()
         });
-        if stop_reason == StopReason::Stop && self.output.tool_calls().next().is_some() {
-            self.output.stop_reason = StopReason::ToolUse;
+        if stop_reason == StopReason::Stop && reply.message.tool_calls().next().is_some() {
+            reply.message.stop_reason = StopReason::ToolUse;
         }
         Ok(())
     }

@@ -7,7 +7,7 @@ use axo_agent::{ExecutionMode, Replay, Tool, ToolContext, ToolError, ToolOutput}
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 
-use crate::jobs::{DeliveryKey, job_name, render_results};
+use crate::jobs::{job_name, render_results};
 use crate::tools::SessionTools;
 
 const DESCRIPTION: &str = "Block until a background job (bg_N) finishes and return its result. Returns immediately when no background job is running. A new user message interrupts the wait.";
@@ -64,7 +64,7 @@ impl Tool for WaitTool {
             invocation,
             ..
         } = cx;
-        let jobs = &self.tools.jobs;
+        let jobs = &self.tools.runner.jobs;
         // Subscribe before the first check so no change between check and await is missed.
         let mut changed = jobs.subscribe();
         loop {
@@ -77,7 +77,7 @@ impl Tool for WaitTool {
                     ids.join(", ")
                 )));
             }
-            let results = jobs.reserve(DeliveryKey::Invocation(invocation));
+            let results = jobs.reserve_for(invocation);
             if !results.is_empty() {
                 return Ok(text(render_results(&results)));
             }

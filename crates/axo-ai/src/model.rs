@@ -19,17 +19,6 @@ pub enum ApiKind {
     OpenAiCodexResponses,
 }
 
-impl ApiKind {
-    /// The serde name, e.g. `anthropic-messages`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ApiKind::AnthropicMessages => "anthropic-messages",
-            ApiKind::OpenAiCompletions => "openai-completions",
-            ApiKind::OpenAiCodexResponses => "openai-codex-responses",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputKind {
@@ -81,8 +70,6 @@ pub struct Model {
     pub cost: Cost,
     pub context_window: u64,
     pub max_tokens: u64,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub compat: Compat,
 }
@@ -105,15 +92,7 @@ pub struct Compat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_session_affinity_headers: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_long_cache_retention: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_strict_mode: Option<bool>,
-    #[serde(
-        default,
-        rename = "supportsOpenAIGrammarTools",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub supports_openai_grammar_tools: Option<bool>,
 
     // OpenAI Completions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,10 +145,6 @@ pub struct Compat {
     pub supports_additional_tools: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tool_search: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_explicit_prompt_cache_mode: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_max_output_tokens: Option<bool>,
 
     // Anthropic Messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,8 +157,6 @@ pub struct Compat {
     pub force_adaptive_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_empty_signature: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_strict_tools: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_mid_convo_tool_changes: Option<bool>,
 }

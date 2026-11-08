@@ -43,6 +43,13 @@ impl From<AgentMessage> for QueuedMessage {
     }
 }
 
+pub(crate) fn last_non_system(messages: &[AgentMessage]) -> Option<&AgentMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| !matches!(message, AgentMessage::Llm(Message::System(_))))
+}
+
 /// A resumable assistant message, its unanswered calls and its trailing results.
 pub struct Unanswered<'a> {
     pub message: &'a AssistantMessage,

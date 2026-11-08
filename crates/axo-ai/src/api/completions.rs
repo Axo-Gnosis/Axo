@@ -11,28 +11,26 @@
 //!   always pi's default `short`), and the `onPayload`/`onResponse` hooks.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
-use futures::channel::mpsc::{self, UnboundedSender};
-use futures::stream::{self, BoxStream};
-use futures::{StreamExt, future};
+use futures::stream::BoxStream;
 use indexmap::IndexMap;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{RetryPolicy, error_body, send_with_retry};
-use crate::api::sse::{SseDecoder, SseEvent};
-use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions};
+use crate::api::http::{read_sse, send};
+use crate::api::sse::SseEvent;
+use crate::api::{ABORTED, Api, Reply, SimpleStreamOptions, StreamOptions, header_map, respond};
 use crate::cost::calculate_cost;
-use crate::error::Error;
-use crate::estimate::{CONTEXT_SAFETY_TOKENS, estimate_context_tokens};
+use crate::estimate::clamp_max_tokens_to_context;
 use crate::event::AssistantEvent;
-use crate::json::{parse_streaming, parse_tool_arguments};
+use crate::json::parse_tool_arguments;
 use crate::model::{
     CacheControlFormat, ChatTemplateValue, InputKind, MaxTokensField, Model, SessionAffinityFormat,
     ThinkingFormat, ThinkingTokenBudgetField, ThinkingVar,
 };
-use crate::thinking::{clamp_level, provider_value};
+use crate::thinking::{MIN_ANSWER_TOKENS, clamp_level, default_thinking_budget, provider_value};
 use crate::transcript::{
     Transcript, TranscriptToolSupport, render_system_message_update, resolve_transcript_tools,
     system_message_text,
@@ -47,13 +45,8 @@ use crate::types::{
 /// the first non-empty one wins.
 const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
-const USER_AGENT: &str = concat!("axo-ai/", env!("CARGO_PKG_VERSION"));
-
 /// Provider error bodies longer than this are truncated in error messages.
 const MAX_PROVIDER_ERROR_BODY_CHARS: usize = 4000;
-
-/// Tokens always left for the answer when a thinking budget shares the response ceiling.
-const MIN_ANSWER_TOKENS: u64 = 1024;
 
 /// The OpenAI Chat Completions API.
 #[derive(Debug, Clone)]
@@ -75,15 +68,13 @@ impl Api for CompletionsApi {
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
-        let (tx, rx) = mpsc::unbounded();
-        let response = Response::new(model.clone(), tx);
+        let response_model = model.clone();
         let http = self.http.clone();
-        // The request is driven by the returned stream itself: dropping the stream drops
-        // the request.
-        let producer =
-            stream::once(async move { response.run(&http, &transcript, &opts, &cancel).await })
-                .filter_map(|()| future::ready(None));
-        stream::select(rx, producer).boxed()
+        respond(model, cancel, move |reply, cancel| async move {
+            let mut response = Response::new(response_model, reply);
+            let result = response.request(&http, &transcript, &opts, &cancel).await;
+            (response.reply, result)
+        })
     }
 }
 
@@ -229,65 +220,30 @@ fn resolve_compat(model: &Model, base_url: &str) -> ResolvedCompat {
     }
 }
 
-/// Request headers, later sources winning: identity → `model.headers` → session
-/// affinity → resolved auth headers → request headers (`None` deletes). The bearer key
-/// goes first so a configured `authorization` header replaces it.
-fn build_headers(
-    model: &Model,
-    compat: &ResolvedCompat,
-    opts: &StreamOptions,
-) -> Result<HeaderMap, String> {
-    let insert = |headers: &mut HeaderMap, name: &str, value: &str| -> Result<(), String> {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| format!("Invalid header name: {name}"))?;
-        let value =
-            HeaderValue::from_str(value).map_err(|_| format!("Invalid value for header {name}"))?;
-        headers.insert(name, value);
-        Ok(())
-    };
-    let mut headers = HeaderMap::new();
-    let api_key = opts
-        .simple
-        .api_key
-        .as_deref()
-        .or(opts.auth.api_key.as_deref())
-        .filter(|key| !key.is_empty());
-    if let Some(key) = api_key {
-        insert(
-            &mut headers,
-            AUTHORIZATION.as_str(),
-            &format!("Bearer {key}"),
-        )?;
-    }
-    insert(&mut headers, "user-agent", USER_AGENT)?;
-    for (name, value) in &model.headers {
-        insert(&mut headers, name, value)?;
+/// Request headers, later sources winning: bearer key → session affinity → resolved
+/// auth headers → request headers (`None` deletes).
+fn build_headers(compat: &ResolvedCompat, opts: &StreamOptions) -> Result<HeaderMap, String> {
+    let mut headers = Vec::new();
+    if let Some(key) = opts.auth.api_key.as_deref().filter(|key| !key.is_empty()) {
+        headers.push(("authorization".to_owned(), Some(format!("Bearer {key}"))));
     }
     if let Some(session_id) = &opts.simple.session_id
         && compat.send_session_affinity_headers
     {
-        if compat.session_affinity_format == SessionAffinityFormat::Openrouter {
-            insert(&mut headers, "x-session-id", session_id)?;
-        } else {
-            if compat.session_affinity_format == SessionAffinityFormat::Openai {
-                insert(&mut headers, "session_id", session_id)?;
+        let names: &[&str] = match compat.session_affinity_format {
+            SessionAffinityFormat::Openrouter => &["x-session-id"],
+            SessionAffinityFormat::Openai => {
+                &["session_id", "x-client-request-id", "x-session-affinity"]
             }
-            insert(&mut headers, "x-client-request-id", session_id)?;
-            insert(&mut headers, "x-session-affinity", session_id)?;
-        }
+            _ => &["x-client-request-id", "x-session-affinity"],
+        };
+        headers.extend(
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), Some(session_id.clone()))),
+        );
     }
-    for (name, value) in &opts.auth.headers {
-        insert(&mut headers, name, value)?;
-    }
-    for (name, value) in &opts.simple.headers {
-        match value {
-            Some(value) => insert(&mut headers, name, value)?,
-            None => {
-                headers.remove(name.as_str());
-            }
-        }
-    }
-    Ok(headers)
+    header_map([headers, opts.configured_headers().into_iter().collect()])
 }
 
 /// The request body (pi `streamSimple` + `buildParams`).
@@ -336,16 +292,11 @@ fn build_params(
         );
     }
 
-    // pi `clampMaxTokensToContext`: leave room for the estimated prompt.
-    let requested_max_tokens = simple.max_tokens.unwrap_or(model.max_tokens);
-    let max_tokens = if model.context_window == 0 {
-        requested_max_tokens.max(1)
-    } else {
-        let available = model.context_window as i64
-            - estimate_context_tokens(transcript.messages()) as i64
-            - CONTEXT_SAFETY_TOKENS;
-        requested_max_tokens.min(available.max(1) as u64)
-    };
+    let max_tokens = clamp_max_tokens_to_context(
+        model,
+        transcript.messages(),
+        simple.max_tokens.unwrap_or(model.max_tokens),
+    );
 
     let mut params = Map::new();
     params.insert("model".into(), model.id.clone().into());
@@ -374,11 +325,6 @@ fn build_params(
     };
     params.insert(max_tokens_field.into(), max_tokens.into());
     if let Some(temperature) = simple.temperature {
-        // Through the decimal text so 0.7f32 is sent as 0.7, not 0.699999988.
-        let temperature = temperature
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(f64::from(temperature));
         params.insert("temperature".into(), temperature.into());
     }
     if let Some(tools) = tools {
@@ -398,13 +344,7 @@ fn build_params(
     let thinking_budget = effort
         .filter(|_| model.reasoning)
         .map(|level| {
-            let budget: u64 = match level {
-                ThinkingLevel::Minimal => 1024,
-                ThinkingLevel::Low => 2048,
-                ThinkingLevel::Medium => 8192,
-                _ => 16384,
-            };
-            budget.min(max_tokens.saturating_sub(MIN_ANSWER_TOKENS))
+            default_thinking_budget(level).min(max_tokens.saturating_sub(MIN_ANSWER_TOKENS))
         })
         .filter(|budget| *budget > 0);
 
@@ -703,10 +643,7 @@ fn convert_messages(
                     let text = result
                         .content
                         .iter()
-                        .filter_map(|block| match block {
-                            UserBlock::Text { text } => Some(text.as_str()),
-                            UserBlock::Image { .. } => None,
-                        })
+                        .filter_map(UserBlock::as_text)
                         .collect::<Vec<_>>()
                         .join("\n");
                     let has_images = result
@@ -1140,19 +1077,16 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
 
 /// A tool call still streaming.
 struct ToolState {
-    /// Position in `output.content`.
+    /// Position in `reply.message.content`.
     index: usize,
     /// `delta.tool_calls[].index`, once known.
     stream_index: Option<u64>,
-    /// Raw arguments text received so far.
-    args: String,
 }
 
 /// One streamed response: the message being built and the block bookkeeping.
 struct Response {
     model: Model,
-    tx: UnboundedSender<AssistantEvent>,
-    output: AssistantMessage,
+    reply: Reply,
     /// The single text block of the response.
     text: Option<usize>,
     /// The single thinking block of the response.
@@ -1166,12 +1100,10 @@ struct Response {
 }
 
 impl Response {
-    fn new(model: Model, tx: UnboundedSender<AssistantEvent>) -> Self {
-        let output = AssistantMessage::empty(&model);
+    fn new(model: Model, reply: Reply) -> Self {
         Self {
             model,
-            tx,
-            output,
+            reply,
             text: None,
             thinking: None,
             reasoning_details: None,
@@ -1182,40 +1114,6 @@ impl Response {
         }
     }
 
-    /// Run the request and send its terminal event.
-    async fn run(
-        mut self,
-        http: &reqwest::Client,
-        transcript: &Transcript,
-        opts: &StreamOptions,
-        cancel: &CancellationToken,
-    ) {
-        let event = match self.request(http, transcript, opts, cancel).await {
-            Ok(reason) => {
-                self.output.stop_reason = reason;
-                AssistantEvent::Done {
-                    reason,
-                    message: self.output,
-                }
-            }
-            Err(message) => {
-                self.apply_reasoning_details();
-                let reason = if cancel.is_cancelled() {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                self.output.stop_reason = reason;
-                self.output.error_message = Some(message);
-                AssistantEvent::Error {
-                    reason,
-                    message: self.output,
-                }
-            }
-        };
-        let _ = self.tx.unbounded_send(event);
-    }
-
     /// Send the request and stream the reply; the error is the message's `error_message`.
     async fn request(
         &mut self,
@@ -1224,66 +1122,22 @@ impl Response {
         opts: &StreamOptions,
         cancel: &CancellationToken,
     ) -> Result<StopReason, String> {
-        let base_url = opts
-            .auth
-            .base_url
-            .as_deref()
-            .unwrap_or(&self.model.base_url)
-            .trim_end_matches('/')
-            .to_owned();
-        let compat = resolve_compat(&self.model, &base_url);
-        let headers = build_headers(&self.model, &compat, opts)?;
-        let params = build_params(&self.model, transcript, &opts.simple, &compat, &base_url);
+        let base_url = opts.base_url(&self.model);
+        let compat = resolve_compat(&self.model, base_url);
+        let headers = build_headers(&compat, opts)?;
+        let params = build_params(&self.model, transcript, &opts.simple, &compat, base_url);
         let url = format!("{base_url}/chat/completions");
-        let response = send_with_retry(
+        let response = send(
             || http.post(&url).headers(headers.clone()).json(&params),
-            &RetryPolicy::default(),
             cancel,
+            &mut self.reply,
+            http_error_message,
         )
-        .await
-        .map_err(|error| match error {
-            Error::Aborted => ABORTED.to_owned(),
-            error => error.to_string(),
-        })?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            self.output.failure = Some(super::http::response_failure(&response));
-            let Some(text) = error_body(response, cancel).await else {
-                return Err(ABORTED.to_owned());
-            };
-            let body = serde_json::from_str::<Value>(&text).ok();
-            if let Some(body) = body.as_ref() {
-                super::http::record_failure(&mut self.output, body);
-            }
-            return Err(http_error_message(status, &text, body.as_ref()));
-        }
-        let _ = self.tx.unbounded_send(AssistantEvent::Start {
-            partial: self.output.clone(),
-        });
-
-        let mut body = std::pin::pin!(response.bytes_stream());
-        let mut decoder = SseDecoder::new();
-        let mut done = false;
-        while !done {
-            let chunk = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
-                chunk = body.next() => chunk,
-            };
-            let events = match chunk {
-                Some(Ok(bytes)) => decoder.push(&bytes),
-                Some(Err(error)) => return Err(error.to_string()),
-                None => {
-                    done = true;
-                    std::mem::take(&mut decoder).finish().into_iter().collect()
-                }
-            };
-            for event in &events {
-                if self.handle_event(event)? {
-                    done = true;
-                    break;
-                }
-            }
+        .await?;
+        self.reply.start();
+        if let Err(error) = read_sse(response, cancel, |event| self.handle_event(event)).await {
+            self.apply_reasoning_details();
+            return Err(error);
         }
 
         self.finish_blocks();
@@ -1291,7 +1145,7 @@ impl Response {
             return Err(ABORTED.to_owned());
         }
         if !self.has_finish_reason && !compat.supports_finish_reason {
-            self.stop_reason = Some(if self.output.tool_calls().next().is_some() {
+            self.stop_reason = Some(if self.reply.message.tool_calls().next().is_some() {
                 StopReason::ToolUse
             } else {
                 StopReason::Stop
@@ -1299,7 +1153,8 @@ impl Response {
         }
         if self.stop_reason == Some(StopReason::Error) {
             return Err(self
-                .output
+                .reply
+                .message
                 .error_message
                 .clone()
                 .unwrap_or_else(|| "Provider returned an error stop reason".to_owned()));
@@ -1310,11 +1165,11 @@ impl Response {
         }
     }
 
-    /// Handle one SSE event; `true` at the `[DONE]` sentinel.
-    fn handle_event(&mut self, event: &SseEvent) -> Result<bool, String> {
+    /// Handle one SSE event; break at the `[DONE]` sentinel.
+    fn handle_event(&mut self, event: &SseEvent) -> Result<ControlFlow<()>, String> {
         let data = event.data.as_str();
         if data.starts_with("[DONE]") {
-            return Ok(true);
+            return Ok(ControlFlow::Break(()));
         }
         if data.is_empty()
             || event
@@ -1322,42 +1177,42 @@ impl Response {
                 .as_deref()
                 .is_some_and(|name| name.starts_with("thread."))
         {
-            return Ok(false);
+            return Ok(ControlFlow::Continue(()));
         }
         let chunk: Value = serde_json::from_str(data).map_err(|error| error.to_string())?;
         if let Some(error) = chunk.get("error").filter(|error| truthy(Some(error))) {
-            super::http::record_failure(&mut self.output, &chunk);
+            super::http::record_failure(&mut self.reply.message, &chunk);
             return Err(with_raw_metadata(
                 api_error_message(None, Some(error), None),
                 Some(error),
             ));
         }
         self.apply_chunk(&chunk);
-        Ok(false)
+        Ok(ControlFlow::Continue(()))
     }
 
     fn apply_chunk(&mut self, chunk: &Value) {
         if !chunk.is_object() {
             return;
         }
-        if self.output.response_id.is_none()
+        if self.reply.message.response_id.is_none()
             && let Some(id) = chunk
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
         {
-            self.output.response_id = Some(id.to_owned());
+            self.reply.message.response_id = Some(id.to_owned());
         }
-        if self.output.response_model.is_none()
+        if self.reply.message.response_model.is_none()
             && let Some(name) = chunk.get("model").and_then(Value::as_str)
             && !name.is_empty()
             && name != self.model.id
         {
-            self.output.response_model = Some(name.to_owned());
+            self.reply.message.response_model = Some(name.to_owned());
         }
         let usage = chunk.get("usage").filter(|usage| truthy(Some(usage)));
         if let Some(usage) = usage {
-            self.output.usage = parse_usage(usage, &self.model);
+            self.reply.message.usage = parse_usage(usage, &self.model);
         }
 
         let Some(choice) = chunk
@@ -1372,18 +1227,18 @@ impl Response {
         if usage.is_none()
             && let Some(usage) = choice.get("usage").filter(|usage| truthy(Some(usage)))
         {
-            self.output.usage = parse_usage(usage, &self.model);
+            self.reply.message.usage = parse_usage(usage, &self.model);
         }
         if let Some(reason) = choice
             .get("finish_reason")
             .and_then(Value::as_str)
             .filter(|reason| !reason.is_empty())
         {
-            self.output.raw_stop_reason = Some(reason.to_owned());
+            self.reply.message.raw_stop_reason = Some(reason.to_owned());
             let (stop_reason, error_message) = map_stop_reason(reason);
             self.stop_reason = Some(stop_reason);
             if error_message.is_some() {
-                self.output.error_message = error_message;
+                self.reply.message.error_message = error_message;
             }
             self.has_finish_reason = true;
         }
@@ -1402,11 +1257,11 @@ impl Response {
         }) {
             let index = self.thinking_block(Some(field));
             if let Some(AssistantBlock::Thinking { thinking, .. }) =
-                self.output.content.get_mut(index)
+                self.reply.message.content.get_mut(index)
             {
                 thinking.push_str(text);
             }
-            let _ = self.tx.unbounded_send(AssistantEvent::ThinkingDelta {
+            self.reply.emit(AssistantEvent::ThinkingDelta {
                 content_index: index,
                 delta: text.to_owned(),
             });
@@ -1425,24 +1280,24 @@ impl Response {
             let index = match self.text {
                 Some(index) => index,
                 None => {
-                    let index = self.output.content.len();
-                    self.output.content.push(AssistantBlock::Text {
+                    let index = self.reply.message.content.len();
+                    self.reply.message.content.push(AssistantBlock::Text {
                         text: String::new(),
                         text_signature: None,
                     });
                     self.text = Some(index);
-                    let _ = self.tx.unbounded_send(AssistantEvent::TextStart {
+                    self.reply.emit(AssistantEvent::TextStart {
                         content_index: index,
                     });
                     index
                 }
             };
             if let Some(AssistantBlock::Text { text: block, .. }) =
-                self.output.content.get_mut(index)
+                self.reply.message.content.get_mut(index)
             {
                 block.push_str(text);
             }
-            let _ = self.tx.unbounded_send(AssistantEvent::TextDelta {
+            self.reply.emit(AssistantEvent::TextDelta {
                 content_index: index,
                 delta: text.to_owned(),
             });
@@ -1460,14 +1315,14 @@ impl Response {
         if let Some(index) = self.thinking {
             return index;
         }
-        let index = self.output.content.len();
-        self.output.content.push(AssistantBlock::Thinking {
+        let index = self.reply.message.content.len();
+        self.reply.message.content.push(AssistantBlock::Thinking {
             thinking: String::new(),
             replay: field.map(|field| ReasoningReplay::ReasoningField(field.to_owned())),
             redacted: false,
         });
         self.thinking = Some(index);
-        let _ = self.tx.unbounded_send(AssistantEvent::ThinkingStart {
+        self.reply.emit(AssistantEvent::ThinkingStart {
             content_index: index,
         });
         index
@@ -1501,19 +1356,21 @@ impl Response {
         let position = match found {
             Some(position) => position,
             None => {
-                let index = self.output.content.len();
-                self.output.content.push(AssistantBlock::ToolCall(ToolCall {
-                    id: id.unwrap_or_default().to_owned(),
-                    name: name.to_owned(),
-                    arguments: JsonMap::new(),
-                    arguments_error: None,
-                }));
+                let index = self.reply.message.content.len();
+                self.reply
+                    .message
+                    .content
+                    .push(AssistantBlock::ToolCall(ToolCall {
+                        id: id.unwrap_or_default().to_owned(),
+                        name: name.to_owned(),
+                        arguments: JsonMap::new(),
+                        arguments_error: None,
+                    }));
                 self.tools.push(ToolState {
                     index,
                     stream_index,
-                    args: String::new(),
                 });
-                let _ = self.tx.unbounded_send(AssistantEvent::ToolCallStart {
+                self.reply.emit(AssistantEvent::ToolCallStart {
                     content_index: index,
                     id: id.unwrap_or_default().to_owned(),
                     name: name.to_owned(),
@@ -1528,12 +1385,8 @@ impl Response {
         if tool.stream_index.is_none() {
             tool.stream_index = stream_index;
         }
-        let arguments = (!arguments_delta.is_empty()).then(|| {
-            tool.args.push_str(arguments_delta);
-            parse_streaming(&tool.args)
-        });
         let index = tool.index;
-        if let Some(AssistantBlock::ToolCall(block)) = self.output.content.get_mut(index) {
+        if let Some(AssistantBlock::ToolCall(block)) = self.reply.message.content.get_mut(index) {
             if block.id.is_empty()
                 && let Some(id) = id
             {
@@ -1542,14 +1395,8 @@ impl Response {
             if block.name.is_empty() && !name.is_empty() {
                 block.name = name.to_owned();
             }
-            if let Some(arguments) = arguments {
-                block.arguments = arguments;
-            }
         }
-        let _ = self.tx.unbounded_send(AssistantEvent::ToolCallDelta {
-            content_index: index,
-            delta: arguments_delta.to_owned(),
-        });
+        self.reply.push_tool_args(index, arguments_delta);
     }
 
     /// Store merged `reasoning_details` as the thinking block's replay data.
@@ -1557,7 +1404,7 @@ impl Response {
         let Some(details) = &self.reasoning_details else {
             return;
         };
-        for block in &mut self.output.content {
+        for block in &mut self.reply.message.content {
             if let AssistantBlock::Thinking { replay, .. } = block {
                 *replay = Some(ReasoningReplay::ReasoningDetails(Value::Array(
                     details.clone(),
@@ -1570,27 +1417,12 @@ impl Response {
     /// arguments get their final parse, and each `*End` carries the final block.
     fn finish_blocks(&mut self) {
         self.apply_reasoning_details();
-        for index in 0..self.output.content.len() {
-            if let AssistantBlock::ToolCall(call) = &mut self.output.content[index]
-                && let Some(tool) = self.tools.iter().find(|tool| tool.index == index)
-            {
-                (call.arguments, call.arguments_error) = parse_tool_arguments(&tool.args);
+        for index in 0..self.reply.message.content.len() {
+            let arguments = self.reply.take_tool_args(index);
+            if let AssistantBlock::ToolCall(call) = &mut self.reply.message.content[index] {
+                (call.arguments, call.arguments_error) = parse_tool_arguments(&arguments);
             }
-            let event = match self.output.content[index].clone() {
-                block @ AssistantBlock::Text { .. } => AssistantEvent::TextEnd {
-                    content_index: index,
-                    block,
-                },
-                block @ AssistantBlock::Thinking { .. } => AssistantEvent::ThinkingEnd {
-                    content_index: index,
-                    block,
-                },
-                block @ AssistantBlock::ToolCall(_) => AssistantEvent::ToolCallEnd {
-                    content_index: index,
-                    block,
-                },
-            };
-            let _ = self.tx.unbounded_send(event);
+            self.reply.end_block(index);
         }
     }
 }

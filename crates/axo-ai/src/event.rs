@@ -78,6 +78,23 @@ pub enum AssistantEvent {
 }
 
 impl AssistantEvent {
+    pub(crate) fn end_block(content_index: usize, block: AssistantBlock) -> Self {
+        match &block {
+            AssistantBlock::Text { .. } => Self::TextEnd {
+                content_index,
+                block,
+            },
+            AssistantBlock::Thinking { .. } => Self::ThinkingEnd {
+                content_index,
+                block,
+            },
+            AssistantBlock::ToolCall(_) => Self::ToolCallEnd {
+                content_index,
+                block,
+            },
+        }
+    }
+
     /// Whether this event ends the stream.
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -215,9 +232,11 @@ impl Accumulator {
 }
 
 /// Arguments are parsed only when a message is taken, not on every delta.
-fn parse_tool_args(message: &mut AssistantMessage, tool_args: &HashMap<usize, String>) {
+pub(crate) fn parse_tool_args(message: &mut AssistantMessage, tool_args: &HashMap<usize, String>) {
     for (index, buffer) in tool_args {
-        if let Some(AssistantBlock::ToolCall(call)) = message.content.get_mut(*index) {
+        if !buffer.is_empty()
+            && let Some(AssistantBlock::ToolCall(call)) = message.content.get_mut(*index)
+        {
             call.arguments = parse_streaming(buffer);
         }
     }
@@ -227,7 +246,9 @@ fn parse_tool_args(message: &mut AssistantMessage, tool_args: &HashMap<usize, St
 /// the moment this wrapper was created (pi `AssistantMessageEventStream`). A message
 /// that already has a duration, or whose `timestamp` predates the wrapper (a response
 /// that started elsewhere), is left untimed.
-pub fn timed(stream: BoxStream<'static, AssistantEvent>) -> BoxStream<'static, AssistantEvent> {
+pub(crate) fn timed(
+    stream: BoxStream<'static, AssistantEvent>,
+) -> BoxStream<'static, AssistantEvent> {
     let started_at = now_ms();
     let started = Instant::now();
     stream

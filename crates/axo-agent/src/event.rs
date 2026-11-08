@@ -6,8 +6,7 @@ use axo_ai::{AssistantEvent, JsonMap, ToolResultMessage};
 use crate::message::AgentMessage;
 use crate::tool::{ToolInvocationId, ToolOutput, ToolUpdate};
 
-/// One event of a run. Each goes first to [`Persist`] (awaited, may mutate it), then to
-/// the broadcast subscribers.
+/// One event of a run, delivered to the ordered, awaited [`Persist`] sink.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     AgentStart,
@@ -30,7 +29,7 @@ pub enum AgentEvent {
     MessageUpdate {
         event: AssistantEvent,
     },
-    /// The finished message; persistence may adjust it before the loop uses it.
+    /// The finished message.
     MessageEnd {
         message: AgentMessage,
         origin: MessageOrigin,
@@ -49,7 +48,6 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         result: ToolOutput,
-        is_error: bool,
     },
 }
 
@@ -68,7 +66,7 @@ pub enum MessageOrigin {
 /// before the next request goes out. An error stops the run.
 #[async_trait]
 pub trait Persist: Send + Sync {
-    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError>;
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError>;
 }
 
 #[derive(Debug, thiserror::Error)]

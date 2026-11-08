@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use axo::store::EntryId;
+use axo::EntryId;
 use axo::tools::Located;
 use axo::{ProjectAccess, SchemeUrl, SessionOptions, SessionTools, Target, ToolFactory};
 use axo_agent::{RunOutcome, Tool, ToolContext, ToolError, ToolOutput};

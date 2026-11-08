@@ -1,40 +1,37 @@
 //! The built-in tools and the per-session state they share.
 
-pub mod ask;
-pub mod bash;
+mod ask;
+pub(crate) mod bash;
 pub(crate) mod bash_urls;
-pub mod edit;
-pub mod files;
-pub mod find;
-pub mod grep;
-pub mod read;
-pub mod truncate;
-pub mod wait;
-pub mod write;
+pub(crate) mod edit;
+pub(crate) mod files;
+pub(crate) mod find;
+pub(crate) mod grep;
+mod ledger;
+pub(crate) mod read;
+pub(crate) mod truncate;
+pub(crate) mod wait;
+pub(crate) mod write;
 
+use ignore::WalkBuilder;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use axo_agent::{AgentMessage, Tool, ToolError};
-use axo_ai::{Message, ToolResultMessage};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::sync::OwnedMutexGuard;
+use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
-use crate::jobs::JobRegistry;
+use crate::jobs::command::CommandRunner;
 use crate::schemes::{SchemeUrl, Schemes, Target};
-use ask::{AskTool, PendingQuestions};
+use ask::AskTool;
+pub(crate) use ask::PendingQuestions;
+pub use ask::{Answer, Question, QuestionOption};
 use bash::BashTool;
 use edit::EditTool;
 use find::FindTool;
@@ -42,6 +39,10 @@ use grep::GrepTool;
 use read::ReadTool;
 use wait::WaitTool;
 use write::WriteTool;
+
+pub use crate::jobs::command::CommandRequest;
+pub use ledger::{FileAccess, FileLedger, lock_file};
+pub(crate) use ledger::{file_key, ledger_access};
 
 /// State shared by one session's tools; each tool holds an `Arc` of it.
 pub struct SessionTools {
@@ -54,15 +55,9 @@ pub struct SessionTools {
     pub context: NestedContext,
     /// The session's scheme registry.
     pub schemes: Schemes,
-    pub questions: Arc<PendingQuestions>,
-    /// `ask` auto-selects the recommended option after this long.
-    pub ask_timeout: Option<Duration>,
-    /// Set `CI=true` for bash commands.
-    pub ci_env: bool,
     /// Runs every local command in its own supervised container (process group or cgroup).
     pub supervisor: Arc<ProcessSupervisor>,
-    /// The session's command jobs: every bash command registers here while it runs.
-    pub jobs: Arc<JobRegistry>,
+    pub(crate) runner: CommandRunner,
 }
 
 /// Builds a host tool for one session from that session's shared state (called again for
@@ -72,11 +67,9 @@ pub type ToolFactory = Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + 
 
 /// A tool path located without applying plain-filesystem fallback rules.
 pub enum Located {
-    /// Not a scheme URL: resolve it with `resolve_path` or `resolve_read_path`.
-    Plain,
-    /// A scheme-backed file; mutations require `writable`.
+    /// A filesystem target; plain paths have no URL and are writable.
     File {
-        url: SchemeUrl,
+        url: Option<SchemeUrl>,
         path: PathBuf,
         writable: bool,
     },
@@ -85,19 +78,54 @@ pub enum Located {
 }
 
 impl SessionTools {
-    /// Cleans and resolves a scheme URL, leaving ordinary paths for filesystem fallback.
+    pub(crate) fn new(
+        cwd: PathBuf,
+        exec: Arc<dyn ExecEnv>,
+        context: NestedContext,
+        schemes: Schemes,
+        runner: CommandRunner,
+    ) -> Self {
+        Self {
+            cwd,
+            exec,
+            ledger: FileLedger::default(),
+            context,
+            schemes,
+            supervisor: runner.supervisor.clone(),
+            runner,
+        }
+    }
+
+    /// Runs a command with output capture, automatic background promotion and job delivery.
+    pub async fn run_command(
+        &self,
+        cx: ToolContext,
+        request: CommandRequest,
+    ) -> Result<ToolOutput, ToolError> {
+        self.runner.run(cx, request).await
+    }
+
+    /// Cleans and resolves a scheme URL or ordinary filesystem path.
     pub async fn locate(&self, path: &str) -> Result<Located, ToolError> {
-        let Some(url) = self.schemes.parse(&clean_path(path))? else {
-            return Ok(Located::Plain);
+        let Some(url) = self.parse_url(path)? else {
+            return Ok(Located::File {
+                path: self.resolve_path(path),
+                url: None,
+                writable: true,
+            });
         };
         match self.schemes.resolve(&url).await? {
             Target::File { path, writable } => Ok(Located::File {
-                url,
+                url: Some(url),
                 path,
                 writable,
             }),
             Target::Virtual => Ok(Located::Virtual { url }),
         }
+    }
+
+    pub(crate) fn parse_url(&self, path: &str) -> Result<Option<SchemeUrl>, ToolError> {
+        self.schemes.parse(&clean_path(path))
     }
 
     /// Rewrites whole-word scheme URLs in a bash command to file paths; the transcript keeps the original.
@@ -111,8 +139,7 @@ impl SessionTools {
     ) -> Result<(PathBuf, Option<String>), ToolError> {
         let path = path.filter(|path| !path.is_empty()).unwrap_or(".");
         match self.locate(path).await? {
-            Located::Plain => Ok((self.resolve_path(path), None)),
-            Located::File { url, path, .. } => Ok((path, Some(url.to_string()))),
+            Located::File { url, path, .. } => Ok((path, url.map(|url| url.to_string()))),
             Located::Virtual { url, .. } => {
                 Err(ToolError(format!("{url} is not a file; use read {url}")))
             }
@@ -147,37 +174,74 @@ impl SessionTools {
         }
         resolved
     }
-
-    /// [`Self::resolve_path`] for reading (pi `resolveReadPath`): when the path does not
-    /// exist, tries the macOS screenshot variants (narrow no-break space before `AM.`/`PM.`,
-    /// NFD, curly apostrophe, NFD + curly apostrophe) and returns the first that exists.
-    pub fn resolve_read_path(&self, path: &str) -> PathBuf {
-        static AM_PM: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?i) (AM|PM)\.").expect("valid regex"));
-        let resolved = self.resolve_path(path);
-        if resolved.exists() {
-            return resolved;
-        }
-        let Some(text) = resolved.to_str() else {
-            return resolved;
-        };
-        let nfd: String = text.nfd().collect();
-        let variants = [
-            AM_PM.replace_all(text, "\u{202F}$1.").into_owned(),
-            nfd.clone(),
-            text.replace('\'', "\u{2019}"),
-            nfd.replace('\'', "\u{2019}"),
-        ];
-        variants
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|variant| *variant != resolved && variant.exists())
-            .unwrap_or(resolved)
-    }
 }
 
-pub(crate) fn root_label<'a>(root: &'a Path, label: Option<&'a str>) -> Cow<'a, str> {
-    label.map_or_else(|| root.to_string_lossy(), Cow::Borrowed)
+/// Tries macOS screenshot variants for a plain filesystem read path that does not exist.
+pub(crate) fn existing_variant(resolved: PathBuf) -> PathBuf {
+    static AM_PM: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i) (AM|PM)\.").expect("valid regex"));
+    if resolved.exists() {
+        return resolved;
+    }
+    let Some(text) = resolved.to_str() else {
+        return resolved;
+    };
+    let nfd: String = text.nfd().collect();
+    let variants = [
+        AM_PM.replace_all(text, "\u{202F}$1.").into_owned(),
+        nfd.clone(),
+        text.replace('\'', "\u{2019}"),
+        nfd.replace('\'', "\u{2019}"),
+    ];
+    variants
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|variant| *variant != resolved && variant.exists())
+        .unwrap_or(resolved)
+}
+
+pub(crate) fn shown<'a>(path: &'a Path, label: Option<&'a str>) -> &'a Path {
+    label.map_or(path, Path::new)
+}
+
+fn walker(root: &Path) -> WalkBuilder {
+    let mut walk = WalkBuilder::new(root);
+    // Hidden files are included, but `.git` itself is never searched or listed.
+    walk.hidden(false)
+        .require_git(false)
+        .add_custom_ignore_filename(".fdignore")
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|entry| entry.file_name() != ".git");
+    walk
+}
+
+fn byte_capped(
+    raw: &str,
+    mut before: Vec<String>,
+    after: Vec<String>,
+    mut details: Map<String, Value>,
+) -> (String, Option<Value>) {
+    use truncate::{DEFAULT_MAX_BYTES, Limits, format_size, truncate_head, truncation_details};
+    let truncation = truncate_head(
+        raw,
+        Limits {
+            max_lines: usize::MAX,
+            max_bytes: DEFAULT_MAX_BYTES,
+        },
+    );
+    let mut output = truncation.content.to_owned();
+    if truncation.truncated() {
+        before.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+        details.insert("truncation".into(), truncation_details(&truncation));
+    }
+    before.extend(after);
+    if !before.is_empty() {
+        output.push_str(&format!("\n\n[{}]", before.join(". ")));
+    }
+    (
+        output,
+        (!details.is_empty()).then_some(Value::Object(details)),
+    )
 }
 
 pub(crate) fn unhost(text: &str, root: &Path, label: Option<&str>) -> String {
@@ -192,14 +256,6 @@ pub(crate) fn unhost(text: &str, root: &Path, label: Option<&str>) -> String {
     };
     text.replace(&format!("{root}/"), &base)
         .replace(root.as_ref(), label)
-}
-
-pub(crate) fn shown<'a>(
-    label: Option<&'a str>,
-    path: &'a str,
-    absolute: &'a Path,
-) -> (&'a str, &'a Path) {
-    (label.unwrap_or(path), label.map_or(absolute, Path::new))
 }
 
 /// Normalizes model path typos shared by scheme and filesystem resolution.
@@ -227,7 +283,12 @@ fn clean_path(path: &str) -> Cow<'_, str> {
 
 /// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait`, plus
 /// `ask` when `ask` is set.
-pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
+pub(crate) fn builtin(
+    tools: &Arc<SessionTools>,
+    ask: bool,
+    questions: Arc<PendingQuestions>,
+    timeout: Option<Duration>,
+) -> Vec<Arc<dyn Tool>> {
     let mut list: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool::new(tools.clone())),
         Arc::new(WriteTool::new(tools.clone())),
@@ -238,7 +299,7 @@ pub fn builtin(tools: &Arc<SessionTools>, ask: bool) -> Vec<Arc<dyn Tool>> {
         Arc::new(WaitTool::new(tools.clone())),
     ];
     if ask {
-        list.push(Arc::new(AskTool::new(tools.clone())));
+        list.push(Arc::new(AskTool::new(questions, timeout)));
     }
     list
 }
@@ -267,125 +328,6 @@ pub(crate) fn merge_tools(
         replace_or_push(&mut builtin, tool.clone(), |tool| tool.name());
     }
     builtin
-}
-
-/// The key two paths to the same file share: the deepest existing ancestor canonicalized,
-/// with the missing tail re-appended, so a file not created yet keys the same through a
-/// symlinked parent. Falls back to the path itself when no ancestor resolves.
-pub(crate) fn file_key(path: &Path) -> PathBuf {
-    path.ancestors()
-        .find_map(|ancestor| {
-            let canonical = std::fs::canonicalize(ancestor).ok()?;
-            let tail = path.strip_prefix(ancestor).ok()?;
-            Some(if tail.as_os_str().is_empty() {
-                canonical
-            } else {
-                canonical.join(tail)
-            })
-        })
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileAccess {
-    Read,
-    Modify,
-}
-
-pub(crate) fn ledger_access(result: &ToolResultMessage) -> Option<(&str, FileAccess)> {
-    if result.is_error {
-        return None;
-    }
-    let ledger = result.details.as_ref()?.get("ledger")?;
-    let path = ledger.get("path")?.as_str()?;
-    let access = FileAccess::deserialize(ledger.get("access")?).ok()?;
-    Some((path, access))
-}
-
-/// Full-file content hashes per canonical path, recorded by `read`, `write` and `edit`.
-#[derive(Debug, Default)]
-pub struct FileLedger(Mutex<HashMap<PathBuf, String>>);
-
-impl FileLedger {
-    /// The SHA-256 of `content`, base64url without padding.
-    pub fn hash(content: &[u8]) -> String {
-        URL_SAFE_NO_PAD.encode(&Sha256::digest(content)[..])
-    }
-
-    /// Records `content` as this session's view of `path`, returning the record for the
-    /// tool result's `details.ledger` (see `restore`).
-    pub fn record(&self, path: &Path, content: &[u8], access: FileAccess) -> Value {
-        let hash = Self::hash(content);
-        let record = json!({ "path": path.to_string_lossy(), "sha256": hash, "access": access });
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(file_key(path), hash);
-        record
-    }
-
-    /// The hash recorded for `path`, if this session has read or written it.
-    pub fn recorded(&self, path: &Path) -> Option<String> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&file_key(path))
-            .cloned()
-    }
-
-    /// Replaces the record with what `messages` show this session saw: the `details.ledger`
-    /// of every successful tool result, later results winning. Run on open and after
-    /// navigation, so the record matches the branch the model sees.
-    pub fn restore(&self, messages: &[AgentMessage]) {
-        let mut ledger = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        ledger.clear();
-        for message in messages {
-            let AgentMessage::Llm(Message::ToolResult(result)) = message else {
-                continue;
-            };
-            if result.is_error {
-                continue;
-            }
-            let Some(record) = result
-                .details
-                .as_ref()
-                .and_then(|details| details.get("ledger"))
-            else {
-                continue;
-            };
-            if let (Some(path), Some(hash)) = (
-                record.get("path").and_then(Value::as_str),
-                record.get("sha256").and_then(Value::as_str),
-            ) {
-                ledger.insert(file_key(Path::new(path)), hash.to_owned());
-            }
-        }
-    }
-}
-
-/// Process-wide per-file mutation locks (pi `file-mutation-queue.ts`); entries die with
-/// their last guard.
-static FILE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(Default::default);
-
-/// Serializes read-modify-write cycles on one file across every session in the process.
-/// Different files proceed in parallel; waiters acquire in FIFO order.
-pub async fn lock_file(path: &Path) -> OwnedMutexGuard<()> {
-    let key = file_key(path);
-    let lock = {
-        let mut locks = FILE_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
-        match locks.get(&key).and_then(Weak::upgrade) {
-            Some(lock) => lock,
-            None => {
-                locks.retain(|_, lock| lock.strong_count() > 0);
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(key, Arc::downgrade(&lock));
-                lock
-            }
-        }
-    };
-    lock.lock_owned().await
 }
 
 #[cfg(test)]

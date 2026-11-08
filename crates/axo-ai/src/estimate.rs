@@ -1,5 +1,6 @@
 //! Context-token estimates. Port of pi `utils/estimate.ts`.
 
+use crate::model::Model;
 use crate::transcript::system_message_text;
 use crate::types::{AssistantBlock, Message, StopReason, Usage, UserBlock};
 
@@ -31,7 +32,7 @@ pub fn estimate_blocks_tokens(content: &[UserBlock]) -> u64 {
 
 /// pi `estimateContextTokens`: the usage of the last assistant response that still
 /// describes the prefix, plus estimates for the messages after it.
-pub fn estimate_context_tokens(messages: &[Message]) -> u64 {
+pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
     let context_tokens = |usage: &Usage| match usage.total_tokens {
         0 => usage.input + usage.output + usage.cache_read + usage.cache_write,
         total => total,
@@ -102,4 +103,19 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                 .sum(),
         ),
     }
+}
+
+/// Leave the estimated context plus a safety margin free.
+pub(crate) fn clamp_max_tokens_to_context(
+    model: &Model,
+    messages: &[Message],
+    max_tokens: u64,
+) -> u64 {
+    if model.context_window == 0 {
+        return max_tokens.max(1);
+    }
+    let available = model.context_window as i64
+        - estimate_context_tokens(messages) as i64
+        - CONTEXT_SAFETY_TOKENS;
+    max_tokens.min(available.max(1) as u64)
 }

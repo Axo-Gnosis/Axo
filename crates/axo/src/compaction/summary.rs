@@ -4,18 +4,20 @@ use std::borrow::Cow;
 use axo_agent::AgentMessage;
 use axo_ai::estimate::{estimate_message_tokens, estimate_text_tokens};
 use axo_ai::{
-    Accumulator, AssistantBlock, AssistantMessage, Context, Message, Model, SimpleStreamOptions,
-    StopReason, Streamer, SystemMessage, ThinkingLevel, ToolChoice, Transcript, Usage, UserBlock,
-    UserMessage, drop_failed_turns, is_context_overflow, now_ms, retry_delay,
+    Accumulator, AssistantBlock, AssistantMessage, Message, Model, SimpleStreamOptions, StopReason,
+    Streamer, SystemMessage, TextBlock, ThinkingLevel, ToolChoice, Transcript, Usage, UserBlock,
+    UserMessage, is_context_overflow, now_ms,
 };
 use futures::StreamExt;
 use indexmap::IndexMap;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{PromptOverride, SummaryRequest};
+use crate::Error;
+use crate::config::{PromptOverride, RetrySettings, SummaryRequest};
 use crate::context::{Diagnostic, DiagnosticOrigin, lower_messages};
+use crate::recovery::retry_delay;
 
-pub(super) const TOO_LARGE: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
+const TOO_LARGE: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
 const NOT_FINISHED: &str = "Summary response must finish normally without tool calls";
 const NOT_SMALLER: &str =
     "Summary is empty, exceeds its output allowance, or does not shrink the replaced content";
@@ -92,7 +94,6 @@ pub(crate) struct SummaryInput {
     pub replaced_tokens: u64,
     pub history_tokens: u64,
     pub prefix_tokens: u64,
-    pub branch: bool,
 }
 
 pub(crate) struct SummaryContext<'a> {
@@ -102,6 +103,7 @@ pub(crate) struct SummaryContext<'a> {
     pub session_id: &'a str,
     pub reply: u64,
     pub prompts: &'a SummaryPrompts,
+    pub retry: RetrySettings,
 }
 
 #[derive(Debug)]
@@ -119,6 +121,14 @@ pub(crate) struct SummaryFailure {
 }
 
 impl SummaryFailure {
+    pub(crate) fn into_error(self) -> Error {
+        if self.aborted {
+            Error::MaintenanceAborted
+        } else {
+            Error::Compaction(self.message)
+        }
+    }
+
     fn new(message: impl Into<String>, fatal: bool) -> Self {
         Self {
             message: message.into(),
@@ -135,7 +145,7 @@ impl SummaryFailure {
     }
 }
 
-pub(crate) fn add_usage(total: &mut Usage, next: &Usage) {
+fn add_usage(total: &mut Usage, next: &Usage) {
     total.input = total.input.saturating_add(next.input);
     total.output = total.output.saturating_add(next.output);
     total.cache_read = total.cache_read.saturating_add(next.cache_read);
@@ -162,11 +172,7 @@ fn user(text: String) -> Message {
 }
 
 fn lowered(messages: &[AgentMessage]) -> Vec<Message> {
-    // Mirrors axo-agent's request pipeline: convert_to_llm then drop_failed_turns
-    // (SessionHooks has no transform_context).
-    let mut messages = lower_messages(messages.to_vec());
-    drop_failed_turns(&mut messages);
-    messages
+    Transcript::new(lower_messages(messages.to_vec())).into_messages()
 }
 
 fn escape_boundaries(text: &str) -> String {
@@ -183,10 +189,7 @@ fn escape_boundaries(text: &str) -> String {
 fn content_text(content: &[UserBlock]) -> String {
     content
         .iter()
-        .filter_map(|block| match block {
-            UserBlock::Text { text } => Some(text.as_str()),
-            UserBlock::Image { .. } => None,
-        })
+        .filter_map(UserBlock::as_text)
         .collect::<Vec<_>>()
         .join("")
 }
@@ -283,11 +286,15 @@ fn separate(
     }
     text.push_str("\n\n");
     text.push_str(instructions);
-    Transcript::normalize(Context {
-        system_prompt: Some(rules.to_owned()),
-        messages: vec![user(text)],
-        tools: Vec::new(),
-    })
+    Transcript::new(vec![
+        Message::System(SystemMessage {
+            content: vec![TextBlock {
+                text: rules.to_owned(),
+            }],
+            ..Default::default()
+        }),
+        user(text),
+    ])
 }
 
 #[allow(
@@ -360,7 +367,8 @@ async fn request(
     };
     let mut usage = Usage::default();
     let result = async {
-        for retry in 0..=3 {
+        let mut retry = 0;
+        loop {
             if cancel.is_cancelled() {
                 return Err(SummaryFailure::aborted());
             }
@@ -414,11 +422,12 @@ async fn request(
                 ));
             }
             if message.stop_reason == StopReason::Error {
-                if let Some(delay) = retry_delay(&message, retry) {
+                if let Some(delay) = retry_delay(&context.retry, &message, retry) {
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(SummaryFailure::aborted()),
                         _ = tokio::time::sleep(delay) => {}
                     }
+                    retry += 1;
                     continue;
                 }
                 let diagnostic = message
@@ -445,7 +454,6 @@ async fn request(
             }
             return Ok(text);
         }
-        Err(SummaryFailure::new("Summary retry budget exhausted", false))
     }
     .await;
     match result {
@@ -468,16 +476,6 @@ pub(crate) async fn generate(
     focus: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<GeneratedSummary, SummaryFailure> {
-    if input.branch {
-        return branch(
-            context,
-            &input.history,
-            input.replaced_tokens,
-            focus,
-            cancel,
-        )
-        .await;
-    }
     let history = lowered(&input.history);
     let prompts = context.prompts;
     let instructions = with_focus(
@@ -504,10 +502,7 @@ pub(crate) async fn generate(
             // The live request keeps the agent's own system prompt for the cache, so the
             // rules travel with the instructions.
             messages.push(user(format!("{}\n\n{instructions}", prompts.rules)));
-            Transcript::normalize(Context {
-                messages,
-                ..Default::default()
-            })
+            Transcript::new(messages)
         } else {
             separate(
                 &history,
@@ -562,15 +557,14 @@ pub(crate) async fn generate(
     clippy::result_large_err,
     reason = "Failures retain billable usage inline; boxing adds an unnecessary allocation"
 )]
-async fn branch(
+pub(crate) async fn branch(
     context: &SummaryContext<'_>,
     messages: &[AgentMessage],
     replaced_tokens: u64,
     focus: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<GeneratedSummary, SummaryFailure> {
-    let mut messages = lowered(messages);
-    messages.retain(|message| !matches!(message, Message::System(_) | Message::ToolResult(_)));
+    let messages = lowered(messages);
     request(
         context,
         separate(

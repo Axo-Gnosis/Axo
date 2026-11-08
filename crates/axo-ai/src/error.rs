@@ -19,9 +19,4 @@ pub enum Error {
     /// Login, token exchange, refresh or credential lookup failed.
     #[error("{0}")]
     Auth(String),
-    /// A provider request failed or the provider returned something unusable.
-    #[error("{0}")]
-    Provider(String),
-    #[error("Request aborted")]
-    Aborted,
 }

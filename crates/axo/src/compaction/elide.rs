@@ -11,8 +11,9 @@ use tokio::io::AsyncWriteExt;
 
 use super::Limits;
 use crate::Error;
+use crate::context::skills::Skill;
 use crate::schemes::artifact::Artifacts;
-use crate::store::{ContextReplacement, EntryId};
+use crate::store::{ContextReplacement, Entry, EntryId, Projection, SeqEntry};
 use crate::tools::{FileAccess, file_key, ledger_access};
 
 #[derive(Clone, Copy)]
@@ -39,25 +40,41 @@ fn artifact(artifacts: &Artifacts, extension: &str, bytes: Vec<u8>) -> (u64, Art
     (n, Artifact { path, bytes })
 }
 
-/// `sources` contains only original ordinary sources, never synthetic summaries.
+/// Select only original ordinary sources, never synthetic summaries.
 pub(crate) fn prepare(
-    messages: &[AgentMessage],
-    sources: &[(EntryId, Range<usize>)],
+    projection: &Projection,
+    entries: &[SeqEntry],
     artifacts: &Artifacts,
-    skill_paths: &[PathBuf],
+    skills: &[Skill],
     mode: ElisionMode,
 ) -> Result<Option<Elision>, Error> {
-    let clearing = matches!(mode, ElisionMode::Clearing { .. });
-    if matches!(mode, ElisionMode::Clearing { limits } if limits.trigger < 20_000) {
-        return Ok(None);
-    }
-    let skill_keys: HashSet<_> = skill_paths.iter().map(|path| file_key(path)).collect();
+    let clearing_target = if let ElisionMode::Clearing { limits } = mode {
+        let Some(target) = limits.clearing_target() else {
+            return Ok(None);
+        };
+        Some(target)
+    } else {
+        None
+    };
+    let clearing = clearing_target.is_some();
+    let messages = &projection.messages;
+    let sources =
+        projection
+            .sources
+            .iter()
+            .filter_map(|source| match &entries[source.entry_index].entry {
+                Entry::Message { base, .. } | Entry::CustomMessage { base, .. } => {
+                    Some((&base.id, &source.messages))
+                }
+                _ => None,
+            });
+    let skill_keys: HashSet<_> = skills.iter().map(|skill| file_key(&skill.path)).collect();
     let mut protected = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         if let AgentMessage::Llm(Message::ToolResult(result)) = message
             && let Some((path, FileAccess::Read)) = ledger_access(result)
         {
-            let path = Path::new(path);
+            let path = Path::new(&path);
             if path.ends_with("SKILL.md") || skill_keys.contains(&file_key(path)) {
                 protected.insert(index);
             }
@@ -104,23 +121,6 @@ pub(crate) fn prepare(
             continue;
         }
         let (updated, content) = match message {
-            AgentMessage::Llm(Message::User(message)) => {
-                let Some(blocks) = elide_user_blocks(
-                    &message.content,
-                    mode,
-                    tool_result,
-                    artifacts,
-                    &mut recoveries,
-                )?
-                else {
-                    continue;
-                };
-                let mut updated = message.clone();
-                updated.content = blocks;
-                let content =
-                    serde_json::to_value(&updated.content).expect("content blocks serialize");
-                (AgentMessage::Llm(Message::User(updated)), content)
-            }
             AgentMessage::Llm(Message::Assistant(message)) => {
                 let Some(blocks) =
                     elide_assistant_blocks(&message.content, mode, artifacts, &mut recoveries)
@@ -133,49 +133,36 @@ pub(crate) fn prepare(
                     serde_json::to_value(&updated.content).expect("content blocks serialize");
                 (AgentMessage::Llm(Message::Assistant(updated)), content)
             }
-            AgentMessage::Llm(Message::ToolResult(message)) => {
-                let Some(blocks) = elide_user_blocks(
-                    &message.content,
-                    mode,
-                    tool_result,
-                    artifacts,
-                    &mut recoveries,
-                )?
+            message => {
+                let blocks = match message {
+                    AgentMessage::Llm(Message::User(message)) => &message.content,
+                    AgentMessage::Llm(Message::ToolResult(message)) => &message.content,
+                    AgentMessage::Custom(message) => &message.content,
+                    _ => continue,
+                };
+                let Some(blocks) =
+                    elide_user_blocks(blocks, mode, tool_result, artifacts, &mut recoveries)?
                 else {
                     continue;
                 };
+                let content = serde_json::to_value(&blocks).expect("content blocks serialize");
                 let mut updated = message.clone();
-                updated.content = blocks;
-                let content =
-                    serde_json::to_value(&updated.content).expect("content blocks serialize");
-                (AgentMessage::Llm(Message::ToolResult(updated)), content)
+                match &mut updated {
+                    AgentMessage::Llm(Message::User(message)) => message.content = blocks,
+                    AgentMessage::Llm(Message::ToolResult(message)) => message.content = blocks,
+                    AgentMessage::Custom(message) => message.content = blocks,
+                    _ => continue,
+                }
+                (updated, content)
             }
-            AgentMessage::Custom(message) => {
-                let Some(blocks) = elide_user_blocks(
-                    &message.content,
-                    mode,
-                    tool_result,
-                    artifacts,
-                    &mut recoveries,
-                )?
-                else {
-                    continue;
-                };
-                let mut updated = message.clone();
-                updated.content = blocks;
-                let content =
-                    serde_json::to_value(&updated.content).expect("content blocks serialize");
-                (AgentMessage::Custom(updated), content)
-            }
-            AgentMessage::Llm(Message::System(_)) => continue,
         };
         candidate_tokens = candidate_tokens
             .saturating_sub(super::message_tokens(message))
             .saturating_add(super::message_tokens(&updated));
         replacements.push((id.clone(), ContextReplacement { content }));
     }
-    if let ElisionMode::Clearing { limits } = mode
-        && (replacements.is_empty() || candidate_tokens > limits.trigger.saturating_sub(20_000))
+    if let Some(target) = clearing_target
+        && (replacements.is_empty() || candidate_tokens > target)
     {
         return Ok(None);
     }

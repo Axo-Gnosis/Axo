@@ -1,18 +1,18 @@
 //! axo's coding-agent core: the built-in tools, Nix dev-shell exec, prompt and context
 //! assembly, config, and sessions on top of `axo-ai` and `axo-agent`.
 
-pub mod axo;
+mod axo;
 mod commands;
 mod compaction;
-pub mod config;
+mod config;
 pub mod context;
-pub mod error;
+mod error;
 pub mod exec;
 mod input;
-pub mod jobs;
-pub mod recovery;
+mod jobs;
+mod recovery;
 pub mod schemes;
-pub mod session;
+mod session;
 pub mod store;
 pub mod tools;
 
@@ -21,13 +21,13 @@ pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
     EffectiveConfig, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride,
-    Settings, SummaryRequest, UserConfig,
+    RetrySettings, Settings, SummaryRequest, UserConfig,
 };
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{OutputError, ProcessSupervisor, Supervision};
-pub use exec::{EnvMap, ExecEnv, HostEnv, Resolved, StaticEnv};
+pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
 pub use jobs::{JobInfo, JobStatus};
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
@@ -35,8 +35,12 @@ pub use session::{
     Attach, Fork, LiveSnapshot, MaintenanceKind, NavigateOptions, PromptRequest, PromptResult,
     RecoveryPolicy, Session, SessionEvent, SessionOptions, ShakeMode,
 };
-pub use tools::ask::{Answer, AskOutcome, PendingQuestions, Question, QuestionOption};
-pub use tools::{SessionTools, ToolFactory};
+pub use store::{
+    CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
+    JsonlStore, ProjectedSource, Projection, RunOutcome, SeqEntry, SessionInfo, SessionStore,
+    SessionWriter, SubmissionKind, TIMESTAMP_FORMAT, project,
+};
+pub use tools::{Answer, CommandRequest, Question, QuestionOption, SessionTools, ToolFactory};
 
 #[cfg(doctest)]
 mod markdown_doctests {

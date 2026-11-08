@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axo::store::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore};
+use axo::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore};
 use axo::{SessionEvent, SessionOptions, ToolFactory};
 use axo_agent::{
     AgentEvent, AgentMessage, CustomMessage, RunOutcome, Tool, ToolContext, ToolError, ToolOutput,
@@ -97,7 +97,7 @@ async fn stop_latch_defers_delivery_to_the_next_prompt() {
                 events.recv().await.unwrap()
                 && name == "hang"
             {
-                session.abort().await;
+                session.abort();
                 return;
             }
         }

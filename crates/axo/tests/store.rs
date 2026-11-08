@@ -1,37 +1,18 @@
 //! Session storage and projection: leaf navigation, compaction, context edits, torn-line repair and the single writer.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use axo::store::{
+use axo::{
     ContextReplacement, Entry, EntryBase, EntryId, Header, JsonlStore, SeqEntry, SessionStore,
     SubmissionKind, project,
 };
 use axo::{Error, PromptPart};
 use axo_agent::AgentMessage;
+use axo_ai::testing::scripted_model;
 use axo_ai::{
-    ApiKind, AssistantBlock, AssistantMessage, Compat, Cost, InputKind, Message, Model,
-    ThinkingLevel, UserBlock, UserMessage, now_ms,
+    AssistantBlock, AssistantMessage, Message, ThinkingLevel, UserBlock, UserMessage, now_ms,
 };
-
-fn model() -> Model {
-    Model {
-        id: "scripted-model".into(),
-        name: "Scripted".into(),
-        api: ApiKind::AnthropicMessages,
-        provider: "scripted".into(),
-        base_url: String::new(),
-        reasoning: false,
-        thinking_level_map: None,
-        input: vec![InputKind::Text],
-        cost: Cost::default(),
-        context_window: 100_000,
-        max_tokens: 4096,
-        headers: BTreeMap::new(),
-        compat: Compat::default(),
-    }
-}
 
 fn base(id: &str, parent: Option<&str>) -> EntryBase {
     EntryBase::new(
@@ -61,7 +42,7 @@ fn assistant_entry(id: &str, parent: &str, text: &str) -> Entry {
                 text: text.into(),
                 text_signature: None,
             }],
-            ..AssistantMessage::empty(&model())
+            ..AssistantMessage::empty(&scripted_model())
         })),
         submission_id: None,
         admitted_jobs: Vec::new(),
@@ -92,13 +73,7 @@ fn text(message: &AgentMessage) -> String {
 }
 
 fn user_text(content: &[UserBlock]) -> String {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            UserBlock::Text { text } => Some(text.as_str()),
-            UserBlock::Image { .. } => None,
-        })
-        .collect()
+    content.iter().filter_map(UserBlock::as_text).collect()
 }
 
 fn texts(messages: &[AgentMessage]) -> Vec<String> {
@@ -288,7 +263,7 @@ async fn preserved_users_are_edited_deduplicated_and_keep_provenance_on_reopen()
     ] {
         entries.push(writer.append(entry).await.unwrap());
     }
-    let path = writer.planned_path().to_owned();
+    let path = writer.path().to_owned();
     drop(writer);
     let (_, reopened) = store.open_read(&path).await.unwrap();
     assert_eq!(entries, reopened);
@@ -325,7 +300,7 @@ async fn preserved_users_are_edited_deduplicated_and_keep_provenance_on_reopen()
     for seq in &reopened {
         fork.append(seq.entry.clone()).await.unwrap();
     }
-    let fork_path = fork.planned_path().to_owned();
+    let fork_path = fork.path().to_owned();
     drop(fork);
     let (_, forked) = store.open_read(&fork_path).await.unwrap();
     assert_eq!(project(&forked, None), projection);
@@ -372,13 +347,13 @@ fn equal_timestamp_edits_invalidate_only_earlier_projected_usage_and_apply_borro
         }
     })
     .collect();
-    let mut projection = axo::store::Projection::default();
+    let mut projection = axo::Projection::default();
     for end in 1..=entries.len() {
         projection.apply(&entries[..end]);
         assert_eq!(projection, project(&entries[..end], None));
     }
     // Batches: a plain chain extends in place; one holding an edit rebuilds.
-    let mut batched = axo::store::Projection::default();
+    let mut batched = axo::Projection::default();
     batched.apply(&entries[..2]);
     assert_eq!(batched, project(&entries[..2], None));
     batched.apply(&entries);
@@ -447,10 +422,7 @@ async fn torn_final_line_is_repaired_on_open() {
         let appended = writer.append(entry.clone()).await.unwrap();
         assert_eq!(appended.seq, seq);
     }
-    let path = writer
-        .path()
-        .expect("file created by the first submission")
-        .to_owned();
+    let path = writer.path().to_owned();
     drop(writer);
 
     let mut file = std::fs::OpenOptions::new()
@@ -511,7 +483,7 @@ async fn second_writer_is_refused() {
         .await
         .unwrap();
     creator.append(submission("s1", None)).await.unwrap();
-    let path = creator.path().expect("file created").to_owned();
+    let path = creator.path().to_owned();
 
     let busy = |result: Result<_, Error>| match result {
         Err(Error::SessionBusy { path: locked }) => locked == path,
@@ -539,7 +511,7 @@ async fn second_writer_is_refused() {
 #[test]
 fn skipped_incremental_updates_and_checkpoint_snapshot_match_full_projection() {
     let mut entries = branched_tree();
-    let mut projection = axo::store::Projection::default();
+    let mut projection = axo::Projection::default();
     for end in 1..=entries.len() {
         projection.apply(&entries[..end]);
         assert_eq!(projection, project(&entries[..end], None));

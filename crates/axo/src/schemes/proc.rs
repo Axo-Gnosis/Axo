@@ -68,7 +68,7 @@ impl Scheme for ProcScheme {
                     .map(|job| {
                         format!(
                             "{}  {}  {}",
-                            job_name(job.id),
+                            job.id,
                             job.status.label(),
                             headline(&job.command)
                         )
@@ -83,7 +83,7 @@ impl Scheme for ProcScheme {
                     .ok_or_else(|| ToolError(format!("No job {}", job_name(id))))?;
                 let mut text = format!(
                     "Job: {}\nCommand: {}\nStatus: {}\nOutput: artifact://{}",
-                    job_name(job.id),
+                    job.id,
                     job.command,
                     job.status.label(),
                     job.artifact

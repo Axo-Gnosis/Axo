@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
+use axo_ai::{Error, FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 use serde_json::json;
 
 #[tokio::test]
@@ -12,6 +12,7 @@ async fn built_in_windows_stop_before_expensive_context_unless_enabled() {
             extended_context,
             config: ModelsConfig::default(),
             credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+            http_client: None,
         })
         .await
         .unwrap();
@@ -59,6 +60,7 @@ async fn explicit_windows_and_custom_models_bypass_price_caps() {
         extended_context: false,
         config,
         credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+        http_client: None,
     })
     .await
     .unwrap();
@@ -112,6 +114,7 @@ async fn catalog_windows_respect_input_limits_and_lowest_price_threshold() {
             extended_context,
             config: ModelsConfig::default(),
             credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+            http_client: None,
         })
         .await
         .unwrap();
@@ -134,4 +137,23 @@ async fn catalog_windows_respect_input_limits_and_lowest_price_threshold() {
             1000
         );
     }
+}
+
+#[tokio::test]
+async fn command_api_keys_are_configuration_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let models = Models::load(ModelsOptions {
+        cache_dir: None,
+        extended_context: false,
+        config: ModelsConfig::parse_jsonc(r#"{"providers":{"openai-codex":{"apiKey":"!echo k"}}}"#)
+            .unwrap(),
+        credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+        http_client: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        models.auth(models.find("openai-codex/gpt-6-sol").unwrap()).await,
+        Err(Error::Config(message)) if message.contains("command config values")
+    ));
 }

@@ -27,11 +27,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use axo::store::{self, Entry, EntryId, SeqEntry};
 use axo::{
     Answer, Command, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult,
     Session, SessionEvent, SessionOptions, Supervision,
 };
+use axo::{Entry, EntryId, SeqEntry};
 use axo_agent::AgentEvent;
 use axo_ai::{AssistantBlock, AssistantEvent, ThinkingLevel, UserBlock};
 use serde_json::Value;
@@ -196,7 +196,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Recovery may have resumed a run, or started requeued prompts, in the background:
     // let it settle first.
     let attach = session.attach(None).await;
-    if attach.live.agent.running {
+    if attach.live.running {
         match print_events(
             session.clone(),
             attach.events,
@@ -331,7 +331,7 @@ async fn print_events(
     mut events: broadcast::Receiver<SessionEvent>,
     first: bool,
     stop: impl Future<Output = ()>,
-) -> Option<store::RunOutcome> {
+) -> Option<axo::RunOutcome> {
     tokio::pin!(stop);
     let mut stopping = false;
     let mut stdout = std::io::stdout();
@@ -373,26 +373,18 @@ async fn print_events(
                 } => println!("[tool] {} {}", call.name, Value::Object(call.arguments)),
                 _ => {}
             },
-            SessionEvent::Agent(AgentEvent::ToolExecutionEnd {
-                name,
-                result,
-                is_error,
-                ..
-            }) => {
+            SessionEvent::Agent(AgentEvent::ToolExecutionEnd { name, result, .. }) => {
                 let text: String = result
                     .content
                     .iter()
-                    .filter_map(|block| match block {
-                        UserBlock::Text { text } => Some(text.as_str()),
-                        UserBlock::Image { .. } => None,
-                    })
+                    .filter_map(UserBlock::as_text)
                     .collect::<Vec<_>>()
                     .join("")
                     .chars()
                     .take(300)
                     .map(|c| if c == '\n' { '⏎' } else { c })
                     .collect();
-                println!("[tool-end] {name} {is_error} {text}");
+                println!("[tool-end] {name} {} {text}", result.is_error);
             }
             SessionEvent::QuestionPending { call_id, questions } => {
                 let mut answers = Vec::new();
@@ -464,7 +456,8 @@ fn print_maintenance(event: &SessionEvent) {
 
 async fn print_system_sections(session: &Session) {
     let attached = session.attach(None).await;
-    let messages: Vec<_> = store::project(&attached.missed, None)
+    let messages: Vec<_> = attached
+        .live
         .messages
         .into_iter()
         .filter_map(|message| match message {

@@ -1,7 +1,7 @@
 //! `transform_messages`: cross-model replay rules.
 
 use axo_ai::{
-    ApiKind, AssistantBlock, AssistantMessage, Compat, Context, Cost, InputKind, Message, Model,
+    ApiKind, AssistantBlock, AssistantMessage, Compat, Cost, InputKind, Message, Model,
     ReasoningReplay, StopReason, ToolCall, ToolResultMessage, Transcript, UserBlock, UserMessage,
     transform_messages,
 };
@@ -20,7 +20,6 @@ fn model(api: ApiKind, provider: &str, id: &str, input: Vec<InputKind>) -> Model
         cost: Cost::default(),
         context_window: 200_000,
         max_tokens: 32_000,
-        headers: Default::default(),
         compat: Compat::default(),
     }
 }
@@ -82,10 +81,7 @@ fn tool_result(id: &str, content: Vec<UserBlock>) -> Message {
 }
 
 fn transcript(messages: Vec<Message>) -> Transcript {
-    Transcript::normalize(Context {
-        messages,
-        ..Context::default()
-    })
+    Transcript::new(messages)
 }
 
 fn text(text: &str) -> AssistantBlock {
@@ -146,18 +142,17 @@ fn foreign_model_thinking_is_dropped() {
 #[test]
 fn errored_and_aborted_assistant_turns_are_omitted() {
     let target = claude();
-    let input = transcript(vec![
+    let input = vec![
         user("one"),
         assistant(&target, vec![text("partial")], StopReason::Error),
         user("two"),
         assistant(&target, vec![text("cut off")], StopReason::Aborted),
         user("three"),
         assistant(&target, vec![text("answer")], StopReason::Stop),
-    ]);
-
-    let output = transform_messages(input.clone(), &target);
-
+    ];
     let expected = [&input[0], &input[2], &input[4], &input[5]].map(Clone::clone);
+
+    let output = Transcript::new(input);
     assert_eq!(output.messages(), expected);
 }
 

@@ -93,7 +93,6 @@ dependencies = [
  "base64",
  "futures",
  "globset",
- "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",

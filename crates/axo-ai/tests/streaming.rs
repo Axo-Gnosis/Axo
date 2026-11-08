@@ -1,57 +1,13 @@
-//! Streaming primitives: SSE decoding, partial/complete tool-argument JSON, and the
-//! event `Accumulator`.
+//! Event `Accumulator` reconstruction.
 
-use axo_ai::api::sse::{SseDecoder, SseEvent};
-use axo_ai::json::{parse_streaming, parse_tool_arguments};
 use axo_ai::testing::{ScriptedApi, ScriptedTurn, reply_thinking_then_text, reply_tool_calls};
 use axo_ai::{
-    Accumulator, ApiKind, AssistantEvent, Compat, Context, Cost, InputKind, Message, Model,
-    SimpleStreamOptions, Streamer, Transcript, UserBlock, UserMessage,
+    Accumulator, ApiKind, AssistantEvent, Compat, Cost, InputKind, Message, Model,
+    SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript, UserBlock, UserMessage,
 };
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
-
-#[test]
-fn sse_event_split_across_three_chunks_with_crlf() {
-    let mut decoder = SseDecoder::new();
-    // The CRLF after the first data line is split between chunks 2 and 3.
-    assert!(
-        decoder
-            .push(b": keep-alive\r\nevent: content_block_delta\r\nda")
-            .is_empty()
-    );
-    assert!(decoder.push(b"ta: {\"a\":1}\r").is_empty());
-    assert_eq!(
-        decoder.push(b"\ndata: {\"b\":2}\r\n\r\n"),
-        [SseEvent {
-            event: Some("content_block_delta".to_owned()),
-            data: "{\"a\":1}\n{\"b\":2}".to_owned(),
-        }]
-    );
-    assert_eq!(decoder.finish(), None);
-}
-
-#[test]
-fn parse_streaming_closes_truncated_prefixes() {
-    let object = |value: Value| value.as_object().unwrap().clone();
-    assert_eq!(parse_streaming(r#"{"a": "x"#), object(json!({ "a": "x" })));
-    assert_eq!(
-        parse_streaming(r#"{"a": [1, 2"#),
-        object(json!({ "a": [1, 2] }))
-    );
-    assert_eq!(parse_streaming(r#"{"a":"#), object(json!({})));
-}
-
-#[test]
-fn parse_tool_arguments_reports_non_object_json() {
-    let (arguments, error) = parse_tool_arguments("[1, 2]");
-    assert!(arguments.is_empty());
-    assert_eq!(
-        error.as_deref(),
-        Some("Tool arguments must be a JSON object\n\nReceived arguments:\n[1, 2]")
-    );
-}
 
 #[tokio::test]
 async fn accumulator_reproduces_done_message() {
@@ -67,19 +23,22 @@ async fn accumulator_reproduces_done_message() {
         cost: Cost::default(),
         context_window: 200_000,
         max_tokens: 32_000,
-        headers: Default::default(),
         compat: Compat::default(),
     };
-    let transcript = Transcript::normalize(Context {
-        system_prompt: Some("You are a test.".to_owned()),
-        messages: vec![Message::User(UserMessage {
+    let transcript = Transcript::new(vec![
+        Message::System(SystemMessage {
+            content: vec![TextBlock {
+                text: "You are a test.".to_owned(),
+            }],
+            ..Default::default()
+        }),
+        Message::User(UserMessage {
             content: vec![UserBlock::Text {
                 text: "hi".to_owned(),
             }],
             timestamp: 0,
-        })],
-        tools: Vec::new(),
-    });
+        }),
+    ]);
     let replies = [
         reply_thinking_then_text("let me think about it", "hello there"),
         reply_tool_calls(&[

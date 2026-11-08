@@ -5,7 +5,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use axo::store::Entry;
+use axo::Entry;
 use axo::{Error, PromptPart, PromptRequest, PromptResult, Session};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;

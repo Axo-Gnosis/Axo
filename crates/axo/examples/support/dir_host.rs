@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axo::store::JsonlStore;
+use axo::JsonlStore;
 use axo::{Axo, AxoBuilder, ConfigLayer, ConfigSource, PROMPT_NAMES, PromptOverride, UserConfig};
 use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 use serde_json::Value;
@@ -21,7 +21,7 @@ impl ConfigSource for DirConfig {
         let path = self.root.join("settings.jsonc");
         let settings = match read_optional(&path)? {
             Some(text) => {
-                let text = axo::tools::files::split_bom(&text).1;
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
                 jsonc_parser::parse_to_serde_value(text, &Default::default()).map_err(|error| {
                     axo::Error::Config {
                         origin: path.display().to_string(),
@@ -75,6 +75,7 @@ pub async fn builder(root: PathBuf) -> Result<AxoBuilder, Box<dyn std::error::Er
         None => ModelsConfig::default(),
     };
     let models = Models::load(ModelsOptions {
+        http_client: None,
         cache_dir: Some(root.join("cache")),
         config: models_config,
         extended_context,

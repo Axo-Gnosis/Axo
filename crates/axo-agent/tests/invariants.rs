@@ -1,7 +1,6 @@
 //! Ordering and lifecycle invariants of the agent loop (`plan/design.md` "Agent loop"),
 //! exercised through the public `Agent` API with a scripted provider.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -10,38 +9,19 @@ use async_trait::async_trait;
 use axo_agent::{
     Agent, AgentConfig, AgentContext, AgentEvent, AgentMessage, BeforeToolCallContext,
     CancelReason, ExecutionMode, HookError, LoopHooks, MessageOrigin, Persist, PersistError,
-    PrepareRequestContext, QueuedMessage, RequestUpdate, RunOutcome, Tool, ToolCallDecision,
-    ToolContext, ToolError, ToolInvocationId, ToolOutput, TurnContext, TurnDecision, TurnFinish,
+    QueuedMessage, RunOutcome, Tool, ToolCallDecision, ToolContext, ToolError, ToolHooks,
+    ToolInvocationId, ToolOutput, TurnContext, TurnFinish,
 };
-use axo_ai::testing::{reply_text, reply_tool_calls};
+use axo_ai::testing::{reply_text, reply_tool_calls, scripted_model};
 use axo_ai::{
-    ApiKind, AssistantBlock, AssistantEvent, AssistantMessage, Compat, Cost, InputKind, Message,
-    Model, ScriptedApi, ScriptedTurn, StopReason, ToolResultMessage, UserBlock, UserMessage,
-    now_ms,
+    AssistantBlock, AssistantEvent, AssistantMessage, Message, Model, ScriptedApi, ScriptedTurn,
+    StopReason, ToolResultMessage, UserBlock, UserMessage, now_ms,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-fn model() -> Model {
-    Model {
-        id: "scripted-model".into(),
-        name: "Scripted".into(),
-        api: ApiKind::AnthropicMessages,
-        provider: "scripted".into(),
-        base_url: String::new(),
-        reasoning: false,
-        thinking_level_map: None,
-        input: vec![InputKind::Text],
-        cost: Cost::default(),
-        context_window: 100_000,
-        max_tokens: 4096,
-        headers: BTreeMap::new(),
-        compat: Compat::default(),
-    }
-}
 
 fn user(text: &str) -> AgentMessage {
     AgentMessage::Llm(Message::User(UserMessage {
@@ -53,10 +33,8 @@ fn user(text: &str) -> AgentMessage {
 fn first_text(content: &[UserBlock]) -> String {
     content
         .iter()
-        .find_map(|block| match block {
-            UserBlock::Text { text } => Some(text.clone()),
-            UserBlock::Image { .. } => None,
-        })
+        .find_map(UserBlock::as_text)
+        .map(str::to_owned)
         .unwrap_or_default()
 }
 
@@ -129,6 +107,8 @@ struct Recorder {
     switch_model: bool,
     agent: OnceLock<Weak<Agent>>,
     entered: Notify,
+    stream_started: Notify,
+    call_streamed: Notify,
     finished_results: Mutex<Vec<Vec<String>>>,
     finished_models: Mutex<Vec<String>>,
 }
@@ -200,20 +180,14 @@ impl LoopHooks for Recorder {
                 || self.should_skip_tools(turn.message, turn.model))
         {
             return Ok(TurnFinish {
-                decision: Some(TurnDecision::Continue),
-                context: Some(AgentContext {
-                    messages: vec![user("projected")],
-                    tools: turn.context.tools.clone(),
-                }),
+                continue_turn: true,
+                messages: Some(vec![user("projected")]),
             });
         }
         if self.replace_final {
             return Ok(TurnFinish {
-                decision: None,
-                context: Some(AgentContext {
-                    messages: vec![user("final projection")],
-                    tools: turn.context.tools.clone(),
-                }),
+                continue_turn: false,
+                messages: Some(vec![user("final projection")]),
             });
         }
         Ok(TurnFinish::default())
@@ -225,9 +199,9 @@ impl LoopHooks for Recorder {
 
     async fn prepare_request(
         &self,
-        _request: PrepareRequestContext<'_>,
+        _context: &AgentContext,
         cancel: &CancellationToken,
-    ) -> Result<Option<RequestUpdate>, HookError> {
+    ) -> Result<Option<Vec<AgentMessage>>, HookError> {
         if self.prepare_failure {
             return Err(HookError("preparation failed".into()));
         }
@@ -238,7 +212,10 @@ impl LoopHooks for Recorder {
         }
         Ok(None)
     }
+}
 
+#[async_trait]
+impl ToolHooks for Recorder {
     async fn before_tool_call(
         &self,
         call: BeforeToolCallContext<'_>,
@@ -262,13 +239,26 @@ impl LoopHooks for Recorder {
 
 #[async_trait]
 impl Persist for Recorder {
-    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
         let name = match event {
             AgentEvent::AgentStart => "AgentStart".to_owned(),
             AgentEvent::AgentEnd { .. } => "AgentEnd".to_owned(),
             AgentEvent::TurnStart => "TurnStart".to_owned(),
             AgentEvent::TurnEnd { .. } => "TurnEnd".to_owned(),
-            AgentEvent::MessageStart { .. } | AgentEvent::MessageUpdate { .. } => return Ok(()),
+            AgentEvent::MessageUpdate { event } => {
+                self.stream_started.notify_one();
+                if matches!(
+                    event,
+                    AssistantEvent::ToolCallEnd {
+                        block: AssistantBlock::ToolCall(call),
+                        ..
+                    } if call.id == "c1"
+                ) {
+                    self.call_streamed.notify_one();
+                }
+                return Ok(());
+            }
+            AgentEvent::MessageStart { .. } => return Ok(()),
             AgentEvent::ToolExecutionUpdate { .. } => return Ok(()),
             AgentEvent::MessageEnd { message, origin } => {
                 if self.slow_persist {
@@ -283,7 +273,7 @@ impl Persist for Recorder {
                             Message::Assistant(assistant) => {
                                 self.assistants.lock().unwrap().push(assistant.clone());
                                 if self.switch_model {
-                                    let mut next = model();
+                                    let mut next = scripted_model();
                                     next.id = "next-model".into();
                                     self.agent.get().unwrap().upgrade().unwrap().set_model(next);
                                 }
@@ -305,12 +295,12 @@ impl Persist for Recorder {
             }
             AgentEvent::ToolExecutionStart { call_id, .. } => format!("exec-start:{call_id}"),
             AgentEvent::ToolExecutionEnd {
-                call_id, is_error, ..
+                call_id, result, ..
             } => {
                 self.exec_ends
                     .lock()
                     .unwrap()
-                    .push((call_id.clone(), *is_error));
+                    .push((call_id.clone(), result.is_error));
                 format!("exec-end:{call_id}")
             }
         };
@@ -662,14 +652,17 @@ fn setup(
         switch_model: false,
         agent: OnceLock::new(),
         entered: Notify::new(),
+        stream_started: Notify::new(),
+        call_streamed: Notify::new(),
         finished_results: Mutex::default(),
         finished_models: Mutex::default(),
     };
     configure(&mut recorder);
     let rec = Arc::new(recorder);
-    let mut config = AgentConfig::new(api.clone(), model());
+    let mut config = AgentConfig::new(api.clone(), scripted_model());
     config.tools = tools;
     config.hooks = rec.clone();
+    config.tool_hooks = vec![rec.clone()];
     config.persist = Some(rec.clone());
     let agent = Arc::new(Agent::new(config));
     rec.agent.set(Arc::downgrade(&agent)).unwrap();
@@ -1083,18 +1076,11 @@ async fn user_cancel_mid_tool_aborts_unanswered_calls() {
 async fn shutdown_cancel_persists_nothing_aborted() {
     // Mid-stream: the aborted assistant message is not persisted.
     let h = setup(vec![ScriptedTurn::HangUntilCancel], Vec::new(), |_| {});
-    let mut events = h.agent.subscribe();
     let agent = h.agent.clone();
     let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
-    tokio::time::timeout(TIMEOUT, async {
-        while let Ok(event) = events.recv().await {
-            if matches!(event, AgentEvent::MessageUpdate { .. }) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("stream started");
+    tokio::time::timeout(TIMEOUT, h.rec.stream_started.notified())
+        .await
+        .expect("stream started");
     h.agent.cancel(CancelReason::Shutdown);
     let outcome = tokio::time::timeout(TIMEOUT, run)
         .await
@@ -1238,26 +1224,11 @@ async fn user_cancel_mid_stream_answers_streamed_calls() {
         Vec::new(),
         |_| {},
     );
-    let mut events = h.agent.subscribe();
     let agent = h.agent.clone();
     let run = tokio::spawn(async move { agent.prompt(vec![user("go").into()]).await });
-    tokio::time::timeout(TIMEOUT, async {
-        while let Ok(event) = events.recv().await {
-            if matches!(
-                &event,
-                AgentEvent::MessageUpdate {
-                    event: AssistantEvent::ToolCallEnd {
-                        block: AssistantBlock::ToolCall(call),
-                        ..
-                    },
-                } if call.id == "c1"
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("c1 streamed");
+    tokio::time::timeout(TIMEOUT, h.rec.call_streamed.notified())
+        .await
+        .expect("c1 streamed");
     h.agent.cancel(CancelReason::User);
     let outcome = tokio::time::timeout(TIMEOUT, run)
         .await
@@ -1387,7 +1358,7 @@ async fn skipped_stop_never_executes_calls_or_silently_succeeds() {
         let probe = Arc::new(Probe::default());
         let mut response = reply_tool_calls(&[("c1", "sleep", json!({}))]);
         response.stop_reason = StopReason::Stop;
-        response.usage.input = model().context_window + 1;
+        response.usage.input = scripted_model().context_window + 1;
         let h = setup(
             vec![ScriptedTurn::Reply(response), text("done")],
             vec![probe_tool("sleep", ExecutionMode::Parallel, &probe)],
@@ -1434,7 +1405,7 @@ async fn recovered_response_reuses_results_without_reemitting_assistant() {
         timestamp: now_ms(),
         duration_ms: None,
     };
-    let mut original_model = model();
+    let mut original_model = scripted_model();
     original_model.id = "original-request-model".into();
     h.agent.set_messages(vec![user("go")]);
     assert_eq!(
@@ -1683,7 +1654,7 @@ fn bare_agent(
     tools: Vec<Arc<dyn Tool>>,
     persist: Arc<dyn Persist>,
 ) -> Arc<Agent> {
-    let mut config = AgentConfig::new(Arc::new(ScriptedApi::new(turns)), model());
+    let mut config = AgentConfig::new(Arc::new(ScriptedApi::new(turns)), scripted_model());
     config.tools = tools;
     config.persist = Some(persist);
     Arc::new(Agent::new(config))
@@ -1704,7 +1675,7 @@ struct LockedPersist(Arc<Inversion>);
 
 #[async_trait]
 impl Persist for LockedPersist {
-    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
         if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
             self.0.persist_waiting.notify_one();
             let _guard = self.0.lock.lock().await;
@@ -1819,7 +1790,7 @@ impl ToolEvents {
 
 #[async_trait]
 impl Persist for ToolEvents {
-    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
         let name = match event {
             AgentEvent::ToolExecutionUpdate { call_id, .. } => format!("update:{call_id}"),
             AgentEvent::ToolExecutionEnd { call_id, .. } => format!("end:{call_id}"),
@@ -2052,7 +2023,7 @@ struct SlowClearance {
 }
 
 #[async_trait]
-impl LoopHooks for SlowClearance {
+impl ToolHooks for SlowClearance {
     async fn before_tool_call(
         &self,
         call: BeforeToolCallContext<'_>,
@@ -2079,13 +2050,13 @@ async fn no_call_starts_before_the_batch_is_cleared() {
             turn(&[("a", "mark", json!({})), ("b", "mark", json!({}))]),
             text("done"),
         ])),
-        model(),
+        scripted_model(),
     );
     config.tools = vec![Arc::new(MarkTool {
         ran: ran.clone(),
         schema: json!({ "type": "object" }),
     })];
-    config.hooks = hooks.clone();
+    config.tool_hooks = vec![hooks.clone()];
     let agent = Agent::new(config);
     let outcome = tokio::time::timeout(SETTLE, agent.prompt(vec![user("go").into()]))
         .await
@@ -2101,7 +2072,7 @@ struct FailFastEnd;
 
 #[async_trait]
 impl Persist for FailFastEnd {
-    async fn persist(&self, event: &mut AgentEvent) -> Result<(), PersistError> {
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
         match event {
             AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "fast" => {
                 Err(PersistError("disk full".into()))

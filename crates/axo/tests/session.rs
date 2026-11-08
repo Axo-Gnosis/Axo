@@ -3,17 +3,74 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use axo::store::{
-    self, Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind,
-};
+use axo::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind};
 use axo::{PromptPart, SessionEvent};
-use axo_agent::{AgentMessage, RunOutcome};
+use axo_agent::{
+    AgentMessage, BeforeToolCallContext, RunOutcome, ToolCallDecision, ToolError, ToolHooks,
+};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
 use common::{axo, options, within};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn session_names_are_file_wide_and_custom_state_follows_the_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("saved"))]).await;
+    let session = host.create_session(options(dir.path())).await.unwrap();
+    session.prompt("persist this session").await.unwrap();
+    let before = session.attach(None).await;
+    let ancestor = EntryId(before.missed.last().unwrap().entry.id().unwrap().to_owned());
+
+    session.set_name(Some("  a\nb ".into())).await.unwrap();
+    assert_eq!(session.name().as_deref(), Some("a b"));
+    let custom = session.append_custom("k", Some(json!(1))).await.unwrap();
+    let leaf = EntryId(custom.entry.id().unwrap().to_owned());
+    assert_eq!(session.custom("k"), Some(json!(1)));
+    assert_eq!(
+        session.attach(None).await.live.messages,
+        before.live.messages
+    );
+    assert!(matches!(
+        session.append_custom("", None).await,
+        Err(axo::Error::InvalidInput(_))
+    ));
+
+    session
+        .navigate(Some(ancestor), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(session.custom("k"), None);
+    assert_eq!(session.name().as_deref(), Some("a b"));
+    session
+        .navigate(Some(leaf.clone()), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(session.custom("k"), Some(json!(1)));
+    session.append_custom("k", None).await.unwrap();
+    assert_eq!(session.custom("k"), None, "the latest empty value wins");
+    session
+        .navigate(Some(leaf), Default::default())
+        .await
+        .unwrap();
+
+    let path = session.path().to_path_buf();
+    session.shutdown().await;
+    drop(session);
+    let reopened = host.open_session(&path, options(dir.path())).await.unwrap();
+    assert_eq!(reopened.name().as_deref(), Some("a b"));
+    assert_eq!(reopened.custom("k"), Some(json!(1)));
+    reopened.set_name(Some(" \r\n ".into())).await.unwrap();
+    assert_eq!(reopened.name(), None);
+    reopened.set_name(Some("renamed".into())).await.unwrap();
+    reopened.set_name(None).await.unwrap();
+    assert_eq!(reopened.name(), None, "the latest empty name wins");
+}
 
 #[tokio::test]
 async fn dropping_a_prompt_future_still_settles_its_run() {
@@ -35,13 +92,13 @@ async fn dropping_a_prompt_future_still_settles_its_run() {
         "the first run hangs until cancelled"
     );
     let mut events = session.attach(None).await.events;
-    session.abort().await;
+    session.abort();
     within(async {
         loop {
             if let SessionEvent::Entry(SeqEntry {
                 entry:
                     Entry::RunEnd {
-                        outcome: store::RunOutcome::Aborted,
+                        outcome: axo::RunOutcome::Aborted,
                         ..
                     },
                 ..
@@ -163,7 +220,7 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
         matches!(
             seq.entry,
             Entry::RunEnd {
-                outcome: store::RunOutcome::Done,
+                outcome: axo::RunOutcome::Done,
                 ..
             }
         )
@@ -276,7 +333,7 @@ async fn navigation_history(
         .append(Entry::ContextEdit {
             base: EntryBase::new(EntryId("edited-abandoned".into()), Some(parent)),
             target_id: EntryId("abandoned-user".into()),
-            replacement: Some(store::ContextReplacement {
+            replacement: Some(axo::ContextReplacement {
                 content: json!([{"type":"text", "text":"EDITED-BRANCH-FACT ".repeat(1000)}]),
             }),
         })
@@ -359,11 +416,11 @@ async fn summarized_navigation_uses_effective_branch_and_preserves_live_selectio
             .count(),
         1
     );
-    let projected = store::project(&entries, None);
+    let projected = axo::project(&entries, None);
     assert_eq!(projected.model.as_deref(), Some("test/live"));
     assert_eq!(projected.thinking, Some(thinking));
     let forked = session.fork(&branch_id).await.unwrap().session;
-    let fork_projection = store::project(&forked.attach(None).await.missed, None);
+    let fork_projection = axo::project(&forked.attach(None).await.missed, None);
     assert!(
         serde_json::to_string(&fork_projection.messages)
             .unwrap()
@@ -384,7 +441,7 @@ async fn summarized_navigation_uses_effective_branch_and_preserves_live_selectio
         )
         .await
         .unwrap();
-    let projection = store::project(&reopened.attach(None).await.missed, None);
+    let projection = axo::project(&reopened.attach(None).await.missed, None);
     assert!(
         serde_json::to_string(&projection.messages)
             .unwrap()
@@ -424,7 +481,7 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
             session.set_model(model).await.unwrap();
         }
         let before = session.attach(None).await.missed;
-        let messages = store::project(&before, None).messages;
+        let messages = axo::project(&before, None).messages;
         let operation = session.navigate(
             Some(destination),
             axo::NavigateOptions {
@@ -440,7 +497,7 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
                     }
                 })
                 .await;
-                session.abort().await;
+                session.abort();
             };
             let (result, ()) = tokio::join!(within(operation), cancel);
             result
@@ -449,10 +506,7 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
         };
         let error = result.expect_err(scenario);
         if scenario == "oversize" {
-            assert!(
-                error.to_string().contains("Rewind to an earlier point"),
-                "{error}"
-            );
+            assert!(matches!(error, axo::Error::Compaction(_)), "{error}");
             assert_eq!(api.requests().len(), 1, "no doomed summary request");
         }
         if scenario == "cancel" {
@@ -460,7 +514,7 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
         }
         let after = session.attach(None).await;
         assert_eq!(
-            store::project(&after.missed, None).messages,
+            axo::project(&after.missed, None).messages,
             messages,
             "{scenario}"
         );
@@ -471,6 +525,134 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
             "{scenario} must not move"
         );
         assert!(after.live.maintenance.is_none());
-        assert!(!after.live.agent.running);
+        assert!(!after.live.running);
     }
+}
+
+#[tokio::test]
+async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
+    struct NoBash;
+
+    #[async_trait::async_trait]
+    impl ToolHooks for NoBash {
+        async fn before_tool_call(
+            &self,
+            call: BeforeToolCallContext<'_>,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolCallDecision, ToolError> {
+            Ok(if call.tool_call.name == "bash" {
+                ToolCallDecision::Block {
+                    reason: Some("no bash".into()),
+                    terminate: false,
+                }
+            } else {
+                ToolCallDecision::Allow
+            })
+        }
+    }
+
+    struct LaterHook(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ToolHooks for LaterHook {
+        async fn before_tool_call(
+            &self,
+            _call: BeforeToolCallContext<'_>,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolCallDecision, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolCallDecision::Allow)
+        }
+    }
+
+    fn assert_blocked(entries: &[SeqEntry], call_id: &str) {
+        let call_index = entries
+            .iter()
+            .position(|seq| {
+                matches!(&seq.entry, Entry::Message {
+                message: AgentMessage::Llm(Message::Assistant(message)),
+                ..
+            } if message.tool_calls().any(|call| call.id == call_id))
+            })
+            .expect("journal contains the tool call");
+        let Some(SeqEntry {
+            entry:
+                Entry::Message {
+                    message: AgentMessage::Llm(Message::ToolResult(result)),
+                    ..
+                },
+            ..
+        }) = entries.get(call_index + 1)
+        else {
+            panic!("the tool result must immediately follow its call in the journal");
+        };
+        assert_eq!(result.tool_call_id, call_id);
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(UserBlock::as_text)
+                .any(|text| text.contains("no bash")),
+            "{:?}",
+            result.content
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = axo(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "original",
+                "bash",
+                json!({"command": "printf ran > original-marker"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("blocked")),
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "fork",
+                "bash",
+                json!({"command": "printf ran > fork-marker"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("blocked again")),
+        ],
+    )
+    .await;
+    let later = Arc::new(LaterHook(AtomicUsize::new(0)));
+    let mut options = common::bash_options(dir.path());
+    let cwd = options.cwd.clone();
+    options.tool_hooks = vec![Arc::new(NoBash), later.clone()];
+    let session = host.create_session(options).await.unwrap();
+    assert_eq!(
+        within(session.prompt("run bash")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let (_, entries) = host.open_session_read(session.path()).await.unwrap();
+    assert_blocked(&entries, "original");
+    assert!(!cwd.join("original-marker").exists());
+    assert_eq!(later.0.load(Ordering::SeqCst), 0);
+
+    let leaf = entries
+        .iter()
+        .rev()
+        .find_map(|seq| match &seq.entry {
+            Entry::Message {
+                base,
+                message: AgentMessage::Llm(Message::Assistant(_)),
+                ..
+            } => Some(base.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let fork = session.fork(&leaf).await.unwrap().session;
+    assert_eq!(
+        within(fork.prompt("try bash again")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let (_, entries) = host.open_session_read(fork.path()).await.unwrap();
+    assert_blocked(&entries, "original");
+    assert_blocked(&entries, "fork");
+    assert!(!cwd.join("original-marker").exists());
+    assert!(!cwd.join("fork-marker").exists());
+    assert_eq!(later.0.load(Ordering::SeqCst), 0);
 }

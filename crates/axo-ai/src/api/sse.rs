@@ -100,3 +100,28 @@ impl SseDecoder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_event_split_across_three_chunks_with_crlf() {
+        let mut decoder = SseDecoder::new();
+        // The CRLF after the first data line is split between chunks 2 and 3.
+        assert!(
+            decoder
+                .push(b": keep-alive\r\nevent: content_block_delta\r\nda")
+                .is_empty()
+        );
+        assert!(decoder.push(b"ta: {\"a\":1}\r").is_empty());
+        assert_eq!(
+            decoder.push(b"\ndata: {\"b\":2}\r\n\r\n"),
+            [SseEvent {
+                event: Some("content_block_delta".to_owned()),
+                data: "{\"a\":1}\n{\"b\":2}".to_owned(),
+            }]
+        );
+        assert_eq!(decoder.finish(), None);
+    }
+}

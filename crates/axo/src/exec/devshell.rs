@@ -127,7 +127,7 @@ struct Layer {
 impl DevShellEnv {
     /// `base`: the host snapshot every resolution starts from and falls back to.
     /// `settings`: the effective bash settings after project access filtering;
-    /// the session uses `HostEnv` instead when `dev_shell` is `Off`.
+    /// the session uses `StaticEnv` instead when `dev_shell` is `Off`.
     /// `cache_dir`: where Nix captures persist (`<cache_dir>/<hash>/{env.json, watches.json, gcroot}`;
     /// axo passes `<AxoBuilder::cache_dir>/devshell`); `None` makes `Nix` mode resolve to `base`.
     /// `Direnv` never uses it.
@@ -184,11 +184,7 @@ impl ExecEnv for DevShellEnv {
                         () = cancel.cancelled() => return inner.host(),
                     };
                     if let Some(env) = loaded {
-                        return Resolved {
-                            env,
-                            notice: None,
-                            prompt_note: None,
-                        };
+                        return env.into();
                     }
                 }
                 inner.host()
@@ -233,11 +229,7 @@ impl ExecEnv for DevShellEnv {
 
 impl Inner {
     fn host(&self) -> Resolved {
-        Resolved {
-            env: self.base.clone(),
-            notice: None,
-            prompt_note: None,
-        }
+        self.base.clone().into()
     }
 
     /// `program` with `args` in `cwd`, run from the host baseline.

@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axo::store::{Entry, Header, JsonlStore, SeqEntry, SessionInfo, SessionStore, SessionWriter};
-use axo::{Axo, Command, JobStatus, Session, SessionEvent};
+use axo::{
+    Axo, Command, Entry, Header, JobStatus, JsonlStore, SeqEntry, Session, SessionEvent,
+    SessionInfo, SessionStore, SessionWriter,
+};
 use axo_agent::RunOutcome;
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
@@ -59,12 +61,8 @@ impl SessionWriter for GatedWriter {
         self.inner.append(entry).await
     }
 
-    fn path(&self) -> Option<&Path> {
+    fn path(&self) -> &Path {
         self.inner.path()
-    }
-
-    fn planned_path(&self) -> &Path {
-        self.inner.planned_path()
     }
 }
 
@@ -233,7 +231,7 @@ async fn await_settled(session: &Session) {
                     delivered.extend(delivered_jobs.iter().cloned());
                 }
             }
-            if admitted.is_subset(&delivered) && !attach.live.agent.running {
+            if admitted.is_subset(&delivered) && !attach.live.running {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -247,14 +245,12 @@ fn texts(transcript: &Transcript) -> Vec<String> {
     transcript
         .iter()
         .flat_map(|message| match message {
-            Message::User(user) => user.content.clone(),
-            Message::ToolResult(result) => result.content.clone(),
-            _ => Vec::new(),
+            Message::User(user) => user.content.as_slice(),
+            Message::ToolResult(result) => result.content.as_slice(),
+            _ => &[],
         })
-        .filter_map(|block| match block {
-            UserBlock::Text { text } => Some(text),
-            UserBlock::Image { .. } => None,
-        })
+        .filter_map(UserBlock::as_text)
+        .map(str::to_owned)
         .collect()
 }
 
@@ -480,7 +476,7 @@ async fn attach_returns_while_a_write_is_in_flight() {
             .any(|seq| matches!(seq.entry, Entry::Submission { .. })),
         "the submission is not written yet"
     );
-    assert!(attach.live.agent.running, "the prompt owns the session");
+    assert!(attach.live.running, "the prompt owns the session");
 
     gate.release.notify_one();
     assert_eq!(within(prompt).await.unwrap().unwrap(), RunOutcome::Done);

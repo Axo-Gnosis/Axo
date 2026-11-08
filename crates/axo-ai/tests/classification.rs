@@ -1,9 +1,7 @@
-use std::time::Duration;
-
 use axo_ai::testing::reply_text;
 use axo_ai::{
     AssistantMessage, ProviderFailure, StopReason, is_context_overflow, is_recoverable_length,
-    is_retryable_error, retry_delay,
+    is_retryable_error,
 };
 
 fn failure(text: &str) -> AssistantMessage {
@@ -99,38 +97,6 @@ fn transient_patterns_and_exclusions_preserve_pi_precedence() {
     ] {
         assert!(!is_retryable_error(&failure(text)), "{text}");
     }
-}
-
-#[test]
-fn delay_is_bounded_and_never_overrides_terminal_exclusions() {
-    let mut message = failure("overloaded");
-    for (index, seconds) in [(0, 2), (1, 4), (2, 8)] {
-        assert_eq!(
-            retry_delay(&message, index),
-            Some(Duration::from_secs(seconds))
-        );
-    }
-    assert_eq!(retry_delay(&message, 3), None);
-    message.failure = Some(ProviderFailure {
-        status: Some(503),
-        code: None,
-        retry_after_ms: Some(60_000),
-        should_retry: None,
-    });
-    assert_eq!(retry_delay(&message, 0), Some(Duration::from_secs(60)));
-    message.failure.as_mut().unwrap().retry_after_ms = Some(60_001);
-    assert_eq!(retry_delay(&message, 0), None);
-    message.failure.as_mut().unwrap().retry_after_ms = Some(0);
-    assert_eq!(retry_delay(&message, 0), Some(Duration::ZERO));
-    message.failure.as_mut().unwrap().should_retry = Some(false);
-    assert_eq!(retry_delay(&message, 0), None);
-    message.failure = None;
-    message.error_message =
-        Some("Server requested 61s retry delay (max: 60s). 503 overloaded".into());
-    assert_eq!(retry_delay(&message, 0), None);
-    message.error_message = Some("overloaded".into());
-    message.stop_reason = StopReason::Aborted;
-    assert_eq!(retry_delay(&message, 0), None);
 }
 
 #[test]

@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axo::store::{Entry, JsonlStore, SeqEntry};
 use axo::{Axo, ProjectAccess, SessionEvent, SessionOptions, StaticEnv};
+use axo::{Entry, JsonlStore, SeqEntry};
 use axo_agent::AgentEvent;
 use axo_ai::{
     AssistantEvent, FileCredentialStore, Models, ModelsConfig, ModelsOptions, ScriptedApi,
@@ -61,6 +61,7 @@ async fn main() -> Result<(), Error> {
                  "baseUrl": "http://127.0.0.1:9/v1", "models": [{ "id": "m" }] } } }"#,
         )?;
         let models = Models::load(ModelsOptions {
+            http_client: None,
             cache_dir: None,
             config,
             extended_context: false,
@@ -126,14 +127,14 @@ async fn main() -> Result<(), Error> {
     .await;
 
     for session in &sessions {
-        session.abort().await;
+        session.abort();
     }
     for (session, mut prompt) in sessions.iter().zip(prompts) {
         loop {
             tokio::select! {
                 _ = &mut prompt => break,
                 // An early sampling failure can race a prompt that has not started yet.
-                _ = tokio::time::sleep(Duration::from_millis(10)) => session.abort().await,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => session.abort(),
             }
         }
     }

@@ -8,15 +8,11 @@ use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
 use globset::GlobBuilder;
-use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::SessionTools;
-use crate::tools::truncate::{
-    DEFAULT_MAX_BYTES, Limits, format_size, truncate_head, truncation_details,
-};
 
 const DEFAULT_LIMIT: usize = 1000;
 
@@ -100,7 +96,7 @@ fn find(
     label: Option<String>,
     cancel: &CancellationToken,
 ) -> Result<(String, Option<Value>), String> {
-    let shown_path = super::root_label(&search_path, label.as_deref());
+    let shown_path = super::shown(&search_path, label.as_deref()).display();
     match std::fs::metadata(&search_path) {
         Err(_) => return Err(format!("Path not found: {shown_path}")),
         Ok(metadata) if !metadata.is_dir() => {
@@ -132,13 +128,7 @@ fn find(
         .map_err(|err| err.to_string())?
         .compile_matcher();
 
-    let mut walk = WalkBuilder::new(&search_path);
-    // `.git` itself is never listed.
-    walk.hidden(false)
-        .require_git(false)
-        .add_custom_ignore_filename(".fdignore")
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(|entry| entry.file_name() != ".git");
+    let walk = super::walker(&search_path);
 
     let mut results = Vec::new();
     let mut errors = Vec::new();
@@ -190,14 +180,6 @@ fn find(
 
     let limit_reached = results.len() >= limit;
     let raw = results.join("\n");
-    let truncation = truncate_head(
-        &raw,
-        Limits {
-            max_lines: usize::MAX,
-            max_bytes: DEFAULT_MAX_BYTES,
-        },
-    );
-    let mut output = truncation.content.to_owned();
     let mut details = Map::new();
     let mut notices = Vec::new();
     if limit_reached {
@@ -207,15 +189,5 @@ fn find(
         ));
         details.insert("resultLimitReached".into(), limit.into());
     }
-    if truncation.truncated() {
-        notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-        details.insert("truncation".into(), truncation_details(&truncation));
-    }
-    if !notices.is_empty() {
-        output.push_str(&format!("\n\n[{}]", notices.join(". ")));
-    }
-    Ok((
-        output,
-        (!details.is_empty()).then_some(Value::Object(details)),
-    ))
+    Ok(super::byte_capped(&raw, notices, Vec::new(), details))
 }

@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use axo_ai::FileCredentialStore;
+use axo_ai::auth::codex::{self, PROVIDER};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let dir = dir.ok_or("--dir is required")?;
-    if provider.as_deref() != Some("openai-codex") {
+    if provider.as_deref() != Some(PROVIDER) {
         return Err("only openai-codex login is supported".into());
     }
     std::fs::create_dir_all(&dir)?;
@@ -43,7 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|line| line.trim().to_owned())
             .filter(|line| !line.is_empty())
     };
-    axo_ai::auth::codex::login(
+    codex::login(
+        &axo_ai::api::http::client(),
         &store,
         &|url| {
             println!("Open this URL in your browser to log in:\n{url}\n");
@@ -53,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     println!(
-        "Logged in to openai-codex; credentials saved to {}",
+        "Logged in to {PROVIDER}; credentials saved to {}",
         dir.join("auth.json").display()
     );
     Ok(())

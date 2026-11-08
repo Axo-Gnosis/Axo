@@ -1,12 +1,14 @@
-//! Session artifacts: stable numeric URLs for full bash and shaken output.
+//! Session artifacts: stable numeric URLs for full command and shaken output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use axo_agent::ToolError;
+use tokio::fs::File;
 
 use super::{Scheme, SchemeContext, SchemeUrl, Target};
 
@@ -14,6 +16,30 @@ use super::{Scheme, SchemeContext, SchemeUrl, Target};
 pub struct Artifacts {
     dir: PathBuf,
     next: Mutex<Option<u64>>,
+    live: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// Keeps a writable artifact live until its owner has closed its file and process.
+pub struct LiveArtifact {
+    path: PathBuf,
+    live: Arc<Mutex<HashSet<PathBuf>>>,
+    file: Option<File>,
+}
+
+impl LiveArtifact {
+    pub(crate) fn take_file(&mut self) -> File {
+        self.file.take().expect("new artifact owns its file")
+    }
+}
+
+impl Drop for LiveArtifact {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.path);
+    }
 }
 
 impl Artifacts {
@@ -22,6 +48,7 @@ impl Artifacts {
         Self {
             dir,
             next: Mutex::new(None),
+            live: Arc::default(),
         }
     }
 
@@ -42,6 +69,41 @@ impl Artifacts {
         let n = *next;
         *next = n.checked_add(1).expect("artifact IDs exhausted");
         (n, self.dir.join(format!("{n}.{tail}")))
+    }
+
+    /// Creates a numbered file, registering it as live before any filesystem mutation.
+    pub async fn create(&self, tail: &str) -> io::Result<(u64, PathBuf, LiveArtifact)> {
+        let (id, path) = self.allocate(tail);
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.clone());
+        let mut guard = LiveArtifact {
+            path: path.clone(),
+            live: self.live.clone(),
+            file: None,
+        };
+        tokio::fs::create_dir_all(&self.dir).await.map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("Failed to create {}: {err}", self.dir.display()),
+            )
+        })?;
+        guard.file = Some(File::create(&path).await.map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("Failed to create {}: {err}", path.display()),
+            )
+        })?);
+        Ok((id, path, guard))
+    }
+
+    /// Paths still owned by writers, which forks must copy instead of hard-linking.
+    pub fn live(&self) -> HashSet<PathBuf> {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Finds the first artifact with exactly this numeric prefix.
@@ -83,11 +145,12 @@ fn numeric_prefix(name: &str) -> Option<u64> {
     parse_id(name.split_once('.')?.0)
 }
 
-/// A bash artifact's suffix: unsafe call-ID bytes become uppercase `%XX` escapes.
-/// The escaped ID is cut to 200 bytes before adding the `bash.` and `.log` framing.
-pub fn bash_tail(call_id: &str) -> String {
-    let mut name = String::with_capacity(call_id.len() + 9);
-    name.push_str("bash.");
+/// A command artifact's suffix: unsafe call-ID bytes become uppercase `%XX` escapes.
+/// The escaped ID is cut to 200 bytes before adding the tool name and `.log` framing.
+pub(crate) fn command_log_tail(tool: &str, call_id: &str) -> String {
+    let mut name = String::with_capacity(tool.len() + call_id.len() + 5);
+    name.push_str(tool);
+    name.push('.');
     for byte in call_id.bytes() {
         if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
             name.push(char::from(byte));
@@ -95,15 +158,15 @@ pub fn bash_tail(call_id: &str) -> String {
             let _ = write!(name, "%{byte:02X}");
         }
     }
-    name.truncate(205);
+    name.truncate(tool.len() + 201);
     name.push_str(".log");
     name
 }
 
-/// Each bash artifact tail (`bash.<escaped id>.log`) mapped to its newest artifact ID, from one scan.
+/// Each command artifact tail mapped to its newest artifact ID, from one scan.
 /// Newest wins because IDs only grow: a reused or empty call ID points at its latest command.
 // ponytail: a crash before the interrupted call created its file falls back to an older same-ID log; recording the artifact ID at call start would close that
-pub fn bash_outputs(dir: &Path) -> HashMap<String, u64> {
+pub(crate) fn command_logs(dir: &Path) -> HashMap<String, u64> {
     let mut map = HashMap::new();
     for entry in std::fs::read_dir(dir)
         .into_iter()
@@ -115,7 +178,6 @@ pub fn bash_outputs(dir: &Path) -> HashMap<String, u64> {
             continue;
         };
         if let Some(n) = parse_id(digits)
-            && tail.starts_with("bash.")
             && tail.ends_with(".log")
         {
             map.entry(tail.to_owned())
@@ -162,24 +224,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bash_outputs_maps_each_call_to_its_newest_log() {
+    fn command_logs_maps_each_call_to_its_newest_log() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "3.bash.call.log",
             "7.bash.call.log",
             "5.bash.other.log",
+            "8.custom.call.log",
             "6.shake.md",
             "notes.txt",
         ] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
         assert_eq!(
-            bash_outputs(dir.path()),
+            command_logs(dir.path()),
             HashMap::from([
                 ("bash.call.log".to_owned(), 7),
-                ("bash.other.log".to_owned(), 5)
+                ("bash.other.log".to_owned(), 5),
+                ("custom.call.log".to_owned(), 8),
             ])
         );
-        assert!(bash_outputs(Path::new("/nonexistent")).is_empty());
+        assert!(command_logs(Path::new("/nonexistent")).is_empty());
+    }
+
+    #[test]
+    fn command_artifact_tails_escape_unsafe_call_ids() {
+        assert_eq!(command_log_tail("bash", "a|b"), "bash.a%7Cb.log");
+        assert_eq!(
+            command_log_tail("bash", "toolu_01Ab"),
+            "bash.toolu_01Ab.log"
+        );
+        for id in ["../../etc/passwd", "/tmp/x"] {
+            assert!(!command_log_tail("bash", id).contains('/'), "{id}");
+        }
     }
 }

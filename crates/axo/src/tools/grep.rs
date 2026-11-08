@@ -12,17 +12,15 @@ use axo_ai::{ToolCall, UserBlock};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::Lossy;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
-use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::SessionTools;
-use crate::tools::truncate::{
-    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Limits, format_size, truncate_head, truncate_line,
-    truncation_details,
-};
+use crate::tools::truncate::truncate_line;
+
+const GREP_MAX_LINE_LENGTH: usize = 500;
 
 const DEFAULT_LIMIT: usize = 100;
 
@@ -111,7 +109,7 @@ fn search(
     label: Option<String>,
     cancel: &CancellationToken,
 ) -> Result<(String, Option<Value>), String> {
-    let shown_path = super::root_label(&search_path, label.as_deref());
+    let shown_path = super::shown(&search_path, label.as_deref()).display();
     let is_dir = std::fs::metadata(&search_path)
         .map_err(|_| format!("Path not found: {shown_path}"))?
         .is_dir();
@@ -135,13 +133,7 @@ fn search(
         .line_number(true)
         .build();
 
-    let mut walk = WalkBuilder::new(&search_path);
-    // `.git` itself is never searched, unlike `rg --hidden`.
-    walk.hidden(false)
-        .require_git(false)
-        .add_custom_ignore_filename(".fdignore")
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(|entry| entry.file_name() != ".git");
+    let mut walk = super::walker(&search_path);
     if let Some(glob) = &args.glob {
         let mut overrides = OverrideBuilder::new(&search_path);
         overrides.add(glob).map_err(|err| err.to_string())?;
@@ -260,15 +252,6 @@ fn search(
     }
 
     let raw = output_lines.join("\n");
-    // No line limit: the match limit already capped the rows.
-    let truncation = truncate_head(
-        &raw,
-        Limits {
-            max_lines: usize::MAX,
-            max_bytes: DEFAULT_MAX_BYTES,
-        },
-    );
-    let mut output = truncation.content.to_owned();
     let mut details = Map::new();
     let mut notices = Vec::new();
     if limit_reached {
@@ -278,21 +261,12 @@ fn search(
         ));
         details.insert("matchLimitReached".into(), limit.into());
     }
-    if truncation.truncated() {
-        notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-        details.insert("truncation".into(), truncation_details(&truncation));
-    }
+    let mut after = Vec::new();
     if lines_truncated {
-        notices.push(format!(
+        after.push(format!(
             "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
         ));
         details.insert("linesTruncated".into(), true.into());
     }
-    if !notices.is_empty() {
-        output.push_str(&format!("\n\n[{}]", notices.join(". ")));
-    }
-    Ok((
-        output,
-        (!details.is_empty()).then_some(Value::Object(details)),
-    ))
+    Ok(super::byte_capped(&raw, notices, after, details))
 }

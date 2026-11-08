@@ -14,6 +14,8 @@ use crate::store::{Entry, EntryId, Projection, SeqEntry};
 use crate::tools::{FileAccess, ledger_access};
 use crate::{CompactionSettings, Error};
 
+const CLEARING_HEADROOM: u64 = 20_000;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
     pub window: u64,
@@ -23,6 +25,10 @@ pub(crate) struct Limits {
     pub keep_recent: u64,
 }
 impl Limits {
+    pub fn clearing_target(&self) -> Option<u64> {
+        self.trigger.checked_sub(CLEARING_HEADROOM)
+    }
+
     pub fn resolve(model: &Model, settings: &CompactionSettings) -> Result<Self, Error> {
         let window = settings
             .max_context
@@ -196,10 +202,10 @@ pub(crate) fn file_lists<'a>(
         {
             match access {
                 FileAccess::Read => {
-                    read.insert(path.to_owned());
+                    read.insert(path);
                 }
                 FileAccess::Modify => {
-                    modified.insert(path.to_owned());
+                    modified.insert(path);
                 }
             }
         }
@@ -258,19 +264,15 @@ pub(crate) fn prepare_compaction(
         Entry::Compaction { summary, .. } => Some(summary.clone()),
         _ => None,
     });
-    let carried: HashSet<&EntryId> = previous
+    let carried: HashSet<&str> = previous
         .and_then(|at| match entry(at) {
             Entry::Compaction {
                 preserved_user_ids, ..
-            } => Some(preserved_user_ids.iter().collect()),
+            } => Some(preserved_user_ids.iter().map(EntryId::as_str).collect()),
             _ => None,
         })
         .unwrap_or_default();
-    let is_carried = |at: usize| {
-        entry(at)
-            .base()
-            .is_some_and(|base| carried.contains(&base.id))
-    };
+    let is_carried = |at: usize| entry(at).id().is_some_and(|id| carried.contains(id));
     let cuts: Vec<usize> = (start..sources.len())
         .filter(|&at| {
             !is_carried(at)
@@ -366,8 +368,8 @@ pub(crate) fn prepare_compaction(
             break;
         }
         remaining -= count;
-        if let Some(base) = entry(at).base() {
-            preserved.push(base.id.clone());
+        if let Some(id) = entry(at).id() {
+            preserved.push(EntryId(id.to_owned()));
         }
     }
     preserved.reverse();
@@ -395,8 +397,8 @@ pub(crate) fn prepare_compaction(
     let files = file_lists(history.iter().chain(&turn_prefix), (0..cut).map(entry));
     let first_kept_entry_id = sources
         .get(cut)
-        .and_then(|_| entry(cut).base())
-        .map_or(checkpoint_id, |base| base.id.clone());
+        .and_then(|_| entry(cut).id())
+        .map_or(checkpoint_id, |id| EntryId(id.to_owned()));
     Ok(PreparedCompaction {
         summary: summary::SummaryInput {
             history,
@@ -407,7 +409,6 @@ pub(crate) fn prepare_compaction(
             replaced_tokens: history_tokens.saturating_add(prefix_tokens),
             history_tokens,
             prefix_tokens,
-            branch: false,
         },
         files,
         first_kept_entry_id,
@@ -421,18 +422,12 @@ pub(crate) fn prepare_branch(
     projection: &Projection,
     entries: &[SeqEntry],
     target: Option<&EntryId>,
-) -> Option<(summary::SummaryInput, FileLists)> {
-    let target_path: HashSet<usize> = target
-        .and_then(|target| {
-            entries
-                .iter()
-                .rposition(|entry| entry.entry.id() == Some(target.as_str()))
-        })
-        .map_or_else(HashSet::new, |at| {
-            crate::store::project::path_to(entries, at)
-                .into_iter()
-                .collect()
-        });
+) -> Option<(Vec<AgentMessage>, u64, FileLists)> {
+    let target_path: HashSet<usize> = target.map_or_else(HashSet::new, |target| {
+        crate::store::path_to(entries, target.as_str())
+            .into_iter()
+            .collect()
+    });
     let common = projection
         .path()
         .iter()
@@ -462,18 +457,5 @@ pub(crate) fn prepare_branch(
             .iter()
             .map(|source| &entries[source.entry_index].entry),
     );
-    Some((
-        summary::SummaryInput {
-            live_prefix: Vec::new(),
-            withheld_systems: Vec::new(),
-            turn_prefix: Vec::new(),
-            previous_summary: None,
-            replaced_tokens: history_tokens,
-            history_tokens,
-            prefix_tokens: 0,
-            history,
-            branch: true,
-        },
-        files,
-    ))
+    Some((history, history_tokens, files))
 }

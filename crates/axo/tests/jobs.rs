@@ -4,17 +4,61 @@
 mod common;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use axo::store::{Entry, SeqEntry};
-use axo::{Axo, JobInfo, JobStatus, Session, SessionEvent};
-use axo_agent::{AgentEvent, RunOutcome};
+use async_trait::async_trait;
+use axo::exec::host::ExecSpec;
+use axo::tools::CommandRequest;
+use axo::{Axo, JobInfo, JobStatus, Session, SessionEvent, SessionTools, ToolFactory};
+use axo::{Entry, SeqEntry};
+use axo_agent::{AgentEvent, RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
 use common::{axo, bash_options, dead, journal, only, tool_text, within};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
+
+struct LateTool(Arc<SessionTools>);
+
+#[async_trait]
+impl Tool for LateTool {
+    fn name(&self) -> &str {
+        "late"
+    }
+
+    fn description(&self) -> &str {
+        "Runs a delayed host command."
+    }
+
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: LazyLock<Value> =
+            LazyLock::new(|| json!({"type": "object", "properties": {}}));
+        &PARAMETERS
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let tools = &self.0;
+        let resolved = tools.exec.resolve(&tools.cwd, &cx.cancel, &|_| {}).await;
+        let spec = ExecSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 1; echo late".into()],
+            cwd: tools.cwd.clone(),
+            env: (*resolved.env).clone(),
+        };
+        tools
+            .run_command(
+                cx,
+                CommandRequest {
+                    spec,
+                    label: "late".into(),
+                    timeout: None,
+                    run_async: true,
+                },
+            )
+            .await
+    }
+}
 
 /// An `Axo` streaming from `turns`, plus the API that records every request.
 async fn scripted(dir: &Path, turns: Vec<ScriptedTurn>) -> (Axo, Arc<ScriptedApi>) {
@@ -31,10 +75,7 @@ fn user_texts(request: &RecordedRequest) -> Vec<String> {
             Message::User(user) => Some(
                 user.content
                     .iter()
-                    .filter_map(|block| match block {
-                        UserBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
+                    .filter_map(UserBlock::as_text)
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
@@ -209,6 +250,107 @@ async fn async_job_result_is_delivered_once_by_idle_wake() {
     let lines = journal(&session);
     let end = assert_job_journaled(&lines, &session, "c1", command, "done");
     assert_delivered_by_message(&lines, end, "done");
+}
+
+#[tokio::test]
+async fn host_command_is_listed_and_delivered_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, api) = scripted(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[("c1", "late", json!({}))])),
+            ScriptedTurn::Reply(reply_text("started it")),
+            ScriptedTurn::Reply(reply_text("it printed late")),
+        ],
+    )
+    .await;
+    let mut options = bash_options(dir.path());
+    let factory: ToolFactory = Arc::new(|tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
+        Arc::new(LateTool(tools.clone()))
+    });
+    options.tools = vec![factory];
+    let session = axo.create_session(options).await.unwrap();
+
+    assert_eq!(
+        within(session.prompt("Run the host command."))
+            .await
+            .unwrap(),
+        RunOutcome::Done
+    );
+    let entries = session.attach(None).await.missed;
+    let output = tool_text(&entries, "c1");
+    assert!(
+        output.contains("Command is still running in the background as bg_1. "),
+        "{output}"
+    );
+    let jobs = session.jobs();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].id, "bg_1");
+    assert_eq!(jobs[0].command, "late");
+    let first_end = entries
+        .iter()
+        .find(|entry| matches!(entry.entry, Entry::RunEnd { .. }))
+        .unwrap()
+        .seq;
+    await_run_end(&session, first_end).await;
+
+    // Shutdown waits for any further run, exposing duplicate automatic delivery.
+    session.shutdown().await;
+    let requests = api.requests();
+    assert_eq!(requests.len(), 3);
+    let users = user_texts(&requests[2]);
+    let deliveries: Vec<_> = users
+        .iter()
+        .filter(|text| text.starts_with("Background job results:"))
+        .collect();
+    assert_eq!(deliveries.len(), 1, "{users:#?}");
+    assert!(deliveries[0].contains("\nlate"), "{users:#?}");
+    let lines = journal(&session);
+    let end = assert_job_journaled(&lines, &session, "c1", "late", "late");
+    assert_eq!(lines[end]["text"], "late");
+    assert_delivered_by_message(&lines, end, "\nlate");
+}
+
+#[tokio::test]
+async fn configured_delay_promotes_a_foreground_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m"}]),
+        json!({"bash": {"promoteAfterMs": 200}}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "sleep 2; echo done"}),
+            )])),
+            ScriptedTurn::Reply(reply_tool_calls(&[("c2", "wait", json!({}))])),
+            ScriptedTurn::Reply(reply_text("it printed done")),
+        ],
+    )
+    .await;
+    let session = host
+        .axo
+        .create_session(bash_options(dir.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        within(session.prompt("Run the command, then wait."))
+            .await
+            .unwrap(),
+        RunOutcome::Done
+    );
+    let entries = session.attach(None).await.missed;
+    let output = tool_text(&entries, "c1");
+    assert!(
+        output.contains("Command is still running in the background as bg_1. "),
+        "{output}"
+    );
+    assert!(!output.contains("done"), "{output}");
+    let waited = tool_text(&entries, "c2");
+    assert!(waited.contains("\ndone"), "{waited}");
+    session.shutdown().await;
 }
 
 #[tokio::test]

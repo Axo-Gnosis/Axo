@@ -1,25 +1,22 @@
-//! The stateful agent (pi `agent/src/agent.ts`): owns the transcript, the queues, the
-//! run's cancellation and the event fan-out around the loop in [`crate::run`].
+//! The stateful agent: owns the transcript, queues and run cancellation around the
+//! loop in [`crate::run`]. Events are delivered through [`Persist`].
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use axo_ai::{
-    Accumulator, AssistantMessage, Message, Model, Streamer, ThinkingLevel, ToolCall,
-    ToolResultMessage,
-};
+use axo_ai::{AssistantMessage, Message, Model, Streamer, ThinkingLevel, ToolResultMessage};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::cancel::CancelReason;
 use crate::error::Error;
-use crate::event::{AgentEvent, Persist};
-use crate::hooks::{LoopHooks, NoHooks};
-use crate::message::{AgentMessage, QueuedMessage};
+use crate::event::Persist;
+use crate::hooks::{LoopHooks, NoHooks, ToolHooks};
+use crate::message::{AgentMessage, QueuedMessage, last_non_system};
 use crate::run::{self, RunStart};
-use crate::tool::{ExecutionMode, Tool};
+use crate::tool::Tool;
 
 pub struct AgentConfig {
     pub streamer: Arc<dyn Streamer>,
@@ -27,20 +24,17 @@ pub struct AgentConfig {
     pub thinking: ThinkingLevel,
     pub tools: Vec<Arc<dyn Tool>>,
     pub hooks: Arc<dyn LoopHooks>,
+    pub tool_hooks: Vec<Arc<dyn ToolHooks>>,
     /// The ordered, awaited subscriber; see [`Persist`].
     pub persist: Option<Arc<dyn Persist>>,
-    pub tool_execution: ExecutionMode,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
     /// Forwarded to providers for cache-aware backends.
     pub session_id: Option<String>,
-    /// Capacity of the event broadcast; a receiver that falls behind gets `Lagged`.
-    pub broadcast_capacity: usize,
 }
 
 impl AgentConfig {
-    /// A config with pi's defaults: no hooks, no persistence, parallel tools,
-    /// one-at-a-time queues, thinking off, broadcast capacity 1024.
+    /// A config with no hooks or persistence, one-at-a-time queues and thinking off.
     pub fn new(streamer: Arc<dyn Streamer>, model: Model) -> Self {
         Self {
             streamer,
@@ -48,12 +42,11 @@ impl AgentConfig {
             thinking: ThinkingLevel::Off,
             tools: Vec::new(),
             hooks: Arc::new(NoHooks),
+            tool_hooks: Vec::new(),
             persist: None,
-            tool_execution: ExecutionMode::Parallel,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
             session_id: None,
-            broadcast_capacity: 1024,
         }
     }
 }
@@ -75,27 +68,14 @@ pub enum RunOutcome {
     Failed(String),
 }
 
-/// A point-in-time view of the agent for late subscribers.
-#[derive(Debug, Clone, Default)]
-pub struct AgentSnapshot {
-    pub running: bool,
-    /// The partial assistant message being streamed.
-    pub streaming: Option<AssistantMessage>,
-    /// Tool calls currently executing.
-    pub pending_tool_calls: Vec<ToolCall>,
-    pub queued_steering: Vec<AgentMessage>,
-    pub queued_follow_up: Vec<AgentMessage>,
-}
-
 pub struct Agent {
     pub(crate) streamer: Arc<dyn Streamer>,
     pub(crate) hooks: Arc<dyn LoopHooks>,
+    pub(crate) tool_hooks: Vec<Arc<dyn ToolHooks>>,
     pub(crate) persist: Option<Arc<dyn Persist>>,
-    pub(crate) tool_execution: ExecutionMode,
     pub(crate) steering_mode: QueueMode,
     pub(crate) follow_up_mode: QueueMode,
     pub(crate) session_id: Option<String>,
-    pub(crate) events: broadcast::Sender<AgentEvent>,
     pub(crate) state: Mutex<State>,
     /// True while `state.steering` is non-empty; written under the state lock.
     pub(crate) steer_pending: watch::Sender<bool>,
@@ -113,10 +93,6 @@ pub(crate) struct State {
     pub(crate) follow_up: VecDeque<QueuedMessage>,
     /// The active run, if any.
     pub(crate) run: Option<ActiveRun>,
-    /// The assistant message being streamed.
-    pub(crate) streaming: Option<Accumulator>,
-    /// Tool calls currently executing.
-    pub(crate) pending_tool_calls: Vec<ToolCall>,
     /// Set by `Agent::shutdown`: every later run begins cancelled.
     pub(crate) shut_down: bool,
 }
@@ -134,23 +110,19 @@ impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.0.lock();
         state.run = None;
-        state.streaming = None;
-        state.pending_tool_calls.clear();
     }
 }
 
 impl Agent {
     pub fn new(cfg: AgentConfig) -> Self {
-        let (events, _) = broadcast::channel(cfg.broadcast_capacity.max(1));
         Self {
             streamer: cfg.streamer,
             hooks: cfg.hooks,
+            tool_hooks: cfg.tool_hooks,
             persist: cfg.persist,
-            tool_execution: cfg.tool_execution,
             steering_mode: cfg.steering_mode,
             follow_up_mode: cfg.follow_up_mode,
             session_id: cfg.session_id,
-            events,
             state: Mutex::new(State {
                 messages: Vec::new(),
                 model: cfg.model,
@@ -159,8 +131,6 @@ impl Agent {
                 steering: VecDeque::new(),
                 follow_up: VecDeque::new(),
                 run: None,
-                streaming: None,
-                pending_tool_calls: Vec::new(),
                 shut_down: false,
             }),
             steer_pending: watch::channel(false).0,
@@ -212,11 +182,7 @@ impl Agent {
             if state.run.is_some() {
                 return Err(Error::Busy);
             }
-            let last = state
-                .messages
-                .iter()
-                .rev()
-                .find(|message| !matches!(message, AgentMessage::Llm(Message::System(_))));
+            let last = last_non_system(&state.messages);
             match last {
                 None => return Err(Error::NothingToContinue),
                 Some(AgentMessage::Llm(Message::Assistant(message)))
@@ -289,10 +255,6 @@ impl Agent {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
-        self.events.subscribe()
-    }
-
     pub fn messages(&self) -> Vec<AgentMessage> {
         self.lock().messages.clone()
     }
@@ -317,14 +279,12 @@ impl Agent {
         self.lock().tools = t;
     }
 
-    pub fn snapshot(&self) -> AgentSnapshot {
+    /// The queued steering and follow-up messages, in delivery order.
+    pub fn queued(&self) -> (Vec<AgentMessage>, Vec<AgentMessage>) {
         let state = self.lock();
-        AgentSnapshot {
-            running: state.run.is_some(),
-            streaming: state.streaming.as_ref().and_then(Accumulator::snapshot),
-            pending_tool_calls: state.pending_tool_calls.clone(),
-            queued_steering: state.steering.iter().map(|m| m.message.clone()).collect(),
-            queued_follow_up: state.follow_up.iter().map(|m| m.message.clone()).collect(),
-        }
+        (
+            state.steering.iter().map(|m| m.message.clone()).collect(),
+            state.follow_up.iter().map(|m| m.message.clone()).collect(),
+        )
     }
 }

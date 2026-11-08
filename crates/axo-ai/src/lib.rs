@@ -3,19 +3,19 @@
 
 pub mod api;
 pub mod auth;
-pub mod cost;
-pub mod error;
+mod cost;
+mod error;
 pub mod estimate;
-pub mod event;
-pub mod json;
+mod event;
+pub(crate) mod json;
 pub mod model;
 pub mod models;
-pub mod overflow;
-pub mod retry;
+mod overflow;
+mod retry;
 pub mod thinking;
 pub mod transcript;
-pub mod transform;
-pub mod types;
+mod transform;
+mod types;
 
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -27,18 +27,17 @@ pub use api::{Api, SimpleStreamOptions, StreamOptions, Streamer, ToolChoice};
 pub use auth::resolve::resolve_config_value;
 pub use auth::store::FileCredentialStore;
 pub use auth::{Credential, CredentialStore, ModelAuth};
-pub use cost::calculate_cost;
 pub use error::Error;
 pub use event::{Accumulator, AssistantEvent};
 pub use model::{ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap};
 pub use models::config::ModelsConfig;
 pub use models::{Models, ModelsOptions};
 pub use overflow::{is_context_overflow, is_recoverable_length};
-pub use retry::{is_fatal_error, is_retryable_error, retry_delay};
+pub use retry::{is_fatal_error, is_retryable_error};
 #[cfg(feature = "testing")]
 pub use testing::{RecordedRequest, ScriptedApi, ScriptedTurn};
-pub use transcript::{Context, Transcript};
-pub use transform::{drop_failed_turns, transform_messages};
+pub use transcript::Transcript;
+pub use transform::transform_messages;
 pub use types::{
     AssistantBlock, AssistantMessage, JsonMap, Message, ProviderFailure, ReasoningReplay,
     StopReason, SystemMessage, TextBlock, ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec,

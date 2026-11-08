@@ -7,12 +7,12 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use axo::store::{Entry, SeqEntry};
 use axo::{Command, Error, PromptPart, Session, SessionEvent, ShakeMode};
+use axo::{Entry, SeqEntry};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
-use axo_ai::{Message, ProviderFailure, ScriptedTurn, StopReason, ThinkingLevel, UserBlock};
-use common::{host, options, within};
+use axo_ai::{Message, ScriptedTurn, ThinkingLevel, UserBlock};
+use common::{host, options, transient, within};
 use serde_json::json;
 
 fn models() -> serde_json::Value {
@@ -55,28 +55,12 @@ fn user_texts(entries: &[SeqEntry]) -> Vec<String> {
             } => Some(
                 user.content
                     .iter()
-                    .filter_map(|block| match block {
-                        UserBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
+                    .filter_map(UserBlock::as_text)
                     .collect::<String>(),
             ),
             _ => None,
         })
         .collect()
-}
-
-fn transient() -> ScriptedTurn {
-    let mut message = reply_text("");
-    message.stop_reason = StopReason::Error;
-    message.error_message = Some("503 service unavailable".into());
-    message.failure = Some(ProviderFailure {
-        status: Some(503),
-        code: None,
-        retry_after_ms: None,
-        should_retry: None,
-    });
-    ScriptedTurn::Reply(message)
 }
 
 fn skill(dir: &Path, name: &str, frontmatter: &str, body: &str) {
@@ -197,7 +181,7 @@ async fn commands_during_a_run_follow_their_policy() {
         models(),
         json!({}),
         vec![
-            transient(),
+            transient(None),
             ScriptedTurn::Reply(reply_text("original done")),
             ScriptedTurn::Reply(reply_text("review done")),
         ],
@@ -320,7 +304,7 @@ async fn selection_changes_during_maintenance_apply() {
     }))
     .await
     .unwrap();
-    session.abort().await;
+    session.abort();
     assert!(matches!(
         within(compact).await,
         Err(Error::MaintenanceAborted)

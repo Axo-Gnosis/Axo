@@ -1,5 +1,5 @@
-//! Loop hooks, ported from pi `agent/src/types.ts` (`AgentLoopConfig` and the hook
-//! contexts). Every method has a no-op default. When each fires: `plan/pi/loop.md` §4.
+//! The loop driver's lifecycle contract and the host's ordered tool-policy hooks.
+//! Every method has a no-op default.
 //!
 //! Failure contract: request preparation and turn finishing can fail the run.
 //! A failing `before_tool_call` blocks the call; a failing `after_tool_call` is logged
@@ -8,9 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_ai::{
-    AssistantMessage, Message, Model, ThinkingLevel, ToolCall, ToolResultMessage, UserBlock,
-};
+use axo_ai::{AssistantMessage, Message, Model, ToolCall, ToolResultMessage, UserBlock};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -25,22 +23,6 @@ pub struct AgentContext {
     pub tools: Vec<Arc<dyn Tool>>,
 }
 
-/// Runtime state right before a provider request (pi `PrepareRequestContext`).
-pub struct PrepareRequestContext<'a> {
-    pub context: &'a AgentContext,
-    pub model: &'a Model,
-    pub thinking: ThinkingLevel,
-}
-
-/// Replacements for this and later requests of the run (pi `AgentRequestUpdate`);
-/// `None` keeps the current value.
-#[derive(Default)]
-pub struct RequestUpdate {
-    pub context: Option<AgentContext>,
-    pub model: Option<Model>,
-    pub thinking: Option<ThinkingLevel>,
-}
-
 /// A maintenance-hook failure, displayed without wrapping.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
@@ -48,8 +30,10 @@ pub struct HookError(pub String);
 
 #[derive(Default)]
 pub struct TurnFinish {
-    pub decision: Option<TurnDecision>,
-    pub context: Option<AgentContext>,
+    /// Request another turn even without tool results or queued messages.
+    pub continue_turn: bool,
+    /// Replace the working transcript; `None` keeps the current messages.
+    pub messages: Option<Vec<AgentMessage>>,
 }
 
 /// A completed turn (pi `AgentTurnContext`, also `PrepareNextTurnContext`).
@@ -64,28 +48,6 @@ pub struct TurnContext<'a> {
     pub tool_results: &'a [ToolResultMessage],
     /// The context after the message and its results were appended.
     pub context: &'a AgentContext,
-    /// What the run would return if it ended now: prompt runs include the prompts,
-    /// continuations exclude pre-existing messages.
-    pub new_messages: &'a [AgentMessage],
-}
-
-/// Replacements before the next turn (pi `AgentLoopTurnUpdate`).
-#[derive(Default)]
-pub struct TurnUpdate {
-    pub context: Option<AgentContext>,
-    /// Messages appended (with normal lifecycle events) before the next request.
-    pub messages: Vec<AgentMessage>,
-    pub model: Option<Model>,
-    pub thinking: Option<ThinkingLevel>,
-}
-
-/// `finish_turn`'s decision (pi `AgentTurnDecision`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnDecision {
-    /// Ensure one more provider request, even with no tool results or queued messages.
-    Continue,
-    /// End the run now without polling queues.
-    End,
 }
 
 /// Context passed to `before_tool_call`. `tool_call.arguments` are already validated.
@@ -112,7 +74,7 @@ pub enum ToolCallDecision {
 pub struct AfterToolCallContext<'a> {
     pub assistant_message: &'a AssistantMessage,
     pub tool_call: &'a ToolCall,
-    /// The executed result before any override.
+    /// The executed result, including overrides from earlier hooks in the list.
     pub result: &'a ToolOutput,
     pub context: &'a AgentContext,
 }
@@ -129,15 +91,6 @@ pub struct AfterToolCallResult {
 
 #[async_trait]
 pub trait LoopHooks: Send + Sync {
-    /// Rewrites the messages for one request (request-only), before `convert_to_llm`.
-    async fn transform_context(
-        &self,
-        messages: Vec<AgentMessage>,
-        _cancel: &CancellationToken,
-    ) -> Vec<AgentMessage> {
-        messages
-    }
-
     /// Lowers agent messages to LLM messages. The default keeps `Llm` messages and
     /// drops `Custom` ones.
     fn convert_to_llm(&self, messages: Vec<AgentMessage>) -> Vec<Message> {
@@ -151,22 +104,23 @@ pub trait LoopHooks: Send + Sync {
     }
 
     /// Before every provider request, including the first; pending messages are already
-    /// appended. Does not poll queues.
+    /// appended. Returns replacement messages, or `None` to keep the transcript.
     async fn prepare_request(
         &self,
-        _request: PrepareRequestContext<'_>,
+        _context: &AgentContext,
         _cancel: &CancellationToken,
-    ) -> Result<Option<RequestUpdate>, HookError> {
+    ) -> Result<Option<Vec<AgentMessage>>, HookError> {
         Ok(None)
     }
 
-    /// After `TurnEnd` when the loop continues, before the next turn starts.
+    /// After `TurnEnd` when continuing. Returned messages are appended with normal
+    /// lifecycle events before the next request.
     async fn prepare_next_turn(
         &self,
         _turn: TurnContext<'_>,
         _cancel: &CancellationToken,
-    ) -> Option<TurnUpdate> {
-        None
+    ) -> Vec<AgentMessage> {
+        Vec::new()
     }
 
     /// After the persisted assistant and results, before `TurnEnd`.
@@ -187,6 +141,17 @@ pub trait LoopHooks: Send + Sync {
     fn should_skip_tools(&self, _response: &AssistantMessage, _model: &Model) -> bool {
         false
     }
+    /// Host-supplied steering messages, drained after the agent's own steering queue at
+    /// each steering drain point.
+    async fn steering(&self) -> Vec<QueuedMessage> {
+        Vec::new()
+    }
+}
+
+/// Host tool policy. Before hooks run in order until the first error or block;
+/// after hooks fold their overrides in order, logging and skipping errors.
+#[async_trait]
+pub trait ToolHooks: Send + Sync {
     /// After argument validation, in source order. An `Err` blocks the call.
     async fn before_tool_call(
         &self,
@@ -204,21 +169,9 @@ pub trait LoopHooks: Send + Sync {
     ) -> Result<Option<AfterToolCallResult>, ToolError> {
         Ok(None)
     }
-
-    /// Host-supplied steering messages, drained after the agent's own steering queue at
-    /// each steering drain point.
-    async fn steering(&self) -> Vec<QueuedMessage> {
-        Vec::new()
-    }
-
-    /// Host-supplied follow-up messages, drained after the agent's own follow-up queue
-    /// when the run would otherwise end.
-    async fn follow_up(&self) -> Vec<QueuedMessage> {
-        Vec::new()
-    }
 }
 
-/// Hooks with every default: no transforms, `Custom` messages dropped.
+/// Hooks with every default: `Custom` messages dropped.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoHooks;
 

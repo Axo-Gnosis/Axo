@@ -109,20 +109,18 @@ fn project_settings_respect_the_trust_boundary() {
 
     let read = source.load(ProjectAccess::Read).unwrap();
     assert_eq!(read.project.access, ProjectAccess::Read);
-    assert_eq!(read.bash.dev_shell, DevShellMode::Direnv);
-    assert_eq!(read.default_model.as_deref(), Some("zebes/qwen"));
+    assert_eq!(read.bash.dev_shell, DevShellMode::Off);
+    assert_eq!(read.default_model.as_deref(), Some("!echo evil/model"));
 
     let trusted = source.load(ProjectAccess::Trust).unwrap();
     assert_eq!(trusted.project.access, ProjectAccess::Read);
     assert_eq!(trusted.bash.dev_shell, DevShellMode::Nix);
-    assert_eq!(
+    assert!(
         source
             .resolve(ProjectAccess::Trust)
             .unwrap()
             .default_model()
-            .unwrap()
-            .as_deref(),
-        Some("evil/model")
+            .is_err()
     );
 
     // Filtering must also happen when there are no user settings to merge with.
@@ -130,14 +128,17 @@ fn project_settings_respect_the_trust_boundary() {
     let read = source.load(ProjectAccess::Read).unwrap();
     assert_eq!(read.project.access, ProjectAccess::Read);
     assert_eq!(read.bash.dev_shell, DevShellMode::Off);
-    assert_eq!(read.default_model, None);
+    assert_eq!(read.default_model.as_deref(), Some("!echo evil/model"));
 
-    // A rejected command must not run, even before its value is discarded.
-    source.set_project_settings(Some(r#"{ "defaultModel": "!exit 1" }"#));
-    assert_eq!(
-        source.load(ProjectAccess::Read).unwrap().default_model,
-        None
-    );
+    // User dev shells are disabled too, even when the project supplies other bash settings.
+    source.set_user(Some(r#"{ "bash": { "devShell": "direnv" } }"#));
+    source.set_project_settings(Some(r#"{ "bash": { "ci": false } }"#));
+    for access in [ProjectAccess::Read, ProjectAccess::Ignore] {
+        assert_eq!(
+            source.load(access).unwrap().bash.dev_shell,
+            DevShellMode::Off
+        );
+    }
 }
 
 #[test]
@@ -303,7 +304,7 @@ fn invalid_settings_are_attributed_to_their_own_layer_before_merging() {
     );
     assert_eq!(origin_of(source.load(ProjectAccess::Trust)), "user");
 
-    // Invalid even though `bash.devShell` would be stripped below trust.
+    // Invalid even though `bash.devShell` would resolve to off below trust.
     source.set_user(Some("{}"));
     source.set_project_settings(Some(r#"{ "bash": { "devShell": "auto" } }"#));
     assert_eq!(origin_of(source.load(ProjectAccess::Read)), "project");
@@ -395,8 +396,18 @@ fn invalid_compaction_settings_are_attributed_before_merge() {
 #[test]
 fn objects_merge_key_by_key_and_arrays_replace() {
     let settings = load(
-        Some(r#"{ "bash": { "devShellWatch": ["a"], "devShellRef": ".#user", "ci": false } }"#),
-        Some(r#"{ "bash": { "devShellWatch": ["b"], "devShellTimeoutMs": 5 } }"#),
+        Some(
+            r#"{
+                "bash": { "devShellWatch": ["a"], "devShellRef": ".#user", "ci": false },
+                "retry": { "maxRetries": 0, "baseDelayMs": 5 }
+            }"#,
+        ),
+        Some(
+            r#"{
+                "bash": { "devShellWatch": ["b"], "devShellTimeoutMs": 5 },
+                "retry": { "maxDelayMs": 10 }
+            }"#,
+        ),
         ProjectAccess::Read,
     );
     assert_eq!(settings.bash.dev_shell_watch, ["b"]);
@@ -404,6 +415,26 @@ fn objects_merge_key_by_key_and_arrays_replace() {
     assert!(!settings.bash.ci);
     assert_eq!(settings.bash.dev_shell_timeout_ms, 5);
     assert_eq!(settings.bash.dev_shell, DevShellMode::Off);
+    assert_eq!(
+        settings.retry,
+        axo::RetrySettings {
+            max_retries: 0,
+            base_delay_ms: 5,
+            max_delay_ms: 10,
+        }
+    );
+    let partial = load(
+        Some(r#"{"retry": {"maxRetries": 0}}"#),
+        None,
+        ProjectAccess::Read,
+    );
+    assert_eq!(
+        partial.retry,
+        axo::RetrySettings {
+            max_retries: 0,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -478,4 +509,11 @@ fn default_model_expands_environment_variables() {
         .default_model()
         .unwrap();
     assert_eq!(model, Some(path));
+    for access in [ProjectAccess::Read, ProjectAccess::Trust] {
+        let config = TestConfig::new(None, Some(r#"{ "defaultModel": "!exit 1" }"#))
+            .resolve(access)
+            .unwrap();
+        assert_eq!(config.settings.default_model.as_deref(), Some("!exit 1"));
+        assert!(config.default_model().is_err());
+    }
 }

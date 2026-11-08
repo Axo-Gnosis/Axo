@@ -316,6 +316,32 @@ pub enum Entry {
 }
 
 impl Entry {
+    /// Whether appending this entry must complete durable storage before returning.
+    pub fn requires_sync(&self) -> bool {
+        match self {
+            Entry::RunStart { .. }
+            | Entry::RunEnd { .. }
+            | Entry::JobStart { .. }
+            | Entry::JobEnd { .. } => true,
+            Entry::Message {
+                admitted_jobs,
+                delivered_jobs,
+                ..
+            } => !admitted_jobs.is_empty() || !delivered_jobs.is_empty(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn rewrites_context(&self) -> bool {
+        matches!(
+            self,
+            Entry::Leaf { .. }
+                | Entry::ContextEdit { .. }
+                | Entry::Compaction { .. }
+                | Entry::BranchSummary { .. }
+        )
+    }
+
     /// The shared fields; `None` for [`Entry::Unknown`].
     pub fn base(&self) -> Option<&EntryBase> {
         match self {

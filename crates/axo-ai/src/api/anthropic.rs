@@ -5,30 +5,29 @@
 //! `long`/`none` cache retentions (axo always uses Anthropic's default 5-minute cache).
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
-use futures::channel::mpsc;
-use futures::stream::{self, BoxStream};
-use futures::{FutureExt, StreamExt, future};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use futures::stream::BoxStream;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{RetryPolicy, error_body, send_with_retry};
-use crate::api::sse::{SseDecoder, SseEvent};
-use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions};
+use crate::api::http::{read_sse, send};
+use crate::api::sse::SseEvent;
+use crate::api::{ABORTED, Api, Reply, SimpleStreamOptions, StreamOptions, header_map, respond};
 use crate::cost::calculate_cost;
-use crate::error::Error;
-use crate::estimate::{CONTEXT_SAFETY_TOKENS, estimate_context_tokens};
+use crate::estimate::clamp_max_tokens_to_context;
 use crate::event::AssistantEvent;
-use crate::json::{parse_streaming, parse_tool_arguments, parse_with_repair};
+use crate::json::{parse_tool_arguments, parse_with_repair};
 use crate::model::{ApiKind, Model, SessionAffinityFormat};
+use crate::thinking::{MIN_ANSWER_TOKENS, default_thinking_budget};
 use crate::transcript::{
     Transcript, current_tools, render_system_message_update, system_message_text,
 };
-use crate::transform::split_error_tool_result_images;
+use crate::transform::replace_images;
 use crate::types::{
-    AssistantBlock, AssistantMessage, Message, ReasoningReplay, StopReason, ThinkingLevel,
-    ToolCall, ToolSpec, Usage, UserBlock,
+    AssistantBlock, Message, ReasoningReplay, StopReason, ThinkingLevel, ToolCall,
+    ToolResultMessage, ToolSpec, Usage, UserBlock,
 };
 
 const API_VERSION: &str = "2023-06-01";
@@ -49,11 +48,6 @@ const ANTHROPIC_MESSAGE_EVENTS: [&str; 6] = [
 ];
 const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// Tokens always left for the answer when a thinking budget shares the response ceiling.
-const MIN_ANSWER_TOKENS: u64 = 1024;
-
-type Emit<'a> = &'a (dyn Fn(AssistantEvent) + Send + Sync);
-
 /// Streams Anthropic Messages responses (`POST {base}/v1/messages`).
 pub struct AnthropicApi {
     http: reqwest::Client,
@@ -73,57 +67,12 @@ impl Api for AnthropicApi {
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
-        let (tx, rx) = mpsc::unbounded();
         let http = self.http.clone();
-        let model = model.clone();
-        let driver = async move {
-            let emit = |event: AssistantEvent| {
-                // The receiver only goes away when the caller dropped the stream.
-                let _ = tx.unbounded_send(event);
-            };
-            let mut output = AssistantMessage::empty(&model);
-            let terminal = match run(
-                &http,
-                &model,
-                &transcript,
-                &opts,
-                &cancel,
-                &mut output,
-                &emit,
-            )
-            .await
-            {
-                Ok(reason) => {
-                    output.stop_reason = reason;
-                    AssistantEvent::Done {
-                        reason,
-                        message: output,
-                    }
-                }
-                Err(message) => {
-                    let reason = if cancel.is_cancelled() {
-                        StopReason::Aborted
-                    } else {
-                        StopReason::Error
-                    };
-                    output.stop_reason = reason;
-                    output.error_message = Some(message);
-                    AssistantEvent::Error {
-                        reason,
-                        message: output,
-                    }
-                }
-            };
-            emit(terminal);
-        };
-        // The driver runs as the stream is polled; `rx` ends when the driver drops `tx`.
-        stream::select(
-            rx,
-            driver
-                .into_stream()
-                .filter_map(|()| future::ready(None::<AssistantEvent>)),
-        )
-        .boxed()
+        let owned_model = model.clone();
+        respond(model, cancel, move |mut reply, cancel| async move {
+            let result = run(&http, &owned_model, &transcript, &opts, &cancel, &mut reply).await;
+            (reply, result)
+        })
     }
 }
 
@@ -164,7 +113,7 @@ impl AnthropicCompat {
 /// pi `AnthropicOptions` as `streamSimple` fills them.
 struct RequestOptions {
     max_tokens: u64,
-    temperature: Option<f32>,
+    temperature: Option<f64>,
     tool_choice: Option<crate::ToolChoice>,
     thinking_enabled: bool,
     thinking_budget_tokens: Option<u64>,
@@ -218,12 +167,7 @@ fn request_options(
     }
 
     // pi `adjustMaxTokensForThinking` with the default budgets (xhigh/max clamp to high).
-    let mut budget: u64 = match level {
-        ThinkingLevel::Minimal => 1024,
-        ThinkingLevel::Low => 2048,
-        ThinkingLevel::Medium => 8192,
-        _ => 16384,
-    };
+    let mut budget = default_thinking_budget(level);
     let adjusted = (base.max_tokens + budget).min(model.max_tokens);
     if adjusted <= budget {
         budget = budget.min(adjusted.saturating_sub(MIN_ANSWER_TOKENS));
@@ -237,64 +181,24 @@ fn request_options(
     }
 }
 
-/// pi `clampMaxTokensToContext`: leave the estimated context plus a safety margin free.
-fn clamp_max_tokens_to_context(model: &Model, messages: &[Message], max_tokens: u64) -> u64 {
-    if model.context_window == 0 {
-        return max_tokens.max(1);
-    }
-    let available = model.context_window as i64
-        - estimate_context_tokens(messages) as i64
-        - CONTEXT_SAFETY_TOKENS;
-    max_tokens.min(available.max(1) as u64)
-}
-
 /// One request, from building the body to the last SSE event. Returns the stop reason
-/// for `Done`, or the error message for `Error`; `output` keeps the partial content.
+/// or error message; `reply` keeps the partial content.
 async fn run(
     http: &reqwest::Client,
     model: &Model,
     transcript: &Transcript,
     opts: &StreamOptions,
     cancel: &CancellationToken,
-    output: &mut AssistantMessage,
-    emit: Emit<'_>,
+    reply: &mut Reply,
 ) -> Result<StopReason, String> {
-    let api_key = opts
-        .simple
-        .api_key
-        .as_deref()
-        .or(opts.auth.api_key.as_deref())
-        .filter(|key| !key.is_empty());
-    let has_auth_header = opts
-        .auth
-        .headers
-        .iter()
-        .map(|(name, value)| (name, Some(value)))
-        .chain(
-            opts.simple
-                .headers
-                .iter()
-                .map(|(name, value)| (name, value.as_ref())),
-        )
-        .any(|(name, value)| {
-            ["authorization", "x-api-key", "cf-aig-authorization"]
-                .iter()
-                .any(|auth| name.eq_ignore_ascii_case(auth))
-                && value.is_some_and(|value| !value.trim().is_empty())
-        });
-    if api_key.is_none() && !has_auth_header {
-        return Err(Error::NoApiKey {
-            provider: model.provider.clone(),
-        }
-        .to_string());
-    }
+    let api_key = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
 
     let compat = AnthropicCompat::of(model);
     let options = request_options(model, transcript, &opts.simple);
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
     let built = build_params(model, &resolved, &compat, &options);
     if built.provider_thinking_level.is_some() {
-        output.provider_thinking_level = built.provider_thinking_level;
+        reply.message.provider_thinking_level = built.provider_thinking_level;
     }
     let betas = beta_features(
         model,
@@ -304,52 +208,27 @@ async fn run(
         &options,
         built.native_tool_changes,
     );
-    let headers = request_headers(model, opts, &compat, api_key, &betas)?;
-    let base_url = opts
-        .auth
-        .base_url
-        .as_deref()
-        .unwrap_or(&model.base_url)
-        .trim_end_matches('/');
-    let url = format!("{base_url}/v1/messages?beta=true");
+    let headers = request_headers(opts, &compat, api_key, &betas)?;
+    let url = format!("{}/v1/messages?beta=true", opts.base_url(model));
     let body = serde_json::to_string(&built.params).map_err(|error| error.to_string())?;
 
     // ponytail: the body is copied per attempt; switch to `bytes::Bytes` if large
     // transcripts make this show up.
-    let mut response = send_with_retry(
+    let response = send(
         || http.post(&url).headers(headers.clone()).body(body.clone()),
-        &RetryPolicy::default(),
         cancel,
+        reply,
+        error_response_message,
     )
-    .await
-    .map_err(|error| match error {
-        Error::Aborted => ABORTED.to_owned(),
-        error => error.to_string(),
-    })?;
-    if !response.status().is_success() {
-        output.failure = Some(super::http::response_failure(&response));
-        return Err(error_response_message(response, cancel, output).await);
-    }
-    emit(AssistantEvent::Start {
-        partial: output.clone(),
-    });
+    .await?;
+    reply.start();
 
-    let mut decoder = SseDecoder::new();
     let mut blocks = BlockMapper::default();
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
-            chunk = response.chunk() => chunk.map_err(|error| error.to_string())?,
-        };
-        let Some(chunk) = chunk else { break };
-        for sse in decoder.push(&chunk) {
-            blocks.handle(sse, model, output, emit)?;
-        }
-    }
-    if let Some(sse) = decoder.finish() {
-        blocks.handle(sse, model, output, emit)?;
-    }
+    read_sse(response, cancel, |sse| {
+        blocks.handle(sse, model, reply)?;
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     if blocks.saw_start && !blocks.saw_stop {
         return Err("Anthropic stream ended before message_stop".to_owned());
     }
@@ -357,37 +236,20 @@ async fn run(
     if cancel.is_cancelled() {
         return Err(ABORTED.to_owned());
     }
-    match blocks.stop {
-        None => Err("Anthropic stream ended without a stop reason".to_owned()),
-        Some(StopReason::Error | StopReason::Aborted) => Err(output
-            .error_message
-            .clone()
-            .unwrap_or_else(|| "An unknown error occurred".to_owned())),
-        Some(reason) => Ok(reason),
-    }
+    blocks
+        .stop
+        .ok_or_else(|| "Anthropic stream ended without a stop reason".to_owned())
 }
 
 /// The Anthropic SDK's `APIError` message: `<status> <body message or JSON or text>`.
-async fn error_response_message(
-    response: reqwest::Response,
-    cancel: &CancellationToken,
-    output: &mut AssistantMessage,
-) -> String {
-    let status = response.status().as_u16();
-    let Some(text) = error_body(response, cancel).await else {
-        return ABORTED.to_owned();
-    };
-    let body = serde_json::from_str::<Value>(&text).ok();
-    if let Some(body) = &body {
-        super::http::record_failure(output, body);
-    }
+fn error_response_message(status: u16, text: &str, body: Option<&Value>) -> String {
     let detail = match body {
         Some(body) => match body.get("message") {
             Some(Value::String(message)) => message.clone(),
             Some(message) => message.to_string(),
             None => body.to_string(),
         },
-        None => text,
+        None => text.to_owned(),
     };
     if detail.is_empty() {
         format!("{status} status code (no body)")
@@ -401,8 +263,6 @@ async fn error_response_message(
 struct BlockMapper {
     /// Anthropic `index` of each content block; `None` once the block stopped.
     index: Vec<Option<u64>>,
-    /// Raw tool-call arguments text, by content position.
-    partial_json: Vec<String>,
     /// Stop reason from `message_delta`; `None` is pi's `pending`.
     stop: Option<StopReason>,
     saw_start: bool,
@@ -410,19 +270,14 @@ struct BlockMapper {
 }
 
 impl BlockMapper {
-    fn handle(
-        &mut self,
-        sse: SseEvent,
-        model: &Model,
-        output: &mut AssistantMessage,
-        emit: Emit<'_>,
-    ) -> Result<(), String> {
+    fn handle(&mut self, sse: &SseEvent, model: &Model, reply: &mut Reply) -> Result<(), String> {
+        let output = &mut reply.message;
         let name = sse.event.as_deref().unwrap_or_default();
         if name == "error" {
             if let Ok(body) = serde_json::from_str::<Value>(&sse.data) {
                 super::http::record_failure(output, &body);
             }
-            return Err(sse.data);
+            return Err(sse.data.clone());
         }
         if !ANTHROPIC_MESSAGE_EVENTS.contains(&name) {
             return Ok(());
@@ -464,9 +319,9 @@ impl BlockMapper {
                 );
                 update_cost(model, &mut output.usage);
             }
-            "content_block_start" => self.start_block(&event, output, emit)?,
-            "content_block_delta" => self.delta(&event, output, emit),
-            "content_block_stop" => self.stop_block(&event, output, emit),
+            "content_block_start" => self.start_block(&event, reply)?,
+            "content_block_delta" => self.delta(&event, reply),
+            "content_block_stop" => self.stop_block(&event, reply),
             "message_delta" => {
                 if let Some(reason) = event["delta"]["stop_reason"].as_str() {
                     output.raw_stop_reason = Some(reason.to_owned());
@@ -513,12 +368,8 @@ impl BlockMapper {
             .position(|tracked| *tracked == Some(index))
     }
 
-    fn start_block(
-        &mut self,
-        event: &Value,
-        output: &mut AssistantMessage,
-        emit: Emit<'_>,
-    ) -> Result<(), String> {
+    fn start_block(&mut self, event: &Value, reply: &mut Reply) -> Result<(), String> {
+        let output = &mut reply.message;
         let block = &event["content_block"];
         let text = |key: &str| block[key].as_str().unwrap_or_default();
         // Text and thinking start empty; initial text arrives as a delta.
@@ -577,33 +428,28 @@ impl BlockMapper {
         };
         output.content.push(new_block);
         self.index.push(event["index"].as_u64());
-        self.partial_json.push(String::new());
-        emit(start);
+        reply.emit(start);
         if !initial.is_empty() {
-            append_text(output, content_index, initial, emit);
+            append_text(reply, content_index, initial);
         }
         Ok(())
     }
 
-    fn delta(&mut self, event: &Value, output: &mut AssistantMessage, emit: Emit<'_>) {
+    fn delta(&mut self, event: &Value, reply: &mut Reply) {
         let Some(content_index) = self.position(event) else {
             return;
         };
         let delta = &event["delta"];
         let text = |key: &str| delta[key].as_str().unwrap_or_default();
         match delta["type"].as_str().unwrap_or_default() {
-            "text_delta" => append_text(output, content_index, text("text"), emit),
-            "thinking_delta" => append_text(output, content_index, text("thinking"), emit),
+            "text_delta" => append_text(reply, content_index, text("text")),
+            "thinking_delta" => append_text(reply, content_index, text("thinking")),
             "input_json_delta" => {
-                if let AssistantBlock::ToolCall(call) = &mut output.content[content_index] {
-                    let part = text("partial_json");
-                    let buffer = &mut self.partial_json[content_index];
-                    buffer.push_str(part);
-                    call.arguments = parse_streaming(buffer);
-                    emit(AssistantEvent::ToolCallDelta {
-                        content_index,
-                        delta: part.to_owned(),
-                    });
+                if matches!(
+                    &reply.message.content[content_index],
+                    AssistantBlock::ToolCall(_)
+                ) {
+                    reply.push_tool_args(content_index, text("partial_json"));
                 }
             }
             // The signature accumulates silently; it surfaces in `ThinkingEnd`.
@@ -612,7 +458,7 @@ impl BlockMapper {
                     replay,
                     redacted: false,
                     ..
-                } = &mut output.content[content_index]
+                } = &mut reply.message.content[content_index]
                 {
                     let part = text("signature");
                     match replay {
@@ -627,39 +473,25 @@ impl BlockMapper {
         }
     }
 
-    fn stop_block(&mut self, event: &Value, output: &mut AssistantMessage, emit: Emit<'_>) {
+    fn stop_block(&mut self, event: &Value, reply: &mut Reply) {
         let Some(content_index) = self.position(event) else {
             return;
         };
         self.index[content_index] = None;
-        if let AssistantBlock::ToolCall(call) = &mut output.content[content_index] {
-            let json = std::mem::take(&mut self.partial_json[content_index]);
-            // No streamed arguments: keep the `input` the block started with.
-            if !json.is_empty() {
-                (call.arguments, call.arguments_error) = parse_tool_arguments(&json);
-            }
+        let json = reply.take_tool_args(content_index);
+        // No streamed arguments: keep the `input` the block started with.
+        if !json.is_empty()
+            && let AssistantBlock::ToolCall(call) = &mut reply.message.content[content_index]
+        {
+            (call.arguments, call.arguments_error) = parse_tool_arguments(&json);
         }
-        let block = output.content[content_index].clone();
-        emit(match block {
-            AssistantBlock::Text { .. } => AssistantEvent::TextEnd {
-                content_index,
-                block,
-            },
-            AssistantBlock::Thinking { .. } => AssistantEvent::ThinkingEnd {
-                content_index,
-                block,
-            },
-            AssistantBlock::ToolCall(_) => AssistantEvent::ToolCallEnd {
-                content_index,
-                block,
-            },
-        });
+        reply.end_block(content_index);
     }
 }
 
 /// Grow a text or thinking block and emit the matching delta.
-fn append_text(output: &mut AssistantMessage, content_index: usize, delta: &str, emit: Emit<'_>) {
-    let event = match &mut output.content[content_index] {
+fn append_text(reply: &mut Reply, content_index: usize, delta: &str) {
+    let event = match &mut reply.message.content[content_index] {
         AssistantBlock::Text { text, .. } => {
             text.push_str(delta);
             AssistantEvent::TextDelta {
@@ -676,7 +508,7 @@ fn append_text(output: &mut AssistantMessage, content_index: usize, delta: &str,
         }
         AssistantBlock::ToolCall(_) => return,
     };
-    emit(event);
+    reply.emit(event);
 }
 
 /// Anthropic reports no total; it is the sum of the parts. Priced after every update.
@@ -782,13 +614,7 @@ fn build_params(
         && !mid_convo_effort
         && compat.temperature
     {
-        // Through the shortest decimal form, so 0.7f32 is sent as 0.7.
-        params["temperature"] = json!(
-            temperature
-                .to_string()
-                .parse::<f64>()
-                .unwrap_or(f64::from(temperature))
-        );
+        params["temperature"] = json!(temperature);
     }
 
     let tool_cache_control = compat.cache_control_on_tools.then_some(&cache_control);
@@ -802,7 +628,7 @@ fn build_params(
             tool_cache_control,
         );
         tools.push(json!({
-            "name": "__pi_deferred_placeholder__",
+            "name": "__deferred_placeholder__",
             "description": "Reserved placeholder. Never available. Never call this.",
             "input_schema": { "type": "object", "properties": {}, "required": [] },
             "defer_loading": true,
@@ -852,7 +678,7 @@ fn build_params(
     }
 }
 
-/// pi `getBetaFeatures`: an `anthropic-beta` header in the model or request headers
+/// pi `getBetaFeatures`: an `anthropic-beta` header in the auth or request headers
 /// replaces the computed list (`None` sends none).
 fn beta_features(
     model: &Model,
@@ -862,27 +688,14 @@ fn beta_features(
     options: &RequestOptions,
     native_tool_changes: bool,
 ) -> Vec<String> {
-    let configured = model
-        .headers
-        .iter()
-        .chain(&opts.auth.headers)
-        .map(|(name, value)| (name, Some(value)))
-        .chain(
-            opts.simple
-                .headers
-                .iter()
-                .map(|(name, value)| (name, value.as_ref())),
-        )
-        .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
-        .map(|(_, value)| value)
-        .next_back();
+    let configured = opts.configured_headers();
     let mut features: Vec<String> = Vec::new();
     let mut add = |feature: &str| {
         if !features.iter().any(|existing| existing == feature) {
             features.push(feature.to_owned());
         }
     };
-    match configured {
+    match configured.get("anthropic-beta") {
         Some(None) => {}
         Some(Some(value)) => value
             .split(',')
@@ -912,29 +725,24 @@ fn beta_features(
 }
 
 /// Headers in the SDK's merge order: API defaults and key, then pi's defaults,
-/// session affinity, model headers, auth headers and request headers (`None` deletes),
+/// session affinity, auth headers and request headers (`None` deletes),
 /// then the body type and the beta list.
 fn request_headers(
-    model: &Model,
     opts: &StreamOptions,
     compat: &AnthropicCompat,
     api_key: Option<&str>,
     betas: &[String],
 ) -> Result<HeaderMap, String> {
-    let user_agent = format!(
-        "axo/{} ({}; {})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
-    let mut layers: Vec<(&str, Option<&str>)> = vec![("anthropic-version", Some(API_VERSION))];
+    let mut prefix = vec![("anthropic-version".to_owned(), Some(API_VERSION.to_owned()))];
     if let Some(key) = api_key {
-        layers.push(("x-api-key", Some(key)));
+        prefix.push(("x-api-key".to_owned(), Some(key.to_owned())));
     }
-    layers.extend([
-        ("user-agent", Some(user_agent.as_str())),
-        ("accept", Some("application/json")),
-        ("anthropic-dangerous-direct-browser-access", Some("true")),
+    prefix.extend([
+        ("accept".to_owned(), Some("application/json".to_owned())),
+        (
+            "anthropic-dangerous-direct-browser-access".to_owned(),
+            Some("true".to_owned()),
+        ),
     ]);
     if let Some(session_id) = &opts.simple.session_id
         && compat.send_session_affinity_headers
@@ -943,44 +751,23 @@ fn request_headers(
             Some(SessionAffinityFormat::Openrouter) => "x-session-id",
             _ => "x-session-affinity",
         };
-        layers.push((name, Some(session_id.as_str())));
+        prefix.push((name.to_owned(), Some(session_id.clone())));
     }
-    layers.extend(
-        model
-            .headers
-            .iter()
-            .chain(&opts.auth.headers)
-            .map(|(name, value)| (name.as_str(), Some(value.as_str()))),
-    );
-    layers.extend(
-        opts.simple
-            .headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_deref())),
-    );
     let betas = betas.join(",");
-    layers.push(("content-type", Some("application/json")));
-    layers.push((
-        "anthropic-beta",
-        (!betas.is_empty()).then_some(betas.as_str()),
-    ));
-
-    let mut headers = HeaderMap::new();
-    for (name, value) in layers {
-        let header = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| format!("Invalid header name: {name}"))?;
-        match value {
-            Some(value) => {
-                let value = HeaderValue::from_str(value)
-                    .map_err(|_| format!("Invalid value for header: {name}"))?;
-                headers.insert(header, value);
-            }
-            None => {
-                headers.remove(header);
-            }
-        }
-    }
-    Ok(headers)
+    let suffix = [
+        (
+            "content-type".to_owned(),
+            Some("application/json".to_owned()),
+        ),
+        (
+            "anthropic-beta".to_owned(),
+            (!betas.is_empty()).then_some(betas),
+        ),
+    ];
+    header_map([prefix
+        .into_iter()
+        .chain(opts.configured_headers())
+        .chain(suffix)])
 }
 
 /// pi `convertTools` for tools without constrained sampling.
@@ -1029,10 +816,7 @@ fn convert_content_blocks(content: &[UserBlock]) -> Value {
         return Value::String(
             content
                 .iter()
-                .filter_map(|block| match block {
-                    UserBlock::Text { text } => Some(text.as_str()),
-                    UserBlock::Image { .. } => None,
-                })
+                .filter_map(UserBlock::as_text)
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
@@ -1046,6 +830,36 @@ fn convert_content_blocks(content: &[UserBlock]) -> Value {
     }
     blocks.extend(content.iter().map(user_block));
     Value::Array(blocks)
+}
+
+/// An error tool result split into a text-only result and images sent after the results.
+struct SplitErrorToolResult {
+    content: Vec<UserBlock>,
+    caption: String,
+    images: Vec<UserBlock>,
+}
+
+fn split_error_tool_result_images(message: &ToolResultMessage) -> Option<SplitErrorToolResult> {
+    if !message.is_error {
+        return None;
+    }
+    let images: Vec<UserBlock> = message
+        .content
+        .iter()
+        .filter(|block| matches!(block, UserBlock::Image { .. }))
+        .cloned()
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+    Some(SplitErrorToolResult {
+        content: replace_images(&message.content, "(image attached after the tool results)"),
+        caption: format!(
+            "Images from the error result of tool call {} ({}):",
+            message.tool_call_id, message.tool_name
+        ),
+        images,
+    })
 }
 
 /// Port of pi `convertMessages`. Returns the wire messages and, for managed-effort
@@ -1103,7 +917,7 @@ fn convert_messages(
                 let blocks: Vec<Value> = user
                     .content
                     .iter()
-                    .filter(|block| !matches!(block, UserBlock::Text { text } if text.trim().is_empty()))
+                    .filter(|block| !block.as_text().is_some_and(|text| text.trim().is_empty()))
                     .map(user_block)
                     .collect();
                 if !blocks.is_empty() {

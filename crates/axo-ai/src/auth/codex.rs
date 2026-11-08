@@ -29,6 +29,8 @@ const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 const ORIGINATOR: &str = "axo";
 /// The provider id credentials are stored under.
 pub const PROVIDER: &str = "openai-codex";
+/// The ChatGPT backend serving Codex models.
+pub const BASE_URL: &str = "https://chatgpt.com/backend-api";
 const PROVIDER_NAME: &str = "OpenAI";
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15); // pi DEFAULT_OAUTH_REFRESH_TIMEOUT_MS
 
@@ -39,6 +41,7 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(15); // pi DEFAULT_OAUTH_R
 /// `None` means no manual input will come. When port 1455 is taken (it is shared with the Codex
 /// CLI) only `manual` is used.
 pub async fn login(
+    http: &reqwest::Client,
     store: &dyn CredentialStore,
     on_url: &(dyn Fn(&str) + Send + Sync),
     manual: impl Future<Output = Option<String>> + Send,
@@ -77,13 +80,13 @@ pub async fn login(
         Some(listener) => {
             let mut callback = pin!(wait_for_callback(listener, &state));
             let input = tokio::select! {
-                code = &mut callback => return exchange_and_store(store, &code?, &verifier).await,
+                code = &mut callback => return exchange_and_store(http, store, &code?, &verifier).await,
                 input = manual => input,
             };
             match input {
                 Some(input) => input,
                 // No manual input will arrive: keep waiting for the browser.
-                None => return exchange_and_store(store, &callback.await?, &verifier).await,
+                None => return exchange_and_store(http, store, &callback.await?, &verifier).await,
             }
         }
         None => manual.await.unwrap_or_default(),
@@ -93,7 +96,7 @@ pub async fn login(
         return Err(Error::Auth("State mismatch".into()));
     }
     let code = code.ok_or_else(|| Error::Auth("Missing authorization code".into()))?;
-    exchange_and_store(store, &code, &verifier).await
+    exchange_and_store(http, store, &code, &verifier).await
 }
 
 /// Refreshes an OpenAI Codex access token; the result carries the rotated refresh token.
@@ -114,13 +117,13 @@ pub async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Cred
 }
 
 async fn exchange_and_store(
+    http: &reqwest::Client,
     store: &dyn CredentialStore,
     code: &str,
     verifier: &str,
 ) -> Result<(), Error> {
-    let http = crate::api::http::client();
     let response = token_request(
-        &http,
+        http,
         &[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
@@ -148,7 +151,7 @@ fn token_request(http: &reqwest::Client, params: &[(&str, &str)]) -> reqwest::Re
         .body(body)
 }
 
-/// Reads a token response into a credential carrying the ChatGPT `accountId`.
+/// Reads a token response into a credential with a validated ChatGPT `accountId`.
 async fn credential_from_response(
     response: reqwest::Response,
     operation: &str,
@@ -182,19 +185,8 @@ async fn credential_from_response(
     };
     let expires = now_ms() + (expires_in * 1000.0) as i64;
 
-    let segments: Vec<&str> = access.split('.').collect();
-    let account_id = match segments.as_slice() {
-        [_, payload, _] => URL_SAFE_PAD_INDIFFERENT.decode(payload).ok(),
-        _ => None,
-    }
-    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-    .and_then(|claims| {
-        claims[JWT_CLAIM_PATH]["chatgpt_account_id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-    })
-    .ok_or_else(|| Error::Auth("Failed to extract accountId from token".into()))?;
+    let account_id = account_id(access)
+        .ok_or_else(|| Error::Auth("Failed to extract accountId from token".into()))?;
 
     Ok(Credential::Oauth {
         access: access.to_owned(),
@@ -202,6 +194,23 @@ async fn credential_from_response(
         expires,
         extra: Map::from_iter([("accountId".to_owned(), Value::String(account_id))]),
     })
+}
+
+/// The ChatGPT account id claim of the access token (a JWT).
+pub(crate) fn account_id(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let payload = URL_SAFE_PAD_INDIFFERENT.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    claims[JWT_CLAIM_PATH]["chatgpt_account_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 /// Splits pasted login input into `(code, state)`: a full redirect URL, `code#state`, a query

@@ -30,10 +30,10 @@ An error from either method fails that `create_session`, `open_session`, or `sch
 2. **Validate the user settings on their own:** `None` or `null` is no settings; a non-object is `Error::Config { origin, message: "expected a JSON object" }`; a value that does not deserialize as `Settings` is `Error::Config` with the layer's `origin` and the deserializer's message. The valid object is merged over the defaults.
 3. **Validate the user prompt overrides:** a name outside `PROMPT_NAMES` is `Error::Config` with that override's `origin` and the message `unknown prompt override "<name>"`; texts are trimmed.
 4. **Derive access:** an explicit `access` wins; otherwise the `project` policy of this same user sample decides via `ProjectSettings::access_for(project_root(cwd))` (see [Project access](#project-access-project--axoprojectsettings)). A project layer can never raise its own access.
-5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project` and `homeAgentsDir`; below `Trust` also strip `bash.devShell` and a `defaultModel` starting with `!`. Each stripped key logs a `tracing` warning carrying the layer's `origin`. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project settings or prompt overrides apply.
-6. **Deserialize the merged object** into `Settings`; an error is attributed to the last applied origin (the project's when project settings were merged, else the user's).
+5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project` and `homeAgentsDir`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project settings or prompt overrides apply.
+6. **Deserialize the merged object** into `Settings`; an error is attributed to the last applied origin (the project's when project settings were merged, else the user's). Below `Trust`, any enabled `bash.devShell` resolves to `"off"`, regardless of which layer enabled it, with one warning naming that setting's winning origin.
 
-`defaultModel` is not resolved here: `EffectiveConfig::default_model` runs its `!command` or expands its `$VAR` at model selection, only when neither `SessionOptions::model` nor the session's recorded model selects one (see [Config values](#config-values)). Filtering already happened in step 5, so a stripped project `!command` never executes.
+`defaultModel` is not resolved here: `EffectiveConfig::default_model` expands its `$VAR` at model selection and rejects values starting with `!`, only when neither `SessionOptions::model` nor the session's recorded model selects one (see [Config values](#config-values)).
 
 Unknown keys are ignored in every layer.
 
@@ -46,7 +46,7 @@ Unknown keys are ignored in every layer.
 
 ### Trust boundary
 
-Hosts are trusted integration code; project layers are untrusted data. axo enforces the rules above on whatever `ConfigSource::project` returns: it never calls `project` at `Ignore`, never lets a project layer set user-only keys or its own access, and below `Trust` never lets it set what runs code. A user layer is host-trusted, so its `!command` `defaultModel` runs. I/O the host performs before or while producing a layer (for example reading a project file inside `user`, or computing `project` eagerly) is outside axo's guarantee: a host that must not touch an ignored project must not read it on its own.
+Hosts are trusted integration code; project layers are untrusted data. axo enforces the rules above on whatever `ConfigSource::project` returns: it never calls `project` at `Ignore`, never lets a project layer set user-only keys or its own access, and below `Trust` resolves `bash.devShell` to `"off"` even when enabled in user settings. Config values starting with `!` are rejected at every access level; they never run code. I/O the host performs before or while producing a layer (for example reading a project file inside `user`, or computing `project` eagerly) is outside axo's guarantee: a host that must not touch an ignored project must not read it on its own.
 
 ### Absent inputs
 
@@ -60,7 +60,7 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 
 | Resource | Supplied through | How axo uses it |
 | :--- | :--- | :--- |
-| Models and credentials | `Axo::builder(models, ..)` with an `Arc<Models>` | The host builds `Models` with `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials })`; see [Models & Credentials](#models-axo_aimodelsconfig--credentials) |
+| Models and credentials | `Axo::builder(models, ..)` with an `Arc<Models>` | The host builds `Models` with `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials, http_client })`; see [Models & Credentials](#models-axo_aimodelsconfig--credentials) |
 | Session store | `Axo::builder(.., store)` with an `Arc<dyn SessionStore>` | `JsonlStore::new(root)` writes `<root>/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`, per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` (`local://<path>`): model scratch files and content handed over in prompts (see [Prompt Parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs)). Forks copy both directories |
 | Cache directory | `AxoBuilder::cache_dir(PathBuf)` | Bundled documentation materialized under `<cache_dir>/docs/` (the `docs` section and `axo://` URLs) and captured Nix dev-shell environments under `<cache_dir>/devshell/`. The `models.dev` catalog cache is separate: it lives wherever the host points `ModelsOptions::cache_dir` |
 | User skills and context files | `UserConfig::skill_roots`, `UserConfig::context_files` | Skill roots (`<root>/<skill>/SKILL.md`) and user-wide instruction files, in the order given |
@@ -101,7 +101,8 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
     "devShellRef": ".#default",
     "devShellWatch": [],
     "devShellTimeoutMs": 600000,
-    "ci": true
+    "ci": true,
+    "promoteAfterMs": 60000
   },
   "ask": {
     "timeoutMs": null
@@ -112,6 +113,11 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
     "reserveTokens": null,
     "keepRecentTokens": null,
     "summaryRequest": "live"
+  },
+  "retry": {
+    "maxRetries": 3,
+    "baseDelayMs": 2000,
+    "maxDelayMs": 60000
   },
   "project": {
     "files": {
@@ -131,7 +137,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 
 | Key | Rust field | Default | Scope | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `defaultModel` | `default_model` | `None` | User or project | Model selector `provider/id` (the ID may itself contain `/`); a bare ID is not looked up. Accepts `$ENV` and `!command` (see [Config values](#config-values)); resolved by `EffectiveConfig::default_model` only when a session falls back to it, and only when starting with `!` or referencing `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged); a `!command` in project settings requires `ProjectAccess::Trust` |
+| `defaultModel` | `default_model` | `None` | User or project | Model selector `provider/id` (the ID may itself contain `/`); a bare ID is not looked up. Accepts `$ENV` (see [Config values](#config-values)); resolved by `EffectiveConfig::default_model` only when a session falls back to it and references `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged). Values starting with `!` are rejected when selected |
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |
 | `steeringMode` | `steering_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
@@ -150,9 +156,9 @@ The `project` block is **user-only**: it is honored only in the user layer. In a
 
 | `ProjectAccess` | Effect |
 | :--- | :--- |
-| `Ignore` (`"ignore"`) | `ConfigSource::project` is not called. Loads no project settings, prompt overrides, context files, or skills |
-| `Read` (`"read"`) | Applies the project layer's safe settings and its prompt overrides, and loads enabled markdown context files and skills; strips `bash.devShell` and `!command` `defaultModel` from project settings with a warning. Dev shells remain disabled even if enabled in user settings |
-| `Trust` (`"trust"`) | Permits all project settings, including `!command` `defaultModel`, and lets `bash.devShell` take effect regardless of which layer enabled it |
+| `Ignore` (`"ignore"`) | `ConfigSource::project` is not called. Loads no project settings, prompt overrides, context files, or skills; `bash.devShell` resolves to `"off"` |
+| `Read` (`"read"`) | Applies project settings and prompt overrides, and loads enabled markdown context files and skills. Below `Trust`, `bash.devShell` resolves to `"off"` with a warning naming the winning origin, even if enabled in user settings |
+| `Trust` (`"trust"`) | Permits project settings and lets `bash.devShell` take effect regardless of which layer enabled it. Config values starting with `!` remain unsupported |
 
 A Rust host can override the resolved access level per session via `SessionOptions::project_access`; it takes precedence over the user policy.
 
@@ -165,10 +171,11 @@ A Rust host can override the resolved access level per session via `SessionOptio
 | `bash.devShellWatch` | `dev_shell_watch` | `[]` | Additional globs relative to the flake root whose mtime/size changes trigger recapture |
 | `bash.devShellTimeoutMs` | `dev_shell_timeout_ms` | `600000` | Timeout in milliseconds for `nix print-dev-env` or `direnv export json` |
 | `bash.ci` | `ci` | `true` | Set `CI=true` in the command environment |
+| `bash.promoteAfterMs` | `promote_after_ms` | `60000` | Promote a still-running command to a background job after this many milliseconds; `0` disables timed promotion, but explicit async execution and pending steering still promote. Applies to `bash` and host tools using `SessionTools::run_command` |
 
 In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<cache_dir>/devshell/<hash>/gcroot` under the host's `AxoBuilder::cache_dir`, where `<hash>` is a 16-hex-digit key of flake dir, ref and system), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
 
-Nix mode needs a cache directory: without `AxoBuilder::cache_dir` it logs `bash.devShell "nix" needs a cache directory (AxoBuilder::cache_dir); using the host environment` and uses `HostEnv`. Direnv mode needs none.
+Nix mode needs a cache directory: without `AxoBuilder::cache_dir` it logs `bash.devShell "nix" needs a cache directory (AxoBuilder::cache_dir); using the host environment` and uses `StaticEnv` with the host environment snapshot. Direnv mode needs none.
 
 In `DevShellMode::Direnv`, `DevShellEnv` searches for the nearest `.envrc` from `cwd` up to the filesystem root `/` and executes `direnv export json` bounded by `devShellTimeoutMs`. An unallowed or failing `.envrc`, or a missing `direnv` executable, falls back silently to the host environment. Lookups and exports are cached for 5 s.
 
@@ -193,7 +200,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use axo::store::JsonlStore;
+use axo::JsonlStore;
 use axo::{Axo, Supervision};
 use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 
@@ -208,6 +215,7 @@ fn main() -> ExitCode {
     runtime.block_on(async {
         let state = PathBuf::from("/var/lib/my-host");
         let models = Models::load(ModelsOptions {
+            http_client: None,
             cache_dir: None,
             extended_context: false,
             config: ModelsConfig::default(),
@@ -256,15 +264,25 @@ Hosts that keep the default need no routing at all: `Axo::builder(models, store)
 | `compaction.keepRecentTokens` | `keep_recent_tokens` | `None` | Explicit retained-tail and user-carryover budget; when `null` or omitted, derived (see [Window and trigger math](sessions-and-compaction.md#window-and-trigger-math-limitsresolve)) |
 | `compaction.summaryRequest` | `summary_request` | `"live"` | `SummaryRequest::Live` (`"live"`) or `SummaryRequest::Separate` (`"separate"`) |
 
+### Transient retries (`retry` / `axo::RetrySettings`)
+
+These settings govern both failed turns and summary requests; they do not change the fixed request-level transport retries.
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `retry.maxRetries` | `max_retries` | `3` | Maximum retries after the initial attempt; `0` disables turn and summary retries |
+| `retry.baseDelayMs` | `base_delay_ms` | `2000` | Exponential backoff base in milliseconds, doubled for each retry when no server delay is supplied; an unrepresentable delay stops retrying |
+| `retry.maxDelayMs` | `max_delay_ms` | `60000` | Maximum accepted server-requested delay in milliseconds; a larger hint stops retrying rather than being clamped |
+
+
 ## Models (`axo_ai::ModelsConfig`) & Credentials
 
-The host builds `Models` and passes it to `Axo::builder`; axo never loads models itself. `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials })` combines the built-in catalog, the `models.dev` catalog (cached as `<cache_dir>/models.dev.json` and fetched when needed; `cache_dir: None` runs without the catalog and does no catalog I/O), and the host's `ModelsConfig`. A host that keeps its `ModelsConfig` as JSONC text can parse it with `ModelsConfig::parse_jsonc` (UTF-8 BOM, comments, and trailing commas accepted; empty text is the default config). Its JSON shape:
+The host builds `Models` and passes it to `Axo::builder`; axo never loads models itself. `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials, http_client })` combines the built-in catalog, the `models.dev` catalog (cached as `<cache_dir>/models.dev.json` and fetched when needed; `cache_dir: None` runs without the catalog and does no catalog I/O), and the host's `ModelsConfig`. `ModelsOptions::http_client` optionally supplies the HTTP client shared by catalog fetches, discovery, adapters, and OAuth refresh. Without one, the default client sends `User-Agent: axo/<version>` and has no read or global request timeout; a supplied client's policies take precedence. A host that keeps its `ModelsConfig` as JSONC text can parse it with `ModelsConfig::parse_jsonc` (UTF-8 BOM, comments, and trailing commas accepted; empty text is the default config). Its JSON shape:
 
 ```json
 {
   "providers": {
     "zebes": {
-      "name": "Zebes Local",
       "api": "openai-completions",
       "baseUrl": "http://zebes:8080/v1",
       "apiKey": "local",
@@ -289,15 +307,14 @@ The host builds `Models` and passes it to `Axo::builder`; axo never loads models
 }
 ```
 
-- **`ApiKind` (`api`):** `"anthropic-messages"`, `"openai-completions"`, `"openai-responses"`, or `"openai-codex-responses"`.
+- **`ApiKind` (`api`):** `"anthropic-messages"`, `"openai-completions"`, or `"openai-codex-responses"`.
 - **Auto-discovery:** If a custom `"openai-completions"` provider omits `models` (`None`) and supplies `baseUrl`, `Models::load` queries `<baseUrl>/models` to populate its model list.
 - **Price-tier window caps:** For catalog and built-in models with `cost.tiers`, `ModelsOptions::extended_context` set to `false` caps `context_window` at the lowest `inputTokensAbove` threshold in `cost.tiers`. Models defined in the `ModelsConfig` or patched via `modelOverrides.contextWindow` keep their explicit window. `Models` is built once per host, so this is a host choice, not a settings key.
 - **Credentials (credential store and environment):** `Models` resolves credentials in order:
-  0. An explicit override key passed to `Models::auth`.
-  1. `ProviderConfig::api_key` in the `ModelsConfig` (a [config value](#config-values): `!command`, `$ENV`, or literal).
+  1. `ProviderConfig::api_key` in the `ModelsConfig` (a [config value](#config-values): `$ENV` or literal).
   2. Stored credentials in `ModelsOptions::credentials` (`Credential::ApiKey` or `Credential::Oauth`). `FileCredentialStore::new(path)` keeps them in one JSON file the host names, replaced by rename with mode `0600`; every write, including a Codex OAuth refresh, holds an exclusive lock on the `<path>.lock` sidecar.
   3. The provider's `env` variable names from the models.dev catalog (for example `$ANTHROPIC_API_KEY`).
-  4. Custom providers absent from the catalog may run without an API key.
+  4. Custom providers absent from the catalog may run without an API key, including those using `"anthropic-messages"`. There is no per-request API-key override; `Models::auth(&model)` uses the same provider-owned resolution.
 
 ## Config values
 
@@ -305,7 +322,7 @@ Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of b
 
 | Form | Result |
 | :--- | :--- |
-| `!command` | Runs `bash -c command` and uses its trimmed stdout. Only a leading `!` counts |
+| Leading `!` | Rejected with a config error; axo never executes command config values |
 | `$NAME` / `${NAME}` | Replaced by the environment variable; can appear anywhere in the value (`"Bearer $TOKEN"`) |
 | `$$` / `$!` | A literal `$` / `!` (start a literal value that begins with `!` with `$!`) |
 | anything else | Used as written |
@@ -316,14 +333,14 @@ Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of b
     "zebes": {
       "api": "openai-completions",
       "baseUrl": "http://zebes:8080/v1",
-      "apiKey": "!pass show zebes/api-key",
+      "apiKey": "$ZEBES_API_KEY",
       "headers": { "X-Team": "$ZEBES_TEAM" }
     }
   }
 }
 ```
 
-- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves through `EffectiveConfig::default_model` only when a session create or open falls back to it (no `SessionOptions::model` and no recorded model), after project filtering; `Axo::schemes` never resolves it.
-- **Caching:** each distinct `!command` runs at most once per process; its output (or failure) is reused until the process restarts, so a rotated secret needs a restart.
-- **Failures:** a command that cannot start, exits non-zero, prints nothing, or runs past 10 seconds is a `Config` error, as is an unset or empty environment variable. stdin is closed and stderr is discarded.
-- **Trust:** a `!command` runs code. A project `defaultModel` starting with `!` is stripped below `Trust` (see [Project access](#project-access-project--axoprojectsettings)); the `ModelsConfig` comes only from the trusted host.
+- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves through `EffectiveConfig::default_model` only when a session create or open falls back to it (no `SessionOptions::model` and no recorded model); `Axo::schemes` never resolves it.
+- **No command cache:** config-value resolution performs environment expansion only and caches no command results.
+- **Failures:** a leading `!`, or an unset or empty environment variable, is a config error.
+- **Host-resolved values:** if a host obtains configuration by executing code, it must do so itself before handing the resulting values to axo.

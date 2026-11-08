@@ -1,9 +1,9 @@
 //! Durable sessions: the entry format, the storage seam with its JSONL
 //! default, and context projection.
 
-pub mod entry;
-pub mod jsonl;
-pub mod project;
+mod entry;
+mod jsonl;
+mod project;
 
 use std::path::Path;
 
@@ -14,6 +14,7 @@ pub use entry::{
     RunOutcome, SeqEntry, SessionInfo, SubmissionKind, TIMESTAMP_FORMAT,
 };
 pub use jsonl::JsonlStore;
+pub(crate) use project::path_to;
 pub use project::{ProjectedSource, Projection, project};
 
 use crate::error::Error;
@@ -47,12 +48,10 @@ pub trait SessionStore: Send + Sync {
 #[async_trait]
 pub trait SessionWriter: Send {
     /// Appends one entry and returns it with its sequence number.
+    /// Return only after durable storage for [`Entry::requires_sync`] entries.
     async fn append(&mut self, entry: Entry) -> Result<SeqEntry, Error>;
 
-    /// The session file, `None` until it is lazily created.
-    fn path(&self) -> Option<&Path>;
-
-    /// Where the session file is or will be created; known from `create` on, so a
-    /// session can place its side files (artifacts/ and local/) before the file exists.
-    fn planned_path(&self) -> &Path;
+    /// Where the session file is or will be created; the file may not exist yet.
+    /// Known from `create` on so a session can place its side files before creation.
+    fn path(&self) -> &Path;
 }

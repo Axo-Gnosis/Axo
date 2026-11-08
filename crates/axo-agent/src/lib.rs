@@ -10,14 +10,13 @@ pub mod message;
 mod run;
 pub mod tool;
 
-pub use agent::{Agent, AgentConfig, AgentSnapshot, QueueMode, RunOutcome};
+pub use agent::{Agent, AgentConfig, QueueMode, RunOutcome};
 pub use cancel::CancelReason;
 pub use error::Error;
 pub use event::{AgentEvent, MessageOrigin, Persist, PersistError};
 pub use hooks::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, BeforeToolCallContext, HookError,
-    LoopHooks, NoHooks, PrepareRequestContext, RequestUpdate, ToolCallDecision, TurnContext,
-    TurnDecision, TurnFinish, TurnUpdate,
+    LoopHooks, NoHooks, ToolCallDecision, ToolHooks, TurnContext, TurnFinish,
 };
 pub use message::{AgentMessage, CustomMessage, QueuedMessage, Unanswered, unanswered_calls};
 pub use tool::{

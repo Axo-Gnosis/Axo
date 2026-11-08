@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_agent::{
-    Agent, AgentConfig, AgentEvent, AgentMessage, Tool, ToolContext, ToolError, ToolOutput,
+    Agent, AgentConfig, AgentEvent, AgentMessage, Persist, PersistError, Tool, ToolContext,
+    ToolError, ToolOutput,
 };
 use axo_ai::{
     AssistantBlock, AssistantEvent, FileCredentialStore, JsonMap, Message, Models, ModelsConfig,
@@ -52,6 +53,38 @@ impl Tool for FnTool {
     }
 }
 
+struct Printer;
+
+#[async_trait]
+impl Persist for Printer {
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
+        match event {
+            AgentEvent::TurnStart => println!("[turn]"),
+            AgentEvent::MessageUpdate { event } => match event {
+                AssistantEvent::TextStart { .. } => print!("[text] "),
+                AssistantEvent::TextDelta { delta, .. } => print!("{delta}"),
+                AssistantEvent::TextEnd { .. } => println!(),
+                AssistantEvent::ToolCallEnd {
+                    block: AssistantBlock::ToolCall(call),
+                    ..
+                } => println!("[tool] {} {}", call.name, json!(call.arguments)),
+                _ => {}
+            },
+            AgentEvent::ToolExecutionEnd { name, result, .. } => {
+                let text: Vec<&str> = result
+                    .content
+                    .iter()
+                    .filter_map(UserBlock::as_text)
+                    .collect();
+                println!("[tool-end] {name} {}", text.join(""));
+            }
+            _ => {}
+        }
+        let _ = std::io::stdout().flush();
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -84,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(err.into()),
     };
     let models = Models::load(ModelsOptions {
+        http_client: None,
         cache_dir: Some(dir.join("cache")),
         config,
         extended_context: false,
@@ -123,41 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::new(AgentConfig {
         thinking,
         tools,
+        persist: Some(Arc::new(Printer)),
         ..AgentConfig::new(Arc::new(models), model)
-    });
-
-    let mut events = agent.subscribe();
-    let printer = tokio::spawn(async move {
-        let mut stdout = std::io::stdout();
-        while let Ok(event) = events.recv().await {
-            match event {
-                AgentEvent::TurnStart => println!("[turn]"),
-                AgentEvent::MessageUpdate { event } => match event {
-                    AssistantEvent::TextStart { .. } => print!("[text] "),
-                    AssistantEvent::TextDelta { delta, .. } => print!("{delta}"),
-                    AssistantEvent::TextEnd { .. } => println!(),
-                    AssistantEvent::ToolCallEnd {
-                        block: AssistantBlock::ToolCall(call),
-                        ..
-                    } => println!("[tool] {} {}", call.name, Value::Object(call.arguments)),
-                    _ => {}
-                },
-                AgentEvent::ToolExecutionEnd { name, result, .. } => {
-                    let text: Vec<&str> = result
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            UserBlock::Text { text } => Some(text.as_str()),
-                            UserBlock::Image { .. } => None,
-                        })
-                        .collect();
-                    println!("[tool-end] {name} {}", text.join(""));
-                }
-                AgentEvent::AgentEnd { .. } => break,
-                _ => {}
-            }
-            let _ = stdout.flush();
-        }
     });
 
     let outcome = agent
@@ -171,7 +172,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into(),
         ])
         .await?;
-    printer.await?;
     println!("[run] {outcome:?}");
     Ok(())
 }

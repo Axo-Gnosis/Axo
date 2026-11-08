@@ -2,8 +2,8 @@ mod common;
 
 use std::{path::Path, sync::Arc};
 
-use axo::store::{self, Entry, EntryBase, EntryId, JsonlStore, SessionStore};
 use axo::{Axo, Error, ShakeMode};
+use axo::{Entry, EntryBase, EntryId, JsonlStore, SessionStore};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
 use axo_ai::{AssistantBlock, Message, Model, ScriptedApi, ScriptedTurn, UserBlock, UserMessage};
@@ -31,10 +31,10 @@ async fn harness(
 async fn history(dir: &Path) -> std::path::PathBuf {
     let store = JsonlStore::new(dir.join("sessions"));
     let mut writer = store
-        .create(store::Header::new(options(dir).cwd, None, None))
+        .create(axo::Header::new(options(dir).cwd, None, None))
         .await
         .unwrap();
-    let path = writer.planned_path().to_path_buf();
+    let path = writer.path().to_path_buf();
     writer
         .append(Entry::Message {
             base: EntryBase::new(EntryId::generate(|_| false), None),

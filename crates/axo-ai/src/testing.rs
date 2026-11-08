@@ -13,9 +13,27 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{ABORTED, SimpleStreamOptions, Streamer};
 use crate::event::AssistantEvent;
-use crate::model::{ApiKind, Model};
+use crate::model::{ApiKind, Compat, Cost, InputKind, Model};
 use crate::transcript::Transcript;
 use crate::types::{AssistantBlock, AssistantMessage, StopReason, ToolCall, Usage, now_ms};
+
+/// A keyless model with stable limits for deterministic scripted sessions.
+pub fn scripted_model() -> Model {
+    Model {
+        id: "scripted-model".into(),
+        name: "Scripted".into(),
+        api: ApiKind::AnthropicMessages,
+        provider: "scripted".into(),
+        base_url: String::new(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec![InputKind::Text],
+        cost: Cost::default(),
+        context_window: 100_000,
+        max_tokens: 4096,
+        compat: Compat::default(),
+    }
+}
 
 /// One scripted response.
 #[derive(Debug, Clone)]
@@ -275,7 +293,6 @@ fn scripted_message(content: Vec<AssistantBlock>, stop_reason: StopReason) -> As
         error_message: None,
         failure: None,
         raw_stop_reason: None,
-        end_turn: None,
         timestamp: now_ms(),
         duration_ms: None,
     }

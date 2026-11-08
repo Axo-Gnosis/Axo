@@ -1,6 +1,6 @@
 # Sessions, Durability & Compaction
 
-`axo` persists every session as an append-only JSONL entry tree (`crates/axo/src/store/` and `crates/axo/src/session/`), journals background jobs into the same file (`crates/axo/src/jobs.rs`), and maintains context size through recoverable artifact elision and model summaries (`crates/axo/src/compaction/`).
+`axo` persists every session as an append-only JSONL entry tree (`crates/axo/src/store/` and `crates/axo/src/session/`), journals background jobs into the same file (`crates/axo/src/jobs/`), and maintains context size through recoverable artifact elision and model summaries (`crates/axo/src/compaction/`).
 
 ## Session Storage (`JsonlStore` & `SessionStore`)
 
@@ -11,7 +11,7 @@ The host passes the store to `Axo::builder(models, store)`. The bundled `JsonlSt
 - **Single-writer lock:** Opening an existing session for writing (`JsonlStore::open_write`) acquires an exclusive non-blocking OS file lock (`std::fs::File::try_lock`) on the session file itself. The lock is explicitly released when the last local writer/write-operation handle drops, so briefly inherited subprocess descriptors cannot prolong it after writer closure. A second writer receives `Error::SessionBusy`. Read-only opens (`Axo::open_session_read`, `Axo::list_sessions`, and `Axo::schemes`, which reads only the header) take no lock.
 - **Torn-line repair:** If the final line lacks a trailing newline, `open_write` appends the newline when the line parses as JSON, and otherwise truncates the torn line back to the previous complete line.
 - **Sequence numbers (`SeqEntry`):** Every entry loaded or appended receives a 0-based monotonic `seq: u64` corresponding to its line index after the `Header`.
-- **Synced records:** `JsonlWriter::append` flushes every line and additionally calls `sync_data` for `run_start`, `run_end`, `job_start`, `job_end`, and any `message` carrying a non-empty `admittedJobs` or `deliveredJobs` receipt, so job state survives a host crash.
+- **Synced records:** `Entry::requires_sync` identifies `run_start`, `run_end`, `job_start`, `job_end`, and any `message` carrying a non-empty `admittedJobs` or `deliveredJobs` receipt. Every `SessionWriter::append` implementation must complete durable storage for these entries before returning, so job state survives a host crash. The bundled JSONL writer flushes every line and additionally calls `sync_data` for these records.
 
 ### The session journal (`crates/axo/src/session/journal.rs`)
 
@@ -35,11 +35,11 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"â€¦","timestamp":"â
 | `usage` | `Entry::Usage { base, kind, provider, model, usage, note }` | Recorded for accounting (such as summary requests); never enters model context |
 | `compaction` | `Entry::Compaction { base, summary, first_kept_entry_id, preserved_user_ids, tokens_before, details, usage, from_hook, reason, focus, system_message }` | Replaces messages before `first_kept_entry_id` with the checkpoint `system_message`, preserved user messages, and a `compactionSummary` custom message wrapping the summary in `<summary>â€¦</summary>` (lowered to a user message). `reason` (`CompactionReason`: `manual`, `threshold`, or `overflow`; absent in older files) records what started it and `focus` the user's focus for a manual compaction |
 | `branch_summary` | `Entry::BranchSummary { base, from_id, summary, details, usage, from_hook, focus }` | Injects a `branchSummary` custom message wrapping the summary in `<summary>â€¦</summary>` (lowered to a user message); `focus` records the user's focus for the summary |
-| `custom` | `Entry::Custom { base, custom_type, data }` | Host metadata; never enters model context |
+| `custom` | `Entry::Custom { base, custom_type, data }` | Host metadata appended with `Session::append_custom`; `Session::custom` returns the latest value of that type on the current root-to-leaf path (branch-scoped). Never enters model context |
 | `custom_message` | `Entry::CustomMessage { base, custom_type, content, details, display }` | Lowered to a user message in model requests |
 | `context_edit` | `Entry::ContextEdit { base, target_id, replacement }` | Replaces `target_id`'s content (`Some(ContextReplacement)`) or hides `target_id` from the projection (`None`) |
-| `label` | `Entry::Label { base, target_id, label }` | Parsed and preserved (pi compatibility); not projected and never enters model context |
-| `session_info` | `Entry::SessionInfo { base, name }` | Parsed and preserved (pi compatibility); not projected and never enters model context |
+| `label` | `Entry::Label { base, target_id, label }` | Dormant format type: pi's label lines are parsed and preserved, but axo has no label API. Not projected and never enters model context |
+| `session_info` | `Entry::SessionInfo { base, name }` | Written by `Session::set_name`; `Session::name` returns the latest name in file order, globally rather than branch-scoped. Not projected and never enters model context |
 | `leaf` | `Entry::Leaf { base }` | Moves the active branch pointer to `base.parent_id` (`None` = before the first entry) |
 | `run_start` | `Entry::RunStart { base, run_id }` | Marks the start of an agent run |
 | `run_end` | `Entry::RunEnd { base, run_id, outcome, reason }` | Marks a settled run (`done`, `aborted`, `failed`, `interrupted`; a parked run is `interrupted` with `reason: "restart_limit"`) |
@@ -48,6 +48,8 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"â€¦","timestamp":"â
 | `job_start` | `Entry::JobStart { base, session_id, job_id, call_id, command, artifact }` | Written in one batch with, and immediately before, the tool result of the call that started job `job_id` (`bg_N`): the `bash` result that promoted it, or the foreground result of a command that exited leaving helpers running in its container (such a record is never admitted; it only reserves the id). `session_id` is the session that started it (copied records in a fork keep the parent's id); `artifact` is the job's output spool `artifact://<artifact>`. Never enters model context; foreground commands whose container is empty at exit write no job records |
 | `job_end` | `Entry::JobEnd { base, job_id, text, is_error }` | The promoted job's rendered result, or the interrupted result written on reopen. Never enters model context; the model sees the result only through the message that delivers it |
 | *(unknown)* | `Entry::Unknown(Value)` | Preserved verbatim on load; ignored by projection |
+
+`Session::set_name` and `Session::append_custom` may append at any time, including during a run; neither adds model-context messages. Names have newlines replaced with spaces and are trimmed; an empty name becomes `None`. An empty custom type is rejected with `Error::InvalidInput`. A latest custom entry with no data makes `Session::custom` return `None`.
 
 ## Projection (`crates/axo/src/store/project.rs`)
 
@@ -60,10 +62,10 @@ Line 1 is the `Header` (`{"type":"session","version":1,"id":"â€¦","timestamp":"â
 
 ## Crash Recovery (`crates/axo/src/recovery.rs`)
 
-When `Axo::open_session` opens a session file, `plan_recovery` inspects the log after the last `Entry::RunEnd`:
+When `Axo::open_session` opens a session file, `plan_recovery` inspects the journal and projection without filesystem access. `Session` applies the plan and attaches any available command-output artifacts:
 
 - **Unfinished tool calls:** If the last assistant message on the path has tool calls without matching `ToolResult` entries:
-  - Tools with `Replay::Never` (`bash`, `edit`, and `write` to a scheme whose `write_replay` is `Never`) immediately receive a persisted synthetic `ToolResult` with `is_error: true` explaining that the process stopped before completion (and pointing to any partial `bash` output as `artifact://<n>`, backed by `<session>/artifacts/<n>.bash.<escaped-call-id>.log`).
+  - Tools with `Replay::Never` (`bash`, `edit`, and `write` to a scheme whose `write_replay` is `Never`) immediately receive a persisted synthetic `ToolResult` with `is_error: true` explaining that the process stopped before completion. `Session` points to any partial command output as `artifact://<n>`, backed by `<session>/artifacts/<n>.<tool>.<escaped-call-id>.log`.
   - Under `RecoveryPolicy::Resume` (default), tools with `Replay::Safe` (`read`, `grep`, `find`, `ask`, `wait`, and `write` to a plain path or `local://`) are left unanswered so `Agent::continue_run` re-executes them in the background.
   - Under `RecoveryPolicy::MarkInterrupted`, `Replay::Safe` calls also receive interrupted results, unconsumed submissions are not requeued, and `Entry::RunEnd { outcome: Interrupted }` is appended immediately.
 - **Interrupted or failed assistant responses:**
@@ -78,13 +80,13 @@ When `Axo::open_session` opens a session file, `plan_recovery` inspects the log 
 
 - **`session.attach(from_seq)`:** Snapshots `Attach { missed, live, events }` from one point of the append order without waiting on a write in flight. Entries publish and live run state relays under the locks `attach` holds while subscribing, so every `SessionEvent::Entry` and live update lands either in the snapshot or on the receiver, never both and never neither. Agent events that follow a write (such as `MessageEnd` after its `message` entry) may still arrive for an entry already in `missed`:
   - `missed`: all `SeqEntry` items with `seq > from_seq` (or all entries when `from_seq` is `None`).
-  - `live`: `LiveSnapshot` containing `run_id`, active `maintenance` (`Compact`, `Shake`, `BranchSummary`), `agent` (`AgentSnapshot` with `running`, partial `streaming` message from `Accumulator`, `pending_tool_calls`, `queued_steering`, `queued_follow_up`), projected `messages`, `pending_questions`, and `jobs` (`Vec<JobInfo>`).
-  - `events`: a `tokio::sync::broadcast::Receiver<SessionEvent>`. If a slow receiver lags (`RecvError::Lagged`), it can call `session.attach(Some(last_seen_seq))` to catch up without stalling the agent loop.
+  - `live`: `LiveSnapshot` containing `run_id`, active `maintenance` (`Compact`, `Shake`, `BranchSummary`), and flattened run fields: `running`, partial `streaming` message, `pending_tool_calls`, `queued_steering`, and `queued_follow_up`; plus projected `messages`, `pending_questions`, and `jobs` (`Vec<JobInfo>`). `Session` owns live run state and event delivery; queue contents come from `Agent::queued()`.
+  - `events`: a `tokio::sync::broadcast::Receiver<SessionEvent>`. If a slow receiver lags, it can call `session.attach(Some(last_seen_seq))` to catch up without stalling the agent loop.
 - **`session.navigate(target, NavigateOptions { summarize, focus })`:**
   - Appends `Entry::Leaf { base: EntryBase { parent_id: target, .. } }`, records `ModelChange` / `ThinkingLevelChange` if the live selection differs from the target branch's historical selection, restores the file ledger and nested context tracker to the new projection, and updates the agent's transcript.
   - Running background jobs keep running. Their results are delivered on whichever branch is selected when they finish; the delivery names the originating command (`[bg_N] <command>`), so it reads correctly away from the branch that started it.
   - With `summarize: true`, first summarizes the abandoned branch with a separate tool-free request (the `BRANCH_SUMMARY` prompt, plus the [focus](#focus) when given) and appends `Entry::BranchSummary` at `target` in place of the `leaf` entry. `focus` without `summarize` returns `Error::InvalidInput`.
-- **`session.fork(entry_id)`:** The fork inherits the parent's `EffectiveConfig` and never calls the `ConfigSource`.
+- **`session.fork(entry_id)`:** The fork inherits the parent's `EffectiveConfig` and ordered `ToolHooks` from `SessionOptions::tool_hooks`, and never calls the `ConfigSource`.
   - Copies the root-to-`entry_id` ancestor chain into a new session file whose `Header` records `parent_session` and `forked_from`.
   - Copies the parent's side files into the fork's session directory: `artifacts/` (hard-linked read-only, copy fallback) and `local/` (copied), so `artifact://` and `local://` URLs, including saved prompt content, resolve in the fork. The output spool of a job that is still running (or retaining helpers) is never hard-linked: the fork gets a read-only snapshot copy, so later output appended by the parent's job does not show up in the fork. Copying is best effort; an entry that cannot be carried over is logged and skipped.
   - The fork gets its own empty job registry: no running job handles carry over, and copied `job_start` records of the parent's session are ignored (their `session_id` differs). New jobs in the fork number from one past the highest `bg_N` any raw record or receipt names (see Raw reconstruction below).
@@ -151,7 +153,7 @@ Automatic maintenance checks `estimate > trigger` in `prepare_request` (before a
 
 When `estimate > trigger`, `axo` evaluates two candidates locally:
 
-1. **Recoverable clearing (`prepare_clearing`):** Protects the newest `40,000` tokens of tool-result content and elides older eligible tool-result text into `<session>/artifacts/<n>.shake.txt` markers (`[shaken ~N tokens; full text: artifact://<n>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000`, and is skipped when `trigger < 20,000`.
+1. **Recoverable clearing (`elide::prepare`):** Protects the newest `40,000` tokens of tool-result content and elides older eligible tool-result text into `<session>/artifacts/<n>.shake.txt` markers (`[shaken ~N tokens; full text: artifact://<n>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000`, and is skipped when `trigger < 20,000`.
 2. **Checkpoint summarization (`Entry::Compaction`):**
    - **Cut point:** Walks backward from the end of the transcript accumulating `keep_recent` tokens and cuts at the first valid boundary (`User`, `Custom`, or `Assistant`, never a `ToolResult`). Message-less records just before the cut (`run_start`, `submission`, `run_end`, settings changes) stay with the kept tail; a cut at a `User` or `Custom` message is always a complete-turn boundary, so only history is summarized. If a single turn exceeds the budget, the turn is split at an `Assistant` boundary and its prefix is summarized with the `COMPACTION_SPLIT_TURN` prompt and merged with the history summary.
    - **Live summary (`SummaryRequest::Live`):** Appends the summary prompt to the live uncleared conversation with `ToolChoice::None` so the request reuses the provider's prompt cache. If the response contains a tool call, stops with `Length` / `Error` / `Aborted`, is empty, or is not strictly smaller than the messages it replaces, it is rejected and `axo` falls back to a separate summary request.
@@ -161,5 +163,6 @@ When `estimate > trigger`, `axo` evaluates two candidates locally:
 
 ## Transient Retry & Overflow Recovery
 
-- **Transient retry (`axo_ai::retry`):** When a turn ends with a retryable provider error (`HTTP 429`, `500`, `502`, `503`, `504`, `520`, `524`, stream transport errors, or `overloaded`/`rate_limit`/`too many requests`/`service_unavailable`/`server_error` without quota exhaustion), `Session` hides the failed assistant message with `Entry::ContextEdit { replacement: None }`, emits `SessionEvent::Retry { attempt, delay_ms }`, sleeps (`2000ms * 2^(attempt - 1)` or the provider's `Retry-After` / reset header up to `60,000ms`; a header exceeding 60 s is not retried), and retries up to 3 times.
-- **One-shot overflow recovery (`axo_ai::overflow`):** When a turn fails with context overflow (or stops with `StopReason::Length` when output is 0 and input + cache_read >= 99% of context window, or output is below requested max_tokens) and `compaction.enabled` is `true`, `Session` hides the failed turn and any tool results it produced, runs recoverable clearing followed by a separate-request compaction pass if needed, and retries once within the same run.
+- **Transient retry:** `axo_ai::is_retryable_error` and `axo_ai::is_fatal_error` classify provider errors; `axo::RetrySettings` owns turn and summary retry policy. When a turn ends with a retryable provider error (`HTTP 429`, `500`, `502`, `503`, `504`, `520`, `524`, stream transport errors, or `overloaded`/`rate_limit`/`too many requests`/`service_unavailable`/`server_error` without quota exhaustion), `Session` hides the failed assistant message with `Entry::ContextEdit { replacement: None }`, emits `SessionEvent::Retry { attempt, delay_ms }`, sleeps, and retries within `retry.maxRetries`. Defaults are 3 retries with 2/4/8-second exponential delays; a server delay hint replaces the backoff, but a hint above `retry.maxDelayMs` (default 60,000 ms) stops retries. `retry.baseDelayMs` sets the backoff base, `retry.maxRetries: 0` disables retries, and an unrepresentable backoff stops retries.
+- **Fixed transport retries:** before a response body is consumed, `axo_ai` separately allows 2 request-level retries. This transport detail is not controlled by `RetrySettings`; it honors server delays up to 60 seconds. A longer hint returns the failed response without sleeping so the adapter preserves the hint for the configurable turn-level policy.
+- **One-shot overflow recovery (`axo_ai::is_context_overflow`, `axo_ai::is_recoverable_length`):** When a turn fails with context overflow (or stops with `StopReason::Length` when output is 0 and input + cache_read >= 99% of context window, or output is below requested max_tokens) and `compaction.enabled` is `true`, `Session` hides the failed turn and any tool results it produced, runs recoverable clearing followed by a separate-request compaction pass if needed, and retries once within the same run.

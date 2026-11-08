@@ -42,27 +42,10 @@ pub struct Resolved {
     pub prompt_note: Option<String>,
 }
 
-/// The host environment, snapshotted once at startup.
-#[derive(Debug, Clone)]
-pub struct HostEnv(pub Arc<EnvMap>);
-
-impl HostEnv {
-    /// Snapshots `std::env::vars_os()`.
-    pub fn snapshot() -> Self {
-        Self(Arc::new(std::env::vars_os().collect()))
-    }
-}
-
-#[async_trait]
-impl ExecEnv for HostEnv {
-    async fn resolve(
-        &self,
-        _cwd: &Path,
-        _cancel: &CancellationToken,
-        _progress: &(dyn for<'a> Fn(&'a str) + Send + Sync),
-    ) -> Resolved {
-        Resolved {
-            env: self.0.clone(),
+impl From<Arc<EnvMap>> for Resolved {
+    fn from(env: Arc<EnvMap>) -> Self {
+        Self {
+            env,
             notice: None,
             prompt_note: None,
         }
@@ -73,6 +56,13 @@ impl ExecEnv for HostEnv {
 #[derive(Debug, Clone)]
 pub struct StaticEnv(pub Arc<EnvMap>);
 
+impl StaticEnv {
+    /// Snapshots the host environment from `std::env::vars_os()`.
+    pub fn host() -> Self {
+        Self(Arc::new(std::env::vars_os().collect()))
+    }
+}
+
 #[async_trait]
 impl ExecEnv for StaticEnv {
     async fn resolve(
@@ -81,10 +71,6 @@ impl ExecEnv for StaticEnv {
         _cancel: &CancellationToken,
         _progress: &(dyn for<'a> Fn(&'a str) + Send + Sync),
     ) -> Resolved {
-        Resolved {
-            env: self.0.clone(),
-            notice: None,
-            prompt_note: None,
-        }
+        self.0.clone().into()
     }
 }
