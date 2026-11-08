@@ -51,7 +51,10 @@ pub(crate) struct SummaryPrompts {
 impl SummaryPrompts {
     /// Takes each prompt from the session's trimmed overrides. An empty override would
     /// make every summary fail, so it is reported and the bundled prompt is kept.
-    pub(crate) fn load(prompts: &IndexMap<String, PromptOverride>) -> (Self, Vec<Diagnostic>) {
+    pub(crate) fn load(
+        prompts: &IndexMap<String, PromptOverride>,
+        name: &str,
+    ) -> (Self, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let mut load = |name: &str, bundled: &str| match prompts.get(name) {
             Some(prompt) if !prompt.text.is_empty() => prompt.text.clone(),
@@ -65,7 +68,10 @@ impl SummaryPrompts {
             None => bundled.trim().to_owned(),
         };
         let prompts = Self {
-            rules: load("SUMMARY", include_str!("../../prompts/SUMMARY.md")),
+            rules: load(
+                "SUMMARY",
+                &include_str!("../../prompts/SUMMARY.md").replace("{name}", name),
+            ),
             initial: load("COMPACTION", include_str!("../../prompts/COMPACTION.md")),
             update: load(
                 "COMPACTION_UPDATE",

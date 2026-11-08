@@ -1,10 +1,10 @@
-# Prompts, Context Files & Skills
+# Prompts, Context Files, Skills & Agents
 
 `axo` represents the system prompt and tool set as `SystemMessage` entries inside the transcript (`crates/axo/src/context/prompt.rs`). Replaying the transcript reconstructs the exact prompt and tool definitions at any point in a session, and mid-session updates emit a diff `SystemMessage` containing only changed sections (`Some(rendered)`) or removed sections (`None`).
 
 Provider requests use `Transcript::new` with the system prompt and tool declarations already carried by `Message::System` entries. Construction removes failed or aborted assistant turns and their tool results from the request; the persisted session history retains them.
 
-Start-time diagnostics for context files, skills, schemes and bundled docs, prompt overrides, host sections, and reserved command names remain available to the host through `session.diagnostics()` (`&[Diagnostic]`) and are still logged as warnings. Runtime `NestedContext` read errors are only logged, not retained in this startup snapshot.
+Start-time diagnostics for context files, skills, agent definitions and tool allowlists, schemes and bundled docs, prompt overrides, host sections, and reserved command names remain available to the host through `session.diagnostics()` (`&[Diagnostic]`) and are still logged as warnings. Runtime `NestedContext` read errors are only logged, not retained in this startup snapshot.
 
 ## System Prompt Sections
 
@@ -12,8 +12,8 @@ Start-time diagnostics for context files, skills, schemes and bundled docs, prom
 
 | # | Section | Source |
 | :--- | :--- | :--- |
-| 1 | `system` | `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
-| 2 | `docs` | `"axo's documentation, including how to extend it: axo://README.md"` (materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
+| 1 | `system` | Non-empty root agent body, else `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
+| 2 | `docs` | `"<name>'s documentation, including how to extend it: <name>://README.md"` (`name` defaults to `axo`; materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
 | 3 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the active tools, formatted as `- {rule}` bullets |
 | 4 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
 | 5 | `work` | `WORK` override (no bundled default; omitted unless provided) |
@@ -26,6 +26,8 @@ Start-time diagnostics for context files, skills, schemes and bundled docs, prom
 | 12 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section |
 
 ### Bundled documentation (`docs`)
+
+The URLs below use the default harness name, `axo`. `AxoBuilder::name` changes the docs scheme and section to the chosen name. Materialization rewrites literal `axo://` URLs in bundled documentation; crate names stay `axo`. Only the bundled `SYSTEM` and `SUMMARY` prompts expand their `{name}` placeholders; host overrides are used verbatim.
 
 When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (including through `Axo::schemes` for a closed session) materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<cache_dir>/docs/`, updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If that directory cannot be written, scheme construction records a `Diagnostic` and omits both the `docs` section and the built-in `axo://` scheme. Prompt refreshes only render the already-loaded sources; they perform no filesystem I/O. Without a cache directory, axo writes nothing, omits the `docs` section without a diagnostic, and registers no `axo://` scheme.
 
@@ -43,7 +45,7 @@ Host section names in `SessionOptions::sections` must start with an ASCII lowerc
 
 ## Prompt Overrides (`EffectiveConfig::prompts`)
 
-axo reads no prompt files of its own. The host supplies overrides through `ConfigSource` as `ConfigLayer::prompts`, keyed by a `PROMPT_NAMES` entry (`SYSTEM`, `WORK`, `PROSE`, `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`), each a `PromptOverride { origin, text }`:
+axo discovers no prompt-override files of its own (agent definition bodies are separate, below). The host supplies overrides through `ConfigSource` as `ConfigLayer::prompts`, keyed by a `PROMPT_NAMES` entry (`SYSTEM`, `WORK`, `PROSE`, `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`), each a `PromptOverride { origin, text }`:
 - `EffectiveConfig::resolve` trims every text and applies the user layer's overrides, then the project layer's when project access is `Read` or `Trust` and the user's `project.files.config` is `true`; the project wins per name. Under `Ignore`, or with `project.files.config: false`, the project layer is never requested.
 - A key outside `PROMPT_NAMES` fails session start with `Error::Config` naming that override's `origin`.
 - A missing key means no override. An unreadable prompt is the host's error to report from `ConfigSource`; axo never sees a file.
@@ -84,11 +86,55 @@ If a summarizer override is empty or whitespace-only, `SummaryPrompts::load` rec
 
 ### On-demand nested context files (`NestedContext`)
 
-When project access is not `Ignore` and `settings.nested_context_files` is `true`, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
+When project access is not `Ignore`, `settings.nested_context_files` is `true`, and the root agent has not disabled context files, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
 - For a touched path inside `project_root`, `NestedContext` checks every directory from `project_root` down to the file's parent directory.
 - Any enabled context file whose canonical path and content are not already present in the startup `context_files` or in the active projection's tool results is appended to that tool result as `<project_instructions path="…">\n{content}\n</project_instructions>`.
 - `NestedContext::restore(&messages)` reconstructs the seen set from the current projected messages on session open, branch navigation, compaction, and `/shake`. If a tool result carrying a nested context file is elided or compacted away, the next file access in that directory reattaches it.
 - Read errors encountered by `NestedContext` at runtime are only logged; they do not appear in `Session::diagnostics`.
+
+## Agent definitions
+
+Hosts supply directories through `ConfigLayer::agent_roots`, not a settings key. At session start, axo scans trusted project roots first, then user roots, each in supplied order. Project roots require `ProjectAccess::Trust`; non-empty roots returned at `Read` are ignored with a warning. At `Ignore`, or with `project.files.config: false`, the project layer is not requested. No agent directory under `.agents/` is discovered implicitly.
+
+Roots are walked recursively in sorted file-name order for `*.md`, following symlinks and respecting the same hidden-file and ignore rules as skills. Missing roots and files without a leading `---` YAML frontmatter block are skipped silently; an empty block is allowed. A canonical file reached twice is loaded once. Agents and teams share a namespace: the first name wins across roots, then `SessionOptions::agents` supplies programmatic `AgentSpec` values after file definitions. Later name collisions produce diagnostics.
+
+### Frontmatter and body
+
+```markdown
+---
+name: reviewer
+description: Read-only code review.
+model: "@bard:low"
+tools: [read, grep, find]
+contextFiles:
+  CLAUDE.md: false
+sections:
+  prose: false
+---
+Review the code for correctness and report actionable findings.
+```
+
+| Key | Meaning |
+| :--- | :--- |
+| `name` | Defaults to the file stem when omitted or empty. Uses the skill name rule: non-empty, at most 64 characters, only lowercase ASCII letters, digits, and hyphens; no leading, trailing, or consecutive hyphens. Unlike skills, violations drop the definition |
+| `description` | Optional listing text, default empty |
+| `model` | A [model selector](configuration.md#model-selectors); considered after the explicit session selector and recorded model, before `defaultModel` |
+| `tools` | Optional allowlist over built-in **and host** tools, as a list or comma-separated string (trimmed, empty entries dropped). Omitted keeps all tools; an empty list keeps none. Unknown tool names produce diagnostics when the agent is selected. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
+| `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings |
+| `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` apply last and can restore removed sections |
+| `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. Stored as metadata only; root session responses are not validated against it |
+
+The trimmed body replaces the `system` section when non-empty; an empty body keeps the configured or bundled `SYSTEM`. Agent bodies are used verbatim, without harness-name substitution, and do not change `WORK`, `PROSE`, or summarizer prompt overrides.
+
+Unreadable files, malformed frontmatter, invalid names or schemas, and collisions produce `Diagnostic` entries and skip the affected definition. Unknown frontmatter keys produce diagnostics but keep an otherwise valid definition; the compatibility keys `blocking`, `spawns`, and `thinkingLevel` are silently ignored. Programmatic specs receive the same name, section, schema, and collision checks, and their bodies are trimmed. File diagnostics carry `DiagnosticOrigin::Path`; programmatic diagnostics have no origin and name the agent in the message.
+
+### Root selection and catalog
+
+`SessionOptions::agent: Option<String>` selects a root agent by name; `None` runs without one. A missing name or a team name returns `Error::AgentNotFound`. `SessionOptions::agents: Vec<AgentSpec>` adds definitions supplied in code; the public types live in `axo::context::agents`. `Session::agents() -> &[AgentDef]` exposes the loaded agent and team catalog. Definitions and the selected root are snapshots: forks inherit them; reopening loads again from the options and roots supplied then, so pass the root name again.
+
+### Teams
+
+A file with a `members` key defines a team instead of an agent. Its keys are `name`, `description`, and `members`; its body is the charter. Each member has a required `agent` name, an optional `as` alias, and an optional `brief`. The roster name is the alias when present, otherwise the agent name. Teams must have at least one member, every reference must name an agent (not a team), and roster names must be valid and unique. Invalid teams are diagnosed and dropped after the catalog is loaded. Teams are listed by `Session::agents()` only; they cannot run as a root agent.
 
 ## Skills (`crates/axo/src/context/skills.rs`)
 

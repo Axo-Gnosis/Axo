@@ -100,6 +100,7 @@ dependencies = [
  "indexmap",
  "jiff",
  "jsonc-parser",
+ "jsonschema",
  "rand",
  "regex",
  "rustix",

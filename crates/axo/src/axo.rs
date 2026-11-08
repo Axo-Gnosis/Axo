@@ -10,6 +10,7 @@ use axo_ai::{Models, Streamer};
 use crate::config::{
     ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
 };
+use crate::context::agents::{AgentDef, load_agents};
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
@@ -23,6 +24,7 @@ use crate::store::{
 };
 
 pub struct Axo {
+    name: String,
     models: Arc<Models>,
     /// What sessions stream through: `models` unless the builder overrode it.
     streamer: Arc<dyn Streamer>,
@@ -43,6 +45,7 @@ pub struct Axo {
 /// [`AxoBuilder::cache_dir`] there is no `docs` prompt section, no `axo://` scheme, and
 /// `bash.devShell` `nix` falls back to the host environment.
 pub struct AxoBuilder {
+    name: String,
     models: Arc<Models>,
     store: Arc<dyn SessionStore>,
     config: Option<Arc<dyn ConfigSource>>,
@@ -65,6 +68,15 @@ impl ConfigSource for NoConfig {
 }
 
 impl AxoBuilder {
+    /// Names the harness in model-facing text: the docs scheme (`<name>://`), the `docs`
+    /// section, and the bundled `SYSTEM`/`SUMMARY` prompts. Defaults to `axo`.
+    pub fn name(mut self, name: impl Into<String>) -> Result<Self, Error> {
+        let name = name.into();
+        crate::schemes::check_harness_name(&name)?;
+        self.name = name;
+        Ok(self)
+    }
+
     /// The host's configuration, sampled per session (see [`ConfigSource`]).
     pub fn config(mut self, config: Arc<dyn ConfigSource>) -> Self {
         self.config = Some(config);
@@ -101,6 +113,7 @@ impl AxoBuilder {
         // never run commands keep working.
         let supervisor = ProcessSupervisor::new(self.supervision.unwrap_or_default());
         Axo {
+            name: self.name,
             models: self.models,
             streamer,
             store: self.store,
@@ -115,6 +128,7 @@ impl AxoBuilder {
 impl Axo {
     pub fn builder(models: Arc<Models>, store: Arc<dyn SessionStore>) -> AxoBuilder {
         AxoBuilder {
+            name: "axo".into(),
             models,
             store,
             config: None,
@@ -202,6 +216,7 @@ impl Axo {
         let (schemes, _, diagnostics, _) = session_schemes(
             &config,
             self.docs_dir().as_deref(),
+            &self.name,
             SchemeContext {
                 session_id: header.id,
                 session_dir: path.with_extension(""),
@@ -235,6 +250,8 @@ impl Axo {
         let SessionOptions {
             cwd,
             model,
+            agent,
+            agents,
             thinking,
             ask_enabled,
             project_access,
@@ -251,20 +268,51 @@ impl Axo {
             &cwd,
             project_access,
         )?);
+        let (agents, agent_diagnostics) = load_agents(&config.agent_roots, &agents);
+        let agent = match agent {
+            Some(name) => Some(
+                agents
+                    .iter()
+                    .find_map(|definition| match definition {
+                        AgentDef::Agent(spec) if spec.name == name => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .ok_or(Error::AgentNotFound(name))?,
+            ),
+            None => None,
+        };
         let settings = &config.settings;
 
-        let selector = match model.or_else(|| projection.model.clone()) {
-            Some(selector) => selector,
-            None => config.default_model()?.ok_or(Error::NoModel)?,
+        let mut selected_model = None;
+        let mut suffix = None;
+        for selector in [
+            model.as_deref(),
+            projection.model.as_deref(),
+            agent.as_ref().and_then(|spec| spec.model.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let choice = settings.resolve_model(&self.models, selector)?;
+            suffix = suffix.or(choice.thinking);
+            if choice.model.is_some() {
+                selected_model = choice.model;
+                break;
+            }
+        }
+        let model = match selected_model {
+            Some(model) => model,
+            None => {
+                let selector = config.default_model()?.ok_or(Error::NoModel)?;
+                let choice = settings.resolve_model(&self.models, &selector)?;
+                suffix = suffix.or(choice.thinking);
+                choice.model.ok_or(Error::NoModel)?
+            }
         };
-        let model = self
-            .models
-            .find(&selector)
-            .ok_or(Error::ModelNotFound(selector))?
-            .clone();
         let thinking = clamp_level(
             &model,
             thinking
+                .or(suffix)
                 .or(projection.thinking)
                 .unwrap_or(settings.default_thinking_level),
         );
@@ -294,6 +342,10 @@ impl Axo {
                 cwd,
                 config,
                 docs_dir: self.docs_dir(),
+                harness_name: self.name.clone(),
+                agents,
+                agent_diagnostics,
+                agent,
                 streamer: self.streamer.clone(),
                 models: self.models.clone(),
                 exec,

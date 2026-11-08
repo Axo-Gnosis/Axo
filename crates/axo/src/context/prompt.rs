@@ -17,8 +17,17 @@ use crate::context::skills::{Skill, escape_xml};
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
+/// Whether a system prompt section name is lowercase ASCII with digits, `_` or `-`.
+pub(crate) fn valid_section_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 /// Owned sources shared by every prompt build for a session.
 pub(crate) struct PromptSources {
+    pub name: String,
     pub cwd: PathBuf,
     /// The session's trimmed prompt overrides, keyed by prompt name.
     pub prompts: IndexMap<String, PromptOverride>,
@@ -57,15 +66,19 @@ pub(crate) fn build_sections(
             .map_or(bundled.trim(), |prompt| prompt.text.as_str())
             .to_owned()
     };
-    let system = prompt_file("SYSTEM", BUNDLED_SYSTEM);
+    let system = sources.prompts.get("SYSTEM").map_or_else(
+        || BUNDLED_SYSTEM.trim().replace("{name}", &sources.name),
+        |prompt| prompt.text.clone(),
+    );
     let work = prompt_file("WORK", "");
     let prose = prompt_file("PROSE", BUNDLED_PROSE);
 
     bodies.insert("system".into(), system);
     if sources.docs {
+        let name = &sources.name;
         bodies.insert(
             "docs".into(),
-            "axo's documentation, including how to extend it: axo://README.md".into(),
+            format!("{name}'s documentation, including how to extend it: {name}://README.md"),
         );
     }
 
@@ -210,6 +223,7 @@ mod tests {
             ("PROSE".to_owned(), override_("")),
         ]);
         let mut sources = PromptSources {
+            name: "axo".into(),
             cwd: "/w".into(),
             prompts,
             docs: false,

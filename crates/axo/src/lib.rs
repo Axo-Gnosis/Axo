@@ -20,8 +20,8 @@ pub use axo::{Axo, AxoBuilder};
 pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
-    EffectiveConfig, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride,
-    RetrySettings, Settings, SummaryRequest, UserConfig,
+    EffectiveConfig, ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings,
+    PromptOverride, RetrySettings, Settings, SummaryRequest, UserConfig,
 };
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use error::Error;

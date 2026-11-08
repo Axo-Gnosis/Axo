@@ -26,13 +26,18 @@ const BUNDLED_DOCS: &[(&str, &str)] = &[
 ];
 
 /// Materializes bundled documentation before registering its directory scheme.
-pub(crate) fn ensure_bundled_docs(docs_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_bundled_docs(docs_dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(docs_dir)?;
-    for &(name, content) in BUNDLED_DOCS {
-        let path = docs_dir.join(name);
+    for &(file, text) in BUNDLED_DOCS {
+        let content = if name == "axo" {
+            std::borrow::Cow::Borrowed(text)
+        } else {
+            std::borrow::Cow::Owned(text.replace("axo://", &format!("{name}://")))
+        };
+        let path = docs_dir.join(file);
         let unchanged = std::fs::read(&path).is_ok_and(|bytes| bytes == content.as_bytes());
         if !unchanged {
-            std::fs::write(&path, content)?;
+            std::fs::write(&path, content.as_bytes())?;
         }
     }
     Ok(())
@@ -40,7 +45,7 @@ pub(crate) fn ensure_bundled_docs(docs_dir: &Path) -> std::io::Result<()> {
 
 /// A named directory, optionally read-only.
 pub struct DirScheme {
-    name: &'static str,
+    name: String,
     root: PathBuf,
     writable: bool,
     doc: &'static str,
@@ -50,7 +55,7 @@ impl DirScheme {
     /// Writable scratch files belonging to one session.
     pub fn local(root: PathBuf) -> Self {
         Self {
-            name: "local",
+            name: "local".into(),
             root,
             writable: true,
             doc: "`local://<path>`: this session's scratch files (plans, notes); writable; list them with `find` and `path: \"local://\"`.",
@@ -58,9 +63,9 @@ impl DirScheme {
     }
 
     /// Read-only bundled documentation.
-    pub fn docs(root: PathBuf) -> Self {
+    pub fn docs(name: &str, root: PathBuf) -> Self {
         Self {
-            name: "axo",
+            name: name.into(),
             root,
             writable: false,
             doc: "",
@@ -71,7 +76,7 @@ impl DirScheme {
 #[async_trait]
 impl Scheme for DirScheme {
     fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn prompt_doc(&self) -> &str {
@@ -104,13 +109,17 @@ mod tests {
     fn materializes_bundled_docs() {
         let temp = tempfile::tempdir().unwrap();
         let docs_dir = temp.path().join("cache/docs");
-        ensure_bundled_docs(&docs_dir).unwrap();
+        ensure_bundled_docs(&docs_dir, "axo").unwrap();
         for &(name, expected) in BUNDLED_DOCS {
             assert_eq!(
                 std::fs::read_to_string(docs_dir.join(name)).unwrap(),
                 expected
             );
         }
+        ensure_bundled_docs(&docs_dir, "axome").unwrap();
+        let readme = std::fs::read_to_string(docs_dir.join("README.md")).unwrap();
+        assert!(readme.contains("axome://README.md"));
+        assert!(!readme.contains("axo://"));
     }
 
     #[tokio::test]
@@ -125,7 +134,7 @@ mod tests {
             path: String::new(),
         };
         assert_eq!(
-            DirScheme::docs(PathBuf::from("/d"))
+            DirScheme::docs("axo", PathBuf::from("/d"))
                 .resolve(&url, &context)
                 .await
                 .map_err(|error| error.0),

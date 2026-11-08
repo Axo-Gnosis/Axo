@@ -95,7 +95,7 @@ struct ShakeArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelArgs {
-    /// `provider/id`.
+    /// A model selector: `provider/id` or `@role`, optionally with `:thinking`, or `:thinking` alone.
     #[schemars(extend("format" = "model"))]
     model: String,
 }

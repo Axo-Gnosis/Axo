@@ -28,6 +28,15 @@ pub enum Error {
     NoModel,
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    /// `SessionOptions::agent` names no agent definition, or names a team.
+    #[error("Agent not found: {0}")]
+    AgentNotFound(String),
+    /// `@name` names no `modelRoles` entry.
+    #[error("Unknown model role: @{0}")]
+    UnknownModelRole(String),
+    /// A model selector is malformed: a bad `:thinking` suffix, or a role whose value names another role.
+    #[error("Invalid model selector \"{selector}\": {message}")]
+    InvalidModelSelector { selector: String, message: String },
     /// A built-in command's arguments are missing or invalid, or its name is unknown.
     #[error("/{command}: {message}")]
     InvalidCommand { command: String, message: String },

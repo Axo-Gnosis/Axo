@@ -7,6 +7,7 @@ mod prompt;
 mod resume;
 mod side_files;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -39,7 +40,8 @@ use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
-use crate::config::{EffectiveConfig, ProjectAccess};
+use crate::config::{EffectiveConfig, ProjectAccess, PromptOverride};
+use crate::context::agents::{AgentDef, AgentSpec, ContextFiles};
 use crate::context::files::{NestedContext, context_file_names, load_context_files};
 use crate::context::prompt::PromptSources;
 use crate::context::skills::{Skill, load_skills};
@@ -64,8 +66,14 @@ use crate::tools::{self, Answer, PendingQuestions, Question, SessionTools, ToolF
 pub struct SessionOptions {
     /// Ignored by `Axo::open_session`, which uses the cwd in the session header.
     pub cwd: PathBuf,
-    /// `provider/model-id`; falls back to the session's last model, then `defaultModel`.
+    /// A model selector (`provider/model`, `@role`, either with `:thinking`, or `:thinking` alone);
+    /// falls back to the session's last model, then the root agent's `model`, then `defaultModel`.
     pub model: Option<String>,
+    /// The root agent, by name, from the agent roots or `agents`. `None` runs without one.
+    /// Pass it again when reopening, as with `sections`; forks inherit it.
+    pub agent: Option<String>,
+    /// Agent definitions supplied in code, after every file-defined one; the first name wins.
+    pub agents: Vec<AgentSpec>,
     /// Falls back to the session's last level, then `defaultThinkingLevel`; clamped to
     /// the model's supported levels.
     pub thinking: Option<ThinkingLevel>,
@@ -94,6 +102,8 @@ impl Default for SessionOptions {
         Self {
             cwd: std::env::current_dir().unwrap_or_default(),
             model: None,
+            agent: None,
+            agents: Vec::new(),
             thinking: None,
             ask_enabled: false,
             project_access: None,
@@ -256,6 +266,10 @@ pub(crate) struct Inherited {
     /// Where bundled docs are materialized for the `docs` section and `axo://`; `None`
     /// omits both.
     pub(crate) docs_dir: Option<PathBuf>,
+    pub(crate) harness_name: String,
+    pub(crate) agents: Vec<AgentDef>,
+    pub(crate) agent_diagnostics: Vec<Diagnostic>,
+    pub(crate) agent: Option<AgentSpec>,
     pub(crate) streamer: Arc<dyn Streamer>,
     /// Where `/model` looks up models.
     pub(crate) models: Arc<Models>,
@@ -602,10 +616,15 @@ impl SessionHooks {
     }
 
     /// Records `model` (and the thinking level it clamps to), then applies it once written.
-    async fn select_model(&self, agent: &Agent, model: Model) -> Result<(), Error> {
+    async fn select_model(
+        &self,
+        agent: &Agent,
+        model: Model,
+        thinking: Option<ThinkingLevel>,
+    ) -> Result<(), Error> {
         let _order = self.selection_order.lock().await;
         let current = self.selection();
-        let level = clamp_level(&model, current.thinking);
+        let level = clamp_level(&model, thinking.unwrap_or(current.thinking));
         let mut entries = vec![Entry::ModelChange {
             base: journal::base(),
             provider: model.provider.clone(),
@@ -907,6 +926,7 @@ impl Persist for SessionHooks {
 pub(crate) fn session_schemes(
     config: &EffectiveConfig,
     docs_dir: Option<&Path>,
+    name: &str,
     cx: SchemeContext,
     host: &[Arc<dyn Scheme>],
     jobs: Option<Arc<JobRegistry>>,
@@ -923,9 +943,9 @@ pub(crate) fn session_schemes(
         Arc::new(SkillScheme::new(&skills)),
         Arc::new(DirScheme::local(cx.session_dir.join(LOCAL_DIR))),
     ];
-    let docs = docs_dir.is_some_and(|docs_dir| match ensure_bundled_docs(docs_dir) {
+    let docs = docs_dir.is_some_and(|docs_dir| match ensure_bundled_docs(docs_dir, name) {
         Ok(()) => {
-            builtins.push(Arc::new(DirScheme::docs(docs_dir.to_path_buf())));
+            builtins.push(Arc::new(DirScheme::docs(name, docs_dir.to_path_buf())));
             true
         }
         Err(error) => {
@@ -976,24 +996,46 @@ impl Session {
         let questions = Arc::new(PendingQuestions::new(events.clone()));
         let settings = &config.settings;
         let project = config.access != ProjectAccess::Ignore;
-        let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
-        let (names, name_diagnostics) = context_file_names(&settings.context_files);
-        let (context_files, file_diagnostics) = load_context_files(
-            &config.context_files,
-            home_agents.as_deref(),
-            cwd,
-            project,
-            &names,
-        );
-        let context = NestedContext::new(
-            (project && settings.nested_context_files).then(|| project_root(cwd)),
-            names,
-            &context_files,
-        );
+        let root_agent = inherited.agent.as_ref();
+        let context_names = match root_agent.and_then(|spec| spec.context_files.as_ref()) {
+            Some(ContextFiles::Off) => None,
+            Some(ContextFiles::Names(overrides)) => {
+                let mut names = settings.context_files.clone();
+                names.extend(overrides.iter().map(|(name, on)| (name.clone(), *on)));
+                Some(Cow::Owned(names))
+            }
+            None => Some(Cow::Borrowed(&settings.context_files)),
+        };
+        let (context_files, context, name_diagnostics, file_diagnostics) = match context_names {
+            None => (
+                Vec::new(),
+                NestedContext::disabled(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Some(context_names) => {
+                let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
+                let (names, name_diagnostics) = context_file_names(&context_names);
+                let (context_files, file_diagnostics) = load_context_files(
+                    &config.context_files,
+                    home_agents.as_deref(),
+                    cwd,
+                    project,
+                    &names,
+                );
+                let context = NestedContext::new(
+                    (project && settings.nested_context_files).then(|| project_root(cwd)),
+                    names,
+                    &context_files,
+                );
+                (context_files, context, name_diagnostics, file_diagnostics)
+            }
+        };
         let (jobs, unfinished) = JobRegistry::new(session_id.clone(), &entries);
         let (schemes, skills, skill_diagnostics, docs) = session_schemes(
             config,
             docs_dir.as_deref(),
+            &inherited.harness_name,
             SchemeContext {
                 session_id: session_id.clone(),
                 session_dir: path.with_extension(""),
@@ -1003,15 +1045,17 @@ impl Session {
             Some(jobs.clone()),
         )?;
         let (summary_prompts, summary_diagnostics) =
-            compaction::summary::SummaryPrompts::load(&config.prompts);
+            compaction::summary::SummaryPrompts::load(&config.prompts, &inherited.harness_name);
         let mut section_diagnostics = Vec::new();
-        let host_sections = host_sections
+        let agent_sections = root_agent
+            .into_iter()
+            .flat_map(|spec| &spec.sections)
+            .filter(|(_, enabled)| !**enabled)
+            .map(|(name, _)| (name.clone(), None));
+        let validated_host_sections = host_sections
             .iter()
             .filter(|(name, _)| {
-                let valid = name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                    && name.chars().all(|c| {
-                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'
-                    });
+                let valid = crate::context::prompt::valid_section_name(name);
                 if !valid {
                     section_diagnostics.push(Diagnostic {
                         origin: None,
@@ -1020,18 +1064,20 @@ impl Session {
                 }
                 valid
             })
-            .cloned()
-            .collect();
-        let diagnostics: Vec<_> = name_diagnostics
-            .into_iter()
-            .chain(file_diagnostics)
-            .chain(skill_diagnostics)
-            .chain(commands::reserved_skill_diagnostics(&skills))
-            .chain(summary_diagnostics)
-            .chain(section_diagnostics)
-            .collect();
-        for diagnostic in &diagnostics {
-            warn!("{diagnostic}");
+            .cloned();
+        let host_sections = agent_sections.chain(validated_host_sections).collect();
+        let mut prompts = config.prompts.clone();
+        if let Some(spec) = root_agent.filter(|spec| !spec.body.is_empty()) {
+            prompts.insert(
+                "SYSTEM".into(),
+                PromptOverride {
+                    origin: spec.path.as_ref().map_or_else(
+                        || format!("agent {}", spec.name),
+                        |path| path.display().to_string(),
+                    ),
+                    text: spec.body.clone(),
+                },
+            );
         }
 
         let runner = crate::jobs::command::CommandRunner {
@@ -1052,7 +1098,7 @@ impl Session {
             .iter()
             .map(|factory| factory(&session_tools))
             .collect();
-        let tools = tools::merge_tools(
+        let mut tools = tools::merge_tools(
             tools::builtin(
                 &session_tools,
                 inherited.ask_enabled,
@@ -1061,6 +1107,33 @@ impl Session {
             ),
             &host,
         );
+        let mut tool_diagnostics = Vec::new();
+        if let Some(spec) = root_agent
+            && let Some(allow) = &spec.tools
+        {
+            for name in allow {
+                if !tools.iter().any(|tool| tool.name() == name) {
+                    tool_diagnostics.push(Diagnostic {
+                        origin: spec.path.clone().map(DiagnosticOrigin::Path),
+                        message: format!("agent \"{}\": unknown tool \"{name}\"", spec.name),
+                    });
+                }
+            }
+            tools.retain(|tool| allow.iter().any(|name| name == tool.name()));
+        }
+        let diagnostics: Vec<_> = name_diagnostics
+            .into_iter()
+            .chain(file_diagnostics)
+            .chain(skill_diagnostics)
+            .chain(commands::reserved_skill_diagnostics(&skills))
+            .chain(summary_diagnostics)
+            .chain(section_diagnostics)
+            .chain(inherited.agent_diagnostics.iter().cloned())
+            .chain(tool_diagnostics)
+            .collect();
+        for diagnostic in &diagnostics {
+            warn!("{diagnostic}");
+        }
 
         let journal = Journal::start(writer, entries, projection.clone(), events.clone());
         let hooks = Arc::new_cyclic(|this: &Weak<SessionHooks>| {
@@ -1090,8 +1163,9 @@ impl Session {
                 preparing: AtomicUsize::new(0),
                 prompt: SessionPrompt {
                     sources: PromptSources {
+                        name: inherited.harness_name.clone(),
                         cwd: cwd.clone(),
-                        prompts: config.prompts.clone(),
+                        prompts,
                         docs,
                         tools: tools.clone(),
                         scheme_docs: session_tools.schemes.prompt_docs(),
@@ -1298,6 +1372,11 @@ impl Session {
         &self.hooks.prompt.sources.skills
     }
 
+    /// Agent and team definitions loaded at start; forks share them.
+    pub fn agents(&self) -> &[AgentDef] {
+        &self.inherited.agents
+    }
+
     /// Start-time context, skill, prompt, and scheme diagnostics, also logged as warnings.
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
@@ -1334,13 +1413,28 @@ impl Session {
             Command::Compact { focus } => self.compact(focus).await,
             Command::Shake { mode } => self.shake(mode).await,
             Command::Model { model } => {
-                let model = self
+                let choice = self
                     .inherited
-                    .models
-                    .find(&model)
-                    .ok_or_else(|| Error::ModelNotFound(model.clone()))?
-                    .clone();
-                self.set_model(model).await
+                    .config
+                    .settings
+                    .resolve_model(&self.inherited.models, &model)?;
+                match choice.model {
+                    Some(model) => {
+                        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+                        detached(
+                            async move { hooks.select_model(&agent, model, choice.thinking).await },
+                        )
+                        .await
+                    }
+                    None => self
+                        .set_thinking(
+                            choice
+                                .thinking
+                                .expect("a selector without a model names a thinking level"),
+                        )
+                        .await
+                        .map(drop),
+                }
             }
             Command::Thinking { level } => self.set_thinking(level).await.map(drop),
             Command::Navigate {
@@ -1385,7 +1479,7 @@ impl Session {
     /// Switches the model from the next request; the thinking level is clamped to it.
     pub async fn set_model(&self, model: Model) -> Result<(), Error> {
         let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-        detached(async move { hooks.select_model(&agent, model).await }).await
+        detached(async move { hooks.select_model(&agent, model, None).await }).await
     }
 
     /// Sets the thinking level from the next request, clamped to the model; returns the

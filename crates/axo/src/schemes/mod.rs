@@ -23,6 +23,23 @@ static EMBEDDED: LazyLock<Regex> =
 static HOST_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9+.-]+$").expect("valid regex"));
 
+pub(crate) fn check_harness_name(name: &str) -> Result<(), crate::Error> {
+    if !HOST_NAME.is_match(name) {
+        return Err(crate::Error::Scheme(format!(
+            "Invalid harness name: {name}"
+        )));
+    }
+    if matches!(
+        name,
+        "artifact" | "file" | "skill" | "local" | "proc" | "agent"
+    ) {
+        return Err(crate::Error::Scheme(format!(
+            "Harness name {name} is reserved"
+        )));
+    }
+    Ok(())
+}
+
 fn split(text: &str) -> Option<(String, &str)> {
     let captures = URL.captures(text)?;
     Some((captures[1].to_ascii_lowercase(), captures.get(2)?.as_str()))

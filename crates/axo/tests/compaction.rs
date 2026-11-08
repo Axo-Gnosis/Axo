@@ -537,7 +537,9 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
     let dir = tempfile::tempdir().unwrap();
     let mut opts = options(dir.path());
     opts.project_access = Some(axo::ProjectAccess::Read);
-    let rules = include_str!("../prompts/SUMMARY.md").trim();
+    let rules = include_str!("../prompts/SUMMARY.md")
+        .trim()
+        .replace("{name}", "axo");
     let host = common::host(
         dir.path(),
         json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),

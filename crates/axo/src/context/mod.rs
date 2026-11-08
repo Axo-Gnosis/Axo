@@ -2,7 +2,9 @@
 //!
 //! Loaders never fail: problems become [`Diagnostic`]s that the session logs.
 
+pub mod agents;
 pub mod files;
+pub(crate) mod markdown;
 pub(crate) mod prompt;
 pub mod skills;
 

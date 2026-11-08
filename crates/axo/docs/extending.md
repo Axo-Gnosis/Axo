@@ -10,8 +10,10 @@ axo reads the ecosystem files itself; everything else arrives from the host, in 
 - **Prompt overrides (`ConfigLayer::prompts`):** The user and project layers may override `SYSTEM`, `WORK`, `PROSE`, or the summarizer prompts (`SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`); the project's override wins per name. An empty `SYSTEM`, `WORK`, or `PROSE` override disables that prompt section, an empty summarizer override keeps the bundled prompt with a `Diagnostic`, and a name outside `PROMPT_NAMES` is an `Error::Config`.
 - **Skills (`.agents/skills/<name>/SKILL.md`, host skill roots, and `~/.agents/skills/<name>/SKILL.md`):** Package task instructions and reference files that the model reads on demand from `<available_skills>` or the user invokes inline with `/<name> [args]`. Roots are searched in order: project `.agents/skills` (needs project access and `project.files.skills`), each `UserConfig::skill_roots` entry, then `~/.agents/skills` (only with `homeAgentsDir: true`). Optional `argument-hint` frontmatter is the placeholder apps show after `/<name>`; a skill named like a built-in command (`compact`, `shake`, `model`, `thinking`, `navigate`) gets a warning diagnostic and is left out of the command catalog. See [`prompts-and-context.md`](prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
 - **Custom providers and model patches (`axo_ai::ModelsConfig`):** The host's `ModelsConfig` registers OpenAI- or Anthropic-compatible endpoints, custom headers, literal or `$ENV` API keys, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `cost`, `compat`). Config values starting with `!` are rejected; hosts resolve command-based secrets before passing configuration. See [`configuration.md`](configuration.md#models-axo_aimodelsconfig--credentials).
+- **Agent definitions:** Supply `*.md` files with YAML frontmatter in `ConfigLayer::agent_roots` (project roots require `Trust`), or `AgentSpec` values through `SessionOptions::agents`. Select a root persona with `SessionOptions::agent`; its body, tool allowlist, context-file switches, and section removals configure the session. See [Agent definitions](prompts-and-context.md#agent-definitions).
+- **Model roles:** User-only `modelRoles` maps role names to model selectors. `SessionOptions::model`, agent models, `defaultModel`, and `/model` accept `provider/model`, `@role`, optional `:thinking` suffixes, or `:thinking` alone. See [Model selectors](configuration.md#model-selectors).
 
-Start-time diagnostics for context files, skills, schemes and bundled docs, prompt overrides, host sections, and reserved command names are available through `session.diagnostics()` and still logged as warnings. Runtime `NestedContext` read errors are only logged; they are not added to that startup snapshot.
+Start-time diagnostics for context files, skills, agent definitions and tool allowlists, schemes and bundled docs, prompt overrides, host sections, and reserved command names are available through `session.diagnostics()` and still logged as warnings. Runtime `NestedContext` read errors are only logged; they are not added to that startup snapshot.
 
 ## 2. Embedding `axo` in a Rust Host
 
@@ -75,6 +77,8 @@ let session = axo
     .create_session(SessionOptions {
         cwd: PathBuf::from("/repo/my-project"),
         model: Some("anthropic/claude-sonnet-4-5".into()),
+        agent: None,
+        agents: Vec::new(),
         thinking: None,
         ask_enabled: true,
         project_access: None,
@@ -162,8 +166,9 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `fork` | `async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error>` | Copies the root-to-`entry_id` path (to its parent when `entry_id` is a user message, returned as `Fork::editable`) into a new session; see [Attaching, Navigating & Forking](sessions-and-compaction.md#attaching-navigating--forking-session) |
 | `reload_exec_env` | `async fn reload_exec_env(&self)` | Invalidates and re-resolves the `ExecEnv` (such as a Nix flake dev shell), queuing a `dev_shell` system-prompt diff if the note changed |
 | `commands` | `fn commands(&self) -> Vec<CommandInfo>` | The command catalog a host may offer: the five built-ins, then each skill whose name is not reserved. See [Commands](#commands) |
-| `run_command` | `async fn run_command(&self, command: Command) -> Result<(), Error>` | Runs a built-in `Command` under its policy; the only way a built-in runs. `Command::Model` takes `provider/id` only (otherwise `Error::ModelNotFound`) |
+| `run_command` | `async fn run_command(&self, command: Command) -> Result<(), Error>` | Runs a built-in `Command` under its policy; the only way a built-in runs. `Command::Model` accepts [model selectors](configuration.md#model-selectors), including roles and thinking-only changes |
 | `id` / `path` / `skills` | `fn id(&self) -> &str`<br>`fn path(&self) -> &Path`<br>`fn skills(&self) -> &[Skill]` | The header UUIDv7 (known before the file exists); the session file, created lazily on the first submission; the skills loaded at start, which feed the prompt catalog and `/name` commands |
+| `agents` | `fn agents(&self) -> &[AgentDef]` | Agent and team definitions loaded at start; forks share them. Select a root with `SessionOptions::agent`; a missing name or a team is `Error::AgentNotFound`. Reopening must pass the root name again |
 | `diagnostics` | `fn diagnostics(&self) -> &[Diagnostic]` | Start-time diagnostics retained for the host and still logged as warnings; excludes runtime `NestedContext` read errors, which are only logged |
 | `schemes` | `fn schemes(&self) -> &Schemes` | This session's URL schemes for hosts resolving URLs they display: `exact`, then `resolve`, then `read` for `Target::Virtual`; a fork resolves to its own files |
 | `jobs` | `fn jobs(&self) -> Vec<JobInfo>` | This session's background jobs, ascending: promoted, retained and rebuilt jobs, finished ones included, exactly the jobs `read proc://` lists. See [Background jobs for hosts](#background-jobs-for-hosts) |
@@ -204,7 +209,7 @@ Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
 | :--- | :--- | :--- | :--- |
 | `compact` | `/compact [focus…]` | `WhenIdle` | `compact(focus)` |
 | `shake` | `/shake <elide\|images\|thinking>` | `WhenIdle` | `shake(mode)` |
-| `model` | `/model <provider/id>` | `Alongside` | `set_model` with the catalog model |
+| `model` | `/model <selector>` | `Alongside` | Select a model and/or thinking level using the [model selector grammar](configuration.md#model-selectors) |
 | `thinking` | `/thinking <level>` | `Alongside` | `set_thinking(level)` |
 | `navigate` | `/navigate <entry> [true\|false] [focus…]` | `WhenIdle` | `navigate(Some(entry), NavigateOptions { summarize, focus })`; focus requires `true` |
 | each skill | `/<name> <free text>` | `Queued` | Prompt text: expanded, then sent through whichever of `prompt`, `steer`, or `follow_up` the app used |

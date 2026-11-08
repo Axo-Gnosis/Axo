@@ -20,6 +20,7 @@ fn project(origin: &str, system: &str, settings: Option<Value>) -> ConfigLayer {
     ConfigLayer {
         origin: origin.into(),
         settings,
+        agent_roots: Vec::new(),
         prompts: [(
             "SYSTEM".to_owned(),
             PromptOverride {

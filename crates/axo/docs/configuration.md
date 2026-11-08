@@ -15,10 +15,10 @@ An error from either method fails that `create_session`, `open_session`, or `sch
 
 | Type | Fields | Meaning |
 | :--- | :--- | :--- |
-| `ConfigLayer` | `origin: String`, `settings: Option<Value>`, `prompts: IndexMap<String, PromptOverride>` | One raw, unvalidated contribution. `origin` names the layer in errors and warnings (a path, a URL, `"host defaults"`, …). `settings` is the [settings](#settings-axosettings) object; `None` and `Some(Value::Null)` both mean no settings. `prompts` is keyed by a `PROMPT_NAMES` entry: a missing key means no override, an empty text is an override |
+| `ConfigLayer` | `origin: String`, `settings: Option<Value>`, `prompts: IndexMap<String, PromptOverride>`, `agent_roots: Vec<PathBuf>` | One raw, unvalidated contribution. `origin` names the layer in errors and warnings (a path, a URL, `"host defaults"`, …). `settings` is the [settings](#settings-axosettings) object; `None` and `Some(Value::Null)` both mean no settings. `prompts` is keyed by a `PROMPT_NAMES` entry: a missing key means no override, an empty text is an override. Agent roots are explicit directories, honored on the project layer only at `Trust` |
 | `PromptOverride` | `origin: String`, `text: String` | One prompt override as the host holds it; `text` is untrimmed, axo trims it |
 | `UserConfig` | `layer: ConfigLayer`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>` | The user's layer plus the user's filesystem resources: skill roots searched after project `.agents/skills` and before `~/.agents/skills`, and context files loaded after `~/.agents/AGENTS.md` and before the project walk (missing files are skipped) |
-| `EffectiveConfig` | `access: ProjectAccess`, `settings: Settings`, `prompts: IndexMap<String, PromptOverride>`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>` | What one session runs with: the effective access, the merged and filtered settings (`defaultModel` still unresolved; see `EffectiveConfig::default_model`), the trimmed prompt overrides (the project's wins per name), and the user's skill roots and context files |
+| `EffectiveConfig` | `access: ProjectAccess`, `settings: Settings`, `prompts: IndexMap<String, PromptOverride>`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>`, `agent_roots: Vec<PathBuf>` | What one session runs with: the effective access, merged and filtered settings (`defaultModel` still unresolved; see `EffectiveConfig::default_model`), trimmed prompt overrides (the project's wins per name), user skill roots and context files, and agent roots (trusted project roots first, then user roots) |
 
 `PROMPT_NAMES` lists the overridable prompts: `SYSTEM`, `WORK`, `PROSE` (system prompt sections; an empty override disables the section) and `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY` (summarizer prompts; an empty override records a `Diagnostic` and keeps the bundled prompt). See [`prompts-and-context.md`](prompts-and-context.md).
 
@@ -30,10 +30,10 @@ An error from either method fails that `create_session`, `open_session`, or `sch
 2. **Validate the user settings on their own:** `None` or `null` is no settings; a non-object is `Error::Config { origin, message: "expected a JSON object" }`; a value that does not deserialize as `Settings` is `Error::Config` with the layer's `origin` and the deserializer's message. The valid object is merged over the defaults.
 3. **Validate the user prompt overrides:** a name outside `PROMPT_NAMES` is `Error::Config` with that override's `origin` and the message `unknown prompt override "<name>"`; texts are trimmed.
 4. **Derive access:** an explicit `access` wins; otherwise the `project` policy of this same user sample decides via `ProjectSettings::access_for(project_root(cwd))` (see [Project access](#project-access-project--axoprojectsettings)). A project layer can never raise its own access.
-5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project` and `homeAgentsDir`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project settings or prompt overrides apply.
+5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project`, `homeAgentsDir`, and `modelRoles`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. Project agent roots apply only at `Trust`; at `Read`, non-empty roots are ignored with a warning. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project contribution applies.
 6. **Deserialize the merged object** into `Settings`; an error is attributed to the last applied origin (the project's when project settings were merged, else the user's). Below `Trust`, any enabled `bash.devShell` resolves to `"off"`, regardless of which layer enabled it, with one warning naming that setting's winning origin.
 
-`defaultModel` is not resolved here: `EffectiveConfig::default_model` expands its `$VAR` at model selection and rejects values starting with `!`, only when neither `SessionOptions::model` nor the session's recorded model selects one (see [Config values](#config-values)).
+`defaultModel` is not resolved here: `EffectiveConfig::default_model` expands its `$VAR` at model selection and rejects values starting with `!`, only when neither `SessionOptions::model`, the session's recorded model, nor the root agent's model selects one (see [Config values](#config-values)).
 
 Unknown keys are ignored in every layer.
 
@@ -63,7 +63,9 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 | Models and credentials | `Axo::builder(models, ..)` with an `Arc<Models>` | The host builds `Models` with `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials, http_client })`; see [Models & Credentials](#models-axo_aimodelsconfig--credentials) |
 | Session store | `Axo::builder(.., store)` with an `Arc<dyn SessionStore>` | `JsonlStore::new(root)` writes `<root>/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`, per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` (`local://<path>`): model scratch files and content handed over in prompts (see [Prompt Parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs)). Forks copy both directories |
 | Cache directory | `AxoBuilder::cache_dir(PathBuf)` | Bundled documentation materialized under `<cache_dir>/docs/` (the `docs` section and `axo://` URLs) and captured Nix dev-shell environments under `<cache_dir>/devshell/`. The `models.dev` catalog cache is separate: it lives wherever the host points `ModelsOptions::cache_dir` |
+| Harness name | `AxoBuilder::name(name) -> Result<Self, Error>` | Defaults to `axo`; names the docs scheme and section and the bundled `SYSTEM`/`SUMMARY` self-references. Names must match `^[a-z][a-z0-9+.-]+$`; `artifact`, `file`, `skill`, `local`, `proc`, and `agent` are reserved. Invalid or reserved names return `Error::Scheme` here; `build()` stays infallible |
 | User skills and context files | `UserConfig::skill_roots`, `UserConfig::context_files` | Skill roots (`<root>/<skill>/SKILL.md`) and user-wide instruction files, in the order given |
+| Agent definitions | `ConfigLayer::agent_roots` | Explicit roots recursively searched for frontmatter-bearing `*.md` files; trusted project roots precede user roots. No implicit `.agents/` discovery. See [Agent definitions](prompts-and-context.md#agent-definitions) |
 
 With `homeAgentsDir: true` in the user layer, axo also reads the ecosystem files `~/.agents/AGENTS.md` (before `UserConfig::context_files`) and `~/.agents/skills/` (after `UserConfig::skill_roots`).
 
@@ -84,6 +86,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 ```json
 {
   "defaultModel": "anthropic/claude-sonnet-4-5",
+  "modelRoles": {},
   "defaultThinkingLevel": "medium",
   "homeAgentsDir": false,
   "steeringMode": "one-at-a-time",
@@ -137,13 +140,24 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 
 | Key | Rust field | Default | Scope | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `defaultModel` | `default_model` | `None` | User or project | Model selector `provider/id` (the ID may itself contain `/`); a bare ID is not looked up. Accepts `$ENV` (see [Config values](#config-values)); resolved by `EffectiveConfig::default_model` only when a session falls back to it and references `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged). Values starting with `!` are rejected when selected |
+| `defaultModel` | `default_model` | `None` | User or project | A [model selector](#model-selectors). Accepts `$ENV` (see [Config values](#config-values)); resolved by `EffectiveConfig::default_model` only when a session falls back to it and references `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged). Values starting with `!` are rejected when selected |
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
+| `modelRoles` | `model_roles` | `{}` | User only | Role name → selector (`provider/model[:thinking]` or `:thinking`); expanded by `@role`. A role cannot name another role. Ignored with a warning in project settings |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |
 | `steeringMode` | `steering_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
 | `followUpMode` | `follow_up_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
 | `contextFiles` | `context_files` | 5 built-in names | User or project | Ordered map of relative paths to booleans merged onto the built-in default map |
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
+
+### Model selectors
+
+Model strings in `SessionOptions::model`, `defaultModel`, agent definitions, and `/model` accept `provider/model`, `@role`, either with `:thinking`, or `:thinking` alone. A bare model ID is not looked up. Exact model matches are tried before splitting a final thinking suffix, so IDs such as `ollama/qwen3:8b` remain intact.
+
+For example, user settings `"modelRoles": {"bard": "anthropic/claude-sonnet-4-5:high"}` make `@bard:low` choose that model with low thinking. The selector's suffix overrides the role value's suffix. An unknown role is `Error::UnknownModelRole`; a role naming another role, or an invalid thinking-only or role suffix, is `Error::InvalidModelSelector`. An unmatched plain selector is `Error::ModelNotFound`. Hosts can call `Settings::resolve_model(&Models, selector)` to obtain a `ModelChoice` containing a model, a thinking level, or both.
+
+At session start, model sources are `SessionOptions::model`, the session's last model, the root agent's model, then `defaultModel`. Thinking-only selectors continue to the next source; the first model wins, and later sources are not consulted. Thinking uses explicit `SessionOptions::thinking`, then the first selector thinking level encountered through the winning model, then the recorded thinking level, then `defaultThinkingLevel`, clamped to the model. If no source supplies a model, start returns `Error::NoModel`.
+
+`/model` accepts the same selectors through `Session::run_command`: a thinking-only selector keeps the current model, and a model selector without a thinking suffix preserves the current thinking level (clamped to the new model). `Session::set_model` still takes a resolved `Model`, not a string.
 
 ### Project access (`project` / `axo::ProjectSettings`)
 

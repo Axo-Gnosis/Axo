@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
-use axo_ai::ThinkingLevel;
+use axo_ai::{Model, Models, ThinkingLevel};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -23,6 +23,8 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 pub struct Settings {
     /// `provider/model-id`.
     pub default_model: Option<String>,
+    /// Role name → selector (`provider/model[:thinking]` or `:thinking`); `@role` selectors expand through it. User settings only.
+    pub model_roles: IndexMap<String, String>,
     pub default_thinking_level: ThinkingLevel,
     /// User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`.
     pub home_agents_dir: bool,
@@ -41,6 +43,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             default_model: None,
+            model_roles: IndexMap::new(),
             default_thinking_level: ThinkingLevel::Medium,
             home_agents_dir: false,
             steering_mode: QueueMode::OneAtATime,
@@ -54,6 +57,83 @@ impl Default for Settings {
             retry: RetrySettings::default(),
         }
     }
+}
+
+/// What a model selector picks: a model, a thinking level, or both (never neither).
+#[derive(Debug, Clone)]
+pub struct ModelChoice {
+    /// The selected model, if the selector names one.
+    pub model: Option<Model>,
+    /// The selected thinking level, if the selector names one.
+    pub thinking: Option<ThinkingLevel>,
+}
+
+impl Settings {
+    /// Resolves a model selector, expanding a user-defined `@role` if present.
+    pub fn resolve_model(&self, models: &Models, selector: &str) -> Result<ModelChoice, Error> {
+        let Some(rest) = selector.strip_prefix('@') else {
+            return plain(models, selector);
+        };
+        let (name, level) = match rest.split_once(':') {
+            Some((name, level)) => (name, Some(level)),
+            None => (rest, None),
+        };
+        let thinking = level
+            .map(|level| {
+                level
+                    .parse::<ThinkingLevel>()
+                    .map_err(|message| Error::InvalidModelSelector {
+                        selector: selector.to_owned(),
+                        message,
+                    })
+            })
+            .transpose()?;
+        let value = self
+            .model_roles
+            .get(name)
+            .ok_or_else(|| Error::UnknownModelRole(name.to_owned()))?;
+        if value.starts_with('@') {
+            return Err(Error::InvalidModelSelector {
+                selector: value.clone(),
+                message: format!("model role \"{name}\" names another role"),
+            });
+        }
+        let mut choice = plain(models, value)?;
+        choice.thinking = thinking.or(choice.thinking);
+        Ok(choice)
+    }
+}
+
+fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
+    if let Some(level) = selector.strip_prefix(':') {
+        let thinking =
+            level
+                .parse::<ThinkingLevel>()
+                .map_err(|message| Error::InvalidModelSelector {
+                    selector: selector.to_owned(),
+                    message,
+                })?;
+        return Ok(ModelChoice {
+            model: None,
+            thinking: Some(thinking),
+        });
+    }
+    if let Some(model) = models.find(selector) {
+        return Ok(ModelChoice {
+            model: Some(model.clone()),
+            thinking: None,
+        });
+    }
+    if let Some((prefix, level)) = selector.rsplit_once(':')
+        && let Ok(thinking) = level.parse::<ThinkingLevel>()
+        && let Some(model) = models.find(prefix)
+    {
+        return Ok(ModelChoice {
+            model: Some(model.clone()),
+            thinking: Some(thinking),
+        });
+    }
+    Err(Error::ModelNotFound(selector.to_owned()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -261,6 +341,9 @@ pub struct ConfigLayer {
     pub settings: Option<Value>,
     /// Overrides keyed by a `PROMPT_NAMES` entry. A missing key means no override; an empty text is an override.
     pub prompts: IndexMap<String, PromptOverride>,
+    /// Agent definition roots, walked recursively for `*.md`. On the project layer
+    /// they are honored only at `ProjectAccess::Trust`.
+    pub agent_roots: Vec<PathBuf>,
 }
 
 /// The user's configuration: the layer plus the user's filesystem resources.
@@ -295,6 +378,8 @@ pub struct EffectiveConfig {
     /// Trimmed. The project's override wins per name.
     pub prompts: IndexMap<String, PromptOverride>,
     pub skill_roots: Vec<PathBuf>,
+    /// Trusted project agent roots, followed by user agent roots.
+    pub agent_roots: Vec<PathBuf>,
     pub context_files: Vec<PathBuf>,
 }
 
@@ -309,7 +394,7 @@ impl EffectiveConfig {
         cwd: &Path,
         access: Option<ProjectAccess>,
     ) -> Result<Self, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir"];
+        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir", "modelRoles"];
 
         let UserConfig {
             layer: user,
@@ -329,8 +414,14 @@ impl EffectiveConfig {
 
         let mut project_origin = None;
         let mut dev_shell_from_project = false;
+        let mut agent_roots = Vec::new();
         if access != ProjectAccess::Ignore && policy.files.config {
             let project = source.project(cwd)?;
+            if access == ProjectAccess::Trust {
+                agent_roots.extend(project.agent_roots);
+            } else if !project.agent_roots.is_empty() {
+                tracing::warn!(origin = %project.origin, "agent roots need a trusted project; ignored");
+            }
             if let Some((mut value, _)) = validate(&project.origin, project.settings)? {
                 let object = value.as_object_mut().expect("validated settings object");
                 filter_project(object, USER_ONLY_KEYS, &project.origin);
@@ -340,6 +431,7 @@ impl EffectiveConfig {
             }
             prompts.extend(prompt_overrides(project.prompts)?);
         }
+        agent_roots.extend(user.agent_roots);
         let origin = project_origin.as_deref().unwrap_or(&user.origin);
         let mut settings: Settings =
             serde_json::from_value(merged).map_err(|error| config_error(origin, error))?;
@@ -357,6 +449,7 @@ impl EffectiveConfig {
             settings,
             prompts,
             skill_roots,
+            agent_roots,
             context_files,
         })
     }

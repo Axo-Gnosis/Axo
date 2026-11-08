@@ -277,20 +277,20 @@ Key risks to design around when building step 3 (script hooks):
 
 ## Track 2: Agents (`AgentSpec`, root agent, `task`, teams)
 
-Notes from the design discussion of 2026-11-04 to 2026-11-07, grounded in [`research/subagents.md`](research/subagents.md) (omp, dsh, Codex, Claude Code, pi, OpenCode, Gemini, Amp, ACP). Items marked **Decided** are settled; **Direction** items are the agreed shape pending detail; the numbered open questions at the end are not yet discussed. Nothing here is implemented.
+Notes from the design discussion of 2026-11-04 to 2026-11-07, grounded in [`research/subagents.md`](research/subagents.md) (omp, dsh, Codex, Claude Code, pi, OpenCode, Gemini, Amp, ACP). Items marked **Decided** are settled; **Direction** items are the agreed shape pending detail; the numbered open questions at the end are not yet discussed. Build step 1 (Phase 1: selectors, agent definitions and the root agent, `AxoBuilder::name`) is implemented; the rest is not.
 
 ### Where we landed
 
 - **Decided: axo bundles no agent and no role names.** Every running agent, root or child, is a definition a host, user or project handed axo. The harness owns the format, the resolution and the lifecycle; hosts own the personas, the workflows that use them, and every name in the alias table.
 - **Decided: one agent-definition format for the root session and children.** The root session is an agent the host designates, not "the harness, configured". A persona like Toph's Axophyte is one file among many; a host selects a different one per conversation (a planner for `/plan`, a reviewer for `/review`).
 - **Decided: children are continuable sessions spawned asynchronously, messaging their parent through the job registry.** No blocking spawn mode. Siblings cannot talk unless spawned as a team.
-- **Decided: the extensibility seams are the policy surface.** axo has no approvals; every spawn decision point (spawn, model, tools, messages) is visible to `ToolHooks::before_tool_call` with the *resolved* spec, and the hook may block, rewrite, or await a host decision. Children run the parent's hooks plus whatever the host adds for that child, never fewer.
+- **Decided: the extensibility seams are the policy surface.** axo has no approvals; spawn decisions are visible to a spawn hook, a new trait in `axo` supplied as `SessionOptions.spawn_hooks` and inherited by children. It is called inside `Session::spawn` with the resolved agent, model, tools, prompt, output schema, depth, team and origin, and returns `Allow`, `Block(reason)` or `Replace(AgentSpec)`; it may await. `ToolHooks::before_tool_call` is unchanged: it sees only the raw `ToolCall`, and `ToolCallDecision` is `Allow | Block`. Children run the parent's hooks plus whatever the host adds for that child, never fewer.
 
 ### Q1 Registry: child sessions are job-registry rows (Decided)
 
 `JobRegistry` splits into a generic delivery layer (ids, `Mode`, admission, `Delivery` state machine, receipts on messages, `job_start` riding the admitting tool result, `job_end` before deliverability, `results_ready` idle-wake, `wait` reservation, rebuild from journal, shutdown) and a per-kind execution record. `Job` gains `kind: Command { command, artifact, spool, phase, container } | Child { session_id, agent, model, team }`; `JobStart`/`JobEnd` carry a `kind` with `Entry::Unknown`-safe defaults. `wait`, `proc://`, `Session::jobs()`, kill and idle-wake need no second code path. Children get their own name space (not `bg_N`) so kill targets are unambiguous.
 
-The registry row is the **delivery contract**, not the child's lifetime: a child's `job_end` is written when it produces a result; the child session itself lives in a **session table on `Axo`** (live or parked by id) so `task` finds an existing child on reopen, hosts can `attach()` to it, and a later message to a finished child admits a new row for the new result. Forks get a new registry (existing rule) but see the same session table. Alternatives rejected: a separate child registry (dsh, Codex) duplicates the exactly-once proof and splits `wait`; a shared generic core extracted from both is more code for the same outcome.
+The registry row is the **delivery contract**, not the child's lifetime: a child's `job_end` is written when it produces a result; the child session itself lives in a **session table created by `Axo` and placed in `Inherited`** (so sessions, `task` and `agent://` reach it) so `task` finds an existing child on reopen, hosts can `attach()` to it, and a later message to a finished child admits a new row for the new result. Hosts use `Axo::session(id)`, which returns a live child or revives a parked one; there is no separate `Axo::open_session(id)` for children. Forks get a new registry (existing rule) but see the same session table. Alternatives rejected: a separate child registry (dsh, Codex) duplicates the exactly-once proof and splits `wait`; a shared generic core extracted from both is more code for the same outcome.
 
 ### Q2 Spawn mode: async only (Decided)
 
@@ -298,37 +298,37 @@ The registry row is the **delivery contract**, not the child's lifetime: a child
 
 ### Q5/Q6 Messaging and teams (Decided)
 
-- Parent ↔ child, both directions, always. Child → parent messages (results, requests, progress) are registry rows: exactly-once, wake an idle parent, and **queue** when the parent is mid-turn (a child never steers like a person or the parent). Parent → child messages use the child's own queue rules (steer, follow-up, abort).
+- Parent ↔ child, both directions, always. Child → parent messages (results, requests, progress) are messages of the child's registry row: exactly-once, wake an idle parent, and **queue** when the parent is mid-turn (a child never steers like a person or the parent). The registry's deliverable unit becomes a message; a command row has exactly one, its result. Parent → child messages use the child's own queue rules (steer, follow-up, abort).
 - Children are continuable: a stable id the parent can message after spawn and after a result.
 - **Teams** switch sibling routing on for one group: the children admitted by one `task` call with `team: true`, or by a team definition. Members get a roster (instance names, one-line briefs) and may address the parent or a named teammate; no broadcast. Results flow to the parent. Shared cancel scope with the admitting call. The registry needs omp's mutual-wait check (every live member waiting, nothing pending → fail the waits).
 - **Team definition** = a markdown file in the agent roots distinguished by `members:`; `members[].agent` names an agent, `as` the roster name, `brief` a fixed per-member instruction; the body is the team charter appended to every member's prompt. Spawnable by name (`task(agent: "review-team", context, tasks?: {name: text})`), from a skill with no code, ad hoc (`team: true` with named or inline members, optional `charter`), or by a host in Rust; all build one `TeamSpec`. Not in v1: nested teams, `count:`, per-member model override.
 
 ### Q3 Ad-hoc agents: allowed, narrow-only (Decided)
 
-`task` accepts `agent: "<name>"` or an inline `spec: { prompt, tools?, model?, output? }`. Inline fields can only restrict: `tools` ⊆ the parent's effective set, `model` any selector (see Q4), `ProjectAccess`, `ExecEnv`, supervision, host hooks, depth and concurrency have no field and are inherited. The inline `prompt` follows axo's fixed delegation framing, which it cannot remove. Omitting both `agent` and `spec` spawns a plain delegate of the parent. The tool description steers toward defined agents; a host that wants omp's strictness blocks inline specs in `before_tool_call`.
+`task` accepts `agent: "<name>"` or an inline `spec: { prompt, tools?, model?, output? }`. Inline fields can only restrict: `tools` ⊆ the parent's effective set, `model` any selector (see Q4), `ProjectAccess`, `ExecEnv`, supervision, host hooks, depth and concurrency have no field and are inherited. The inline `prompt` follows axo's fixed delegation framing, which it cannot remove. Omitting both `agent` and `spec` spawns a plain delegate of the parent. The tool description steers toward defined agents; a host that wants omp's strictness blocks inline specs in the spawn hook.
 
 ### Q4 Models and aliases (Decided)
 
 - `modelRoles` (user-only settings key, empty by default, host-filled) maps a name to a selector. No built-in names; host workloads (`plan`, `commit`, …) define their own and axo only resolves them.
-- One selector grammar everywhere (`SessionOptions.model`, `/model`, agent files, `task`): `[@alias | provider/model][:thinking]`; bare `:thinking` keeps the model and overrides thinking; `@x` with no entry is an error, never a fallback. Public `Axo::resolve_model`.
+- One selector grammar everywhere (`SessionOptions.model`, `/model`, agent files, `task`): `[@alias | provider/model][:thinking]`; bare `:thinking` keeps the model and overrides thinking; `@x` with no entry is an error, never a fallback. Public `Settings::resolve_model(&Models, selector) -> ModelChoice`; model ids are matched exactly before a `:thinking` suffix is split off.
 - Child cascade, one resolver: `task(model:)` → `subagents.models[<agent name>]` → `AgentSpec.model` → `subagents.defaultModel` → parent's live model and thinking. Both `subagents.*` keys are user-only and take the same grammar; team members resolve by their `agent` name.
-- `task` may name any model free-form (a no-alias user must still be able to pick); the description says to inherit unless asked or warranted; hosts gate or rewrite in `ToolHooks::before_tool_call`. The spawn record keeps the winning selector string next to the expanded id.
+- `task` may name any model free-form (a no-alias user must still be able to pick); the description says to inherit unless asked or warranted; hosts gate or rewrite in the spawn hook. The spawn record keeps the winning selector string next to the expanded id.
 
 ### Q7 Context: per-agent switches over shared defaults (Decided)
 
-Every named piece of context is individually switchable per agent with one vocabulary at three levels, resolved **settings → `subagents.*` (children only) → the agent's frontmatter → host `SessionOptions.sections`/`tools`**, last writer wins:
+Every named piece of context is individually switchable per agent with one vocabulary at three levels, resolved **settings → `subagents.*` (children only) → the agent's frontmatter → host `SessionOptions.sections`/`tools`**, last writer wins; the agent's `tools` allowlist filters host tools as well as built-ins; an empty body leaves `system` as it is:
 
 - `contextFiles` (the existing name→bool map; `false` = all off), `sections` (name→bool over built-in and host section names), `tools`, `model`, `output`.
 - Built-in default for children: context files **off** (omp's rule), skills, docs, cwd, dev shell on. The root default is today's behavior.
 - The agent body is the `system` section text (root) or follows the fixed delegation framing (child); `WORK`, `PROSE` and the summarizer prompts stay as prompt overrides because they are shared texts, not personas. `prompts/SYSTEM.md` becomes unnecessary once a root agent is used.
 - Inherited with no override: cwd, `ProjectAccess`, `ExecEnv`, supervision, host hooks, the parent's resolved `EffectiveConfig`. Not included: the parent transcript (a Codex-style filtered `fork` mode is a later addition if a case demands it). `ask` is removed from children; a child asks its parent.
-- The child's header records `parent_session`, the spawning call id, depth, agent name and winning selector; `Session::agent()` exposes the kind to hosts (e.g. a memory hook that skips children).
+- The child's header sets `parent_session` (the parent's file path, as forks do, with `forked_from` `None`) and a separate `spawn: SpawnLink { parentSessionId, callId, depth, agent, model }`; `Session::agent()` exposes the kind to hosts (e.g. a memory hook that skips children).
 
 ### Agent definitions and where they live (Decided)
 
 - `AgentSpec` is plain data: `name`, `description`, `model`, `tools`, `contextFiles`, `sections`, `output` (JSON Schema), body; a team adds `members`. Markdown + YAML frontmatter, body = prompt; `name` from frontmatter or file stem. omp keys (`blocking`, `spawns`, `thinkingLevel`) tolerated and ignored.
-- Hosts supply roots, not parsed values: `UserConfig.agent_roots: Vec<PathBuf>` and the same on the project `ConfigLayer` (applied only at `Trust`), mirroring `skill_roots`; axo walks each root recursively for `*.md`, kind from frontmatter, structure is the user's. One namespace for agents and teams; first name wins in root order; `SessionOptions.agents` programmatic specs come last. **Nothing new is read from `.agents/`** (supersedes the `.agents/agents` idea in [`research/agents-dir.md`](research/agents-dir.md)).
-- Root selection: `SessionOptions.agent: Option<AgentRef>`; `None` keeps the bundled `SYSTEM` and settings-only behavior.
+- Hosts supply roots, not parsed values: `ConfigLayer.agent_roots: Vec<PathBuf>` on the user layer, plus the project layer at `Trust`, mirroring `skill_roots`; axo walks each root recursively for `*.md`, kind from frontmatter, structure is the user's. Files without a frontmatter block are skipped; names follow the skill rule and violations drop the definition. One namespace for agents and teams; first name wins in root order; `SessionOptions.agents` programmatic specs come last. **Nothing new is read from `.agents/`** (supersedes the `.agents/agents` idea in [`research/agents-dir.md`](research/agents-dir.md)).
+- Root selection: `SessionOptions.agent: Option<String>`; `None` keeps the bundled `SYSTEM` and settings-only behavior. An unknown name or a team is `Error::AgentNotFound`; reopen passes it again; forks inherit it.
 
 ### Q8 Budgets: depth, concurrency, turns (Decided)
 
@@ -340,25 +340,25 @@ All user-only settings under `subagents`; no concurrency control exists in axo t
 | `maxConcurrent` | 8 | counted as running child turns across the whole tree under one root (idle, finished children hold no slot); excess spawns are queued in order, not failed; a team's members are admitted together or not yet |
 | `maxTurns` | 50 | per run of a child (a turn is one model request inside a run); overridable per agent in frontmatter; at the cap pending tool calls are answered "turn budget exhausted", one wrap-up turn runs with no tools (or only `yield`), the result is delivered flagged as partial, and a parent follow-up starts a fresh run with a fresh budget |
 
-No wall-clock timeout (a slow model should not fail a correct child; the parent kills via `proc://`). Finished children park immediately (drop the `Session`, keep the JSONL) and revive on message; no idle TTL. Per-provider request limiting (a `Semaphore` around `stream` in `axo-ai`, configured per provider in the models config) is deferred and independent; `maxConcurrent` bounds the damage meanwhile. The root session has no turn cap: the user is watching it.
+No wall-clock timeout (a slow model should not fail a correct child; the parent kills via `proc://`). A child parks (leaves the session table, file kept) only when idle and owning no running background jobs, because dropping a `Session` kills its jobs. Parked children revive on message; no idle TTL. Per-provider request limiting (a `Semaphore` around `stream` in `axo-ai`, configured per provider in the models config) is deferred and independent; `maxConcurrent` bounds the damage meanwhile. The root session has no turn cap: the user is watching it.
 
 ### Q9 Structured output: the `yield` tool (Decided)
 
 - An agent with `output` (JSON Schema) gets a `yield` tool whose parameter schema *is* that schema; calling it with a valid value ends the run with the value as the result. Invalid values return the validation errors as an error result and the run continues; after 3 failures, or if the model answers in text without yielding (one nudge turn first), the run ends with an error result carrying the last attempt, so the parent gets exactly one delivery either way. Agents without `output` have no `yield` tool and their final text is the result.
 - The schema comes from the agent file, the `task` call (`output` on a named or inline spec; a call overrides the file; this is how a skill like `/cleanup` imposes its findings shape without the agent knowing the skill), or host code. `{ "type": "string" }` is valid and simply forces an explicit final answer. Team members keep their own `output`; a team has none.
 - The value lives in the child's transcript as the `yield` call's byte-stable arguments and in the parent's `job_end` as the delivered text; no sidecar file, no new entry kind. `agent://<id>/result` and `agent://<id>/result/<json-pointer>` read it from the session table (reopened children are read from their journal).
-- Delivered text is capped like `bash` output with a pointer to the full result, and the shared `job_result` lowering escapes anything resembling axo's own section or wrapper tags (one check shared with `bash`, not child-specific).
+- Delivered text is capped like `bash` output with a pointer to the full result, and the shared `job_result` lowering escapes anything resembling axo's own section or wrapper tags (new escaping applied to both job results and child messages; axo escapes no tool or job output today).
 - Load-time validation: an agent file whose `output` schema does not compile is a diagnostic and the agent is dropped; an inline schema that does not compile is a `ToolError` to the parent. Independent of Track 1's `structured_content` on `ToolOutput`.
 
 ### Q10 Observation surface (Decided)
 
 - **Parent side:** children are registry rows, so the existing `SessionEvent::Jobs` fires on spawn, finish and kill with `JobInfo.kind: Child { session_id, agent, model, team }`; the `task` call entry and the delivered result message are the parent-transcript activity. No progress aggregation and no child-event forwarding with parent ids: those exist in omp and Claude because the host is across a pipe.
-- **Child side:** `Axo::session(id)` (live) / `Axo::open_session(id)` (parked, revives) from the session table; `child.attach()` returns the same stream as the root, so a host renders a child exactly like the main chat and may steer, follow up or abort it under the same rules. `Session::agent() -> Option<AgentInfo { name, depth, parent, team, model }>` identifies it.
-- **Model side (`agent://`):** `agent://<id>` = status (running / idle / finished / failed, turn count), agent and model, result if any, latest assistant text while running, so a read never fails; `agent://<id>/result[/<json-pointer>]`; `agent://<id>/transcript` = the child's conversation rendered in the `ShakeMode::Elide` form (user and assistant text in full, one line per tool call, tool results elided), with `read` line ranges applying to virtual targets. `write agent://<id>` messages the child (follow-up; steering is host-only). `proc://` lists child rows with their `agent://` link; `write proc://<id>/kill` aborts. No separate `history://` scheme. The nested paths are the same shape as `proc://bg_N/kill` and `skill://<name>/<path>`; `/result/<pointer>` is the one data-pointer path.
+- **Child side:** `Axo::session(id)` returns a live child or revives a parked one from the session table, created by `Axo` and placed in `Inherited` so sessions, `task` and `agent://` reach it; there is no separate `Axo::open_session(id)` for children. `child.attach()` returns the same stream as the root, so a host renders a child exactly like the main chat and may steer, follow up or abort it under the same rules. `Session::agent() -> Option<AgentInfo { name, depth, parent, team, model }>` identifies it.
+- **Model side (`agent://`):** `agent://<id>` = status (running / idle / finished / failed, turn count), agent and model, result if any, latest assistant text while running, so a read never fails; `agent://<id>/result[/<json-pointer>]`; `agent://<id>/transcript` = the child's conversation rendered by adapting `serialize` in `compaction/summary.rs` (user and assistant text in full, one line per tool call, tool results elided), paged with `read`'s `offset`/`limit`. `write agent://<id>` messages the child (follow-up; steering is host-only). `proc://` lists child rows with their `agent://` link; `write proc://<id>/kill` aborts. No separate `history://` scheme. The nested paths are the same shape as `proc://bg_N/kill` and `skill://<name>/<path>`; `/result/<pointer>` is the one data-pointer path.
 
 ### Per-host identity (Decided)
 
-The harness calls itself `axo` by default; a host may rename it with one `AxoBuilder::name` that drives every self-reference: the docs scheme (`<name>://README.md`), the `docs` section line, the "running in <name>" sentences in `SYSTEM` and `SUMMARY`, and the bundled docs, rendered through a `{name}` placeholder when materialized. Children inherit it. Resolves open question 10 below.
+The harness calls itself `axo` by default; a host may rename it with one `AxoBuilder::name` that drives every self-reference: the docs scheme (`<name>://README.md`), the `docs` section line, the "running in <name>" sentences in `SYSTEM` and `SUMMARY`, and the bundled docs. Bundled `SYSTEM`/`SUMMARY` carry a `{name}` placeholder; materialized docs have `axo://` rewritten to `<name>://` (crate names stay `axo`); an invalid or reserved name is an error from `AxoBuilder::name`. Children inherit it. Resolves open question 10 below.
 
 ### Deferred to Track 1
 
@@ -366,7 +366,7 @@ The parent-and-children rule, hook safety without approvals and subagents-in-scr
 
 ### Host surface (Direction)
 
-`Session::spawn(spec_or_team, prompt, call_id) -> handle` public, with `task` a thin wrapper; `ToolHooks::before_tool_call` receives resolved specs and may await a host decision. Durability follows [`research/durable.md`](research/durable.md): spawn is `Replay::Safe` keyed by `(parent_session, call_id)`; reopen never respawns.
+`Session::spawn(spec_or_team, prompt, call_id) -> handle` public, with `task` a thin wrapper; the spawn hook receives resolved specs and may await a host decision. Durability follows [`research/durable.md`](research/durable.md): spawn is `Replay::Safe` keyed by `(parent_session, call_id)`; reopen never respawns.
 
 ### Build order
 
@@ -374,7 +374,7 @@ The parent-and-children rule, hook safety without approvals and subagents-in-scr
 2. Registry kinds, session table on `Axo`, child spawn with durability links and budgets, child→parent delivery, `yield`, `agent://`.
 3. `task` (named, inline, async), parent→child messaging, teams and team files, mutual-wait check, concurrency queue.
 
-The design discussion is complete; implementation has not started.
+The design discussion is complete; build step 1 (Phase 1: selectors, agent definitions and the root agent, `AxoBuilder::name`) is implemented; the rest is not.
 
 ---
 
