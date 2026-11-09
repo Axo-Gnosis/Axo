@@ -49,7 +49,8 @@ pub enum Error {
     /// A built-in command's arguments are missing or invalid, or its name is unknown.
     #[error("/{command}: {message}")]
     InvalidCommand { command: String, message: String },
-    /// A prompt part names a missing file, or content has an invalid name.
+    /// Invalid caller input: a prompt part names a missing file, content has an invalid name,
+    /// or a spawn or team request is malformed.
     #[error("{0}")]
     InvalidInput(String),
     /// A run or maintenance operation owns the session's idle reservation.

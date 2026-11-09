@@ -15,6 +15,8 @@ use tokio::sync::{broadcast, oneshot};
 use crate::error::Error;
 use crate::session::SessionEvent;
 
+pub(crate) const ASK: &str = "ask";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Question {
@@ -255,7 +257,7 @@ impl AskTool {
 #[async_trait]
 impl Tool for AskTool {
     fn name(&self) -> &str {
-        "ask"
+        ASK
     }
 
     fn description(&self) -> &str {

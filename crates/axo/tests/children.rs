@@ -5,49 +5,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axo::{
-    AgentSpec, Entry, Error, InlineSpec, JobInfo, JobKind, RecoveryPolicy, Session, SessionEvent,
+    AgentSpec, Entry, Error, InlineSpec, JobInfo, JobKind, RecoveryPolicy, SessionEvent,
     SessionOptions, SessionTools, SpawnContext, SpawnDecision, SpawnHook, SpawnRequest,
     ToolFactory,
 };
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
-use common::{host, journal, only, options, within};
+use common::{delivered, entry, host, journal, only, options, request, until, within};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
-
-async fn until(mut ready: impl FnMut() -> bool) {
-    within(async {
-        while !ready() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-}
-
-async fn entry(session: &Session, matches: impl Fn(&Entry) -> bool) {
-    let mut attached = session.attach(None).await;
-    if attached.missed.iter().any(|seq| matches(&seq.entry)) {
-        return;
-    }
-    within(async {
-        loop {
-            match attached.events.recv().await {
-                Ok(SessionEvent::Entry(seq)) if matches(&seq.entry) => break,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
-            }
-        }
-    })
-    .await;
-}
-
-async fn delivered(session: &Session, job: &str) {
-    entry(session, |entry| {
-        matches!(entry, Entry::Message { delivered_jobs, .. } if delivered_jobs.iter().any(|id| id == job))
-    })
-    .await;
-}
 
 fn request_text(request: &RecordedRequest) -> String {
     request
@@ -65,14 +32,6 @@ fn request_text(request: &RecordedRequest) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn request(task: &str) -> SpawnRequest {
-    SpawnRequest {
-        task: task.into(),
-        model: Some("test/child".into()),
-        ..Default::default()
-    }
 }
 
 #[tokio::test]
@@ -333,6 +292,8 @@ async fn child_finishing_while_parent_closed_is_reconciled() {
         }
     })
     .await;
+    // Reconciliation runs in the background after open returns.
+    entry(&parent, |entry| matches!(entry, Entry::JobEnd { .. })).await;
     let lines = journal(&parent);
     let end = only(&lines, "reconciled result", |v| v["type"] == "job_end");
     assert_eq!(lines[end]["text"], "late result");
@@ -395,6 +356,42 @@ async fn parent_shutdown_resumes_child_on_reopen() {
             .count(),
         2
     );
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn reopen_survives_child_that_cannot_revive() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = host(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ack"))],
+    )
+    .await;
+    first.api.lane("child", vec![ScriptedTurn::HangUntilCancel]);
+    let parent = first.axo.create_session(options(dir.path())).await.unwrap();
+    let path = parent.path().to_path_buf();
+    let handle = parent.spawn(request("check")).await.unwrap();
+    until(|| first.api.requests().iter().any(|r| r.model.id == "child")).await;
+    parent.shutdown().await;
+    drop(handle);
+    drop(parent);
+
+    // The child's model is gone, so reviving its unfinished run fails.
+    let second = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ok"))],
+    )
+    .await;
+    let parent = second
+        .axo
+        .open_session(&path, options(dir.path()))
+        .await
+        .unwrap();
+    within(parent.prompt("next")).await.unwrap();
     parent.shutdown().await;
 }
 
@@ -600,5 +597,77 @@ async fn max_concurrent_queues_child_runs() {
     });
     assert_eq!(lines[second_end]["text"], "second");
     drop(second);
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn kill_before_child_run_starts_aborts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({"subagents":{"maxConcurrent":1}}),
+        vec![
+            ScriptedTurn::Reply(reply_text("p1")),
+            ScriptedTurn::Reply(reply_text("p2")),
+        ],
+    )
+    .await;
+    host.api.lane("child", vec![ScriptedTurn::HangUntilCancel]);
+    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
+    let held = parent.spawn(request("hold")).await.unwrap();
+    until(|| host.api.requests().iter().any(|r| r.model.id == "child")).await;
+    // Claimed, but waiting for the only run slot: no agent run exists yet.
+    let queued = parent.spawn(request("queued")).await.unwrap();
+    assert!(parent.kill_job(&queued.job));
+    assert!(parent.kill_job(&held.job));
+    entry(&queued.session, |entry| {
+        matches!(entry, Entry::RunEnd { .. })
+    })
+    .await;
+    entry(
+        &parent,
+        |entry| matches!(entry, Entry::JobEnd { job_id, .. } if job_id == "agent_2"),
+    )
+    .await;
+    let lines = journal(&parent);
+    let end = only(&lines, "queued child result", |v| {
+        v["type"] == "job_end" && v["jobId"] == "agent_2"
+    });
+    assert_eq!(lines[end]["text"], "Run stopped before finishing.");
+    assert_eq!(
+        host.api
+            .requests()
+            .iter()
+            .filter(|r| r.model.id == "child")
+            .count(),
+        1,
+        "the stopped child never reached the model"
+    );
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn steer_right_after_spawn_keeps_the_task_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ok")); 2],
+    )
+    .await;
+    host.api
+        .lane("child", vec![ScriptedTurn::Reply(reply_text("done")); 2]);
+    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
+    let handle = parent.spawn(request("the task")).await.unwrap();
+    handle.session.steer("extra").await.unwrap();
+    delivered(&parent, "agent_1").await;
+    let requests = host.api.requests();
+    let first = requests
+        .iter()
+        .find(|r| r.model.id == "child")
+        .expect("a child request");
+    assert!(request_text(first).contains("the task"));
     parent.shutdown().await;
 }

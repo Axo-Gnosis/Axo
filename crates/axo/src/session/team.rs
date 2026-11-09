@@ -84,7 +84,7 @@ impl TeamState {
             waits.waiting.clone()
         };
         let stuck = self.members.iter().all(|id| {
-            let Some(session) = sessions.peek(id) else {
+            let Some(session) = sessions.live(id) else {
                 return true;
             };
             let activity = *session.hooks.activity.borrow();

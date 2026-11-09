@@ -32,7 +32,7 @@ pub struct AgentSpec {
     /// `false` removes the section; `true` changes nothing.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub sections: IndexMap<String, bool>,
-    /// JSON Schema of the agent's result (validated at load; used from Phase 3).
+    /// JSON Schema of a child's result, returned through `yield`; validated at load and ignored for root sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     /// Model requests per child run before the wrap-up turn; `None` uses `subagents.maxTurns`. Ignored for root sessions

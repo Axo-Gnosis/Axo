@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, QueueMode, RunOutcome};
+use crate::agent::{Agent, RunOutcome};
 use crate::cancel::CancelReason;
 use crate::error::Error;
 use crate::event::{AgentEvent, MessageOrigin};
@@ -862,26 +862,10 @@ impl Run<'_> {
     }
 
     /// Takes the next messages of the steering (`true`) or follow-up queue per its mode,
-    /// then the host's steering messages. Draining the last steering message clears the
-    /// steer signal under the same lock.
+    /// then the host's steering messages.
     async fn drain_queue(&self, steering: bool) -> Vec<QueuedMessage> {
         let agent = self.agent;
-        let mut messages = {
-            let mut state = agent.lock();
-            let (queue, mode) = if steering {
-                (&mut state.steering, agent.steering_mode)
-            } else {
-                (&mut state.follow_up, agent.follow_up_mode)
-            };
-            let taken: Vec<QueuedMessage> = match mode {
-                QueueMode::All => queue.drain(..).collect(),
-                QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
-            };
-            if steering && queue.is_empty() {
-                agent.steer_pending.send_replace(false);
-            }
-            taken
-        };
+        let mut messages = agent.take_queued(steering);
         if steering {
             messages.extend(agent.hooks.steering().await);
         }

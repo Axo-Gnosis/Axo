@@ -47,6 +47,12 @@ pub(crate) struct JobId {
     pub(crate) n: u64,
 }
 
+/// `digits` as a number, if written in canonical decimal: no sign or leading zeros.
+fn canonical(digits: &str) -> Option<u64> {
+    let n: u64 = digits.parse().ok()?;
+    (n.to_string() == digits).then_some(n)
+}
+
 impl JobId {
     pub(crate) fn parse(name: &str) -> Option<Self> {
         let (ns, digits) = if let Some(digits) = name.strip_prefix("bg_") {
@@ -54,9 +60,8 @@ impl JobId {
         } else {
             (Namespace::Agent, name.strip_prefix("agent_")?)
         };
-        let n: u64 = digits.parse().ok()?;
-        // Canonical decimal only: no sign or leading zeros.
-        (n.to_string() == digits).then_some(Self { ns, n })
+        let n = canonical(digits)?;
+        Some(Self { ns, n })
     }
 }
 
@@ -539,10 +544,10 @@ impl JobRegistry {
                     team,
                     ..
                 } => {
-                    if let Some(team) = team
-                        && let Some(digits) = team.id.strip_prefix("team_")
-                        && let Ok(n) = digits.parse::<u64>()
-                        && n.to_string() == digits
+                    if let Some(n) = team
+                        .as_ref()
+                        .and_then(|team| team.id.strip_prefix("team_"))
+                        .and_then(canonical)
                     {
                         max_team = max_team.max(n);
                     }
@@ -1265,10 +1270,8 @@ impl JobRegistry {
         for (seq, entry) in held {
             if !shut_down {
                 let result = match self.host() {
-                    Some(host) => host.journal(entry).await,
-                    None => Err(Error::Host(
-                        std::io::Error::other("cannot journal child message: session gone").into(),
-                    )),
+                    Some(host) => host.journal(entry).await.map_err(|error| error.to_string()),
+                    None => Err("session gone".to_owned()),
                 };
                 if let Err(error) = result {
                     if let Some(job) = self.lock().jobs.get_mut(&id) {
@@ -1405,6 +1408,38 @@ impl JobRegistry {
         self.bump();
     }
 
+    /// Run ids the row for child `child_session_id` already has a result for.
+    pub(crate) fn reported_runs(&self, child_session_id: &str) -> HashSet<String> {
+        self.lock()
+            .jobs
+            .values()
+            .find(|job| {
+                job.admission != Admission::Never
+                    && matches!(&job.kind, Kind::Child(run) if run.session_id == child_session_id)
+            })
+            .map(|job| {
+                job.messages
+                    .values()
+                    .filter(|message| !message.note)
+                    .filter_map(|message| message.run_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Pending child rows that tool call `call_id` spawned.
+    pub(crate) fn spawned_pending(&self, call_id: &str) -> Vec<JobId> {
+        self.lock()
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.admission == Admission::Pending
+                    && matches!(&job.kind, Kind::Child(run) if run.call_id.as_deref() == Some(call_id))
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Durable child notes and one result per run, shared by live completion and reconciliation.
     pub(crate) async fn child_message(
         &self,
@@ -1480,13 +1515,15 @@ impl JobRegistry {
             };
         self.bump();
         if !self.lock().shut_down {
-            let result = match self.host() {
-                Some(host) => host.journal(entry).await,
-                None => Err(Error::Host(
-                    std::io::Error::other("cannot journal child message: session gone").into(),
-                )),
+            let Some(host) = self.host() else {
+                // The parent no longer tracks this child.
+                if let Some(job) = self.lock().jobs.get_mut(&msg.job) {
+                    job.messages.remove(&msg.seq);
+                }
+                self.bump();
+                return Ok(false);
             };
-            if let Err(error) = result {
+            if let Err(error) = host.journal(entry).await {
                 if let Some(job) = self.lock().jobs.get_mut(&msg.job) {
                     job.messages.remove(&msg.seq);
                 }

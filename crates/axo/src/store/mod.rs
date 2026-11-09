@@ -25,7 +25,7 @@ use crate::error::Error;
 pub trait SessionStore: Send + Sync {
     /// A writer for a new session. Storage may be created lazily, on the
     /// first `submission`, non-system `message` or `child_start` entry; a fork
-    /// or child (header with `parent_session`) is created right away.
+    /// (header with `parent_session`) is created right away.
     async fn create(&self, header: Header) -> Result<Box<dyn SessionWriter>, Error>;
 
     /// Opens an existing session for writing. Holds the single-writer lock

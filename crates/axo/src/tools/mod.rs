@@ -1,6 +1,6 @@
 //! The built-in tools and the per-session state they share.
 
-mod ask;
+pub(crate) mod ask;
 pub(crate) mod bash;
 pub(crate) mod bash_urls;
 pub(crate) mod edit;

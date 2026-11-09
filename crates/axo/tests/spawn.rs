@@ -1,55 +1,14 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use axo::{Entry, Session, SessionEvent, SpawnRequest};
+use axo::{Entry, RecoveryPolicy, SessionOptions, SpawnRequest};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, UserBlock};
-use common::{host, journal, only, options, within};
+use common::{
+    delivered, entry, host, journal, message_text, only, options, request, until, within,
+};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
-
-async fn until(mut ready: impl FnMut() -> bool) {
-    within(async {
-        while !ready() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-}
-
-async fn entry(session: &Session, matches: impl Fn(&Entry) -> bool) {
-    let mut attached = session.attach(None).await;
-    if attached.missed.iter().any(|seq| matches(&seq.entry)) {
-        return;
-    }
-    within(async {
-        loop {
-            match attached.events.recv().await {
-                Ok(SessionEvent::Entry(seq)) if matches(&seq.entry) => break,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
-            }
-        }
-    })
-    .await;
-}
-
-async fn delivered(session: &Session, job: &str) {
-    entry(session, |entry| {
-        matches!(entry, Entry::Message { delivered_jobs, .. } if delivered_jobs.iter().any(|id| id == job))
-    })
-    .await;
-}
-
-fn request(task: &str) -> SpawnRequest {
-    SpawnRequest {
-        task: task.into(),
-        model: Some("test/child".into()),
-        ..Default::default()
-    }
-}
 
 fn schema() -> Value {
     json!({
@@ -57,10 +16,6 @@ fn schema() -> Value {
         "properties": {"findings": {"type": "array", "items": {"type": "string"}}},
         "required": ["findings"]
     })
-}
-
-fn message_text(line: &Value) -> &str {
-    line["message"]["content"][0]["text"].as_str().unwrap()
 }
 
 fn tool_names(request: &RecordedRequest) -> Vec<&str> {
@@ -285,6 +240,77 @@ async fn spawn_rerun_adopts_existing_child() {
         1
     );
     assert_eq!(host.axo.list_sessions(&cwd).await.unwrap().len(), 2);
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn mark_interrupted_admits_children_of_unfinished_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "s1",
+                "spawn",
+                json!({"task": "check", "model": "test/child"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("ok")),
+            ScriptedTurn::Reply(reply_text("spare")),
+        ],
+    )
+    .await;
+    host.api.lane(
+        "child",
+        vec![
+            ScriptedTurn::HangUntilCancel,
+            ScriptedTurn::Reply(reply_text("late")),
+        ],
+    );
+    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
+    let path = parent.path().to_path_buf();
+    within(parent.prompt("go")).await.unwrap();
+    until(|| host.api.requests().iter().any(|r| r.model.id == "child")).await;
+    parent.shutdown().await;
+    drop(parent);
+
+    // A crash right after the child started, before the spawn result was written.
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut kept = Vec::new();
+    for line in original.lines() {
+        kept.push(line);
+        let value: Value = serde_json::from_str(line).unwrap();
+        if value["type"] == "child_start" {
+            break;
+        }
+    }
+    std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+
+    let parent = within(host.axo.open_session(
+        &path,
+        SessionOptions {
+            recovery: RecoveryPolicy::MarkInterrupted,
+            ..options(dir.path())
+        },
+    ))
+    .await
+    .unwrap();
+    entry(
+        &parent,
+        |entry| matches!(entry, Entry::JobEnd { job_id, .. } if job_id == "agent_1"),
+    )
+    .await;
+    let lines = journal(&parent);
+    let result = only(&lines, "interrupted spawn result", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "s1"
+    });
+    assert_eq!(lines[result]["admittedJobs"], json!(["agent_1"]));
+    assert!(message_text(&lines[result]).contains("It started agent_1"));
+    let end = only(&lines, "revived child result", |v| {
+        v["type"] == "job_end" && v["jobId"] == "agent_1"
+    });
+    assert_eq!(lines[end]["text"], "late");
     parent.shutdown().await;
 }
 

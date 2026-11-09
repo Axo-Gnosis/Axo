@@ -1,14 +1,17 @@
 //! Live and parked child sessions, and registries through which they report results.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axo_agent::{BeforeToolCallContext, ToolCallDecision, ToolError, ToolHooks};
+use axo_agent::{AgentMessage, BeforeToolCallContext, ToolCallDecision, ToolError, ToolHooks};
 use axo_ai::thinking::clamp_level;
+use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -65,6 +68,14 @@ impl ChildLog {
             LogEntries::Stored(entries) => entries,
         }
     }
+
+    /// The projected messages: the live journal's projection, else projected from the file.
+    pub(crate) fn messages(&self) -> Cow<'_, [AgentMessage]> {
+        match &self.entries {
+            LogEntries::Live(view) => Cow::Borrowed(&view.projection.messages),
+            LogEntries::Stored(entries) => Cow::Owned(project(entries, None).messages),
+        }
+    }
 }
 
 impl SessionTable {
@@ -97,20 +108,21 @@ impl SessionTable {
             });
     }
 
+    /// The live session, if any, without re-pinning a parked one.
     pub(crate) fn live(&self, id: &str) -> Option<Arc<Session>> {
+        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = slots.get(id)?;
+        slot.live.clone().or_else(|| slot.weak.upgrade())
+    }
+
+    /// The live session, re-pinned in the table so it stays resident while it works.
+    fn pin(&self, id: &str) -> Option<Arc<Session>> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = slots.get_mut(id)?;
         if slot.live.is_none() {
             slot.live = slot.weak.upgrade();
         }
         slot.live.clone()
-    }
-
-    /// Looks up a live session without re-pinning a parked slot.
-    pub(crate) fn peek(&self, id: &str) -> Option<Arc<Session>> {
-        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        let slot = slots.get(id)?;
-        slot.live.clone().or_else(|| slot.weak.upgrade())
     }
 
     pub(crate) fn team(&self, parent: &str, link: &TeamLink) -> Arc<TeamState> {
@@ -172,7 +184,7 @@ impl SessionTable {
     }
 
     pub(crate) async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
-        if let Some(session) = self.live(id) {
+        if let Some(session) = self.pin(id) {
             return Ok(session);
         }
         let seed = self
@@ -183,7 +195,7 @@ impl SessionTable {
             .map(|slot| slot.seed.clone())
             .ok_or_else(|| Error::SessionNotFound(id.to_owned()))?;
         let _gate = self.revive.lock().await;
-        if let Some(session) = self.live(id) {
+        if let Some(session) = self.pin(id) {
             return Ok(session);
         }
         let session = revive(&seed).await?;
@@ -335,45 +347,72 @@ pub(super) async fn park_when_idle(
     }
 }
 
-impl Session {
-    pub(super) async fn reconcile_children(&self) -> Result<(), Error> {
-        for child in self
-            .hooks
-            .tools
-            .runner
-            .jobs
-            .children()
-            .into_iter()
-            .filter(|child| child.admitted)
-        {
-            self.hooks.reconcile_child(&child).await?;
+/// Reports each ended run of `entries` the parent has no result for yet.
+async fn report_runs(
+    jobs: &JobRegistry,
+    child_id: &str,
+    entries: &[SeqEntry],
+    output: Option<&Value>,
+) -> Result<(), Error> {
+    let reported = jobs.reported_runs(child_id);
+    for run_id in ended_runs(entries) {
+        if reported.contains(&run_id) {
+            continue;
         }
-        Ok(())
+        if let Some(message) = run_message(entries, &run_id, output) {
+            jobs.child_message(child_id, message, false).await?;
+        }
     }
+    Ok(())
+}
+
+/// Reconciles every admitted child after a reopen, one at a time, until the session shuts down.
+/// Boxed as `dyn Send`: `Session::start` spawns this, and it revives children through
+/// `Session::start` again, so an opaque future type would be recursive.
+pub(super) fn reconcile_children(
+    hooks: Weak<SessionHooks>,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let children: Vec<_> = match hooks.upgrade() {
+            Some(hooks) => hooks
+                .tools
+                .runner
+                .jobs
+                .children()
+                .into_iter()
+                .filter(|child| child.admitted)
+                .collect(),
+            None => return,
+        };
+        for child in children {
+            let Some(hooks) = hooks.upgrade() else { return };
+            if hooks.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            hooks.reconcile_child(&child).await;
+        }
+    })
 }
 
 impl SessionHooks {
-    pub(super) async fn reconcile_child(&self, child: &ChildRef) -> Result<(), Error> {
+    /// Reports a child's unreported runs and revives it if it has unfinished work; a child
+    /// that cannot be read or revived is logged and skipped.
+    pub(super) async fn reconcile_child(&self, child: &ChildRef) {
+        if let Err(error) = self.try_reconcile_child(child).await {
+            warn!(%error, child_id = %child.session_id, "could not reconcile child session");
+        }
+    }
+
+    async fn try_reconcile_child(&self, child: &ChildRef) -> Result<(), Error> {
         let child_id = &child.session_id;
         let jobs = &self.tools.runner.jobs;
-        let log = match self
+        let log = self
             .inherited
             .sessions
             .child_log(&*self.inherited.store, child_id, &child.path)
-            .await
-        {
-            Ok(log) => log,
-            Err(error) => {
-                warn!(%error, %child_id, "could not read child session");
-                return Ok(());
-            }
-        };
+            .await?;
         let output = log.link.as_ref().and_then(|link| link.spec.output.as_ref());
-        for run_id in ended_runs(log.entries()) {
-            if let Some(message) = run_message(log.entries(), &run_id, output) {
-                jobs.child_message(child_id, message, false).await?;
-            }
-        }
+        report_runs(jobs, child_id, log.entries(), output).await?;
         if log.live.is_some() {
             return Ok(());
         }
@@ -384,28 +423,18 @@ impl SessionHooks {
         };
         let seed = Arc::new(ChildSeed {
             path: child.path.clone(),
-            inherited: child_inherited(&self.inherited, &link.spec),
+            inherited: child_inherited(&self.inherited, &link.spec, self.loaded()),
             link,
         });
         if recover {
-            let child = match revive(&seed).await {
-                Ok(child) => child,
-                Err(error @ Error::SessionBusy { .. }) => {
-                    warn!(%error, %child_id, "could not revive child session");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
+            let child = revive(&seed).await?;
             self.inherited
                 .sessions
                 .insert_live(child_id.clone(), seed, child.clone());
+            // Revival recovery can end runs without settling them through the parent.
             let view = child.hooks.journal.view();
             let output = child.agent().and_then(|link| link.spec.output.as_ref());
-            for run_id in ended_runs(&view.entries) {
-                if let Some(message) = run_message(&view.entries, &run_id, output) {
-                    jobs.child_message(child_id, message, false).await?;
-                }
-            }
+            report_runs(jobs, child_id, &view.entries, output).await?;
         } else {
             self.inherited.sessions.seed(child_id.clone(), seed);
         }

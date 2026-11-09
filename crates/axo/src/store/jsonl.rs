@@ -130,7 +130,7 @@ impl SessionStore for JsonlStore {
         let path = self.session_dir(&header.cwd).join(file_name);
         let mut pending = serde_json::to_vec(&header).map_err(|err| io_error(&path, err.into()))?;
         pending.push(b'\n');
-        // Forks and children have a parent link: their files exist right away.
+        // Forks have a parent link: their files exist right away.
         let file = if header.parent_session.is_some() {
             let target = path.clone();
             let buffered = std::mem::take(&mut pending);

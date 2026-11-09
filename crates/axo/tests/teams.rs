@@ -1,54 +1,15 @@
 mod common;
 
 use std::path::Path;
-use std::time::Duration;
 
 use axo::{
-    AgentSpec, Entry, JobKind, Session, SessionEvent, SessionOptions, SpawnRequest, TeamHandle,
-    TeamMemberRequest, TeamRef, TeamRequest,
+    AgentSpec, Entry, JobKind, SessionOptions, SpawnRequest, TeamHandle, TeamMemberRequest,
+    TeamRef, TeamRequest,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn};
-use common::{host, journal, only, options, within};
+use common::{delivered, entry, host, journal, message_text, only, options, until, within};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
-
-async fn until(mut ready: impl FnMut() -> bool) {
-    within(async {
-        while !ready() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-}
-
-async fn entry(session: &Session, matches: impl Fn(&Entry) -> bool) {
-    let mut attached = session.attach(None).await;
-    if attached.missed.iter().any(|seq| matches(&seq.entry)) {
-        return;
-    }
-    within(async {
-        loop {
-            match attached.events.recv().await {
-                Ok(SessionEvent::Entry(seq)) if matches(&seq.entry) => break,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
-            }
-        }
-    })
-    .await;
-}
-
-async fn delivered(session: &Session, job: &str) {
-    entry(session, |entry| {
-        matches!(entry, Entry::Message { delivered_jobs, .. } if delivered_jobs.iter().any(|id| id == job))
-    })
-    .await;
-}
-
-fn message_text(line: &Value) -> &str {
-    line["message"]["content"][0]["text"].as_str().unwrap()
-}
 
 fn team_options(dir: &Path) -> SessionOptions {
     SessionOptions {

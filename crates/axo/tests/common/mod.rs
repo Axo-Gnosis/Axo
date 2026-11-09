@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axo::{
-    Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, Session, SessionOptions, StaticEnv,
-    UserConfig,
+    Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, Session, SessionEvent, SessionOptions,
+    SpawnRequest, StaticEnv, UserConfig,
 };
 use axo::{Entry, JsonlStore, SeqEntry, SessionStore};
 use axo_agent::AgentMessage;
@@ -18,6 +18,7 @@ use axo_ai::{
     ScriptedApi, ScriptedTurn, StopReason, Streamer, UserBlock,
 };
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -251,4 +252,54 @@ pub async fn within<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(TIMEOUT, future)
         .await
         .expect("timed out")
+}
+
+/// Polls `ready` until it holds.
+pub async fn until(mut ready: impl FnMut() -> bool) {
+    within(async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+/// Waits for an entry matching `matches`, already written or yet to come.
+pub async fn entry(session: &Session, matches: impl Fn(&Entry) -> bool) {
+    let mut attached = session.attach(None).await;
+    if attached.missed.iter().any(|seq| matches(&seq.entry)) {
+        return;
+    }
+    within(async {
+        loop {
+            match attached.events.recv().await {
+                Ok(SessionEvent::Entry(seq)) if matches(&seq.entry) => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
+            }
+        }
+    })
+    .await;
+}
+
+/// Waits until a message delivers `job`'s result.
+pub async fn delivered(session: &Session, job: &str) {
+    entry(session, |entry| {
+        matches!(entry, Entry::Message { delivered_jobs, .. } if delivered_jobs.iter().any(|id| id == job))
+    })
+    .await;
+}
+
+/// A spawn of `task` on the `test/child` model.
+pub fn request(task: &str) -> SpawnRequest {
+    SpawnRequest {
+        task: task.into(),
+        model: Some("test/child".into()),
+        ..Default::default()
+    }
+}
+
+/// The first text block of a raw `message` entry.
+pub fn message_text(line: &Value) -> &str {
+    line["message"]["content"][0]["text"].as_str().unwrap()
 }

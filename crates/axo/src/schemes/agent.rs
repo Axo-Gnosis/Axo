@@ -12,7 +12,7 @@ use crate::jobs::child::{ChildMessage, last_result, latest_text, turns};
 use crate::jobs::{JobId, JobKind, JobRegistry, JobStatus, Namespace};
 use crate::session::AgentRoutes;
 use crate::session::children::SessionTable;
-use crate::store::{SessionStore, project};
+use crate::store::SessionStore;
 
 pub(crate) struct AgentScheme {
     jobs: Arc<JobRegistry>,
@@ -176,10 +176,10 @@ impl Scheme for AgentScheme {
                 }
             }
             AgentPath::Transcript(_) => {
-                let text = render_conversation(
-                    &lowered(&project(log.entries(), None).messages),
-                    ToolDetail::OneLine,
-                );
+                // ponytail: every read renders the whole transcript (and re-reads a parked
+                // child's file) before the read tool pages it; cache the text per child
+                // revision if long transcripts page slowly.
+                let text = render_conversation(&lowered(&log.messages()), ToolDetail::OneLine);
                 Ok(if text.is_empty() {
                     "(no messages yet)".into()
                 } else {

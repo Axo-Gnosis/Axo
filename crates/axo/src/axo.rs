@@ -239,6 +239,7 @@ impl Axo {
             },
             host,
             None,
+            None,
         )?;
         for diagnostic in diagnostics {
             tracing::warn!("{diagnostic}");
@@ -371,6 +372,7 @@ impl Axo {
                 sessions: self.sessions.clone(),
                 spawn_hooks,
                 run_slots,
+                loaded: None,
             }),
             model,
             thinking,

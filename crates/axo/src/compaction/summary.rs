@@ -311,7 +311,7 @@ fn separate(
     if let Some(previous) = previous {
         text.push_str(&format!(
             "\n\n<previous-summary>\n{}\n</previous-summary>",
-            escape_wrappers(previous).into_owned()
+            escape_wrappers(previous)
         ));
     }
     text.push_str("\n\n");

@@ -5,7 +5,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, PoisonError, Weak};
 
 use async_trait::async_trait;
-use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput};
+use axo_agent::{
+    QueuedMessage, Replay, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
+};
 use axo_ai::thinking::clamp_level;
 use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock};
 use indexmap::IndexMap;
@@ -15,7 +17,7 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use super::children::ChildSeed;
-use super::{Inherited, Session, SessionHooks, SessionSetup};
+use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, member_name_problem};
 use crate::error::Error;
@@ -23,6 +25,10 @@ use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
 use crate::jobs::child::{ChildMessage, ChildRun};
 use crate::store::{Entry, Header, Projection, RosterEntry, SpawnLink, TeamLink};
+use crate::tools::ask::ASK;
+use crate::tools::output::YIELD;
+
+pub(crate) const SPAWN: &str = "spawn";
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnRequest {
@@ -50,7 +56,7 @@ pub struct TeamRequest {
     pub tasks: IndexMap<String, PromptInput>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TeamMemberRequest {
     pub name: String,
     /// A catalog agent; with `spec` also `None`, a plain delegate.
@@ -67,7 +73,7 @@ pub struct TeamHandle {
     pub members: Vec<(String, ChildHandle)>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct InlineSpec {
     /// The agent body (after axo's fixed delegation framing).
     pub prompt: String,
@@ -93,7 +99,7 @@ pub trait SpawnHook: Send + Sync {
 /// Who asked for a spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnOrigin {
-    /// `Session::spawn`.
+    /// `Session::spawn` or `Session::spawn_team`.
     Host,
     /// The model's `spawn` tool call.
     Tool { call_id: String },
@@ -145,7 +151,11 @@ fn validate_output(output: Option<&Value>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn child_inherited(parent: &Inherited, spec: &AgentSpec) -> Arc<Inherited> {
+pub(super) fn child_inherited(
+    parent: &Inherited,
+    spec: &AgentSpec,
+    loaded: Loaded,
+) -> Arc<Inherited> {
     Arc::new(Inherited {
         cwd: parent.cwd.clone(),
         config: parent.config.clone(),
@@ -167,6 +177,7 @@ pub(super) fn child_inherited(parent: &Inherited, spec: &AgentSpec) -> Arc<Inher
         sessions: parent.sessions.clone(),
         spawn_hooks: parent.spawn_hooks.clone(),
         run_slots: parent.run_slots.clone(),
+        loaded: Some(loaded),
     })
 }
 
@@ -222,7 +233,7 @@ impl SessionHooks {
             .tools
             .iter()
             .map(|tool| tool.name())
-            .filter(|name| !matches!(*name, "ask" | "yield"))
+            .filter(|name| !matches!(*name, ASK | YIELD))
             .map(str::to_owned)
             .collect()
     }
@@ -378,7 +389,7 @@ impl SessionHooks {
             header.spawn = Some(link.clone());
             let child_id = header.id.clone();
             let writer = self.inherited.store.create(header).await?;
-            let inherited = child_inherited(&self.inherited, &link.spec);
+            let inherited = child_inherited(&self.inherited, &link.spec, self.loaded());
             let expanded_model = format!("{}/{}", model.provider, model.id);
             let child = Arc::new(
                 Session::start(SessionSetup {
@@ -394,10 +405,18 @@ impl SessionHooks {
                 })
                 .await?,
             );
-            prepared.push((child, inherited, link, expanded_model, task));
+            let first = child.prepare_first(task).await?;
+            prepared.push((child, inherited, link, expanded_model, first));
+        }
+        // ponytail: an I/O failure from here until the parent's child_start leaves unreachable
+        // child files; add SessionStore::delete if that shows up.
+        let mut claimed = Vec::with_capacity(prepared.len());
+        for (child, inherited, link, model, first) in prepared {
+            let message = child.claim_first(first).await?;
+            claimed.push((child, inherited, link, model, message));
         }
         let jobs = &self.tools.runner.jobs;
-        let ids: Vec<_> = prepared
+        let ids: Vec<_> = claimed
             .iter()
             .map(|(child, _, link, model, _)| {
                 jobs.reserve_child(ChildRun {
@@ -427,12 +446,12 @@ impl SessionHooks {
                 jobs.admit_child(*id).await;
             }
         }
-        let is_team = prepared
+        let is_team = claimed
             .first()
             .is_some_and(|(_, _, link, _, _)| link.team.is_some());
-        let mut handles = Vec::with_capacity(prepared.len());
-        let mut first_runs = Vec::with_capacity(prepared.len());
-        for ((child, inherited, link, _, task), id) in prepared.into_iter().zip(ids) {
+        let mut handles = Vec::with_capacity(claimed.len());
+        let mut first_runs = Vec::with_capacity(claimed.len());
+        for ((child, inherited, link, _, message), id) in claimed.into_iter().zip(ids) {
             self.inherited.sessions.insert_live(
                 child.hooks.session_id.clone(),
                 Arc::new(ChildSeed {
@@ -442,7 +461,7 @@ impl SessionHooks {
                 }),
                 child.clone(),
             );
-            first_runs.push((child.clone(), task));
+            first_runs.push((child.clone(), message));
             handles.push(ChildHandle {
                 job: id.to_string(),
                 session: child,
@@ -474,9 +493,9 @@ impl SessionHooks {
                 }
             });
         }
-        for (child, task) in first_runs {
+        for (child, message) in first_runs {
             let child_id = child.hooks.session_id.clone();
-            start_first_run(child, task, jobs.clone(), child_id);
+            start_first_run(child, message, jobs.clone(), child_id);
         }
         Ok(handles)
     }
@@ -513,7 +532,7 @@ impl SessionHooks {
                 vec![Launch {
                     resolved,
                     task,
-                    header: Header::new(self.inherited.cwd.clone(), Some(self.path.clone()), None),
+                    header: Header::new(self.inherited.cwd.clone(), None, None),
                     team: None,
                 }],
                 depth,
@@ -541,10 +560,7 @@ impl SessionHooks {
                     .inherited
                     .agents
                     .iter()
-                    .find(|definition| match definition {
-                        AgentDef::Agent(spec) => spec.name == name,
-                        AgentDef::Team(spec) => spec.name == name,
-                    })
+                    .find(|definition| definition.name() == name)
                     .ok_or_else(|| Error::AgentNotFound(name.clone()))?;
                 let AgentDef::Team(team) = definition else {
                     return Err(Error::InvalidInput(format!(
@@ -600,7 +616,13 @@ impl SessionHooks {
             }
         };
         let n = members.len();
-        let max = self.inherited.config.settings.subagents.max_concurrent;
+        let max = self
+            .inherited
+            .config
+            .settings
+            .subagents
+            .max_concurrent
+            .max(1);
         if n > max {
             return Err(Error::SpawnBlocked(format!(
                 "A team of {n} members exceeds subagents.maxConcurrent ({max})"
@@ -651,7 +673,7 @@ impl SessionHooks {
         }
         let id = self.tools.runner.jobs.reserve_team();
         let headers: Vec<_> = (0..n)
-            .map(|_| Header::new(self.inherited.cwd.clone(), Some(self.path.clone()), None))
+            .map(|_| Header::new(self.inherited.cwd.clone(), None, None))
             .collect();
         let roster: Vec<_> = resolved_members
             .iter()
@@ -693,12 +715,12 @@ impl SessionHooks {
 
 fn start_first_run(
     child: Arc<Session>,
-    task: PromptInput,
+    message: QueuedMessage,
     jobs: Arc<JobRegistry>,
     child_id: String,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = child.prompt(task).await {
+        if let Err(error) = child.run_first(message).await {
             let started = child
                 .hooks
                 .journal
@@ -888,41 +910,14 @@ impl SpawnTool {
 #[derive(Deserialize)]
 struct SpawnArguments {
     agent: Option<String>,
-    spec: Option<InlineArguments>,
+    spec: Option<InlineSpec>,
     task: Option<String>,
     tasks: Option<IndexMap<String, String>>,
-    members: Option<Vec<MemberArguments>>,
+    members: Option<Vec<TeamMemberRequest>>,
     charter: Option<String>,
     context: Option<String>,
     model: Option<String>,
     output: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct MemberArguments {
-    name: String,
-    agent: Option<String>,
-    spec: Option<InlineArguments>,
-    brief: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct InlineArguments {
-    prompt: String,
-    tools: Option<Vec<String>>,
-    model: Option<String>,
-    output: Option<Value>,
-}
-
-impl From<InlineArguments> for InlineSpec {
-    fn from(spec: InlineArguments) -> Self {
-        Self {
-            prompt: spec.prompt,
-            tools: spec.tools,
-            model: spec.model,
-            output: spec.output,
-        }
-    }
 }
 
 fn single_output(id: String) -> ToolOutput {
@@ -958,7 +953,7 @@ fn team_output(team: &str, members: impl Iterator<Item = (String, String)>) -> T
 #[async_trait]
 impl Tool for SpawnTool {
     fn name(&self) -> &str {
-        "spawn"
+        SPAWN
     }
 
     fn description(&self) -> &str {
@@ -997,10 +992,7 @@ impl Tool for SpawnTool {
         let children = hooks.tools.runner.jobs.adopt(&cx.call.id, cx.invocation);
         if let Some(first) = children.first() {
             for child in &children {
-                hooks
-                    .reconcile_child(child)
-                    .await
-                    .map_err(|error| ToolError(error.to_string()))?;
+                hooks.reconcile_child(child).await;
             }
             return Ok(match &first.team {
                 Some(team) => team_output(
@@ -1064,7 +1056,7 @@ impl Tool for SpawnTool {
                 .spawn(
                     SpawnRequest {
                         agent,
-                        spec: spec.map(InlineSpec::from),
+                        spec,
                         task: with_context(task),
                         model,
                         output,
@@ -1110,16 +1102,7 @@ impl Tool for SpawnTool {
             .spawn_team(
                 TeamRequest {
                     team: agent,
-                    members: members
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|member| TeamMemberRequest {
-                            name: member.name,
-                            agent: member.agent,
-                            spec: member.spec.map(InlineSpec::from),
-                            brief: member.brief,
-                        })
-                        .collect(),
+                    members: members.unwrap_or_default(),
                     charter,
                     tasks: member_tasks,
                 },

@@ -6,6 +6,7 @@ use axo_ai::{
 
 use super::delivery::enqueue;
 use super::journal::{self, View};
+use super::spawn::SPAWN;
 use super::{RecoveryPolicy, RunRequest, Session};
 use crate::compaction::Limits;
 use crate::error::Error;
@@ -236,6 +237,8 @@ impl Session {
                     )));
                 }
             },
+            // ponytail: Park writes no tool results, so a spawn call parked here leaves its
+            // tool-spawned rows pending; give Park interrupted results if that shows up.
             RecoveryPlan::Park { run_id } => (
                 run_id,
                 store::RunOutcome::Interrupted,
@@ -262,6 +265,8 @@ impl Session {
                     // Calls that would have been rerun are not run either.
                     calls.extend(rerun.into_iter().map(|call| (call, None)));
                 }
+                let jobs = &self.hooks.tools.runner.jobs;
+                let mut admitted = Vec::new();
                 let results: Vec<Entry> = calls
                     .into_iter()
                     .map(|(call, artifact)| {
@@ -272,6 +277,21 @@ impl Session {
                         if let Some(n) = artifact {
                             text.push_str(&format!(" Output so far: artifact://{n}"));
                         }
+                        // The children an interrupted spawn started are admitted by this
+                        // result, as its own result would have.
+                        let ids = if call.name == SPAWN {
+                            jobs.spawned_pending(&call.id)
+                        } else {
+                            Vec::new()
+                        };
+                        let admitted_jobs: Vec<_> = ids.iter().map(ToString::to_string).collect();
+                        if !admitted_jobs.is_empty() {
+                            text.push_str(&format!(
+                                " It started {}; results arrive as messages.",
+                                admitted_jobs.join(", ")
+                            ));
+                        }
+                        admitted.extend(ids);
                         Entry::Message {
                             base: journal::base(),
                             message: AgentMessage::Llm(Message::ToolResult(ToolResultMessage {
@@ -284,13 +304,16 @@ impl Session {
                                 duration_ms: None,
                             })),
                             submission_id: None,
-                            admitted_jobs: Vec::new(),
+                            admitted_jobs,
                             delivered_jobs: Vec::new(),
                         }
                     })
                     .collect();
                 if !results.is_empty() {
                     self.hooks.append(results).await?;
+                }
+                for id in admitted {
+                    jobs.admit_child(id).await;
                 }
                 if policy == RecoveryPolicy::MarkInterrupted {
                     (run_id, store::RunOutcome::Interrupted, None)

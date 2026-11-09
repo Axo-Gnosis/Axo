@@ -15,9 +15,16 @@ use super::{
 };
 use crate::context::prompt::escape_wrappers;
 use crate::error::Error;
-use crate::input::{Prepared, PromptInput, PromptPart, prepare, render};
+use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
 use crate::jobs::{JobHost, JobRegistry};
 use crate::store::{Entry, SeqEntry, SubmissionKind};
+
+/// A new child's task, prepared but not saved.
+pub(super) struct FirstPrompt {
+    entry: Entry,
+    message: QueuedMessage,
+    saved: SavedFiles,
+}
 
 /// Who owns the session. A run, standalone maintenance or a navigation sets `running`;
 /// maintenance also names itself. Only compare-and-set transitions claim it, so two
@@ -95,12 +102,14 @@ impl SessionHooks {
     /// delivery start a run first: then `running` stays set and the run settles like any
     /// other. Called wherever the session would go idle.
     pub(super) fn release_or_deliver(&self) {
+        // The claim a Stop targeted ends here; a Stop never carries over to the next owner.
+        self.stop_requested.store(false, Ordering::Release);
         if self.may_deliver()
             && let Some((agent, hooks)) = self.owners()
         {
-            // A steer or follow-up queued while idle, or after the run's last drain point, starts the next run.
-            let mut queued = agent.take_steering();
-            queued.extend(agent.take_follow_ups());
+            // A steer or follow-up queued while idle, or after the run's last drain point,
+            // starts the next run; the rest drain at that run's drain points.
+            let queued = agent.take_next_input();
             if !queued.is_empty() {
                 let mut messages = self.run_input(self.reserve_delivery(), None);
                 messages.extend(queued);
@@ -314,6 +323,44 @@ impl Session {
             self.hooks.release_or_deliver();
         }
         Ok(())
+    }
+
+    /// Validates and renders a new child's task; writes nothing.
+    pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
+        let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
+        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None);
+        Ok(FirstPrompt {
+            entry,
+            message,
+            saved,
+        })
+    }
+
+    /// Claims the new child and saves its task, so no steer, follow-up or mail runs first
+    /// and reopening finds the task (an unconsumed submission) after a crash.
+    pub(super) async fn claim_first(&self, first: FirstPrompt) -> Result<QueuedMessage, Error> {
+        if !self.hooks.claim_idle() {
+            return Err(Error::Busy);
+        }
+        if let Err(error) = self.hooks.append(vec![first.entry]).await {
+            self.hooks.release_or_deliver();
+            return Err(error);
+        }
+        first.saved.keep();
+        Ok(first.message)
+    }
+
+    /// Runs the task `claim_first` saved; returns when the run settles.
+    pub(super) async fn run_first(&self, message: QueuedMessage) -> Result<RunOutcome, Error> {
+        let messages = self
+            .hooks
+            .run_input(self.hooks.reserve_delivery(), Some(message));
+        run_to_settle(
+            self.agent.clone(),
+            self.hooks.clone(),
+            RunRequest::Prompt(messages),
+        )
+        .await
     }
 }
 #[async_trait]

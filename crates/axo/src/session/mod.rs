@@ -42,11 +42,11 @@ use self::maintenance::Maintenance;
 use self::prompt::{PromptState, SessionPrompt};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
-use self::spawn::SpawnTool;
 pub use self::spawn::{
     ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
     SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
 };
+use self::spawn::{SPAWN, SpawnTool};
 use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
@@ -299,8 +299,17 @@ pub(crate) struct Inherited {
     pub(crate) store: Arc<dyn SessionStore>,
     pub(crate) sessions: Arc<SessionTable>,
     pub(crate) spawn_hooks: Vec<Arc<dyn SpawnHook>>,
-    /// Child runs streaming at once under one root session.
+    /// Child runs streaming at once under one root session and its live forks.
     pub(crate) run_slots: Arc<tokio::sync::Semaphore>,
+    /// `Some` for children: `session_schemes` skips skill discovery and docs materialization.
+    pub(crate) loaded: Option<Loaded>,
+}
+
+/// Skills and the docs flag a child takes from its parent instead of loading them again.
+#[derive(Clone)]
+pub(crate) struct Loaded {
+    pub(crate) skills: Vec<Skill>,
+    pub(crate) docs: bool,
 }
 
 /// Everything `Axo` resolved for a new, opened or forked session.
@@ -362,6 +371,9 @@ struct SessionHooks {
     /// Set when a run ends other than `Done` or the user stops an active one; finished
     /// job results then wait for the user's next input instead of starting a run.
     auto_paused: AtomicBool,
+    /// Set by a Stop while the session is claimed; the next run start honors it, so a Stop
+    /// before the run begins is not lost.
+    stop_requested: AtomicBool,
     /// Set once in `Session::start`; weak, since the agent holds these hooks.
     agent: OnceLock<Weak<Agent>>,
     /// These hooks, for tasks that deliver job results.
@@ -487,6 +499,14 @@ impl SessionHooks {
 
     fn selection(&self) -> Selection {
         self.selection.borrow().clone()
+    }
+
+    /// What a child of this session reuses instead of loading again.
+    pub(super) fn loaded(&self) -> Loaded {
+        Loaded {
+            skills: self.prompt.sources.skills.clone(),
+            docs: self.prompt.sources.docs,
+        }
     }
 
     fn model(&self) -> Model {
@@ -1053,6 +1073,12 @@ impl Persist for SessionHooks {
             }
             _ => {}
         }
+        if matches!(event, AgentEvent::AgentStart)
+            && self.stop_requested.swap(false, Ordering::AcqRel)
+            && let Some(agent) = self.agent.get().and_then(Weak::upgrade)
+        {
+            agent.cancel(CancelReason::User);
+        }
         let _ = self.events.send(SessionEvent::Agent(event.clone()));
         Ok(())
     }
@@ -1079,7 +1105,8 @@ pub(crate) struct LiveSchemes {
 /// `live` is given, then `host` schemes. Open sessions and `Axo::schemes` both build
 /// them here, so given the same effective config a file-backed URL resolves alike
 /// whether its session is open or not; only open sessions get `proc://` and
-/// `agent://` (`Axo::schemes` passes no live state).
+/// `agent://` (`Axo::schemes` passes no live state). A child passes its parent's
+/// `loaded` skills and docs flag, which skips discovery and docs materialization.
 pub(crate) fn session_schemes(
     config: &EffectiveConfig,
     docs_dir: Option<&Path>,
@@ -1087,31 +1114,43 @@ pub(crate) fn session_schemes(
     cx: SchemeContext,
     host: &[Arc<dyn Scheme>],
     live: Option<LiveSchemes>,
+    loaded: Option<&Loaded>,
 ) -> Result<(Schemes, Vec<Skill>, Vec<Diagnostic>, bool), Error> {
-    let settings = &config.settings;
-    let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
-    let (skills, mut diagnostics) = load_skills(
-        &config.skill_roots,
-        home_agents.as_deref(),
-        &cx.cwd,
-        config.access != ProjectAccess::Ignore && settings.project.files.skills,
-    );
+    let (skills, mut diagnostics) = match loaded {
+        Some(loaded) => (loaded.skills.clone(), Vec::new()),
+        None => {
+            let settings = &config.settings;
+            let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
+            load_skills(
+                &config.skill_roots,
+                home_agents.as_deref(),
+                &cx.cwd,
+                config.access != ProjectAccess::Ignore && settings.project.files.skills,
+            )
+        }
+    };
     let mut builtins: Vec<Arc<dyn Scheme>> = vec![
         Arc::new(SkillScheme::new(&skills)),
         Arc::new(DirScheme::local(cx.session_dir.join(LOCAL_DIR))),
     ];
-    let docs = docs_dir.is_some_and(|docs_dir| match ensure_bundled_docs(docs_dir, name) {
-        Ok(()) => {
+    let docs = docs_dir.is_some_and(|docs_dir| {
+        let ready = match loaded {
+            Some(loaded) => loaded.docs,
+            None => match ensure_bundled_docs(docs_dir, name) {
+                Ok(()) => true,
+                Err(error) => {
+                    diagnostics.push(Diagnostic {
+                        origin: Some(DiagnosticOrigin::Path(docs_dir.to_path_buf())),
+                        message: error.to_string(),
+                    });
+                    false
+                }
+            },
+        };
+        if ready {
             builtins.push(Arc::new(DirScheme::docs(name, docs_dir.to_path_buf())));
-            true
         }
-        Err(error) => {
-            diagnostics.push(Diagnostic {
-                origin: Some(DiagnosticOrigin::Path(docs_dir.to_path_buf())),
-                message: error.to_string(),
-            });
-            false
-        }
+        ready
     });
     if let Some(live) = live {
         builtins.push(Arc::new(ProcScheme {
@@ -1222,6 +1261,7 @@ impl Session {
                     team: link.as_ref().and_then(|link| link.team.clone()),
                 },
             }),
+            inherited.loaded.as_ref(),
         )?;
         let (summary_prompts, summary_diagnostics) =
             compaction::summary::SummaryPrompts::load(&config.prompts, &inherited.harness_name);
@@ -1318,7 +1358,7 @@ impl Session {
         }
         let depth = link.as_ref().map_or(0, |link| link.depth);
         if depth >= settings.subagents.max_depth {
-            tools.retain(|tool| tool.name() != "spawn");
+            tools.retain(|tool| tool.name() != SPAWN);
         }
         if let Some(output) = link.as_ref().and_then(|link| link.spec.output.as_ref())
             && let Some(state) = &yield_state
@@ -1380,6 +1420,7 @@ impl Session {
                     prompts: summary_prompts,
                     cancel: Mutex::new(None),
                 },
+                stop_requested: AtomicBool::new(false),
                 preparing: AtomicUsize::new(0),
                 prompt: SessionPrompt {
                     sources: PromptSources {
@@ -1520,7 +1561,7 @@ impl Session {
             });
         }
         if recovery.is_some() {
-            session.reconcile_children().await?;
+            tokio::spawn(children::reconcile_children(Arc::downgrade(&session.hooks)));
         }
         Ok(session)
     }
@@ -1695,6 +1736,7 @@ impl Session {
     pub fn abort(&self) {
         if self.hooks.activity.borrow().running {
             self.hooks.auto_paused.store(true, Ordering::Release);
+            self.hooks.stop_requested.store(true, Ordering::Release);
         }
         self.hooks.cancel_maintenance(false);
         self.agent.cancel(CancelReason::User);
@@ -1794,7 +1836,9 @@ impl Session {
     /// Copies the root→`entry_id` path into a new session file that records this one as
     /// its parent. The fork runs with this session's resolved configuration. Forking at a
     /// user message copies the path to its parent and returns the message's parts to edit
-    /// and resubmit.
+    /// and resubmit. A live fork shares this session's child-run slots; a fork of a child
+    /// also keeps its agent prompt, without `ask` or host sections. Reopening the fork with
+    /// `Axo::open_session` resolves it as an independent root.
     pub async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error> {
         let Selection { model, thinking } = self.hooks.selection();
         let (path, editable) = {

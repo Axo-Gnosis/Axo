@@ -235,17 +235,35 @@ impl Agent {
         self.lock().follow_up.push_back(m);
     }
 
-    /// Removes and returns every queued steering message, in order, and lowers the steer signal.
-    pub fn take_steering(&self) -> Vec<QueuedMessage> {
+    /// Takes the next messages of the steering (`true`) or follow-up queue per its mode.
+    /// Draining the last steering message clears the steer signal under the same lock.
+    pub(crate) fn take_queued(&self, steering: bool) -> Vec<QueuedMessage> {
         let mut state = self.lock();
-        let taken = state.steering.drain(..).collect();
-        self.steer_pending.send_replace(false);
+        let (queue, mode) = if steering {
+            (&mut state.steering, self.steering_mode)
+        } else {
+            (&mut state.follow_up, self.follow_up_mode)
+        };
+        let taken = match mode {
+            QueueMode::All => queue.drain(..).collect(),
+            QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
+        };
+        if steering && queue.is_empty() {
+            self.steer_pending.send_replace(false);
+        }
         taken
     }
 
-    /// Removes and returns every queued follow-up message, in order.
-    pub fn take_follow_ups(&self) -> Vec<QueuedMessage> {
-        self.lock().follow_up.drain(..).collect()
+    /// What a run started from idle begins with: the next steering messages per the
+    /// steering mode, else the next follow-ups per the follow-up mode. The rest stay
+    /// queued for the run's own drain points.
+    pub fn take_next_input(&self) -> Vec<QueuedMessage> {
+        let steering = self.take_queued(true);
+        if steering.is_empty() {
+            self.take_queued(false)
+        } else {
+            steering
+        }
     }
 
     /// Cancels the active run, if any. The first reason given for a run wins.
