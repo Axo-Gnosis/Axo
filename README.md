@@ -44,6 +44,16 @@ Every session is an append-only JSONL entry tree (with the bundled `JsonlStore`:
 - **Live attach:** `session.attach(from_seq)` returns missed durable entries since `from_seq`, a `LiveSnapshot` of any run or maintenance in progress (partial reply, running tools, pending `ask` questions, queued submissions) plus the session's background jobs, and a live broadcast receiver.
 - **Branching & forking:** `session.navigate(target, options)` moves the persisted `leaf` pointer inside the tree (optionally summarizing the abandoned branch into a `branch_summary` entry); `session.fork(entry_id)` clones the path into a new session file and returns the forked user message's parts as `Fork::editable` for the client to edit and resubmit.
 
+### Child sessions
+
+Hosts spawn asynchronous children with `Session::spawn`, selecting a catalog agent, an `InlineSpec`, or a plain delegate. Each child has its own journal, a persisted resolved spec, and one parent-registry row across all its runs. Run messages are delivered exactly once through the shared job-delivery machinery and reconciled when the parent reopens.
+
+- **Budgets:** User-only `subagents` settings control depth, FIFO concurrent-run slots, turn-budget wrap-up, model defaults, and context-file defaults.
+- **Isolation and policy:** Children have fixed, first-position delegation framing, do not inherit host prompt sections, and cannot ask the user. Hosts can allow, block, or replace their specs through `SpawnHook`.
+- **Lifecycle:** Idle children park; `Axo::session` returns a live child or revives a parked one. Parent shutdown preserves unfinished child runs for recovery on reopen. `JobInfo::kind` distinguishes command and child rows.
+
+See [Spawning child sessions](crates/axo/docs/extending.md#spawning-child-sessions) and [Child sessions](crates/axo/docs/sessions-and-compaction.md#child-sessions).
+
 ### Commands & prompt parts
 
 `axo` owns the user command catalog and the shape of a user message; hosts decide which commands to expose and how:
@@ -60,7 +70,7 @@ Every local command (`bash` and dev-shell capture) runs in its own container, ch
 
 - **Retained helpers:** A command's result returns when its root shell exits (plus a 100 ms drain); processes it left running in its container stay supervised as `bg_N`, keep spooling output, and can be inspected or killed.
 - **Promotion:** `bash` moves to the background after 60 s, when the user steers, or immediately with `async: true`, returning `bg_N` and its `artifact://` output. The optional `timeout` keeps no default and is never reset.
-- **Exactly-once results:** A finished job's result reaches the model once, through `wait` or an automatic `job_result` message injected at the next turn boundary (an idle session starts a run for it). Promotion, results and delivery receipts are journaled, so results survive crashes and reopen; reopening never starts a run by itself.
+- **Exactly-once results:** A finished command's result reaches the model once, through `wait` or an automatic `job_result` message injected at the next turn boundary (an idle session starts a run for it). Promotion, results and delivery receipts are journaled, so results survive crashes and reopen; results reconciled on open do not by themselves start a run.
 - **`proc://`:** `read proc://` lists jobs, `read proc://bg_N` shows one, and `write proc://bg_N/kill` stops it.
 - **Stop:** `session.abort()` stops the foreground turn only; background jobs keep running, and automatic delivery waits for the next user message.
 
@@ -74,7 +84,7 @@ Every local command (`bash` and dev-shell capture) runs in its own container, ch
 
 ### Sectioned system prompt, context files & skills
 
-The system prompt lives in the transcript as named `<section>` blocks (`system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `cwd`, `dev_shell`, `date`, plus host sections). Mid-session updates emit a diff `SystemMessage` containing only changed sections.
+The system prompt lives in the transcript as named `<section>` blocks (`system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `cwd`, `dev_shell`, `date`, plus host sections). Children prepend a fixed `delegation` section and omit inherited host sections. Mid-session updates emit a diff `SystemMessage` containing only changed sections.
 
 - **Replaceable prompts:** `SYSTEM`, `WORK`, `PROSE`, and the five summarizer prompts can be overridden by the host's user layer or, at `read` and `trust` access with `project.files.config` on (the default), the project layer it supplies (the project wins per name). Overrides are sampled once when a session is created or opened. An empty `SYSTEM`, `WORK`, or `PROSE` override disables that section.
 - **Ordered `contextFiles` & nested loading:** Startup loads `~/.agents/AGENTS.md` (only when `homeAgentsDir: true`), then the host's `UserConfig::context_files` in order, then walks from the git root to `cwd` loading enabled names from `settings.contextFiles` (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`). Touching a file in a subdirectory with `read`, `write`, or `edit` attaches any unseen nested context files onto that tool result (when `settings.nestedContextFiles` is `true` and project access allows it) without invalidating the system prompt cache.

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::context::markdown::{self, name_problems, split_frontmatter};
@@ -12,25 +12,37 @@ use crate::context::prompt::valid_section_name;
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// An agent's prompt and context switches.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct AgentSpec {
     /// The agent's unique catalog name.
     pub name: String,
     /// One line for listings; may be empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// A model selector (`[@role | provider/model][:thinking]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Tool allowlist over built-in and host tools; `None` keeps every tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     /// `None` keeps `settings.contextFiles`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_files: Option<ContextFiles>,
     /// `false` removes the section; `true` changes nothing.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub sections: IndexMap<String, bool>,
     /// JSON Schema of the agent's result (validated at load; used from Phase 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
+    /// Model requests per child run before the wrap-up turn; `None` uses `subagents.maxTurns`. Ignored for root sessions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
     /// The prompt (trimmed).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
     /// The definition file; `None` for specs passed in code.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
 
@@ -41,6 +53,37 @@ pub enum ContextFiles {
     Off,
     /// Override individual names in `settings.contextFiles`.
     Names(IndexMap<String, bool>),
+}
+
+impl Serialize for ContextFiles {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => serializer.serialize_bool(false),
+            Self::Names(names) => names.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextFiles {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match RawContextFiles::deserialize(deserializer)? {
+            RawContextFiles::Bool(false) => Ok(Self::Off),
+            RawContextFiles::Bool(true) => Err(serde::de::Error::custom(
+                "`true` keeps the default context files",
+            )),
+            RawContextFiles::Map(names) => Ok(Self::Names(names)),
+        }
+    }
+}
+
+pub(crate) fn context_files_switch<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ContextFiles>, D::Error> {
+    Ok(match Option::<RawContextFiles>::deserialize(d)? {
+        None | Some(RawContextFiles::Bool(true)) => None,
+        Some(RawContextFiles::Bool(false)) => Some(ContextFiles::Off),
+        Some(RawContextFiles::Map(names)) => Some(ContextFiles::Names(names)),
+    })
 }
 
 /// A named roster of agents and its shared charter.
@@ -104,10 +147,12 @@ struct Frontmatter {
     description: String,
     model: Option<String>,
     tools: Option<ToolList>,
-    context_files: Option<RawContextFiles>,
+    #[serde(default, deserialize_with = "context_files_switch")]
+    context_files: Option<ContextFiles>,
     #[serde(default)]
     sections: IndexMap<String, bool>,
     output: Option<Value>,
+    max_turns: Option<u32>,
     members: Option<Vec<RawMember>>,
 }
 
@@ -250,6 +295,7 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
             "contextFiles",
             "sections",
             "output",
+            "maxTurns",
         ]
     };
     for key in mapping.keys() {
@@ -308,13 +354,10 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
                 .map(str::to_owned)
                 .collect(),
         }),
-        context_files: frontmatter.context_files.and_then(|files| match files {
-            RawContextFiles::Bool(false) => Some(ContextFiles::Off),
-            RawContextFiles::Bool(true) => None,
-            RawContextFiles::Map(names) => Some(ContextFiles::Names(names)),
-        }),
+        context_files: frontmatter.context_files,
         sections: frontmatter.sections,
         output: frontmatter.output,
+        max_turns: frontmatter.max_turns,
         body,
         path: Some(path.to_path_buf()),
     };

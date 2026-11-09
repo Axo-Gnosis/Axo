@@ -16,6 +16,7 @@ use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
 use crate::exec::{EnvMap, ExecEnv, StaticEnv};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
+use crate::session::children::SessionTable;
 use crate::session::{
     Inherited, RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes,
 };
@@ -38,6 +39,7 @@ pub struct Axo {
     /// Supervises every local command (bash and dev-shell capture) in its own container
     /// (process group or cgroup).
     supervisor: Arc<ProcessSupervisor>,
+    sessions: Arc<SessionTable>,
 }
 
 /// Builds an [`Axo`]. Nothing here reads configuration: without [`AxoBuilder::config`]
@@ -121,6 +123,7 @@ impl AxoBuilder {
             cache_dir: self.cache_dir,
             base_env,
             supervisor,
+            sessions: Arc::new(SessionTable::default()),
         }
     }
 }
@@ -170,6 +173,11 @@ impl Axo {
         options: SessionOptions,
     ) -> Result<Session, Error> {
         let (header, entries, writer) = self.store.open_write(path).await?;
+        if header.spawn.is_some() {
+            return Err(Error::ChildSession {
+                path: path.to_path_buf(),
+            });
+        }
         let projection = project(&entries, None);
         let recovery = options.recovery;
         self.start(
@@ -184,6 +192,12 @@ impl Axo {
             Some(recovery),
         )
         .await
+    }
+
+    /// A live child session, or a parked one revived (its unfinished run resumes). Children
+    /// are known once their parent is open in this process.
+    pub async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
+        self.sessions.session(id).await
     }
 
     /// Reads a saved session without locking it.
@@ -259,6 +273,7 @@ impl Axo {
             sections,
             tools: host_tools,
             tool_hooks,
+            spawn_hooks,
             schemes: host_schemes,
             recovery: _,
         } = options;
@@ -283,23 +298,16 @@ impl Axo {
         };
         let settings = &config.settings;
 
-        let mut selected_model = None;
-        let mut suffix = None;
-        for selector in [
-            model.as_deref(),
-            projection.model.as_deref(),
-            agent.as_ref().and_then(|spec| spec.model.as_deref()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let choice = settings.resolve_model(&self.models, selector)?;
-            suffix = suffix.or(choice.thinking);
-            if choice.model.is_some() {
-                selected_model = choice.model;
-                break;
-            }
-        }
+        let cascade = settings.first_model(
+            &self.models,
+            [
+                model.as_deref(),
+                projection.model.as_deref(),
+                agent.as_ref().and_then(|spec| spec.model.as_deref()),
+            ],
+        )?;
+        let selected_model = cascade.model;
+        let mut suffix = cascade.thinking;
         let model = match selected_model {
             Some(model) => model,
             None => {
@@ -337,6 +345,9 @@ impl Axo {
             )),
         };
 
+        let run_slots = Arc::new(tokio::sync::Semaphore::new(
+            settings.subagents.max_concurrent.max(1),
+        ));
         Session::start(SessionSetup {
             inherited: Arc::new(Inherited {
                 cwd,
@@ -356,6 +367,9 @@ impl Axo {
                 host_schemes,
                 tool_hooks,
                 store: self.store.clone(),
+                sessions: self.sessions.clone(),
+                spawn_hooks,
+                run_slots,
             }),
             model,
             thinking,
@@ -364,6 +378,7 @@ impl Axo {
             entries,
             projection,
             recovery,
+            link: None,
         })
         .await
     }

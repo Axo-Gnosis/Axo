@@ -220,18 +220,7 @@ pub enum RecoveryPlan {
     },
 }
 
-/// Plans recovery from a session's entries. `replay_of` maps an unanswered call to its
-/// replay policy.
-///
-/// Only the last `run_start` is considered: runs never overlap, so once a later
-/// run exists an older unclosed one has nothing left to recover.
-pub fn plan_recovery(
-    entries: &[SeqEntry],
-    projection: &Projection,
-    model: &Model,
-    replay_of: &dyn Fn(&ToolCall) -> Replay,
-) -> RecoveryPlan {
-    let active: HashSet<usize> = projection.path().iter().copied().collect();
+fn unconsumed_submissions(entries: &[SeqEntry]) -> impl Iterator<Item = &SeqEntry> {
     // Submissions since the last run settled (an open run's own prompt is written
     // before its `run_start`); earlier leftovers were dropped with their run.
     let since = entries
@@ -248,16 +237,14 @@ pub fn plan_recovery(
             _ => None,
         })
         .collect();
-    let requeue: Vec<SeqEntry> = entries[since..]
-        .iter()
-        .filter(|seq| {
-            matches!(&seq.entry, Entry::Submission { submission_id, .. }
-                if !consumed.contains(submission_id.as_str()))
-        })
-        .cloned()
-        .collect();
+    entries[since..].iter().filter(move |seq| {
+        matches!(&seq.entry, Entry::Submission { submission_id, .. }
+            if !consumed.contains(submission_id.as_str()))
+    })
+}
 
-    let open = entries
+fn open_run<'a>(entries: &'a [SeqEntry], projection: &Projection) -> Option<(usize, &'a String)> {
+    entries
         .iter()
         .enumerate()
         .rev()
@@ -266,12 +253,33 @@ pub fn plan_recovery(
             _ => None,
         })
         .filter(|(start, run_id)| {
-            active.contains(start)
+            projection.path().contains(start)
                 && !entries[start + 1..].iter().any(
                     |seq| matches!(&seq.entry, Entry::RunEnd { run_id: end, .. } if end == *run_id),
                 )
-        });
-    let Some((start, run_id)) = open else {
+        })
+}
+
+/// Whether opening this journal has an unfinished run or input to recover.
+pub(crate) fn needs_recovery(entries: &[SeqEntry]) -> bool {
+    open_run(entries, &project(entries, None)).is_some()
+        || unconsumed_submissions(entries).next().is_some()
+}
+
+/// Plans recovery from a session's entries. `replay_of` maps an unanswered call to its
+/// replay policy.
+///
+/// Only the last `run_start` is considered: runs never overlap, so once a later
+/// run exists an older unclosed one has nothing left to recover.
+pub fn plan_recovery(
+    entries: &[SeqEntry],
+    projection: &Projection,
+    model: &Model,
+    replay_of: &dyn Fn(&ToolCall) -> Replay,
+) -> RecoveryPlan {
+    let active: HashSet<usize> = projection.path().iter().copied().collect();
+    let requeue: Vec<SeqEntry> = unconsumed_submissions(entries).cloned().collect();
+    let Some((start, run_id)) = open_run(entries, projection) else {
         return if requeue.is_empty() {
             RecoveryPlan::None
         } else {
@@ -558,12 +566,14 @@ mod tests {
         }
 
         fn plan(&self) -> RecoveryPlan {
-            plan_recovery(
+            let plan = plan_recovery(
                 &self.entries,
                 &crate::project(&self.entries, None),
                 &scripted_model(),
                 &replay_of,
-            )
+            );
+            assert_eq!(needs_recovery(&self.entries), plan != RecoveryPlan::None);
+            plan
         }
     }
 

@@ -1,6 +1,6 @@
 //! A deterministic [`Streamer`] that replays scripted turns, for tests.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Mutex;
@@ -64,6 +64,7 @@ pub struct RecordedRequest {
 #[derive(Debug, Default)]
 pub struct ScriptedApi {
     turns: Mutex<VecDeque<ScriptedTurn>>,
+    lanes: Mutex<HashMap<String, VecDeque<ScriptedTurn>>>,
     requests: Mutex<Vec<RecordedRequest>>,
 }
 
@@ -71,8 +72,21 @@ impl ScriptedApi {
     pub fn new(turns: Vec<ScriptedTurn>) -> Self {
         Self {
             turns: Mutex::new(turns.into()),
+            lanes: Mutex::new(HashMap::new()),
             requests: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Serves `turns`, in order, to requests for model id `model_id` only; requests for
+    /// other models keep using the shared queue. A lane that runs out behaves as
+    /// `ScriptedTurn::Error("script exhausted")`.
+    pub fn lane(&self, model_id: &str, turns: Vec<ScriptedTurn>) {
+        self.lanes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(model_id.to_owned())
+            .or_default()
+            .extend(turns);
     }
 
     /// Complete requests, including the actual model and options, in call order.
@@ -133,11 +147,19 @@ impl Streamer for ScriptedApi {
                 transcript,
                 options: opts,
             });
-        let turn = self
-            .turns
+        let lane_turn = self
+            .lanes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .pop_front()
+            .get_mut(&model.id)
+            .map(VecDeque::pop_front);
+        let turn = lane_turn
+            .unwrap_or_else(|| {
+                self.turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front()
+            })
             .unwrap_or_else(|| ScriptedTurn::Error("script exhausted".into()));
 
         match turn {

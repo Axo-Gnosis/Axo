@@ -577,7 +577,12 @@ mod tests {
                 )
                 .unwrap(),
                 CommandRunner {
-                    jobs: JobRegistry::new("test".into(), &[]).0,
+                    jobs: JobRegistry::new(
+                        "test".into(),
+                        &[],
+                        Arc::new(crate::session::children::SessionTable::default()),
+                    )
+                    .0,
                     artifacts,
                     supervisor: ProcessSupervisor::new(Supervision::default()),
                     ci: false,

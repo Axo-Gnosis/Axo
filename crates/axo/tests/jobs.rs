@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use axo::exec::host::ExecSpec;
 use axo::tools::CommandRequest;
-use axo::{Axo, JobInfo, JobStatus, Session, SessionEvent, SessionTools, ToolFactory};
+use axo::{Axo, JobInfo, JobKind, JobStatus, Session, SessionEvent, SessionTools, ToolFactory};
 use axo::{Entry, SeqEntry};
 use axo_agent::{AgentEvent, RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
@@ -286,7 +286,7 @@ async fn host_command_is_listed_and_delivered_once() {
     let jobs = session.jobs();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(jobs[0].id, "bg_1");
-    assert_eq!(jobs[0].command, "late");
+    assert!(matches!(&jobs[0].kind, JobKind::Command { command, .. } if command == "late"));
     let first_end = entries
         .iter()
         .find(|entry| matches!(entry.entry, Entry::RunEnd { .. }))
@@ -634,11 +634,15 @@ async fn host_job_api_reports_and_kills() {
     );
     let jobs = session.jobs();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
-    let artifact = jobs[0].artifact;
+    let JobKind::Command { artifact, .. } = &jobs[0].kind else {
+        panic!("expected a command job");
+    };
     let running = vec![JobInfo {
         id: "bg_1".into(),
-        command: "sleep 30".into(),
-        artifact,
+        kind: JobKind::Command {
+            command: "sleep 30".into(),
+            artifact: *artifact,
+        },
         status: JobStatus::Running,
     }];
     assert_eq!(jobs, running);

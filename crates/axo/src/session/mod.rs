@@ -1,11 +1,13 @@
 //! A conversation with one agent in one working directory, saved as it happens.
 
+pub(crate) mod children;
 mod delivery;
 pub(crate) mod journal;
 mod maintenance;
 mod prompt;
 mod resume;
 mod side_files;
+pub(crate) mod spawn;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -32,12 +34,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
+use self::children::{ChildState, SessionTable, TurnBudget};
 use self::delivery::{Activity, enqueue, relay_jobs};
 use self::journal::Journal;
 use self::maintenance::Maintenance;
 use self::prompt::{PromptState, SessionPrompt};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
+pub use self::spawn::{
+    ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnRequest,
+};
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
 use crate::config::{EffectiveConfig, ProjectAccess, PromptOverride};
@@ -50,7 +56,7 @@ use crate::error::Error;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::input::{PromptInput, PromptPart};
-use crate::jobs::{JobHost, JobInfo, JobRegistry, parse_job_id};
+use crate::jobs::{JobHost, JobId, JobInfo, JobRegistry};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::Artifacts;
 use crate::schemes::dir::{DirScheme, ensure_bundled_docs};
@@ -90,6 +96,8 @@ pub struct SessionOptions {
     pub tools: Vec<ToolFactory>,
     /// Ordered host tool policies, inherited by forks.
     pub tool_hooks: Vec<Arc<dyn ToolHooks>>,
+    /// Ordered spawn policies; children inherit them.
+    pub spawn_hooks: Vec<Arc<dyn SpawnHook>>,
     /// Host schemes; one named like a built-in replaces it (artifact and file are reserved).
     pub schemes: Vec<Arc<dyn Scheme>>,
     /// What `Axo::open_session` does with a run left unfinished.
@@ -111,6 +119,7 @@ impl Default for SessionOptions {
             sections: Vec::new(),
             tools: Vec::new(),
             tool_hooks: Vec::new(),
+            spawn_hooks: Vec::new(),
             schemes: Vec::new(),
             recovery: RecoveryPolicy::default(),
         }
@@ -282,6 +291,10 @@ pub(crate) struct Inherited {
     pub(crate) host_schemes: Vec<Arc<dyn Scheme>>,
     pub(crate) tool_hooks: Vec<Arc<dyn ToolHooks>>,
     pub(crate) store: Arc<dyn SessionStore>,
+    pub(crate) sessions: Arc<SessionTable>,
+    pub(crate) spawn_hooks: Vec<Arc<dyn SpawnHook>>,
+    /// Child runs streaming at once under one root session.
+    pub(crate) run_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Everything `Axo` resolved for a new, opened or forked session.
@@ -299,6 +312,7 @@ pub(crate) struct SessionSetup {
     pub(crate) projection: Projection,
     /// Recovery to run on `entries`; `None` for new sessions and forks.
     pub(crate) recovery: Option<RecoveryPolicy>,
+    pub(crate) link: Option<store::SpawnLink>,
 }
 
 pub struct Session {
@@ -312,6 +326,7 @@ pub struct Session {
 struct SessionHooks {
     events: broadcast::Sender<SessionEvent>,
     inherited: Arc<Inherited>,
+    child: Option<ChildState>,
     /// The header id and lazily created session file.
     session_id: String,
     path: PathBuf,
@@ -383,6 +398,20 @@ async fn run_to_settle(
     hooks: Arc<SessionHooks>,
     request: RunRequest,
 ) -> Result<RunOutcome, Error> {
+    // ponytail: a waiting child holds its slot while its own children queue; nested trees at maxConcurrent can deadlock — release the slot while in wait if maxDepth > 1 becomes common.
+    let _slot = if hooks.child.is_some() {
+        Some(
+            hooks
+                .inherited
+                .run_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("never closed"),
+        )
+    } else {
+        None
+    };
     let result = std::panic::AssertUnwindSafe(async {
         match request {
             RunRequest::Prompt(messages) => agent.prompt(messages).await,
@@ -569,12 +598,28 @@ impl SessionHooks {
                 closed = self
                     .append(vec![Entry::RunEnd {
                         base: journal::base(),
-                        run_id,
+                        run_id: run_id.clone(),
                         outcome,
                         reason,
                     }])
                     .await
                     .map(drop);
+                if closed.is_ok()
+                    && let Some(child) = &self.child
+                    && let Some(parent) = self
+                        .inherited
+                        .sessions
+                        .registry(&child.link.parent_session_id)
+                {
+                    let message =
+                        crate::jobs::child::run_message(&self.journal.view().entries, &run_id);
+                    if let Some(message) = message
+                        && let Err(error) =
+                            parent.child_message(&self.session_id, message, true).await
+                    {
+                        warn!(%error, "child result delivery failed");
+                    }
+                }
             }
         }
         if closed.is_err() {
@@ -700,6 +745,9 @@ impl LoopHooks for SessionHooks {
         _context: &AgentContext,
         cancel: &CancellationToken,
     ) -> Result<Option<Vec<AgentMessage>>, HookError> {
+        if let Some(child) = &self.child {
+            child.budget.request();
+        }
         if self
             .automatic(CompactionReason::Threshold, cancel)
             .await
@@ -821,10 +869,26 @@ impl LoopHooks for SessionHooks {
 
     async fn prepare_next_turn(
         &self,
-        _turn: TurnContext<'_>,
+        turn: TurnContext<'_>,
         _cancel: &CancellationToken,
     ) -> Vec<AgentMessage> {
-        self.take_system()
+        let mut messages = self.take_system();
+        if let Some(child) = &self.child
+            && child.budget.requests() == child.budget.limit
+            && turn.message.tool_calls().next().is_some()
+        {
+            let limit = child.budget.limit;
+            messages.push(AgentMessage::Custom(axo_agent::CustomMessage {
+                custom_type: crate::jobs::child::TURN_BUDGET.into(),
+                content: vec![UserBlock::Text {
+                    text: format!("Turn budget exhausted: this run used its {limit} turns. Tool calls are no longer executed. Reply now with your final answer: what you completed, what remains, and what your parent needs to continue."),
+                }],
+                display: true,
+                details: None,
+                timestamp: axo_ai::now_ms(),
+            }));
+        }
+        messages
     }
 
     /// Finished job results reach an active run at each steering drain point. They do
@@ -841,6 +905,18 @@ impl Persist for SessionHooks {
     /// only the journal task; live state changes under a lock that is never held across
     /// an await.
     async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
+        if matches!(event, AgentEvent::AgentStart)
+            && let Some(child) = &self.child
+        {
+            child.budget.reset();
+            if let Some(parent) = self
+                .inherited
+                .sessions
+                .registry(&child.link.parent_session_id)
+            {
+                parent.child_running(&self.session_id);
+            }
+        }
         match event {
             // A resumed run keeps the id of the run it continues.
             AgentEvent::AgentStart if self.live().run_id.is_none() => {
@@ -979,6 +1055,7 @@ impl Session {
             entries,
             projection,
             recovery,
+            link,
         } = setup;
         let Inherited {
             cwd,
@@ -1031,7 +1108,11 @@ impl Session {
                 (context_files, context, name_diagnostics, file_diagnostics)
             }
         };
-        let (jobs, unfinished) = JobRegistry::new(session_id.clone(), &entries);
+        let (jobs, unfinished) =
+            JobRegistry::new(session_id.clone(), &entries, inherited.sessions.clone());
+        inherited
+            .sessions
+            .register(session_id.clone(), Arc::downgrade(&jobs));
         let (schemes, skills, skill_diagnostics, docs) = session_schemes(
             config,
             docs_dir.as_deref(),
@@ -1136,6 +1217,17 @@ impl Session {
         }
 
         let journal = Journal::start(writer, entries, projection.clone(), events.clone());
+        let child = link.map(|link| ChildState {
+            budget: Arc::new(TurnBudget::new(
+                link.spec.max_turns.unwrap_or(settings.subagents.max_turns),
+            )),
+            link,
+        });
+        let mut tool_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
+        if let Some(child) = &child {
+            tool_hooks.push(child.budget.clone());
+        }
+        tool_hooks.extend(inherited.tool_hooks.iter().cloned());
         let hooks = Arc::new_cyclic(|this: &Weak<SessionHooks>| {
             jobs.attach(this.clone() as Weak<dyn JobHost>);
             SessionHooks {
@@ -1163,6 +1255,7 @@ impl Session {
                 preparing: AtomicUsize::new(0),
                 prompt: SessionPrompt {
                     sources: PromptSources {
+                        delegation: child.is_some(),
                         name: inherited.harness_name.clone(),
                         cwd: cwd.clone(),
                         prompts,
@@ -1183,6 +1276,7 @@ impl Session {
                 auto_paused: AtomicBool::new(false),
                 agent: OnceLock::new(),
                 this: this.clone(),
+                child,
             }
         });
         tokio::spawn(relay_jobs(
@@ -1194,7 +1288,7 @@ impl Session {
             thinking,
             tools,
             hooks: hooks.clone(),
-            tool_hooks: inherited.tool_hooks.clone(),
+            tool_hooks,
             persist: Some(hooks.clone()),
             steering_mode: settings.steering_mode,
             follow_up_mode: settings.follow_up_mode,
@@ -1202,6 +1296,13 @@ impl Session {
             ..AgentConfig::new(inherited.streamer.clone(), model)
         }));
         let _ = hooks.agent.set(Arc::downgrade(&agent));
+        if hooks.child.is_some() {
+            tokio::spawn(children::park_when_idle(
+                Arc::downgrade(&hooks),
+                hooks.activity.subscribe(),
+                jobs.subscribe(),
+            ));
+        }
 
         let session = Session {
             agent,
@@ -1286,6 +1387,9 @@ impl Session {
                 }
             });
         }
+        if recovery.is_some() {
+            session.reconcile_children().await?;
+        }
         Ok(session)
     }
 
@@ -1297,6 +1401,11 @@ impl Session {
     /// The header id (UUIDv7), known before the session file exists.
     pub fn id(&self) -> &str {
         &self.hooks.session_id
+    }
+
+    /// The spawn link of a child session; `None` for root sessions and forks.
+    pub fn agent(&self) -> Option<&store::SpawnLink> {
+        self.hooks.child.as_ref().map(|child| &child.link)
     }
 
     /// Sets the file-wide session name; newlines become spaces and blank names clear it.
@@ -1388,10 +1497,10 @@ impl Session {
         self.hooks.tools.runner.jobs.list()
     }
 
-    /// Stops job `id` (`bg_N`), like `write proc://bg_N/kill`; false when it is unknown
+    /// Stops job `id` (`bg_N` or `agent_N`), like `write proc://<id>/kill`; false when unknown
     /// or no longer running.
     pub fn kill_job(&self, id: &str) -> bool {
-        parse_job_id(id).is_some_and(|id| self.hooks.tools.runner.jobs.kill(id))
+        JobId::parse(id).is_some_and(|id| self.hooks.tools.runner.jobs.kill(id))
     }
 
     /// This session's URL schemes, for hosts resolving URLs they display: recognize with
@@ -1473,6 +1582,21 @@ impl Session {
             .subscribe()
             .wait_for(|activity| !activity.running)
             .await;
+        let ids: Vec<_> = self
+            .hooks
+            .tools
+            .runner
+            .jobs
+            .children()
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect();
+        let children: Vec<_> = ids
+            .iter()
+            .filter_map(|id| self.inherited.sessions.live(id))
+            .collect();
+        futures::future::join_all(children.iter().map(|child| Box::pin(child.shutdown()))).await;
+        self.inherited.sessions.remove(&ids);
         self.hooks.tools.runner.jobs.shutdown().await;
     }
 
@@ -1652,6 +1776,7 @@ impl Session {
             entries,
             projection,
             recovery: None,
+            link: None,
         })
         .await?;
         Ok(Fork { session, editable })
@@ -1665,5 +1790,18 @@ impl Drop for Session {
         self.agent.shutdown();
         self.hooks.cancel_maintenance(true);
         self.hooks.tools.runner.jobs.kill_all();
+        let ids: Vec<_> = self
+            .hooks
+            .tools
+            .runner
+            .jobs
+            .children()
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect();
+        self.inherited.sessions.remove(&ids);
+        self.inherited
+            .sessions
+            .unregister(self.id(), &self.hooks.tools.runner.jobs);
     }
 }

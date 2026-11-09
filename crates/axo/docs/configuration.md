@@ -30,7 +30,7 @@ An error from either method fails that `create_session`, `open_session`, or `sch
 2. **Validate the user settings on their own:** `None` or `null` is no settings; a non-object is `Error::Config { origin, message: "expected a JSON object" }`; a value that does not deserialize as `Settings` is `Error::Config` with the layer's `origin` and the deserializer's message. The valid object is merged over the defaults.
 3. **Validate the user prompt overrides:** a name outside `PROMPT_NAMES` is `Error::Config` with that override's `origin` and the message `unknown prompt override "<name>"`; texts are trimmed.
 4. **Derive access:** an explicit `access` wins; otherwise the `project` policy of this same user sample decides via `ProjectSettings::access_for(project_root(cwd))` (see [Project access](#project-access-project--axoprojectsettings)). A project layer can never raise its own access.
-5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project`, `homeAgentsDir`, and `modelRoles`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. Project agent roots apply only at `Trust`; at `Read`, non-empty roots are ignored with a warning. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project contribution applies.
+5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project`, `homeAgentsDir`, `modelRoles`, and `subagents`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. Project agent roots apply only at `Trust`; at `Read`, non-empty roots are ignored with a warning. At `Ignore`, or with `project.files.config: false`, `project` is not called and no project contribution applies.
 6. **Deserialize the merged object** into `Settings`; an error is attributed to the last applied origin (the project's when project settings were merged, else the user's). Below `Trust`, any enabled `bash.devShell` resolves to `"off"`, regardless of which layer enabled it, with one warning naming that setting's winning origin.
 
 `defaultModel` is not resolved here: `EffectiveConfig::default_model` expands its `$VAR` at model selection and rejects values starting with `!`, only when neither `SessionOptions::model`, the session's recorded model, nor the root agent's model selects one (see [Config values](#config-values)).
@@ -42,6 +42,7 @@ Unknown keys are ignored in every layer.
 - **Sampling:** every `Axo::create_session`, `Axo::open_session`, and `Axo::schemes` call samples `user()` afresh and computes access from that same sample, so a policy or settings change applies to the next session start without rebuilding `Axo`.
 - **Per session:** a session keeps the `EffectiveConfig` it started with. Settings, prompt overrides (including `SYSTEM`, `WORK`, and `PROSE` when the system prompt is rebuilt for a new date or dev-shell note), skill roots, and context-file paths are fixed at create or open.
 - **Forks:** `Session::fork` inherits the parent's resolved `EffectiveConfig` and never calls the source.
+- **Children:** `Session::spawn` inherits the parent's resolved configuration without sampling the source, applying the child defaults below. The resolved `AgentSpec` is saved in the child's header and reused on revival; agent-file edits do not change an existing child.
 - **Build:** `Axo::builder` and `AxoBuilder::build` call no source method.
 
 ### Trust boundary
@@ -87,6 +88,14 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 {
   "defaultModel": "anthropic/claude-sonnet-4-5",
   "modelRoles": {},
+  "subagents": {
+    "maxDepth": 1,
+    "maxConcurrent": 8,
+    "maxTurns": 50,
+    "defaultModel": null,
+    "models": {},
+    "contextFiles": false
+  },
   "defaultThinkingLevel": "medium",
   "homeAgentsDir": false,
   "steeringMode": "one-at-a-time",
@@ -148,6 +157,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `followUpMode` | `follow_up_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
 | `contextFiles` | `context_files` | 5 built-in names | User or project | Ordered map of relative paths to booleans merged onto the built-in default map |
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
+| `subagents` | `subagents` | See below | User only | Child-session budgets and defaults (`SubagentSettings`). Ignored with a warning in project settings |
 
 ### Model selectors
 
@@ -158,6 +168,23 @@ For example, user settings `"modelRoles": {"bard": "anthropic/claude-sonnet-4-5:
 At session start, model sources are `SessionOptions::model`, the session's last model, the root agent's model, then `defaultModel`. Thinking-only selectors continue to the next source; the first model wins, and later sources are not consulted. Thinking uses explicit `SessionOptions::thinking`, then the first selector thinking level encountered through the winning model, then the recorded thinking level, then `defaultThinkingLevel`, clamped to the model. If no source supplies a model, start returns `Error::NoModel`.
 
 `/model` accepts the same selectors through `Session::run_command`: a thinking-only selector keeps the current model, and a model selector without a thinking suffix preserves the current thinking level (clamped to the new model). `Session::set_model` still takes a resolved `Model`, not a string.
+
+### Child sessions (`subagents` / `axo::SubagentSettings`)
+
+The whole block is **user-only**, including in trusted projects. These settings govern children started through `Session::spawn`, not the root session's run.
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `subagents.maxDepth` | `max_depth` | `1` | Maximum child depth: root sessions are depth 0, their children depth 1. `0` disables spawning |
+| `subagents.maxConcurrent` | `max_concurrent` | `8` | Shared child-run slots under one root session. Runs beyond the limit queue first in, first out; `0` is treated as `1`. The root run does not take a slot |
+| `subagents.maxTurns` | `max_turns` | `50` | Model requests per child run before its wrap-up turn; an agent's `maxTurns` overrides it. Calls in the last budgeted turn are blocked; wrap-up calls terminate the run. See [Child sessions](sessions-and-compaction.md#child-sessions) |
+| `subagents.defaultModel` | `default_model` | `None` | Fallback child model selector before inheriting the parent's live model |
+| `subagents.models` | `models` | `{}` | Catalog agent name → model selector |
+| `subagents.contextFiles` | `context_files` | `false` | Default child context-file policy: `false` disables home, user, project, and nested context files; `true` uses the inherited session settings; a name-to-boolean map overrides the inherited `contextFiles` map |
+
+Child model selection considers `SpawnRequest::model`, the named agent's entry in `subagents.models`, the resolved spec's model, then `subagents.defaultModel`. The first selector naming a model wins; otherwise the parent's live model is inherited. The first thinking suffix encountered through that winning selector wins, otherwise the parent's live thinking level is used, clamped to the selected model. These child selectors use [model selector](#model-selectors) syntax, not the environment-expanding `defaultModel` fallback.
+
+An agent's explicit context-file map or `false` overrides the child default. Omitted or `true` on the agent uses `subagents.contextFiles`. Children always disable `ask` and do not inherit `SessionOptions::sections`; see [Child prompts](prompts-and-context.md#child-prompts).
 
 ### Project access (`project` / `axo::ProjectSettings`)
 

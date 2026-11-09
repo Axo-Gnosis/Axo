@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::context::agents::ContextFiles;
 use crate::context::project_root;
 use crate::error::Error;
 
@@ -37,6 +38,7 @@ pub struct Settings {
     pub project: ProjectSettings,
     pub compaction: CompactionSettings,
     pub retry: RetrySettings,
+    pub subagents: SubagentSettings,
 }
 
 impl Default for Settings {
@@ -55,6 +57,39 @@ impl Default for Settings {
             project: ProjectSettings::default(),
             compaction: CompactionSettings::default(),
             retry: RetrySettings::default(),
+            subagents: SubagentSettings::default(),
+        }
+    }
+}
+
+/// Child-session budgets and defaults. User settings only.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SubagentSettings {
+    /// Deepest spawn: a root session is depth 0, its children 1.
+    pub max_depth: u32,
+    /// Child runs that may run at once under one root session; more wait first in, first out.
+    pub max_concurrent: usize,
+    /// Model requests per child run before the wrap-up turn; an agent's `maxTurns` overrides it.
+    pub max_turns: u32,
+    /// Selector for children whose cascade names no model.
+    pub default_model: Option<String>,
+    /// Agent name → selector.
+    pub models: IndexMap<String, String>,
+    /// Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`.
+    #[serde(deserialize_with = "crate::context::agents::context_files_switch")]
+    pub context_files: Option<ContextFiles>,
+}
+
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            max_depth: 1,
+            max_concurrent: 8,
+            max_turns: 50,
+            default_model: None,
+            models: IndexMap::new(),
+            context_files: Some(ContextFiles::Off),
         }
     }
 }
@@ -68,7 +103,36 @@ pub struct ModelChoice {
     pub thinking: Option<ThinkingLevel>,
 }
 
+/// What a list of selectors picks: the first one naming a model wins; the first thinking suffix seen up to it is kept.
+pub(crate) struct Cascade<'a> {
+    pub model: Option<Model>,
+    pub thinking: Option<ThinkingLevel>,
+    pub selector: Option<&'a str>,
+}
+
 impl Settings {
+    pub(crate) fn first_model<'a>(
+        &self,
+        models: &Models,
+        selectors: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Result<Cascade<'a>, Error> {
+        let mut cascade = Cascade {
+            model: None,
+            thinking: None,
+            selector: None,
+        };
+        for selector in selectors.into_iter().flatten() {
+            let choice = self.resolve_model(models, selector)?;
+            cascade.thinking = cascade.thinking.or(choice.thinking);
+            if choice.model.is_some() {
+                cascade.model = choice.model;
+                cascade.selector = Some(selector);
+                break;
+            }
+        }
+        Ok(cascade)
+    }
+
     /// Resolves a model selector, expanding a user-defined `@role` if present.
     pub fn resolve_model(&self, models: &Models, selector: &str) -> Result<ModelChoice, Error> {
         let Some(rest) = selector.strip_prefix('@') else {
@@ -394,7 +458,7 @@ impl EffectiveConfig {
         cwd: &Path,
         access: Option<ProjectAccess>,
     ) -> Result<Self, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir", "modelRoles"];
+        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir", "modelRoles", "subagents"];
 
         let UserConfig {
             layer: user,

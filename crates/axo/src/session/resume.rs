@@ -10,6 +10,7 @@ use super::{RecoveryPolicy, RunRequest, Session};
 use crate::compaction::Limits;
 use crate::error::Error;
 use crate::input::render;
+use crate::jobs::JobId;
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::{command_log_tail, command_logs};
 use crate::store::{self, Entry, EntryId, SeqEntry, SubmissionKind};
@@ -35,7 +36,7 @@ impl Session {
     /// Ends each admitted job a closed session left unfinished: writes its `JobEnd` once
     /// and makes the interrupted result pending. Delivery waits for the next prompt, a
     /// resumed run's steering, or `wait`; opening never starts a run for it.
-    pub(super) async fn reconcile_jobs(&self, unfinished: Vec<u64>) -> Result<(), Error> {
+    pub(super) async fn reconcile_jobs(&self, unfinished: Vec<JobId>) -> Result<(), Error> {
         self.hooks
             .tools
             .runner

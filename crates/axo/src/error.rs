@@ -31,6 +31,15 @@ pub enum Error {
     /// `SessionOptions::agent` names no agent definition, or names a team.
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
+    /// A spawn hook blocked a spawn, the depth limit was reached, or the parent is shutting down.
+    #[error("{0}")]
+    SpawnBlocked(String),
+    /// `Axo::session` knows no child session with this id.
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
+    /// `Axo::open_session` was given a child session's file.
+    #[error("{}: a child session; reach it through Axo::session", path.display())]
+    ChildSession { path: PathBuf },
     /// `@name` names no `modelRoles` entry.
     #[error("Unknown model role: @{0}")]
     UnknownModelRole(String),

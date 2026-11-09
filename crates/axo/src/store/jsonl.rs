@@ -130,7 +130,7 @@ impl SessionStore for JsonlStore {
         let path = self.session_dir(&header.cwd).join(file_name);
         let mut pending = serde_json::to_vec(&header).map_err(|err| io_error(&path, err.into()))?;
         pending.push(b'\n');
-        // A fork is an explicit copy the user asked for: its file exists right away.
+        // Forks and children have a parent link: their files exist right away.
         let file = if header.parent_session.is_some() {
             let target = path.clone();
             let buffered = std::mem::take(&mut pending);
@@ -241,6 +241,7 @@ impl SessionStore for JsonlStore {
                             timestamp: header.timestamp,
                             cwd: header.cwd,
                             parent_session: header.parent_session,
+                            spawn: header.spawn,
                             modified,
                         })
                     });
@@ -256,8 +257,8 @@ impl SessionStore for JsonlStore {
     }
 }
 
-/// Appends to one session file. Until the first `submission` or non-system
-/// `message` entry, the header and entries buffer in `pending` and no file exists.
+/// Appends to one session file. Until the first `submission`, non-system `message`
+/// or `child_start` entry, the header and entries buffer in `pending` and no file exists.
 struct JsonlWriter {
     path: PathBuf,
     /// The open, locked file; `None` while the session is still lazy.
@@ -294,7 +295,7 @@ impl SessionWriter for JsonlWriter {
         if self.file.is_none() {
             // The seed system prompt alone is not worth a file.
             let creates = match &entry {
-                Entry::Submission { .. } => true,
+                Entry::Submission { .. } | Entry::ChildStart { .. } => true,
                 Entry::Message { message, .. } => {
                     !matches!(message, AgentMessage::Llm(Message::System(_)))
                 }

@@ -13,7 +13,7 @@ use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
-/// `system, docs, tools, schemes, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
+/// `delegation, system, docs, tools, schemes, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
@@ -29,6 +29,8 @@ pub(crate) fn valid_section_name(name: &str) -> bool {
 pub(crate) struct PromptSources {
     pub name: String,
     pub cwd: PathBuf,
+    /// Whether to prepend the fixed, non-overridable child delegation framing.
+    pub delegation: bool,
     /// The session's trimmed prompt overrides, keyed by prompt name.
     pub prompts: IndexMap<String, PromptOverride>,
     /// Whether the bundled documentation scheme is available.
@@ -45,6 +47,7 @@ pub(crate) struct PromptSources {
     pub host_sections: Vec<(String, Option<String>)>,
 }
 
+const BUNDLED_DELEGATION: &str = include_str!("../../prompts/DELEGATION.md");
 const BUNDLED_SYSTEM: &str = include_str!("../../prompts/SYSTEM.md");
 const BUNDLED_PROSE: &str = include_str!("../../prompts/PROSE.md");
 /// Builds sections without I/O or validation. `system`, `work` and `prose` come
@@ -151,6 +154,10 @@ pub(crate) fn build_sections(
         }
     }
 
+    if sources.delegation {
+        bodies.shift_insert(0, "delegation".into(), BUNDLED_DELEGATION.trim().to_owned());
+    }
+
     bodies
         .into_iter()
         .filter(|(_, body)| !body.trim().is_empty())
@@ -225,6 +232,7 @@ mod tests {
         let mut sources = PromptSources {
             name: "axo".into(),
             cwd: "/w".into(),
+            delegation: false,
             prompts,
             docs: false,
             tools: Vec::new(),
@@ -242,5 +250,16 @@ mod tests {
         let sections = build_sections(&sources, None, "2026-10-22");
         let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
         assert_eq!(&keys[..2], &["system", "docs"]);
+
+        sources.delegation = true;
+        for override_ in [Some("Host replacement.".into()), None] {
+            sources.host_sections = vec![("delegation".into(), override_)];
+            let sections = build_sections(&sources, None, "2026-10-22");
+            assert_eq!(sections.first().unwrap().0, "delegation");
+            assert_eq!(
+                sections["delegation"],
+                format!("<delegation>\n{}\n</delegation>", BUNDLED_DELEGATION.trim())
+            );
+        }
     }
 }

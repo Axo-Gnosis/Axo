@@ -12,6 +12,7 @@ use axo_ai::{SystemMessage, ThinkingLevel, Usage, UserBlock};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::context::agents::AgentSpec;
 use crate::input::PromptPart;
 
 /// The `version` written into new session headers.
@@ -78,6 +79,29 @@ pub struct Header {
     /// The entry of `parent_session` the fork was taken at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<EntryId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<SpawnLink>,
+}
+
+/// How a child session was spawned; stored in its header.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnLink {
+    /// The parent's header id.
+    pub parent_session_id: String,
+    /// The parent's tool call that spawned it; `None` for host spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// 1 for a root session's children.
+    pub depth: u32,
+    /// The catalog agent; `None` for inline specs and plain delegates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The selector that chose the model; `None` when the parent's live model was inherited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The spec the child runs, after defaults and spawn hooks; reopening reuses it.
+    pub spec: AgentSpec,
 }
 
 impl Header {
@@ -96,6 +120,7 @@ impl Header {
             cwd,
             parent_session,
             forked_from,
+            spawn: None,
         }
     }
 }
@@ -303,13 +328,36 @@ pub enum Entry {
         command: String,
         artifact: u64,
     },
-    /// A background job's result; never in context.
+    /// A child session admitted as row `job_id` (`agent_N`); never in context.
+    ChildStart {
+        #[serde(flatten)]
+        base: EntryBase,
+        /// The parent, which owns the row.
+        session_id: String,
+        job_id: String,
+        /// The tool call whose result admits the row; `None`: admitted by this entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        child_session_id: String,
+        child_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// The expanded `provider/id`.
+        model: String,
+    },
+    /// One message of a row: a command's result or a child's message; `job_id` names it
+    /// (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
     JobEnd {
         #[serde(flatten)]
         base: EntryBase,
         job_id: String,
         text: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        partial: bool,
+        /// The child run the message reports.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     #[serde(untagged)]
     Unknown(Value),
@@ -322,6 +370,7 @@ impl Entry {
             Entry::RunStart { .. }
             | Entry::RunEnd { .. }
             | Entry::JobStart { .. }
+            | Entry::ChildStart { .. }
             | Entry::JobEnd { .. } => true,
             Entry::Message {
                 admitted_jobs,
@@ -362,6 +411,7 @@ impl Entry {
             | Entry::RunResumed { base, .. }
             | Entry::Submission { base, .. }
             | Entry::JobStart { base, .. }
+            | Entry::ChildStart { base, .. }
             | Entry::JobEnd { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
@@ -387,6 +437,7 @@ impl Entry {
             | Entry::RunResumed { base, .. }
             | Entry::Submission { base, .. }
             | Entry::JobStart { base, .. }
+            | Entry::ChildStart { base, .. }
             | Entry::JobEnd { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
@@ -463,6 +514,7 @@ pub struct SessionInfo {
     pub timestamp: String,
     pub cwd: PathBuf,
     pub parent_session: Option<PathBuf>,
+    pub spawn: Option<SpawnLink>,
     /// File modification time.
     pub modified: SystemTime,
 }

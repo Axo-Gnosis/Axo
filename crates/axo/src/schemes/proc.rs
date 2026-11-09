@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axo_agent::ToolError;
 
 use super::{Scheme, SchemeContext, SchemeUrl, Target};
-use crate::jobs::{JobRegistry, headline, job_name, parse_job_id};
+use crate::jobs::{JobId, JobKind, JobRegistry, headline};
 
 pub struct ProcScheme {
     pub jobs: Arc<JobRegistry>,
@@ -15,8 +15,8 @@ pub struct ProcScheme {
 /// The paths `proc://` serves; anything else is rejected.
 enum ProcPath {
     List,
-    Job(u64),
-    Kill(u64),
+    Job(JobId),
+    Kill(JobId),
 }
 
 fn parse(path: &str) -> Option<ProcPath> {
@@ -27,7 +27,7 @@ fn parse(path: &str) -> Option<ProcPath> {
         Some((job, action)) => (job, Some(action)),
         None => (path, None),
     };
-    let id = parse_job_id(job)?;
+    let id = JobId::parse(job)?;
     match action {
         None => Some(ProcPath::Job(id)),
         Some("kill") => Some(ProcPath::Kill(id)),
@@ -65,13 +65,17 @@ impl Scheme for ProcScheme {
                 }
                 Ok(jobs
                     .iter()
-                    .map(|job| {
-                        format!(
-                            "{}  {}  {}",
+                    .map(|job| match &job.kind {
+                        JobKind::Command { command, .. } => {
+                            format!("{}  {}  {}", job.id, job.status.label(), headline(command))
+                        }
+                        JobKind::Child { agent, model, .. } => format!(
+                            "{}  {}  {}  {}",
                             job.id,
                             job.status.label(),
-                            headline(&job.command)
-                        )
+                            agent.as_deref().unwrap_or("subagent"),
+                            model
+                        ),
                     })
                     .collect::<Vec<_>>()
                     .join("\n"))
@@ -80,14 +84,28 @@ impl Scheme for ProcScheme {
                 let (job, result) = self
                     .jobs
                     .get(id)
-                    .ok_or_else(|| ToolError(format!("No job {}", job_name(id))))?;
-                let mut text = format!(
-                    "Job: {}\nCommand: {}\nStatus: {}\nOutput: artifact://{}",
-                    job.id,
-                    job.command,
-                    job.status.label(),
-                    job.artifact
-                );
+                    .ok_or_else(|| ToolError(format!("No job {id}")))?;
+                let mut text = match &job.kind {
+                    JobKind::Command { command, artifact } => format!(
+                        "Job: {}\nCommand: {}\nStatus: {}\nOutput: artifact://{}",
+                        job.id,
+                        command,
+                        job.status.label(),
+                        artifact
+                    ),
+                    JobKind::Child {
+                        session_id,
+                        agent,
+                        model,
+                    } => format!(
+                        "Job: {}\nAgent: {}\nModel: {}\nSession: {}\nStatus: {}",
+                        job.id,
+                        agent.as_deref().unwrap_or("subagent"),
+                        model,
+                        session_id,
+                        job.status.label()
+                    ),
+                };
                 if let Some(result) = &result {
                     text.push_str("\n\nResult:\n");
                     text.push_str(result);
@@ -105,8 +123,8 @@ impl Scheme for ProcScheme {
         _cx: &SchemeContext,
     ) -> Result<String, ToolError> {
         match parse(&url.path).ok_or_else(|| unsupported(url))? {
-            ProcPath::Kill(id) if self.jobs.kill(id) => Ok(format!("Stopping {}.", job_name(id))),
-            ProcPath::Kill(id) => Ok(format!("{} is not running.", job_name(id))),
+            ProcPath::Kill(id) if self.jobs.kill(id) => Ok(format!("Stopping {id}.")),
+            ProcPath::Kill(id) => Ok(format!("{id} is not running.")),
             ProcPath::List | ProcPath::Job(_) => Err(ToolError(format!("{url} is read-only"))),
         }
     }

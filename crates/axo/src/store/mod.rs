@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 pub use entry::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
-    RunOutcome, SeqEntry, SessionInfo, SubmissionKind, TIMESTAMP_FORMAT,
+    RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT,
 };
 pub use jsonl::JsonlStore;
 pub(crate) use project::path_to;
@@ -23,8 +23,8 @@ use crate::error::Error;
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// A writer for a new session. Storage may be created lazily, on the
-    /// first `submission` or non-system `message` entry; a fork (header with
-    /// `parent_session`) is created right away.
+    /// first `submission`, non-system `message` or `child_start` entry; a fork
+    /// or child (header with `parent_session`) is created right away.
     async fn create(&self, header: Header) -> Result<Box<dyn SessionWriter>, Error>;
 
     /// Opens an existing session for writing. Holds the single-writer lock

@@ -7,7 +7,7 @@ use axo_agent::{ExecutionMode, Replay, Tool, ToolContext, ToolError, ToolOutput}
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 
-use crate::jobs::{job_name, render_results};
+use crate::jobs::render_results;
 use crate::tools::SessionTools;
 
 const DESCRIPTION: &str = "Block until a background job (bg_N) finishes and return its result. Returns immediately when no background job is running. A new user message interrupts the wait.";
@@ -70,7 +70,7 @@ impl Tool for WaitTool {
         loop {
             if steer.is_pending() {
                 let running = jobs.running_admitted();
-                let ids: Vec<String> = running.iter().map(|&id| job_name(id)).collect();
+                let ids: Vec<String> = running.iter().map(ToString::to_string).collect();
                 return Ok(text(format!(
                     "Wait interrupted by a new message; {} background job(s) still running: {}.",
                     ids.len(),

@@ -12,18 +12,19 @@ Start-time diagnostics for context files, skills, agent definitions and tool all
 
 | # | Section | Source |
 | :--- | :--- | :--- |
-| 1 | `system` | Non-empty root agent body, else `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
-| 2 | `docs` | `"<name>'s documentation, including how to extend it: <name>://README.md"` (`name` defaults to `axo`; materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
-| 3 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the active tools, formatted as `- {rule}` bullets |
-| 4 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
-| 5 | `work` | `WORK` override (no bundled default; omitted unless provided) |
-| 6 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
-| 7 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
-| 8 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
-| 9 | `cwd` | `inputs.cwd.display()` |
-| 10 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
-| 11 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
-| 12 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section |
+| 1 | `delegation` | Children only: fixed bundled `crates/axo/prompts/DELEGATION.md`; always first, not overridable or removable |
+| 2 | `system` | Non-empty selected agent body, else `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
+| 3 | `docs` | `"<name>'s documentation, including how to extend it: <name>://README.md"` (`name` defaults to `axo`; materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
+| 4 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the active tools, formatted as `- {rule}` bullets |
+| 5 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
+| 6 | `work` | `WORK` override (no bundled default; omitted unless provided) |
+| 7 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
+| 8 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
+| 9 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
+| 10 | `cwd` | `inputs.cwd.display()` |
+| 11 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
+| 12 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
+| 13 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section; not inherited by children |
 
 ### Bundled documentation (`docs`)
 
@@ -86,7 +87,7 @@ If a summarizer override is empty or whitespace-only, `SummaryPrompts::load` rec
 
 ### On-demand nested context files (`NestedContext`)
 
-When project access is not `Ignore`, `settings.nested_context_files` is `true`, and the root agent has not disabled context files, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
+When project access is not `Ignore`, `settings.nested_context_files` is `true`, and the selected agent has not disabled context files, successful `read`, `write`, and `edit` calls invoke `NestedContext::attach(&path)` on `SessionTools::context`:
 - For a touched path inside `project_root`, `NestedContext` checks every directory from `project_root` down to the file's parent directory.
 - Any enabled context file whose canonical path and content are not already present in the startup `context_files` or in the active projection's tool results is appended to that tool result as `<project_instructions path="…">\n{content}\n</project_instructions>`.
 - `NestedContext::restore(&messages)` reconstructs the seen set from the current projected messages on session open, branch navigation, compaction, and `/shake`. If a tool result carrying a nested context file is elided or compacted away, the next file access in that directory reattaches it.
@@ -118,11 +119,12 @@ Review the code for correctness and report actionable findings.
 | :--- | :--- |
 | `name` | Defaults to the file stem when omitted or empty. Uses the skill name rule: non-empty, at most 64 characters, only lowercase ASCII letters, digits, and hyphens; no leading, trailing, or consecutive hyphens. Unlike skills, violations drop the definition |
 | `description` | Optional listing text, default empty |
-| `model` | A [model selector](configuration.md#model-selectors); considered after the explicit session selector and recorded model, before `defaultModel` |
+| `model` | A [model selector](configuration.md#model-selectors); root sessions consider it after the explicit session selector and recorded model, before `defaultModel`. Children use the [child model cascade](configuration.md#child-sessions-subagents--axosubagentsettings) |
 | `tools` | Optional allowlist over built-in **and host** tools, as a list or comma-separated string (trimmed, empty entries dropped). Omitted keeps all tools; an empty list keeps none. Unknown tool names produce diagnostics when the agent is selected. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
-| `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings |
-| `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` apply last and can restore removed sections |
-| `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. Stored as metadata only; root session responses are not validated against it |
+| `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings for roots and uses `subagents.contextFiles` for children |
+| `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` can restore removed sections in root sessions; children's fixed `delegation` section cannot be removed |
+| `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. Stored as metadata only; responses are not validated against it |
+| `maxTurns` | Model requests per child run before the wrap-up turn; omitted uses `subagents.maxTurns` (default 50). Ignored for root sessions. The tool list stays unchanged; budget enforcement blocks calls through an internal hook |
 
 The trimmed body replaces the `system` section when non-empty; an empty body keeps the configured or bundled `SYSTEM`. Agent bodies are used verbatim, without harness-name substitution, and do not change `WORK`, `PROSE`, or summarizer prompt overrides.
 
@@ -131,6 +133,14 @@ Unreadable files, malformed frontmatter, invalid names or schemas, and collision
 ### Root selection and catalog
 
 `SessionOptions::agent: Option<String>` selects a root agent by name; `None` runs without one. A missing name or a team name returns `Error::AgentNotFound`. `SessionOptions::agents: Vec<AgentSpec>` adds definitions supplied in code; the public types live in `axo::context::agents`. `Session::agents() -> &[AgentDef]` exposes the loaded agent and team catalog. Definitions and the selected root are snapshots: forks inherit them; reopening loads again from the options and roots supplied then, so pass the root name again.
+
+### Child prompts
+
+`Session::spawn` selects a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools. Named agents use their own allowlists over built-in and host tools.
+
+Children share the parent's resolved configuration and prompt overrides, agent catalog, host tool factories, schemes, and tool/spawn hooks. They do **not** inherit host `SessionOptions::sections`, and `ask` is always disabled. Context files default to off through `subagents.contextFiles`; an agent can supply its own map or disable them explicitly.
+
+The fixed `delegation` section tells the child to work autonomously without asking questions and to report its outcome, evidence, and hand-off needs to the parent. It is inserted first after all section overrides, cannot be replaced or removed, and is not a `PROMPT_NAMES` override. The resolved spec, including spawn-hook replacements and child defaults, is persisted in `SpawnLink::spec`; revival reuses it rather than looking up an edited agent definition. See [Spawning child sessions](extending.md#spawning-child-sessions).
 
 ### Teams
 
@@ -244,7 +254,7 @@ A truncated foreground `bash` result names `artifact://<n>` in its notice and ha
 
 ### `wait`
 
-`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background job finishes, then returns every pending result, each as `[bg_N] <first command line, max 120 chars>\n<result>`, joined by blank lines. It returns `No background jobs are running.` at once when no admitted job is still running, `Wait interrupted by a new message; {n} background job(s) still running: bg_…` when the user steers, and `Operation aborted` (error) on Stop. It sleeps on registry changes instead of polling, and the results it returns are consumed: they are never delivered again. Any tool batch containing `wait` runs one call at a time, so a `bash` promoted earlier in the same batch is already admitted when `wait` looks for running jobs.
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a command result or child-run message is pending, then returns every pending message, joined by blank lines. Command results use `[bg_N] <first command line, max 120 chars>\n<result>`; child messages use the child row and agent name (or “subagent”), with a partial-result label when the turn budget was exhausted. It returns `No background jobs are running.` at once when no admitted job is still running, a wait-interrupted notice listing the running row ids when the user steers, and `Operation aborted` (error) on Stop. It sleeps on registry changes instead of polling, and committed results are consumed: they are never delivered again. Any tool batch containing `wait` runs one call at a time, so a `bash` promoted earlier in the same batch is already admitted when `wait` looks for running jobs.
 
 ### `proc://`
 
@@ -252,11 +262,13 @@ The session's `proc://` scheme (`Target::Virtual`; prompt doc `proc:// backgroun
 
 | Operation | Result |
 | :--- | :--- |
-| `read proc://` | One line per job, `bg_N  {status}  {command first line, max 120 chars}`, status `running`, `helpers running`, `finished`, or `failed`; or `No background jobs.` |
+| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Status is `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
 | `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://bg_N or proc://bg_N/kill.` |
 | `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
+| `read proc://agent_N` | Child row details: `Job:`, `Agent:`, `Model:`, `Session:`, `Status:`, plus `Result:` for its latest undelivered message |
+| `write proc://agent_N/kill` | Aborts the running child session; does not remove its row or prevent later host prompts |
 
-Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside a session) has no `proc://`.
+Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside a session) has no `proc://`.
 
 ### Results in context
 
@@ -268,5 +280,7 @@ Background job results:
 [bg_N] <command>
 <result>
 ```
+
+Child messages use the same envelope, with the child row in brackets followed by its catalog agent name (or “subagent”). Budget-limited results add “(partial: turn budget exhausted)” to that label. A child keeps one row across all its runs; see [Child sessions](sessions-and-compaction.md#child-sessions).
 
 During a run it is injected at the next turn boundary, after the current tool batch; it never counts as a steer, so it neither promotes `bash` nor interrupts `wait`. With the session idle, it starts a run of its own unless automatic continuation is latched off by a Stop or an unsuccessful run. A new `prompt` places pending results before the user's message.

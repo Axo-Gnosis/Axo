@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use super::{JobRegistry, job_name};
+use super::{JobId, JobRegistry, Mode};
 use crate::exec::host::{Container, ExecSpec, Process, ProcessSupervisor};
 use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
@@ -123,6 +123,7 @@ impl JobControl {
 pub(super) struct CommandRun {
     pub(super) command: String,
     pub(super) artifact: u64,
+    pub(super) mode: Mode,
     pub(super) phase: Phase,
     pub(super) control: Option<Arc<JobControl>>,
     pub(super) task: Option<JoinHandle<()>>,
@@ -250,7 +251,7 @@ impl CommandRunner {
                         } else {
                             snapshot
                         };
-                        let name = job_name(id);
+                        let name = id.to_string();
                         return Ok(ToolOutput {
                             content: vec![UserBlock::Text {
                                 text: format!(
@@ -325,7 +326,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Stops the job when the waiter is dropped before its command finished.
-struct StopOnDrop<'a>(Option<(&'a JobRegistry, u64)>);
+struct StopOnDrop<'a>(Option<(&'a JobRegistry, JobId)>);
 
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
@@ -338,7 +339,7 @@ impl Drop for StopOnDrop<'_> {
 /// Owns a running command: its process, output readers and spool.
 struct CommandTask {
     jobs: Arc<JobRegistry>,
-    id: u64,
+    id: JobId,
     /// The call whose tool result carries a retained job's `job_start`.
     invocation: ToolInvocationId,
     call_id: String,
@@ -458,10 +459,7 @@ impl CommandTask {
                 false,
             ),
             (Some(Stop::Killed), _) => (
-                with_status(
-                    body,
-                    &format!("Command was stopped (proc://{}/kill)", job_name(id)),
-                ),
+                with_status(body, &format!("Command was stopped (proc://{id}/kill)")),
                 true,
                 false,
             ),
@@ -503,7 +501,7 @@ impl CommandTask {
                 // Before the waiter gets the result, so the result's batch carries it.
                 jobs.retain_on_commit(invocation, id, &call_id);
             }
-            let name = job_name(id);
+            let name = id.to_string();
             text.push_str(&format!(
                 "\n\nProcesses started by this command are still running as {name} (read proc://{name}; stop with write proc://{name}/kill)."
             ));

@@ -21,24 +21,26 @@ pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
     EffectiveConfig, ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings,
-    PromptOverride, RetrySettings, Settings, SummaryRequest, UserConfig,
+    PromptOverride, RetrySettings, Settings, SubagentSettings, SummaryRequest, UserConfig,
 };
+pub use context::agents::AgentSpec;
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{OutputError, ProcessSupervisor, Supervision};
 pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
-pub use jobs::{JobInfo, JobStatus};
+pub use jobs::{JobInfo, JobKind, JobStatus};
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
-    Attach, Fork, LiveSnapshot, MaintenanceKind, NavigateOptions, PromptRequest, PromptResult,
-    RecoveryPolicy, Session, SessionEvent, SessionOptions, ShakeMode,
+    Attach, ChildHandle, Fork, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
+    PromptRequest, PromptResult, RecoveryPolicy, Session, SessionEvent, SessionOptions, ShakeMode,
+    SpawnContext, SpawnDecision, SpawnHook, SpawnRequest,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
     JsonlStore, ProjectedSource, Projection, RunOutcome, SeqEntry, SessionInfo, SessionStore,
-    SessionWriter, SubmissionKind, TIMESTAMP_FORMAT, project,
+    SessionWriter, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT, project,
 };
 pub use tools::{Answer, CommandRequest, Question, QuestionOption, SessionTools, ToolFactory};
 
