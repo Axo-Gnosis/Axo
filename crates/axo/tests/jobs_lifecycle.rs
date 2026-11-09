@@ -226,6 +226,10 @@ async fn reopen_marks_admitted_jobs_interrupted_once() {
             call_id: format!("c{n}"),
             command: format!("sleep {}", 299 + n),
             artifact: n - 1,
+            started_at: 0,
+            tool: None,
+            cwd: None,
+            promotion: None,
         };
         let rows = [
             message(
@@ -333,6 +337,10 @@ async fn job_ids_skip_every_recorded_id() {
                 call_id: "c0".into(),
                 command: "sleep 300 &".into(),
                 artifact: 0,
+                started_at: 0,
+                tool: None,
+                cwd: None,
+                promotion: None,
             },
             Entry::Message {
                 base: EntryBase::new(EntryId("delivery-5".into()), Some(start)),

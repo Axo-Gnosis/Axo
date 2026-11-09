@@ -153,25 +153,6 @@ impl SummaryFailure {
     }
 }
 
-fn add_usage(total: &mut Usage, next: &Usage) {
-    total.input = total.input.saturating_add(next.input);
-    total.output = total.output.saturating_add(next.output);
-    total.cache_read = total.cache_read.saturating_add(next.cache_read);
-    total.cache_write = total.cache_write.saturating_add(next.cache_write);
-    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
-    if let Some(value) = next.cache_write_1h {
-        total.cache_write_1h = Some(total.cache_write_1h.unwrap_or(0).saturating_add(value));
-    }
-    if let Some(value) = next.reasoning {
-        total.reasoning = Some(total.reasoning.unwrap_or(0).saturating_add(value));
-    }
-    total.cost.input += next.cost.input;
-    total.cost.output += next.cost.output;
-    total.cost.cache_read += next.cost.cache_read;
-    total.cost.cache_write += next.cost.cache_write;
-    total.cost.total += next.cost.total;
-}
-
 fn user(text: String) -> Message {
     Message::User(UserMessage {
         content: vec![UserBlock::Text { text }],
@@ -429,7 +410,7 @@ async fn request(
             }
             let message = accumulator.into_message();
             if let Some(message) = &message {
-                add_usage(&mut usage, &message.usage);
+                usage += &message.usage;
             }
             if cancelled || cancel.is_cancelled() {
                 return Err(SummaryFailure::aborted());
@@ -554,14 +535,14 @@ pub(crate) async fn generate(
         let result = request(context, prefix, false, input.prefix_tokens, cancel).await;
         match result {
             Ok(prefix) => {
-                add_usage(&mut combined.usage, &prefix.usage);
+                combined.usage += &prefix.usage;
                 combined
                     .text
                     .push_str("\n\n---\n\n**Turn Context (split turn):**\n\n");
                 combined.text.push_str(&prefix.text);
             }
             Err(mut error) => {
-                add_usage(&mut error.usage, &combined.usage);
+                error.usage += &combined.usage;
                 return Err(error);
             }
         }

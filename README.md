@@ -61,6 +61,8 @@ Every local command runs in a host-selected container (`Supervision::ProcessGrou
 
 The system prompt is assembled into named `<section>` blocks (`delegation` for children, `system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `team` for team members, `cwd`, `dev_shell`, `date`, plus host sections). Startup and tool execution discover instructions, skills, and personas across user and project roots. See [System prompt sections](crates/axo/docs/prompts-and-context.md#system-prompt-sections), [Context files](crates/axo/docs/prompts-and-context.md#context-files-cratesaxosrccontextfilesrs), and [Skills](crates/axo/docs/prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
 
+Hosts can switch a root persona and replace live host sections and tools; see [Session control methods](crates/axo/docs/extending.md#session-control-methods).
+
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 
 When `bash.devShell` is set to `"nix"` or `"direnv"` in a trusted project, `axo` captures and caches the project's environment and runs subsequent commands directly against it (~3 ms overhead per command instead of ~460 ms for `nix develop -c`). See [Execution environment](crates/axo/docs/configuration.md#execution-environment-bash--axobashsettings).

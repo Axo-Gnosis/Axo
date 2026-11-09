@@ -272,6 +272,7 @@ async fn commit(
                     Entry::Submission { .. }
                         | Entry::Usage { .. }
                         | Entry::ModelChange { .. }
+                        | Entry::AgentChange { .. }
                         | Entry::ThinkingLevelChange { .. }
                 ) {
                     view.revision = view.revision.wrapping_add(1);

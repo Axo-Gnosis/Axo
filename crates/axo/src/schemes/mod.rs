@@ -246,9 +246,26 @@ impl Schemes {
         self.handler(url)?.resolve(url, &self.context).await
     }
 
-    /// Reads a URL that resolved to [`Target::Virtual`].
+    /// Reads a URL's virtual resource or resolved UTF-8 file.
     pub async fn read(&self, url: &SchemeUrl) -> Result<String, ToolError> {
-        self.handler(url)?.read(url, &self.context).await
+        let handler = self.handler(url)?;
+        match handler.resolve(url, &self.context).await? {
+            Target::Virtual => handler.read(url, &self.context).await,
+            Target::File { path, .. } => {
+                let bytes = tokio::fs::read(path).await.map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        ToolError(format!("{url} not found"))
+                    } else {
+                        ToolError(format!("{url}: {error}"))
+                    }
+                })?;
+                String::from_utf8(bytes).map_err(|_| {
+                    ToolError(format!(
+                        "{url} is not UTF-8 text; resolve it and read the file"
+                    ))
+                })
+            }
+        }
     }
 
     /// Writes a URL that resolved to [`Target::Virtual`], returning the handler's result text.

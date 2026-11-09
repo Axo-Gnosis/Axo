@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axo::{
-    AgentSpec, Entry, Error, InlineSpec, JobInfo, JobKind, RecoveryPolicy, SessionEvent,
+    AgentSpec, Entry, Error, InlineSpec, JobInfo, JobKind, JobStatus, RecoveryPolicy, SessionEvent,
     SessionOptions, SessionTools, SpawnContext, SpawnDecision, SpawnHook, SpawnRequest,
     ToolFactory,
 };
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
-use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
+use axo_ai::{AssistantBlock, Message, ScriptedTurn, Usage, UserBlock};
 use common::{delivered, entry, host, journal, only, options, request, until, within};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -66,22 +66,31 @@ async fn spawned_child_delivers_once_and_parks() {
     within(async {
         loop {
             match events.recv().await {
-                Ok(SessionEvent::Jobs { jobs }) => {
-                    if let Some(JobInfo { id, kind, .. }) =
-                        jobs.iter().find(|job| job.id == "agent_1")
-                    {
-                        assert_eq!(id, "agent_1");
-                        assert_eq!(
-                            kind,
-                            &JobKind::Child {
-                                session_id: child_id.clone(),
-                                agent: None,
-                                model: "test/child".into(),
-                                team: None,
-                            }
-                        );
-                        break;
+                Ok(SessionEvent::Job(JobInfo { id, kind, .. })) if id == "agent_1" => {
+                    let JobKind::Child {
+                        session_id,
+                        path,
+                        depth,
+                        agent,
+                        model,
+                        team,
+                        resident,
+                        progress,
+                    } = kind
+                    else {
+                        panic!("expected a child job");
+                    };
+                    assert_eq!(session_id, child_id);
+                    assert_eq!(path, handle.session.path());
+                    assert_eq!(depth, 1);
+                    assert_eq!(agent, None);
+                    assert_eq!(model, "test/child");
+                    assert_eq!(team, None);
+                    assert!(resident);
+                    if let Some(progress) = progress {
+                        assert!(progress.turns <= progress.max_turns + 1);
                     }
+                    break;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
@@ -146,7 +155,52 @@ async fn spawned_child_delivers_once_and_parks() {
     until(|| weak.upgrade().is_none()).await;
     let revived = within(host.axo.session(&child_id)).await.unwrap();
     assert_eq!(revived.id(), child_id);
-    assert_eq!(revived.agent().unwrap().depth, 1);
+    assert_eq!(revived.spawn_link().unwrap().depth, 1);
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn opening_child_with_closed_parent_names_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("noted"))],
+    )
+    .await;
+    host.api
+        .lane("child", vec![ScriptedTurn::Reply(reply_text("done"))]);
+    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
+    let root_path = parent.path().to_path_buf();
+    let handle = parent.spawn(request("check")).await.unwrap();
+    let child_id = handle.session.id().to_owned();
+    let child_path = handle.session.path().to_path_buf();
+    delivered(&parent, &handle.job).await;
+    entry(&parent, |entry| matches!(entry, Entry::RunEnd { .. })).await;
+    parent.shutdown().await;
+    drop(handle);
+    drop(parent);
+
+    match host
+        .axo
+        .open_session(&child_path, options(dir.path()))
+        .await
+    {
+        Err(Error::ChildSession { path, root }) => {
+            assert_eq!(path, child_path);
+            assert_eq!(root, Some(root_path.clone()));
+        }
+        Err(error) => panic!("unexpected error: {error}"),
+        Ok(_) => panic!("child opened as a root"),
+    }
+    let parent = host
+        .axo
+        .open_session(&root_path, options(dir.path()))
+        .await
+        .unwrap();
+    let child = within(host.axo.session(&child_id)).await.unwrap();
+    assert_eq!(child.id(), child_id);
     parent.shutdown().await;
 }
 
@@ -462,7 +516,10 @@ async fn spawn_policies_block() {
         .await
         .unwrap();
     let replacement = replaced.spawn(request("check")).await.unwrap();
-    assert_eq!(replacement.session.agent().unwrap().spec.body, "Replaced.");
+    assert_eq!(
+        replacement.session.spawn_link().unwrap().spec.body,
+        "Replaced."
+    );
     delivered(&parent, "agent_1").await;
     delivered(&replaced, "agent_1").await;
     parent.shutdown().await;
@@ -540,63 +597,168 @@ async fn turn_budget_wraps_up_and_flags_partial() {
 }
 
 #[tokio::test]
-async fn max_concurrent_queues_child_runs() {
+async fn queued_children_publish_running_and_per_run_usage() {
     let dir = tempfile::tempdir().unwrap();
+    let mut parent_reply = reply_text("ack");
+    parent_reply.usage = Usage {
+        input: 101,
+        output: 13,
+        total_tokens: 114,
+        ..Default::default()
+    };
+    let mut parent_tool = reply_tool_calls(&[("r1", "read", json!({"path":"missing.txt"}))]);
+    parent_tool.usage = Usage {
+        input: 31,
+        output: 7,
+        total_tokens: 38,
+        ..Default::default()
+    };
     let host = host(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({"subagents":{"maxConcurrent":1}}),
         vec![
-            ScriptedTurn::Reply(reply_text("p1")),
-            ScriptedTurn::Reply(reply_text("p2")),
+            ScriptedTurn::Reply(parent_tool.clone()),
+            ScriptedTurn::Reply(parent_reply.clone()),
+            ScriptedTurn::Reply(parent_tool),
+            ScriptedTurn::Reply(parent_reply),
         ],
     )
     .await;
+    let mut gate = reply_tool_calls(&[("g1", "gate", json!({}))]);
+    gate.usage = Usage {
+        input: 17,
+        output: 3,
+        total_tokens: 20,
+        ..Default::default()
+    };
+    let mut done = reply_text("done");
+    done.usage = Usage {
+        input: 23,
+        output: 5,
+        total_tokens: 28,
+        ..Default::default()
+    };
     host.api.lane(
         "child",
         vec![
-            ScriptedTurn::HangUntilCancel,
-            ScriptedTurn::Reply(reply_text("second")),
+            ScriptedTurn::Reply(gate.clone()),
+            ScriptedTurn::Reply(done.clone()),
+            ScriptedTurn::Reply(gate),
+            ScriptedTurn::Reply(done),
         ],
     );
-    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
-    let first = parent.spawn(request("first")).await.unwrap();
+    let release = Arc::new(Notify::new());
+    let factory: ToolFactory = Arc::new({
+        let release = release.clone();
+        move |_: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Gate(release.clone())) }
+    });
+    let parent = host
+        .axo
+        .create_session(SessionOptions {
+            tools: vec![factory],
+            ..options(dir.path())
+        })
+        .await
+        .unwrap();
+    let spawn = |task| SpawnRequest {
+        spec: Some(InlineSpec {
+            tools: Some(vec!["gate".into()]),
+            ..Default::default()
+        }),
+        ..request(task)
+    };
+    let first = parent.spawn(spawn("first")).await.unwrap();
     until(|| host.api.requests().iter().any(|r| r.model.id == "child")).await;
-    let second = parent.spawn(request("second")).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        host.api
-            .requests()
-            .iter()
-            .filter(|r| r.model.id == "child")
-            .count(),
-        1
-    );
-    first.session.abort();
-    entry(
-        &parent,
-        |entry| matches!(entry, Entry::JobEnd { job_id, .. } if job_id == "agent_2"),
-    )
+    let second = parent.spawn(spawn("second")).await.unwrap();
+    let queued = parent
+        .jobs()
+        .into_iter()
+        .find(|job| job.id == second.job)
+        .unwrap();
+    assert_eq!(queued.status, JobStatus::Queued);
+    assert!(matches!(
+        queued.kind,
+        JobKind::Child {
+            resident: true,
+            depth: 1,
+            ..
+        }
+    ));
+    let mut events = parent.attach(None).await.events;
+    release.notify_one();
+    within(async {
+        loop {
+            match events.recv().await {
+                Ok(SessionEvent::Job(job))
+                    if job.id == second.job && job.status == JobStatus::Running =>
+                {
+                    break;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
+            }
+        }
+    })
     .await;
-    assert_eq!(
-        host.api
-            .requests()
+    // The second child's first turn also blocks, so Running cannot race its completion.
+    release.notify_one();
+    for child in [&first, &second] {
+        delivered(&parent, &child.job).await;
+        let child_lines = journal(&child.session);
+        let mut expected = Usage::default();
+        let mut turns = 0;
+        for line in &child_lines {
+            if line["type"] == "message" && line["message"]["role"] == "assistant" {
+                let usage: Usage =
+                    serde_json::from_value(line["message"]["usage"].clone()).unwrap();
+                expected += &usage;
+                turns += 1;
+            }
+        }
+        assert_eq!(turns, 2);
+        assert_eq!(expected.total_tokens, 48);
+        let lines = journal(&parent);
+        let end = only(&lines, "child usage report", |v| {
+            v["type"] == "job_end" && v["jobId"] == child.job
+        });
+        assert_eq!(
+            lines[end]["usage"],
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+    // Wait for the run consuming the final child result, not an earlier idle wake.
+    until(|| {
+        let lines = journal(&parent);
+        let delivered = lines
             .iter()
-            .filter(|r| r.model.id == "child")
-            .count(),
-        2
-    );
-    let lines = journal(&parent);
-    let first_end = only(&lines, "first child result", |v| {
-        v["type"] == "job_end" && v["jobId"] == "agent_1"
-    });
-    assert_eq!(lines[first_end]["text"], "Run stopped before finishing.");
-    assert_eq!(lines[first_end]["isError"], true);
-    let second_end = only(&lines, "second child result", |v| {
-        v["type"] == "job_end" && v["jobId"] == "agent_2"
-    });
-    assert_eq!(lines[second_end]["text"], "second");
-    drop(second);
+            .rposition(|v| v["deliveredJobs"].is_array())
+            .unwrap();
+        lines
+            .iter()
+            .enumerate()
+            .any(|(index, v)| index > delivered && v["type"] == "run_end")
+    })
+    .await;
+    let mut expected = Usage::default();
+    let mut runs = 0;
+    for line in journal(&parent) {
+        match line["type"].as_str() {
+            Some("run_start") => expected = Usage::default(),
+            Some("message") if line["message"]["role"] == "assistant" => {
+                let usage: Usage =
+                    serde_json::from_value(line["message"]["usage"].clone()).unwrap();
+                expected += &usage;
+            }
+            Some("run_end") => {
+                assert!(expected.total_tokens >= 152);
+                assert_eq!(line["usage"], serde_json::to_value(&expected).unwrap());
+                runs += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(runs > 0);
     parent.shutdown().await;
 }
 

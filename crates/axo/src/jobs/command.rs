@@ -1,8 +1,9 @@
 //! Supervised command execution, foreground promotion, output shaping and retention.
 
 use std::collections::VecDeque;
+use std::os::unix::fs::FileExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -11,12 +12,12 @@ use axo_ai::UserBlock;
 use serde_json::{Value, json};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use super::{JobId, JobRegistry, Mode};
+use super::{CommandExit, JobId, JobRegistry, Killer, Mode, Promotion};
 use crate::exec::host::{Container, ExecSpec, Process, ProcessSupervisor};
 use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
@@ -101,13 +102,14 @@ pub(super) enum Phase {
 pub(super) enum Stop {
     Aborted,
     TimedOut(f64),
-    Killed,
+    Killed(Killer),
 }
 
 pub(super) struct JobControl {
     pub(super) cancel: CancellationToken,
     pub(super) stop: Mutex<Option<Stop>>,
     pub(super) container: Container,
+    pub(super) promote: Notify,
 }
 
 impl JobControl {
@@ -122,11 +124,117 @@ impl JobControl {
 
 pub(super) struct CommandRun {
     pub(super) command: String,
+    pub(super) call_id: String,
+    pub(super) tool: String,
+    pub(super) cwd: PathBuf,
+    pub(super) started_at: i64,
+    pub(super) promotion: Option<Promotion>,
+    pub(super) promoted_at: Option<i64>,
+    pub(super) ended_at: Option<i64>,
+    pub(super) exit: Option<CommandExit>,
+    pub(super) output: Arc<OutputState>,
     pub(super) artifact: u64,
     pub(super) mode: Mode,
     pub(super) phase: Phase,
     pub(super) control: Option<Arc<JobControl>>,
     pub(super) task: Option<JoinHandle<()>>,
+}
+
+pub(super) struct RegisterCommand {
+    pub(super) command: String,
+    pub(super) tool: String,
+    pub(super) cwd: PathBuf,
+    pub(super) call_id: String,
+    pub(super) started_at: i64,
+    pub(super) artifact: u64,
+    pub(super) control: Arc<JobControl>,
+    pub(super) output: Arc<OutputState>,
+}
+
+pub(super) struct OutputState {
+    pub(super) path: PathBuf,
+    pub(super) progress: watch::Sender<OutputProgress>,
+}
+
+/// The flushed output prefix and whether the command and its helpers have finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutputProgress {
+    /// Raw bytes available to read.
+    pub bytes: u64,
+    /// No further output will be written.
+    pub done: bool,
+}
+
+/// A command's raw merged stdout and stderr, readable while it runs.
+pub struct CommandOutput {
+    job: String,
+    artifact: u64,
+    file: Arc<std::fs::File>,
+    progress: watch::Receiver<OutputProgress>,
+}
+
+impl CommandOutput {
+    pub(super) fn new(
+        job: String,
+        artifact: u64,
+        file: std::fs::File,
+        progress: watch::Receiver<OutputProgress>,
+    ) -> Self {
+        Self {
+            job,
+            artifact,
+            file: Arc::new(file),
+            progress,
+        }
+    }
+
+    /// The command's job id, including before it is listed.
+    pub fn job(&self) -> &str {
+        &self.job
+    }
+
+    /// The artifact id backing the command's raw output.
+    pub fn artifact(&self) -> u64 {
+        self.artifact
+    }
+
+    /// Subscribes to flushed output progress.
+    pub fn progress(&self) -> watch::Receiver<OutputProgress> {
+        self.progress.clone()
+    }
+
+    /// Reads raw bytes, clamping the range to the flushed output prefix.
+    pub async fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<Vec<u8>> {
+        let end = range.end.min(self.progress.borrow().bytes);
+        let start = range.start.min(end);
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            let len = usize::try_from(end - start).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "output range is too large",
+                )
+            })?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(std::io::Error::other)?;
+            bytes.resize(len, 0);
+            let mut read = 0;
+            while read < len {
+                match file.read_at(&mut bytes[read..], start + read as u64) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            bytes.truncate(read);
+            Ok(bytes)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
 }
 
 pub(crate) struct CommandRunner {
@@ -174,6 +282,8 @@ impl CommandRunner {
         if self.ci {
             spec.env.insert("CI".into(), "true".into());
         }
+        let cwd = spec.cwd.clone();
+        let started_at = axo_ai::now_ms();
         let process = match self.supervisor.spawn(spec).await {
             Ok(process) => process,
             Err(msg) => {
@@ -186,28 +296,43 @@ impl CommandRunner {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
             container: process.container(),
+            promote: Notify::new(),
         });
-        let id = jobs.register(label, artifact, control.clone());
+        let output = Arc::new(OutputState {
+            path: artifact_path.clone(),
+            progress: watch::Sender::new(OutputProgress::default()),
+        });
+        let id = jobs.register(RegisterCommand {
+            command: label,
+            tool: call.name.clone(),
+            cwd,
+            call_id: call.id.clone(),
+            started_at,
+            artifact,
+            control: control.clone(),
+            output: output.clone(),
+        });
         let (done, mut ended) = oneshot::channel();
         let shared = Arc::new(CommandShared {
             shaper: Mutex::new(Shaper::default()),
-            progress: watch::Sender::new(0),
+            output,
             done: Mutex::new(Some(done)),
         });
-        let mut changes = shared.progress.subscribe();
+        let mut changes = shared.output.progress.subscribe();
         let task = tokio::spawn(
             CommandTask {
                 jobs: jobs.clone(),
                 id,
                 invocation,
                 call_id: call.id.clone(),
-                control,
+                control: control.clone(),
                 shared: shared.clone(),
                 process,
                 spool: Some(spool),
                 spool_path: artifact_path,
                 artifact,
                 timeout,
+                started_at,
                 live,
             }
             .run(),
@@ -231,17 +356,20 @@ impl CommandRunner {
                     aborting = true;
                     jobs.stop(id, Stop::Aborted);
                 },
-                () = async {
-                    if !run_async {
+                cause = async {
+                    if run_async {
+                        Promotion::Async
+                    } else {
                         tokio::select! {
-                            () = steer.pending() => {},
-                            () = sleep_until(promote_at), if !self.promote_after.is_zero() => {},
+                            () = control.promote.notified() => Promotion::Host,
+                            () = steer.pending() => Promotion::Steer,
+                            () = sleep_until(promote_at), if !self.promote_after.is_zero() => Promotion::Timer,
                         }
                     }
                 }, if promotable && !aborting => {
                     promotable = false;
                     // Refused once the command finished meanwhile: it stays in the foreground.
-                    if jobs.promote(id, invocation, &call.id) {
+                    if jobs.promote(id, invocation, &call.id, cause) {
                         // The call's cancel no longer reaches the job; the timeout keeps its
                         // deadline, and proc:// kill or session shutdown stop it.
                         abandon.0 = None;
@@ -315,8 +443,7 @@ struct CommandEnd {
 /// What the command task shares with the foreground waiter.
 struct CommandShared {
     shaper: Mutex<Shaper>,
-    /// Bumped on every chunk, for throttled progress updates.
-    progress: watch::Sender<u64>,
+    output: Arc<OutputState>,
     /// Taken by the command task when the waiter owns the result.
     done: Mutex<Option<oneshot::Sender<CommandEnd>>>,
 }
@@ -350,6 +477,7 @@ struct CommandTask {
     spool_path: PathBuf,
     artifact: u64,
     timeout: Option<Duration>,
+    started_at: i64,
     live: LiveArtifact,
 }
 
@@ -367,6 +495,7 @@ impl CommandTask {
             spool_path,
             artifact,
             timeout,
+            started_at,
             live,
         } = self;
         let container = process.container();
@@ -381,9 +510,8 @@ impl CommandTask {
             tokio::select! {
                 chunk = chunks.recv(), if pipes_open => match chunk {
                     Some(chunk) => {
-                        write_spool(&mut spool, &mut capture_error, &spool_path, &chunk).await;
                         lock(&shared.shaper).push(&chunk);
-                        shared.progress.send_modify(|n| *n = n.wrapping_add(1));
+                        write_spool(&mut spool, &mut capture_error, &shared.output, &chunk).await;
                     }
                     None => {
                         pipes_open = false;
@@ -449,8 +577,23 @@ impl CommandTask {
         }
         let full_output = (keep && truncated).then(|| format!("artifact://{artifact}"));
         let body = lock(&shared.shaper).render(full_output.as_deref());
-        let details = full_output.map(|url| json!({ "fullOutput": url }));
+        let ended_at = axo_ai::now_ms();
 
+        let exit = match (&stop, &status) {
+            (Some(Stop::Aborted), _) => Some(CommandExit::Aborted),
+            (Some(Stop::TimedOut(secs)), _) => Some(CommandExit::TimedOut { after_secs: *secs }),
+            (Some(Stop::Killed(by)), _) => Some(CommandExit::Killed { by: *by }),
+            (None, Ok(status)) => Some(match (status.code(), status.signal()) {
+                (Some(code), _) => CommandExit::Exited { code },
+                (_, Some(signal)) => CommandExit::Signaled { signal },
+                _ => CommandExit::Exited { code: 1 },
+            }),
+            (None, Err(_)) => None,
+        };
+        let mut details = json!({ "exit": exit, "durationMs": ended_at - started_at });
+        if let Some(url) = full_output {
+            details["fullOutput"] = json!(url);
+        }
         let (mut text, is_error, aborted) = match (stop, status) {
             (Some(Stop::Aborted), _) => (with_status(body, "Command aborted"), true, true),
             (Some(Stop::TimedOut(secs)), _) => (
@@ -458,8 +601,14 @@ impl CommandTask {
                 true,
                 false,
             ),
-            (Some(Stop::Killed), _) => (
-                with_status(body, &format!("Command was stopped (proc://{id}/kill)")),
+            (Some(Stop::Killed(by)), _) => (
+                with_status(
+                    body,
+                    &match by {
+                        Killer::Model => format!("Command was stopped (proc://{id}/kill)"),
+                        Killer::Host => "Command was stopped by the user".to_owned(),
+                    },
+                ),
                 true,
                 false,
             ),
@@ -512,18 +661,18 @@ impl CommandTask {
             }
         }
         if promoted {
-            jobs.command_done(id, text, is_error).await;
+            jobs.command_done(id, text, is_error, exit).await;
         } else {
             if retained {
                 // `proc://bg_N` shows the result while the helpers run; never journaled.
-                jobs.command_done(id, text.clone(), is_error).await;
+                jobs.command_done(id, text.clone(), is_error, exit).await;
             }
             if let Some(done) = lock(&shared.done).take() {
                 let _ = done.send(CommandEnd {
                     text,
                     is_error,
                     aborted,
-                    details,
+                    details: Some(details),
                 });
             }
         }
@@ -538,7 +687,7 @@ impl CommandTask {
                     tokio::select! {
                         chunk = chunks.recv(), if pipes_open => match chunk {
                             Some(chunk) => {
-                                write_spool(&mut spool, &mut capture_error, &spool_path, &chunk).await;
+                                write_spool(&mut spool, &mut capture_error, &shared.output, &chunk).await;
                             }
                             None => pipes_open = false,
                         },
@@ -553,7 +702,7 @@ impl CommandTask {
             let deadline = Instant::now() + EXIT_IDLE;
             if pipes_open {
                 while let Ok(Some(chunk)) = timeout_at(deadline, chunks.recv()).await {
-                    write_spool(&mut spool, &mut capture_error, &spool_path, &chunk).await;
+                    write_spool(&mut spool, &mut capture_error, &shared.output, &chunk).await;
                 }
             }
             if let Some(killer) = killer {
@@ -568,6 +717,10 @@ impl CommandTask {
         drop(spool);
         process.close().await;
         drop(live);
+        shared
+            .output
+            .progress
+            .send_modify(|progress| progress.done = true);
         jobs.closed(id);
     }
 }
@@ -586,16 +739,29 @@ fn with_status(text: String, line: &str) -> String {
 async fn write_spool(
     spool: &mut Option<File>,
     capture_error: &mut Option<String>,
-    path: &Path,
+    output: &OutputState,
     chunk: &[u8],
 ) {
-    if let Some(file) = spool
-        && let Err(err) = file.write_all(chunk).await
-    {
-        tracing::warn!(path = %path.display(), %err, "bash output spool failed");
-        *spool = None;
-        *capture_error = Some(err.to_string());
+    let mut written = 0;
+    if let Some(file) = spool {
+        let result = async {
+            file.write_all(chunk).await?;
+            file.flush().await
+        }
+        .await;
+        match result {
+            Ok(()) => written = chunk.len() as u64,
+            Err(err) => {
+                tracing::warn!(path = %output.path.display(), %err, "bash output spool failed");
+                *spool = None;
+                *capture_error = Some(err.to_string());
+            }
+        }
     }
+    // Notifies even without a spool: the foreground waiter renders from the shaper.
+    output
+        .progress
+        .send_modify(|progress| progress.bytes += written);
 }
 
 /// Streaming output with bounded memory: the head is kept until it is

@@ -8,17 +8,42 @@ mod project;
 use std::path::Path;
 
 use async_trait::async_trait;
+use axo_agent::AgentMessage;
+use axo_ai::{Message, Usage};
 
 pub use entry::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
-    RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT,
-    TeamLink, TeamRef,
+    RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind, SubmittedCustom,
+    TIMESTAMP_FORMAT, TeamLink, TeamRef,
 };
 pub use jsonl::JsonlStore;
 pub(crate) use project::path_to;
 pub use project::{ProjectedSource, Projection, project};
 
 use crate::error::Error;
+
+/// Assistant-message usage after a run's start, excluding maintenance and derived totals.
+pub(crate) fn run_usage(entries: &[SeqEntry], run_id: &str) -> Usage {
+    let Some(start) = entries
+        .iter()
+        .position(|seq| matches!(&seq.entry, Entry::RunStart { run_id: id, .. } if id == run_id))
+    else {
+        return Usage::default();
+    };
+    let mut usage = Usage::default();
+    for seq in &entries[start + 1..] {
+        match &seq.entry {
+            Entry::RunStart { .. } => break,
+            Entry::RunEnd { run_id: id, .. } if id == run_id => break,
+            Entry::Message {
+                message: AgentMessage::Llm(Message::Assistant(message)),
+                ..
+            } => usage += &message.usage,
+            _ => {}
+        }
+    }
+    usage
+}
 
 /// Where session files live. [`JsonlStore`] is the default; a host may supply its own.
 #[async_trait]
@@ -41,7 +66,8 @@ pub trait SessionStore: Send + Sync {
     /// Reads only a session's header, without locking it or reading its entries.
     async fn read_header(&self, path: &Path) -> Result<Header, Error>;
 
-    /// Sessions started in `cwd`, most recently modified first.
+    /// Sessions started in `cwd`, including children, most recently modified first.
+    /// Child ancestry resolution uses the returned ids and spawn links.
     async fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, Error>;
 }
 

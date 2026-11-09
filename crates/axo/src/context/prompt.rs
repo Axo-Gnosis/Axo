@@ -50,17 +50,24 @@ pub(crate) struct PromptSources {
     pub delegation: bool,
     /// The fixed team section of a team member.
     pub team: Option<String>,
-    /// The session's trimmed prompt overrides, keyed by prompt name.
-    pub prompts: IndexMap<String, PromptOverride>,
     /// Whether the bundled documentation scheme is available.
     pub docs: bool,
-    /// Active tools; their guidelines make the `tools` section.
-    pub tools: Vec<Arc<dyn Tool>>,
     /// Scheme prompt docs: the schemes section.
     pub scheme_docs: Vec<String>,
-    pub context_files: Vec<ContextFile>,
     /// Skills with `disable_model_invocation` are left out of the listing.
     pub skills: Vec<Skill>,
+}
+
+/// Inputs which change when the host switches a session's persona, sections or tools.
+#[derive(Clone)]
+pub(crate) struct PromptShape {
+    /// Config prompt overrides plus the persona's `SYSTEM` body, keyed by prompt name.
+    pub prompts: IndexMap<String, PromptOverride>,
+    /// Active tools; their guidelines make the `tools` section.
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub context_files: Vec<ContextFile>,
+    /// Sections the persona disables (`None`), applied before host sections.
+    pub agent_sections: Vec<(String, Option<String>)>,
     /// Prevalidated host sections, applied last: `Some(body)` sets or replaces a
     /// section, `None` removes it.
     pub host_sections: Vec<(String, Option<String>)>,
@@ -75,6 +82,7 @@ const BUNDLED_PROSE: &str = include_str!("../../prompts/PROSE.md");
 /// `date` is today as `YYYY-MM-DD`.
 pub(crate) fn build_sections(
     sources: &PromptSources,
+    shape: &PromptShape,
     dev_shell: Option<&str>,
     date: &str,
 ) -> Sections {
@@ -82,13 +90,13 @@ pub(crate) fn build_sections(
     let mut bodies: IndexMap<String, String> = IndexMap::new();
 
     let prompt_file = |name: &str, bundled: &str| -> String {
-        sources
+        shape
             .prompts
             .get(name)
             .map_or(bundled.trim(), |prompt| prompt.text.as_str())
             .to_owned()
     };
-    let system = sources.prompts.get("SYSTEM").map_or_else(
+    let system = shape.prompts.get("SYSTEM").map_or_else(
         || BUNDLED_SYSTEM.trim().replace("{name}", &sources.name),
         |prompt| prompt.text.clone(),
     );
@@ -104,7 +112,7 @@ pub(crate) fn build_sections(
         );
     }
 
-    bodies.insert("tools".into(), render_guidelines(&sources.tools));
+    bodies.insert("tools".into(), render_guidelines(&shape.tools));
     if !sources.scheme_docs.is_empty() {
         let mut body = "Tools accept these URLs as paths. In bash, a URL that is a whole argument, a `--flag=`/`NAME=` value or a redirect target becomes its file path.".to_owned();
         for doc in &sources.scheme_docs {
@@ -116,8 +124,8 @@ pub(crate) fn build_sections(
     bodies.insert("work".into(), work);
     bodies.insert("prose".into(), prose);
 
-    if !sources.context_files.is_empty() {
-        let parts: Vec<String> = sources
+    if !shape.context_files.is_empty() {
+        let parts: Vec<String> = shape
             .context_files
             .iter()
             .map(ContextFile::render)
@@ -125,7 +133,7 @@ pub(crate) fn build_sections(
         bodies.insert("project_context".into(), parts.join("\n\n"));
     }
 
-    let has_tool = |name: &str| sources.tools.iter().any(|tool| tool.name() == name);
+    let has_tool = |name: &str| shape.tools.iter().any(|tool| tool.name() == name);
     let visible: Vec<&Skill> = sources
         .skills
         .iter()
@@ -160,7 +168,7 @@ pub(crate) fn build_sections(
     }
     bodies.insert("date".into(), date.to_owned());
 
-    for (name, body) in &sources.host_sections {
+    for (name, body) in shape.agent_sections.iter().chain(&shape.host_sections) {
         match body {
             Some(body) => {
                 // `insert` keeps an existing section's position, so overriding a core
@@ -264,28 +272,31 @@ mod tests {
             cwd: "/w".into(),
             delegation: false,
             team: None,
-            prompts,
             docs: false,
-            tools: Vec::new(),
             scheme_docs: Vec::new(),
-            context_files: Vec::new(),
             skills: Vec::new(),
+        };
+        let mut shape = PromptShape {
+            prompts,
+            tools: Vec::new(),
+            context_files: Vec::new(),
+            agent_sections: Vec::new(),
             host_sections: Vec::new(),
         };
-        let sections = build_sections(&sources, None, "2026-10-22");
+        let sections = build_sections(&sources, &shape, None, "2026-10-22");
         assert_eq!(sections["system"], "<system>\nHost system.\n</system>");
         assert!(!sections.contains_key("docs"));
         assert!(!sections.contains_key("prose"));
 
         sources.docs = true;
-        let sections = build_sections(&sources, None, "2026-10-22");
+        let sections = build_sections(&sources, &shape, None, "2026-10-22");
         let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
         assert_eq!(&keys[..2], &["system", "docs"]);
 
         sources.delegation = true;
         for override_ in [Some("Host replacement.".into()), None] {
-            sources.host_sections = vec![("delegation".into(), override_)];
-            let sections = build_sections(&sources, None, "2026-10-22");
+            shape.host_sections = vec![("delegation".into(), override_)];
+            let sections = build_sections(&sources, &shape, None, "2026-10-22");
             assert_eq!(sections.first().unwrap().0, "delegation");
             assert_eq!(
                 sections["delegation"],

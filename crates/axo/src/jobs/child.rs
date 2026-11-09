@@ -4,25 +4,36 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use axo_agent::AgentMessage;
-use axo_ai::{AssistantBlock, AssistantMessage, Message, UserBlock};
+use axo_ai::{AssistantBlock, AssistantMessage, Message, Usage, UserBlock};
 use serde_json::Value;
 
-use crate::store::{Entry, RunOutcome, SeqEntry, TeamRef};
+use crate::store::{Entry, RunOutcome, SeqEntry, TeamRef, run_usage};
 use crate::tools::output::{YIELD, value_text, yielded_value};
 use crate::tools::truncate::{Limits, format_size, truncate_head};
 
-use super::JobId;
+use super::{ChildProgress, JobId};
 
 pub(crate) const TURN_BUDGET: &str = "turn_budget";
 
 pub(crate) struct ChildRun {
     pub(crate) session_id: String,
     pub(crate) call_id: Option<String>,
+    pub(crate) depth: u32,
+    pub(crate) started_at: i64,
     pub(crate) path: PathBuf,
     pub(crate) agent: Option<String>,
     pub(crate) model: String,
-    pub(crate) running: bool,
+    pub(crate) phase: ChildPhase,
+    pub(crate) resident: bool,
+    pub(crate) progress: Option<ChildProgress>,
     pub(crate) team: Option<TeamRef>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildPhase {
+    Queued,
+    Running,
+    Idle,
 }
 
 pub(crate) struct ChildMessage {
@@ -31,6 +42,8 @@ pub(crate) struct ChildMessage {
     pub(crate) is_error: bool,
     pub(crate) partial: bool,
     pub(crate) note: bool,
+    pub(crate) usage: Option<Usage>,
+    pub(crate) value: Option<Value>,
 }
 
 /// Child text capped like command output (2000 lines / 50 KB), pointing at the full result.
@@ -147,7 +160,7 @@ pub(crate) fn run_message(
             message
                 .tool_calls()
                 .find(|call| call.id == result.tool_call_id)
-                .map(|call| value_text(&yielded_value(schema, &call.arguments)))
+                .map(|call| yielded_value(schema, &call.arguments))
         })
     });
     let failure = |reason: &str| {
@@ -175,8 +188,8 @@ pub(crate) fn run_message(
             ),
         }
     };
-    let (text, is_error) = if let Some(text) = yielded {
-        (text, false)
+    let (text, is_error) = if let Some(value) = &yielded {
+        (value_text(value), false)
     } else {
         match outcome {
             RunOutcome::Done if output.is_some() => {
@@ -203,6 +216,8 @@ pub(crate) fn run_message(
         is_error,
         partial,
         note: false,
+        usage: Some(run_usage(entries, run_id)),
+        value: yielded,
     })
 }
 

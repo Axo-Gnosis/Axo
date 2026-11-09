@@ -85,7 +85,14 @@ impl Tool for WaitTool {
             }
             let results = jobs.reserve_for(invocation);
             if !results.is_empty() {
-                return Ok(text(render_results(&results)));
+                let refs: Vec<String> = results
+                    .iter()
+                    .map(|result| result.msg.to_string())
+                    .collect();
+                return Ok(ToolOutput {
+                    details: Some(json!({"jobs": refs})),
+                    ..text(render_results(&results))
+                });
             }
             if jobs.has_mail() {
                 return Ok(text(MAIL_ARRIVED.into()));

@@ -1,13 +1,136 @@
-use std::sync::{Mutex, PoisonError};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use axo_agent::{AgentMessage, QueuedMessage};
+use crate::config::{EffectiveConfig, PromptOverride};
+use crate::context::agents::{AgentSpec, ContextFiles};
+use crate::context::files::{ContextFile, context_file_names, load_context_files};
+use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir, project_root};
+use crate::tools::{self, ToolFactory};
+use axo_agent::{AgentMessage, QueuedMessage, Tool};
 use axo_ai::{Message, SystemMessage, ToolSpec, now_ms};
 use tokio_util::sync::CancellationToken;
 
 use super::{Session, SessionHooks, journal};
-use crate::context::prompt::{PromptSources, Sections, build_sections, system_message};
+use crate::context::prompt::{
+    PromptShape, PromptSources, Sections, build_sections, system_message,
+};
 use crate::error::Error;
 use crate::store::Entry;
+/// Session-owned inputs reused when deriving a new persona shape.
+#[derive(Clone)]
+pub(crate) struct ShapeBase {
+    pub config: Arc<EffectiveConfig>,
+    pub cwd: PathBuf,
+    pub project: bool,
+    pub builtin: Vec<Arc<dyn Tool>>,
+    pub host_tools: Vec<Arc<dyn Tool>>,
+    pub host_tool_factories: Vec<ToolFactory>,
+    pub host_sections: Vec<(String, Option<String>)>,
+    pub depth: u32,
+    pub yield_tool: Option<Arc<dyn Tool>>,
+}
+
+/// Discovery inputs and startup files installed together in nested context.
+pub(crate) struct NestedParts {
+    pub root: Option<PathBuf>,
+    pub names: Vec<PathBuf>,
+    pub startup: Vec<ContextFile>,
+}
+
+/// Derives the mutable prompt and tool surface without changing live session state.
+/// Context-file loading performs blocking file I/O.
+pub(crate) fn shape(
+    base: &ShapeBase,
+    agent: Option<&AgentSpec>,
+) -> (PromptShape, NestedParts, Vec<Diagnostic>) {
+    let settings = &base.config.settings;
+    let mut diagnostics = Vec::new();
+    let mut names = settings.context_files.clone();
+    let disabled = matches!(
+        agent.and_then(|spec| spec.context_files.as_ref()),
+        Some(ContextFiles::Off)
+    );
+    if let Some(ContextFiles::Names(overrides)) = agent.and_then(|spec| spec.context_files.as_ref())
+    {
+        names.extend(
+            overrides
+                .iter()
+                .map(|(name, enabled)| (name.clone(), *enabled)),
+        );
+    }
+    let nested = if disabled {
+        NestedParts {
+            root: None,
+            names: Vec::new(),
+            startup: Vec::new(),
+        }
+    } else {
+        let (names, name_diagnostics) = context_file_names(&names);
+        diagnostics.extend(name_diagnostics);
+        let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
+        let (startup, file_diagnostics) = load_context_files(
+            &base.config.context_files,
+            home_agents.as_deref(),
+            &base.cwd,
+            base.project,
+            &names,
+        );
+        diagnostics.extend(file_diagnostics);
+        NestedParts {
+            root: (base.project && settings.nested_context_files).then(|| project_root(&base.cwd)),
+            names,
+            startup,
+        }
+    };
+    let mut prompts = base.config.prompts.clone();
+    if let Some(spec) = agent.filter(|spec| !spec.body.is_empty()) {
+        prompts.insert(
+            "SYSTEM".into(),
+            PromptOverride {
+                origin: spec.path.as_ref().map_or_else(
+                    || format!("agent {}", spec.name),
+                    |path| path.display().to_string(),
+                ),
+                text: spec.body.clone(),
+            },
+        );
+    }
+    let agent_sections = agent
+        .into_iter()
+        .flat_map(|spec| &spec.sections)
+        .filter(|(_, enabled)| !**enabled)
+        .map(|(name, _)| (name.clone(), None))
+        .collect();
+    let mut tools = tools::merge_tools(base.builtin.clone(), &base.host_tools);
+    if let Some(spec) = agent
+        && let Some(allow) = &spec.tools
+    {
+        for name in allow {
+            if !tools.iter().any(|tool| tool.name() == name) {
+                diagnostics.push(Diagnostic {
+                    origin: spec.path.clone().map(DiagnosticOrigin::Path),
+                    message: format!("agent \"{}\": unknown tool \"{name}\"", spec.name),
+                });
+            }
+        }
+        tools.retain(|tool| allow.iter().any(|name| name == tool.name()));
+    }
+    if base.depth >= settings.subagents.max_depth {
+        tools.retain(|tool| tool.name() != "spawn");
+    }
+    if let Some(yield_tool) = &base.yield_tool {
+        tools.retain(|tool| tool.name() != "yield");
+        tools.push(yield_tool.clone());
+    }
+    let shape = PromptShape {
+        prompts,
+        tools,
+        context_files: nested.startup.clone(),
+        agent_sections,
+        host_sections: base.host_sections.clone(),
+    };
+    (shape, nested, diagnostics)
+}
 
 /// The last prompt build and the exec-environment note and local date it used.
 pub(super) struct PromptState {
@@ -22,6 +145,7 @@ pub(super) struct PromptState {
 /// The session's system prompt: its inputs and its last build.
 pub(super) struct SessionPrompt {
     pub(super) sources: PromptSources,
+    pub(super) shape: Mutex<PromptShape>,
     pub(super) state: Mutex<PromptState>,
 }
 
@@ -33,11 +157,38 @@ impl SessionPrompt {
     /// Rebuilds the prompt and queues its diff when the environment note or date changes.
     pub(super) fn refresh(&self, note: Option<String>) {
         let date = today();
+        let shape = self.shape.lock().unwrap_or_else(PoisonError::into_inner);
         let mut state = self.state();
         if state.sections.is_some() && state.note == note && state.date == date {
             return;
         }
-        let sections = build_sections(&self.sources, note.as_deref(), &date);
+        Self::build(&self.sources, &shape, &mut state, note, date);
+    }
+
+    /// Rebuilds after a shape change even when the environment note and date are unchanged.
+    pub(super) fn rebuild(&self) {
+        let shape = self.shape.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state();
+        let note = state.note.clone();
+        Self::build(&self.sources, &shape, &mut state, note, today());
+    }
+
+    pub(super) fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.shape
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .tools
+            .clone()
+    }
+
+    fn build(
+        sources: &PromptSources,
+        shape: &PromptShape,
+        state: &mut PromptState,
+        note: Option<String>,
+        date: String,
+    ) {
+        let sections = build_sections(sources, shape, note.as_deref(), &date);
         if let Some(message) = system_message(state.sections.as_ref(), &sections) {
             state
                 .pending
@@ -116,8 +267,7 @@ impl SessionHooks {
             });
             let tools: Vec<_> = self
                 .prompt
-                .sources
-                .tools
+                .tools()
                 .iter()
                 .map(|tool| ToolSpec {
                     name: tool.name().to_owned(),

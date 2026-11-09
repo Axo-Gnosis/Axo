@@ -19,11 +19,11 @@ use tracing::warn;
 use super::children::ChildSeed;
 use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
-use crate::context::agents::{AgentDef, AgentSpec, member_name_problem};
+use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
 use crate::error::Error;
 use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
-use crate::jobs::child::{ChildMessage, ChildRun};
+use crate::jobs::child::{ChildMessage, ChildPhase, ChildRun};
 use crate::store::{Entry, Header, Projection, RosterEntry, SpawnLink, TeamLink};
 use crate::tools::ask::ASK;
 use crate::tools::output::YIELD;
@@ -152,10 +152,15 @@ fn validate_output(output: Option<&Value>) -> Result<(), Error> {
 }
 
 pub(super) fn child_inherited(
-    parent: &Inherited,
+    hooks: &SessionHooks,
     spec: &AgentSpec,
     loaded: Loaded,
 ) -> Arc<Inherited> {
+    let parent = &hooks.inherited;
+    let base = hooks
+        .shape_base
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     Arc::new(Inherited {
         cwd: parent.cwd.clone(),
         config: parent.config.clone(),
@@ -169,8 +174,8 @@ pub(super) fn child_inherited(
         exec: parent.exec.clone(),
         supervisor: parent.supervisor.clone(),
         ask_enabled: false,
-        host_sections: Vec::new(),
-        host_tools: parent.host_tools.clone(),
+        host_sections: base.host_sections.clone(),
+        host_tools: base.host_tool_factories.clone(),
         host_schemes: parent.host_schemes.clone(),
         tool_hooks: parent.tool_hooks.clone(),
         store: parent.store.clone(),
@@ -229,8 +234,7 @@ impl SessionHooks {
 
     fn parent_tools(&self) -> Vec<String> {
         self.prompt
-            .sources
-            .tools
+            .tools()
             .iter()
             .map(|tool| tool.name())
             .filter(|name| !matches!(*name, ASK | YIELD))
@@ -250,15 +254,21 @@ impl SessionHooks {
                     "SpawnRequest takes agent or spec, not both".into(),
                 ));
             }
-            (Some(name), None) => self
-                .inherited
-                .agents
-                .iter()
-                .find_map(|definition| match definition {
-                    AgentDef::Agent(spec) if spec.name == name => Some(spec.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| Error::AgentNotFound(name.to_owned()))?,
+            (Some(name), None) => {
+                let spec = self
+                    .inherited
+                    .agents
+                    .iter()
+                    .find_map(|definition| match definition {
+                        AgentDef::Agent(spec) if spec.name == name => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::AgentNotFound(name.to_owned()))?;
+                if spec.run_as == RunAs::Root {
+                    return Err(Error::AgentNotSubagent(name.to_owned()));
+                }
+                spec
+            }
             (None, Some(inline)) => {
                 if let Some(tools) = &inline.tools {
                     for tool in tools {
@@ -389,7 +399,7 @@ impl SessionHooks {
             header.spawn = Some(link.clone());
             let child_id = header.id.clone();
             let writer = self.inherited.store.create(header).await?;
-            let inherited = child_inherited(&self.inherited, &link.spec, self.loaded());
+            let inherited = child_inherited(self, &link.spec, self.loaded());
             let expanded_model = format!("{}/{}", model.provider, model.id);
             let child = Arc::new(
                 Session::start(SessionSetup {
@@ -422,10 +432,16 @@ impl SessionHooks {
                 jobs.reserve_child(ChildRun {
                     session_id: child.hooks.session_id.clone(),
                     call_id: tool.as_ref().map(|tool| tool.call_id.clone()),
+                    depth: link.depth,
+                    // Stamped by `child_start_entry`.
+                    started_at: 0,
                     path: child.path().to_path_buf(),
                     agent: link.agent.clone(),
                     model: model.clone(),
-                    running: true,
+                    phase: ChildPhase::Queued,
+                    // Live from creation; the session table re-pins and parks it later.
+                    resident: true,
+                    progress: None,
                     team: link.team.as_ref().map(TeamLink::team_ref),
                 })
             })
@@ -738,6 +754,8 @@ fn start_first_run(
                             is_error: true,
                             partial: false,
                             note: false,
+                            usage: None,
+                            value: None,
                         },
                         true,
                     )
@@ -766,6 +784,9 @@ impl SpawnTool {
         let mut defined = false;
         for definition in agents {
             if let AgentDef::Agent(spec) = definition {
+                if spec.run_as == RunAs::Root {
+                    continue;
+                }
                 if !defined {
                     description.push_str("\n\nDefined agents:");
                     defined = true;

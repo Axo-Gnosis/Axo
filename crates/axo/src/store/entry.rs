@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use axo_agent::AgentMessage;
-use axo_ai::{SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_ai::{Message, SystemMessage, ThinkingLevel, Usage, UserBlock};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -196,6 +196,18 @@ impl EntryBase {
                 .to_string(),
         }
     }
+
+    /// The entry's timestamp as Unix milliseconds, if it is valid.
+    pub fn timestamp_ms(&self) -> Option<i64> {
+        self.timestamp
+            .parse::<jiff::Timestamp>()
+            .ok()
+            .map(|timestamp| timestamp.as_millisecond())
+    }
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 /// One line after the header.
@@ -234,6 +246,13 @@ pub enum Entry {
         base: EntryBase,
         provider: String,
         model_id: String,
+    },
+    /// The root persona's catalog name; `None` removes the persona.
+    AgentChange {
+        #[serde(flatten)]
+        base: EntryBase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     /// Usage outside the transcript (e.g. `cache_warm`); never in context.
     Usage {
@@ -346,6 +365,9 @@ pub enum Entry {
         outcome: RunOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// Assistant-message usage for this run, excluding maintenance requests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
     /// One recovery of an unfinished run.
     RunResumed {
@@ -365,6 +387,11 @@ pub enum Entry {
         parts: Vec<PromptPart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+        /// The teammate that submitted this input, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom: Option<SubmittedCustom>,
     },
     /// A command promoted to a background job; never in context.
     JobStart {
@@ -375,6 +402,14 @@ pub enum Entry {
         call_id: String,
         command: String,
         artifact: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        started_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promotion: Option<crate::jobs::Promotion>,
     },
     /// A child session admitted as row `job_id` (`agent_N`); never in context.
     ChildStart {
@@ -411,12 +446,35 @@ pub enum Entry {
         /// A child's mid-run message (`write agent://parent`), not a run result.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         note: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<crate::jobs::CommandExit>,
+        /// Assistant-message usage for the child run, excluding maintenance requests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        /// The child's structured result, if one was yielded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<Value>,
     },
     #[serde(untagged)]
     Unknown(Value),
 }
 
 impl Entry {
+    /// Usage incurred by this entry, including failed assistant responses.
+    ///
+    /// Run and job totals are derived summaries, not additional usage.
+    pub fn usage(&self) -> Option<&Usage> {
+        match self {
+            Self::Message {
+                message: AgentMessage::Llm(Message::Assistant(message)),
+                ..
+            } => Some(&message.usage),
+            Self::Usage { usage, .. } => Some(usage),
+            Self::Compaction { usage, .. } | Self::BranchSummary { usage, .. } => usage.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Whether appending this entry must complete durable storage before returning.
     pub fn requires_sync(&self) -> bool {
         match self {
@@ -450,6 +508,7 @@ impl Entry {
             Entry::Message { base, .. }
             | Entry::ThinkingLevelChange { base, .. }
             | Entry::ModelChange { base, .. }
+            | Entry::AgentChange { base, .. }
             | Entry::Usage { base, .. }
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
@@ -476,6 +535,7 @@ impl Entry {
             Entry::Message { base, .. }
             | Entry::ThinkingLevelChange { base, .. }
             | Entry::ModelChange { base, .. }
+            | Entry::AgentChange { base, .. }
             | Entry::Usage { base, .. }
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
@@ -543,6 +603,13 @@ pub enum CompactionReason {
     /// Overflow recovery after a context-pressure response.
     Overflow,
 }
+/// The host-defined presentation of a submitted custom message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmittedCustom {
+    pub custom_type: String,
+    pub display: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -550,6 +617,8 @@ pub enum SubmissionKind {
     Prompt,
     Steer,
     FollowUp,
+    /// Held until a turn boundary or the next run; never starts a run.
+    Quiet,
     /// A teammate's message (`write agent://<name>`): delivered at the next turn boundary or
     /// by `wait`, never as a steer.
     Mail,

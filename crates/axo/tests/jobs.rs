@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -10,12 +11,15 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use axo::exec::host::ExecSpec;
 use axo::tools::CommandRequest;
-use axo::{Axo, JobInfo, JobKind, JobStatus, Session, SessionEvent, SessionTools, ToolFactory};
+use axo::{
+    Axo, CommandExit, JobInfo, JobKind, JobStatus, Killer, MessageDelivery, Promotion, Session,
+    SessionEvent, SessionTools, ToolFactory, jobs_from_entries,
+};
 use axo::{Entry, SeqEntry};
 use axo_agent::{AgentEvent, RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
-use common::{axo, bash_options, dead, journal, only, tool_text, within};
+use common::{axo, bash_options, dead, journal, only, tool_text, until, within};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -170,14 +174,23 @@ async fn await_run_end(session: &Session, after: u64) {
     .await;
 }
 
-/// Waits for a `SessionEvent::Jobs` whose snapshot equals `want`.
-async fn await_jobs(events: &mut broadcast::Receiver<SessionEvent>, want: &[JobInfo]) {
+/// Folds `Job`/`JobGone` events into `rows` until they equal `want`.
+async fn await_jobs(
+    events: &mut broadcast::Receiver<SessionEvent>,
+    rows: &mut BTreeMap<String, JobInfo>,
+    want: &[JobInfo],
+) {
     within(async {
-        loop {
+        while !rows.values().eq(want) {
             match events.recv().await {
-                Ok(SessionEvent::Jobs { jobs }) if jobs == want => break,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
+                Ok(SessionEvent::Job(info)) => {
+                    rows.insert(info.id.clone(), info);
+                }
+                Ok(SessionEvent::JobGone { id }) => {
+                    rows.remove(&id);
+                }
+                Ok(_) => {}
+                Err(e) => panic!("job events: {e}"),
             }
         }
     })
@@ -188,6 +201,217 @@ async fn await_jobs(events: &mut broadcast::Receiver<SessionEvent>, want: &[JobI
 async fn read_url(session: &Session, url: &str) -> String {
     let url = session.schemes().exact(url).expect("registered scheme");
     session.schemes().read(&url).await.unwrap()
+}
+
+#[tokio::test]
+async fn command_events_are_ordered_across_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, _) = scripted(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "printf a; sleep 0.2; printf b", "async": true}),
+            )])),
+            ScriptedTurn::Reply(reply_text("started")),
+            ScriptedTurn::Reply(reply_text("finished")),
+        ],
+    )
+    .await;
+    let session = Arc::new(axo.create_session(bash_options(dir.path())).await.unwrap());
+    let mut events = session.attach(None).await.events;
+    let prompt = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Run it.").await }
+    });
+    let running = within(async {
+        loop {
+            match events.recv().await.unwrap() {
+                SessionEvent::Job(info) if info.id == "bg_1" => {
+                    assert_eq!(info.status, JobStatus::Running);
+                    assert_eq!(info.call_id.as_deref(), Some("c1"));
+                    assert!(matches!(
+                        info.kind,
+                        JobKind::Command {
+                            promotion: Some(Promotion::Async),
+                            exit: None,
+                            ..
+                        }
+                    ));
+                    break info;
+                }
+                SessionEvent::Entry(seq) if matches!(seq.entry, Entry::JobEnd { .. }) => {
+                    panic!("job_end preceded the running row")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    let mut attached = session.attach(None).await;
+    assert_eq!(attached.live.jobs, vec![running]);
+    within(async {
+        let mut ended = false;
+        loop {
+            match events.recv().await.unwrap() {
+                SessionEvent::Entry(seq) => {
+                    if let Entry::JobEnd { job_id, exit, .. } = seq.entry {
+                        assert_eq!(job_id, "bg_1");
+                        assert_eq!(exit, Some(CommandExit::Exited { code: 0 }));
+                        ended = true;
+                    }
+                }
+                // The row reads finished at once; its message turns deliverable only
+                // after the `job_end` append.
+                SessionEvent::Job(info)
+                    if info.id == "bg_1"
+                        && info.status == JobStatus::Finished
+                        && info.messages[0].delivery != MessageDelivery::Writing =>
+                {
+                    assert!(ended, "deliverable row preceded job_end");
+                    assert_eq!(info.messages.len(), 1);
+                    assert!(matches!(
+                        info.messages[0].delivery,
+                        MessageDelivery::Pending | MessageDelivery::Delivered
+                    ));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    within(async {
+        let mut finished = false;
+        loop {
+            if let SessionEvent::Job(info) = attached.events.recv().await.unwrap() {
+                assert_eq!(info.id, "bg_1");
+                if finished {
+                    assert_eq!(
+                        info.status,
+                        JobStatus::Finished,
+                        "attach replayed stale state"
+                    );
+                }
+                if info.status == JobStatus::Finished {
+                    finished = true;
+                    assert!(matches!(
+                        info.kind,
+                        JobKind::Command {
+                            exit: Some(CommandExit::Exited { code: 0 }),
+                            ..
+                        }
+                    ));
+                    if info.messages[0].delivery == MessageDelivery::Delivered {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert_eq!(within(prompt).await.unwrap().unwrap(), RunOutcome::Done);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreground_output_handle_survives_completion_and_host_can_promote() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m"}]),
+        json!({"bash": {"promoteAfterMs": 60000}}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "printf a; sleep 0.2; printf b"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("finished")),
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c2",
+                "bash",
+                json!({"command": "sleep 1"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("backgrounded")),
+            ScriptedTurn::Reply(reply_text("finished")),
+        ],
+    )
+    .await;
+    let session = Arc::new(
+        host.axo
+            .create_session(bash_options(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let prompt = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Run the first command.").await }
+    });
+    let output = within(async {
+        loop {
+            if let Some(output) = session.command_output("c1") {
+                break output;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(output.job(), "bg_1");
+    assert!(
+        session.jobs().is_empty(),
+        "foreground rows must not be listed"
+    );
+    let mut progress = output.progress();
+    within(async {
+        while !progress.borrow().done {
+            progress.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert_eq!(progress.borrow().bytes, 2);
+    assert_eq!(output.read(0..2).await.unwrap(), b"ab");
+    assert_eq!(output.read(1..100).await.unwrap(), b"b");
+    assert_eq!(within(prompt).await.unwrap().unwrap(), RunOutcome::Done);
+    let lines = journal(&session);
+    let result = only(&lines, "foreground result", |line| {
+        line["message"]["toolCallId"] == "c1"
+    });
+    assert_eq!(
+        lines[result]["message"]["details"]["exit"],
+        json!({"type": "exited", "code": 0})
+    );
+    assert!(
+        lines[result]["message"]["details"]["durationMs"]
+            .as_i64()
+            .unwrap()
+            >= 0
+    );
+    let prompt = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Run the second command.").await }
+    });
+    until(|| session.command_output("c2").is_some()).await;
+    assert!(session.background("c2"));
+    assert!(!session.background("unknown"));
+    assert_eq!(within(prompt).await.unwrap().unwrap(), RunOutcome::Done);
+    let result = tool_text(&session.attach(None).await.missed, "c2");
+    let jobs = session.jobs();
+    assert_eq!(jobs.len(), 1);
+    assert!(
+        result.contains(&format!("in the background as {}", jobs[0].id)),
+        "{result}"
+    );
+    assert!(matches!(
+        jobs[0].kind,
+        JobKind::Command {
+            promotion: Some(Promotion::Host),
+            ..
+        }
+    ));
+    common::delivered(&session, &jobs[0].id).await;
+    session.shutdown().await;
 }
 
 #[tokio::test]
@@ -387,6 +611,11 @@ async fn wait_consumes_the_result_and_auto_delivery_skips_it() {
     let waited = tool_text(&entries, "c2");
     assert!(waited.contains("[bg_1] sleep 1; echo done"), "{waited}");
     assert!(waited.contains("done"), "{waited}");
+    let lines = journal(&session);
+    let result = only(&lines, "wait result", |line| {
+        line["message"]["toolCallId"] == "c2"
+    });
+    assert_eq!(lines[result]["message"]["details"]["jobs"], json!(["bg_1"]));
 
     // Shutdown awaits any automatic run, so one that delivered again would show here.
     session.shutdown().await;
@@ -625,6 +854,7 @@ async fn host_job_api_reports_and_kills() {
     .await;
     let session = axo.create_session(bash_options(dir.path())).await.unwrap();
     let mut events = session.attach(None).await.events;
+    let mut rows = BTreeMap::new();
 
     assert_eq!(
         within(session.prompt("Run it in the background."))
@@ -634,20 +864,34 @@ async fn host_job_api_reports_and_kills() {
     );
     let jobs = session.jobs();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
-    let JobKind::Command { artifact, .. } = &jobs[0].kind else {
+    let JobKind::Command {
+        artifact,
+        command,
+        tool,
+        cwd,
+        promotion,
+        promoted_at,
+        ended_at,
+        exit,
+    } = &jobs[0].kind
+    else {
         panic!("expected a command job");
     };
-    let running = vec![JobInfo {
-        id: "bg_1".into(),
-        kind: JobKind::Command {
-            command: "sleep 30".into(),
-            artifact: *artifact,
-        },
-        status: JobStatus::Running,
-    }];
-    assert_eq!(jobs, running);
+    assert_eq!(command, "sleep 30");
+    assert_eq!(tool, "bash");
+    assert_eq!(cwd, &dir.path().join("work"));
+    assert_eq!(*promotion, Some(Promotion::Async));
+    assert!(promoted_at.is_some());
+    assert_eq!(*ended_at, None);
+    assert_eq!(*exit, None);
+    assert_eq!(jobs[0].id, "bg_1");
+    assert_eq!(jobs[0].call_id.as_deref(), Some("c1"));
+    assert!(jobs[0].started_at > 0);
+    assert!(jobs[0].messages.is_empty());
+    assert_eq!(jobs[0].status, JobStatus::Running);
+    let running = jobs.clone();
     assert_eq!(session.attach(None).await.live.jobs, running);
-    await_jobs(&mut events, &running).await;
+    await_jobs(&mut events, &mut rows, &running).await;
     assert_eq!(
         read_url(&session, "proc://").await,
         "bg_1  running  sleep 30"
@@ -655,12 +899,30 @@ async fn host_job_api_reports_and_kills() {
 
     let before_kill = last_seq(&session).await;
     assert!(session.kill_job("bg_1"));
-    let failed = vec![JobInfo {
-        status: JobStatus::Failed,
-        ..running[0].clone()
-    }];
-    await_jobs(&mut events, &failed).await;
-    assert_eq!(session.jobs(), failed);
+    common::delivered(&session, "bg_1").await;
+    until(|| {
+        session.jobs().iter().any(|job| {
+            job.id == "bg_1"
+                && job
+                    .messages
+                    .iter()
+                    .any(|message| message.delivery == MessageDelivery::Delivered)
+        })
+    })
+    .await;
+    let failed = session.jobs();
+    assert_eq!(failed[0].status, JobStatus::Failed);
+    assert!(matches!(
+        failed[0].kind,
+        JobKind::Command {
+            exit: Some(CommandExit::Killed { by: Killer::Host }),
+            ended_at: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(failed[0].messages.len(), 1);
+    assert_eq!(failed[0].messages[0].delivery, MessageDelivery::Delivered);
+    await_jobs(&mut events, &mut rows, &failed).await;
     // The result lands before the container closes; once closed, nothing is left to stop.
     let deadline = Instant::now() + Duration::from_secs(3);
     while session.kill_job("bg_1") {
@@ -685,4 +947,15 @@ async fn host_job_api_reports_and_kills() {
 
     await_run_end(&session, before_kill).await;
     session.shutdown().await;
+    let (header, entries) = axo.open_session_read(session.path()).await.unwrap();
+    assert_eq!(jobs_from_entries(&header, &entries), session.jobs());
+    let end = entries
+        .iter()
+        .find_map(|seq| match &seq.entry {
+            Entry::JobEnd { text, exit, .. } => Some((text, exit)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(end.0, "Command was stopped by the user");
+    assert_eq!(*end.1, Some(CommandExit::Killed { by: Killer::Host }));
 }

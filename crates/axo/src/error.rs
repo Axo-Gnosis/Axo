@@ -31,6 +31,10 @@ pub enum Error {
     /// `SessionOptions::agent` names no agent definition, or names a team.
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
+    #[error("Agent {0} cannot run as a root session (runAs: subagent)")]
+    AgentNotRoot(String),
+    #[error("Agent {0} cannot be spawned (runAs: root)")]
+    AgentNotSubagent(String),
     /// A spawn hook blocked a spawn, the depth limit was reached, or the parent is shutting down.
     #[error("{0}")]
     SpawnBlocked(String),
@@ -38,8 +42,11 @@ pub enum Error {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
     /// `Axo::open_session` was given a child session's file.
-    #[error("{}: a child session; reach it through Axo::session", path.display())]
-    ChildSession { path: PathBuf },
+    #[error("{}: a child session; open its root session{} and reach the child through Axo::session", path.display(), root.as_ref().map(|root| format!(" ({})", root.display())).unwrap_or_default())]
+    ChildSession {
+        path: PathBuf,
+        root: Option<PathBuf>,
+    },
     /// `@name` names no `modelRoles` entry.
     #[error("Unknown model role: @{0}")]
     UnknownModelRole(String),

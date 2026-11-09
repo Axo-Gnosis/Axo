@@ -11,6 +11,22 @@ use crate::context::markdown::{self, name_problems, split_frontmatter};
 use crate::context::prompt::valid_section_name;
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
+/// Where an agent definition may run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunAs {
+    Root,
+    Subagent,
+    #[default]
+    Any,
+}
+
+impl RunAs {
+    pub fn is_any(&self) -> bool {
+        *self == Self::Any
+    }
+}
+
 /// An agent's prompt and context switches.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -20,6 +36,9 @@ pub struct AgentSpec {
     /// One line for listings; may be empty.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Root persona, spawned agent, or both (the default).
+    #[serde(default, skip_serializing_if = "RunAs::is_any")]
+    pub run_as: RunAs,
     /// A model selector (`[@role | provider/model][:thinking]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -145,6 +164,8 @@ struct Frontmatter {
     name: Option<String>,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    run_as: RunAs,
     model: Option<String>,
     tools: Option<ToolList>,
     #[serde(default, deserialize_with = "context_files_switch")]
@@ -234,10 +255,10 @@ pub fn load_agents(
             warn(format!("name \"{}\" collision", spec.name));
         }
     }
-    let agent_names: HashSet<String> = definitions
+    let agent_names: IndexMap<String, RunAs> = definitions
         .iter()
         .filter_map(|definition| match definition {
-            AgentDef::Agent(spec) => Some(spec.name.clone()),
+            AgentDef::Agent(spec) => Some((spec.name.clone(), spec.run_as)),
             AgentDef::Team(_) => None,
         })
         .collect();
@@ -290,6 +311,7 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
         &[
             "name",
             "description",
+            "runAs",
             "model",
             "tools",
             "contextFiles",
@@ -344,6 +366,7 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
     let mut spec = AgentSpec {
         name,
         description: frontmatter.description,
+        run_as: frontmatter.run_as,
         model: frontmatter.model,
         tools: frontmatter.tools.map(|tools| match tools {
             ToolList::List(tools) => tools,
@@ -398,14 +421,17 @@ pub(crate) fn member_name_problem(name: &str) -> Option<String> {
         .or_else(|| (name == "parent").then(|| "member name \"parent\" is reserved".into()))
 }
 
-fn team_problem(team: &TeamSpec, agents: &HashSet<String>) -> Option<String> {
+fn team_problem(team: &TeamSpec, agents: &IndexMap<String, RunAs>) -> Option<String> {
     if team.members.is_empty() {
         return Some("a team needs at least one member".into());
     }
     let mut names = HashSet::new();
     for member in &team.members {
-        if !agents.contains(&member.agent) {
+        if !agents.contains_key(&member.agent) {
             return Some(format!("member \"{}\" is not an agent", member.agent));
+        }
+        if agents.get(&member.agent) == Some(&RunAs::Root) {
+            return Some(format!("member \"{}\" is root-only", member.agent));
         }
         let name = member.roster_name();
         if member_name_problem(name).is_some() {

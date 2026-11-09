@@ -64,6 +64,10 @@ impl YieldState {
         self.nudge_due.store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn record_failures(&self, n: u32) -> u32 {
         self.failures.fetch_add(n, Ordering::Relaxed) + n
     }

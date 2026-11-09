@@ -76,6 +76,8 @@ impl Log {
             kind,
             parts,
             request_id: None,
+            sender: None,
+            custom: None,
         })
     }
 
@@ -126,6 +128,7 @@ impl Log {
             run_id: run_id.into(),
             outcome: axo::RunOutcome::Done,
             reason: None,
+            usage: None,
         });
     }
 }

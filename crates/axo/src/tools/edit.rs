@@ -579,8 +579,10 @@ mod tests {
                 CommandRunner {
                     jobs: JobRegistry::new(
                         "test".into(),
+                        0,
                         &[],
                         Arc::new(crate::session::children::SessionTable::default()),
+                        broadcast::channel(16).0,
                     )
                     .0,
                     artifacts,

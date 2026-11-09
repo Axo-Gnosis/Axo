@@ -25,6 +25,7 @@ flowchart LR
 | **1. Codemode, script extensions & agent specs** | Embedded JS sandbox (`rquickjs`), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and child script hooks (rungs 2–5) | **Active focus.** Rungs 0–1 decided; rungs 2+ in discussion |
 | **5. Extensions (Bun host), MCP & `ast_edit`** | Extension contract, Bun stdio host & `@axo/sdk`, `.mcp.json` / host-supplied MCP tool adapter, optional `ast_edit` | Planned |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
+| **Session modes** | Cache-safe mode overlays, durable transitions, call-time tool gating and optional model swaps | Follow-up to the host surface work; design inputs below |
 
 ---
 
@@ -277,6 +278,7 @@ Key risks to design around when building step 3 (script hooks):
 - **Track 2 (Agents, `spawn`, teams):** Landed in code; settled architecture decisions in [`design.md`](design.md#agents-and-child-sessions-axo) and runtime reference in [`crates/axo/docs/prompts-and-context.md`](../crates/axo/docs/prompts-and-context.md#agent-definitions), [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#child-sessions), and [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#spawning-child-sessions). Grounding research in [`research/subagents.md`](research/subagents.md).
 - **Track 3 (Async `bash`, background jobs & `wait`):** Landed in code; settled decisions in [`design.md`](design.md#settled-core-decisions) and runtime reference in [`crates/axo/docs/configuration.md`](../crates/axo/docs/configuration.md#command-supervision-axosupervision) and [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#background-job-durability). Historical verification log preserved in [`research/track3-supervision.md`](research/track3-supervision.md).
 - **Track 4 (URL scheme registry):** Landed in code; settled decisions in [`design.md`](design.md#settled-core-decisions) and runtime reference in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#3-rust-extension-traits).
+- **Host surface (shipping in this change):** Typed job and child state over one ordered event stream with complete attach snapshots, live command output, persisted switchable root personas, durable host messages, and introspection getters. Settled contracts in [`design.md`](design.md#host-contract-axo); persona and mode grounding in [`research/personas-and-modes.md`](research/personas-and-modes.md). First-class session modes remain follow-up work.
 ---
 
 ## Track 5: Extensions (Bun host), MCP & `ast_edit`
@@ -318,6 +320,20 @@ Decisions when resumed:
 1. Use the `agent-client-protocol` crate or handwritten serde types (<1k lines).
 2. Default to `RecoveryPolicy::MarkInterrupted` on interactive open so the user decides whether to resume an interrupted run.
 3. Optional ACP `terminal/create` backend for `bash`.
+
+---
+
+## Session modes
+
+Follow-up to the host surface work, separate from root personas. These are the design inputs for the next plan, not modes shipped by this change. Harness comparisons and cache behavior are recorded in [`research/personas-and-modes.md`](research/personas-and-modes.md).
+
+- **Mode definition:** a markdown file whose body holds the instructions, with frontmatter for a tool block policy and an optional model selector.
+- **Durable selection:** `Session::set_mode`, journaled as `mode_change`.
+- **Cache-safe transitions:** enter and leave messages through `Session::post` with `HostDelivery::Quiet`, without changing the system prompt or tool list.
+- **Compaction survival:** re-inject the reminder after compaction while the mode is active; OpenCode re-checks it on every request.
+- **Enforcement:** tool gating at call time, not tool-list removal.
+- **Model selection:** swap to the mode's model on enter and restore the previous model on exit, as with omp's plan role; this is the accepted cache break.
+- **No bundled modes:** axo supplies the mechanism; hosts, users and projects supply mode definitions.
 
 ---
 

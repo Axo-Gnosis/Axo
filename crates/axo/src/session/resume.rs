@@ -1,4 +1,4 @@
-use axo_agent::{AgentMessage, QueuedMessage, Replay};
+use axo_agent::{AgentMessage, CustomMessage, QueuedMessage, Replay};
 use axo_ai::{
     AssistantMessage, Message, Model, StopReason, ToolCall, ToolResultMessage, UserBlock,
     UserMessage, now_ms,
@@ -10,7 +10,7 @@ use super::spawn::SPAWN;
 use super::{RecoveryPolicy, RunRequest, Session};
 use crate::compaction::Limits;
 use crate::error::Error;
-use crate::input::render;
+use crate::input::{PromptPart, render};
 use crate::jobs::JobId;
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::artifact::{command_log_tail, command_logs};
@@ -60,14 +60,35 @@ impl Session {
                 submission_id,
                 kind,
                 parts,
+                custom,
                 ..
             } = seq.entry
             {
-                let message = AgentMessage::Llm(Message::User(UserMessage {
-                    content: render(&parts, &self.hooks.prompt.sources.skills, &self.hooks.tools)
+                let message = if let Some(custom) = custom {
+                    AgentMessage::Custom(CustomMessage {
+                        custom_type: custom.custom_type,
+                        content: parts
+                            .into_iter()
+                            .filter_map(|part| match part {
+                                PromptPart::Text { text } => Some(UserBlock::Text { text }),
+                                _ => None,
+                            })
+                            .collect(),
+                        display: custom.display,
+                        details: None,
+                        timestamp: now_ms(),
+                    })
+                } else {
+                    AgentMessage::Llm(Message::User(UserMessage {
+                        content: render(
+                            &parts,
+                            &self.hooks.prompt.sources.skills,
+                            &self.hooks.tools,
+                        )
                         .await,
-                    timestamp: now_ms(),
-                }));
+                        timestamp: now_ms(),
+                    }))
+                };
                 queued.push((
                     kind,
                     QueuedMessage {
@@ -167,11 +188,9 @@ impl Session {
     ) -> Result<Option<Resumption>, Error> {
         let log = self.hooks.journal.view();
         let model = self.hooks.model();
+        let tools = self.hooks.prompt.tools();
         let replay_of = |call: &ToolCall| {
-            self.hooks
-                .prompt
-                .sources
-                .tools
+            tools
                 .iter()
                 .find(|tool| tool.name() == call.name)
                 .map_or(Replay::Never, |tool| tool.replay(call))
@@ -226,7 +245,7 @@ impl Session {
                 }) => {
                     self.claim_resume(run_id, attempt).await?;
                     for (kind, message) in self.requeued(requeue).await {
-                        enqueue(&self.agent, &self.hooks.tools.runner.jobs, kind, message);
+                        enqueue(&self.agent, &self.hooks, kind, message);
                     }
                     return Ok(Some(Resumption::RecoverResponse(
                         RunRequest::RecoverResponse {
@@ -326,6 +345,10 @@ impl Session {
         self.hooks
             .append(vec![Entry::RunEnd {
                 base: journal::base(),
+                usage: Some(store::run_usage(
+                    &self.hooks.journal.view().entries,
+                    &run_id,
+                )),
                 run_id,
                 outcome,
                 reason,

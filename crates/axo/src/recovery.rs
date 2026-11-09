@@ -491,6 +491,8 @@ mod tests {
                 kind,
                 parts,
                 request_id: None,
+                sender: None,
+                custom: None,
             })
         }
 
@@ -554,6 +556,7 @@ mod tests {
                 run_id: run_id.into(),
                 outcome: crate::RunOutcome::Done,
                 reason: None,
+                usage: None,
             });
         }
 

@@ -124,6 +124,7 @@ Review the code for correctness and report actionable findings.
 | :--- | :--- |
 | `name` | Defaults to the file stem when omitted or empty. Uses the skill name rule: non-empty, at most 64 characters, only lowercase ASCII letters, digits, and hyphens; no leading, trailing, or consecutive hyphens. Unlike skills, violations drop the definition |
 | `description` | Optional listing text, default empty |
+| `runAs` | `root`, `subagent`, or `any` (default); controls whether the definition can be a root persona, a spawned agent, or both. Root-only agents are omitted from the spawn listing and rejected as team members |
 | `model` | A [model selector](configuration.md#model-selectors); root sessions consider it after the explicit session selector and recorded model, before `defaultModel`. Children use the [child model cascade](configuration.md#child-sessions-subagents--axosubagentsettings) |
 | `tools` | Optional allowlist over built-in **and host** tools, as a list or comma-separated string (trimmed, empty entries dropped). Omitted keeps all tools; an empty list keeps none. Unknown tool names produce diagnostics when the agent is selected. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
 | `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings for roots and uses `subagents.contextFiles` for children |
@@ -137,13 +138,19 @@ Unreadable files, malformed frontmatter, invalid names or schemas, and collision
 
 ### Root selection and catalog
 
-`SessionOptions::agent: Option<String>` selects a root agent by name; `None` runs without one. A missing name or a team name returns `Error::AgentNotFound`. `SessionOptions::agents: Vec<AgentSpec>` adds definitions supplied in code; the public types live in `axo::context::agents`. `Session::agents() -> &[AgentDef]` exposes the loaded agent and team catalog. Definitions and the selected root are snapshots: forks inherit them; reopening loads again from the options and roots supplied then, so pass the root name again.
+`SessionOptions::agent: Option<String>` selects a root persona by name. `None` keeps the session's recorded agent (none for a new session); `Some` selects it, recording a change on reopen. A missing name or a team name returns `Error::AgentNotFound`; an explicit subagent-only selection returns `Error::AgentNotRoot`. The journal stores the name in `agent_change`, not a frozen spec: reopening resolves the current definition again. If the recorded persona is missing or now subagent-only, axo retains a diagnostic and records that the session runs without it.
+
+`SessionOptions::agents: Vec<AgentSpec>` adds definitions supplied in code; the public types live in `axo::context::agents`, and `AgentSpec` and `RunAs` are also re-exported from `axo`. `Session::agents() -> &[AgentDef]` exposes the loaded agent and team catalog. Forks inherit the live persona and catalog. On reopen, pass programmatic definitions and host sections/tools again; these are host inputs, not serialized definitions.
+
+`Axo::catalog(cwd, project_access, agents)` resolves the same configuration and definitions without creating a session. It performs blocking file I/O and returns `Catalog { config, agents, diagnostics }`; model roles live in `config.settings.model_roles`.
 
 ### Child prompts
 
 `Session::spawn` and the model's `spawn` tool select a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask` and `yield`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools excluding those two tools. Named agents use their own allowlists over built-in and host tools.
 
-Children share the parent's resolved configuration and prompt overrides, agent catalog, host tool factories, schemes, and tool/spawn hooks. They do **not** inherit host `SessionOptions::sections`, and `ask` is always disabled. Context files default to off through `subagents.contextFiles`; an agent can supply its own map or disable them explicitly.
+A named agent with `runAs: root` fails spawning with `Error::AgentNotSubagent`. Team definitions referencing one are dropped with a root-only-member diagnostic.
+
+Children share the parent's resolved configuration and prompt overrides, agent catalog, host tool factories and host sections, schemes, and tool/spawn hooks. Spawning samples host tools and sections from the parent's live prompt shape; `ask` is always disabled. Context files default to off through `subagents.contextFiles`; an agent can supply its own map or disable them explicitly.
 
 The fixed `delegation` section tells the child to work autonomously without asking questions and to report its outcome, evidence, and hand-off needs to the parent. It is inserted first after all section overrides, cannot be replaced or removed, and is not a `PROMPT_NAMES` override. The resolved spec, including spawn-hook replacements and child defaults, is persisted in `SpawnLink::spec`; revival reuses it rather than looking up an edited agent definition. See [Spawning child sessions](extending.md#spawning-child-sessions).
 
@@ -233,6 +240,8 @@ If the skill body contains no `$` argument placeholders (`$ARGUMENTS`, `$@`, `$N
 
 The submission stores the original parts, not the expansion; the expansion exists only in the user message. Recovery re-renders requeued submissions, so their skills are expanded from the current `SKILL.md` (see [Crash Recovery](sessions-and-compaction.md#crash-recovery-cratesaxosrcrecoveryrs)).
 
+Host messages sent with `Session::post(HostMessage { custom_type, text, display, delivery })` are not user skill invocations: their text bypasses skill expansion, including when recovered from the journal. They enter the conversation without changing the system prompt or tools, preserving that stable request prefix for caching. `display` controls client presentation, not model visibility. See [Host messages](extending.md#host-messages) for `Steer`, `FollowUp`, and non-waking `Quiet` delivery.
+
 ## User Commands (`crates/axo/src/commands.rs`)
 
 `Session::commands()` returns the catalog of built-in commands (`compact`, `shake`, `model`, `thinking`, `navigate`) and discovered skills. The command catalog, dispatch via `Session::run_command`, policies, JSON Schema argument schemas, and typed command text parsing are documented in [Commands](extending.md#commands).
@@ -269,7 +278,8 @@ Every `bash` command and host command submitted through `SessionTools::run_comma
 A running command is promoted to a background job when the first of these happens:
 - `async: true` is set in `bash` arguments, or a host's `CommandRequest` sets `run_async: true` (immediately);
 - it is still running after `bash.promoteAfterMs` milliseconds (default `60000`, or 60 seconds; `0` disables timed promotion);
-- a steer is pending: the user sent a message while it ran (`ToolContext::steer`).
+- a steer is pending: the user sent a message while it ran (`ToolContext::steer`);
+- the host calls `Session::background(call_id)`.
 
 Environment resolution (dev-shell capture) stays in the foreground; the promotion timer and steer promotion start only once the process runs. A command that already finished is never promoted, and promotion is attempted at most once per call. The tool result then returns at once with the output so far (or `(no output yet)`) followed by:
 
@@ -277,7 +287,7 @@ Environment resolution (dev-shell capture) stays in the foreground; the promotio
 Command is still running in the background as bg_N. Full output: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with write proc://bg_N/kill.
 ```
 
-A truncated foreground `bash` result names `artifact://<n>` in its notice and has `details: {"fullOutput": "artifact://<n>"}`. Its `details` when promoted are `{"job": "bg_N", "fullOutput": "artifact://<n>"}`. After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `write proc://bg_N/kill`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. Stopped by kill, the result reads `Command was stopped (proc://bg_N/kill)` with `is_error: true`.
+Every foreground result has `details: {"exit": <typed exit or null>, "durationMs": <milliseconds>}`; a truncated result also names `artifact://<n>` in its notice and adds `"fullOutput": "artifact://<n>"`. Promoted results keep `details: {"job": "bg_N", "fullOutput": "artifact://<n>"}`. Typed exits distinguish exit codes, signals, timeout seconds, model/host kills, foreground aborts and reopen interruption (see [host job types](extending.md#background-jobs-for-hosts)). After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `write proc://bg_N/kill`, `Session::kill_job`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. A model kill reads `Command was stopped (proc://bg_N/kill)`; a host kill reads `Command was stopped by the user`; both have `is_error: true`.
 
 **Retained helpers.** A result is the root shell's: it returns when the root exits plus a fixed 100 ms drain. If processes the command started are still alive in its container (for example backgrounded `&` or `nohup` children, which stay in the process group; under cgroup supervision also `setsid` descendants, which leave the process group and are invisible to process-group mode), the result, foreground or background, ends with `Processes started by this command are still running as bg_N (read proc://bg_N; stop with write proc://bg_N/kill). Their output continues in artifact://<n>.` They stay listed and killable as `bg_N` until they exit; no second result follows.
 
@@ -286,6 +296,8 @@ A truncated foreground `bash` result names `artifact://<n>` in its notice and ha
 ### `wait`
 
 `wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. Any tool batch containing `wait` runs one call at a time, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
+
+When results are returned, `details: {"jobs": ["bg_1", "agent_2/3", …]}` identifies the individual messages consumed, just like automatic `job_result` delivery. Message text remains in the tool result and corresponding journal entries.
 
 Incoming teammate mail also wakes `wait`. With no row results to return, it responds `New messages arrived; they follow this result.`; the queued mail is delivered immediately after the tool batch, not embedded in that tool result. Outside a team, no running admitted jobs and no mail returns `No background jobs are running.` immediately.
 
@@ -297,7 +309,7 @@ The session's `proc://` scheme (`Target::Virtual`) inspects and stops background
 
 | Operation | Result |
 | :--- | :--- |
-| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
+| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `queued` (a child waiting for a run slot), `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
 | `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://<id> or proc://<id>/kill.` |
 | `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
 | `read proc://agent_N` | Child row details: `Job:`, `Agent:`, optional `Team: team_N (member)`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
@@ -311,9 +323,9 @@ The session's virtual `agent://` scheme reads children spawned by that session; 
 
 | Operation | Result |
 | :--- | :--- |
-| `read agent://agent_N` | Agent id, name (or “subagent”), optional `Team: team_N (member)`, model, session id, status, and assistant-turn count. Status is `running`, `finished`, or `failed`, as in `proc://`, with no idle label. Shows latest text while running, otherwise the last result, marked partial when its turn budget was exhausted |
+| `read agent://agent_N` | Agent id, name (or “subagent”), optional `Team: team_N (member)`, model, session id, status, and assistant-turn count. Status is `queued` while waiting for a run slot, `running` while holding it, or `finished` / `failed`, as in `proc://`, with no idle label. Shows latest text while running, otherwise the last result, marked partial when its turn budget was exhausted |
 | `read agent://agent_N/result` | Full latest completed-run result, even after delivery; errors if no result exists yet. A trailing slash is also accepted |
-| `read agent://agent_N/result/<json-pointer>` | Parses the result as JSON and selects the pointer after adding its leading slash; for example `result/findings/0` selects the first finding. Strings return raw text, other values pretty-printed JSON. Missing pointers or non-JSON results are errors |
+| `read agent://agent_N/result/<json-pointer>` | Selects from the persisted typed result value when present; otherwise parses the result text as JSON for older or untyped results. Adds the pointer's leading slash; for example `result/findings/0` selects the first finding. Strings return raw text, other values pretty-printed JSON. Missing pointers or non-JSON fallback text are errors. Typed string values remain strings, even if their text happens to look like JSON |
 | `read agent://agent_N/transcript` | Projected conversation, including compaction summaries, not the raw journal. System messages are omitted; tool calls are abbreviated to 200 characters and tool results to their first line (up to 200 characters), with a count of additional lines. Page with the read tool's `offset` and `limit` |
 | `write agent://agent_N` | Sends non-blank content through `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_N. Its reply arrives as a new result.` |
 | `write agent://agent_N/steer` | Sends non-blank content through `Session::steer`, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_N: it reads your message after its current tool calls.` |

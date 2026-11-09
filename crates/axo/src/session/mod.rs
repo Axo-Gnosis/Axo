@@ -10,7 +10,6 @@ mod side_files;
 pub(crate) mod spawn;
 pub(crate) mod team;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,7 +25,7 @@ use axo_agent::{
 use axo_ai::thinking::clamp_level;
 use axo_ai::{
     Accumulator, AssistantMessage, Message, Model, Models, StopReason, Streamer, ThinkingLevel,
-    ToolCall, ToolResultMessage, UserBlock,
+    ToolCall, ToolResultMessage, Usage, UserBlock,
 };
 use futures::FutureExt;
 use serde_json::Value;
@@ -36,31 +35,31 @@ use tracing::warn;
 use uuid::Uuid;
 
 use self::children::{ChildState, SessionTable, TurnBudget};
-use self::delivery::{Activity, enqueue, relay_jobs};
+use self::delivery::{Activity, enqueue};
 use self::journal::Journal;
 use self::maintenance::Maintenance;
-use self::prompt::{PromptState, SessionPrompt};
+use self::prompt::{PromptState, SessionPrompt, ShapeBase, shape};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
+use self::spawn::SpawnTool;
 pub use self::spawn::{
     ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
     SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
 };
-use self::spawn::{SPAWN, SpawnTool};
 use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
-use crate::config::{EffectiveConfig, ProjectAccess, PromptOverride};
-use crate::context::agents::{AgentDef, AgentSpec, ContextFiles};
-use crate::context::files::{NestedContext, context_file_names, load_context_files};
+use crate::config::{EffectiveConfig, ProjectAccess};
+use crate::context::agents::{AgentDef, AgentSpec, RunAs};
+use crate::context::files::NestedContext;
 use crate::context::prompt::PromptSources;
 use crate::context::skills::{Skill, load_skills};
-use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir, project_root};
+use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir};
 use crate::error::Error;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::input::{PromptInput, PromptPart};
-use crate::jobs::{JobHost, JobId, JobInfo, JobRegistry};
+use crate::jobs::{ChildProgress, JobHost, JobId, JobInfo, JobRegistry};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
 use crate::schemes::agent::AgentScheme;
 use crate::schemes::artifact::Artifacts;
@@ -81,8 +80,8 @@ pub struct SessionOptions {
     /// A model selector (`provider/model`, `@role`, either with `:thinking`, or `:thinking` alone);
     /// falls back to the session's last model, then the root agent's `model`, then `defaultModel`.
     pub model: Option<String>,
-    /// The root agent, by name, from the agent roots or `agents`. `None` runs without one.
-    /// Pass it again when reopening, as with `sections`; forks inherit it.
+    /// The root agent by name. `None` keeps the session's recorded agent (none for a new
+    /// session); `Some` selects it, recording a change on reopen.
     pub agent: Option<String>,
     /// Agent definitions supplied in code, after every file-defined one; the first name wins.
     pub agents: Vec<AgentSpec>,
@@ -211,9 +210,17 @@ pub enum SessionEvent {
         attempt: u32,
         delay_ms: u64,
     },
-    /// The background jobs changed; the full list, as [`Session::jobs`] returns it.
-    Jobs {
-        jobs: Vec<JobInfo>,
+    /// A listed job appeared or changed.
+    Job(JobInfo),
+    /// A job left the list.
+    JobGone {
+        id: String,
+    },
+    /// The estimated context and the current model's compaction limits.
+    Context(ContextUsage),
+    /// Automatic result delivery was paused or resumed.
+    AutoPaused {
+        paused: bool,
     },
 }
 
@@ -235,6 +242,33 @@ pub enum PromptResult {
     /// The `request_id` was already submitted: the earlier `submission` entry. No run
     /// was started.
     Duplicate(SeqEntry),
+}
+/// A durable host instruction, delivered without changing the prompt's system sections.
+#[derive(Debug, Clone)]
+pub struct HostMessage {
+    pub custom_type: String,
+    pub text: String,
+    pub display: bool,
+    pub delivery: HostDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDelivery {
+    /// The next turn boundary; starts a run when idle.
+    Steer,
+    /// When the active run would end; starts a run when idle.
+    FollowUp,
+    /// The next turn boundary or run start; never starts a run.
+    Quiet,
+}
+
+/// Estimated context size and effective compaction limits, in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub tokens: u64,
+    pub window: u64,
+    pub trigger: u64,
+    pub reserve: u64,
 }
 
 /// A client's view when attaching: what it missed, the live state, and the events from
@@ -264,6 +298,13 @@ pub struct LiveSnapshot {
     pub pending_questions: Vec<(String, Vec<Question>)>,
     /// The background jobs, as [`Session::jobs`] returns them.
     pub jobs: Vec<JobInfo>,
+    /// Recorded spend, including maintenance and failed assistant requests, without run/job rollups.
+    pub usage: Usage,
+    pub model: Model,
+    pub thinking: ThinkingLevel,
+    pub agent: Option<String>,
+    pub context: Option<ContextUsage>,
+    pub auto_paused: bool,
 }
 
 /// A new session copied from a point of another.
@@ -274,6 +315,7 @@ pub struct Fork {
 }
 
 /// Immutable host inputs inherited by forks and child sessions.
+#[derive(Clone)]
 pub(crate) struct Inherited {
     pub(crate) cwd: PathBuf,
     /// Resolved once by `Axo` for this session; a fork inherits its parent's.
@@ -360,6 +402,8 @@ struct SessionHooks {
     activity: watch::Sender<Activity>,
     /// Held across a steer or follow-up's write, so the agent queues them in journal order.
     queue_order: tokio::sync::Mutex<()>,
+    /// Durable host messages held until a run's next delivery boundary.
+    quiet: Mutex<Vec<QueuedMessage>>,
     /// Held across a selection change's write and its apply, so changes take effect in
     /// journal order and only once durable.
     selection_order: tokio::sync::Mutex<()>,
@@ -368,6 +412,8 @@ struct SessionHooks {
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
     preparing: AtomicUsize,
     prompt: SessionPrompt,
+    shape_base: Mutex<ShapeBase>,
+    agent_spec: Mutex<Option<AgentSpec>>,
     /// Set when a run ends other than `Done` or the user stops an active one; finished
     /// job results then wait for the user's next input instead of starting a run.
     auto_paused: AtomicBool,
@@ -430,13 +476,25 @@ async fn run_to_settle(
         };
         Some(match reserved {
             Some(permit) => permit,
-            None => hooks
-                .inherited
-                .run_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("never closed"),
+            None => match hooks.inherited.run_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if let Some(parent) = hooks
+                        .inherited
+                        .sessions
+                        .registry(&child.link.parent_session_id)
+                    {
+                        parent.child_queued(&hooks.session_id);
+                    }
+                    hooks
+                        .inherited
+                        .run_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("never closed")
+                }
+            },
         })
     } else {
         None
@@ -551,6 +609,47 @@ impl SessionHooks {
             self.tools.ledger.restore(&view.projection.messages);
             self.tools.context.restore(&view.projection.messages);
         }
+        if appended.iter().any(|seq| {
+            seq.entry.rewrites_context()
+                || matches!(
+                    &seq.entry,
+                    Entry::Message {
+                        message: AgentMessage::Llm(Message::Assistant(_)),
+                        ..
+                    }
+                )
+        }) {
+            self.emit_context();
+        }
+    }
+
+    fn context_usage(&self) -> Option<ContextUsage> {
+        self.context_usage_for(&self.journal.view().projection)
+    }
+
+    fn context_usage_for(&self, projection: &Projection) -> Option<ContextUsage> {
+        let limits = Limits::resolve(&self.model(), &self.maintenance.settings).ok()?;
+        Some(ContextUsage {
+            tokens: compaction::estimate(projection),
+            window: limits.window,
+            trigger: limits.trigger,
+            reserve: limits.reserve,
+        })
+    }
+
+    fn emit_context(&self) {
+        self.journal.read(|view| {
+            if let Some(usage) = self.context_usage_for(&view.projection) {
+                let _ = self.events.send(SessionEvent::Context(usage));
+            }
+        });
+    }
+
+    fn set_auto_paused(&self, paused: bool) {
+        let _live = self.live();
+        if self.auto_paused.swap(paused, Ordering::AcqRel) != paused {
+            let _ = self.events.send(SessionEvent::AutoPaused { paused });
+        }
     }
 
     /// Hides the failed response at entry `at` and its tool results from the context.
@@ -610,7 +709,7 @@ impl SessionHooks {
     ) -> Result<RunOutcome, Error> {
         self.tools.runner.jobs.release_uncommitted();
         if !matches!(result, Ok(RunOutcome::Done)) {
-            self.auto_paused.store(true, Ordering::Release);
+            self.set_auto_paused(true);
         }
         let run_id = {
             let mut live = self.live();
@@ -638,6 +737,7 @@ impl SessionHooks {
                         run_id: run_id.clone(),
                         outcome,
                         reason,
+                        usage: Some(store::run_usage(&self.journal.view().entries, &run_id)),
                     }])
                     .await
                     .map(drop);
@@ -663,7 +763,7 @@ impl SessionHooks {
             }
         }
         if closed.is_err() {
-            self.auto_paused.store(true, Ordering::Release);
+            self.set_auto_paused(true);
         }
         self.release_or_deliver();
         closed?;
@@ -677,6 +777,7 @@ impl SessionHooks {
         &self,
         model: Option<&str>,
         thinking: Option<ThinkingLevel>,
+        agent: Option<&str>,
     ) -> Result<(), Error> {
         let _order = self.selection_order.lock().await;
         let selection = self.selection();
@@ -694,6 +795,18 @@ impl SessionHooks {
                 thinking_level: selection.thinking,
             });
         }
+        let live_agent = self
+            .agent_spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|spec| spec.name.clone());
+        if agent != live_agent.as_deref() {
+            entries.push(Entry::AgentChange {
+                base: journal::base(),
+                agent: live_agent,
+            });
+        }
         if !entries.is_empty() {
             self.append(entries).await?;
         }
@@ -709,7 +822,19 @@ impl SessionHooks {
     ) -> Result<(), Error> {
         let _order = self.selection_order.lock().await;
         let current = self.selection();
-        let level = clamp_level(&model, thinking.unwrap_or(current.thinking));
+        let (entries, level) = self.model_entries(&current, &model, thinking);
+        self.append(entries).await?;
+        self.apply_selection(agent, model, level);
+        Ok(())
+    }
+
+    fn model_entries(
+        &self,
+        current: &Selection,
+        model: &Model,
+        thinking: Option<ThinkingLevel>,
+    ) -> (Vec<Entry>, ThinkingLevel) {
+        let level = clamp_level(model, thinking.unwrap_or(current.thinking));
         let mut entries = vec![Entry::ModelChange {
             base: journal::base(),
             provider: model.provider.clone(),
@@ -721,8 +846,11 @@ impl SessionHooks {
                 thinking_level: level,
             });
         }
-        self.append(entries).await?;
-        if level != current.thinking {
+        (entries, level)
+    }
+
+    fn apply_selection(&self, agent: &Agent, model: Model, level: ThinkingLevel) {
+        if level != self.selection().thinking {
             agent.set_thinking(level);
         }
         agent.set_model(model.clone());
@@ -730,7 +858,7 @@ impl SessionHooks {
             model,
             thinking: level,
         });
-        Ok(())
+        self.emit_context();
     }
 
     /// Records `level`, clamped to the model, then applies it once written; returns the
@@ -759,11 +887,16 @@ impl SessionHooks {
 
     /// [`SessionHooks::record_selection`] against the current position.
     async fn record_current_selection(&self) -> Result<(), Error> {
-        let (model, thinking) = {
+        let (model, thinking, agent) = {
             let view = self.journal.view();
-            (view.projection.model.clone(), view.projection.thinking)
+            (
+                view.projection.model.clone(),
+                view.projection.thinking,
+                view.projection.agent.clone(),
+            )
         };
-        self.record_selection(model.as_deref(), thinking).await
+        self.record_selection(model.as_deref(), thinking, agent.as_deref())
+            .await
     }
 
     fn yield_nudge(&self) -> bool {
@@ -974,8 +1107,8 @@ impl LoopHooks for SessionHooks {
         messages
     }
 
-    /// Finished job results and mail reach an active run at each steering drain point.
-    /// Neither sets the steer signal; mail wakes `wait` through the job registry.
+    /// Finished job results, mail and quiet host messages reach each steering drain
+    /// point without setting the steer signal; mail also wakes `wait`.
     async fn steering(&self) -> Vec<QueuedMessage> {
         self.reserve_delivery()
     }
@@ -1042,6 +1175,30 @@ impl Persist for SessionHooks {
                 let appended = self.append(batch).await;
                 jobs.settle(receipts, appended.is_ok()).await;
                 appended.map_err(|err| PersistError(err.to_string()))?;
+                let run_id = self.live().run_id.clone();
+                if matches!(message, AgentMessage::Llm(Message::Assistant(_)))
+                    && let Some(child) = &self.child
+                    && let Some(parent) = self
+                        .inherited
+                        .sessions
+                        .registry(&child.link.parent_session_id)
+                    && let Some(run_id) = run_id
+                {
+                    let turns = child.budget.requests();
+                    parent.child_progress(
+                        &self.session_id,
+                        ChildProgress {
+                            turns,
+                            max_turns: child.budget.limit,
+                            wrapping_up: turns >= child.budget.limit,
+                            yield_failures: child
+                                .output
+                                .as_ref()
+                                .map_or(0, |output| output.failures()),
+                            usage: store::run_usage(&self.journal.view().entries, &run_id),
+                        },
+                    );
+                }
             }
             AgentEvent::ToolExecutionStart {
                 call_id,
@@ -1202,42 +1359,13 @@ impl Session {
         let settings = &config.settings;
         let project = config.access != ProjectAccess::Ignore;
         let root_agent = inherited.agent.as_ref();
-        let context_names = match root_agent.and_then(|spec| spec.context_files.as_ref()) {
-            Some(ContextFiles::Off) => None,
-            Some(ContextFiles::Names(overrides)) => {
-                let mut names = settings.context_files.clone();
-                names.extend(overrides.iter().map(|(name, on)| (name.clone(), *on)));
-                Some(Cow::Owned(names))
-            }
-            None => Some(Cow::Borrowed(&settings.context_files)),
-        };
-        let (context_files, context, name_diagnostics, file_diagnostics) = match context_names {
-            None => (
-                Vec::new(),
-                NestedContext::disabled(),
-                Vec::new(),
-                Vec::new(),
-            ),
-            Some(context_names) => {
-                let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
-                let (names, name_diagnostics) = context_file_names(&context_names);
-                let (context_files, file_diagnostics) = load_context_files(
-                    &config.context_files,
-                    home_agents.as_deref(),
-                    cwd,
-                    project,
-                    &names,
-                );
-                let context = NestedContext::new(
-                    (project && settings.nested_context_files).then(|| project_root(cwd)),
-                    names,
-                    &context_files,
-                );
-                (context_files, context, name_diagnostics, file_diagnostics)
-            }
-        };
-        let (jobs, unfinished) =
-            JobRegistry::new(session_id.clone(), &entries, inherited.sessions.clone());
+        let (jobs, unfinished) = JobRegistry::new(
+            session_id.clone(),
+            link.as_ref().map_or(1, |link| link.depth + 1),
+            &entries,
+            inherited.sessions.clone(),
+            events.clone(),
+        );
         inherited
             .sessions
             .register(session_id.clone(), Arc::downgrade(&jobs));
@@ -1266,11 +1394,6 @@ impl Session {
         let (summary_prompts, summary_diagnostics) =
             compaction::summary::SummaryPrompts::load(&config.prompts, &inherited.harness_name);
         let mut section_diagnostics = Vec::new();
-        let agent_sections = root_agent
-            .into_iter()
-            .flat_map(|spec| &spec.sections)
-            .filter(|(_, enabled)| !**enabled)
-            .map(|(name, _)| (name.clone(), None));
         let validated_host_sections = host_sections
             .iter()
             .filter(|(name, _)| {
@@ -1283,21 +1406,8 @@ impl Session {
                 }
                 valid
             })
-            .cloned();
-        let host_sections = agent_sections.chain(validated_host_sections).collect();
-        let mut prompts = config.prompts.clone();
-        if let Some(spec) = root_agent.filter(|spec| !spec.body.is_empty()) {
-            prompts.insert(
-                "SYSTEM".into(),
-                PromptOverride {
-                    origin: spec.path.as_ref().map_or_else(
-                        || format!("agent {}", spec.name),
-                        |path| path.display().to_string(),
-                    ),
-                    text: spec.body.clone(),
-                },
-            );
-        }
+            .cloned()
+            .collect();
 
         let runner = crate::jobs::command::CommandRunner {
             jobs: jobs.clone(),
@@ -1309,7 +1419,7 @@ impl Session {
         let session_tools = Arc::new(SessionTools::new(
             cwd.clone(),
             exec.clone(),
-            context,
+            NestedContext::disabled(),
             schemes,
             runner,
         ));
@@ -1327,54 +1437,49 @@ impl Session {
             .map(|factory| factory(&session_tools))
             .collect();
         let spawn_tool = Arc::new(SpawnTool::new(&inherited.agents, &settings.model_roles));
-        let mut tools = tools::merge_tools(
-            tools::builtin(
-                &session_tools,
-                Some(spawn_tool.clone()),
-                team.clone().map(|team| TeamSeat {
-                    team,
-                    member: session_id.clone(),
-                    sessions: inherited.sessions.clone(),
-                }),
-                inherited.ask_enabled,
-                questions.clone(),
-                settings.ask.timeout_ms.map(Duration::from_millis),
-            ),
-            &host,
+        let builtin = tools::builtin(
+            &session_tools,
+            Some(spawn_tool.clone()),
+            team.clone().map(|team| TeamSeat {
+                team,
+                member: session_id.clone(),
+                sessions: inherited.sessions.clone(),
+            }),
+            inherited.ask_enabled,
+            questions.clone(),
+            settings.ask.timeout_ms.map(Duration::from_millis),
         );
-        let mut tool_diagnostics = Vec::new();
-        if let Some(spec) = root_agent
-            && let Some(allow) = &spec.tools
-        {
-            for name in allow {
-                if !tools.iter().any(|tool| tool.name() == name) {
-                    tool_diagnostics.push(Diagnostic {
-                        origin: spec.path.clone().map(DiagnosticOrigin::Path),
-                        message: format!("agent \"{}\": unknown tool \"{name}\"", spec.name),
-                    });
-                }
-            }
-            tools.retain(|tool| allow.iter().any(|name| name == tool.name()));
-        }
         let depth = link.as_ref().map_or(0, |link| link.depth);
-        if depth >= settings.subagents.max_depth {
-            tools.retain(|tool| tool.name() != SPAWN);
-        }
-        if let Some(output) = link.as_ref().and_then(|link| link.spec.output.as_ref())
-            && let Some(state) = &yield_state
-        {
-            tools.retain(|tool| tool.name() != YIELD);
-            tools.push(Arc::new(YieldTool::new(output, state.clone())));
-        }
-        let diagnostics: Vec<_> = name_diagnostics
+        let yield_tool: Option<Arc<dyn Tool>> = link
+            .as_ref()
+            .and_then(|link| link.spec.output.as_ref())
+            .zip(yield_state.as_ref())
+            .map(|(output, state)| {
+                Arc::new(YieldTool::new(output, state.clone())) as Arc<dyn Tool>
+            });
+        let shape_base = ShapeBase {
+            config: config.clone(),
+            cwd: cwd.clone(),
+            project,
+            builtin,
+            host_tools: host,
+            host_tool_factories: host_tools.clone(),
+            host_sections: validated_host_sections,
+            depth,
+            yield_tool,
+        };
+        let (prompt_shape, nested, shape_diagnostics) = shape(&shape_base, root_agent);
+        session_tools
+            .context
+            .reset(nested.root, nested.names, &nested.startup);
+        let tools = prompt_shape.tools.clone();
+        let diagnostics: Vec<_> = shape_diagnostics
             .into_iter()
-            .chain(file_diagnostics)
             .chain(skill_diagnostics)
             .chain(commands::reserved_skill_diagnostics(&skills))
             .chain(summary_diagnostics)
             .chain(section_diagnostics)
             .chain(inherited.agent_diagnostics.iter().cloned())
-            .chain(tool_diagnostics)
             .collect();
         for diagnostic in &diagnostics {
             warn!("{diagnostic}");
@@ -1402,6 +1507,8 @@ impl Session {
                 events,
                 inherited: inherited.clone(),
                 session_id: session_id.clone(),
+                shape_base: Mutex::new(shape_base),
+                agent_spec: Mutex::new(root_agent.cloned()),
                 path,
                 tools: session_tools.clone(),
                 questions,
@@ -1414,6 +1521,7 @@ impl Session {
                 }),
                 activity: watch::Sender::new(Activity::default()),
                 queue_order: tokio::sync::Mutex::new(()),
+                quiet: Mutex::new(Vec::new()),
                 selection_order: tokio::sync::Mutex::new(()),
                 maintenance: Maintenance {
                     settings: settings.compaction.clone(),
@@ -1431,14 +1539,11 @@ impl Session {
                             .map(team::section),
                         name: inherited.harness_name.clone(),
                         cwd: cwd.clone(),
-                        prompts,
                         docs,
-                        tools: tools.clone(),
                         scheme_docs: session_tools.schemes.prompt_docs(),
-                        context_files,
                         skills,
-                        host_sections,
                     },
+                    shape: Mutex::new(prompt_shape),
                     state: Mutex::new(PromptState {
                         note: None,
                         date: String::new(),
@@ -1452,11 +1557,6 @@ impl Session {
                 child,
             }
         });
-        tokio::spawn(relay_jobs(
-            Arc::downgrade(&hooks.tools.runner.jobs),
-            hooks.tools.runner.jobs.subscribe(),
-            hooks.events.clone(),
-        ));
         let agent = Arc::new(Agent::new(AgentConfig {
             thinking,
             tools,
@@ -1498,7 +1598,11 @@ impl Session {
         // Nothing else runs on the session yet: these writes go in order.
         session
             .hooks
-            .record_selection(projection.model.as_deref(), projection.thinking)
+            .record_selection(
+                projection.model.as_deref(),
+                projection.thinking,
+                projection.agent.as_deref(),
+            )
             .await?;
         session.hooks.sync_sections().await?;
         if recovery.is_some() {
@@ -1528,8 +1632,8 @@ impl Session {
                 // With no turn to continue, the requeued input starts the run instead.
                 let mut first = Vec::new();
                 for (kind, message) in queued {
-                    if has_turns {
-                        enqueue(agent, &session.hooks.tools.runner.jobs, kind, message);
+                    if has_turns || kind == SubmissionKind::Quiet {
+                        enqueue(agent, &session.hooks, kind, message);
                     } else {
                         first.push(message);
                     }
@@ -1547,12 +1651,23 @@ impl Session {
                         SubmissionKind::Prompt | SubmissionKind::Mail => prompts.push(message),
                         SubmissionKind::Steer => agent.steer(message),
                         SubmissionKind::FollowUp => agent.follow_up(message),
+                        SubmissionKind::Quiet => enqueue(agent, &session.hooks, kind, message),
                     }
                 }
                 (!prompts.is_empty()).then_some(RunRequest::Prompt(prompts))
             }
         };
         if let Some(request) = request {
+            let request = match request {
+                RunRequest::Prompt(messages) => {
+                    let mut input = session
+                        .hooks
+                        .run_input(session.hooks.reserve_delivery(), None);
+                    input.extend(messages);
+                    RunRequest::Prompt(input)
+                }
+                other => other,
+            };
             let run = run_to_settle(session.agent.clone(), session.hooks.clone(), request);
             tokio::spawn(async move {
                 if let Err(err) = run.await {
@@ -1561,7 +1676,12 @@ impl Session {
             });
         }
         if recovery.is_some() {
-            tokio::spawn(children::reconcile_children(Arc::downgrade(&session.hooks)));
+            let reconciling = session.hooks.inherited.sessions.reconciling();
+            let reconcile = children::reconcile_children(Arc::downgrade(&session.hooks));
+            tokio::spawn(async move {
+                reconcile.await;
+                drop(reconciling);
+            });
         }
         Ok(session)
     }
@@ -1577,8 +1697,29 @@ impl Session {
     }
 
     /// The spawn link of a child session; `None` for root sessions and forks.
-    pub fn agent(&self) -> Option<&store::SpawnLink> {
+    pub fn spawn_link(&self) -> Option<&store::SpawnLink> {
         self.hooks.child.as_ref().map(|child| &child.link)
+    }
+
+    /// The current root persona or the definition this child was spawned with.
+    pub fn agent(&self) -> Option<AgentSpec> {
+        self.hooks
+            .agent_spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn model(&self) -> Model {
+        self.hooks.model()
+    }
+
+    pub fn thinking(&self) -> ThinkingLevel {
+        self.hooks.selection().thinking
+    }
+
+    pub fn config(&self) -> &EffectiveConfig {
+        &self.inherited.config
     }
 
     /// Sets the file-wide session name; newlines become spaces and blank names clear it.
@@ -1673,11 +1814,28 @@ impl Session {
     /// Stops job `id` (`bg_N` or `agent_N`), like `write proc://<id>/kill`; false when unknown
     /// or no longer running.
     pub fn kill_job(&self, id: &str) -> bool {
-        JobId::parse(id).is_some_and(|id| self.hooks.tools.runner.jobs.kill(id))
+        JobId::parse(id).is_some_and(|id| {
+            self.hooks
+                .tools
+                .runner
+                .jobs
+                .kill(id, crate::jobs::Killer::Host)
+        })
     }
 
-    /// This session's URL schemes, for hosts resolving URLs they display: recognize with
-    /// `exact`, then `resolve`, and `read` a `Target::Virtual`. A fork resolves to its own files.
+    /// Opens a command's flushed raw output, including commands still in the foreground.
+    /// A handle remains readable after the command's spool is unlinked.
+    pub fn command_output(&self, call_id: &str) -> Option<crate::jobs::CommandOutput> {
+        self.hooks.tools.runner.jobs.command_output(call_id)
+    }
+
+    /// Requests promotion of a foreground command. A command that finishes first stays foreground.
+    pub fn background(&self, call_id: &str) -> bool {
+        self.hooks.tools.runner.jobs.background(call_id)
+    }
+
+    /// This session's URL schemes: recognize with `exact`, resolve files with `resolve`,
+    /// or read UTF-8 text from either file or virtual targets with `read`.
     pub fn schemes(&self) -> &Schemes {
         &self.hooks.tools.schemes
     }
@@ -1735,7 +1893,7 @@ impl Session {
     /// changes nothing.
     pub fn abort(&self) {
         if self.hooks.activity.borrow().running {
-            self.hooks.auto_paused.store(true, Ordering::Release);
+            self.hooks.set_auto_paused(true);
             self.hooks.stop_requested.store(true, Ordering::Release);
         }
         self.hooks.cancel_maintenance(false);
@@ -1780,6 +1938,179 @@ impl Session {
         detached(async move { hooks.select_model(&agent, model, None).await }).await
     }
 
+    /// Switches the root persona from the next request, applying its model selector when
+    /// present. Changing the system prompt and tools is cache-heavy on models without
+    /// mid-conversation system-message and tool changes.
+    pub async fn set_agent(&self, name: Option<&str>) -> Result<(), Error> {
+        if self.hooks.child.is_some() {
+            return Err(Error::InvalidInput(
+                "Child sessions keep the agent they were spawned with".into(),
+            ));
+        }
+        let spec = name
+            .map(|name| {
+                let spec = self
+                    .inherited
+                    .agents
+                    .iter()
+                    .find_map(|definition| match definition {
+                        AgentDef::Agent(spec) if spec.name == name => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::AgentNotFound(name.to_owned()))?;
+                if spec.run_as == RunAs::Subagent {
+                    return Err(Error::AgentNotRoot(name.to_owned()));
+                }
+                Ok(spec)
+            })
+            .transpose()?;
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move {
+            let _order = hooks.selection_order.lock().await;
+            let choice = spec
+                .as_ref()
+                .and_then(|spec| spec.model.as_deref())
+                .map(|selector| {
+                    hooks
+                        .inherited
+                        .config
+                        .settings
+                        .resolve_model(&hooks.inherited.models, selector)
+                })
+                .transpose()?;
+            let mut entries = vec![Entry::AgentChange {
+                base: journal::base(),
+                agent: spec.as_ref().map(|spec| spec.name.clone()),
+            }];
+            let selection = choice.map(|choice| {
+                let current = hooks.selection();
+                let model = choice.model.unwrap_or_else(|| current.model.clone());
+                let (model_entries, level) = hooks.model_entries(&current, &model, choice.thinking);
+                entries.extend(model_entries);
+                (model, level)
+            });
+            hooks.append(entries).await?;
+            if let Some((model, level)) = selection {
+                hooks.apply_selection(&agent, model, level);
+            }
+            let (new_shape, nested, diagnostics) = {
+                let base = hooks
+                    .shape_base
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                shape(&base, spec.as_ref())
+            };
+            for diagnostic in diagnostics {
+                warn!("{diagnostic}");
+            }
+            let tools = new_shape.tools.clone();
+            *hooks
+                .prompt
+                .shape
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = new_shape;
+            hooks
+                .tools
+                .context
+                .reset(nested.root, nested.names, &nested.startup);
+            hooks
+                .tools
+                .context
+                .restore(&hooks.journal.view().projection.messages);
+            agent.set_tools(tools);
+            *hooks
+                .agent_spec
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = spec;
+            hooks.prompt.rebuild();
+            hooks.emit_context();
+            Ok(())
+        })
+        .await
+    }
+
+    /// Changes a host section from the next request. Hosts pass sections again on reopen.
+    /// This is cache-heavy on models without mid-conversation system messages.
+    pub async fn set_section(&self, name: &str, body: Option<String>) -> Result<(), Error> {
+        if self.hooks.child.is_some() {
+            return Err(Error::InvalidInput(
+                "Child sessions keep the prompt and tools they were spawned with".into(),
+            ));
+        }
+        if !crate::context::prompt::valid_section_name(name) {
+            return Err(Error::InvalidInput(format!(
+                "Invalid system prompt section name: {name}"
+            )));
+        }
+        let _order = self.hooks.selection_order.lock().await;
+        let replace = |sections: &mut Vec<(String, Option<String>)>| {
+            if let Some((_, value)) = sections.iter_mut().find(|(key, _)| key == name) {
+                *value = body.clone();
+            } else {
+                sections.push((name.to_owned(), body.clone()));
+            }
+        };
+        replace(
+            &mut self
+                .hooks
+                .shape_base
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .host_sections,
+        );
+        replace(
+            &mut self
+                .hooks
+                .prompt
+                .shape
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .host_sections,
+        );
+        self.hooks.prompt.rebuild();
+        Ok(())
+    }
+
+    /// Replaces host tool factories from the next request, still honoring the persona's
+    /// allowlist. Hosts pass tools again on reopen. Changes are cache-heavy on models
+    /// without mid-conversation tool changes.
+    pub async fn set_tools(&self, tools: Vec<ToolFactory>) -> Result<(), Error> {
+        if self.hooks.child.is_some() {
+            return Err(Error::InvalidInput(
+                "Child sessions keep the prompt and tools they were spawned with".into(),
+            ));
+        }
+        let _order = self.hooks.selection_order.lock().await;
+        let host = tools
+            .iter()
+            .map(|factory| factory(&self.hooks.tools))
+            .collect();
+        let spec = self.agent();
+        let (new_shape, _, diagnostics) = {
+            let mut base = self
+                .hooks
+                .shape_base
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            base.host_tools = host;
+            base.host_tool_factories = tools;
+            shape(&base, spec.as_ref())
+        };
+        for diagnostic in diagnostics {
+            warn!("{diagnostic}");
+        }
+        let tools = new_shape.tools;
+        self.hooks
+            .prompt
+            .shape
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .tools = tools.clone();
+        self.agent.set_tools(tools);
+        self.hooks.prompt.rebuild();
+        Ok(())
+    }
+
     /// Sets the thinking level from the next request, clamped to the model; returns the
     /// level applied.
     pub async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error> {
@@ -1799,18 +2130,28 @@ impl Session {
         Ok(())
     }
 
+    /// The current estimated context size and effective compaction limits.
+    pub fn context_usage(&self) -> Option<ContextUsage> {
+        self.hooks.context_usage()
+    }
+
     /// The entries after `from` (all with `None`), the live state and an event receiver,
     /// all taken at one point of the append order: no entry is missed or duplicated.
     /// Never waits on a write in flight.
     pub async fn attach(&self, from: Option<u64>) -> Attach {
-        let activity = *self.hooks.activity.borrow();
-        // Entries publish, and live updates relay, under these two locks: subscribing
-        // inside both splits every event into before (in the snapshot) or after
-        // (received).
+        // Entries publish under the journal lock, live updates relay under the live lock
+        // and job rows announce under the registry lock: subscribing inside all three
+        // splits every event into before (in the snapshot) or after (received).
         self.hooks.journal.read(|view| {
             let live = self.hooks.live();
+            let activity = *self.hooks.activity.borrow();
             let (queued_steering, queued_follow_up) = self.agent.queued();
-            let events = self.hooks.events.subscribe();
+            let (jobs, events) = self
+                .hooks
+                .tools
+                .runner
+                .jobs
+                .announced_with(|| self.hooks.events.subscribe());
             let start = from.map_or(0, |seq| {
                 view.entries.partition_point(|entry| entry.seq <= seq)
             });
@@ -1820,13 +2161,26 @@ impl Session {
                     run_id: live.run_id.clone(),
                     maintenance: activity.maintenance,
                     running: activity.running,
+                    model: self.model(),
+                    thinking: self.thinking(),
+                    agent: self.agent().map(|spec| spec.name),
+                    context: self.hooks.context_usage_for(&view.projection),
+                    auto_paused: self.hooks.auto_paused.load(Ordering::Acquire),
                     streaming: live.streaming.as_ref().and_then(Accumulator::snapshot),
                     pending_tool_calls: live.tool_calls.clone(),
                     queued_steering,
                     queued_follow_up,
                     messages: view.projection.messages.clone(),
                     pending_questions: self.hooks.questions.pending(),
-                    jobs: self.jobs(),
+                    jobs,
+                    usage: view
+                        .entries
+                        .iter()
+                        .filter_map(|seq| seq.entry.usage())
+                        .fold(Usage::default(), |mut total, usage| {
+                            total += usage;
+                            total
+                        }),
                 },
                 events,
             }
@@ -1934,6 +2288,7 @@ impl Session {
                 writer
                     .append(Entry::RunEnd {
                         base: EntryBase::new(id, parent),
+                        usage: Some(store::run_usage(&entries, &run_id)),
                         run_id,
                         outcome,
                         reason,
@@ -1943,8 +2298,19 @@ impl Session {
         }
 
         let projection = project(&entries, None);
+        let mut inherited = (*self.inherited).clone();
+        inherited.agent = self.agent();
+        {
+            let base = self
+                .hooks
+                .shape_base
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            inherited.host_tools = base.host_tool_factories.clone();
+            inherited.host_sections = base.host_sections.clone();
+        }
         let session = Session::start(SessionSetup {
-            inherited: self.inherited.clone(),
+            inherited: Arc::new(inherited),
             model,
             thinking,
             session_id,

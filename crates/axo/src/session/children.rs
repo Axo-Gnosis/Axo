@@ -35,6 +35,17 @@ pub(crate) struct SessionTable {
     teams: Mutex<HashMap<String, Weak<TeamState>>>,
     // ponytail: one revive gate; per-id gates if revivals contend
     revive: tokio::sync::Mutex<()>,
+    /// Reopened sessions still seeding their children in the background.
+    reconciling: watch::Sender<usize>,
+}
+
+/// Counts one session's background child reconciliation until dropped.
+pub(crate) struct Reconciling(Arc<SessionTable>);
+
+impl Drop for Reconciling {
+    fn drop(&mut self) {
+        self.0.reconciling.send_modify(|n| *n -= 1);
+    }
 }
 
 struct Slot {
@@ -85,15 +96,18 @@ impl SessionTable {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
-                id,
+                id.clone(),
                 Slot {
-                    seed,
+                    seed: seed.clone(),
                     weak: Arc::downgrade(&session),
                     live: Some(session),
                 },
             );
         // Dropping a session can remove its children from this table.
         drop(old);
+        if let Some(parent) = self.registry(&seed.link.parent_session_id) {
+            parent.set_resident(&id, true);
+        }
     }
 
     pub(crate) fn seed(&self, id: String, seed: Arc<ChildSeed>) {
@@ -117,12 +131,22 @@ impl SessionTable {
 
     /// The live session, re-pinned in the table so it stays resident while it works.
     fn pin(&self, id: &str) -> Option<Arc<Session>> {
-        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        let slot = slots.get_mut(id)?;
-        if slot.live.is_none() {
-            slot.live = slot.weak.upgrade();
+        let (session, parent) = {
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            let slot = slots.get_mut(id)?;
+            let repin = slot.live.is_none();
+            if repin {
+                slot.live = slot.weak.upgrade();
+            }
+            (
+                slot.live.clone(),
+                (repin && slot.live.is_some()).then(|| slot.seed.link.parent_session_id.clone()),
+            )
+        };
+        if let Some(parent) = parent.and_then(|parent| self.registry(&parent)) {
+            parent.set_resident(id, true);
         }
-        slot.live.clone()
+        session
     }
 
     pub(crate) fn team(&self, parent: &str, link: &TeamLink) -> Arc<TeamState> {
@@ -138,13 +162,18 @@ impl SessionTable {
     }
 
     pub(crate) fn park(&self, id: &str) {
-        let session = self
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(id)
-            .and_then(|slot| slot.live.take());
-        drop(session);
+        let parked = {
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            slots
+                .get_mut(id)
+                .map(|slot| (slot.live.take(), slot.seed.link.parent_session_id.clone()))
+        };
+        if let Some((session, parent)) = parked {
+            if let Some(parent) = self.registry(&parent) {
+                parent.set_resident(id, false);
+            }
+            drop(session);
+        }
     }
 
     pub(crate) fn remove(&self, ids: &[String]) {
@@ -183,17 +212,33 @@ impl SessionTable {
             .and_then(Weak::upgrade)
     }
 
-    pub(crate) async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
-        if let Some(session) = self.pin(id) {
-            return Ok(session);
-        }
-        let seed = self
-            .slots
+    /// Counts a reopened session's child reconciliation, so lookups wait for its seeds.
+    pub(crate) fn reconciling(self: &Arc<Self>) -> Reconciling {
+        self.reconciling.send_modify(|n| *n += 1);
+        Reconciling(self.clone())
+    }
+
+    fn seed_of(&self, id: &str) -> Option<Arc<ChildSeed>> {
+        self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .map(|slot| slot.seed.clone())
-            .ok_or_else(|| Error::SessionNotFound(id.to_owned()))?;
+    }
+
+    pub(crate) async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
+        if let Some(session) = self.pin(id) {
+            return Ok(session);
+        }
+        let seed = match self.seed_of(id) {
+            Some(seed) => seed,
+            None => {
+                // A root opened moments ago may still be seeding its children.
+                let _ = self.reconciling.subscribe().wait_for(|n| *n == 0).await;
+                self.seed_of(id)
+                    .ok_or_else(|| Error::SessionNotFound(id.to_owned()))?
+            }
+        };
         let _gate = self.revive.lock().await;
         if let Some(session) = self.pin(id) {
             return Ok(session);
@@ -212,7 +257,7 @@ impl SessionTable {
     ) -> Result<ChildLog, Error> {
         if let Some(live) = self.live(session_id) {
             return Ok(ChildLog {
-                link: live.agent().cloned(),
+                link: live.spawn_link().cloned(),
                 entries: LogEntries::Live(live.hooks.journal.view()),
                 live: Some(live),
             });
@@ -423,7 +468,7 @@ impl SessionHooks {
         };
         let seed = Arc::new(ChildSeed {
             path: child.path.clone(),
-            inherited: child_inherited(&self.inherited, &link.spec, self.loaded()),
+            inherited: child_inherited(self, &link.spec, self.loaded()),
             link,
         });
         if recover {
@@ -433,7 +478,9 @@ impl SessionHooks {
                 .insert_live(child_id.clone(), seed, child.clone());
             // Revival recovery can end runs without settling them through the parent.
             let view = child.hooks.journal.view();
-            let output = child.agent().and_then(|link| link.spec.output.as_ref());
+            let output = child
+                .spawn_link()
+                .and_then(|link| link.spec.output.as_ref());
             report_runs(jobs, child_id, &view.entries, output).await?;
         } else {
             self.inherited.sessions.seed(child_id.clone(), seed);

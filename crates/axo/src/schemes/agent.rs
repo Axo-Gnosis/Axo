@@ -161,11 +161,14 @@ impl Scheme for AgentScheme {
                 let Some(pointer) = pointer else {
                     return Ok(result.text);
                 };
-                let value: Value = serde_json::from_str(&result.text).map_err(|_| {
-                    ToolError(format!(
-                        "{id}'s result is not JSON; read agent://{id}/result"
-                    ))
-                })?;
+                let value = match self.jobs.child_result_value(id, result.run_id.as_deref()) {
+                    Some(value) => value,
+                    None => serde_json::from_str::<Value>(&result.text).map_err(|_| {
+                        ToolError(format!(
+                            "{id}'s result is not JSON; read agent://{id}/result"
+                        ))
+                    })?,
+                };
                 let value = value
                     .pointer(&format!("/{pointer}"))
                     .ok_or_else(|| ToolError(format!("No value at /{pointer} in {id}'s result")))?;
@@ -250,6 +253,8 @@ impl Scheme for AgentScheme {
                             is_error: false,
                             partial: false,
                             note: true,
+                            usage: None,
+                            value: None,
                         },
                         true,
                     )

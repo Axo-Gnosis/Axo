@@ -10,7 +10,8 @@ use axo_ai::{Models, Streamer};
 use crate::config::{
     ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
 };
-use crate::context::agents::{AgentDef, load_agents};
+use crate::context::Diagnostic;
+use crate::context::agents::{AgentDef, AgentSpec, RunAs, load_agents};
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
@@ -40,6 +41,13 @@ pub struct Axo {
     /// (process group or cgroup).
     supervisor: Arc<ProcessSupervisor>,
     sessions: Arc<SessionTable>,
+}
+
+/// Configuration and agent definitions resolved without starting a session.
+pub struct Catalog {
+    pub config: Arc<EffectiveConfig>,
+    pub agents: Vec<AgentDef>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Builds an [`Axo`]. Nothing here reads configuration: without [`AxoBuilder::config`]
@@ -167,15 +175,33 @@ impl Axo {
     /// run settled, is handled per `options.recovery`; a resumed run (or one started for
     /// requeued prompts) continues in the background, so this returns right away (watch
     /// for its `run_end` via `Session::attach`).
+    /// Child files return [`Error::ChildSession`] with the owning root's path when
+    /// its ancestry is available; open that root, then use [`Axo::session`].
     pub async fn open_session(
         &self,
         path: &Path,
         options: SessionOptions,
     ) -> Result<Session, Error> {
         let (header, entries, writer) = self.store.open_write(path).await?;
-        if header.spawn.is_some() {
+        if let Some(spawn) = &header.spawn {
+            let sessions = self.store.list(&header.cwd).await?;
+            let mut parent = spawn.parent_session_id.as_str();
+            let mut root = None;
+            for _ in 0..sessions.len() {
+                let Some(info) = sessions.iter().find(|info| info.id == parent) else {
+                    break;
+                };
+                match &info.spawn {
+                    Some(spawn) => parent = &spawn.parent_session_id,
+                    None => {
+                        root = Some(info.path.clone());
+                        break;
+                    }
+                }
+            }
             return Err(Error::ChildSession {
                 path: path.to_path_buf(),
+                root,
             });
         }
         let projection = project(&entries, None);
@@ -195,7 +221,8 @@ impl Axo {
     }
 
     /// A live child session, or a parked one revived (its unfinished run resumes). Children
-    /// are known once their parent is open in this process.
+    /// are known once their parent is open in this process; an unknown id first waits for
+    /// reopened sessions to finish registering their children.
     pub async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
         self.sessions.session(id).await
     }
@@ -247,6 +274,36 @@ impl Axo {
         Ok(schemes)
     }
 
+    /// Resolves configuration and definitions using blocking file I/O, without a session.
+    /// Model roles are available in `config.settings.model_roles`.
+    pub fn catalog(
+        &self,
+        cwd: &Path,
+        project_access: Option<ProjectAccess>,
+        agents: &[AgentSpec],
+    ) -> Result<Catalog, Error> {
+        self.resolve_catalog(cwd, project_access, agents)
+    }
+
+    fn resolve_catalog(
+        &self,
+        cwd: &Path,
+        project_access: Option<ProjectAccess>,
+        agents: &[AgentSpec],
+    ) -> Result<Catalog, Error> {
+        let config = Arc::new(EffectiveConfig::resolve(
+            &*self.config,
+            cwd,
+            project_access,
+        )?);
+        let (agents, diagnostics) = load_agents(&config.agent_roots, agents);
+        Ok(Catalog {
+            config,
+            agents,
+            diagnostics,
+        })
+    }
+
     /// Where bundled docs are materialized; `None` without a cache directory.
     fn docs_dir(&self) -> Option<PathBuf> {
         self.cache_dir.as_ref().map(|cache| cache.join("docs"))
@@ -280,22 +337,31 @@ impl Axo {
             recovery: _,
         } = options;
 
-        let config = Arc::new(EffectiveConfig::resolve(
-            &*self.config,
-            &cwd,
-            project_access,
-        )?);
-        let (agents, agent_diagnostics) = load_agents(&config.agent_roots, &agents);
-        let agent = match agent {
-            Some(name) => Some(
-                agents
-                    .iter()
-                    .find_map(|definition| match definition {
-                        AgentDef::Agent(spec) if spec.name == name => Some(spec.clone()),
-                        _ => None,
-                    })
-                    .ok_or(Error::AgentNotFound(name))?,
-            ),
+        let Catalog {
+            config,
+            agents,
+            diagnostics: mut agent_diagnostics,
+        } = self.resolve_catalog(&cwd, project_access, &agents)?;
+        let explicit_agent = agent.is_some();
+        let agent = match agent.as_ref().or(projection.agent.as_ref()) {
+            Some(name) => {
+                let spec = agents.iter().find_map(|definition| match definition {
+                    AgentDef::Agent(spec) if spec.name == *name => Some(spec),
+                    _ => None,
+                });
+                match spec {
+                    Some(spec) if spec.run_as != RunAs::Subagent => Some(spec.clone()),
+                    Some(_) if explicit_agent => return Err(Error::AgentNotRoot(name.clone())),
+                    None if explicit_agent => return Err(Error::AgentNotFound(name.clone())),
+                    _ => {
+                        agent_diagnostics.push(Diagnostic {
+                            origin: None,
+                            message: format!("agent \"{name}\" from the session is unavailable; running without it"),
+                        });
+                        None
+                    }
+                }
+            }
             None => None,
         };
         let settings = &config.settings;

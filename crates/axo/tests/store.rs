@@ -385,6 +385,8 @@ fn submission(id: &str, parent: Option<&str>) -> Entry {
             text: "hello".into(),
         }],
         request_id: None,
+        sender: None,
+        custom: None,
     }
 }
 

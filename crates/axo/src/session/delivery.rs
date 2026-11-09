@@ -2,22 +2,21 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use axo_agent::{Agent, AgentMessage, QueuedMessage, RunOutcome};
+use axo_agent::{Agent, AgentMessage, CustomMessage, QueuedMessage, RunOutcome};
 use axo_ai::{Message, UserBlock, UserMessage, now_ms};
-use tokio::sync::{broadcast, watch};
 use tracing::warn;
 use uuid::Uuid;
 
 use super::journal::{self, View};
 use super::{
-    MaintenanceKind, PromptRequest, PromptResult, RunRequest, Session, SessionEvent, SessionHooks,
-    detached, run_to_settle,
+    HostDelivery, HostMessage, MaintenanceKind, PromptRequest, PromptResult, RunRequest, Session,
+    SessionHooks, detached, run_to_settle,
 };
 use crate::context::prompt::escape_wrappers;
 use crate::error::Error;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
-use crate::jobs::{JobHost, JobRegistry};
-use crate::store::{Entry, SeqEntry, SubmissionKind};
+use crate::jobs::JobHost;
+use crate::store::{Entry, SeqEntry, SubmissionKind, SubmittedCustom};
 
 /// A new child's task, prepared but not saved.
 pub(super) struct FirstPrompt {
@@ -85,6 +84,9 @@ impl SessionHooks {
     /// For the owner of `running`: starts a run delivering every pending job result;
     /// false when nothing is pending.
     fn start_delivery(&self, agent: Arc<Agent>, hooks: Arc<SessionHooks>) -> bool {
+        if !self.tools.runner.jobs.has_pending() {
+            return false;
+        }
         let delivery = self.reserve_delivery();
         if delivery.is_empty() {
             return false;
@@ -149,7 +151,7 @@ impl SessionHooks {
         }
     }
 
-    /// Reserves pending job results, followed by every queued teammate message.
+    /// Reserves pending job results, then mail, then quiet host messages.
     pub(super) fn reserve_delivery(&self) -> Vec<QueuedMessage> {
         let jobs = &self.tools.runner.jobs;
         let mut delivery = Vec::new();
@@ -157,6 +159,12 @@ impl SessionHooks {
             delivery.push(message);
         }
         delivery.extend(jobs.take_mail());
+        delivery.extend(
+            self.quiet
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..),
+        );
         delivery
     }
 }
@@ -195,6 +203,7 @@ impl Session {
             parts,
             content,
             request.request_id.clone(),
+            None,
         );
         let mut entry = Some(entry);
         let mut duplicate = None;
@@ -235,7 +244,7 @@ impl Session {
             };
             saved.keep();
             drop(preparing);
-            hooks.auto_paused.store(false, Ordering::Release);
+            hooks.set_auto_paused(false);
             // Pending job results precede the user's message.
             let messages = hooks.run_input(hooks.reserve_delivery(), Some(message));
             let outcome = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await?;
@@ -285,13 +294,59 @@ impl Session {
 
     /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::Steer, input.into()).await
+        self.queue(SubmissionKind::Steer, input.into(), None).await
     }
 
     /// Saves and queues a user message delivered when the active run would otherwise end;
     /// on an idle session it starts a run.
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::FollowUp, input.into()).await
+        self.queue(SubmissionKind::FollowUp, input.into(), None)
+            .await
+    }
+
+    /// Posts a durable custom message without expanding skills. This is the cache-safe
+    /// channel for host instructions: it changes neither the system prompt nor tools.
+    /// Quiet messages wait for a turn boundary or the next run and never start a run.
+    pub async fn post(&self, message: HostMessage) -> Result<(), Error> {
+        if message.custom_type.is_empty() || message.text.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "Host messages need a custom type and text".into(),
+            ));
+        }
+        if message.custom_type == "job_result" {
+            return Err(Error::InvalidInput("job_result is reserved".into()));
+        }
+        let kind = match message.delivery {
+            HostDelivery::Steer => SubmissionKind::Steer,
+            HostDelivery::FollowUp => SubmissionKind::FollowUp,
+            HostDelivery::Quiet => SubmissionKind::Quiet,
+        };
+        let submission_id = Uuid::now_v7().to_string();
+        let entry = Entry::Submission {
+            base: journal::base(),
+            submission_id: submission_id.clone(),
+            kind,
+            parts: vec![PromptPart::Text {
+                text: message.text.clone(),
+            }],
+            request_id: None,
+            sender: None,
+            custom: Some(SubmittedCustom {
+                custom_type: message.custom_type.clone(),
+                display: message.display,
+            }),
+        };
+        let queued = QueuedMessage {
+            id: Some(submission_id),
+            message: AgentMessage::Custom(CustomMessage {
+                custom_type: message.custom_type,
+                content: vec![UserBlock::Text { text: message.text }],
+                display: message.display,
+                details: None,
+                timestamp: now_ms(),
+            }),
+        };
+        self.queue_message(kind, entry, queued, None).await
     }
 
     /// Saves and queues a teammate's message, read at the next turn boundary; on an idle session it starts a run.
@@ -300,26 +355,46 @@ impl Session {
             "Message from {sender} (reply with write agent://{sender}):\n\n{}",
             escape_wrappers(content)
         );
-        self.queue(SubmissionKind::Mail, text.into()).await
+        self.queue(SubmissionKind::Mail, text.into(), Some(sender.to_owned()))
+            .await
     }
 
     /// Saves the submission and hands its message to the queue for `kind`.
     /// `saved` files stay only once the entry is written.
-    async fn queue(&self, kind: SubmissionKind, input: PromptInput) -> Result<(), Error> {
+    async fn queue(
+        &self,
+        kind: SubmissionKind,
+        input: PromptInput,
+        sender: Option<String>,
+    ) -> Result<(), Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
-        let (entry, message) = submission(kind, parts, content, None);
+        let (entry, message) = submission(kind, parts, content, None, sender);
+        self.queue_message(kind, entry, message, Some(saved)).await
+    }
+
+    async fn queue_message(
+        &self,
+        kind: SubmissionKind,
+        entry: Entry,
+        message: QueuedMessage,
+        saved: Option<SavedFiles>,
+    ) -> Result<(), Error> {
         let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
         detached(async move {
             // Awaits only the journal, which never waits on the session.
             let _order = hooks.queue_order.lock().await;
             hooks.append(vec![entry]).await?;
-            saved.keep();
-            hooks.auto_paused.store(false, Ordering::Release);
-            enqueue(&agent, &hooks.tools.runner.jobs, kind, message);
+            if let Some(saved) = saved {
+                saved.keep();
+            }
+            if kind != SubmissionKind::Quiet {
+                hooks.set_auto_paused(false);
+            }
+            enqueue(&agent, &hooks, kind, message);
             Ok::<(), Error>(())
         })
         .await?;
-        if self.hooks.claim_idle() {
+        if kind != SubmissionKind::Quiet && self.hooks.claim_idle() {
             self.hooks.release_or_deliver();
         }
         Ok(())
@@ -328,7 +403,7 @@ impl Session {
     /// Validates and renders a new child's task; writes nothing.
     pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
-        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None);
+        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None);
         Ok(FirstPrompt {
             entry,
             message,
@@ -374,33 +449,21 @@ impl JobHost for SessionHooks {
     }
 }
 
-/// Sends a `SessionEvent::Jobs` snapshot on each registry change; ends once the registry
-/// is gone. Weak, so the relay never keeps a closed session's jobs alive.
-pub(super) async fn relay_jobs(
-    registry: Weak<JobRegistry>,
-    mut changed: watch::Receiver<u64>,
-    events: broadcast::Sender<SessionEvent>,
-) {
-    while changed.changed().await.is_ok() {
-        let Some(live) = registry.upgrade() else {
-            return;
-        };
-        let jobs = live.list();
-        drop(live);
-        let _ = events.send(SessionEvent::Jobs { jobs });
-    }
-}
-
 pub(super) fn enqueue(
     agent: &Agent,
-    jobs: &JobRegistry,
+    hooks: &SessionHooks,
     kind: SubmissionKind,
     message: QueuedMessage,
 ) {
     match kind {
         SubmissionKind::FollowUp => agent.follow_up(message),
         SubmissionKind::Prompt | SubmissionKind::Steer => agent.steer(message),
-        SubmissionKind::Mail => jobs.post_mail(message),
+        SubmissionKind::Mail => hooks.tools.runner.jobs.post_mail(message),
+        SubmissionKind::Quiet => hooks
+            .quiet
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(message),
     }
 }
 
@@ -411,6 +474,7 @@ fn submission(
     parts: Vec<PromptPart>,
     content: Vec<UserBlock>,
     request_id: Option<String>,
+    sender: Option<String>,
 ) -> (Entry, QueuedMessage) {
     let submission_id = Uuid::now_v7().to_string();
     let entry = Entry::Submission {
@@ -419,6 +483,8 @@ fn submission(
         kind,
         parts,
         request_id,
+        sender,
+        custom: None,
     };
     let message = AgentMessage::Llm(Message::User(UserMessage {
         content,

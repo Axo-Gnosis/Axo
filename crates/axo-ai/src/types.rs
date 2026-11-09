@@ -263,6 +263,27 @@ pub struct Usage {
     pub cost: UsageCost,
 }
 
+impl std::ops::AddAssign<&Usage> for Usage {
+    fn add_assign(&mut self, next: &Usage) {
+        self.input = self.input.saturating_add(next.input);
+        self.output = self.output.saturating_add(next.output);
+        self.cache_read = self.cache_read.saturating_add(next.cache_read);
+        self.cache_write = self.cache_write.saturating_add(next.cache_write);
+        self.total_tokens = self.total_tokens.saturating_add(next.total_tokens);
+        if let Some(value) = next.cache_write_1h {
+            self.cache_write_1h = Some(self.cache_write_1h.unwrap_or(0).saturating_add(value));
+        }
+        if let Some(value) = next.reasoning {
+            self.reasoning = Some(self.reasoning.unwrap_or(0).saturating_add(value));
+        }
+        self.cost.input += next.cost.input;
+        self.cost.output += next.cost.output;
+        self.cost.cache_read += next.cost.cache_read;
+        self.cost.cache_write += next.cost.cache_write;
+        self.cost.total += next.cost.total;
+    }
+}
+
 /// Cost of one response in USD.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

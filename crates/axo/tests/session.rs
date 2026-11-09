@@ -73,6 +73,114 @@ async fn session_names_are_file_wide_and_custom_state_follows_the_branch() {
 }
 
 #[tokio::test]
+async fn quiet_host_message_waits_for_a_prompt_and_survives_reopening_once() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = common::host(
+            dir.path(),
+            json!([{"id": "m"}]),
+            json!({}),
+            vec![
+                ScriptedTurn::Reply(reply_text("first")),
+                ScriptedTurn::Reply(reply_text("second")),
+            ],
+        )
+        .await;
+        let mut session = host.axo.create_session(options(dir.path())).await.unwrap();
+        let text = "/word keep this host instruction literal";
+        within(session.post(axo::HostMessage {
+            custom_type: "host-note".into(),
+            text: text.into(),
+            display: false,
+            delivery: axo::HostDelivery::Quiet,
+        }))
+        .await
+        .unwrap();
+        let idle = session.attach(None).await;
+        assert!(!idle.live.running);
+        assert!(idle.live.run_id.is_none());
+        assert!(
+            idle.missed
+                .iter()
+                .all(|seq| !matches!(seq.entry, Entry::RunStart { .. }))
+        );
+        assert!(host.api.requests().is_empty());
+
+        if reopen {
+            let path = session.path().to_path_buf();
+            session.shutdown().await;
+            drop(session);
+            session = host
+                .axo
+                .open_session(&path, options(dir.path()))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let idle = session.attach(None).await;
+        assert!(!idle.live.running, "quiet input must not start a run");
+        assert!(idle.live.run_id.is_none());
+        assert!(
+            idle.missed
+                .iter()
+                .all(|seq| !matches!(seq.entry, Entry::RunStart { .. }))
+        );
+        assert!(host.api.requests().is_empty());
+
+        assert_eq!(
+            within(session.prompt("answer now")).await.unwrap(),
+            RunOutcome::Done
+        );
+        {
+            let requests = host.api.requests();
+            assert_eq!(requests.len(), 1);
+            let users: Vec<_> = requests[0]
+                .transcript
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(user.content.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                matches!(users.as_slice(), [host, prompt]
+                    if matches!(host, [UserBlock::Text { text: actual }] if actual == text)
+                    && matches!(prompt, [UserBlock::Text { text }] if text == "answer now")),
+                "custom text must precede the prompt without slash-command rendering: {users:?}"
+            );
+        }
+        within(session.prompt("continue")).await.unwrap();
+        let entries = session.attach(None).await.missed;
+        let customs: Vec<_> = entries
+            .iter()
+            .filter_map(|seq| match &seq.entry {
+                Entry::Message {
+                    message: AgentMessage::Custom(custom),
+                    submission_id,
+                    ..
+                } if custom.custom_type == "host-note" => Some((custom, submission_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            customs.len(),
+            1,
+            "quiet input must be delivered exactly once"
+        );
+        let (custom, submission_id) = customs[0];
+        assert!(submission_id.is_some());
+        assert!(!custom.display);
+        assert!(matches!(
+            custom.content.as_slice(),
+            [UserBlock::Text { text: actual }] if actual == text
+        ));
+        assert_eq!(host.api.requests().len(), 2);
+        session.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn dropping_a_prompt_future_still_settles_its_run() {
     let dir = tempfile::tempdir().unwrap();
     let axo = axo(
@@ -207,6 +315,8 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
                     text: "second".into(),
                 }],
                 request_id: None,
+                sender: None,
+                custom: None,
             })
             .await
             .unwrap();
@@ -655,4 +765,149 @@ async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
     assert!(!cwd.join("original-marker").exists());
     assert!(!cwd.join("fork-marker").exists());
     assert_eq!(later.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
+    use axo::context::agents::{AgentSpec, RunAs};
+    use axo_ai::transcript::current_system_prompt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_text("a")),
+            ScriptedTurn::Reply(reply_text("b")),
+        ],
+    )
+    .await;
+    let a = AgentSpec {
+        name: "a".into(),
+        body: "PERSONA A".into(),
+        tools: Some(vec!["read".into()]),
+        ..Default::default()
+    };
+    let b = AgentSpec {
+        name: "b".into(),
+        body: "PERSONA B".into(),
+        run_as: RunAs::Root,
+        ..Default::default()
+    };
+    let mut initial = options(dir.path());
+    initial.agent = Some("a".into());
+    initial.agents = vec![a.clone(), b.clone()];
+    let session = host.axo.create_session(initial).await.unwrap();
+    assert_eq!(session.agent().unwrap().name, "a");
+    assert!(session.spawn_link().is_none());
+    within(session.prompt("first")).await.unwrap();
+    let path = session.path().to_path_buf();
+    session.shutdown().await;
+    drop(session);
+
+    // Reopening without `agent` re-resolves the recorded persona by name.
+    let mut reopen_options = options(dir.path());
+    reopen_options.agents = vec![a.clone(), b];
+    let reopened = host.axo.open_session(&path, reopen_options).await.unwrap();
+    assert_eq!(reopened.agent().unwrap().name, "a");
+    reopened
+        .set_section("host_rules", Some("LIVE HOST RULES".into()))
+        .await
+        .unwrap();
+    reopened.set_agent(Some("b")).await.unwrap();
+    assert_eq!(reopened.agent().unwrap().name, "b");
+    within(reopened.prompt("second")).await.unwrap();
+    let requests = host.api.requests();
+    assert!(current_system_prompt(requests[0].transcript.messages()).contains("PERSONA A"));
+    assert!(current_system_prompt(requests[1].transcript.messages()).contains("PERSONA B"));
+    assert!(current_system_prompt(requests[1].transcript.messages()).contains("LIVE HOST RULES"));
+    let restored_tools = requests[1]
+        .transcript
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::System(system) => Some(&system.tools_added),
+            _ => None,
+        })
+        .flatten()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        restored_tools.contains(&"write"),
+        "switching away restores base tools"
+    );
+    let snapshot = reopened.attach(None).await.live;
+    assert_eq!(snapshot.agent.as_deref(), Some("b"));
+    assert_eq!(snapshot.model.id, reopened.model().id);
+    assert_eq!(snapshot.thinking, reopened.thinking());
+    let initial_tools = requests[0]
+        .transcript
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            Message::System(system) => Some(&system.tools_added),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        initial_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["read"]
+    );
+    let entries = common::journal(&reopened);
+    assert!(entries.iter().any(|entry| entry["type"] == "agent_change"));
+    reopened.set_agent(None).await.unwrap();
+    assert!(reopened.agent().is_none());
+    reopened.shutdown().await;
+    drop(reopened);
+    let cleared = host
+        .axo
+        .open_session(&path, options(dir.path()))
+        .await
+        .unwrap();
+    assert!(
+        cleared.agent().is_none(),
+        "an explicit clear must survive reopening"
+    );
+}
+
+#[tokio::test]
+async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation() {
+    use axo::context::agents::{AgentSpec, RunAs};
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = axo(dir.path(), vec![]).await;
+    let root = AgentSpec {
+        name: "root-only".into(),
+        run_as: RunAs::Root,
+        ..Default::default()
+    };
+    let child = AgentSpec {
+        name: "child-only".into(),
+        run_as: RunAs::Subagent,
+        ..Default::default()
+    };
+    let mut settings = options(dir.path());
+    settings.agents = vec![root, child.clone()];
+    let session = host.create_session(settings).await.unwrap();
+    assert!(matches!(
+        session.set_agent(Some("child-only")).await,
+        Err(axo::Error::AgentNotRoot(name)) if name == "child-only"
+    ));
+    assert!(session.agent().is_none());
+    assert!(matches!(
+        session.spawn(axo::SpawnRequest {
+            agent: Some("root-only".into()),
+            task: "must not start".into(),
+            ..Default::default()
+        }).await,
+        Err(axo::Error::AgentNotSubagent(name)) if name == "root-only"
+    ));
+    assert!(
+        session.jobs().is_empty(),
+        "rejected spawns must not admit children"
+    );
 }

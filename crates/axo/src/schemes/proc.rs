@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axo_agent::ToolError;
 
 use super::{Scheme, SchemeContext, SchemeUrl, Target};
-use crate::jobs::{JobId, JobKind, JobRegistry, headline};
+use crate::jobs::{JobId, JobKind, JobRegistry, Killer, headline};
 
 pub struct ProcScheme {
     pub jobs: Arc<JobRegistry>,
@@ -94,7 +94,9 @@ impl Scheme for ProcScheme {
                     .get(id)
                     .ok_or_else(|| ToolError(format!("No job {id}")))?;
                 let mut text = match &job.kind {
-                    JobKind::Command { command, artifact } => format!(
+                    JobKind::Command {
+                        command, artifact, ..
+                    } => format!(
                         "Job: {}\nCommand: {}\nStatus: {}\nOutput: artifact://{}",
                         job.id,
                         command,
@@ -140,7 +142,9 @@ impl Scheme for ProcScheme {
         _cx: &SchemeContext,
     ) -> Result<String, ToolError> {
         match parse(&url.path).ok_or_else(|| unsupported(url))? {
-            ProcPath::Kill(id) if self.jobs.kill(id) => Ok(format!("Stopping {id}.")),
+            ProcPath::Kill(id) if self.jobs.kill(id, Killer::Model) => {
+                Ok(format!("Stopping {id}."))
+            }
             ProcPath::Kill(id) => Ok(format!("{id} is not running.")),
             ProcPath::List | ProcPath::Job(_) => Err(ToolError(format!("{url} is read-only"))),
         }

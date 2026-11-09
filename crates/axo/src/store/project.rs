@@ -33,6 +33,8 @@ pub struct Projection {
     pub model: Option<String>,
     /// The latest `thinking_level_change` on the path.
     pub thinking: Option<ThinkingLevel>,
+    /// The latest root persona selected by `agent_change` on the path.
+    pub agent: Option<String>,
     processed: usize,
     /// Id of the entry the path ends at.
     leaf: Option<String>,
@@ -91,6 +93,7 @@ impl Projection {
     /// Follows the settings a path entry changes (pi `getSessionContextSettings`).
     fn track(&mut self, entry: &Entry) {
         match entry {
+            Entry::AgentChange { agent, .. } => self.agent.clone_from(agent),
             Entry::ModelChange {
                 provider, model_id, ..
             } => self.model = Some(format!("{provider}/{model_id}")),

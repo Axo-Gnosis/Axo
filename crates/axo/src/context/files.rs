@@ -167,6 +167,10 @@ fn read_context_file(path: PathBuf) -> Result<ContextFile, Diagnostic> {
 
 /// Context files outside the startup walk, attached to file-tool results on first touch.
 pub struct NestedContext {
+    state: Mutex<NestedState>,
+}
+
+struct NestedState {
     root: Option<PathBuf>,
     names: Arc<[PathBuf]>,
     base: Seen,
@@ -181,10 +185,12 @@ impl NestedContext {
             base.admit(file_key(&file.path), &file.content);
         }
         Self {
-            root,
-            names: names.into(),
-            seen: Arc::new(Mutex::new(base.clone())),
-            base,
+            state: Mutex::new(NestedState {
+                root,
+                names: names.into(),
+                seen: Arc::new(Mutex::new(base.clone())),
+                base,
+            }),
         }
     }
 
@@ -192,14 +198,29 @@ impl NestedContext {
         Self::new(None, Vec::new(), &[])
     }
 
+    /// Replaces discovery settings and clears deduplication to the new startup files.
+    /// In-flight attachments retain their previous snapshot and cannot pollute the new one.
+    pub fn reset(&self, root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) {
+        let replacement = Self::new(root, names, startup);
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = replacement
+            .state
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+
     /// Loads context files on a blocking worker without holding the seen-files lock.
     pub async fn attach(&self, file: &Path) -> Vec<UserBlock> {
-        let Some(root) = self.root.as_ref().filter(|root| file.starts_with(root)) else {
-            return Vec::new();
+        let (root, names, seen) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(root) = state.root.as_ref().filter(|root| file.starts_with(root)) else {
+                return Vec::new();
+            };
+            (
+                root.clone(),
+                Arc::clone(&state.names),
+                Arc::clone(&state.seen),
+            )
         };
-        let root = root.clone();
-        let names = Arc::clone(&self.names);
-        let seen = Arc::clone(&self.seen);
         let file = file.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let Some(parent) = file.parent() else {
@@ -267,8 +288,9 @@ impl NestedContext {
                 }
             }
         }
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.clone_from(&self.base);
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut seen = state.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.clone_from(&state.base);
         for (key, content) in restored {
             seen.admit(key, content);
         }
