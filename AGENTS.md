@@ -1,5 +1,20 @@
 # Repository Guidelines
 
+## Embedder-First Design
+
+Axo is an embeddable harness, not a fixed agent product. Build capabilities and enforce their correctness; leave product policy, workflows, presentation, and interpretation to the host. A feature should enable hosts to realize their own designs, not prescribe ours.
+
+Practical rule: **If the model can see it, the host can read it as typed data. If the model can do it, the host can do it through a typed method. If the UI shows it live, the session file can rebuild it later.**
+
+For every feature or architectural change, evaluate it from the host's side:
+
+- **Usable public surface**: Can a host implement the intended behavior through supported APIs, without reaching into internals, duplicating harness logic, or forking axo? Expose the information and operations it actually needs; internal support alone is not a usable feature.
+- **Deliberate extension points**: Provide hooks where hosts need to observe, decide, or customize behavior. Make their timing, inputs, outputs, ordering, and failure semantics explicit, with clear ownership between host and harness.
+- **Lifecycle fit**: Trace the intended integration end to end, including changes during an active session. Do not make a capability startup-only or immutable by accident; lifecycle restrictions must follow real invariants, not implementation convenience.
+- **Coherent, sufficient APIs**: Keep the public contract clear, consistent, and reasonably complete for supported use cases. Prefer composable capabilities over host-specific special cases, without adding speculative abstractions or hooks.
+
+Validate the host-facing path, not just the internal mechanism. If the architecture prevents a legitimate intended integration, treat that as a design gap rather than leaving the host to work around it.
+
 ## Living Documentation (Paramount)
 
 Architecture, active plans, and runtime reference docs live in dedicated files—do not duplicate them here, and **never let them drift**:
