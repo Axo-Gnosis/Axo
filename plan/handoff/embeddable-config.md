@@ -1,6 +1,6 @@
 # Handoff: axo claims configuration a host should own
 
-Status: open, blocks further feature work (Track 2 subagents, Track 5 extensions). Written 2026-11-04.
+Status: resolved (see plan/design.md Configuration ownership; implemented via `ConfigSource` and `EffectiveConfig::resolve`). Written 2026-11-04.
 
 ## The issue
 

@@ -94,8 +94,8 @@ impl ToolUpdates {
     }
 }
 
-/// How the tool calls of one assistant message run. A batch runs sequentially when the
-/// agent is configured so or any tool in it asks for it.
+/// How the tool calls of one assistant message run. A batch runs sequentially when any
+/// tool in it asks for it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ExecutionMode {
     #[default]

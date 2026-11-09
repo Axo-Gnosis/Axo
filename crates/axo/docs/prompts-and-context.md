@@ -22,7 +22,7 @@ Start-time diagnostics for context files, skills, agent definitions and tool all
 | 8 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
 | 9 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
 | 10 | `team` | Team members only: fixed identity, charter, member brief, ordered roster and messaging guidance |
-| 11 | `cwd` | `inputs.cwd.display()` |
+| 11 | `cwd` | `sources.cwd.display()` |
 | 12 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
 | 13 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
 | 14 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section; not inherited by children |
@@ -31,9 +31,9 @@ The fixed child sections are inserted after overrides: `delegation` first, and `
 
 ### Bundled documentation (`docs`)
 
-The URLs below use the default harness name, `axo`. `AxoBuilder::name` changes the docs scheme and section to the chosen name. Materialization rewrites literal `axo://` URLs in bundled documentation; crate names stay `axo`. Only the bundled `SYSTEM` and `SUMMARY` prompts expand their `{name}` placeholders; host overrides are used verbatim.
+The URLs below use the default harness name, `axo`. `AxoBuilder::name` renames the docs scheme to `<name>://` and names the harness in the `docs` section's text; the section key stays `docs`. Materialization rewrites literal `axo://` URLs in bundled documentation; crate names stay `axo`. Only the bundled `SYSTEM` and `SUMMARY` prompts expand their `{name}` placeholders; host overrides are used verbatim.
 
-When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (including through `Axo::schemes` for a closed session) materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<cache_dir>/docs/`, updating files on disk only when their contents differ. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If that directory cannot be written, scheme construction records a `Diagnostic` and omits both the `docs` section and the built-in `axo://` scheme. Prompt refreshes only render the already-loaded sources; they perform no filesystem I/O. Without a cache directory, axo writes nothing, omits the `docs` section without a diagnostic, and registers no `axo://` scheme.
+When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (including through `Axo::schemes` for a closed session) materializes the crate's bundled documentation (`README.md`, `configuration.md`, `prompts-and-context.md`, `sessions-and-compaction.md`, `extending.md`) into `<cache_dir>/docs/`, updating files on disk only when their contents differ. Child sessions reuse their parent's loaded skills and docs availability instead of discovering or materializing again. The `docs` section points to `axo://README.md`, which resolves to the bundled entry point in that directory. If that directory cannot be written, scheme construction records a `Diagnostic` (retained by an open session, only logged by `Axo::schemes`) and omits both the `docs` section and the built-in `axo://` scheme. Prompt refreshes only render the already-loaded sources; they perform no filesystem I/O. Without a cache directory, axo writes nothing, omits the `docs` section without a diagnostic, and registers no `axo://` scheme.
 
 ### Built-in tool guidelines (`tools`)
 
@@ -43,7 +43,7 @@ Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the bui
 - `read`: `"Use read to examine files instead of cat or sed."`
 - `write`: `"Use write only for new files or complete rewrites."`
 - `edit`: `"When changing several places in one file, use one edit call with several entries in edits[]."`
-- `bash`: `"A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes."` and `"List jobs with read proc:// and stop one with write proc://bg_N/kill (empty content)."` (see [Background Jobs](#background-jobs-cratesaxosrcjobsrs))
+- `bash`: `"A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes."` and `"List jobs with read proc:// and stop one with write proc://bg_N/kill (empty content)."` (see [Background Jobs](#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs))
 
 ### Host section validation
 
@@ -127,7 +127,7 @@ Review the code for correctness and report actionable findings.
 | `model` | A [model selector](configuration.md#model-selectors); root sessions consider it after the explicit session selector and recorded model, before `defaultModel`. Children use the [child model cascade](configuration.md#child-sessions-subagents--axosubagentsettings) |
 | `tools` | Optional allowlist over built-in **and host** tools, as a list or comma-separated string (trimmed, empty entries dropped). Omitted keeps all tools; an empty list keeps none. Unknown tool names produce diagnostics when the agent is selected. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
 | `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings for roots and uses `subagents.contextFiles` for children |
-| `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` can restore removed sections in root sessions; children's fixed `delegation` section cannot be removed |
+| `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` can restore removed sections in root sessions (appended after core sections rather than returning to their original position); children's fixed `delegation` section cannot be removed |
 | `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. For children, defines the result returned through `yield`; ignored for root sessions |
 | `maxTurns` | Model requests per child run before the wrap-up turn; omitted uses `subagents.maxTurns` (default 50). Ignored for root sessions. The tool list stays unchanged; budget enforcement blocks calls through an internal hook, except `yield` |
 
@@ -181,7 +181,7 @@ The result identifies a per-parent team id and each member's child row in roster
 
 ### Discovery (`load_skills`)
 
-`load_skills` scans roots in this order:
+`load_skills` scans roots in this order (child sessions reuse their parent's loaded skills instead of discovering again):
 1. `<dir>/.agents/skills` for each directory from `cwd` up to `project_root(cwd)` (when `project` is `true` and `project.files.skills` is `true`).
 2. The host's `UserConfig::skill_roots`, in order.
 3. `~/.agents/skills` (when `home_agents_dir` is `true`).

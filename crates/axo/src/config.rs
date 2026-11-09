@@ -519,8 +519,8 @@ impl EffectiveConfig {
     }
 
     /// `settings.default_model` with `$VAR` expanded and `!command` values rejected.
-    /// Sessions call this only when neither `SessionOptions::model` nor the session's recorded model
-    /// selects one, so an unresolvable value fails only that selection.
+    /// Sessions call this only when neither `SessionOptions::model`, the session's recorded model,
+    /// nor the root agent's model selects one, so an unresolvable value fails only that selection.
     pub fn default_model(&self) -> Result<Option<String>, Error> {
         let Some(model) = &self.settings.default_model else {
             return Ok(None);

@@ -8,7 +8,7 @@ A host implements `ConfigSource` and passes it to `AxoBuilder::config(Arc<dyn Co
 
 | Method | Signature | Contract |
 | :--- | :--- | :--- |
-| `user` | `fn user(&self) -> Result<UserConfig, Error>` | Called once per `Axo::create_session`, `Axo::open_session`, and `Axo::schemes`, before anything else |
+| `user` | `fn user(&self) -> Result<UserConfig, Error>` | Called once per `Axo::create_session`, `Axo::open_session`, and `Axo::schemes`, before any other `ConfigSource` call |
 | `project` | `fn project(&self, cwd: &Path) -> Result<ConfigLayer, Error>` | The project contribution for a session in `cwd`; the project root is `axo::context::project_root(cwd)` (the git root, or `cwd` outside a repository). Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust` and the user's `project.files.config` is `true` |
 
 An error from either method fails that `create_session`, `open_session`, or `schemes` call as returned. Hosts report an unreadable path as `Error::Io { path, source }`, invalid content they parse (for example malformed JSONC) as `Error::Config { origin, message }`, and any other acquisition failure as `Error::Host(Box::new(err))`, which carries the host's own error.
@@ -62,7 +62,7 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 | Resource | Supplied through | How axo uses it |
 | :--- | :--- | :--- |
 | Models and credentials | `Axo::builder(models, ..)` with an `Arc<Models>` | The host builds `Models` with `Models::load(ModelsOptions { cache_dir, extended_context, config, credentials, http_client })`; see [Models & Credentials](#models-axo_aimodelsconfig--credentials) |
-| Session store | `Axo::builder(.., store)` with an `Arc<dyn SessionStore>` | `JsonlStore::new(root)` writes `<root>/--<encoded-cwd>--/<timestamp>_<uuidv7>.jsonl`, per-session `<session>/artifacts/` bash and maintenance artifacts (`artifact://<n>`), and `<session>/local/` (`local://<path>`): model scratch files and content handed over in prompts (see [Prompt Parts](prompts-and-context.md#prompt-parts-cratesaxosrcinputrs)). Forks copy both directories |
+| Session store | `Axo::builder(.., store)` with an `Arc<dyn SessionStore>` | `JsonlStore::new(root)` or any `SessionStore`; see [Session Storage](sessions-and-compaction.md#session-storage-jsonlstore--sessionstore) |
 | Cache directory | `AxoBuilder::cache_dir(PathBuf)` | Bundled documentation materialized under `<cache_dir>/docs/` (the `docs` section and `axo://` URLs) and captured Nix dev-shell environments under `<cache_dir>/devshell/`. The `models.dev` catalog cache is separate: it lives wherever the host points `ModelsOptions::cache_dir` |
 | Harness name | `AxoBuilder::name(name) -> Result<Self, Error>` | Defaults to `axo`; names the docs scheme and section and the bundled `SYSTEM`/`SUMMARY` self-references. Names must match `^[a-z][a-z0-9+.-]+$`; `artifact`, `file`, `skill`, `local`, `proc`, and `agent` are reserved. Invalid or reserved names return `Error::Scheme` here; `build()` stays infallible |
 | User skills and context files | `UserConfig::skill_roots`, `UserConfig::context_files` | Skill roots (`<root>/<skill>/SKILL.md`) and user-wide instruction files, in the order given |
@@ -70,7 +70,7 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 
 With `homeAgentsDir: true` in the user layer, axo also reads the ecosystem files `~/.agents/AGENTS.md` (before `UserConfig::context_files`) and `~/.agents/skills/` (after `UserConfig::skill_roots`).
 
-The `drive` and `memory` examples ship their own host under an explicit, required `--dir <dir>` (no default, no environment variable): a JSONC `settings.jsonc` user layer (whose `extendedContext` boolean the example itself reads for `ModelsOptions::extended_context`), `prompts/<NAME>.md` overrides, `skills/`, `AGENTS.md`, `models.jsonc`, `auth.json`, `sessions/`, and `cache/` (both `cache_dir`s). That layout belongs to the examples, not to axo.
+The `drive` example requires `--dir <dir>`; `memory` uses it only with `--model`. Both ship a host with a JSONC `settings.jsonc` user layer (whose `extendedContext` boolean the example itself reads for `ModelsOptions::extended_context`), `prompts/<NAME>.md` overrides, `skills/`, `AGENTS.md`, `models.jsonc`, `auth.json`, `sessions/`, and `cache/` (both `cache_dir`s). That layout belongs to the examples, not to axo.
 
 ### Project resources
 
@@ -86,7 +86,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 
 ```json
 {
-  "defaultModel": "anthropic/claude-sonnet-4-5",
+  "defaultModel": null,
   "modelRoles": {},
   "subagents": {
     "maxDepth": 1,
@@ -137,10 +137,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
       "config": true
     },
     "access": "read",
-    "paths": {
-      "/repo/**": "trust",
-      "~/scratch/**": "ignore"
-    }
+    "paths": {}
   }
 }
 ```
@@ -157,6 +154,11 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `followUpMode` | `follow_up_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
 | `contextFiles` | `context_files` | 5 built-in names | User or project | Ordered map of relative paths to booleans merged onto the built-in default map |
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
+| `bash` | `bash` | See below | User or project | Supervised subprocess and dev-shell execution (`BashSettings`) |
+| `ask` | `ask` | See below | User or project | Question tool configuration (`AskSettings`) |
+| `project` | `project` | See below | User only | Project access boundaries and policy (`ProjectSettings`) |
+| `compaction` | `compaction` | See below | User or project | Session compaction triggers and reserve (`CompactionSettings`) |
+| `retry` | `retry` | See below | User or project | Transient model request retry policy (`RetrySettings`) |
 | `subagents` | `subagents` | See below | User only | Child-session budgets and defaults (`SubagentSettings`). Ignored with a warning in project settings |
 
 ### Model selectors
@@ -192,10 +194,11 @@ For a single child, `SpawnRequest::output` (or the model's call-level `output`) 
 
 The `project` block is **user-only**: it is honored only in the user layer. In a project layer it is stripped before merging and logged as a warning, so a project can never choose its own access.
 
-- `project.files.skills` (`true`): read project `.agents/skills/`.
-- `project.files.config` (`true`): request the host's project layer (`ConfigSource::project`): its settings and prompt overrides. `false` keeps project access for context files and skills while never calling `project`.
+- `project.files` (`axo::ProjectFiles`):
+  - `project.files.skills` (`true`): read project `.agents/skills/`.
+  - `project.files.config` (`true`): request the host's project layer (`ConfigSource::project`): its settings and prompt overrides. `false` keeps project access for context files and skills while never calling `project`.
 - `project.access` (`"read"`): default `ProjectAccess` when no glob in `project.paths` matches the project root (the git root, or `cwd` outside a repository).
-- `project.paths` (`{}`): ordered map of globs over the project root to `"ignore"`, `"read"`, or `"trust"`. Evaluated in map order with the last matching pattern winning. `~/` expands to `$HOME` (skipped if `HOME` is unset), and `/` is matched literally (`literal_separator(true)`).
+- `project.paths` (`{}`): ordered map of globs over the project root to `"ignore"`, `"read"`, or `"trust"` (an invalid glob is skipped with a warning). Evaluated in map order with the last matching pattern winning (for example `{"/repo/**": "trust", "~/scratch/**": "ignore"}`). `~/` expands to `$HOME` (skipped if `HOME` is unset), and `/` is matched literally (`literal_separator(true)`).
 
 | `ProjectAccess` | Effect |
 | :--- | :--- |
@@ -216,13 +219,13 @@ A Rust host can override the resolved access level per session via `SessionOptio
 | `bash.ci` | `ci` | `true` | Set `CI=true` in the command environment |
 | `bash.promoteAfterMs` | `promote_after_ms` | `60000` | Promote a still-running command to a background job after this many milliseconds; `0` disables timed promotion, but explicit async execution and pending steering still promote. Applies to `bash` and host tools using `SessionTools::run_command` |
 
-In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<cache_dir>/devshell/<hash>/gcroot` under the host's `AxoBuilder::cache_dir`, where `<hash>` is a 16-hex-digit key of flake dir, ref and system), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
+In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<cache_dir>/devshell/<hash>/gcroot` under the host's `AxoBuilder::cache_dir`, where `<hash>` is a 16-hex-digit key of flake dir, ref, system, and `devShellWatch` globs), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
 
 Nix mode needs a cache directory: without `AxoBuilder::cache_dir` it logs `bash.devShell "nix" needs a cache directory (AxoBuilder::cache_dir); using the host environment` and uses `StaticEnv` with the host environment snapshot. Direnv mode needs none.
 
 In `DevShellMode::Direnv`, `DevShellEnv` searches for the nearest `.envrc` from `cwd` up to the filesystem root `/` and executes `direnv export json` bounded by `devShellTimeoutMs`. An unallowed or failing `.envrc`, or a missing `direnv` executable, falls back silently to the host environment. Lookups and exports are cached for 5 s.
 
-Every subprocess `DevShellEnv` runs (`direnv export json`, `git ls-files`, `nix print-dev-env`, and the capture `bash` that sources the dev-shell script) goes through the session's `ProcessSupervisor` in its own container (a process group or, in cgroup mode, a job cgroup), as an internal foreground capture: it is never a background job, never promotable, and never listed under `proc://`. `devShellTimeoutMs` kills the whole container, not just the direct child, and the capture `bash` container is killed as soon as the environment dump is read, so services or traps started by `shellHook` die with it. A supervision failure (cgroup mode without a usable root or a supervisor that does not report ready) is handled like any other capture failure: resolution falls back to the host environment (with the capture failure notice in `Nix` mode). Environment resolution always finishes before the `bash` tool starts its command, so the background-promotion timer and steer promotion only begin once the command runs; `Session::abort` still cancels a capture in progress.
+Every subprocess `DevShellEnv` runs (`direnv export json`, `direnv status --json`, `git ls-files`, `nix print-dev-env`, and the capture `bash` that sources the dev-shell script) goes through the session's `ProcessSupervisor` in its own container (a process group or, in cgroup mode, a job cgroup), as an internal foreground capture: it is never a background job, never promotable, and never listed under `proc://`. `devShellTimeoutMs` kills the whole container, not just the direct child, and the capture `bash` container is killed as soon as the environment dump is read, so services or traps started by `shellHook` die with it. A supervision failure (cgroup mode without a usable root or a supervisor that does not report ready) is handled like any other capture failure: resolution falls back to the host environment (with the capture failure notice in `Nix` mode). Environment resolution always finishes before the `bash` tool starts its command, so the background-promotion timer and steer promotion only begin once the command runs; `Session::abort` still cancels a capture in progress.
 
 ### Command supervision (`axo::Supervision`)
 
@@ -288,8 +291,8 @@ Hosts that keep the default need no routing at all: `Axo::builder(models, store)
 - **Cgroup root:** whether explicit (`cgroup_root`) or derived from `/proc/self/cgroup`, the root is canonicalized (symlinks resolved) before the probe and must lie under `/sys/fs/cgroup`; one that does not fails with the reason `it is not inside the cgroup v2 hierarchy at /sys/fs/cgroup`.
 - **Failures (cgroup mode only):** an unusable root reports `Command supervision unavailable: cannot create a job cgroup under {root}: {err}. Run the host in a delegated cgroup (systemd: Delegate=yes), set cgroup_root in Supervision::Cgroup, or use Supervision::ProcessGroup.` (where `{err}` is the OS error, `/proc/self/cgroup names no cgroup v2 path`, `it is not inside the cgroup v2 hierarchy at /sys/fs/cgroup`, or `it has no cgroup.kill (cgroup v2 on Linux 5.14+ required)`); a supervisor that cannot start reports `Command supervisor {program} failed to start: {err}`; one that starts but does not report `ready` within 5 s reports `Command supervisor {program} did not report ready; the host must route these arguments to axo::exec::supervisor::run`. The `bash` tool returns the message as its error and runs nothing; dev-shell resolution falls back as described above. axo never switches to process groups on its own.
 - **Per command, process-group mode:** the command starts with `process_group(0)`, so its pgid is its pid. The guard is `sh -c 'read _; kill -KILL -- -"$0"' <pgid>` holding a pipe from axo, started in its own process group as well: if axo dies, the pipe closes and the guard kills the group; when the job closes normally axo kills the guard first. The guard is best effort (if `sh` cannot start, a warning is logged and the command still runs), and losing the guard never kills the job. Because neither the command nor the guard shares the host's foreground process group, a Ctrl-C or SIGTSTP at the host's terminal reaches no job and no watcher.
-- **Per command, cgroup mode:** each command gets `<root>/axo-job-<uuidv7>`. A `guard` process stays in axo's own cgroup and watches axo through a pidfd while axo watches it; whichever survives the other writes `cgroup.kill` and removes the directory, so detached (`setsid`, double-forked, `nohup`) descendants never outlive both. Only the simultaneous death of axo and the guardian leaves a job behind. The command itself starts as `enter`, which joins the job cgroup, verifies the move, and then `exec`s the program. The guardian and the `enter` root each start in their own process group (`process_group(0)`), like the command in process-group mode, so terminal signals aimed at the host reach neither. The supervisor process inherits the host's own (trusted) launch environment, which a wrapped host executable may need to start at all; the command environment travels over `enter`'s stdin and is applied only after cgroup entry, at `exec`, so nothing in the job environment (such as `LD_PRELOAD`) runs before the process is inside its cgroup. `enter` exits 125 when it cannot join the cgroup, 127 when the program is not found, and 126 for other `exec` failures.
-- **Descendants:** in process-group mode, in-group descendants stay supervised, drained to the command's artifact, and inspectable and killable through `proc://` (see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsrs)); `setsid` escapees need cgroup mode. When the host is PID 1 or a child subreaper, a job's leftover processes are reparented to it; axo reaps those zombies itself (a non-blocking `waitpgid` on the job's group) so the container empties and the job can close instead of hanging on them.
+- **Per command, cgroup mode:** each command gets `<root>/axo-job-<uuidv7>`. A `guard` process stays in axo's own cgroup and watches axo through a pidfd while axo watches it; whichever survives the other writes `cgroup.kill` and removes the directory, so detached (`setsid`, double-forked, `nohup`) descendants never outlive both. Only the simultaneous death of axo and the guardian leaves a job behind. The command itself starts as `enter`, which joins the job cgroup, verifies the move, and then `exec`s the program. The guardian and the `enter` root each start in their own process group (`process_group(0)`), like the command in process-group mode, so terminal signals aimed at the host reach neither. The supervisor process inherits the host's own (trusted) launch environment, which a wrapped host executable may need to start at all; the command environment travels over `enter`'s stdin and is applied only after cgroup entry, at `exec`, so nothing in the job environment (such as `LD_PRELOAD`) runs before the process is inside its cgroup. `enter` exits 125 when it cannot read its environment or join and verify the cgroup, 127 when the program is not found, and 126 for other `exec` failures.
+- **Descendants:** in process-group mode, in-group descendants stay supervised, drained to the command's artifact, and inspectable and killable through `proc://` (see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs)); `setsid` escapees need cgroup mode. When the host is PID 1 or a child subreaper, a job's leftover processes are reparented to it; axo reaps those zombies itself (a non-blocking `waitpgid` on the job's group) so the container empties and the job can close instead of hanging on them.
 
 ### Question tool (`ask` / `axo::AskSettings`)
 
@@ -350,6 +353,9 @@ The host builds `Models` and passes it to `Axo::builder`; axo never loads models
 }
 ```
 
+- **Provider entries (`providers.<id>`):** with the ID of a catalog provider, an entry patches that provider; otherwise it defines a new one. Fields: `api` (`ApiKind`), `baseUrl`, `apiKey` (raw config value), `headers` (map of string to raw config value), `compat` (arbitrary JSON map), `models` (list of `ModelConfig`, or absent for discovery), and `modelOverrides` (map of model ID to `ModelPatch`).
+- **Model fields (`ModelConfig` / `ModelPatch`):** `id` (required on definitions in `models`), `name`, `api`, `baseUrl`, `reasoning` (boolean), `thinkingLevelMap`, `input` (list of `"text"`, `"image"`), `cost` (`CostPatch`: `input`, `output`, `cacheRead`, `cacheWrite`, and `tiers`), `contextWindow`, `maxTokens`, `headers`, and `compat`.
+- **Merge semantics:** fields set in `ModelPatch` replace existing scalars; `thinkingLevelMap` merges per level, `compat` deep-merges, headers merge into existing headers, and `cost.tiers` replaces.
 - **`ApiKind` (`api`):** `"anthropic-messages"`, `"openai-completions"`, or `"openai-codex-responses"`.
 - **Auto-discovery:** If a custom `"openai-completions"` provider omits `models` (`None`) and supplies `baseUrl`, `Models::load` queries `<baseUrl>/models` to populate its model list.
 - **Price-tier window caps:** For catalog and built-in models with `cost.tiers`, `ModelsOptions::extended_context` set to `false` caps `context_window` at the lowest `inputTokensAbove` threshold in `cost.tiers`. Models defined in the `ModelsConfig` or patched via `modelOverrides.contextWindow` keep their explicit window. `Models` is built once per host, so this is a host choice, not a settings key.
@@ -383,7 +389,7 @@ Three kinds of value are resolved by `axo_ai::resolve_config_value` instead of b
 }
 ```
 
-- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves through `EffectiveConfig::default_model` only when a session create or open falls back to it (no `SessionOptions::model` and no recorded model); `Axo::schemes` never resolves it.
+- **When:** `apiKey` and `headers` resolve when a request needs them, and also while `Models::load` discovers a provider's models. `defaultModel` resolves through `EffectiveConfig::default_model` only when a session create or open falls back to it (no `SessionOptions::model`, recorded model, or root agent model); `Axo::schemes` never resolves it.
 - **No command cache:** config-value resolution performs environment expansion only and caches no command results.
 - **Failures:** a leading `!`, or an unset or empty environment variable, is a config error.
 - **Host-resolved values:** if a host obtains configuration by executing code, it must do so itself before handing the resulting values to axo.
