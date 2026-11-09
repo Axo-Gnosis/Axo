@@ -102,6 +102,54 @@ pub struct SpawnLink {
     pub model: Option<String>,
     /// The spec the child runs, after defaults and spawn hooks; reopening reuses it.
     pub spec: AgentSpec,
+    /// The member's team; `None` outside teams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamLink>,
+}
+
+/// A team member's identity in its parent's registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamRef {
+    /// `team_N`, numbered per parent session.
+    pub id: String,
+    /// The roster name.
+    pub member: String,
+}
+
+/// A team member's place in its team; stored in its spawn link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamLink {
+    pub id: String,
+    pub member: String,
+    /// The catalog team; `None` for ad-hoc teams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub charter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
+    /// Every member, in roster order, this one included.
+    pub roster: Vec<RosterEntry>,
+}
+
+impl TeamLink {
+    pub(crate) fn team_ref(&self) -> TeamRef {
+        TeamRef {
+            id: self.id.clone(),
+            member: self.member.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RosterEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub session_id: String,
 }
 
 impl Header {
@@ -344,6 +392,8 @@ pub enum Entry {
         agent: Option<String>,
         /// The expanded `provider/id`.
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        team: Option<TeamRef>,
     },
     /// One message of a row: a command's result or a child's message; `job_id` names it
     /// (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
@@ -358,6 +408,9 @@ pub enum Entry {
         /// The child run the message reports.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<String>,
+        /// A child's mid-run message (`write agent://parent`), not a run result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        note: bool,
     },
     #[serde(untagged)]
     Unknown(Value),
@@ -497,6 +550,9 @@ pub enum SubmissionKind {
     Prompt,
     Steer,
     FollowUp,
+    /// A teammate's message (`write agent://<name>`): delivered at the next turn boundary or
+    /// by `wait`, never as a steer.
+    Mail,
 }
 
 /// An entry with its position: the 0-based line index after the header.

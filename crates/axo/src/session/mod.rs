@@ -8,6 +8,7 @@ mod prompt;
 mod resume;
 mod side_files;
 pub(crate) mod spawn;
+pub(crate) mod team;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -44,7 +45,9 @@ use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
 use self::spawn::SpawnTool;
 pub use self::spawn::{
     ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
+    SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
 };
+use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
 use crate::config::{EffectiveConfig, ProjectAccess, PromptOverride};
@@ -402,16 +405,27 @@ async fn run_to_settle(
     request: RunRequest,
 ) -> Result<RunOutcome, Error> {
     // ponytail: a waiting child holds its slot while its own children queue; nested trees at maxConcurrent can deadlock — release the slot while in wait if maxDepth > 1 becomes common.
-    let _slot = if hooks.child.is_some() {
-        Some(
-            hooks
+    // ponytail: only a team's first runs reserve slots together; later member runs queue one by one
+    let _slot = if let Some(child) = &hooks.child {
+        let first_slot = child
+            .first_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let reserved = match first_slot {
+            Some(receiver) => receiver.await.ok(),
+            None => None,
+        };
+        Some(match reserved {
+            Some(permit) => permit,
+            None => hooks
                 .inherited
                 .run_slots
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("never closed"),
-        )
+        })
     } else {
         None
     };
@@ -940,10 +954,10 @@ impl LoopHooks for SessionHooks {
         messages
     }
 
-    /// Finished job results reach an active run at each steering drain point. They do
-    /// not set the steer signal, so they never promote `bash` or interrupt `wait`.
+    /// Finished job results and mail reach an active run at each steering drain point.
+    /// Neither sets the steer signal; mail wakes `wait` through the job registry.
     async fn steering(&self) -> Vec<QueuedMessage> {
-        self.reserve_delivery().into_iter().collect()
+        self.reserve_delivery()
     }
 }
 
@@ -1044,10 +1058,19 @@ impl Persist for SessionHooks {
     }
 }
 
+/// Where `write agent://parent` and `write agent://<teammate>` go from a session.
+pub(crate) struct AgentRoutes {
+    pub(crate) session_id: String,
+    /// `None` for root sessions and forks.
+    pub(crate) parent: Option<String>,
+    pub(crate) team: Option<crate::store::TeamLink>,
+}
+
 pub(crate) struct LiveSchemes {
     pub(crate) jobs: Arc<JobRegistry>,
     pub(crate) sessions: Arc<SessionTable>,
     pub(crate) store: Arc<dyn SessionStore>,
+    pub(crate) routes: AgentRoutes,
 }
 
 /// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
@@ -1094,11 +1117,12 @@ pub(crate) fn session_schemes(
         builtins.push(Arc::new(ProcScheme {
             jobs: live.jobs.clone(),
         }));
-        builtins.push(Arc::new(AgentScheme {
-            jobs: live.jobs,
-            sessions: live.sessions,
-            store: live.store,
-        }));
+        builtins.push(Arc::new(AgentScheme::new(
+            live.jobs,
+            live.sessions,
+            live.store,
+            live.routes,
+        )));
     }
     let artifacts = Arc::new(Artifacts::new(cx.session_dir.join(ARTIFACTS_DIR)));
     let schemes = Schemes::new(cx, artifacts, builtins, host)?;
@@ -1192,6 +1216,11 @@ impl Session {
                 jobs: jobs.clone(),
                 sessions: inherited.sessions.clone(),
                 store: inherited.store.clone(),
+                routes: AgentRoutes {
+                    session_id: session_id.clone(),
+                    parent: link.as_ref().map(|link| link.parent_session_id.clone()),
+                    team: link.as_ref().and_then(|link| link.team.clone()),
+                },
             }),
         )?;
         let (summary_prompts, summary_diagnostics) =
@@ -1248,6 +1277,11 @@ impl Session {
             .as_ref()
             .and_then(|link| link.spec.output.as_ref())
             .map(|_| Arc::new(YieldState::default()));
+        let team = link.as_ref().and_then(|link| {
+            link.team
+                .as_ref()
+                .map(|team| inherited.sessions.team(&link.parent_session_id, team))
+        });
         let host: Vec<Arc<dyn Tool>> = host_tools
             .iter()
             .map(|factory| factory(&session_tools))
@@ -1257,6 +1291,11 @@ impl Session {
             tools::builtin(
                 &session_tools,
                 Some(spawn_tool.clone()),
+                team.clone().map(|team| TeamSeat {
+                    team,
+                    member: session_id.clone(),
+                    sessions: inherited.sessions.clone(),
+                }),
                 inherited.ask_enabled,
                 questions.clone(),
                 settings.ask.timeout_ms.map(Duration::from_millis),
@@ -1307,6 +1346,8 @@ impl Session {
                 link.spec.max_turns.unwrap_or(settings.subagents.max_turns),
             )),
             output: yield_state,
+            team,
+            first_slot: Mutex::new(None),
             link,
         });
         let mut tool_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
@@ -1343,6 +1384,10 @@ impl Session {
                 prompt: SessionPrompt {
                     sources: PromptSources {
                         delegation: child.is_some(),
+                        team: child
+                            .as_ref()
+                            .and_then(|child| child.link.team.as_ref())
+                            .map(team::section),
                         name: inherited.harness_name.clone(),
                         cwd: cwd.clone(),
                         prompts,
@@ -1443,7 +1488,7 @@ impl Session {
                 let mut first = Vec::new();
                 for (kind, message) in queued {
                     if has_turns {
-                        enqueue(agent, kind, message);
+                        enqueue(agent, &session.hooks.tools.runner.jobs, kind, message);
                     } else {
                         first.push(message);
                     }
@@ -1458,7 +1503,7 @@ impl Session {
                 let mut prompts = Vec::new();
                 for (kind, message) in queued {
                     match kind {
-                        SubmissionKind::Prompt => prompts.push(message),
+                        SubmissionKind::Prompt | SubmissionKind::Mail => prompts.push(message),
                         SubmissionKind::Steer => agent.steer(message),
                         SubmissionKind::FollowUp => agent.follow_up(message),
                     }

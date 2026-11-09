@@ -7,7 +7,7 @@ use axo_agent::AgentMessage;
 use axo_ai::{AssistantBlock, AssistantMessage, Message, UserBlock};
 use serde_json::Value;
 
-use crate::store::{Entry, RunOutcome, SeqEntry};
+use crate::store::{Entry, RunOutcome, SeqEntry, TeamRef};
 use crate::tools::output::{YIELD, value_text, yielded_value};
 use crate::tools::truncate::{Limits, format_size, truncate_head};
 
@@ -22,6 +22,7 @@ pub(crate) struct ChildRun {
     pub(crate) agent: Option<String>,
     pub(crate) model: String,
     pub(crate) running: bool,
+    pub(crate) team: Option<TeamRef>,
 }
 
 pub(crate) struct ChildMessage {
@@ -29,6 +30,7 @@ pub(crate) struct ChildMessage {
     pub(crate) text: String,
     pub(crate) is_error: bool,
     pub(crate) partial: bool,
+    pub(crate) note: bool,
 }
 
 /// Child text capped like command output (2000 lines / 50 KB), pointing at the full result.
@@ -200,6 +202,7 @@ pub(crate) fn run_message(
         text,
         is_error,
         partial,
+        note: false,
     })
 }
 

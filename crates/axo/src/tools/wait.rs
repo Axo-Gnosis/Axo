@@ -8,19 +8,23 @@ use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 
 use crate::jobs::render_results;
+use crate::session::team::{TeamSeat, WaitGuard, mutual_wait};
 use crate::tools::SessionTools;
 
-const DESCRIPTION: &str = "Block until a background job (bg_N) or subagent (agent_N) reports, then return every pending result. Returns immediately when none is running. A new user message interrupts the wait.";
+const DESCRIPTION: &str = "Block until a background job (bg_N) or subagent (agent_N) reports or a message arrives, then return every pending result. Returns immediately when none is running; in a team, it fails when every running member is waiting. A steer interrupts the wait.";
+const MAIL_ARRIVED: &str = "New messages arrived; they follow this result.";
 
 pub struct WaitTool {
     tools: Arc<SessionTools>,
+    team: Option<TeamSeat>,
     parameters: Value,
 }
 
 impl WaitTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>, team: Option<TeamSeat>) -> Self {
         Self {
             tools,
+            team,
             parameters: json!({ "type": "object", "properties": {} }),
         }
     }
@@ -67,6 +71,8 @@ impl Tool for WaitTool {
         let jobs = &self.tools.runner.jobs;
         // Subscribe before the first check so no change between check and await is missed.
         let mut changed = jobs.subscribe();
+        let mut team_changed = self.team.as_ref().map(|seat| seat.team.subscribe());
+        let mut guard: Option<WaitGuard> = None;
         loop {
             if steer.is_pending() {
                 let running = jobs.running_admitted();
@@ -81,12 +87,31 @@ impl Tool for WaitTool {
             if !results.is_empty() {
                 return Ok(text(render_results(&results)));
             }
-            if jobs.running_admitted().is_empty() {
-                return Ok(text("No background jobs are running.".into()));
+            if jobs.has_mail() {
+                return Ok(text(MAIL_ARRIVED.into()));
+            }
+            match &self.team {
+                None => {
+                    if jobs.running_admitted().is_empty() {
+                        return Ok(text("No background jobs are running.".into()));
+                    }
+                }
+                Some(seat) => {
+                    guard.get_or_insert_with(|| seat.team.enter_wait(&seat.member));
+                    if seat.team.deadlocked(&seat.member, &seat.sessions) {
+                        return Err(ToolError(mutual_wait(seat.team.id())));
+                    }
+                }
             }
             tokio::select! {
                 // The registry owns the sender and outlives this call, so this never errors.
                 _ = changed.changed() => {}
+                () = async {
+                    match &mut team_changed {
+                        Some(rx) => { let _ = rx.changed().await; }
+                        None => std::future::pending().await,
+                    }
+                } => {}
                 () = steer.pending() => {}
                 () = cancel.cancelled() => return Err(ToolError("Operation aborted".into())),
             }

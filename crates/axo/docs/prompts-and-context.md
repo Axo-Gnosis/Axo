@@ -21,10 +21,13 @@ Start-time diagnostics for context files, skills, agent definitions and tool all
 | 7 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
 | 8 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
 | 9 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
-| 10 | `cwd` | `inputs.cwd.display()` |
-| 11 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
-| 12 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
-| 13 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section; not inherited by children |
+| 10 | `team` | Team members only: fixed identity, charter, member brief, ordered roster and messaging guidance |
+| 11 | `cwd` | `inputs.cwd.display()` |
+| 12 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
+| 13 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
+| 14 | `<host sections>` | Entries from `SessionOptions::sections`: `Some(body)` inserts or replaces in place, `None` removes the section; not inherited by children |
+
+The fixed child sections are inserted after overrides: `delegation` first, and `team` immediately before `cwd` (at the end if `cwd` is absent). An agent's section switches cannot remove them.
 
 ### Bundled documentation (`docs`)
 
@@ -146,18 +149,21 @@ The fixed `delegation` section tells the child to work autonomously without aski
 
 ### Spawning and returning results
 
-`spawn` starts a separate child session in the background and returns its `agent_N` id immediately, not its final answer. Its description lists defined agents (not teams) and available model roles. Prefer a defined agent, use an inline spec only when none fits, or omit both selectors for a plain delegate. Leave the model unset unless there is a reason to change it.
+`spawn` starts children in the background and returns their `agent_N` ids immediately, not their final answers. Its description lists defined agents, teams with their roster names, and available model roles. Prefer a defined agent or team; use an inline spec or ad-hoc roster only when none fits. Omit `agent`, `spec` and `members` for a plain delegate. Leave the model unset unless there is a reason to change it.
 
 | Parameter | Meaning |
 | :--- | :--- |
-| `agent` | Optional catalog agent name; mutually exclusive with `spec` |
-| `spec` | Optional inline object: required `prompt`, optional `tools` allowlist, `model`, and `output` JSON Schema |
-| `task` | Required, non-blank assignment; the child's initial prompt, not a copy of the parent's conversation |
-| `context` | Optional background appended to the task as `\n\nContext:\n{context}` when non-blank |
-| `model` | Optional model selector, including `@role` and a thinking suffix; overrides the spec's model |
-| `output` | Optional JSON Schema overriding the agent's own result schema before spawn hooks run |
+| `agent` | Optional catalog agent or team name; mutually exclusive with `spec` and `members` |
+| `spec` | Optional inline single-agent object: required `prompt`, optional `tools` allowlist, `model`, and `output` JSON Schema |
+| `task` | Required, non-blank assignment for a single agent. For teams, the fallback initial prompt for members without an entry in `tasks`; never a copy of the parent's conversation |
+| `tasks` | Teams only: object mapping roster names to their initial assignments. Every member needs a non-blank task; unknown names fail |
+| `members` | Ad-hoc team only: ordered array of objects with required `name`, optional `agent` or `spec` (exclusive; neither means a plain delegate), and optional standing `brief` |
+| `charter` | Ad-hoc teams only: standing instructions shared by every member; a defined team uses its file body |
+| `context` | Optional background appended to each assignment as `\n\nContext:\n{context}` when non-blank |
+| `model` | Single agents only: optional model selector, including `@role` and a thinking suffix; overrides the spec's model |
+| `output` | Single agents only: optional JSON Schema overriding the agent's own result schema before spawn hooks run |
 
-Keep working after spawning: each finished run's result arrives automatically, or through `wait` when there is nothing else to do. Read [agent URLs](#agent) for status, results, or the child's projected conversation; write to the child to send a follow-up. `spawn` is `Replay::Safe`: recovery adopts the same child for a repeated call id instead of creating a duplicate.
+Keep working after spawning: each finished run's result arrives automatically, or through `wait` when there is nothing else to do. Read [agent URLs](#agent) for status, results, conversations and messaging routes. `spawn` is `Replay::Safe`: recovery adopts every existing child for a repeated call id instead of creating duplicates.
 
 A child with `output` must call `yield` to return its final result; a text answer alone is not a result. With an explicit `"type": "object"` schema, the tool arguments are the result object. Other schemas are wrapped in an object with required `result`, so a string schema takes `{"result":"answer"}` and returns the string itself. Accepted strings are delivered as raw text; other values use compact JSON.
 
@@ -165,7 +171,11 @@ Arguments are validated before tool hooks or execution. Rejected calls report va
 
 ### Teams
 
-A file with a `members` key defines a team instead of an agent. Its keys are `name`, `description`, and `members`; its body is the charter. Each member has a required `agent` name, an optional `as` alias, and an optional `brief`. The roster name is the alias when present, otherwise the agent name. Teams must have at least one member, every reference must name an agent (not a team), and roster names must be valid and unique. Invalid teams are diagnosed and dropped after the catalog is loaded. Teams are listed by `Session::agents()` only; they cannot run as a root agent.
+A file with a `members` key defines a team instead of an agent. Its keys are `name`, `description`, and `members`; its body is the charter. Each member has a required `agent` name, an optional `as` alias, and an optional `brief`. The roster name is the alias when present, otherwise the agent name. Teams must have at least one member, every reference must name an agent (not a team), and roster names must be valid and unique; `parent` is reserved. Invalid teams are diagnosed and dropped after the catalog is loaded. Teams are listed by `Session::agents()` and can be spawned by name, but cannot run as root agents.
+
+For a defined team, call `spawn` with `{"agent":"review-team","task":"check the change"}` or supply `tasks` by roster name. For an ad-hoc team, use `{"members":[{"name":"a","agent":"reviewer"},{"name":"b","spec":{"prompt":"Check correctness."}}],"charter":"Compare findings.","tasks":{"a":"check the API","b":"check behavior"}}`. Each member gets its explicit task or the shared fallback, plus any non-blank context. Team calls reject call-level `model` and `output`; put these in agent files or member specs instead. Nested teams and per-member call overrides are not supported.
+
+The result identifies a per-parent team id and each member's child row in roster order, with details shaped as `{"team":"team_1","jobs":{"a":"agent_1","b":"agent_2"}}`. Each member has its own run and reports its own result to the parent. The fixed `team` section names the member and team, includes the charter and brief, and lists the roster with agent descriptions and a “(you)” marker. Members exchange mail through the [agent scheme](#agent); there is no broadcast. See [wait](#wait) for waiting on teammates, and [Concurrent runs](sessions-and-compaction.md#budgets-and-lifecycle) for first-run slot reservation and team-size limits.
 
 ## Skills (`crates/axo/src/context/skills.rs`)
 
@@ -275,7 +285,11 @@ A truncated foreground `bash` result names `artifact://<n>` in its notice and ha
 
 ### `wait`
 
-`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending message, joined by blank lines. Command results use `[bg_N] <first command line, max 120 chars>\n<result>`; child messages use the child row and agent name (or “subagent”), with a partial-result label when the turn budget was exhausted. It returns `No background jobs are running.` at once when no admitted job is still running, a wait-interrupted notice listing the running row ids when the user steers, and `Operation aborted` (error) on Stop. It sleeps on registry changes instead of polling, and committed results are consumed: they are never delivered again. Any tool batch containing `wait` runs one call at a time, so a promoted `bash` or a `spawn` earlier in the same batch has committed admission before `wait` looks for running jobs.
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. Any tool batch containing `wait` runs one call at a time, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
+
+Incoming teammate mail also wakes `wait`. With no row results to return, it responds `New messages arrived; they follow this result.`; the queued mail is delivered immediately after the tool batch, not embedded in that tool result. Outside a team, no running admitted jobs and no mail returns `No background jobs are running.` immediately.
+
+In a team, `wait` keeps waiting while teammates can still reply, even with no jobs of its own. It fails all waiting members with a mutual-wait error when every running member is waiting and nothing can produce a reply: idle or unavailable members count as stuck, while maintenance, pending mail/results, or running admitted jobs prevent that diagnosis. Send the needed message or finish with a result rather than waiting in a cycle.
 
 ### `proc://`
 
@@ -283,27 +297,30 @@ The session's `proc://` scheme (`Target::Virtual`) inspects and stops background
 
 | Operation | Result |
 | :--- | :--- |
-| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Status is `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
+| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
 | `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://<id> or proc://<id>/kill.` |
 | `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
-| `read proc://agent_N` | Child row details: `Job:`, `Agent:`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
+| `read proc://agent_N` | Child row details: `Job:`, `Agent:`, optional `Team: team_N (member)`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
 | `write proc://agent_N/kill` | Aborts the running child session; does not remove its row or prevent later prompts or follow-ups |
 
 Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside an open session) has neither `proc://` nor `agent://`.
 
 ### `agent://`
 
-The session's `agent://` scheme is virtual and addresses children spawned by that session. List their ids with `read proc://`; an unknown child is an error.
+The session's virtual `agent://` scheme reads children spawned by that session; list their ids with `read proc://`. Children can also write to their parent, and team members can write to their own teammates by roster name. These named routes do not expose other sessions' status or transcripts.
 
 | Operation | Result |
 | :--- | :--- |
-| `read agent://agent_N` | Agent id, name (or “subagent”), model, session id, status, and assistant-turn count. Status is `running`, `finished`, or `failed`, as in `proc://`, with no idle label. Shows latest text while running, otherwise the last result, marked partial when its turn budget was exhausted |
+| `read agent://agent_N` | Agent id, name (or “subagent”), optional `Team: team_N (member)`, model, session id, status, and assistant-turn count. Status is `running`, `finished`, or `failed`, as in `proc://`, with no idle label. Shows latest text while running, otherwise the last result, marked partial when its turn budget was exhausted |
 | `read agent://agent_N/result` | Full latest completed-run result, even after delivery; errors if no result exists yet. A trailing slash is also accepted |
 | `read agent://agent_N/result/<json-pointer>` | Parses the result as JSON and selects the pointer after adding its leading slash; for example `result/findings/0` selects the first finding. Strings return raw text, other values pretty-printed JSON. Missing pointers or non-JSON results are errors |
 | `read agent://agent_N/transcript` | Projected conversation, including compaction summaries, not the raw journal. System messages are omitted; tool calls are abbreviated to 200 characters and tool results to their first line (up to 200 characters), with a count of additional lines. Page with the read tool's `offset` and `limit` |
 | `write agent://agent_N` | Sends non-blank content through `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_N. Its reply arrives as a new result.` |
+| `write agent://agent_N/steer` | Sends non-blank content through `Session::steer`, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_N: it reads your message after its current tool calls.` |
+| `write agent://parent` | Sends a mid-run note without ending the child's run; returns `Sent to your parent.`. Delivery is at the parent's next turn boundary or through `wait`, never a steer; an idle parent wakes subject to its Stop latch. Roots and forks have no parent route. A closed parent or one no longer tracking the child is an error, not a successful send |
+| `write agent://<name>` | Sends durable mail to a teammate in this session's roster; returns `Sent to <name>.`. Mail is read at the next turn boundary, wakes `wait`, and starts an idle receiver's run. It never steers or waits for the receiver to finish its run. Self-mail, names outside the roster and sibling access from non-team children are errors |
 
-Result and transcript paths are read-only. Reads never consume pending deliveries. Writes are actions with `Replay::Never`, so crash recovery does not automatically repeat a follow-up.
+Result and transcript paths are read-only; `/steer`, `parent` and teammate paths are write-only. Reads never consume pending deliveries. Writes are actions with `Replay::Never`, so crash recovery never repeats a potentially completed send. Teammate mail arrives as `Message from <name> (reply with write agent://<name>):` followed by its content, with axo wrapper tags escaped.
 
 ### Results in context
 
@@ -316,8 +333,8 @@ Background job results:
 <result>
 ```
 
-Child messages use the same envelope, with the child row in brackets followed by its catalog agent name (or “subagent”). Budget-limited results add “(partial: turn budget exhausted)” to that label. A child keeps one row across all its runs; see [Child sessions](sessions-and-compaction.md#child-sessions).
+Child messages use the same envelope, with the child row in brackets followed by its catalog agent name (or “subagent”); team rows use “<member> of team_N”. Mid-run notes prefix that label with “message from”. Budget-limited results add “(partial: turn budget exhausted)”. A note does not change the child's run status. See [Child sessions](sessions-and-compaction.md#child-sessions) for durability.
 
 Child delivery text is capped at 2000 lines or 50 KB, with an `agent://agent_N/result` pointer for the full result. An oversized first line is replaced by a notice suggesting that URL or a JSON pointer. The pointer always names the latest result, even if the capped delivery was an older run. Both command and child deliveries escape axo's fixed wrapper tags (such as `<system>` and `<conversation>`) by changing their opening `<` to `&lt;`; arbitrary host section names are not covered. The journal's `job_end` retains the full, unescaped text.
 
-During a run it is injected at the next turn boundary, after the current tool batch; it never counts as a steer, so it neither promotes `bash` nor interrupts `wait`. With the session idle, it starts a run of its own unless automatic continuation is latched off by a Stop or an unsuccessful run. A new `prompt` places pending results before the user's message.
+During a run, automatic row-message delivery occurs at the next turn boundary after the current tool batch; it never counts as a steer or promotes `bash`. A pending row message satisfies `wait` through its result reservation instead. With the session idle, it starts a run of its own unless automatic continuation is latched off by a Stop or an unsuccessful run. A new `prompt` places pending results before the user's message.

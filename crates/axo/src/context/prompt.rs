@@ -15,7 +15,7 @@ use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
-/// `delegation, system, docs, tools, schemes, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
+/// `delegation, system, docs, tools, schemes, work, prose, project_context, skills, team, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
@@ -25,7 +25,7 @@ pub(crate) fn escape_wrappers(text: &str) -> Cow<'_, str> {
     // ponytail: fixed list; add host section names if hosts report spoofing
     static TAGS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|delegation|system|docs|tools|schemes|work|prose|project_context|cwd|dev_shell|date)\b",
+            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|delegation|system|docs|team|tools|schemes|work|prose|project_context|cwd|dev_shell|date)\b",
         )
         .expect("constant wrapper pattern")
     });
@@ -48,6 +48,8 @@ pub(crate) struct PromptSources {
     pub cwd: PathBuf,
     /// Whether to prepend the fixed, non-overridable child delegation framing.
     pub delegation: bool,
+    /// The fixed team section of a team member.
+    pub team: Option<String>,
     /// The session's trimmed prompt overrides, keyed by prompt name.
     pub prompts: IndexMap<String, PromptOverride>,
     /// Whether the bundled documentation scheme is available.
@@ -171,6 +173,11 @@ pub(crate) fn build_sections(
         }
     }
 
+    if let Some(team) = &sources.team {
+        let at = bodies.get_index_of("cwd").unwrap_or(bodies.len());
+        bodies.shift_insert(at, "team".into(), team.clone());
+    }
+
     if sources.delegation {
         bodies.shift_insert(0, "delegation".into(), BUNDLED_DELEGATION.trim().to_owned());
     }
@@ -256,6 +263,7 @@ mod tests {
             name: "axo".into(),
             cwd: "/w".into(),
             delegation: false,
+            team: None,
             prompts,
             docs: false,
             tools: Vec::new(),

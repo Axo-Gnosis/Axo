@@ -35,12 +35,14 @@ pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     Attach, ChildHandle, Fork, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
     PromptRequest, PromptResult, RecoveryPolicy, Session, SessionEvent, SessionOptions, ShakeMode,
-    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
+    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle,
+    TeamMemberRequest, TeamRequest,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
-    JsonlStore, ProjectedSource, Projection, RunOutcome, SeqEntry, SessionInfo, SessionStore,
-    SessionWriter, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT, project,
+    JsonlStore, ProjectedSource, Projection, RosterEntry, RunOutcome, SeqEntry, SessionInfo,
+    SessionStore, SessionWriter, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT, TeamLink, TeamRef,
+    project,
 };
 pub use tools::{Answer, CommandRequest, Question, QuestionOption, SessionTools, ToolFactory};
 

@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 pub use entry::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
-    RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT,
+    RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind, TIMESTAMP_FORMAT,
+    TeamLink, TeamRef,
 };
 pub use jsonl::JsonlStore;
 pub(crate) use project::path_to;

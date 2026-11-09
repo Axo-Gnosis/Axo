@@ -78,7 +78,7 @@ impl SessionHooks {
     /// kept), pending system diffs, then `delivery`, then `input`.
     pub(super) fn run_input(
         &self,
-        delivery: Option<QueuedMessage>,
+        delivery: Vec<QueuedMessage>,
         input: Option<QueuedMessage>,
     ) -> Vec<QueuedMessage> {
         self.refresh_prompt(self.prompt.note());

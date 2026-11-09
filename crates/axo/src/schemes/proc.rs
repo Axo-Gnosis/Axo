@@ -69,13 +69,21 @@ impl Scheme for ProcScheme {
                         JobKind::Command { command, .. } => {
                             format!("{}  {}  {}", job.id, job.status.label(), headline(command))
                         }
-                        JobKind::Child { agent, model, .. } => format!(
-                            "{}  {}  {}  {}",
-                            job.id,
-                            job.status.label(),
-                            agent.as_deref().unwrap_or("subagent"),
-                            model
-                        ),
+                        JobKind::Child {
+                            agent, model, team, ..
+                        } => {
+                            let name = team
+                                .as_ref()
+                                .map(|team| format!("{} of {}", team.member, team.id));
+                            format!(
+                                "{}  {}  {}  {}",
+                                job.id,
+                                job.status.label(),
+                                name.as_deref()
+                                    .unwrap_or_else(|| agent.as_deref().unwrap_or("subagent")),
+                                model
+                            )
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n"))
@@ -97,14 +105,23 @@ impl Scheme for ProcScheme {
                         session_id,
                         agent,
                         model,
-                    } => format!(
-                        "Job: {}\nAgent: {}\nModel: {}\nSession: {}\nStatus: {}\nDetails: agent://{id}",
-                        job.id,
-                        agent.as_deref().unwrap_or("subagent"),
-                        model,
-                        session_id,
-                        job.status.label()
-                    ),
+                        team,
+                        ..
+                    } => {
+                        let mut text = format!(
+                            "Job: {}\nAgent: {}",
+                            job.id,
+                            agent.as_deref().unwrap_or("subagent"),
+                        );
+                        if let Some(team) = team {
+                            text.push_str(&format!("\nTeam: {} ({})", team.id, team.member));
+                        }
+                        text.push_str(&format!(
+                            "\nModel: {model}\nSession: {session_id}\nStatus: {}\nDetails: agent://{id}",
+                            job.status.label()
+                        ));
+                        text
+                    }
                 };
                 if let Some(result) = &result {
                     text.push_str("\n\nResult:\n");

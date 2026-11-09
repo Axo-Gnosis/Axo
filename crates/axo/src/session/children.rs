@@ -9,18 +9,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axo_agent::{BeforeToolCallContext, ToolCallDecision, ToolError, ToolHooks};
 use axo_ai::thinking::clamp_level;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::delivery::Activity;
 use super::spawn::child_inherited;
+use super::team::TeamState;
 use super::{Inherited, RecoveryPolicy, Session, SessionHooks, SessionSetup, journal};
 use crate::error::Error;
 use crate::jobs::child::{ended_runs, run_message};
 use crate::jobs::{ChildRef, JobRegistry};
 use crate::recovery::needs_recovery;
-use crate::store::{SeqEntry, SessionStore, SpawnLink, project};
+use crate::store::{SeqEntry, SessionStore, SpawnLink, TeamLink, project};
 use crate::tools::output::{YIELD, YieldState};
 
 /// Every child session this process knows, live or parked, plus every open session's registry (children deliver through it).
@@ -28,6 +29,7 @@ use crate::tools::output::{YIELD, YieldState};
 pub(crate) struct SessionTable {
     slots: Mutex<HashMap<String, Slot>>,
     registries: Mutex<HashMap<String, Weak<JobRegistry>>>,
+    teams: Mutex<HashMap<String, Weak<TeamState>>>,
     // ponytail: one revive gate; per-id gates if revivals contend
     revive: tokio::sync::Mutex<()>,
 }
@@ -102,6 +104,25 @@ impl SessionTable {
             slot.live = slot.weak.upgrade();
         }
         slot.live.clone()
+    }
+
+    /// Looks up a live session without re-pinning a parked slot.
+    pub(crate) fn peek(&self, id: &str) -> Option<Arc<Session>> {
+        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = slots.get(id)?;
+        slot.live.clone().or_else(|| slot.weak.upgrade())
+    }
+
+    pub(crate) fn team(&self, parent: &str, link: &TeamLink) -> Arc<TeamState> {
+        let mut teams = self.teams.lock().unwrap_or_else(PoisonError::into_inner);
+        teams.retain(|_, team| team.strong_count() != 0);
+        let key = format!("{parent}/{}", link.id);
+        if let Some(team) = teams.get(&key).and_then(Weak::upgrade) {
+            return team;
+        }
+        let team = Arc::new(TeamState::new(link));
+        teams.insert(key, Arc::downgrade(&team));
+        team
     }
 
     pub(crate) fn park(&self, id: &str) {
@@ -236,6 +257,8 @@ pub(super) struct ChildState {
     pub(super) link: SpawnLink,
     pub(super) budget: Arc<TurnBudget>,
     pub(super) output: Option<Arc<YieldState>>,
+    pub(super) team: Option<Arc<TeamState>>,
+    pub(super) first_slot: Mutex<Option<oneshot::Receiver<OwnedSemaphorePermit>>>,
 }
 
 pub(super) struct TurnBudget {
@@ -297,6 +320,9 @@ pub(super) async fn park_when_idle(
             changed = jobs.changed() => if changed.is_err() { return; },
         }
         let Some(hooks) = hooks.upgrade() else { return };
+        if let Some(team) = hooks.child.as_ref().and_then(|child| child.team.as_ref()) {
+            team.bump();
+        }
         let activity = *activity.borrow_and_update();
         let registry = &hooks.tools.runner.jobs;
         if !activity.running

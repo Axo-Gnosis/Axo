@@ -13,6 +13,7 @@ use super::{
     MaintenanceKind, PromptRequest, PromptResult, RunRequest, Session, SessionEvent, SessionHooks,
     detached, run_to_settle,
 };
+use crate::context::prompt::escape_wrappers;
 use crate::error::Error;
 use crate::input::{Prepared, PromptInput, PromptPart, prepare, render};
 use crate::jobs::{JobHost, JobRegistry};
@@ -77,10 +78,11 @@ impl SessionHooks {
     /// For the owner of `running`: starts a run delivering every pending job result;
     /// false when nothing is pending.
     fn start_delivery(&self, agent: Arc<Agent>, hooks: Arc<SessionHooks>) -> bool {
-        let Some(delivery) = self.reserve_delivery() else {
+        let delivery = self.reserve_delivery();
+        if delivery.is_empty() {
             return false;
-        };
-        let messages = self.run_input(Some(delivery), None);
+        }
+        let messages = self.run_input(delivery, None);
         tokio::spawn(async move {
             if let Err(err) = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await {
                 warn!(%err, "job result delivery run failed");
@@ -89,18 +91,19 @@ impl SessionHooks {
         true
     }
 
-    /// Ends the busy state its caller owns, unless queued follow-ups or pending job
-    /// results start a run first: then `running` stays set and the run settles like any
+    /// Ends the busy state its caller owns, unless queued steers, follow-ups or pending
+    /// delivery start a run first: then `running` stays set and the run settles like any
     /// other. Called wherever the session would go idle.
     pub(super) fn release_or_deliver(&self) {
         if self.may_deliver()
             && let Some((agent, hooks)) = self.owners()
         {
-            // A follow-up queued while idle, or after the run's last drain point, starts the next run.
-            let follow_ups = agent.take_follow_ups();
-            if !follow_ups.is_empty() {
+            // A steer or follow-up queued while idle, or after the run's last drain point, starts the next run.
+            let mut queued = agent.take_steering();
+            queued.extend(agent.take_follow_ups());
+            if !queued.is_empty() {
                 let mut messages = self.run_input(self.reserve_delivery(), None);
-                messages.extend(follow_ups);
+                messages.extend(queued);
                 tokio::spawn(async move {
                     if let Err(err) =
                         run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await
@@ -137,10 +140,15 @@ impl SessionHooks {
         }
     }
 
-    /// Reserves every pending job result for one queued `job_result` message; `None`
-    /// when nothing is pending.
-    pub(super) fn reserve_delivery(&self) -> Option<QueuedMessage> {
-        self.tools.runner.jobs.delivery_message()
+    /// Reserves pending job results, followed by every queued teammate message.
+    pub(super) fn reserve_delivery(&self) -> Vec<QueuedMessage> {
+        let jobs = &self.tools.runner.jobs;
+        let mut delivery = Vec::new();
+        if let Some(message) = jobs.delivery_message() {
+            delivery.push(message);
+        }
+        delivery.extend(jobs.take_mail());
+        delivery
     }
 }
 
@@ -266,7 +274,7 @@ impl Session {
         Ok((prepared, content))
     }
 
-    /// Saves and queues a user message delivered after the current tool calls finish.
+    /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::Steer, input.into()).await
     }
@@ -274,15 +282,20 @@ impl Session {
     /// Saves and queues a user message delivered when the active run would otherwise end;
     /// on an idle session it starts a run.
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::FollowUp, input.into()).await?;
-        if self.hooks.claim_idle() {
-            self.hooks.release_or_deliver();
-        }
-        Ok(())
+        self.queue(SubmissionKind::FollowUp, input.into()).await
     }
 
-    /// `steer`/`follow_up`: saves the submission and hands its message to the agent's
-    /// queue for `kind`. `saved` files stay only once the entry is written.
+    /// Saves and queues a teammate's message, read at the next turn boundary; on an idle session it starts a run.
+    pub(crate) async fn post_mail(&self, sender: &str, content: &str) -> Result<(), Error> {
+        let text = format!(
+            "Message from {sender} (reply with write agent://{sender}):\n\n{}",
+            escape_wrappers(content)
+        );
+        self.queue(SubmissionKind::Mail, text.into()).await
+    }
+
+    /// Saves the submission and hands its message to the queue for `kind`.
+    /// `saved` files stay only once the entry is written.
     async fn queue(&self, kind: SubmissionKind, input: PromptInput) -> Result<(), Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
         let (entry, message) = submission(kind, parts, content, None);
@@ -293,10 +306,14 @@ impl Session {
             hooks.append(vec![entry]).await?;
             saved.keep();
             hooks.auto_paused.store(false, Ordering::Release);
-            enqueue(&agent, kind, message);
-            Ok(())
+            enqueue(&agent, &hooks.tools.runner.jobs, kind, message);
+            Ok::<(), Error>(())
         })
-        .await
+        .await?;
+        if self.hooks.claim_idle() {
+            self.hooks.release_or_deliver();
+        }
+        Ok(())
     }
 }
 #[async_trait]
@@ -327,10 +344,16 @@ pub(super) async fn relay_jobs(
     }
 }
 
-pub(super) fn enqueue(agent: &Agent, kind: SubmissionKind, message: QueuedMessage) {
+pub(super) fn enqueue(
+    agent: &Agent,
+    jobs: &JobRegistry,
+    kind: SubmissionKind,
+    message: QueuedMessage,
+) {
     match kind {
         SubmissionKind::FollowUp => agent.follow_up(message),
         SubmissionKind::Prompt | SubmissionKind::Steer => agent.steer(message),
+        SubmissionKind::Mail => jobs.post_mail(message),
     }
 }
 

@@ -197,7 +197,7 @@ impl Session {
                 let queued = self.requeued(requeue).await;
                 if queued
                     .iter()
-                    .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt))
+                    .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt | SubmissionKind::Mail))
                 {
                     self.hooks
                         .activity
@@ -225,7 +225,7 @@ impl Session {
                 }) => {
                     self.claim_resume(run_id, attempt).await?;
                     for (kind, message) in self.requeued(requeue).await {
-                        enqueue(&self.agent, kind, message);
+                        enqueue(&self.agent, &self.hooks.tools.runner.jobs, kind, message);
                     }
                     return Ok(Some(Resumption::RecoverResponse(
                         RunRequest::RecoverResponse {

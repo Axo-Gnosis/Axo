@@ -391,6 +391,13 @@ fn validate_agent(spec: &mut AgentSpec, warn: &mut impl FnMut(String)) -> bool {
     true
 }
 
+pub(crate) fn member_name_problem(name: &str) -> Option<String> {
+    name_problems(name)
+        .into_iter()
+        .next()
+        .or_else(|| (name == "parent").then(|| "member name \"parent\" is reserved".into()))
+}
+
 fn team_problem(team: &TeamSpec, agents: &HashSet<String>) -> Option<String> {
     if team.members.is_empty() {
         return Some("a team needs at least one member".into());
@@ -401,7 +408,7 @@ fn team_problem(team: &TeamSpec, agents: &HashSet<String>) -> Option<String> {
             return Some(format!("member \"{}\" is not an agent", member.agent));
         }
         let name = member.roster_name();
-        if !name_problems(name).is_empty() {
+        if member_name_problem(name).is_some() {
             return Some(format!("invalid member name \"{name}\""));
         }
         if !names.insert(name) {

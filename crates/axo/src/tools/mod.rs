@@ -30,6 +30,7 @@ use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::jobs::command::CommandRunner;
 use crate::schemes::{SchemeUrl, Schemes, Target};
+use crate::session::team::TeamSeat;
 use ask::AskTool;
 pub(crate) use ask::PendingQuestions;
 pub use ask::{Answer, Question, QuestionOption};
@@ -287,6 +288,7 @@ fn clean_path(path: &str) -> Cow<'_, str> {
 pub(crate) fn builtin(
     tools: &Arc<SessionTools>,
     spawn: Option<Arc<dyn Tool>>,
+    team: Option<TeamSeat>,
     ask: bool,
     questions: Arc<PendingQuestions>,
     timeout: Option<Duration>,
@@ -298,7 +300,7 @@ pub(crate) fn builtin(
         Arc::new(BashTool::new(tools.clone())),
         Arc::new(GrepTool::new(tools.clone())),
         Arc::new(FindTool::new(tools.clone())),
-        Arc::new(WaitTool::new(tools.clone())),
+        Arc::new(WaitTool::new(tools.clone(), team)),
     ];
     if let Some(spawn) = spawn {
         list.push(spawn);

@@ -118,6 +118,7 @@ async fn spawned_child_delivers_once_and_parks() {
                                 session_id: child_id.clone(),
                                 agent: None,
                                 model: "test/child".into(),
+                                team: None,
                             }
                         );
                         break;

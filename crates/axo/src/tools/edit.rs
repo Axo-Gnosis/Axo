@@ -593,6 +593,7 @@ mod tests {
                 tools: crate::tools::builtin(
                     &session,
                     None,
+                    None,
                     false,
                     Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
                     None,

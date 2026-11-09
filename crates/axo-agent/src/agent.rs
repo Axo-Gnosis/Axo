@@ -235,6 +235,14 @@ impl Agent {
         self.lock().follow_up.push_back(m);
     }
 
+    /// Removes and returns every queued steering message, in order, and lowers the steer signal.
+    pub fn take_steering(&self) -> Vec<QueuedMessage> {
+        let mut state = self.lock();
+        let taken = state.steering.drain(..).collect();
+        self.steer_pending.send_replace(false);
+        taken
+    }
+
     /// Removes and returns every queued follow-up message, in order.
     pub fn take_follow_ups(&self) -> Vec<QueuedMessage> {
         self.lock().follow_up.drain(..).collect()

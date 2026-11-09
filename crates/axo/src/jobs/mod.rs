@@ -1,5 +1,6 @@
-//! Per-session command and child-session jobs. Rows own ordered messages with separate
-//! admission and delivery receipts; rebuilding uses every raw journal entry.
+//! Per-session command and child-session jobs, and the session's incoming mail.
+//! Rows own ordered messages with separate admission and delivery receipts;
+//! rebuilding uses every raw journal entry.
 
 pub(crate) mod child;
 pub(crate) mod command;
@@ -7,7 +8,7 @@ pub(crate) mod command;
 use child::{ChildMessage, ChildRun};
 use command::{CommandRun, JobControl, Phase, Stop};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -23,7 +24,7 @@ use crate::error::Error;
 use crate::schemes::artifact::Artifacts;
 use crate::session::children::SessionTable;
 use crate::session::journal;
-use crate::store::{Entry, SeqEntry};
+use crate::store::{Entry, SeqEntry, TeamRef};
 
 /// The session side of a registry.
 #[async_trait]
@@ -105,7 +106,7 @@ impl fmt::Display for MessageRef {
 
 /// A job's `job_start`, written with the result of the call that started it.
 struct JobStarted {
-    id: JobId,
+    ids: Vec<JobId>,
     /// A promoted job's result carries the receipt; a retained command only reserves its id.
     admits: bool,
     entry: Option<Entry>,
@@ -161,6 +162,8 @@ pub enum JobKind {
         session_id: String,
         agent: Option<String>,
         model: String,
+        /// The member's team; `None` outside teams.
+        team: Option<TeamRef>,
     },
 }
 
@@ -169,6 +172,7 @@ pub(crate) struct ChildRef {
     pub(crate) session_id: String,
     pub(crate) path: PathBuf,
     pub(crate) admitted: bool,
+    pub(crate) team: Option<TeamRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +204,7 @@ struct JobMessage {
     is_error: bool,
     partial: bool,
     run_id: Option<String>,
+    note: bool,
     /// `None` once delivered: the transcript holds it.
     text: Option<String>,
     delivery: Delivery,
@@ -211,6 +216,7 @@ impl JobMessage {
             is_error,
             partial: false,
             run_id: None,
+            note: false,
             text: Some(text),
             delivery: Delivery::NotDeliverable,
         }
@@ -230,7 +236,10 @@ struct Job {
 
 impl Job {
     fn view(&self, id: JobId) -> JobInfo {
-        let last = self.messages.last_key_value().map(|(_, message)| message);
+        let last = match &self.kind {
+            Kind::Command(_) => self.messages.last_key_value().map(|(_, message)| message),
+            Kind::Child(_) => self.messages.values().rev().find(|message| !message.note),
+        };
         let ended_status = || match last {
             Some(message) if !message.is_error => JobStatus::Finished,
             _ => JobStatus::Failed,
@@ -260,6 +269,7 @@ impl Job {
                     session_id: run.session_id.clone(),
                     agent: run.agent.clone(),
                     model: run.model.clone(),
+                    team: run.team.clone(),
                 },
             ),
         };
@@ -287,8 +297,10 @@ impl Job {
 #[derive(Default)]
 struct State {
     jobs: BTreeMap<JobId, Job>,
+    mail: VecDeque<QueuedMessage>,
     next_bg: u64,
     next_agent: u64,
+    next_team: u64,
     admissions: HashMap<ToolInvocationId, JobStarted>,
     shut_down: bool,
 }
@@ -323,7 +335,7 @@ pub(crate) struct Receipts {
     pub delivered_jobs: Vec<String>,
     pub submission_id: Option<String>,
     key: Option<DeliveryKey>,
-    admitted: Option<JobId>,
+    admitted: Vec<JobId>,
 }
 
 /// Renders reserved messages as `[{row}] {label}\n{text}`, joined by blank lines.
@@ -361,10 +373,11 @@ impl JobRegistry {
         let admitted = started
             .as_ref()
             .filter(|started| started.admits)
-            .map(|started| started.id);
+            .map(|started| started.ids.clone())
+            .unwrap_or_default();
         Receipts {
             start: started.and_then(|started| started.entry),
-            admitted_jobs: admitted.map(|id| id.to_string()).into_iter().collect(),
+            admitted_jobs: admitted.iter().map(ToString::to_string).collect(),
             delivered_jobs,
             submission_id,
             key,
@@ -378,7 +391,7 @@ impl JobRegistry {
             if let Some(key) = &receipts.key {
                 self.commit(key);
             }
-            if let Some(id) = receipts.admitted {
+            for id in receipts.admitted {
                 match id.ns {
                     Namespace::Agent => self.admit_child(id).await,
                     Namespace::Bg => {
@@ -392,14 +405,14 @@ impl JobRegistry {
             if let Some(key) = &receipts.key {
                 self.release(key);
             }
-            if let Some(id) = receipts.admitted {
+            for id in receipts.admitted {
                 self.admission_failed(id);
             }
         }
     }
 
     pub(crate) fn delivery_message(&self) -> Option<QueuedMessage> {
-        if !self.has_pending() {
+        if !self.pending_message() {
             return None;
         }
         let id = format!("delivery-{}", uuid::Uuid::now_v7());
@@ -458,6 +471,7 @@ impl JobRegistry {
                 is_error: true,
                 partial: false,
                 run_id: None,
+                note: false,
             })
             .await?;
             self.recovered_end(id, text);
@@ -473,6 +487,7 @@ impl JobRegistry {
     ) -> (Arc<Self>, Vec<JobId>) {
         let mut max_bg = 0;
         let mut max_agent = 0;
+        let mut max_team = 0;
         let mut observe = |id: JobId| match id.ns {
             Namespace::Bg => max_bg = max_bg.max(id.n),
             Namespace::Agent => max_agent = max_agent.max(id.n),
@@ -521,8 +536,16 @@ impl JobRegistry {
                     child_path,
                     agent,
                     model,
+                    team,
                     ..
                 } => {
+                    if let Some(team) = team
+                        && let Some(digits) = team.id.strip_prefix("team_")
+                        && let Ok(n) = digits.parse::<u64>()
+                        && n.to_string() == digits
+                    {
+                        max_team = max_team.max(n);
+                    }
                     let Some(id) = JobId::parse(job_id) else {
                         continue;
                     };
@@ -543,6 +566,7 @@ impl JobRegistry {
                                     agent: agent.clone(),
                                     model: model.clone(),
                                     running: false,
+                                    team: team.clone(),
                                 }),
                                 admission: Admission::Pending,
                                 messages: BTreeMap::new(),
@@ -570,11 +594,12 @@ impl JobRegistry {
                     is_error,
                     partial,
                     run_id,
+                    note,
                     ..
                 } => {
                     if let Some(msg) = MessageRef::parse(job_id) {
                         observe(msg.job);
-                        ended.insert(msg, (text, *is_error, *partial, run_id));
+                        ended.insert(msg, (text, *is_error, *partial, run_id, *note));
                     }
                 }
                 _ => {}
@@ -587,7 +612,7 @@ impl JobRegistry {
                 job.admission = Admission::Admitted;
             }
         }
-        for (msg, (text, is_error, partial, run_id)) in ended {
+        for (msg, (text, is_error, partial, run_id, note)) in ended {
             if let Some(job) = jobs.get_mut(&msg.job) {
                 if matches!(&job.kind, Kind::Command(_)) && msg.seq != 1 {
                     continue;
@@ -599,6 +624,7 @@ impl JobRegistry {
                         is_error,
                         partial,
                         run_id: run_id.clone(),
+                        note,
                         text: (!was_delivered).then(|| text.clone()),
                         delivery: if was_delivered {
                             Delivery::Delivered
@@ -622,6 +648,7 @@ impl JobRegistry {
                 jobs,
                 next_bg: max_bg + 1,
                 next_agent: max_agent + 1,
+                next_team: max_team + 1,
                 ..State::default()
             }),
             changed: watch::Sender::new(0),
@@ -725,7 +752,7 @@ impl JobRegistry {
                     state.admissions.insert(
                         invocation,
                         JobStarted {
-                            id,
+                            ids: vec![id],
                             admits: true,
                             entry: Some(entry),
                         },
@@ -755,7 +782,7 @@ impl JobRegistry {
         state.admissions.insert(
             invocation,
             JobStarted {
-                id,
+                ids: vec![id],
                 admits: false,
                 entry: Some(entry),
             },
@@ -804,6 +831,7 @@ impl JobRegistry {
                         is_error,
                         partial: false,
                         run_id: None,
+                        note: false,
                     });
             job.messages.insert(1, JobMessage::command(text, is_error));
             (end, shut_down && job.release_message(1))
@@ -954,7 +982,9 @@ impl JobRegistry {
 
     fn admission_failed(&self, id: JobId) {
         let mut state = self.lock();
-        state.admissions.retain(|_, admission| admission.id != id);
+        state
+            .admissions
+            .retain(|_, admission| !admission.ids.contains(&id));
         let child = fail_admission(&mut state, id);
         drop(state);
         if let Some(session) = child.and_then(|id| self.sessions.live(&id)) {
@@ -978,8 +1008,16 @@ impl JobRegistry {
                 let label = match &job.kind {
                     Kind::Command(run) => headline(&run.command).to_owned(),
                     Kind::Child(run) => {
-                        let mut label = run.agent.as_deref().unwrap_or("subagent").to_owned();
-                        if message.partial {
+                        let name = match &run.team {
+                            Some(team) => format!("{} of {}", team.member, team.id),
+                            None => run.agent.as_deref().unwrap_or("subagent").to_owned(),
+                        };
+                        let mut label = if message.note {
+                            format!("message from {name}")
+                        } else {
+                            name
+                        };
+                        if !message.note && message.partial {
                             label.push_str(" (partial: turn budget exhausted)");
                         }
                         label
@@ -1048,7 +1086,7 @@ impl JobRegistry {
             .admissions
             .drain()
             .filter(|(_, admission)| admission.admits)
-            .map(|(_, admission)| admission.id)
+            .flat_map(|(_, admission)| admission.ids)
             .collect();
         let children: Vec<String> = dropped
             .iter()
@@ -1066,7 +1104,35 @@ impl JobRegistry {
         self.move_reserved(None, Delivery::Pending);
     }
 
+    /// Queues a saved teammate message; the next turn boundary, run start or `wait` takes it.
+    pub(crate) fn post_mail(&self, message: QueuedMessage) {
+        self.lock().mail.push_back(message);
+        self.bump();
+    }
+
+    pub(crate) fn take_mail(&self) -> Vec<QueuedMessage> {
+        let messages: Vec<_> = self.lock().mail.drain(..).collect();
+        if !messages.is_empty() {
+            self.bump();
+        }
+        messages
+    }
+
+    pub(crate) fn has_mail(&self) -> bool {
+        !self.lock().mail.is_empty()
+    }
+
     pub(crate) fn has_pending(&self) -> bool {
+        let state = self.lock();
+        !state.mail.is_empty()
+            || state.jobs.values().any(|job| {
+                job.messages
+                    .values()
+                    .any(|message| message.delivery == Delivery::Pending)
+            })
+    }
+
+    fn pending_message(&self) -> bool {
         self.lock().jobs.values().any(|job| {
             job.messages
                 .values()
@@ -1128,6 +1194,13 @@ impl JobRegistry {
             })
     }
 
+    pub(crate) fn reserve_team(&self) -> String {
+        let mut state = self.lock();
+        let id = format!("team_{}", state.next_team);
+        state.next_team += 1;
+        id
+    }
+
     pub(crate) fn reserve_child(&self, run: ChildRun) -> JobId {
         let mut state = self.lock();
         let id = JobId {
@@ -1180,6 +1253,7 @@ impl JobRegistry {
                             is_error: message.is_error,
                             partial: message.partial,
                             run_id: message.run_id.clone(),
+                            note: message.note,
                         },
                     ))
                 })
@@ -1216,44 +1290,54 @@ impl JobRegistry {
         }
     }
 
-    pub(crate) fn admit_on_result(&self, invocation: ToolInvocationId, id: JobId) {
+    pub(crate) fn admit_on_result(&self, invocation: ToolInvocationId, ids: Vec<JobId>) {
         self.lock().admissions.insert(
             invocation,
             JobStarted {
-                id,
+                ids,
                 admits: true,
                 entry: None,
             },
         );
     }
 
-    /// The child row a tool call `call_id` spawned; a pending one is admitted again by `invocation`'s result.
-    pub(crate) fn adopt(&self, call_id: &str, invocation: ToolInvocationId) -> Option<ChildRef> {
+    /// The child rows a tool call `call_id` spawned; pending ones are admitted again by `invocation`'s result.
+    pub(crate) fn adopt(&self, call_id: &str, invocation: ToolInvocationId) -> Vec<ChildRef> {
         let mut state = self.lock();
-        let child = state.jobs.iter().find_map(|(id, job)| {
-            let Kind::Child(run) = &job.kind else {
-                return None;
-            };
-            (run.call_id.as_deref() == Some(call_id) && job.admission != Admission::Never).then(
-                || ChildRef {
-                    id: *id,
-                    session_id: run.session_id.clone(),
-                    path: run.path.clone(),
-                    admitted: job.admission == Admission::Admitted,
-                },
-            )
-        })?;
-        if !child.admitted {
+        let children: Vec<_> = state
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                let Kind::Child(run) = &job.kind else {
+                    return None;
+                };
+                (run.call_id.as_deref() == Some(call_id) && job.admission != Admission::Never).then(
+                    || ChildRef {
+                        id: *id,
+                        session_id: run.session_id.clone(),
+                        path: run.path.clone(),
+                        admitted: job.admission == Admission::Admitted,
+                        team: run.team.clone(),
+                    },
+                )
+            })
+            .collect();
+        let pending: Vec<_> = children
+            .iter()
+            .filter(|child| !child.admitted)
+            .map(|child| child.id)
+            .collect();
+        if !pending.is_empty() {
             state.admissions.insert(
                 invocation,
                 JobStarted {
-                    id: child.id,
+                    ids: pending,
                     admits: true,
                     entry: None,
                 },
             );
         }
-        Some(child)
+        children
     }
 
     /// A listed child row's view and session file.
@@ -1289,6 +1373,7 @@ impl JobRegistry {
             child_path: run.path.clone(),
             agent: run.agent.clone(),
             model: run.model.clone(),
+            team: run.team.clone(),
         }
     }
 
@@ -1302,6 +1387,7 @@ impl JobRegistry {
                     session_id: run.session_id.clone(),
                     path: run.path.clone(),
                     admitted: job.admission == Admission::Admitted,
+                    team: run.team.clone(),
                 }),
                 Kind::Command(_) => None,
             })
@@ -1319,26 +1405,28 @@ impl JobRegistry {
         self.bump();
     }
 
-    /// One durable parent message per child run, shared by live completion and reconciliation.
+    /// Durable child notes and one result per run, shared by live completion and reconciliation.
     pub(crate) async fn child_message(
         &self,
         child_session_id: &str,
         message: ChildMessage,
         wake: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let (msg, entry) =
             {
                 let mut state = self.lock();
                 let Some((id, job)) = state.jobs.iter_mut().find(|(_, job)| {
                 job.admission != Admission::Never
                     && matches!(&job.kind, Kind::Child(run) if run.session_id == child_session_id)
-            }) else { return Ok(()) };
-                if message.run_id.as_ref().is_some_and(|run_id| {
-                    job.messages
-                        .values()
-                        .any(|m| m.run_id.as_ref() == Some(run_id))
-                }) {
-                    return Ok(());
+            }) else { return Ok(false) };
+                if !message.note
+                    && message.run_id.as_ref().is_some_and(|run_id| {
+                        job.messages
+                            .values()
+                            .any(|m| m.run_id.as_ref() == Some(run_id))
+                    })
+                {
+                    return Ok(true);
                 }
                 let seq = job.messages.last_key_value().map_or(1, |(seq, _)| seq + 1);
                 if job.admission == Admission::Pending {
@@ -1349,15 +1437,18 @@ impl JobRegistry {
                             is_error: message.is_error,
                             partial: message.partial,
                             run_id: message.run_id,
+                            note: message.note,
                             delivery: Delivery::Held,
                         },
                     );
-                    if let Kind::Child(run) = &mut job.kind {
+                    if !message.note
+                        && let Kind::Child(run) = &mut job.kind
+                    {
                         run.running = false;
                     }
                     drop(state);
                     self.bump();
-                    return Ok(());
+                    return Ok(true);
                 }
                 let msg = MessageRef { job: *id, seq };
                 let entry = Entry::JobEnd {
@@ -1367,6 +1458,7 @@ impl JobRegistry {
                     is_error: message.is_error,
                     partial: message.partial,
                     run_id: message.run_id.clone(),
+                    note: message.note,
                 };
                 job.messages.insert(
                     seq,
@@ -1375,10 +1467,13 @@ impl JobRegistry {
                         is_error: message.is_error,
                         partial: message.partial,
                         run_id: message.run_id,
+                        note: message.note,
                         delivery: Delivery::NotDeliverable,
                     },
                 );
-                if let Kind::Child(run) = &mut job.kind {
+                if !message.note
+                    && let Kind::Child(run) = &mut job.kind
+                {
                     run.running = false;
                 }
                 (msg, entry)
@@ -1410,7 +1505,7 @@ impl JobRegistry {
         if wake {
             self.results_ready();
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn open(&self) -> bool {
