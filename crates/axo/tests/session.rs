@@ -88,6 +88,19 @@ async fn quiet_host_message_waits_for_a_prompt_and_survives_reopening_once() {
         .await;
         let mut session = host.axo.create_session(options(dir.path())).await.unwrap();
         let text = "/word keep this host instruction literal";
+        for reserved in ["turn_budget", "compactionSummary"] {
+            assert!(matches!(
+                session
+                    .post(axo::HostMessage {
+                        custom_type: reserved.into(),
+                        text: "spoof".into(),
+                        display: false,
+                        delivery: axo::HostDelivery::Quiet,
+                    })
+                    .await,
+                Err(axo::Error::InvalidInput(_))
+            ));
+        }
         within(session.post(axo::HostMessage {
             custom_type: "host-note".into(),
             text: text.into(),
@@ -176,6 +189,110 @@ async fn quiet_host_message_waits_for_a_prompt_and_survives_reopening_once() {
             [UserBlock::Text { text: actual }] if actual == text
         ));
         assert_eq!(host.api.requests().len(), 2);
+        session.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn input_queued_when_a_run_stops_survives_reopening() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = common::host(
+            dir.path(),
+            json!([{"id": "m"}]),
+            json!({}),
+            vec![
+                ScriptedTurn::HangUntilCancel,
+                ScriptedTurn::Reply(reply_text("one")),
+                ScriptedTurn::Reply(reply_text("two")),
+                ScriptedTurn::Reply(reply_text("three")),
+            ],
+        )
+        .await;
+        let mut session = host.axo.create_session(options(dir.path())).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
+                .await
+                .is_err(),
+            "the first run hangs until cancelled"
+        );
+        within(session.post(axo::HostMessage {
+            custom_type: "host-note".into(),
+            text: "quiet note".into(),
+            display: false,
+            delivery: axo::HostDelivery::Quiet,
+        }))
+        .await
+        .unwrap();
+        within(session.steer("steer text")).await.unwrap();
+        session.abort();
+        common::entry(&session, |entry| {
+            matches!(
+                entry,
+                Entry::RunEnd {
+                    outcome: axo::RunOutcome::Aborted,
+                    ..
+                }
+            )
+        })
+        .await;
+        let queued = session
+            .attach(None)
+            .await
+            .missed
+            .iter()
+            .find_map(|seq| match &seq.entry {
+                Entry::RunEnd { queued, .. } => Some(queued.len()),
+                _ => None,
+            });
+        assert_eq!(queued, Some(2), "the run_end names both leftovers");
+        let requests = host.api.requests().len();
+
+        if reopen {
+            let path = session.path().to_path_buf();
+            session.shutdown().await;
+            drop(session);
+            session = host
+                .axo
+                .open_session(&path, options(dir.path()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !session.attach(None).await.live.running,
+                "held input must not start a run"
+            );
+            assert_eq!(host.api.requests().len(), requests);
+        }
+
+        assert_eq!(
+            within(session.prompt("answer now")).await.unwrap(),
+            RunOutcome::Done
+        );
+        let entries = session.attach(None).await.missed;
+        let count = |pred: &dyn Fn(&AgentMessage) -> bool| {
+            entries
+                .iter()
+                .filter(|seq| {
+                    matches!(&seq.entry, Entry::Message { message, submission_id: Some(_), .. } if pred(message))
+                })
+                .count()
+        };
+        assert_eq!(
+            count(
+                &|message| matches!(message, AgentMessage::Custom(custom) if custom.custom_type == "host-note")
+            ),
+            1,
+            "reopen = {reopen}"
+        );
+        assert_eq!(
+            count(
+                &|message| matches!(message, AgentMessage::Llm(Message::User(user))
+                if matches!(user.content.as_slice(), [UserBlock::Text { text }] if text == "steer text"))
+            ),
+            1,
+            "reopen = {reopen}"
+        );
         session.shutdown().await;
     }
 }

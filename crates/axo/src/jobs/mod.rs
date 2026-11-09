@@ -29,6 +29,9 @@ use crate::session::children::SessionTable;
 use crate::session::{SessionEvent, journal};
 use crate::store::{Entry, Header, SeqEntry, TeamRef};
 
+/// Custom type of the message that delivers background job results.
+pub(crate) const JOB_RESULT: &str = "job_result";
+
 /// The session side of a registry.
 #[async_trait]
 pub(crate) trait JobHost: Send + Sync {
@@ -788,7 +791,7 @@ impl JobRegistry {
         let jobs: Vec<String> = results.iter().map(|r| r.msg.to_string()).collect();
         Some(QueuedMessage {
             message: AgentMessage::Custom(CustomMessage {
-                custom_type: "job_result".into(),
+                custom_type: JOB_RESULT.into(),
                 content: vec![UserBlock::Text {
                     text: format!("Background job results:\n\n{}", render_results(&results)),
                 }],
@@ -912,6 +915,7 @@ impl JobRegistry {
         let State {
             jobs, announced, ..
         } = &mut *state;
+        // ponytail: rebuilds every listed row's view per change (O(rows)); track dirty row ids in State if sessions keep hundreds of rows.
         for (id, job) in jobs.iter().filter(|(_, job)| listed(job)) {
             let info = job.view(*id);
             if announced.get(id) != Some(&info) {
@@ -964,7 +968,7 @@ impl JobRegistry {
         };
         state.next_bg += 1;
         if state.shut_down {
-            control.stop(Stop::Killed(Killer::Host));
+            control.stop(Stop::Shutdown);
         }
         state.jobs.insert(
             id,
@@ -1444,6 +1448,15 @@ impl JobRegistry {
             self.bump();
         }
         messages
+    }
+
+    /// Ids of the queued mail messages.
+    pub(crate) fn mail_ids(&self) -> Vec<String> {
+        self.lock()
+            .mail
+            .iter()
+            .filter_map(|m| m.id.clone())
+            .collect()
     }
 
     pub(crate) fn has_mail(&self) -> bool {
@@ -1986,7 +1999,7 @@ impl JobRegistry {
                     if run.phase != Phase::Closed
                         && let Some(control) = &run.control
                     {
-                        control.stop(Stop::Killed(Killer::Host));
+                        control.stop(Stop::Shutdown);
                     }
                     run.task.take()
                 })

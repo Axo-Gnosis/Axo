@@ -21,8 +21,11 @@ use crate::store::{self, Entry, EntryId, SeqEntry, SubmissionKind};
 pub(super) enum Resumption {
     /// Continue the open run; requeued input goes through the agent's queues.
     Continue(Vec<(SubmissionKind, QueuedMessage)>),
-    /// No run was open: queue steers and follow-ups, and start a run with the prompts.
-    Requeue(Vec<(SubmissionKind, QueuedMessage)>),
+    /// No run was open: everything is queued; with wake, prompts and mail start a run.
+    Requeue {
+        queued: Vec<(SubmissionKind, QueuedMessage)>,
+        wake: bool,
+    },
     RecoverResponse(RunRequest),
 }
 
@@ -208,37 +211,35 @@ impl Session {
         };
         // Nothing below reads the snapshot, so no write copies it.
         drop(log);
-        let (run_id, outcome, reason) = match plan {
+        let (run_id, outcome, reason, held) = match plan {
             RecoveryPlan::None => return Ok(None),
-            RecoveryPlan::Requeue { requeue } => {
+            RecoveryPlan::Requeue { requeue, wake } => {
                 if policy == RecoveryPolicy::MarkInterrupted {
                     return Ok(None);
                 }
                 let queued = self.requeued(requeue).await;
-                if queued
-                    .iter()
-                    .any(|(kind, _)| matches!(kind, SubmissionKind::Prompt | SubmissionKind::Mail))
-                {
+                if wake {
                     self.hooks
                         .activity
                         .send_modify(|activity| activity.running = true);
                 }
-                return Ok(Some(Resumption::Requeue(queued)));
+                return Ok(Some(Resumption::Requeue { queued, wake }));
             }
             RecoveryPlan::Finish {
                 run_id,
                 outcome,
                 reason,
-            } => (run_id, outcome, reason),
+                requeue,
+            } => (run_id, outcome, reason, requeue),
             RecoveryPlan::RecoverResponse {
                 run_id,
                 attempt,
                 requeue,
                 ..
             } => match recovered {
-                None => (run_id, store::RunOutcome::Interrupted, None),
+                None => (run_id, store::RunOutcome::Interrupted, None, requeue),
                 Some(RecoveredResponse { finished: true, .. }) => {
-                    (run_id, store::RunOutcome::Done, None)
+                    (run_id, store::RunOutcome::Done, None, requeue)
                 }
                 Some(RecoveredResponse {
                     response, results, ..
@@ -258,10 +259,11 @@ impl Session {
             },
             // ponytail: Park writes no tool results, so a spawn call parked here leaves its
             // tool-spawned rows pending; give Park interrupted results if that shows up.
-            RecoveryPlan::Park { run_id } => (
+            RecoveryPlan::Park { run_id, requeue } => (
                 run_id,
                 store::RunOutcome::Interrupted,
                 Some("restart_limit".to_owned()),
+                requeue,
             ),
             RecoveryPlan::Resume {
                 run_id,
@@ -335,13 +337,26 @@ impl Session {
                     jobs.admit_child(id).await;
                 }
                 if policy == RecoveryPolicy::MarkInterrupted {
-                    (run_id, store::RunOutcome::Interrupted, None)
+                    (run_id, store::RunOutcome::Interrupted, None, requeue)
                 } else {
                     self.claim_resume(run_id, attempt).await?;
                     return Ok(Some(Resumption::Continue(self.requeued(requeue).await)));
                 }
             }
         };
+        // MarkInterrupted drops unconsumed input; Resume holds it without starting a run.
+        let held = if policy == RecoveryPolicy::Resume {
+            held
+        } else {
+            Vec::new()
+        };
+        let queued = held
+            .iter()
+            .filter_map(|seq| match &seq.entry {
+                Entry::Submission { submission_id, .. } => Some(submission_id.clone()),
+                _ => None,
+            })
+            .collect();
         self.hooks
             .append(vec![Entry::RunEnd {
                 base: journal::base(),
@@ -352,8 +367,12 @@ impl Session {
                 run_id,
                 outcome,
                 reason,
+                queued,
             }])
             .await?;
+        for (kind, message) in self.requeued(held).await {
+            enqueue(&self.agent, &self.hooks, kind, message);
+        }
         Ok(None)
     }
 
@@ -365,7 +384,12 @@ impl Session {
                 attempt,
             }])
             .await?;
-        self.hooks.live().run_id = Some(run_id);
+        let usage = store::run_usage(&self.hooks.journal.view().entries, &run_id);
+        {
+            let mut live = self.hooks.live();
+            live.run_id = Some(run_id);
+            live.usage = usage;
+        }
         self.hooks
             .activity
             .send_modify(|activity| activity.running = true);

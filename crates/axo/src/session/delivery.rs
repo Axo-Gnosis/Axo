@@ -15,8 +15,22 @@ use super::{
 use crate::context::prompt::escape_wrappers;
 use crate::error::Error;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
-use crate::jobs::JobHost;
-use crate::store::{Entry, SeqEntry, SubmissionKind, SubmittedCustom};
+use crate::jobs::child::TURN_BUDGET;
+use crate::jobs::{JOB_RESULT, JobHost};
+use crate::store::{
+    BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, Entry, SeqEntry, SubmissionKind, SubmittedCustom,
+};
+use crate::tools::output::YIELD_NUDGE;
+
+/// Custom types the engine writes or reads with special meaning; a host message
+/// using one would be mistaken for the engine's own.
+const RESERVED_CUSTOM_TYPES: [&str; 5] = [
+    JOB_RESULT,
+    TURN_BUDGET,
+    YIELD_NUDGE,
+    COMPACTION_SUMMARY_TYPE,
+    BRANCH_SUMMARY_TYPE,
+];
 
 /// A new child's task, prepared but not saved.
 pub(super) struct FirstPrompt {
@@ -62,6 +76,24 @@ impl SessionHooks {
             self.agent.get().and_then(Weak::upgrade)?,
             self.this.upgrade()?,
         ))
+    }
+
+    /// Submission ids waiting in the agent's queues, the mail queue and the quiet queue.
+    pub(super) fn queued_submissions(&self) -> Vec<String> {
+        let mut ids = self
+            .agent
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or_else(Vec::new, |agent| agent.queued_ids());
+        ids.extend(self.tools.runner.jobs.mail_ids());
+        ids.extend(
+            self.quiet
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter_map(|m| m.id.clone()),
+        );
+        ids
     }
 
     /// Whether finished job results may start a run of their own.
@@ -313,8 +345,11 @@ impl Session {
                 "Host messages need a custom type and text".into(),
             ));
         }
-        if message.custom_type == "job_result" {
-            return Err(Error::InvalidInput("job_result is reserved".into()));
+        if RESERVED_CUSTOM_TYPES.contains(&message.custom_type.as_str()) {
+            return Err(Error::InvalidInput(format!(
+                "{} is reserved",
+                message.custom_type
+            )));
         }
         let kind = match message.delivery {
             HostDelivery::Steer => SubmissionKind::Steer,

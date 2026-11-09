@@ -103,6 +103,8 @@ pub(super) enum Stop {
     Aborted,
     TimedOut(f64),
     Killed(Killer),
+    /// The session shut down around the command.
+    Shutdown,
 }
 
 pub(super) struct JobControl {
@@ -583,6 +585,7 @@ impl CommandTask {
             (Some(Stop::Aborted), _) => Some(CommandExit::Aborted),
             (Some(Stop::TimedOut(secs)), _) => Some(CommandExit::TimedOut { after_secs: *secs }),
             (Some(Stop::Killed(by)), _) => Some(CommandExit::Killed { by: *by }),
+            (Some(Stop::Shutdown), _) => Some(CommandExit::Interrupted),
             (None, Ok(status)) => Some(match (status.code(), status.signal()) {
                 (Some(code), _) => CommandExit::Exited { code },
                 (_, Some(signal)) => CommandExit::Signaled { signal },
@@ -609,6 +612,11 @@ impl CommandTask {
                         Killer::Host => "Command was stopped by the user".to_owned(),
                     },
                 ),
+                true,
+                false,
+            ),
+            (Some(Stop::Shutdown), _) => (
+                with_status(body, "Command was interrupted when the session closed"),
                 true,
                 false,
             ),

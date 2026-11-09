@@ -5,11 +5,13 @@ use crate::config::{EffectiveConfig, PromptOverride};
 use crate::context::agents::{AgentSpec, ContextFiles};
 use crate::context::files::{ContextFile, context_file_names, load_context_files};
 use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir, project_root};
+use crate::tools::output::YIELD;
 use crate::tools::{self, ToolFactory};
 use axo_agent::{AgentMessage, QueuedMessage, Tool};
 use axo_ai::{Message, SystemMessage, ToolSpec, now_ms};
 use tokio_util::sync::CancellationToken;
 
+use super::spawn::SPAWN;
 use super::{Session, SessionHooks, journal};
 use crate::context::prompt::{
     PromptShape, PromptSources, Sections, build_sections, system_message,
@@ -116,10 +118,10 @@ pub(crate) fn shape(
         tools.retain(|tool| allow.iter().any(|name| name == tool.name()));
     }
     if base.depth >= settings.subagents.max_depth {
-        tools.retain(|tool| tool.name() != "spawn");
+        tools.retain(|tool| tool.name() != SPAWN);
     }
     if let Some(yield_tool) = &base.yield_tool {
-        tools.retain(|tool| tool.name() != "yield");
+        tools.retain(|tool| tool.name() != YIELD);
         tools.push(yield_tool.clone());
     }
     let shape = PromptShape {
@@ -219,6 +221,25 @@ fn today() -> String {
 }
 
 impl SessionHooks {
+    /// Derives `spec`'s prompt and tool shape from the current base on a blocking thread:
+    /// context-file loading does blocking file I/O. Logs its diagnostics.
+    pub(super) async fn reshape(&self, spec: Option<AgentSpec>) -> (PromptShape, NestedParts) {
+        let base = self
+            .shape_base
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let (new_shape, nested, diagnostics) =
+            match tokio::task::spawn_blocking(move || shape(&base, spec.as_ref())).await {
+                Ok(shaped) => shaped,
+                Err(join) => std::panic::resume_unwind(join.into_panic()),
+            };
+        for diagnostic in diagnostics {
+            tracing::warn!("{diagnostic}");
+        }
+        (new_shape, nested)
+    }
+
     /// Rebuilds the prompt for `note` and today's date; a change goes out as a pending
     /// system diff.
     pub(super) fn refresh_prompt(&self, note: Option<String>) {

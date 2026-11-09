@@ -13,7 +13,10 @@ use super::Limits;
 use crate::Error;
 use crate::context::skills::Skill;
 use crate::schemes::artifact::Artifacts;
-use crate::store::{ContextReplacement, Entry, EntryId, Projection, SeqEntry};
+use crate::store::{
+    BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, ContextReplacement, Entry, EntryId, Projection,
+    SeqEntry,
+};
 use crate::tools::{FileAccess, file_key, ledger_access};
 
 #[derive(Clone, Copy)]
@@ -110,7 +113,7 @@ pub(crate) fn prepare(
         };
         if protected.contains(&index)
             || matches!(message, AgentMessage::Llm(Message::System(_)))
-            || matches!(message, AgentMessage::Custom(custom) if matches!(custom.custom_type.as_str(), "compactionSummary" | "branchSummary"))
+            || matches!(message, AgentMessage::Custom(custom) if custom.custom_type == COMPACTION_SUMMARY_TYPE || custom.custom_type == BRANCH_SUMMARY_TYPE)
             || (matches!(mode, ElisionMode::Elide | ElisionMode::Clearing { .. })
                 && age_protected.contains(&index))
         {

@@ -9,7 +9,7 @@ use axo_ai::{AssistantMessage, Message, Model, StopReason, ToolCall, is_retryabl
 use crate::compaction::{self, Limits};
 use crate::config::RetrySettings;
 use crate::error::Error;
-use crate::store::{Entry, EntryId, Projection, RunOutcome, SeqEntry, project};
+use crate::store::{Entry, EntryId, Projection, RunOutcome, SeqEntry, SubmissionKind, project};
 
 /// Restarts without a new `message` entry after which a run is parked.
 const RESTART_LIMIT: usize = 5;
@@ -188,15 +188,21 @@ pub(crate) fn checkpoint_completed(
 pub enum RecoveryPlan {
     /// No unfinished run and nothing to requeue.
     None,
-    /// No unfinished run, but submissions written after the last settled run were never
-    /// consumed.
-    Requeue { requeue: Vec<SeqEntry> },
+    /// No unfinished run, but submissions written after the last settled run, or held by
+    /// its `run_end`, were never consumed.
+    Requeue {
+        requeue: Vec<SeqEntry>,
+        /// A Prompt or Mail written after the last run_end starts a run; held input never does.
+        wake: bool,
+    },
     /// Only `run_end` is missing: the run's last response settled it (`Done`), or it failed
     /// or aborted with every call answered (`Failed`/`Aborted`).
     Finish {
         run_id: String,
         outcome: RunOutcome,
         reason: Option<String>,
+        /// Unconsumed submissions; recovery's run_end holds them (see Entry::RunEnd::queued).
+        requeue: Vec<SeqEntry>,
     },
     /// Classify and finish maintenance for a terminal response before replay.
     RecoverResponse {
@@ -206,7 +212,11 @@ pub enum RecoveryPlan {
         requeue: Vec<SeqEntry>,
     },
     /// The restart limit is reached: close the run as interrupted (`restart_limit`).
-    Park { run_id: String },
+    Park {
+        run_id: String,
+        /// Unconsumed submissions; recovery's run_end holds them (see Entry::RunEnd::queued).
+        requeue: Vec<SeqEntry>,
+    },
     /// Continue the run as resume `attempt`.
     Resume {
         run_id: String,
@@ -220,13 +230,19 @@ pub enum RecoveryPlan {
     },
 }
 
-fn unconsumed_submissions(entries: &[SeqEntry]) -> impl Iterator<Item = &SeqEntry> {
-    // Submissions since the last run settled (an open run's own prompt is written
-    // before its `run_start`); earlier leftovers were dropped with their run.
-    let since = entries
+/// Unconsumed submissions, flagged `true` when held: named by the last `run_end`'s
+/// `queued` rather than written after it. Submissions since the last run settled are
+/// pending (an open run's own prompt is written before its `run_start`); earlier
+/// leftovers not named by that `run_end` were dropped with their run.
+fn unconsumed_submissions(entries: &[SeqEntry]) -> impl Iterator<Item = (bool, &SeqEntry)> {
+    let end = entries
         .iter()
-        .rposition(|seq| matches!(seq.entry, Entry::RunEnd { .. }))
-        .map_or(0, |index| index + 1);
+        .rposition(|seq| matches!(seq.entry, Entry::RunEnd { .. }));
+    let since = end.map_or(0, |index| index + 1);
+    let held: HashSet<&str> = match end.map(|index| &entries[index].entry) {
+        Some(Entry::RunEnd { queued, .. }) => queued.iter().map(String::as_str).collect(),
+        _ => HashSet::new(),
+    };
     let consumed: HashSet<&str> = entries
         .iter()
         .filter_map(|seq| match &seq.entry {
@@ -237,10 +253,21 @@ fn unconsumed_submissions(entries: &[SeqEntry]) -> impl Iterator<Item = &SeqEntr
             _ => None,
         })
         .collect();
-    entries[since..].iter().filter(move |seq| {
-        matches!(&seq.entry, Entry::Submission { submission_id, .. }
-            if !consumed.contains(submission_id.as_str()))
-    })
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, seq)| match &seq.entry {
+            Entry::Submission { submission_id, .. }
+                if !consumed.contains(submission_id.as_str()) =>
+            {
+                if index >= since {
+                    Some((false, seq))
+                } else {
+                    held.contains(submission_id.as_str()).then_some((true, seq))
+                }
+            }
+            _ => None,
+        })
 }
 
 fn open_run<'a>(entries: &'a [SeqEntry], projection: &Projection) -> Option<(usize, &'a String)> {
@@ -278,12 +305,25 @@ pub fn plan_recovery(
     replay_of: &dyn Fn(&ToolCall) -> Replay,
 ) -> RecoveryPlan {
     let active: HashSet<usize> = projection.path().iter().copied().collect();
-    let requeue: Vec<SeqEntry> = unconsumed_submissions(entries).cloned().collect();
+    let mut wake = false;
+    let requeue: Vec<SeqEntry> = unconsumed_submissions(entries)
+        .map(|(held, seq)| {
+            wake |= !held
+                && matches!(
+                    &seq.entry,
+                    Entry::Submission {
+                        kind: SubmissionKind::Prompt | SubmissionKind::Mail,
+                        ..
+                    }
+                );
+            seq.clone()
+        })
+        .collect();
     let Some((start, run_id)) = open_run(entries, projection) else {
         return if requeue.is_empty() {
             RecoveryPlan::None
         } else {
-            RecoveryPlan::Requeue { requeue }
+            RecoveryPlan::Requeue { requeue, wake }
         };
     };
     let run: Vec<&SeqEntry> = entries[start + 1..]
@@ -355,6 +395,7 @@ pub fn plan_recovery(
                             RunOutcome::Failed
                         },
                         reason: response.error_message.clone(),
+                        requeue,
                     };
                 }
             }
@@ -367,6 +408,7 @@ pub fn plan_recovery(
                 run_id: run_id.clone(),
                 outcome: RunOutcome::Done,
                 reason: None,
+                requeue,
             };
         }
     }
@@ -380,6 +422,7 @@ pub fn plan_recovery(
     if restarts_without_progress >= RESTART_LIMIT {
         return RecoveryPlan::Park {
             run_id: run_id.clone(),
+            requeue,
         };
     }
     let resumes = run
@@ -551,12 +594,17 @@ mod tests {
         }
 
         fn run_end(&mut self, run_id: &str) {
+            self.run_end_queued(run_id, &[]);
+        }
+
+        fn run_end_queued(&mut self, run_id: &str, queued: &[&str]) {
             self.push(|base| Entry::RunEnd {
                 base,
                 run_id: run_id.into(),
                 outcome: crate::RunOutcome::Done,
                 reason: None,
                 usage: None,
+                queued: queued.iter().map(|id| (*id).to_owned()).collect(),
             });
         }
 
@@ -626,6 +674,7 @@ mod tests {
                 run_id: "r1".into(),
                 outcome: crate::RunOutcome::Done,
                 reason: None,
+                requeue: Vec::new(),
             }
         );
 
@@ -655,7 +704,8 @@ mod tests {
         assert_eq!(
             log.plan(),
             RecoveryPlan::Park {
-                run_id: "r1".into()
+                run_id: "r1".into(),
+                requeue: Vec::new(),
             }
         );
     }
@@ -718,7 +768,34 @@ mod tests {
         assert_eq!(
             log.plan(),
             RecoveryPlan::Requeue {
-                requeue: vec![stranded]
+                requeue: vec![stranded],
+                wake: true,
+            }
+        );
+    }
+
+    #[test]
+    fn run_end_holds_its_queued_submissions() {
+        let mut log = Log::default();
+        log.user("s1", SubmissionKind::Prompt, "first");
+        log.run_start("r1");
+        let quiet = log.submission("q1", SubmissionKind::Quiet, "note");
+        log.submission("s2", SubmissionKind::Steer, "dropped");
+        log.run_end_queued("r1", &["q1"]);
+        assert_eq!(
+            log.plan(),
+            RecoveryPlan::Requeue {
+                requeue: vec![quiet.clone()],
+                wake: false,
+            }
+        );
+
+        let mail = log.submission("m1", SubmissionKind::Mail, "hi");
+        assert_eq!(
+            log.plan(),
+            RecoveryPlan::Requeue {
+                requeue: vec![quiet, mail],
+                wake: true,
             }
         );
     }
@@ -787,7 +864,8 @@ mod tests {
         assert_eq!(
             log.plan(),
             RecoveryPlan::Park {
-                run_id: "r1".into()
+                run_id: "r1".into(),
+                requeue: Vec::new(),
             }
         );
     }
@@ -818,6 +896,7 @@ mod tests {
                 run_id: "r1".into(),
                 outcome: crate::RunOutcome::Done,
                 reason: None,
+                requeue: Vec::new(),
             }
         );
         log.user("s2", SubmissionKind::FollowUp, "next task");
@@ -857,6 +936,17 @@ mod tests {
                         run_id: "r1".into(),
                         outcome,
                         reason: Some("permission denied".into()),
+                        requeue: Vec::new(),
+                    }
+                );
+                let late = log.submission("late", SubmissionKind::Steer, "late");
+                assert_eq!(
+                    log.plan(),
+                    RecoveryPlan::Finish {
+                        run_id: "r1".into(),
+                        outcome,
+                        reason: Some("permission denied".into()),
+                        requeue: vec![late],
                     }
                 );
             }

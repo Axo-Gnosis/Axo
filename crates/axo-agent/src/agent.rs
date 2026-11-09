@@ -235,6 +235,17 @@ impl Agent {
         self.lock().follow_up.push_back(m);
     }
 
+    /// Ids of the queued steering, then follow-up messages that carry one.
+    pub fn queued_ids(&self) -> Vec<String> {
+        let state = self.lock();
+        state
+            .steering
+            .iter()
+            .chain(&state.follow_up)
+            .filter_map(|m| m.id.clone())
+            .collect()
+    }
+
     /// Takes the next messages of the steering (`true`) or follow-up queue per its mode.
     /// Draining the last steering message clears the steer signal under the same lock.
     pub(crate) fn take_queued(&self, steering: bool) -> Vec<QueuedMessage> {

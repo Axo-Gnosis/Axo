@@ -368,6 +368,10 @@ pub enum Entry {
         /// Assistant-message usage for this run, excluding maintenance requests.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        /// Submission ids still queued when the run ended; reopening requeues those no
+        /// `message` consumed. Empty when the run's leftovers are dropped (fork, `MarkInterrupted`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        queued: Vec<String>,
     },
     /// One recovery of an unfinished run.
     RunResumed {

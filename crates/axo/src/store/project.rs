@@ -16,6 +16,8 @@ const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
+pub(crate) const COMPACTION_SUMMARY_TYPE: &str = "compactionSummary";
+pub(crate) const BRANCH_SUMMARY_TYPE: &str = "branchSummary";
 
 /// Provenance of one selected context entry, including entries hidden by edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,7 +303,7 @@ fn entry_messages(entry: &Entry) -> Vec<AgentMessage> {
             summary,
             ..
         } if !summary.is_empty() => vec![summary_message(
-            "branchSummary",
+            BRANCH_SUMMARY_TYPE,
             format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
             json!({ "summary": summary, "fromId": from_id }),
             &base.timestamp,
@@ -314,7 +316,7 @@ fn entry_messages(entry: &Entry) -> Vec<AgentMessage> {
             ..
         } => {
             let summary = summary_message(
-                "compactionSummary",
+                COMPACTION_SUMMARY_TYPE,
                 format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
                 json!({ "summary": summary, "tokensBefore": tokens_before }),
                 &base.timestamp,

@@ -129,6 +129,7 @@ impl Log {
             outcome: axo::RunOutcome::Done,
             reason: None,
             usage: None,
+            queued: Vec::new(),
         });
     }
 }
@@ -296,6 +297,69 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
         assert_eq!(ends[0].1, outcome);
         assert!(host.api.requests().is_empty());
     }
+}
+
+#[tokio::test]
+async fn recovery_closed_run_holds_unconsumed_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id":"m", "contextWindow":100000, "maxTokens":4096}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_text("a")),
+            ScriptedTurn::Reply(reply_text("b")),
+        ],
+    )
+    .await;
+    let options = options(dir.path());
+    let mut selected = scripted_model();
+    selected.provider = "test".into();
+    selected.id = "m".into();
+    let mut log = Log::default();
+    log.user("s1", SubmissionKind::Prompt, "start");
+    log.run_start("r1");
+    log.message(
+        Message::Assistant(AssistantMessage {
+            stop_reason: StopReason::Error,
+            error_message: Some("permission denied".into()),
+            ..AssistantMessage::empty(&selected)
+        }),
+        None,
+    );
+    log.submission("q1", SubmissionKind::Steer, "late steer");
+    let store = JsonlStore::new(dir.path().join("sessions"));
+    let mut writer = store
+        .create(axo::Header::new(options.cwd.clone(), None, None))
+        .await
+        .unwrap();
+    let path = writer.path().to_path_buf();
+    for entry in log.entries {
+        writer.append(entry.entry).await.unwrap();
+    }
+    drop(writer);
+
+    let session = host.axo.open_session(&path, options).await.unwrap();
+    let (_, entries) = store.open_read(&path).await.unwrap();
+    assert!(entries.iter().any(|seq| matches!(
+        &seq.entry,
+        Entry::RunEnd { run_id, outcome: axo::RunOutcome::Failed, queued, .. }
+            if run_id == "r1" && queued == &["q1"]
+    )));
+    assert!(host.api.requests().is_empty(), "held input started a run");
+
+    assert!(matches!(
+        within(session.prompt("next")).await.unwrap(),
+        RunOutcome::Done
+    ));
+    let delivered = raw(&session)
+        .await
+        .iter()
+        .filter(|seq| {
+            matches!(&seq.entry, Entry::Message { submission_id: Some(id), .. } if id == "q1")
+        })
+        .count();
+    assert_eq!(delivered, 1);
 }
 
 #[tokio::test]

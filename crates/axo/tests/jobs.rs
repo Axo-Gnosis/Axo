@@ -959,3 +959,43 @@ async fn host_job_api_reports_and_kills() {
     assert_eq!(end.0, "Command was stopped by the user");
     assert_eq!(*end.1, Some(CommandExit::Killed { by: Killer::Host }));
 }
+
+#[tokio::test]
+async fn shutdown_interrupts_background_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, _api) = scripted(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "sleep 30", "async": true}),
+            )])),
+            ScriptedTurn::Reply(reply_text("started it")),
+        ],
+    )
+    .await;
+    let session = axo.create_session(bash_options(dir.path())).await.unwrap();
+    assert_eq!(
+        within(session.prompt("Run it in the background."))
+            .await
+            .unwrap(),
+        RunOutcome::Done
+    );
+    session.shutdown().await;
+    until(|| {
+        matches!(
+            session.jobs()[0].kind,
+            JobKind::Command {
+                exit: Some(CommandExit::Interrupted),
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        read_url(&session, "proc://bg_1")
+            .await
+            .contains("Command was interrupted when the session closed")
+    );
+}

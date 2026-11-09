@@ -17,7 +17,7 @@ pub use entry::{
     TIMESTAMP_FORMAT, TeamLink, TeamRef,
 };
 pub use jsonl::JsonlStore;
-pub(crate) use project::path_to;
+pub(crate) use project::{BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, path_to};
 pub use project::{ProjectedSource, Projection, project};
 
 use crate::error::Error;

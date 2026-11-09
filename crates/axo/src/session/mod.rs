@@ -433,6 +433,8 @@ struct LiveRun {
     run_id: Option<String>,
     streaming: Option<Accumulator>,
     tool_calls: Vec<ToolCall>,
+    /// Assistant usage of the open run so far; seeded from the journal when a run resumes.
+    usage: Usage,
 }
 
 /// The live model and thinking level; `model_change` / `thinking_level_change` entries
@@ -731,6 +733,9 @@ impl SessionHooks {
                 Err(error) => Some((store::RunOutcome::Failed, Some(error.to_string()))),
             };
             if let Some((outcome, reason)) = end {
+                // Held across the snapshot and the write: input queued meanwhile lands either
+                // in queued or after this run_end.
+                let order = self.queue_order.lock().await;
                 closed = self
                     .append(vec![Entry::RunEnd {
                         base: journal::base(),
@@ -738,9 +743,11 @@ impl SessionHooks {
                         outcome,
                         reason,
                         usage: Some(store::run_usage(&self.journal.view().entries, &run_id)),
+                        queued: self.queued_submissions(),
                     }])
                     .await
                     .map(drop);
+                drop(order);
                 if closed.is_ok()
                     && let Some(child) = &self.child
                     && let Some(parent) = self
@@ -795,17 +802,20 @@ impl SessionHooks {
                 thinking_level: selection.thinking,
             });
         }
-        let live_agent = self
-            .agent_spec
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|spec| spec.name.clone());
-        if agent != live_agent.as_deref() {
-            entries.push(Entry::AgentChange {
-                base: journal::base(),
-                agent: live_agent,
-            });
+        // A child's persona is its SpawnLink spec; agent_change names only root catalog personas.
+        if self.child.is_none() {
+            let live_agent = self
+                .agent_spec
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(|spec| spec.name.clone());
+            if agent != live_agent.as_deref() {
+                entries.push(Entry::AgentChange {
+                    base: journal::base(),
+                    agent: live_agent,
+                });
+            }
         }
         if !entries.is_empty() {
             self.append(entries).await?;
@@ -1146,7 +1156,9 @@ impl Persist for SessionHooks {
                 }])
                 .await
                 .map_err(|err| PersistError(err.to_string()))?;
-                self.live().run_id = Some(run_id);
+                let mut live = self.live();
+                live.run_id = Some(run_id);
+                live.usage = Usage::default();
             }
             AgentEvent::MessageUpdate { event: update } => {
                 self.relay_live(event, |live| {
@@ -1175,14 +1187,20 @@ impl Persist for SessionHooks {
                 let appended = self.append(batch).await;
                 jobs.settle(receipts, appended.is_ok()).await;
                 appended.map_err(|err| PersistError(err.to_string()))?;
-                let run_id = self.live().run_id.clone();
+                let (open, usage) = {
+                    let mut live = self.live();
+                    if let AgentMessage::Llm(Message::Assistant(response)) = message {
+                        live.usage += &response.usage;
+                    }
+                    (live.run_id.is_some(), live.usage.clone())
+                };
                 if matches!(message, AgentMessage::Llm(Message::Assistant(_)))
                     && let Some(child) = &self.child
                     && let Some(parent) = self
                         .inherited
                         .sessions
                         .registry(&child.link.parent_session_id)
-                    && let Some(run_id) = run_id
+                    && open
                 {
                     let turns = child.budget.requests();
                     parent.child_progress(
@@ -1195,7 +1213,7 @@ impl Persist for SessionHooks {
                                 .output
                                 .as_ref()
                                 .map_or(0, |output| output.failures()),
-                            usage: store::run_usage(&self.journal.view().entries, &run_id),
+                            usage,
                         },
                     );
                 }
@@ -1644,14 +1662,14 @@ impl Session {
                     RunRequest::Prompt(first)
                 })
             }
-            Some(Resumption::Requeue(queued)) => {
+            Some(Resumption::Requeue { queued, wake }) => {
                 let mut prompts = Vec::new();
                 for (kind, message) in queued {
                     match kind {
-                        SubmissionKind::Prompt | SubmissionKind::Mail => prompts.push(message),
-                        SubmissionKind::Steer => agent.steer(message),
-                        SubmissionKind::FollowUp => agent.follow_up(message),
-                        SubmissionKind::Quiet => enqueue(agent, &session.hooks, kind, message),
+                        SubmissionKind::Prompt | SubmissionKind::Mail if wake => {
+                            prompts.push(message);
+                        }
+                        _ => enqueue(agent, &session.hooks, kind, message),
                     }
                 }
                 (!prompts.is_empty()).then_some(RunRequest::Prompt(prompts))
@@ -1993,16 +2011,7 @@ impl Session {
             if let Some((model, level)) = selection {
                 hooks.apply_selection(&agent, model, level);
             }
-            let (new_shape, nested, diagnostics) = {
-                let base = hooks
-                    .shape_base
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                shape(&base, spec.as_ref())
-            };
-            for diagnostic in diagnostics {
-                warn!("{diagnostic}");
-            }
+            let (new_shape, nested) = hooks.reshape(spec.clone()).await;
             let tools = new_shape.tools.clone();
             *hooks
                 .prompt
@@ -2080,35 +2089,36 @@ impl Session {
                 "Child sessions keep the prompt and tools they were spawned with".into(),
             ));
         }
-        let _order = self.hooks.selection_order.lock().await;
-        let host = tools
-            .iter()
-            .map(|factory| factory(&self.hooks.tools))
-            .collect();
-        let spec = self.agent();
-        let (new_shape, _, diagnostics) = {
-            let mut base = self
-                .hooks
-                .shape_base
+        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        detached(async move {
+            let _order = hooks.selection_order.lock().await;
+            let host = tools.iter().map(|factory| factory(&hooks.tools)).collect();
+            let spec = hooks
+                .agent_spec
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            base.host_tools = host;
-            base.host_tool_factories = tools;
-            shape(&base, spec.as_ref())
-        };
-        for diagnostic in diagnostics {
-            warn!("{diagnostic}");
-        }
-        let tools = new_shape.tools;
-        self.hooks
-            .prompt
-            .shape
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .tools = tools.clone();
-        self.agent.set_tools(tools);
-        self.hooks.prompt.rebuild();
-        Ok(())
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            {
+                let mut base = hooks
+                    .shape_base
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                base.host_tools = host;
+                base.host_tool_factories = tools;
+            }
+            let (new_shape, _) = hooks.reshape(spec).await;
+            let tools = new_shape.tools;
+            hooks
+                .prompt
+                .shape
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tools = tools.clone();
+            agent.set_tools(tools);
+            hooks.prompt.rebuild();
+            Ok::<(), Error>(())
+        })
+        .await
     }
 
     /// Sets the thinking level from the next request, clamped to the model; returns the
@@ -2269,8 +2279,9 @@ impl Session {
                 run_id,
                 outcome,
                 reason,
+                ..
             } => Some((run_id, outcome, reason)),
-            RecoveryPlan::Park { run_id }
+            RecoveryPlan::Park { run_id, .. }
             | RecoveryPlan::Resume { run_id, .. }
             | RecoveryPlan::RecoverResponse { run_id, .. } => Some((
                 run_id,
@@ -2292,6 +2303,7 @@ impl Session {
                         run_id,
                         outcome,
                         reason,
+                        queued: Vec::new(),
                     })
                     .await?,
             );

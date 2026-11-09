@@ -427,11 +427,12 @@ fn team_problem(team: &TeamSpec, agents: &IndexMap<String, RunAs>) -> Option<Str
     }
     let mut names = HashSet::new();
     for member in &team.members {
-        if !agents.contains_key(&member.agent) {
-            return Some(format!("member \"{}\" is not an agent", member.agent));
-        }
-        if agents.get(&member.agent) == Some(&RunAs::Root) {
-            return Some(format!("member \"{}\" is root-only", member.agent));
+        match agents.get(&member.agent) {
+            None => return Some(format!("member \"{}\" is not an agent", member.agent)),
+            Some(RunAs::Root) => {
+                return Some(format!("member \"{}\" is root-only", member.agent));
+            }
+            _ => {}
         }
         let name = member.roster_name();
         if member_name_problem(name).is_some() {

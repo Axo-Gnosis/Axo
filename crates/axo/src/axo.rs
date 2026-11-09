@@ -1,6 +1,7 @@
 //! The process-wide entry point: models, the session store, the host's configuration
 //! source and the host environment.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -184,21 +185,7 @@ impl Axo {
     ) -> Result<Session, Error> {
         let (header, entries, writer) = self.store.open_write(path).await?;
         if let Some(spawn) = &header.spawn {
-            let sessions = self.store.list(&header.cwd).await?;
-            let mut parent = spawn.parent_session_id.as_str();
-            let mut root = None;
-            for _ in 0..sessions.len() {
-                let Some(info) = sessions.iter().find(|info| info.id == parent) else {
-                    break;
-                };
-                match &info.spawn {
-                    Some(spawn) => parent = &spawn.parent_session_id,
-                    None => {
-                        root = Some(info.path.clone());
-                        break;
-                    }
-                }
-            }
+            let root = self.child_root(&header.cwd, &spawn.parent_session_id).await;
             return Err(Error::ChildSession {
                 path: path.to_path_buf(),
                 root,
@@ -218,6 +205,32 @@ impl Axo {
             Some(recovery),
         )
         .await
+    }
+
+    /// The root session file above a child whose parent is `parent`, through the sessions
+    /// listed in `cwd`; `None` when the listing fails or the chain breaks.
+    async fn child_root(&self, cwd: &Path, parent: &str) -> Option<PathBuf> {
+        let sessions = match self.store.list(cwd).await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "cannot list sessions to find a child's root");
+                return None;
+            }
+        };
+        let by_id: HashMap<&str, &SessionInfo> = sessions
+            .iter()
+            .map(|info| (info.id.as_str(), info))
+            .collect();
+        let mut parent = parent;
+        // Bounded by the listing so a corrupt parent cycle cannot loop forever.
+        for _ in 0..sessions.len() {
+            let info = by_id.get(parent)?;
+            match &info.spawn {
+                Some(spawn) => parent = &spawn.parent_session_id,
+                None => return Some(info.path.clone()),
+            }
+        }
+        None
     }
 
     /// A live child session, or a parked one revived (its unfinished run resumes). Children
@@ -282,15 +295,6 @@ impl Axo {
         project_access: Option<ProjectAccess>,
         agents: &[AgentSpec],
     ) -> Result<Catalog, Error> {
-        self.resolve_catalog(cwd, project_access, agents)
-    }
-
-    fn resolve_catalog(
-        &self,
-        cwd: &Path,
-        project_access: Option<ProjectAccess>,
-        agents: &[AgentSpec],
-    ) -> Result<Catalog, Error> {
         let config = Arc::new(EffectiveConfig::resolve(
             &*self.config,
             cwd,
@@ -341,7 +345,7 @@ impl Axo {
             config,
             agents,
             diagnostics: mut agent_diagnostics,
-        } = self.resolve_catalog(&cwd, project_access, &agents)?;
+        } = self.catalog(&cwd, project_access, &agents)?;
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {

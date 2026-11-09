@@ -143,6 +143,13 @@ async fn spawned_child_delivers_once_and_parks() {
     let header: Value = serde_json::from_str(bytes.lines().next().unwrap()).unwrap();
     assert_eq!(header["spawn"]["parentSessionId"], parent.id());
     assert_eq!(header["spawn"]["depth"], 1);
+    assert!(
+        bytes
+            .lines()
+            .skip(1)
+            .all(|line| { serde_json::from_str::<Value>(line).unwrap()["type"] != "agent_change" }),
+        "a child's persona is its spawn link, never an agent_change"
+    );
     let sessions = host.axo.list_sessions(&cwd).await.unwrap();
     assert!(sessions.iter().any(|s| s.id == child_id));
     assert!(sessions.iter().any(|s| s.id == parent.id()));
