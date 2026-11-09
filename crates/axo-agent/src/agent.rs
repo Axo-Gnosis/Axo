@@ -235,6 +235,11 @@ impl Agent {
         self.lock().follow_up.push_back(m);
     }
 
+    /// Removes and returns every queued follow-up message, in order.
+    pub fn take_follow_ups(&self) -> Vec<QueuedMessage> {
+        self.lock().follow_up.drain(..).collect()
+    }
+
     /// Cancels the active run, if any. The first reason given for a run wins.
     pub fn cancel(&self, reason: CancelReason) {
         let mut state = self.lock();

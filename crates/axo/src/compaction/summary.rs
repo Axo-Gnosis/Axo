@@ -14,8 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Error;
 use crate::config::{PromptOverride, RetrySettings, SummaryRequest};
+use crate::context::prompt::escape_wrappers;
 use crate::context::{Diagnostic, DiagnosticOrigin, lower_messages};
 use crate::recovery::retry_delay;
+use crate::tools::truncate::truncate_line;
 
 const TOO_LARGE: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
 const NOT_FINISHED: &str = "Summary response must finish normally without tool calls";
@@ -177,19 +179,8 @@ fn user(text: String) -> Message {
     })
 }
 
-fn lowered(messages: &[AgentMessage]) -> Vec<Message> {
+pub(crate) fn lowered(messages: &[AgentMessage]) -> Vec<Message> {
     Transcript::new(lower_messages(messages.to_vec())).into_messages()
-}
-
-fn escape_boundaries(text: &str) -> String {
-    static TAGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)<\s*/?\s*(?:conversation|previous-summary)\s*>")
-            .expect("constant boundary pattern")
-    });
-    TAGS.replace_all(text, |caps: &regex::Captures<'_>| {
-        format!("&lt;{}", &caps[0][1..])
-    })
-    .into_owned()
 }
 
 fn content_text(content: &[UserBlock]) -> String {
@@ -226,7 +217,22 @@ fn tool_text(text: &str) -> String {
     )
 }
 
+/// How a rendered conversation shows tool calls and results.
+#[derive(Clone, Copy)]
+pub(crate) enum ToolDetail {
+    /// Summarizer input: full call arguments, results capped at 2000 UTF-16 units (`tool_text`).
+    Capped,
+    /// `agent://…/transcript`: each call and each result cut to one line of at most 200 chars.
+    OneLine,
+}
+
 fn serialize(messages: &[Message]) -> String {
+    escape_wrappers(&render_conversation(messages, ToolDetail::Capped)).into_owned()
+}
+
+/// `[User]: …`, `[Assistant]: …`, `[Assistant tool calls]: a(k=v); b(…)`, `[Tool result]: …`,
+/// joined by blank lines; system messages skipped.
+pub(crate) fn render_conversation(messages: &[Message], detail: ToolDetail) -> String {
     let mut parts = Vec::new();
     for message in messages {
         match message {
@@ -257,7 +263,11 @@ fn serialize(messages: &[Message]) -> String {
                             .map(|(key, value)| format!("{key}={value}"))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("{}({args})", call.name)
+                        let text = format!("{}({args})", call.name);
+                        match detail {
+                            ToolDetail::Capped => text,
+                            ToolDetail::OneLine => truncate_line(&text, 200).0.into_owned(),
+                        }
                     })
                     .collect();
                 if !calls.is_empty() {
@@ -267,13 +277,27 @@ fn serialize(messages: &[Message]) -> String {
             Message::ToolResult(message) => {
                 let text = content_text(&message.content);
                 if !text.is_empty() {
-                    parts.push(format!("[Tool result]: {}", tool_text(&text)));
+                    let text = match detail {
+                        ToolDetail::Capped => tool_text(&text),
+                        ToolDetail::OneLine => {
+                            let mut lines = text.lines();
+                            let mut first = truncate_line(lines.next().unwrap_or_default(), 200)
+                                .0
+                                .into_owned();
+                            let remaining = lines.count();
+                            if remaining > 0 {
+                                first.push_str(&format!(" [+{remaining} lines]"));
+                            }
+                            first
+                        }
+                    };
+                    parts.push(format!("[Tool result]: {text}"));
                 }
             }
             Message::System(_) => {}
         }
     }
-    escape_boundaries(&parts.join("\n\n"))
+    parts.join("\n\n")
 }
 
 /// One summarizer request: the rules as its system prompt, then the serialized messages.
@@ -287,7 +311,7 @@ fn separate(
     if let Some(previous) = previous {
         text.push_str(&format!(
             "\n\n<previous-summary>\n{}\n</previous-summary>",
-            escape_boundaries(previous)
+            escape_wrappers(previous).into_owned()
         ));
     }
     text.push_str("\n\n");

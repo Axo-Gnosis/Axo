@@ -171,13 +171,13 @@ At session start, model sources are `SessionOptions::model`, the session's last 
 
 ### Child sessions (`subagents` / `axo::SubagentSettings`)
 
-The whole block is **user-only**, including in trusted projects. These settings govern children started through `Session::spawn`, not the root session's run.
+The whole block is **user-only**, including in trusted projects. These settings govern children started through `Session::spawn` or the model's `spawn` tool, not the root session's run.
 
 | Key | Rust field | Default | Meaning |
 | :--- | :--- | :--- | :--- |
-| `subagents.maxDepth` | `max_depth` | `1` | Maximum child depth: root sessions are depth 0, their children depth 1. `0` disables spawning |
+| `subagents.maxDepth` | `max_depth` | `1` | Maximum child depth: root sessions are depth 0, their children depth 1. `0` disables spawning. The model's `spawn` tool is offered only below this depth, after applying the agent's tool allowlist |
 | `subagents.maxConcurrent` | `max_concurrent` | `8` | Shared child-run slots under one root session. Runs beyond the limit queue first in, first out; `0` is treated as `1`. The root run does not take a slot |
-| `subagents.maxTurns` | `max_turns` | `50` | Model requests per child run before its wrap-up turn; an agent's `maxTurns` overrides it. Calls in the last budgeted turn are blocked; wrap-up calls terminate the run. See [Child sessions](sessions-and-compaction.md#child-sessions) |
+| `subagents.maxTurns` | `max_turns` | `50` | Model requests per child run before its wrap-up turn; an agent's `maxTurns` overrides it. Calls in the last budgeted turn are blocked; wrap-up calls terminate the run. `yield` is exempt so a child with an output schema can still return its result. See [Child sessions](sessions-and-compaction.md#child-sessions) |
 | `subagents.defaultModel` | `default_model` | `None` | Fallback child model selector before inheriting the parent's live model |
 | `subagents.models` | `models` | `{}` | Catalog agent name → model selector |
 | `subagents.contextFiles` | `context_files` | `false` | Default child context-file policy: `false` disables home, user, project, and nested context files; `true` uses the inherited session settings; a name-to-boolean map overrides the inherited `contextFiles` map |
@@ -185,6 +185,8 @@ The whole block is **user-only**, including in trusted projects. These settings 
 Child model selection considers `SpawnRequest::model`, the named agent's entry in `subagents.models`, the resolved spec's model, then `subagents.defaultModel`. The first selector naming a model wins; otherwise the parent's live model is inherited. The first thinking suffix encountered through that winning selector wins, otherwise the parent's live thinking level is used, clamped to the selected model. These child selectors use [model selector](#model-selectors) syntax, not the environment-expanding `defaultModel` fallback.
 
 An agent's explicit context-file map or `false` overrides the child default. Omitted or `true` on the agent uses `subagents.contextFiles`. Children always disable `ask` and do not inherit `SessionOptions::sections`; see [Child prompts](prompts-and-context.md#child-prompts).
+
+`SpawnRequest::output` (or the model's call-level `output`) overrides the selected agent's result schema before spawn hooks run. An agent returned by a replacing hook keeps its own schema. Output schemas apply only to children, not root personas; see [Spawning and returning results](prompts-and-context.md#spawning-and-returning-results) for `yield`, wrapping non-object schemas, and failure handling.
 
 ### Project access (`project` / `axo::ProjectSettings`)
 

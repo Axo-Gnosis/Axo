@@ -89,15 +89,30 @@ impl SessionHooks {
         true
     }
 
-    /// Ends the busy state its caller owns, unless pending job results start a delivery
-    /// run first: then `running` stays set and the run settles like any other. Called
-    /// wherever the session would go idle.
+    /// Ends the busy state its caller owns, unless queued follow-ups or pending job
+    /// results start a run first: then `running` stays set and the run settles like any
+    /// other. Called wherever the session would go idle.
     pub(super) fn release_or_deliver(&self) {
         if self.may_deliver()
             && let Some((agent, hooks)) = self.owners()
-            && self.start_delivery(agent, hooks)
         {
-            return;
+            // A follow-up queued while idle, or after the run's last drain point, starts the next run.
+            let follow_ups = agent.take_follow_ups();
+            if !follow_ups.is_empty() {
+                let mut messages = self.run_input(self.reserve_delivery(), None);
+                messages.extend(follow_ups);
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await
+                    {
+                        warn!(%err, "follow-up run failed");
+                    }
+                });
+                return;
+            }
+            if self.start_delivery(agent, hooks) {
+                return;
+            }
         }
         self.activity
             .send_modify(|activity| activity.running = false);
@@ -256,9 +271,14 @@ impl Session {
         self.queue(SubmissionKind::Steer, input.into()).await
     }
 
-    /// Saves and queues a user message delivered when the run would otherwise end.
+    /// Saves and queues a user message delivered when the active run would otherwise end;
+    /// on an idle session it starts a run.
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::FollowUp, input.into()).await
+        self.queue(SubmissionKind::FollowUp, input.into()).await?;
+        if self.hooks.claim_idle() {
+            self.hooks.release_or_deliver();
+        }
+        Ok(())
     }
 
     /// `steer`/`follow_up`: saves the submission and hands its message to the agent's

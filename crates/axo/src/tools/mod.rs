@@ -8,6 +8,7 @@ pub(crate) mod files;
 pub(crate) mod find;
 pub(crate) mod grep;
 mod ledger;
+pub(crate) mod output;
 pub(crate) mod read;
 pub(crate) mod truncate;
 pub(crate) mod wait;
@@ -281,10 +282,11 @@ fn clean_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-/// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait`, plus
-/// `ask` when `ask` is set.
+/// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait`,
+/// followed by `spawn` when supplied and `ask` when `ask` is set.
 pub(crate) fn builtin(
     tools: &Arc<SessionTools>,
+    spawn: Option<Arc<dyn Tool>>,
     ask: bool,
     questions: Arc<PendingQuestions>,
     timeout: Option<Duration>,
@@ -298,6 +300,9 @@ pub(crate) fn builtin(
         Arc::new(FindTool::new(tools.clone())),
         Arc::new(WaitTool::new(tools.clone())),
     ];
+    if let Some(spawn) = spawn {
+        list.push(spawn);
+    }
     if ask {
         list.push(Arc::new(AskTool::new(questions, timeout)));
     }

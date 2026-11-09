@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::jobs::render_results;
 use crate::tools::SessionTools;
 
-const DESCRIPTION: &str = "Block until a background job (bg_N) finishes and return its result. Returns immediately when no background job is running. A new user message interrupts the wait.";
+const DESCRIPTION: &str = "Block until a background job (bg_N) or subagent (agent_N) reports, then return every pending result. Returns immediately when none is running. A new user message interrupts the wait.";
 
 pub struct WaitTool {
     tools: Arc<SessionTools>,

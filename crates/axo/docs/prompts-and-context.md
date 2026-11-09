@@ -34,6 +34,8 @@ When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (in
 
 ### Built-in tool guidelines (`tools`)
 
+Before agent allowlists and depth filtering, the built-in order is `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `spawn`, followed by `ask` when enabled. `spawn` is withheld when the session's depth is at least `subagents.maxDepth` (roots have depth 0). Filtering it after the allowlist avoids an unknown-tool diagnostic for an inherited allowlist naming `spawn`. Children with an output schema receive `yield` after the allowlist regardless of whether it names that tool.
+
 Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the built-in tool set:
 - `read`: `"Use read to examine files instead of cat or sed."`
 - `write`: `"Use write only for new files or complete rewrites."`
@@ -123,8 +125,8 @@ Review the code for correctness and report actionable findings.
 | `tools` | Optional allowlist over built-in **and host** tools, as a list or comma-separated string (trimmed, empty entries dropped). Omitted keeps all tools; an empty list keeps none. Unknown tool names produce diagnostics when the agent is selected. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
 | `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings for roots and uses `subagents.contextFiles` for children |
 | `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` can restore removed sections in root sessions; children's fixed `delegation` section cannot be removed |
-| `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. Stored as metadata only; responses are not validated against it |
-| `maxTurns` | Model requests per child run before the wrap-up turn; omitted uses `subagents.maxTurns` (default 50). Ignored for root sessions. The tool list stays unchanged; budget enforcement blocks calls through an internal hook |
+| `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. For children, defines the result returned through `yield`; ignored for root sessions |
+| `maxTurns` | Model requests per child run before the wrap-up turn; omitted uses `subagents.maxTurns` (default 50). Ignored for root sessions. The tool list stays unchanged; budget enforcement blocks calls through an internal hook, except `yield` |
 
 The trimmed body replaces the `system` section when non-empty; an empty body keeps the configured or bundled `SYSTEM`. Agent bodies are used verbatim, without harness-name substitution, and do not change `WORK`, `PROSE`, or summarizer prompt overrides.
 
@@ -136,11 +138,30 @@ Unreadable files, malformed frontmatter, invalid names or schemas, and collision
 
 ### Child prompts
 
-`Session::spawn` selects a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools. Named agents use their own allowlists over built-in and host tools.
+`Session::spawn` and the model's `spawn` tool select a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask` and `yield`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools excluding those two tools. Named agents use their own allowlists over built-in and host tools.
 
 Children share the parent's resolved configuration and prompt overrides, agent catalog, host tool factories, schemes, and tool/spawn hooks. They do **not** inherit host `SessionOptions::sections`, and `ask` is always disabled. Context files default to off through `subagents.contextFiles`; an agent can supply its own map or disable them explicitly.
 
 The fixed `delegation` section tells the child to work autonomously without asking questions and to report its outcome, evidence, and hand-off needs to the parent. It is inserted first after all section overrides, cannot be replaced or removed, and is not a `PROMPT_NAMES` override. The resolved spec, including spawn-hook replacements and child defaults, is persisted in `SpawnLink::spec`; revival reuses it rather than looking up an edited agent definition. See [Spawning child sessions](extending.md#spawning-child-sessions).
+
+### Spawning and returning results
+
+`spawn` starts a separate child session in the background and returns its `agent_N` id immediately, not its final answer. Its description lists defined agents (not teams) and available model roles. Prefer a defined agent, use an inline spec only when none fits, or omit both selectors for a plain delegate. Leave the model unset unless there is a reason to change it.
+
+| Parameter | Meaning |
+| :--- | :--- |
+| `agent` | Optional catalog agent name; mutually exclusive with `spec` |
+| `spec` | Optional inline object: required `prompt`, optional `tools` allowlist, `model`, and `output` JSON Schema |
+| `task` | Required, non-blank assignment; the child's initial prompt, not a copy of the parent's conversation |
+| `context` | Optional background appended to the task as `\n\nContext:\n{context}` when non-blank |
+| `model` | Optional model selector, including `@role` and a thinking suffix; overrides the spec's model |
+| `output` | Optional JSON Schema overriding the agent's own result schema before spawn hooks run |
+
+Keep working after spawning: each finished run's result arrives automatically, or through `wait` when there is nothing else to do. Read [agent URLs](#agent) for status, results, or the child's projected conversation; write to the child to send a follow-up. `spawn` is `Replay::Safe`: recovery adopts the same child for a repeated call id instead of creating a duplicate.
+
+A child with `output` must call `yield` to return its final result; a text answer alone is not a result. With an explicit `"type": "object"` schema, the tool arguments are the result object. Other schemas are wrapped in an object with required `result`, so a string schema takes `{"result":"answer"}` and returns the string itself. Accepted strings are delivered as raw text; other values use compact JSON.
+
+Arguments are validated before tool hooks or execution. Rejected calls report validation errors for the child to fix. A turn ending without a valid yield gets one `yield_nudge` per run; ending again without yielding reports an error rather than accepting the text. Three rejected yield calls fail the run. Failure reports include the last rejected attempt, or the last text answer when there was none. The internal turn-budget hook always permits `yield`, and its wrap-up notice asks output children to call it with their best final result. `yield` is `Replay::Safe`; its state resets for each run.
 
 ### Teams
 
@@ -254,21 +275,35 @@ A truncated foreground `bash` result names `artifact://<n>` in its notice and ha
 
 ### `wait`
 
-`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a command result or child-run message is pending, then returns every pending message, joined by blank lines. Command results use `[bg_N] <first command line, max 120 chars>\n<result>`; child messages use the child row and agent name (or “subagent”), with a partial-result label when the turn budget was exhausted. It returns `No background jobs are running.` at once when no admitted job is still running, a wait-interrupted notice listing the running row ids when the user steers, and `Operation aborted` (error) on Stop. It sleeps on registry changes instead of polling, and committed results are consumed: they are never delivered again. Any tool batch containing `wait` runs one call at a time, so a `bash` promoted earlier in the same batch is already admitted when `wait` looks for running jobs.
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending message, joined by blank lines. Command results use `[bg_N] <first command line, max 120 chars>\n<result>`; child messages use the child row and agent name (or “subagent”), with a partial-result label when the turn budget was exhausted. It returns `No background jobs are running.` at once when no admitted job is still running, a wait-interrupted notice listing the running row ids when the user steers, and `Operation aborted` (error) on Stop. It sleeps on registry changes instead of polling, and committed results are consumed: they are never delivered again. Any tool batch containing `wait` runs one call at a time, so a promoted `bash` or a `spawn` earlier in the same batch has committed admission before `wait` looks for running jobs.
 
 ### `proc://`
 
-The session's `proc://` scheme (`Target::Virtual`; prompt doc `proc:// background jobs: read proc:// lists them, read proc://bg_N shows one, write proc://bg_N/kill (empty content) stops it.`) inspects and stops jobs without consuming results:
+The session's `proc://` scheme (`Target::Virtual`) inspects and stops background command jobs and subagents without consuming results. List both with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop either with `write proc://<id>/kill` (empty content):
 
 | Operation | Result |
 | :--- | :--- |
 | `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Status is `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
-| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://bg_N or proc://bg_N/kill.` |
+| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://<id> or proc://<id>/kill.` |
 | `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
-| `read proc://agent_N` | Child row details: `Job:`, `Agent:`, `Model:`, `Session:`, `Status:`, plus `Result:` for its latest undelivered message |
-| `write proc://agent_N/kill` | Aborts the running child session; does not remove its row or prevent later host prompts |
+| `read proc://agent_N` | Child row details: `Job:`, `Agent:`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
+| `write proc://agent_N/kill` | Aborts the running child session; does not remove its row or prevent later prompts or follow-ups |
 
-Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside a session) has no `proc://`.
+Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside an open session) has neither `proc://` nor `agent://`.
+
+### `agent://`
+
+The session's `agent://` scheme is virtual and addresses children spawned by that session. List their ids with `read proc://`; an unknown child is an error.
+
+| Operation | Result |
+| :--- | :--- |
+| `read agent://agent_N` | Agent id, name (or “subagent”), model, session id, status, and assistant-turn count. Status is `running`, `finished`, or `failed`, as in `proc://`, with no idle label. Shows latest text while running, otherwise the last result, marked partial when its turn budget was exhausted |
+| `read agent://agent_N/result` | Full latest completed-run result, even after delivery; errors if no result exists yet. A trailing slash is also accepted |
+| `read agent://agent_N/result/<json-pointer>` | Parses the result as JSON and selects the pointer after adding its leading slash; for example `result/findings/0` selects the first finding. Strings return raw text, other values pretty-printed JSON. Missing pointers or non-JSON results are errors |
+| `read agent://agent_N/transcript` | Projected conversation, including compaction summaries, not the raw journal. System messages are omitted; tool calls are abbreviated to 200 characters and tool results to their first line (up to 200 characters), with a count of additional lines. Page with the read tool's `offset` and `limit` |
+| `write agent://agent_N` | Sends non-blank content through `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_N. Its reply arrives as a new result.` |
+
+Result and transcript paths are read-only. Reads never consume pending deliveries. Writes are actions with `Replay::Never`, so crash recovery does not automatically repeat a follow-up.
 
 ### Results in context
 
@@ -282,5 +317,7 @@ Background job results:
 ```
 
 Child messages use the same envelope, with the child row in brackets followed by its catalog agent name (or “subagent”). Budget-limited results add “(partial: turn budget exhausted)” to that label. A child keeps one row across all its runs; see [Child sessions](sessions-and-compaction.md#child-sessions).
+
+Child delivery text is capped at 2000 lines or 50 KB, with an `agent://agent_N/result` pointer for the full result. An oversized first line is replaced by a notice suggesting that URL or a JSON pointer. The pointer always names the latest result, even if the capped delivery was an older run. Both command and child deliveries escape axo's fixed wrapper tags (such as `<system>` and `<conversation>`) by changing their opening `<` to `&lt;`; arbitrary host section names are not covered. The journal's `job_end` retains the full, unescaped text.
 
 During a run it is injected at the next turn boundary, after the current tool batch; it never counts as a steer, so it neither promotes `bash` nor interrupts `wait`. With the session idle, it starts a run of its own unless automatic continuation is latched off by a Stop or an unsuccessful run. A new `prompt` places pending results before the user's message.

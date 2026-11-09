@@ -37,7 +37,7 @@ fn parse(path: &str) -> Option<ProcPath> {
 
 fn unsupported(url: &SchemeUrl) -> ToolError {
     ToolError(format!(
-        "Unsupported proc:// path: {}. Use proc://, proc://bg_N or proc://bg_N/kill.",
+        "Unsupported proc:// path: {}. Use proc://, proc://<id> or proc://<id>/kill.",
         url.path
     ))
 }
@@ -49,7 +49,7 @@ impl Scheme for ProcScheme {
     }
 
     fn prompt_doc(&self) -> &str {
-        "proc:// background jobs: read proc:// lists them, read proc://bg_N shows one, write proc://bg_N/kill (empty content) stops it."
+        "proc:// background jobs and subagents: read proc:// lists them, read proc://bg_N or proc://agent_N shows one, write proc://<id>/kill (empty content) stops it."
     }
 
     async fn resolve(&self, _url: &SchemeUrl, _cx: &SchemeContext) -> Result<Target, ToolError> {
@@ -98,7 +98,7 @@ impl Scheme for ProcScheme {
                         agent,
                         model,
                     } => format!(
-                        "Job: {}\nAgent: {}\nModel: {}\nSession: {}\nStatus: {}",
+                        "Job: {}\nAgent: {}\nModel: {}\nSession: {}\nStatus: {}\nDetails: agent://{id}",
                         job.id,
                         agent.as_deref().unwrap_or("subagent"),
                         model,

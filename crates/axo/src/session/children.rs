@@ -1,7 +1,7 @@
 //! Live and parked child sessions, and registries through which they report results.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -15,12 +15,13 @@ use tracing::warn;
 
 use super::delivery::Activity;
 use super::spawn::child_inherited;
-use super::{Inherited, RecoveryPolicy, Session, SessionHooks, SessionSetup};
+use super::{Inherited, RecoveryPolicy, Session, SessionHooks, SessionSetup, journal};
 use crate::error::Error;
-use crate::jobs::JobRegistry;
 use crate::jobs::child::{ended_runs, run_message};
+use crate::jobs::{ChildRef, JobRegistry};
 use crate::recovery::needs_recovery;
-use crate::store::{SpawnLink, project};
+use crate::store::{SeqEntry, SessionStore, SpawnLink, project};
+use crate::tools::output::{YIELD, YieldState};
 
 /// Every child session this process knows, live or parked, plus every open session's registry (children deliver through it).
 #[derive(Default)]
@@ -42,6 +43,26 @@ pub(crate) struct ChildSeed {
     pub(crate) path: PathBuf,
     pub(crate) inherited: Arc<Inherited>,
     pub(crate) link: SpawnLink,
+}
+
+pub(crate) struct ChildLog {
+    pub(crate) live: Option<Arc<Session>>,
+    pub(crate) link: Option<SpawnLink>,
+    entries: LogEntries,
+}
+
+enum LogEntries {
+    Live(Arc<journal::View>),
+    Stored(Vec<SeqEntry>),
+}
+
+impl ChildLog {
+    pub(crate) fn entries(&self) -> &[SeqEntry] {
+        match &self.entries {
+            LogEntries::Live(view) => &view.entries,
+            LogEntries::Stored(entries) => entries,
+        }
+    }
 }
 
 impl SessionTable {
@@ -148,6 +169,28 @@ impl SessionTable {
         self.insert_live(id.to_owned(), seed, session.clone());
         Ok(session)
     }
+
+    /// A child's link and raw entries: from the live session's journal view, else read from its file.
+    pub(crate) async fn child_log(
+        &self,
+        store: &dyn SessionStore,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<ChildLog, Error> {
+        if let Some(live) = self.live(session_id) {
+            return Ok(ChildLog {
+                link: live.agent().cloned(),
+                entries: LogEntries::Live(live.hooks.journal.view()),
+                live: Some(live),
+            });
+        }
+        let (header, entries) = store.open_read(path).await?;
+        Ok(ChildLog {
+            live: None,
+            link: header.spawn,
+            entries: LogEntries::Stored(entries),
+        })
+    }
 }
 
 pub(super) async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
@@ -192,6 +235,7 @@ pub(super) async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
 pub(super) struct ChildState {
     pub(super) link: SpawnLink,
     pub(super) budget: Arc<TurnBudget>,
+    pub(super) output: Option<Arc<YieldState>>,
 }
 
 pub(super) struct TurnBudget {
@@ -224,9 +268,12 @@ impl TurnBudget {
 impl ToolHooks for TurnBudget {
     async fn before_tool_call(
         &self,
-        _call: BeforeToolCallContext<'_>,
+        call: BeforeToolCallContext<'_>,
         _cancel: &CancellationToken,
     ) -> Result<ToolCallDecision, ToolError> {
+        if call.tool_call.name == YIELD {
+            return Ok(ToolCallDecision::Allow);
+        }
         let requests = self.requests();
         Ok(if requests >= self.limit {
             ToolCallDecision::Block {
@@ -264,56 +311,77 @@ pub(super) async fn park_when_idle(
 
 impl Session {
     pub(super) async fn reconcile_children(&self) -> Result<(), Error> {
-        let jobs = &self.hooks.tools.runner.jobs;
-        for (_, child_id, path) in jobs.children() {
-            let live = self.inherited.sessions.live(&child_id);
-            let (header, entries) = if let Some(child) = &live {
-                (None, child.hooks.journal.view().entries.clone())
-            } else {
-                match self.inherited.store.open_read(&path).await {
-                    Ok((header, entries)) => (Some(header), entries),
-                    Err(error) => {
-                        warn!(%error, %child_id, "could not read child session");
-                        continue;
-                    }
+        for child in self
+            .hooks
+            .tools
+            .runner
+            .jobs
+            .children()
+            .into_iter()
+            .filter(|child| child.admitted)
+        {
+            self.hooks.reconcile_child(&child).await?;
+        }
+        Ok(())
+    }
+}
+
+impl SessionHooks {
+    pub(super) async fn reconcile_child(&self, child: &ChildRef) -> Result<(), Error> {
+        let child_id = &child.session_id;
+        let jobs = &self.tools.runner.jobs;
+        let log = match self
+            .inherited
+            .sessions
+            .child_log(&*self.inherited.store, child_id, &child.path)
+            .await
+        {
+            Ok(log) => log,
+            Err(error) => {
+                warn!(%error, %child_id, "could not read child session");
+                return Ok(());
+            }
+        };
+        let output = log.link.as_ref().and_then(|link| link.spec.output.as_ref());
+        for run_id in ended_runs(log.entries()) {
+            if let Some(message) = run_message(log.entries(), &run_id, output) {
+                jobs.child_message(child_id, message, false).await?;
+            }
+        }
+        if log.live.is_some() {
+            return Ok(());
+        }
+        let recover = needs_recovery(log.entries());
+        let Some(link) = log.link else {
+            warn!(%child_id, "child session has no spawn link");
+            return Ok(());
+        };
+        let seed = Arc::new(ChildSeed {
+            path: child.path.clone(),
+            inherited: child_inherited(&self.inherited, &link.spec),
+            link,
+        });
+        if recover {
+            let child = match revive(&seed).await {
+                Ok(child) => child,
+                Err(error @ Error::SessionBusy { .. }) => {
+                    warn!(%error, %child_id, "could not revive child session");
+                    return Ok(());
                 }
+                Err(error) => return Err(error),
             };
-            for run_id in ended_runs(&entries) {
-                if let Some(message) = run_message(&entries, &run_id) {
-                    jobs.child_message(&child_id, message, false).await?;
+            self.inherited
+                .sessions
+                .insert_live(child_id.clone(), seed, child.clone());
+            let view = child.hooks.journal.view();
+            let output = child.agent().and_then(|link| link.spec.output.as_ref());
+            for run_id in ended_runs(&view.entries) {
+                if let Some(message) = run_message(&view.entries, &run_id, output) {
+                    jobs.child_message(child_id, message, false).await?;
                 }
             }
-            let Some(header) = header else { continue };
-            let Some(link) = header.spawn else {
-                warn!(%child_id, "child session has no spawn link");
-                continue;
-            };
-            let seed = Arc::new(ChildSeed {
-                path,
-                inherited: child_inherited(&self.inherited, &link.spec),
-                link,
-            });
-            if needs_recovery(&entries) {
-                let child = match revive(&seed).await {
-                    Ok(child) => child,
-                    Err(error @ Error::SessionBusy { .. }) => {
-                        warn!(%error, %child_id, "could not revive child session");
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                self.inherited
-                    .sessions
-                    .insert_live(child_id.clone(), seed, child.clone());
-                let entries = child.hooks.journal.view().entries.clone();
-                for run_id in ended_runs(&entries) {
-                    if let Some(message) = run_message(&entries, &run_id) {
-                        jobs.child_message(&child_id, message, false).await?;
-                    }
-                }
-            } else {
-                self.inherited.sessions.seed(child_id, seed);
-            }
+        } else {
+            self.inherited.sessions.seed(child_id.clone(), seed);
         }
         Ok(())
     }

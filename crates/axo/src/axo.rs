@@ -215,6 +215,7 @@ impl Axo {
     /// `skill://` over the skills on disk now, `axo://` with a cache directory), plus
     /// `host`. Reads only the header, samples the configuration source, and materializes
     /// bundled docs when a cache directory is configured: no lock, recovery, or model.
+    /// Live `proc://` and `agent://` schemes are available only through an open session.
     /// Resolve for display; write to a session's files through an open `Session`.
     /// `project_access` is the `SessionOptions::project_access` the host
     /// opens this session with (`None` uses the user policy), so `skill://` sees the same

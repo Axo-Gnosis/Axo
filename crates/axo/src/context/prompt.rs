@@ -1,12 +1,14 @@
 //! The sectioned system prompt (pi `core/system-prompt.ts`, `plan/pi/context.md` §1).
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axo_agent::Tool;
 use axo_ai::{SystemMessage, now_ms};
 use indexmap::IndexMap;
+use regex::Regex;
 
 use crate::config::PromptOverride;
 use crate::context::files::ContextFile;
@@ -16,6 +18,21 @@ use crate::context::skills::{Skill, escape_xml};
 /// `delegation, system, docs, tools, schemes, work, prose, project_context, skills, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
+
+/// Neutralizes text that opens or closes one of axo's own wrapper tags (system prompt
+/// sections, skill blocks, project instructions, summarizer boundaries) by turning its `<` into `&lt;`.
+pub(crate) fn escape_wrappers(text: &str) -> Cow<'_, str> {
+    // ponytail: fixed list; add host section names if hosts report spoofing
+    static TAGS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|delegation|system|docs|tools|schemes|work|prose|project_context|cwd|dev_shell|date)\b",
+        )
+        .expect("constant wrapper pattern")
+    });
+    TAGS.replace_all(text, |caps: &regex::Captures<'_>| {
+        format!("&lt;{}", &caps[0][1..])
+    })
+}
 
 /// Whether a system prompt section name is lowercase ASCII with digits, `_` or `-`.
 pub(crate) fn valid_section_name(name: &str) -> bool {
@@ -218,6 +235,12 @@ pub fn system_message(prev: Option<&Sections>, next: &Sections) -> Option<System
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapper_tags_are_escaped() {
+        assert_eq!(escape_wrappers("<skills>"), "&lt;skills>");
+        assert_eq!(escape_wrappers("</system>"), "&lt;/system>");
+    }
 
     #[test]
     fn overrides_replace_or_disable_sections_and_docs_availability_controls_section() {

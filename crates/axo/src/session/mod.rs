@@ -41,8 +41,9 @@ use self::maintenance::Maintenance;
 use self::prompt::{PromptState, SessionPrompt};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
+use self::spawn::SpawnTool;
 pub use self::spawn::{
-    ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnRequest,
+    ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
 };
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
@@ -58,6 +59,7 @@ use crate::exec::host::ProcessSupervisor;
 use crate::input::{PromptInput, PromptPart};
 use crate::jobs::{JobHost, JobId, JobInfo, JobRegistry};
 use crate::recovery::{self, RecoveryPlan, plan_recovery};
+use crate::schemes::agent::AgentScheme;
 use crate::schemes::artifact::Artifacts;
 use crate::schemes::dir::{DirScheme, ensure_bundled_docs};
 use crate::schemes::proc::ProcScheme;
@@ -67,6 +69,7 @@ use crate::store::{
     self, CompactionReason, Entry, EntryBase, EntryId, Header, Projection, SeqEntry, SessionStore,
     SessionWriter, SubmissionKind, project,
 };
+use crate::tools::output::{MAX_YIELD_FAILURES, YIELD, YIELD_NUDGE, YieldState, YieldTool};
 use crate::tools::{self, Answer, PendingQuestions, Question, SessionTools, ToolFactory};
 
 pub struct SessionOptions {
@@ -611,8 +614,11 @@ impl SessionHooks {
                         .sessions
                         .registry(&child.link.parent_session_id)
                 {
-                    let message =
-                        crate::jobs::child::run_message(&self.journal.view().entries, &run_id);
+                    let message = crate::jobs::child::run_message(
+                        &self.journal.view().entries,
+                        &run_id,
+                        child.link.spec.output.as_ref(),
+                    );
                     if let Some(message) = message
                         && let Err(error) =
                             parent.child_message(&self.session_id, message, true).await
@@ -725,6 +731,13 @@ impl SessionHooks {
         };
         self.record_selection(model.as_deref(), thinking).await
     }
+
+    fn yield_nudge(&self) -> bool {
+        self.child
+            .as_ref()
+            .and_then(|child| child.output.as_ref())
+            .is_some_and(|output| output.nudge())
+    }
 }
 
 #[async_trait]
@@ -791,7 +804,7 @@ impl LoopHooks for SessionHooks {
                 let changed = self.automatic(CompactionReason::Overflow, cancel).await?;
                 let messages = changed.then(|| self.projected_messages());
                 return Ok(TurnFinish {
-                    continue_turn: false,
+                    continue_turn: self.yield_nudge(),
                     messages,
                 });
             }
@@ -857,14 +870,27 @@ impl LoopHooks for SessionHooks {
                 let changed = self.automatic(CompactionReason::Threshold, cancel).await?;
                 let messages = changed.then(|| self.projected_messages());
                 return Ok(TurnFinish {
-                    continue_turn: false,
+                    continue_turn: self.yield_nudge(),
                     messages,
                 });
             }
             Ok(TurnFinish::default())
         }
         .await;
-        result.map_err(|error| HookError(error.to_string()))
+        let result = result.map_err(|error| HookError(error.to_string()))?;
+        if let Some(output) = self.child.as_ref().and_then(|child| child.output.as_ref()) {
+            let failures = turn
+                .tool_results
+                .iter()
+                .filter(|result| result.tool_name == YIELD && result.is_error)
+                .count() as u32;
+            if failures > 0 && output.record_failures(failures) >= MAX_YIELD_FAILURES {
+                return Err(HookError(format!(
+                    "yield was rejected {MAX_YIELD_FAILURES} times"
+                )));
+            }
+        }
+        Ok(result)
     }
 
     async fn prepare_next_turn(
@@ -878,10 +904,33 @@ impl LoopHooks for SessionHooks {
             && turn.message.tool_calls().next().is_some()
         {
             let limit = child.budget.limit;
+            let text = if child.output.is_some() {
+                format!(
+                    "Turn budget exhausted: this run used its {limit} turns. Tool calls other than yield are no longer executed. Call yield now with your best final result."
+                )
+            } else {
+                format!(
+                    "Turn budget exhausted: this run used its {limit} turns. Tool calls are no longer executed. Reply now with your final answer: what you completed, what remains, and what your parent needs to continue."
+                )
+            };
             messages.push(AgentMessage::Custom(axo_agent::CustomMessage {
                 custom_type: crate::jobs::child::TURN_BUDGET.into(),
+                content: vec![UserBlock::Text { text }],
+                display: true,
+                details: None,
+                timestamp: axo_ai::now_ms(),
+            }));
+        }
+        if self
+            .child
+            .as_ref()
+            .and_then(|child| child.output.as_ref())
+            .is_some_and(|output| output.take_nudge())
+        {
+            messages.push(AgentMessage::Custom(axo_agent::CustomMessage {
+                custom_type: YIELD_NUDGE.into(),
                 content: vec![UserBlock::Text {
-                    text: format!("Turn budget exhausted: this run used its {limit} turns. Tool calls are no longer executed. Reply now with your final answer: what you completed, what remains, and what your parent needs to continue."),
+                    text: "You ended your turn without calling yield. Call yield now with your final result; your run ends when it is accepted.".into(),
                 }],
                 display: true,
                 details: None,
@@ -909,6 +958,9 @@ impl Persist for SessionHooks {
             && let Some(child) = &self.child
         {
             child.budget.reset();
+            if let Some(output) = &child.output {
+                output.reset();
+            }
             if let Some(parent) = self
                 .inherited
                 .sessions
@@ -992,20 +1044,26 @@ impl Persist for SessionHooks {
     }
 }
 
+pub(crate) struct LiveSchemes {
+    pub(crate) jobs: Arc<JobRegistry>,
+    pub(crate) sessions: Arc<SessionTable>,
+    pub(crate) store: Arc<dyn SessionStore>,
+}
+
 /// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
 /// `artifact://` and `local://` in the side folders beside the session file `path`,
-/// `skill://`, `axo://` docs when `docs_dir` is given, `proc://` over `jobs` when given,
-/// then `host` schemes. Open sessions and `Axo::schemes` both build them here, so given
-/// the same effective config a file-backed URL resolves alike whether its session is open
-/// or not; only open sessions get `proc://` (`Axo::schemes` passes no `jobs`), since a
-/// closed session has no live jobs.
+/// `skill://`, `axo://` docs when `docs_dir` is given, `proc://` and `agent://` when
+/// `live` is given, then `host` schemes. Open sessions and `Axo::schemes` both build
+/// them here, so given the same effective config a file-backed URL resolves alike
+/// whether its session is open or not; only open sessions get `proc://` and
+/// `agent://` (`Axo::schemes` passes no live state).
 pub(crate) fn session_schemes(
     config: &EffectiveConfig,
     docs_dir: Option<&Path>,
     name: &str,
     cx: SchemeContext,
     host: &[Arc<dyn Scheme>],
-    jobs: Option<Arc<JobRegistry>>,
+    live: Option<LiveSchemes>,
 ) -> Result<(Schemes, Vec<Skill>, Vec<Diagnostic>, bool), Error> {
     let settings = &config.settings;
     let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
@@ -1032,8 +1090,15 @@ pub(crate) fn session_schemes(
             false
         }
     });
-    if let Some(jobs) = jobs {
-        builtins.push(Arc::new(ProcScheme { jobs }));
+    if let Some(live) = live {
+        builtins.push(Arc::new(ProcScheme {
+            jobs: live.jobs.clone(),
+        }));
+        builtins.push(Arc::new(AgentScheme {
+            jobs: live.jobs,
+            sessions: live.sessions,
+            store: live.store,
+        }));
     }
     let artifacts = Arc::new(Artifacts::new(cx.session_dir.join(ARTIFACTS_DIR)));
     let schemes = Schemes::new(cx, artifacts, builtins, host)?;
@@ -1123,7 +1188,11 @@ impl Session {
                 cwd: cwd.clone(),
             },
             host_schemes,
-            Some(jobs.clone()),
+            Some(LiveSchemes {
+                jobs: jobs.clone(),
+                sessions: inherited.sessions.clone(),
+                store: inherited.store.clone(),
+            }),
         )?;
         let (summary_prompts, summary_diagnostics) =
             compaction::summary::SummaryPrompts::load(&config.prompts, &inherited.harness_name);
@@ -1175,13 +1244,19 @@ impl Session {
             schemes,
             runner,
         ));
+        let yield_state = link
+            .as_ref()
+            .and_then(|link| link.spec.output.as_ref())
+            .map(|_| Arc::new(YieldState::default()));
         let host: Vec<Arc<dyn Tool>> = host_tools
             .iter()
             .map(|factory| factory(&session_tools))
             .collect();
+        let spawn_tool = Arc::new(SpawnTool::new(&inherited.agents, &settings.model_roles));
         let mut tools = tools::merge_tools(
             tools::builtin(
                 &session_tools,
+                Some(spawn_tool.clone()),
                 inherited.ask_enabled,
                 questions.clone(),
                 settings.ask.timeout_ms.map(Duration::from_millis),
@@ -1202,6 +1277,16 @@ impl Session {
             }
             tools.retain(|tool| allow.iter().any(|name| name == tool.name()));
         }
+        let depth = link.as_ref().map_or(0, |link| link.depth);
+        if depth >= settings.subagents.max_depth {
+            tools.retain(|tool| tool.name() != "spawn");
+        }
+        if let Some(output) = link.as_ref().and_then(|link| link.spec.output.as_ref())
+            && let Some(state) = &yield_state
+        {
+            tools.retain(|tool| tool.name() != YIELD);
+            tools.push(Arc::new(YieldTool::new(output, state.clone())));
+        }
         let diagnostics: Vec<_> = name_diagnostics
             .into_iter()
             .chain(file_diagnostics)
@@ -1221,6 +1306,7 @@ impl Session {
             budget: Arc::new(TurnBudget::new(
                 link.spec.max_turns.unwrap_or(settings.subagents.max_turns),
             )),
+            output: yield_state,
             link,
         });
         let mut tool_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
@@ -1230,6 +1316,7 @@ impl Session {
         tool_hooks.extend(inherited.tool_hooks.iter().cloned());
         let hooks = Arc::new_cyclic(|this: &Weak<SessionHooks>| {
             jobs.attach(this.clone() as Weak<dyn JobHost>);
+            spawn_tool.attach(this.clone());
             SessionHooks {
                 events,
                 inherited: inherited.clone(),
@@ -1589,7 +1676,7 @@ impl Session {
             .jobs
             .children()
             .into_iter()
-            .map(|(_, id, _)| id)
+            .map(|child| child.session_id)
             .collect();
         let children: Vec<_> = ids
             .iter()
@@ -1797,7 +1884,7 @@ impl Drop for Session {
             .jobs
             .children()
             .into_iter()
-            .map(|(_, id, _)| id)
+            .map(|child| child.session_id)
             .collect();
         self.inherited.sessions.remove(&ids);
         self.inherited

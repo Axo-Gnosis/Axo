@@ -1,5 +1,6 @@
 //! Per-session URL schemes for files and host-provided virtual resources.
 
+pub(crate) mod agent;
 pub mod artifact;
 pub(crate) mod dir;
 pub(crate) mod proc;
