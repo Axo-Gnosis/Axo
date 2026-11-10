@@ -33,16 +33,16 @@ use crate::tool::{
 };
 
 pub struct Routed<'a> {
-    pub tool: &'a Arc<dyn Tool>,
+    pub tool: Arc<dyn Tool>,
     pub call: Cow<'a, ToolCall>,
     /// The dispatcher the model called, when the call was redirected.
-    pub via: Option<&'a Arc<dyn Tool>>,
+    pub via: Option<Arc<dyn Tool>>,
 }
 
 /// The tool `call` runs. `Err` is the model-facing "not found" text.
 pub fn route<'a>(
-    tools: &'a [Arc<dyn Tool>],
-    deferred: &'a [Arc<dyn Tool>],
+    tools: &[Arc<dyn Tool>],
+    deferred: &[Arc<dyn Tool>],
     call: &'a ToolCall,
 ) -> Result<Routed<'a>, String> {
     let find = |name: &str| {
@@ -51,6 +51,7 @@ pub fn route<'a>(
             .chain(deferred)
             .find(|tool| tool.name() == name)
             .ok_or_else(|| format!("Tool {name} not found"))
+            .cloned()
     };
     let tool = find(&call.name)?;
     if let Some((name, arguments)) = tool.target(call) {
@@ -559,24 +560,29 @@ impl Run<'_> {
         message: &AssistantMessage,
         calls: &[ToolCall],
     ) -> Result<(Vec<ToolResultMessage>, bool), Error> {
-        let sequential = calls.iter().any(|call| {
-            route(&self.context.tools, &self.context.deferred, call)
+        let routed: Vec<_> = calls
+            .iter()
+            .map(|call| route(&self.context.tools, &self.context.deferred, call))
+            .collect();
+        let sequential = routed.iter().any(|routed| {
+            routed
+                .as_ref()
                 .is_ok_and(|routed| routed.tool.execution_mode() == ExecutionMode::Sequential)
         });
         // The batch terminates only when every produced result asks for it.
         let mut terminates: Vec<bool> = Vec::with_capacity(calls.len());
         let mut results = Vec::with_capacity(calls.len());
 
-        for calls in calls.chunks(if sequential { 1 } else { calls.len().max(1) }) {
+        let size = if sequential { 1 } else { calls.len().max(1) };
+        for (calls, routed) in calls.chunks(size).zip(routed.chunks(size)) {
             let mut slots: Vec<Option<Outcome>> = calls.iter().map(|_| None).collect();
             let mut ready = Vec::with_capacity(calls.len());
             // Preparation, including `before_tool_call`, runs in source order and clears
             // the whole batch before any call starts.
-            for (index, call) in calls.iter().enumerate() {
-                let routed = route(&self.context.tools, &self.context.deferred, call);
+            for (index, (call, routed)) in calls.iter().zip(routed).enumerate() {
                 let effective = routed.as_ref().map_or(call, |routed| routed.call.as_ref());
                 self.emit_start(effective).await?;
-                let prepared = match &routed {
+                let prepared = match routed {
                     Ok(routed) => self.prepare(message, call, routed).await,
                     Err(text) => Prepared::Immediate(error_output(text.clone())),
                 };
@@ -628,12 +634,12 @@ impl Run<'_> {
         original: &ToolCall,
         routed: &Routed<'_>,
     ) -> Prepared {
-        if let Some(via) = routed.via
+        if let Some(via) = &routed.via
             && let Err(text) = validate_arguments(&**via, original)
         {
             return Prepared::Immediate(error_output(text));
         }
-        let tool = routed.tool;
+        let tool = &routed.tool;
         let call = routed.call.as_ref();
         if let Err(text) = validate_arguments(&**tool, call) {
             return Prepared::Immediate(error_output(text));

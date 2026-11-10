@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::context::agents::AgentSpec;
+use crate::context::modes::ToolLimits;
 use crate::input::PromptPart;
 
 /// The `version` written into new session headers.
@@ -102,6 +103,9 @@ pub struct SpawnLink {
     pub model: Option<String>,
     /// The spec the child runs, after defaults and spawn hooks; reopening reuses it.
     pub spec: AgentSpec,
+    /// Tool limits of the root mode this child was spawned under; every descendant inherits them.
+    #[serde(default, skip_serializing_if = "ToolLimits::is_empty")]
+    pub limits: ToolLimits,
     /// The member's team; `None` outside teams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<TeamLink>,

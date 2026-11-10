@@ -2,9 +2,10 @@ use std::sync::{Arc, OnceLock, PoisonError, Weak};
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
-use axo_ai::{ToolCall, UserBlock, thinking::clamp_level};
+use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock, thinking::clamp_level};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
+use tracing::warn;
 
 use super::{Selection, Session, SessionEvent, SessionHooks, detached, journal};
 use crate::context::modes::ModeSpec;
@@ -21,6 +22,12 @@ pub(super) struct ModeState {
     pub yield_tool: Option<Arc<dyn Tool>>,
 }
 
+/// Mode state at the position navigation is leaving.
+pub(super) struct ModeOrigin {
+    mode: Option<String>,
+    restore: Option<ModeRestore>,
+}
+
 impl SessionHooks {
     pub(super) fn effective_mode(&self) -> Option<Arc<ModeSpec>> {
         self.mode
@@ -30,23 +37,80 @@ impl SessionHooks {
             .clone()
     }
 
-    pub(super) fn rebase_mode(&self) {
-        let name = self.journal.view().projection.mode.clone();
-        let selected = self
-            .inherited
+    pub(super) fn selected_mode(&self) -> Option<Arc<ModeSpec>> {
+        self.mode
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .selected
+            .clone()
+    }
+
+    pub(super) fn mode_origin(&self) -> ModeOrigin {
+        let view = self.journal.view();
+        ModeOrigin {
+            mode: view.projection.mode.clone(),
+            restore: view.projection.mode_restore.clone(),
+        }
+    }
+
+    fn catalog_mode(&self, name: Option<&String>) -> Option<Arc<ModeSpec>> {
+        self.inherited
             .modes
             .iter()
-            .find(|spec| Some(&spec.name) == name.as_ref())
-            .cloned();
+            .find(|spec| Some(&spec.name) == name)
+            .cloned()
+    }
+
+    /// Follows the current position's mode after navigation. Crossing into or out of a mode
+    /// switches the model as entering or leaving it would, then records the live selection.
+    pub(super) async fn rebase_mode(&self, origin: ModeOrigin) -> Result<(), Error> {
+        let target = self.catalog_mode(self.journal.view().projection.mode.as_ref());
+        let left = self.catalog_mode(origin.mode.as_ref());
+        let crossed =
+            target.as_ref().map(|spec| &spec.name) != left.as_ref().map(|spec| &spec.name);
+        let switched = if crossed {
+            let _order = self.selection_order.lock().await;
+            let current = self.selection();
+            let base = self.restore_base(origin.restore.filter(|_| left.is_some()), &current);
+            let (model, level, restore) = self
+                .mode_target(target.as_deref(), &base)
+                .unwrap_or_else(|error| {
+                    // The leaf is already written; navigation must not fail half-moved.
+                    warn!(%error, "mode model unavailable after navigation");
+                    (base.model.clone(), base.thinking, None)
+                });
+            self.switch_live(&current, model.clone(), level);
+            Some((model, level, restore))
+        } else {
+            None
+        };
+        self.record_current_selection().await?;
+        if let (Some(spec), Some((model, level, restore))) = (&target, switched) {
+            let _order = self.selection_order.lock().await;
+            let live = self.selection();
+            if live.model.provider == model.provider
+                && live.model.id == model.id
+                && live.thinking == level
+                && self.journal.view().projection.mode_restore != restore
+            {
+                self.append(vec![Entry::ModeChange {
+                    base: journal::base(),
+                    mode: Some(spec.name.clone()),
+                    restore,
+                }])
+                .await?;
+            }
+        }
         let mut state = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
         let changed = state.selected.as_ref().map(|spec| &spec.name)
-            != selected.as_ref().map(|spec| &spec.name);
-        state.selected = selected;
+            != target.as_ref().map(|spec| &spec.name);
+        state.selected = target;
         if changed {
             let _ = self.events.send(SessionEvent::Mode {
                 mode: state.selected.as_ref().map(|spec| spec.name.clone()),
             });
         }
+        Ok(())
     }
 
     pub(super) async fn select_mode(&self, spec: Option<Arc<ModeSpec>>) -> Result<(), Error> {
@@ -84,7 +148,40 @@ impl SessionHooks {
             view.projection.mode_restore.clone()
         };
         let current = self.selection();
-        let base = restore
+        let base = self.restore_base(restore, &current);
+        let (model, level, restore) = self.mode_target(spec.as_deref(), &base)?;
+        let model_changed =
+            current.model.provider != model.provider || current.model.id != model.id;
+        let mut entries = if model_changed {
+            self.model_entries(&current, &model, Some(level)).0
+        } else if current.thinking != level {
+            vec![Entry::ThinkingLevelChange {
+                base: journal::base(),
+                thinking_level: level,
+            }]
+        } else {
+            Vec::new()
+        };
+        entries.push(Entry::ModeChange {
+            base: journal::base(),
+            mode: name.clone(),
+            restore,
+        });
+        self.append(entries).await?;
+        self.switch_live(&current, model, level);
+        self.mode
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .selected = spec;
+        let _ = self.events.send(SessionEvent::Mode { mode: name });
+        self.results.supersede();
+        Ok(())
+    }
+
+    /// The selection a mode change starts from: the one recorded on entering the left mode,
+    /// else the live one.
+    fn restore_base(&self, restore: Option<ModeRestore>, current: &Selection) -> Selection {
+        restore
             .and_then(|restore| {
                 self.inherited
                     .models
@@ -94,9 +191,17 @@ impl SessionHooks {
                         thinking: restore.thinking_level,
                     })
             })
-            .unwrap_or_else(|| current.clone());
+            .unwrap_or_else(|| current.clone())
+    }
+
+    /// The model and level `spec` runs with from `base`, plus the selection to restore on
+    /// leaving it when they differ.
+    fn mode_target(
+        &self,
+        spec: Option<&ModeSpec>,
+        base: &Selection,
+    ) -> Result<(Model, ThinkingLevel, Option<ModeRestore>), Error> {
         let choice = spec
-            .as_ref()
             .and_then(|spec| spec.model.as_deref())
             .map(|selector| {
                 self.inherited
@@ -113,18 +218,6 @@ impl SessionHooks {
             None => (base.model.clone(), base.thinking),
         };
         let level = clamp_level(&model, thinking);
-        let model_changed =
-            current.model.provider != model.provider || current.model.id != model.id;
-        let mut entries = if model_changed {
-            self.model_entries(&current, &model, Some(level)).0
-        } else if current.thinking != level {
-            vec![Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: level,
-            }]
-        } else {
-            Vec::new()
-        };
         let restore = (spec.is_some()
             && (base.model.provider != model.provider
                 || base.model.id != model.id
@@ -134,28 +227,21 @@ impl SessionHooks {
                 model_id: base.model.id.clone(),
                 thinking_level: base.thinking,
             });
-        entries.push(Entry::ModeChange {
-            base: journal::base(),
-            mode: name.clone(),
-            restore,
-        });
-        self.append(entries).await?;
-        if let Some(agent) = self.agent.get().and_then(Weak::upgrade) {
-            if model_changed {
-                self.apply_selection(&agent, model, level);
-            } else if current.thinking != level {
-                agent.set_thinking(level);
-                self.selection
-                    .send_modify(|selection| selection.thinking = level);
-            }
+        Ok((model, level, restore))
+    }
+
+    /// Applies `model` and `level` to the attached agent; a no-op before one attaches.
+    fn switch_live(&self, current: &Selection, model: Model, level: ThinkingLevel) {
+        let Some(agent) = self.agent.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        if current.model.provider != model.provider || current.model.id != model.id {
+            self.apply_selection(&agent, model, level);
+        } else if current.thinking != level {
+            agent.set_thinking(level);
+            self.selection
+                .send_modify(|selection| selection.thinking = level);
         }
-        self.mode
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .selected = spec;
-        let _ = self.events.send(SessionEvent::Mode { mode: name });
-        self.results.supersede();
-        Ok(())
     }
 
     pub(super) fn mode_notice(&self) -> Option<Entry> {
@@ -249,12 +335,7 @@ impl Session {
 
     /// The selected mode, including a selection waiting for the next request boundary.
     pub fn mode(&self) -> Option<Arc<ModeSpec>> {
-        self.hooks
-            .mode
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .selected
-            .clone()
+        self.hooks.selected_mode()
     }
 
     /// Accepts a pending mode result. A message overrides the mode's continuation.
@@ -516,7 +597,7 @@ impl EnterModeTool {
         if modes.is_empty() {
             return None;
         }
-        let mut description = "Switch this session into a mode: instructions, and sometimes tool limits, for one kind of work. Modes:".to_owned();
+        let mut description = "Switch this session into a mode: instructions, and sometimes tool limits, for one kind of work.\nModes:".to_owned();
         for mode in &modes {
             description.push_str(&format!("\n- {}: {}", mode.name, mode.description));
         }

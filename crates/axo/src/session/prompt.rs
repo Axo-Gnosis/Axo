@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::config::{EffectiveConfig, PromptOverride};
 use crate::context::agents::{AgentSpec, ContextFiles};
 use crate::context::files::{ContextFile, context_file_names, load_context_files};
+use crate::context::modes::ToolLimits;
 use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir, project_root};
 use crate::tools::call::CALL;
 use crate::tools::kill::KILL;
@@ -38,6 +39,8 @@ pub(crate) struct ShapeBase {
     pub enter_mode: Option<Arc<dyn Tool>>,
     pub has_modes: bool,
     pub yield_tool: Option<Arc<dyn Tool>>,
+    /// The inherited mode ceiling of a child; empty on a root.
+    pub limits: ToolLimits,
 }
 
 /// Discovery inputs and startup files installed together in nested context.
@@ -177,6 +180,11 @@ pub(crate) fn shape(
             matches!(tool.name(), KILL | SEND) || allow.iter().any(|name| name == tool.name())
         });
         deferred.retain(|tool| allow.iter().any(|name| name == tool.name()));
+    }
+    // An inherited mode ceiling, unlike a persona allowlist, also removes kill and send.
+    if !base.limits.is_empty() {
+        tools.retain(|tool| base.limits.permits(tool.name()));
+        deferred.retain(|tool| base.limits.permits(tool.name()));
     }
     if base.depth >= settings.subagents.max_depth {
         tools.retain(|tool| tool.name() != SPAWN);

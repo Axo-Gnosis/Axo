@@ -564,18 +564,8 @@ fn convert_messages(
     compat: &ResolvedCompat,
     folded_system_messages: usize,
 ) -> Vec<Value> {
-    let mut call_names = HashMap::new();
-    if compat.requires_tool_result_name {
-        for message in messages {
-            if let Message::Assistant(assistant) = message {
-                call_names.extend(
-                    assistant
-                        .tool_calls()
-                        .map(|call| (call.id.as_str(), call.name.as_str())),
-                );
-            }
-        }
-    }
+    // The calls of the latest assistant message; its results follow it directly.
+    let mut call_names: Vec<(&str, &str)> = Vec::new();
     let instruction_role = if model.reasoning && compat.supports_developer_role {
         "developer"
     } else {
@@ -633,6 +623,14 @@ fn convert_messages(
                 params.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant(assistant) => {
+                if compat.requires_tool_result_name {
+                    call_names.clear();
+                    call_names.extend(
+                        assistant
+                            .tool_calls()
+                            .map(|call| (call.id.as_str(), call.name.as_str())),
+                    );
+                }
                 let Some(converted) = convert_assistant(model, assistant, compat) else {
                     i += 1;
                     continue;
@@ -667,9 +665,9 @@ fn convert_messages(
                     if compat.requires_tool_result_name {
                         // Routed results name the inner tool; the wire must name the model's call.
                         let name = call_names
-                            .get(result.tool_call_id.as_str())
-                            .copied()
-                            .unwrap_or(&result.tool_name);
+                            .iter()
+                            .find(|(id, _)| *id == result.tool_call_id)
+                            .map_or(result.tool_name.as_str(), |(_, name)| name);
                         if !name.is_empty() {
                             tool_message["name"] = name.into();
                         }

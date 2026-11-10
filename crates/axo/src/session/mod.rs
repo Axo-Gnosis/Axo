@@ -1557,6 +1557,10 @@ impl Session {
             has_peers,
             has_modes: link.is_none() && !inherited.modes.is_empty(),
             yield_tool,
+            limits: link
+                .as_ref()
+                .map(|link| link.limits.clone())
+                .unwrap_or_default(),
         };
         let (prompt_shape, nested, shape_diagnostics) = shape(&shape_base, root_agent);
         session_tools

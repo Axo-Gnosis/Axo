@@ -327,46 +327,196 @@ async fn mode_follows_navigation_and_survives_reopening() {
     reopened.shutdown().await;
 }
 
+fn declared(request: &RecordedRequest) -> Vec<String> {
+    declarations(request)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
 #[tokio::test]
-async fn child_spawn_cannot_regain_a_tool_denied_by_the_mode() {
+async fn mode_limits_bind_every_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}, {"id":"child"}]),
+        json!({"subagents":{"maxDepth":2}}),
+        vec![
+            ScriptedTurn::Reply(reply_text("child observed")),
+            ScriptedTurn::Reply(reply_text("child observed")),
+        ],
+    )
+    .await;
+    host.api.lane(
+        "child",
+        vec![
+            ScriptedTurn::Reply(reply_text("done")),
+            ScriptedTurn::Reply(reply_text("done")),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    );
+    let mut opts = mode_options(dir.path());
+    opts.modes[0].tools.deny = vec!["write".into(), "send".into()];
+    let limits = opts.modes[0].tools.clone();
+    let parent = host.axo.create_session(opts).await.unwrap();
+    parent.set_mode(Some("plan")).await.unwrap();
+    let child = within(parent.spawn(common::request("Inspect only.")))
+        .await
+        .unwrap();
+    let grandchild = within(child.session.spawn(common::request("Inspect deeper.")))
+        .await
+        .unwrap();
+    assert_eq!(child.session.spawn_link().unwrap().limits, limits);
+    let link = grandchild.session.spawn_link().unwrap();
+    assert_eq!(link.limits, limits);
+    assert_eq!(link.depth, 2);
+    common::until(|| {
+        host.api
+            .requests()
+            .iter()
+            .filter(|request| request.model.id == "child")
+            .count()
+            >= 2
+    })
+    .await;
+    for request in host
+        .api
+        .requests()
+        .iter()
+        .filter(|request| request.model.id == "child")
+    {
+        let tools = declared(request);
+        assert!(tools.iter().any(|name| name == "read"), "{tools:?}");
+        assert!(
+            !tools.iter().any(|name| name == "write" || name == "send"),
+            "{tools:?}"
+        );
+    }
+    grandchild.session.shutdown().await;
+    child.session.shutdown().await;
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_spawn_follows_the_selected_mode() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(
         dir.path(),
         json!([{"id":"m"}, {"id":"child"}]),
         json!({}),
-        vec![
-            ScriptedTurn::Reply(reply_text("ready to inspect")),
-            ScriptedTurn::Reply(reply_text("child observed")),
-        ],
+        vec![],
     )
     .await;
-    host.api
-        .lane("child", vec![ScriptedTurn::Reply(reply_text("done"))]);
     let parent = host
         .axo
         .create_session(mode_options(dir.path()))
         .await
         .unwrap();
     parent.set_mode(Some("plan")).await.unwrap();
-    within(parent.prompt("Begin planning.")).await.unwrap();
-    let child = within(parent.spawn(common::request("Inspect only.")))
+    let restricted = within(parent.spawn(common::request("Inspect only.")))
         .await
         .unwrap();
-    let tools = child
-        .session
-        .spawn_link()
-        .unwrap()
-        .spec
-        .tools
-        .as_ref()
-        .expect("mode limits materialized in child allowlist");
-    assert!(!tools.iter().any(|name| name == "write"));
-    assert!(
-        tools.iter().any(|name| name == "read"),
-        "unrestricted tools remain available"
+    assert_eq!(
+        restricted.session.spawn_link().unwrap().limits,
+        plan().tools
     );
-    child.session.shutdown().await;
+    parent.set_mode(None).await.unwrap();
+    let free = within(parent.spawn(common::request("Inspect freely.")))
+        .await
+        .unwrap();
+    assert!(free.session.spawn_link().unwrap().limits.is_empty());
+    restricted.session.shutdown().await;
+    free.session.shutdown().await;
     parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn navigation_across_a_mode_boundary_switches_its_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}, {"id":"planner"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("planned"))],
+    )
+    .await;
+    let mut opts = mode_options(dir.path());
+    opts.modes[0].model = Some("test/planner".into());
+    let session = host.axo.create_session(opts).await.unwrap();
+    let before = session
+        .append_custom("before-mode", Some(json!(true)))
+        .await
+        .unwrap();
+    let before = EntryId(before.entry.id().unwrap().to_owned());
+    session.set_mode(Some("plan")).await.unwrap();
+    within(session.prompt("Plan.")).await.unwrap();
+    let entered = journal(&session)
+        .into_iter()
+        .rev()
+        .find(|entry| entry["type"] == "message" && entry["message"]["role"] == "assistant")
+        .expect("assistant entry");
+    let entered = EntryId(entered["id"].as_str().unwrap().to_owned());
+    within(session.navigate(Some(before), Default::default()))
+        .await
+        .unwrap();
+    assert_eq!(session.model().id, "m");
+    assert!(session.mode().is_none());
+    within(session.navigate(Some(entered), Default::default()))
+        .await
+        .unwrap();
+    assert_eq!(session.model().id, "planner");
+    assert_eq!(session.mode().unwrap().name, "plan");
+    session.set_mode(None).await.unwrap();
+    assert_eq!(session.model().id, "m");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_notice_after_a_prompt_is_cut_as_a_split_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
+        json!({"compaction":{
+            "enabled":false, "reserveTokens":1024, "keepRecentTokens":50, "summaryRequest":"live"
+        }}),
+        vec![
+            ScriptedTurn::Reply(reply_text(&"first answer ".repeat(400))),
+            ScriptedTurn::Reply(reply_text("ok")),
+            ScriptedTurn::Reply(reply_text("history summary")),
+            ScriptedTurn::Reply(reply_text("turn prefix summary")),
+        ],
+    )
+    .await;
+    let mut opts = mode_options(dir.path());
+    opts.modes[0].body = INSTRUCTIONS.repeat(8);
+    let session = host.axo.create_session(opts).await.unwrap();
+    within(session.prompt("Remember cedar.")).await.unwrap();
+    session.set_mode(Some("plan")).await.unwrap();
+    // Longer than its own summary, so the split-turn summary shrinks it.
+    within(session.prompt("Now plan the change. ".repeat(10)))
+        .await
+        .unwrap();
+    within(session.compact(None)).await.unwrap();
+
+    let entries = journal(&session);
+    let notice = entries
+        .iter()
+        .find(|entry| entry["type"] == "custom_message" && entry["customType"] == "mode_notice")
+        .expect("mode notice");
+    let compaction = entries
+        .iter()
+        .find(|entry| entry["type"] == "compaction")
+        .expect("compaction");
+    assert_eq!(compaction["firstKeptEntryId"], notice["id"]);
+    assert_eq!(
+        host.api.requests().len(),
+        4,
+        "history summary, then turn prefix summary"
+    );
+    session.shutdown().await;
 }
 
 struct Probe(&'static str);

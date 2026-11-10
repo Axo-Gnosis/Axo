@@ -521,6 +521,7 @@ impl SessionHooks {
             ),
             None => (Entry::Leaf { base }, None),
         };
+        let origin = self.mode_origin();
         let committed = match self.check_live(cancel) {
             Ok(()) => self.append_if(revision, vec![entry]).await.map(drop),
             Err(error) => Err(error),
@@ -532,10 +533,9 @@ impl SessionHooks {
             }
             return Err(error);
         }
-        self.record_current_selection().await?;
+        self.rebase_mode(origin).await?;
         self.take_system();
         self.rebase_promoted();
-        self.rebase_mode();
         self.install_tools();
         self.sync_sections().await?;
         Ok(())
@@ -651,16 +651,16 @@ impl Session {
             {
                 return Err(Error::EntryNotFound(target.to_string()));
             }
+            let origin = hooks.mode_origin();
             hooks
                 .append(vec![Entry::Leaf {
                     base: journal::base_at(target),
                 }])
                 .await?;
-            hooks.record_current_selection().await?;
+            hooks.rebase_mode(origin).await?;
             // Pending diffs were relative to the old position; they are recomputed below.
             hooks.take_system();
             hooks.rebase_promoted();
-            hooks.rebase_mode();
             hooks.install_tools();
             hooks.sync_sections().await?;
             agent.set_messages(hooks.journal.view().projection.messages.clone());

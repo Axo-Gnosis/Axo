@@ -21,7 +21,7 @@ use super::modes::ENTER_MODE;
 use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
-use crate::context::modes::ModeSpec;
+use crate::context::modes::{ModeSpec, ToolLimits};
 use crate::error::Error;
 use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
@@ -29,7 +29,6 @@ use crate::jobs::child::{ChildMessage, ChildPhase, ChildRun};
 use crate::store::{Entry, Header, Projection, RosterEntry, SpawnLink, TeamLink};
 use crate::tools::ask::ASK;
 use crate::tools::call::CALL;
-use crate::tools::merge_tools;
 use crate::tools::output::YIELD;
 
 pub(crate) const SPAWN: &str = "spawn";
@@ -123,8 +122,10 @@ pub struct SpawnContext<'a> {
     pub spec: &'a AgentSpec,
     /// The catalog name; `None` for inline specs and plain delegates.
     pub agent: Option<&'a str>,
-    /// The parent's effective mode.
+    /// The parent's mode applied to this spawn: selected for host spawns, effective for tool spawns.
     pub mode: Option<&'a ModeSpec>,
+    /// The inherited tool ceiling the child will run under.
+    pub limits: &'a ToolLimits,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
     pub task: &'a PromptInput,
@@ -214,6 +215,7 @@ struct Resolved {
     model: Model,
     thinking: ThinkingLevel,
     selector: Option<String>,
+    limits: ToolLimits,
 }
 
 struct Launch {
@@ -320,7 +322,17 @@ impl SessionHooks {
         team: Option<SpawnTeam<'_>>,
     ) -> Result<Resolved, Error> {
         let settings = &self.inherited.config.settings;
-        let mode = self.effective_mode();
+        let mode = match origin {
+            SpawnOrigin::Host => self.selected_mode(),
+            SpawnOrigin::Tool { .. } => self.effective_mode(),
+        };
+        let limits = match &self.child {
+            Some(child) => child.link.limits.clone(),
+            None => mode
+                .as_ref()
+                .map(|mode| mode.tools.clone())
+                .unwrap_or_default(),
+        };
         normalize(&mut spec, &settings.subagents);
         let select = |spec: &AgentSpec| -> Result<_, Error> {
             let cascade = settings.first_model(
@@ -352,6 +364,7 @@ impl SessionHooks {
                     spec: &spec,
                     agent: agent.as_deref(),
                     mode: mode.as_deref(),
+                    limits: &limits,
                     model: &model,
                     thinking,
                     task,
@@ -372,30 +385,13 @@ impl SessionHooks {
                 }
             }
         }
-        if let Some(mode) = mode
-            && !mode.tools.is_empty()
-        {
-            let tools = spec.tools.get_or_insert_with(|| {
-                let base = self
-                    .shape_base
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                merge_tools(base.builtin.clone(), &base.host_tools)
-                    .iter()
-                    .chain(&base.host_deferred)
-                    .map(|tool| tool.name())
-                    .filter(|name| !matches!(*name, ASK | YIELD | CALL | ENTER_MODE))
-                    .map(str::to_owned)
-                    .collect()
-            });
-            tools.retain(|name| mode.tools.permits(name));
-        }
         Ok(Resolved {
             spec,
             agent,
             model,
             thinking,
             selector,
+            limits,
         })
     }
 
@@ -419,6 +415,7 @@ impl SessionHooks {
                 model,
                 thinking,
                 selector,
+                limits,
             } = resolved;
             let link = SpawnLink {
                 parent_session_id: self.session_id.clone(),
@@ -427,6 +424,7 @@ impl SessionHooks {
                 agent,
                 model: selector,
                 spec,
+                limits,
                 team,
             };
             header.spawn = Some(link.clone());

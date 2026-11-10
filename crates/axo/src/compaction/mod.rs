@@ -10,6 +10,7 @@ use axo_ai::estimate::estimate_blocks_tokens;
 use axo_ai::transcript::replay_system_message;
 use axo_ai::{Message, Model, StopReason};
 
+use crate::session::{MODE_NOTICE, TOOL_CATALOG};
 use crate::store::{Entry, EntryId, Projection, SeqEntry};
 use crate::tools::{FileAccess, ledger_access};
 use crate::{CompactionSettings, Error};
@@ -78,11 +79,18 @@ fn system(message: &AgentMessage) -> bool {
 fn real_user(message: &AgentMessage) -> bool {
     matches!(message, AgentMessage::Llm(Message::User(_)))
 }
+// Reconciled notices precede a reply inside a turn; every other custom message opens one.
+fn notice(message: &AgentMessage) -> bool {
+    matches!(message, AgentMessage::Custom(custom)
+        if matches!(custom.custom_type.as_str(), MODE_NOTICE | TOOL_CATALOG))
+}
 fn turn_start(message: &AgentMessage) -> bool {
-    real_user(message) || matches!(message, AgentMessage::Custom(_))
+    real_user(message) || (matches!(message, AgentMessage::Custom(_)) && !notice(message))
 }
 fn cut_point(message: &AgentMessage) -> bool {
-    turn_start(message) || matches!(message, AgentMessage::Llm(Message::Assistant(_)))
+    turn_start(message)
+        || notice(message)
+        || matches!(message, AgentMessage::Llm(Message::Assistant(_)))
 }
 fn tokens(messages: &[AgentMessage]) -> u64 {
     messages.iter().map(message_tokens).sum()
