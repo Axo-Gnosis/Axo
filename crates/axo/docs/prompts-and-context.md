@@ -4,7 +4,7 @@
 
 Provider requests use `Transcript::new` with the system prompt and tool declarations already carried by `Message::System` entries. Construction removes failed or aborted assistant turns and their tool results from the request; the persisted session history retains them.
 
-Start-time diagnostics for context files, skills, agent definitions and tool allowlists, schemes and bundled docs, prompt overrides, host sections, and reserved command names remain available to the host through `session.diagnostics()` (`&[Diagnostic]`) and are still logged as warnings. Runtime `NestedContext` read errors are only logged, not retained in this startup snapshot.
+Start-time diagnostics for context files, skills, agent and mode definitions, tool allowlists, schemes and bundled docs, prompt overrides, host sections, and reserved or hidden command names remain available to the host through `session.diagnostics()` (`&[Diagnostic]`) and are still logged as warnings. Runtime `NestedContext` read errors are only logged, not retained in this startup snapshot.
 
 ## System Prompt Sections
 
@@ -15,7 +15,7 @@ Start-time diagnostics for context files, skills, agent definitions and tool all
 | 1 | `delegation` | Children only: fixed bundled `crates/axo/prompts/DELEGATION.md`; always first, not overridable or removable |
 | 2 | `system` | Non-empty selected agent body, else `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
 | 3 | `docs` | `"<name>'s documentation, including how to extend it: <name>://README.md"` (`name` defaults to `axo`; materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
-| 4 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the active tools, formatted as `- {rule}` bullets |
+| 4 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the direct tools in the prompt shape, formatted as `- {rule}` bullets; deferred-tool promotions do not add guidelines here |
 | 5 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
 | 6 | `work` | `WORK` override (no bundled default; omitted unless provided) |
 | 7 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
@@ -37,13 +37,27 @@ When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (in
 
 ### Built-in tool guidelines (`tools`)
 
-Before agent allowlists and depth filtering, the built-in order is `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `spawn`, followed by `ask` when enabled. `spawn` is withheld when the session's depth is at least `subagents.maxDepth` (roots have depth 0). Filtering it after the allowlist avoids an unknown-tool diagnostic for an inherited allowlist naming `spawn`. Children with an output schema receive `yield` after the allowlist regardless of whether it names that tool.
+Before agent allowlists and depth filtering, the built-in order is `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `kill`, `spawn`, `send`, followed by `ask` when enabled. `spawn` is withheld when the session's depth is at least `subagents.maxDepth` (roots have depth 0). Filtering it after the allowlist avoids an unknown-tool diagnostic for an inherited allowlist naming `spawn`. `kill` and `send` bypass agent allowlists, then presence is derived from the effective tools: `kill` exists when `bash` or `spawn` remains; `send` exists when `spawn` remains or the session has a parent or teammates. Children with an output schema receive `yield` after the allowlist regardless of whether it names that tool. `call` is appended when deferred tools remain, or a root has mode definitions.
 
 Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the built-in tool set:
 - `read`: `"Use read to examine files instead of cat or sed."`
 - `write`: `"Use write only for new files or complete rewrites."`
 - `edit`: `"When changing several places in one file, use one edit call with several entries in edits[]."`
-- `bash`: `"A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes."` and `"List jobs with read proc:// and stop one with write proc://bg_N/kill (empty content)."` (see [Background Jobs](#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs))
+- `bash`: `"A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes."` and `"List jobs with read proc:// and stop one with kill."` (see [Background Jobs](#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs))
+
+### Deferred tools
+
+Host tools may be direct (`HostTool::direct`) or deferred (`HostTool::deferred`). Direct tools contribute declarations and guidelines to the initial prompt. Deferred tools remain callable but are omitted from those initial declarations and guidelines. Agent allowlists filter both sets. A deferred name colliding with a direct tool is ignored with a diagnostic; among deferred duplicates, the first wins.
+
+The name `call` is always reserved for the dispatcher: host direct or deferred tools with that name are ignored with diagnostic `host tool "call" is reserved for deferred tools; ignored`, even when no deferred tools or modes remain.
+
+Before a request, changes in deferred names are announced as a persisted, non-display `tool_catalog` custom message with `details.added` and `details.removed` name arrays. Reconciliation folds additions and removals from **all surviving catalog notices in projection order**, rather than using a latest-notice snapshot, then compares that announced set with the current catalog. It lists additions with summaries and removed names, rather than changing the system prompt. Summaries use the first non-blank description line, remove control characters and stop at 200 characters; the announcement explicitly treats summaries as descriptions, not instructions. Changes to descriptions alone do not produce a name-change announcement.
+
+The reserved, read-only `tool://` scheme lists the current deferred catalog, including tools already promoted to direct declarations. An empty catalog reads `No deferred tools.`. `read tool://<name>` returns the full description, guidelines, JSON Schema, and a `call` example; an unknown name reports `No deferred tool named <name>; read tool:// to list them.`. Writes fail with `tool:// is read-only; run a deferred tool with call.`. Reading a named tool also requests promotion; merely listing the catalog does not.
+
+Use `call {"tool":"name","args":{…}}`: `tool` is required and `args` is an optional object defaulting to `{}`. Routing resolves against the effective direct and deferred tools, retaining the original call id while using the target name and arguments for schema validation, hooks, events, execution, cancellation, replay policy and sequential scheduling. A missing target fails with `Tool <name> not found`; `call` is not an allowlist bypass. Dispatch is one hop, not recursive.
+
+Promotion happens at the next request boundary, in documentation-request order, without removing the tool from the deferred catalog. `Model::tool_support()` governs cache-preserving declarations: `TranscriptToolSupport::Changes` permits promotion; `TranscriptToolSupport::Additions` permits it except for `yield`; `TranscriptToolSupport::None` leaves tools callable only through the deferred surface unless already declared. Promotions append tool declarations, not deferred guidelines to the system prompt. Projection changes reconstruct promotions from replayed system declarations intersected with the current catalog. Unmounting a tool removes its promotion; on addition-only models that removal can require resending the tool list rather than preserving the cached prefix.
 
 ### Host section validation
 
@@ -126,7 +140,7 @@ Review the code for correctness and report actionable findings.
 | `description` | Optional listing text, default empty |
 | `runAs` | `root`, `subagent`, or `any` (default); controls whether the definition can be a root persona, a spawned agent, or both. Root-only agents are omitted from the spawn listing and rejected as team members |
 | `model` | A [model selector](configuration.md#model-selectors); root sessions consider it after the explicit session selector and recorded model, before `defaultModel`. Children use the [child model cascade](configuration.md#child-sessions-subagents--axosubagentsettings) |
-| `tools` | Optional allowlist over built-in **and host** tools, as a list or comma-separated string (trimmed, empty entries dropped). Omitted keeps all tools; an empty list keeps none. Unknown tool names produce diagnostics when the agent is selected. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
+| `tools` | Optional allowlist over built-in **and host** direct/deferred tools, as a list or comma-separated string (CSV entries are trimmed and empty entries dropped; lists are retained as supplied). Omitted keeps all tools; an empty list removes ordinary tools. Unknown tool names produce diagnostics when the agent is selected. Lifecycle tools `kill` and `send` are retained according to the presence rules above, and required `yield` and `call` are added after filtering. `ask` is removed unless listed, and listing it does not enable it when `ask_enabled` is false |
 | `contextFiles` | `false` disables all home, user, project, and nested context files, including their name/file diagnostics. A name-to-boolean map overrides `settings.contextFiles`, preserving existing key positions and appending new keys. Omitted or `true` keeps settings for roots and uses `subagents.contextFiles` for children |
 | `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host `SessionOptions::sections` can restore removed sections in root sessions (appended after core sections rather than returning to their original position); children's fixed `delegation` section cannot be removed |
 | `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. For children, defines the result returned through `yield`; ignored for root sessions |
@@ -142,11 +156,11 @@ Unreadable files, malformed frontmatter, invalid names or schemas, and collision
 
 `SessionOptions::agents: Vec<AgentSpec>` adds definitions supplied in code; the public types live in `axo::context::agents`, and `AgentSpec` and `RunAs` are also re-exported from `axo`. `Session::agents() -> &[AgentDef]` exposes the loaded agent and team catalog. Forks inherit the live persona and catalog. On reopen, pass programmatic definitions and host sections/tools again; these are host inputs, not serialized definitions.
 
-`Axo::catalog(cwd, project_access, agents)` resolves the same configuration and definitions without creating a session. It performs blocking file I/O and returns `Catalog { config, agents, diagnostics }`; model roles live in `config.settings.model_roles`.
+`Axo::catalog(cwd, project_access, agents, modes)` takes the working directory, optional project access, an agent-spec slice and a mode-spec slice. It resolves the same configuration and definitions without creating a session, performs blocking file I/O, and returns `Result<Catalog, Error>` with `Catalog { config, agents, modes, diagnostics }`; modes are shared `Arc<ModeSpec>` values and model roles live in `config.settings.model_roles`.
 
 ### Child prompts
 
-`Session::spawn` and the model's `spawn` tool select a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask` and `yield`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools excluding those two tools. Named agents use their own allowlists over built-in and host tools.
+`Session::spawn` and the model's `spawn` tool select a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask`, `yield`, `call`, and `enter_mode`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools excluding those four tools. Named agents use their own allowlists over built-in and host tools. The child's own surface adds required `yield` and `call` under the normal rules; it does not inherit the parent's dispatcher or mode-entry tool.
 
 A named agent with `runAs: root` fails spawning with `Error::AgentNotSubagent`. Team definitions referencing one are dropped with a root-only-member diagnostic.
 
@@ -170,9 +184,11 @@ The fixed `delegation` section tells the child to work autonomously without aski
 | `model` | Single agents only: optional model selector, including `@role` and a thinking suffix; overrides the spec's model |
 | `output` | Single agents only: optional JSON Schema overriding the agent's own result schema before spawn hooks run |
 
-Keep working after spawning: each finished run's result arrives automatically, or through `wait` when there is nothing else to do. Read [agent URLs](#agent) for status, results, conversations and messaging routes. `spawn` is `Replay::Safe`: recovery adopts every existing child for a repeated call id instead of creating duplicates.
+Keep working after spawning: each finished run's result arrives automatically, or through `wait` when there is nothing else to do. Read [agent URLs](#agent) for status, results and conversations; use [send](#send) for messages. `spawn` is `Replay::Safe`: recovery adopts every existing child for a repeated call id instead of creating duplicates.
 
 A child with `output` must call `yield` to return its final result; a text answer alone is not a result. With an explicit `"type": "object"` schema, the tool arguments are the result object. Other schemas are wrapped in an object with required `result`, so a string schema takes `{"result":"answer"}` and returns the string itself. Accepted strings are delivered as raw text; other values use compact JSON.
+
+Result reconstruction matches a successful `yield` result to its assistant call by call id. For `call {"tool":"yield","args":{…}}`, it extracts the inner `args` before applying the output schema, not the outer dispatcher arguments.
 
 Arguments are validated before tool hooks or execution. Rejected calls report validation errors for the child to fix. A turn ending without a valid yield gets one `yield_nudge` per run; ending again without yielding reports an error rather than accepting the text. Three rejected yield calls fail the run. Failure reports include the last rejected attempt, or the last text answer when there was none. The internal turn-budget hook always permits `yield`, and its wrap-up notice asks output children to call it with their best final result. `yield` is `Replay::Safe`; its state resets for each run.
 
@@ -182,7 +198,93 @@ A file with a `members` key defines a team instead of an agent. Its keys are `na
 
 For a defined team, call `spawn` with `{"agent":"review-team","task":"check the change"}` or supply `tasks` by roster name. For an ad-hoc team, use `{"members":[{"name":"a","agent":"reviewer"},{"name":"b","spec":{"prompt":"Check correctness."}}],"charter":"Compare findings.","tasks":{"a":"check the API","b":"check behavior"}}`. Each member gets its explicit task or the shared fallback, plus any non-blank context. Team calls reject call-level `model` and `output`; put these in agent files or member specs instead. Nested teams and per-member call overrides are not supported.
 
-The result identifies a per-parent team id and each member's child row in roster order, with details shaped as `{"team":"team_1","jobs":{"a":"agent_1","b":"agent_2"}}`. Each member has its own run and reports its own result to the parent. The fixed `team` section names the member and team, includes the charter and brief, and lists the roster with agent descriptions and a “(you)” marker. Members exchange mail through the [agent scheme](#agent); there is no broadcast. See [wait](#wait) for waiting on teammates, and [Concurrent runs](sessions-and-compaction.md#budgets-and-lifecycle) for first-run slot reservation and team-size limits.
+The result identifies a per-parent team id and each member's child row in roster order, with details shaped as `{"team":"team_1","jobs":{"a":"agent_1","b":"agent_2"}}`. Each member has its own run and reports its own result to the parent. The fixed `team` section names the member and team, includes the charter and brief, and lists the roster with agent descriptions and a “(you)” marker. Members exchange mail through [send](#send); there is no broadcast. See [wait](#wait) for waiting on teammates, and [Concurrent runs](sessions-and-compaction.md#budgets-and-lifecycle) for first-run slot reservation and team-size limits.
+
+## Mode definitions
+
+Modes add root-session instructions and call-time tool limits without replacing the root persona. Hosts select or end a mode with `Session::set_mode`; the selection is journaled and takes effect for instructions and limits at the next request boundary. Hosts supply `ConfigLayer::mode_roots` and `SessionOptions::modes`; no `.agents/` mode directory is discovered implicitly. Trusted project roots precede user roots, each in supplied order. Project roots require `ProjectAccess::Trust`; at `Read` they are ignored with a warning, and at `Ignore` or with `project.files.config: false` the project layer is not requested.
+
+`load_modes` recursively walks roots in sorted file-name order with the shared skill/agent hidden-file, ignore and symlink rules, loading `*.md` files. Missing roots and files without leading YAML frontmatter are skipped; an empty frontmatter block is valid. Canonical paths are deduplicated. Files precede programmatic specs, and the first mode name wins. Modes have their own namespace, separate from agents and teams.
+
+```markdown
+---
+name: plan
+description: Plan a change.
+argument-hint: task
+disable-model-invocation: true
+model: "@planner"
+tools:
+  allow: [read, grep]
+  deny: [write]
+result:
+  schema: {type: string}
+  review: true
+  then: Implement the approved plan.
+bash: read-only
+---
+Produce a concrete plan.
+```
+
+| Key | Stored meaning |
+| :--- | :--- |
+| `name` | Defaults to the file stem when omitted or empty; same strict name rules as agent definitions |
+| `description` | Optional listing text, default empty |
+| `argument-hint` | Optional string copied into command metadata |
+| `disable-model-invocation` | Boolean, default false; true excludes the mode from `enter_mode`, without affecting host selection or command listing |
+| `model` | Optional model selector, resolved on selection rather than during definition loading; mode-owned model/thinking changes can be restored on exit |
+| `tools` | `ToolLimits`: optional `allow` list and `deny` list (default empty). `ToolLimits::permits` requires membership in `allow` when set, and always rejects names in `deny`; omitted allow permits any name not denied, empty allow permits none |
+| `result` | Optional `ModeResult`; when present, `schema` defaults to a string JSON Schema, `review` to false, and `then` to no continuation text. Mounts a deferred `yield` while the mode is effective; review waits for the host before acceptance ends the mode |
+| Other keys | Preserved in `ModeSpec::extra` as host policy data, without unknown-key diagnostics |
+
+Bodies are trimmed and file definitions retain their path. Unreadable files, malformed frontmatter, invalid names, invalid result schemas, built-in command names and duplicate mode names produce diagnostics and skip the definition. Programmatic specs receive the same validation and body trimming. File diagnostics have `DiagnosticOrigin::Path`; programmatic diagnostics have no origin and identify the mode. Result schemas are compiled for validity at load time.
+
+`Session::modes()` and `Catalog::modes` expose shared mode definitions. `Session::commands()` lists built-ins first, modes second (`CommandKind::Mode` with `CommandPolicy::Alongside` and the argument hint), then skills not hidden by either. A skill with a mode's name still loads, but is omitted from that command catalog and gets a path diagnostic: `skill name "<name>" is hidden by the mode /<name>; the command catalog lists the mode`. Ordinary prompt skill expansion is unchanged. `Command::parse` / `Command::decode` handle built-ins only; use `Session::parse_command` for mode commands.
+
+### Model entry and results
+
+Roots with at least one mode whose `disable_model_invocation` is false offer deferred `enter_mode`, subject to the root persona's tool allowlist and ordinary direct/deferred name-collision rules. Children never receive this built-in. Its description starts `Switch this session into a mode: instructions, and sometimes tool limits, for one kind of work. Modes:` and appends one `- <name>: <description>` line per model-invocable mode. Its object schema requires `mode`, a string enum of those names, and rejects additional properties. Invoke it with `call {"tool":"enter_mode","args":{"mode":"plan"}}`; it is `Replay::Safe` and returns `Mode "<name>" starts with your next step; its instructions follow.`. Like host selection, the instructions and limits take effect at the next request boundary. The active mode's gate may block `enter_mode`; it is not a lifecycle exemption.
+
+An effective mode with `result` mounts deferred `yield`, even when the root persona's allowlist omits it. It is also exempt from the mode allow/deny gate, but not host policies. Read `tool://yield` for its current schema and use `call {"tool":"yield","args":{…}}`. An explicit `"type":"object"` schema takes the result object directly; every other schema is wrapped in an object with required `result` and no additional properties. For the default string schema, use `{"result":"answer"}`. Validation happens before tool hooks and execution: invalid arguments leave the mode active for correction.
+
+Execution requires that the yield's mode is both selected and effective. A host selection change invalidates the old yield immediately, even while the in-flight batch retains the old mode's ordinary tool limits. Completion clears the mode only if the same definition is still selected, so a concurrent replacement cannot be ended by an older result.
+
+The description is `End the current mode by returning its result. The arguments must match the result schema; if they are rejected, fix the listed errors and call yield again.`; wrapped schemas append ` Put the result in "result".`. Documentation reads promote this changing-schema tool to native declarations only on `TranscriptToolSupport::Changes`; on `Additions` or `None`, keep using `call`. Its deferred registration follows the effective mode at request boundaries and disappears when the effective mode ends. Unlike child output, mode results do not impose a missing-yield nudge or three-rejection run limit.
+
+When any modes are loaded for a root, host direct or deferred tools named `yield` are ignored, even if no mode is active or model-invocable, with diagnostic `host tool "yield" is reserved for modes; ignored`. Roots with modes retain `call` after persona filtering so mode results stay callable. See [Mode result review](sessions-and-compaction.md#mode-result-review) for acceptance, continuation, review, and recovery.
+
+### Mode notices and call-time limits
+
+`Session::mode()` returns the selected mode, including a selection waiting for the next request boundary. Selection alone does not start a model run. A change during an in-flight request leaves that request's tool batch under the previous effective mode. At the next boundary, the selected mode becomes effective and is exposed through `ToolScope::mode` and `SpawnContext::mode`.
+
+Instructions enter context as a persisted `Entry::CustomMessage` of reserved type `mode_notice`, with `display: false` and `details: {"mode": "<name>"}` (null on exit), not as a replacement system section. Before each request, reconciliation compares the effective name with the most recent projected mode notice's name. It does not compare bodies or hashes. If compaction removes the notice, the next request reannounces an active mode; if the latest notice still names the effective mode, no duplicate is appended.
+
+An entry notice contains the trimmed body exactly in this wrapper:
+
+```xml
+<mode name="<name>">
+<body>
+</mode>
+```
+
+When switching from an announced mode, it begins with `Mode "<previous>" has ended.` and a newline. An explicit allow list adds `Only these tools run while this mode is active: <comma-separated names>.`; a non-empty deny list adds `These tools do not run while this mode is active: <comma-separated names>.`, each on its own line. The final line is:
+
+```text
+This mode stays active until the user ends it.
+```
+
+For a definition with `result`, the final line instead reads:
+
+```text
+Finish this mode by calling yield with its result: call {"tool": "yield", "args": …}; read tool://yield for the arguments.
+```
+
+Ending an announced mode emits `Mode "<name>" has ended; its instructions and tool limits no longer apply.`. Hosts cannot post their own `mode_notice` messages. The `mode` tag belongs to the protected wrapper set: wherever `escape_wrappers` sanitizes untrusted wrapper text, opening and closing mode tags have their `<` changed to `&lt;`.
+
+Mode allow/deny limits gate execution rather than removing ordinary tool declarations or guidelines, preserving the stable prompt/tool prefix for caching. Deny wins over allow, and an empty allow list permits no ordinary tools. The gate checks the routed target name, so deferred `call` dispatch does not bypass it. A blocked call reports `<tool> is unavailable in mode "<name>".` without terminating the run. `yield` is exempt from this gate; host policies may still reject calls. Mode extras remain host policy data, not built-in enforcement.
+
+Children do not inherit the mode body or catalog and cannot select a root mode. Instead, after spawn hooks and replacements, the parent's effective limits intersect the child's tool allowlist; when no child allowlist exists, axo materializes one from the parent's built-in and host direct/deferred tools, excluding `ask` and `yield`, then filters it. That resolved list persists in `SpawnLink::spec`, so later parent mode changes do not relax an existing child and revival retains its limits. Normal child lifecycle-tool presence rules still apply.
+
+See [Root modes](sessions-and-compaction.md#root-modes) for branch/reopen behavior and model restoration.
 
 ## Skills (`crates/axo/src/context/skills.rs`)
 
@@ -244,7 +346,8 @@ Host messages sent with `Session::post(HostMessage { custom_type, text, display,
 
 ## User Commands (`crates/axo/src/commands.rs`)
 
-`Session::commands()` returns the catalog of built-in commands (`compact`, `shake`, `model`, `thinking`, `navigate`) and discovered skills. The command catalog, dispatch via `Session::run_command`, policies, JSON Schema argument schemas, and typed command text parsing are documented in [Commands](extending.md#commands).
+`Session::commands()` returns built-in commands (`compact`, `shake`, `model`, `thinking`, `navigate`), loaded modes, and discovered skills not hidden by built-ins or modes, in that order. `Session::parse_command` tries built-ins first, then recognizes `/<mode-name> [prompt…]` as `Command::Mode { name, prompt }`; the optional prompt is the trimmed remainder, not parsed positional arguments. Unknown names return no command. `Session::run_command` selects the mode, then sends a non-empty prompt through `Session::steer` (starting a run if idle). With no prompt it only selects the mode. Modes use `CommandPolicy::Alongside`, so selection is allowed during a turn; instructions and limits change at the next request boundary. `prompt`, `steer`, and `follow_up` do not parse mode commands themselves. The command catalog, built-in dispatch, policies, JSON Schema argument schemas, and typed command text parsing are documented in [Commands](extending.md#commands).
+
 ## Prompt Parts (`crates/axo/src/input.rs`)
 
 `prompt`, `steer`, and `follow_up` take `impl Into<PromptInput>` (`PromptInput { parts: Vec<PromptPart> }`; `&str`, `String`, and `&String` convert to one `Text` part, and `Vec<PromptPart>` converts directly); `prompt_with` takes `PromptRequest { input: PromptInput, request_id: Option<String> }`. `PromptPart` serializes with a `type` tag and camelCase names:
@@ -284,12 +387,12 @@ A running command is promoted to a background job when the first of these happen
 Environment resolution (dev-shell capture) stays in the foreground; the promotion timer and steer promotion start only once the process runs. A command that already finished is never promoted, and promotion is attempted at most once per call. The tool result then returns at once with the output so far (or `(no output yet)`) followed by:
 
 ```text
-Command is still running in the background as bg_N. Full output: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with write proc://bg_N/kill.
+Command is still running in the background as bg_N. Full output: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with kill.
 ```
 
-Every foreground result has `details: {"exit": <typed exit or null>, "durationMs": <milliseconds>}`; a truncated result also names `artifact://<n>` in its notice and adds `"fullOutput": "artifact://<n>"`. Promoted results keep `details: {"job": "bg_N", "fullOutput": "artifact://<n>"}`. Typed exits distinguish exit codes, signals, timeout seconds, model/host kills, foreground aborts and shutdown or reopen interruption (see [host job types](extending.md#background-jobs-for-hosts)). After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `write proc://bg_N/kill`, `Session::kill_job`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. A model kill reads `Command was stopped (proc://bg_N/kill)`; a host kill reads `Command was stopped by the user`; a shutdown reads `Command was interrupted when the session closed`; all have `is_error: true`.
+Every foreground result has `details: {"exit": <typed exit or null>, "durationMs": <milliseconds>}`; a truncated result also names `artifact://<n>` in its notice and adds `"fullOutput": "artifact://<n>"`. Promoted results keep `details: {"job": "bg_N", "fullOutput": "artifact://<n>"}`. Typed exits distinguish exit codes, signals, timeout seconds, model/host kills, foreground aborts and shutdown or reopen interruption (see [host job types](extending.md#background-jobs-for-hosts)). After promotion, Stop (`Session::abort`) and the call's cancellation no longer reach the job; only `kill {"id":"bg_N"}`, `Session::kill_job`, the call's own `timeout` (which keeps its original deadline and has no default), and session shutdown stop it. A model kill reads `Command was stopped (kill bg_N)`; a host kill reads `Command was stopped by the user`; a shutdown reads `Command was interrupted when the session closed`; all have `is_error: true`.
 
-**Retained helpers.** A result is the root shell's: it returns when the root exits plus a fixed 100 ms drain. If processes the command started are still alive in its container (for example backgrounded `&` or `nohup` children, which stay in the process group; under cgroup supervision also `setsid` descendants, which leave the process group and are invisible to process-group mode), the result, foreground or background, ends with `Processes started by this command are still running as bg_N (read proc://bg_N; stop with write proc://bg_N/kill). Their output continues in artifact://<n>.` They stay listed and killable as `bg_N` until they exit; no second result follows.
+**Retained helpers.** A result is the root shell's: it returns when the root exits plus a fixed 100 ms drain. If processes the command started are still alive in its container (for example backgrounded `&` or `nohup` children, which stay in the process group; under cgroup supervision also `setsid` descendants, which leave the process group and are invisible to process-group mode), the result, foreground or background, ends with `Processes started by this command are still running as bg_N (read proc://bg_N; stop with kill). Their output continues in artifact://<n>.` They stay listed and killable as `bg_N` until they exit; no second result follows.
 
 **Capture loss.** If writing the output spool fails, the command keeps running and the result shows the bounded output already captured, with `[Output capture failed: {err}. Showing partial output only.]` appended and no artifact URL.
 
@@ -305,21 +408,25 @@ In a team, `wait` keeps waiting while teammates can still reply, even with no jo
 
 ### `proc://`
 
-The session's `proc://` scheme (`Target::Virtual`) inspects and stops background command jobs and subagents without consuming results. List both with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop either with `write proc://<id>/kill` (empty content):
+The session's read-only `proc://` scheme (`Target::Virtual`) inspects background command jobs and subagents without consuming results. List both with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop one with [kill](#kill).
 
 | Operation | Result |
 | :--- | :--- |
 | `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `queued` (a child waiting for a run slot), `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
-| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc://, proc://<id> or proc://<id>/kill.` |
-| `write proc://bg_N/kill` | Stops a listed job (promoted, or retaining helpers) and any retained helpers: `Stopping bg_N.`, or `bg_N is not running.` |
+| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc:// or proc://<id>.` |
 | `read proc://agent_N` | Child row details: `Job:`, `Agent:`, optional `Team: team_N (member)`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
-| `write proc://agent_N/kill` | Aborts the running child session; does not remove its row or prevent later prompts or follow-ups |
 
 Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside an open session) has neither `proc://` nor `agent://`.
 
+### `kill`
+
+`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
+
+There are no proc action paths: reads of a `/kill` suffix are unsupported, and all proc writes fail with `<url> is read-only`.
+
 ### `agent://`
 
-The session's virtual `agent://` scheme reads children spawned by that session; list their ids with `read proc://`. Children can also write to their parent, and team members can write to their own teammates by roster name. These named routes do not expose other sessions' status or transcripts.
+The session's read-only virtual `agent://` scheme reads children spawned by that session; list their ids with `read proc://`. Parent and teammate names are destinations for [send](#send), not URLs exposing their status or transcripts.
 
 | Operation | Result |
 | :--- | :--- |
@@ -327,12 +434,23 @@ The session's virtual `agent://` scheme reads children spawned by that session; 
 | `read agent://agent_N/result` | Full latest completed-run result, even after delivery; errors if no result exists yet. A trailing slash is also accepted |
 | `read agent://agent_N/result/<json-pointer>` | Selects from the persisted typed result value when present; otherwise parses the result text as JSON for older or untyped results. Adds the pointer's leading slash; for example `result/findings/0` selects the first finding. Strings return raw text, other values pretty-printed JSON. Missing pointers or non-JSON fallback text are errors. Typed string values remain strings, even if their text happens to look like JSON |
 | `read agent://agent_N/transcript` | Projected conversation, including compaction summaries, not the raw journal. System messages are omitted; tool calls are abbreviated to 200 characters and tool results to their first line (up to 200 characters), with a count of additional lines. Page with the read tool's `offset` and `limit` |
-| `write agent://agent_N` | Sends non-blank content through `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_N. Its reply arrives as a new result.` |
-| `write agent://agent_N/steer` | Sends non-blank content through `Session::steer`, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_N: it reads your message after its current tool calls.` |
-| `write agent://parent` | Sends a mid-run note without ending the child's run; returns `Sent to your parent.`. Delivery is at the parent's next turn boundary or through `wait`, never a steer; an idle parent wakes subject to its Stop latch. Roots and forks have no parent route. A closed parent or one no longer tracking the child is an error, not a successful send |
-| `write agent://<name>` | Sends durable mail to a teammate in this session's roster; returns `Sent to <name>.`. Mail is read at the next turn boundary, wakes `wait`, and starts an idle receiver's run. It never steers or waits for the receiver to finish its run. Self-mail, names outside the roster and sibling access from non-team children are errors |
 
-Result and transcript paths are read-only; `/steer`, `parent` and teammate paths are write-only. Reads never consume pending deliveries. Writes are actions with `Replay::Never`, so crash recovery never repeats a potentially completed send. Teammate mail arrives as `Message from <name> (reply with write agent://<name>):` followed by its content, with axo wrapper tags escaped.
+Reads never consume pending deliveries. Every agent write fails with `<url> is read-only`. Messaging and stopping are tools, not scheme writes.
+
+### `send`
+
+`send` takes required strings `to` and `message`, plus optional boolean `steer` (default false); no other properties are accepted. Destinations are bare child ids (`agent_N`), `parent`, or a teammate's roster name, never URLs.
+
+| Destination | Behavior |
+| :--- | :--- |
+| `send {"to":"agent_1","message":"…"}` | Uses `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_1. Its reply arrives as a new result.` |
+| `send {"to":"agent_1","message":"…","steer":true}` | Uses `Session::steer`, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_1: it reads your message after its current tool calls.` |
+| `send {"to":"parent","message":"…"}` | Sends a mid-run note without ending the child's run; returns `Sent to your parent.`. Delivery is at the parent's next turn boundary or through `wait`, never a steer; an idle parent wakes subject to its Stop latch |
+| `send {"to":"reviewer","message":"…"}` | Sends durable mail to that teammate in the sender's roster; returns `Sent to reviewer.`. Mail is read at the next turn boundary, wakes `wait`, and starts an idle receiver's run. It never steers or waits for completion |
+
+Blank text fails with `message must not be blank`. Steering a non-child destination fails with `Only your subagents can be steered; send to <to> without steer.`. An unknown child id reports `No agent <id>`. Parent errors distinguish `This session has no parent.`, `Your parent session is not open; nothing was sent.`, and `Your parent no longer tracks this session; nothing was sent.`; roots and forks have no parent route. Self-mail fails with `You are <to>; send to a teammate or to parent.`. Other unknown destinations report `No agent named <to>. Your subagents are agent_N`, followed by the available parent and teammate routes. Non-team children cannot message siblings by name.
+
+`send` uses the default `Replay::Never` policy, so crash recovery does not repeat a potentially completed send. Teammate mail arrives as `Message from <name> (reply with send to "<name>"):` followed by its content, with axo wrapper tags escaped.
 
 ### Results in context
 

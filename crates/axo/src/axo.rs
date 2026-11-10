@@ -13,6 +13,7 @@ use crate::config::{
 };
 use crate::context::Diagnostic;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, load_agents};
+use crate::context::modes::{ModeSpec, load_modes};
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
@@ -44,10 +45,11 @@ pub struct Axo {
     sessions: Arc<SessionTable>,
 }
 
-/// Configuration and agent definitions resolved without starting a session.
+/// Configuration, agent definitions and mode definitions resolved without starting a session.
 pub struct Catalog {
     pub config: Arc<EffectiveConfig>,
     pub agents: Vec<AgentDef>,
+    pub modes: Vec<Arc<ModeSpec>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -294,16 +296,20 @@ impl Axo {
         cwd: &Path,
         project_access: Option<ProjectAccess>,
         agents: &[AgentSpec],
+        modes: &[ModeSpec],
     ) -> Result<Catalog, Error> {
         let config = Arc::new(EffectiveConfig::resolve(
             &*self.config,
             cwd,
             project_access,
         )?);
-        let (agents, diagnostics) = load_agents(&config.agent_roots, agents);
+        let (agents, mut diagnostics) = load_agents(&config.agent_roots, agents);
+        let (modes, mode_diagnostics) = load_modes(&config.mode_roots, modes);
+        diagnostics.extend(mode_diagnostics);
         Ok(Catalog {
             config,
             agents,
+            modes: modes.into_iter().map(Arc::new).collect(),
             diagnostics,
         })
     }
@@ -329,13 +335,14 @@ impl Axo {
             model,
             agent,
             agents,
+            modes,
             thinking,
             ask_enabled,
             project_access,
             exec_env,
             sections,
             tools: host_tools,
-            tool_hooks,
+            tool_policies,
             spawn_hooks,
             schemes: host_schemes,
             recovery: _,
@@ -344,8 +351,9 @@ impl Axo {
         let Catalog {
             config,
             agents,
+            modes,
             diagnostics: mut agent_diagnostics,
-        } = self.catalog(&cwd, project_access, &agents)?;
+        } = self.catalog(&cwd, project_access, &agents, &modes)?;
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
@@ -427,6 +435,7 @@ impl Axo {
                 docs_dir: self.docs_dir(),
                 harness_name: self.name.clone(),
                 agents,
+                modes,
                 agent_diagnostics,
                 agent,
                 streamer: self.streamer.clone(),
@@ -437,7 +446,7 @@ impl Axo {
                 host_sections: sections,
                 host_tools,
                 host_schemes,
-                tool_hooks,
+                tool_policies,
                 store: self.store.clone(),
                 sessions: self.sessions.clone(),
                 spawn_hooks,

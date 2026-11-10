@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::transcript::TranscriptToolSupport;
 use crate::types::ThinkingLevel;
 
 /// The wire API a model is served through.
@@ -72,6 +73,38 @@ pub struct Model {
     pub max_tokens: u64,
     #[serde(default)]
     pub compat: Compat,
+}
+
+impl Model {
+    /// How this model takes tool-list changes after the first request without losing its cached prefix.
+    pub fn tool_support(&self) -> TranscriptToolSupport {
+        let on = |flag: Option<bool>| flag.unwrap_or(false);
+        let compat = &self.compat;
+        match self.api {
+            ApiKind::AnthropicMessages
+                if on(compat.supports_mid_convo_system_messages)
+                    && on(compat.supports_mid_convo_tool_changes) =>
+            {
+                TranscriptToolSupport::Changes
+            }
+            ApiKind::OpenAiCodexResponses
+                if on(compat.supports_mid_convo_system_messages)
+                    && on(compat.supports_additional_tools) =>
+            {
+                TranscriptToolSupport::Changes
+            }
+            ApiKind::OpenAiCodexResponses if on(compat.supports_tool_search) => {
+                TranscriptToolSupport::Additions
+            }
+            ApiKind::OpenAiCompletions
+                if on(compat.supports_mid_convo_system_messages)
+                    && on(compat.supports_mid_convo_tool_additions) =>
+            {
+                TranscriptToolSupport::Additions
+            }
+            _ => TranscriptToolSupport::None,
+        }
+    }
 }
 
 /// Compatibility quirks: the union of the compat fields pi's Anthropic Messages, OpenAI

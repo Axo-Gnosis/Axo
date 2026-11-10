@@ -24,6 +24,7 @@ pub use config::{
     PromptOverride, RetrySettings, Settings, SubagentSettings, SummaryRequest, UserConfig,
 };
 pub use context::agents::{AgentSpec, RunAs};
+pub use context::modes::{ModeResult, ModeSpec, ToolLimits};
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
@@ -37,17 +38,20 @@ pub use jobs::{
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     Attach, ChildHandle, ContextUsage, Fork, HostDelivery, HostMessage, InlineSpec, LiveSnapshot,
-    MaintenanceKind, NavigateOptions, PromptRequest, PromptResult, RecoveryPolicy, Session,
-    SessionEvent, SessionOptions, ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin,
-    SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
+    MaintenanceKind, NavigateOptions, PendingResult, PromptRequest, PromptResult, RecoveryPolicy,
+    Session, SessionEvent, SessionOptions, ShakeMode, SpawnContext, SpawnDecision, SpawnHook,
+    SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy,
+    ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
-    JsonlStore, ProjectedSource, Projection, RosterEntry, RunOutcome, SeqEntry, SessionInfo,
-    SessionStore, SessionWriter, SpawnLink, SubmissionKind, SubmittedCustom, TIMESTAMP_FORMAT,
-    TeamLink, TeamRef, project,
+    JsonlStore, ModeRestore, ProjectedSource, Projection, RosterEntry, RunOutcome, SeqEntry,
+    SessionInfo, SessionStore, SessionWriter, SpawnLink, SubmissionKind, SubmittedCustom,
+    TIMESTAMP_FORMAT, TeamLink, TeamRef, project,
 };
-pub use tools::{Answer, CommandRequest, Question, QuestionOption, SessionTools, ToolFactory};
+pub use tools::{
+    Answer, CommandRequest, Exposure, HostTool, Question, QuestionOption, SessionTools, ToolFactory,
+};
 
 #[cfg(doctest)]
 mod markdown_doctests {

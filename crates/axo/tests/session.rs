@@ -3,15 +3,13 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axo::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, SubmissionKind};
-use axo::{PromptPart, SessionEvent};
-use axo_agent::{
-    AgentMessage, BeforeToolCallContext, RunOutcome, ToolCallDecision, ToolError, ToolHooks,
-};
+use axo::{PromptPart, SessionEvent, ToolPolicy, ToolScope};
+use axo_agent::{AgentMessage, BeforeToolCallContext, RunOutcome, ToolCallDecision, ToolError};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
 use common::{axo, options, within};
@@ -757,16 +755,18 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
 }
 
 #[tokio::test]
-async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
-    struct NoBash;
+async fn tool_policies_block_bash_in_sessions_and_forks_before_later_policies() {
+    struct NoBash(Mutex<Vec<String>>);
 
     #[async_trait::async_trait]
-    impl ToolHooks for NoBash {
+    impl ToolPolicy for NoBash {
         async fn before_tool_call(
             &self,
+            scope: &ToolScope,
             call: BeforeToolCallContext<'_>,
             _cancel: &CancellationToken,
         ) -> Result<ToolCallDecision, ToolError> {
+            self.0.lock().unwrap().push(scope.session_id.clone());
             Ok(if call.tool_call.name == "bash" {
                 ToolCallDecision::Block {
                     reason: Some("no bash".into()),
@@ -781,9 +781,10 @@ async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
     struct LaterHook(AtomicUsize);
 
     #[async_trait::async_trait]
-    impl ToolHooks for LaterHook {
+    impl ToolPolicy for LaterHook {
         async fn before_tool_call(
             &self,
+            _scope: &ToolScope,
             _call: BeforeToolCallContext<'_>,
             _cancel: &CancellationToken,
         ) -> Result<ToolCallDecision, ToolError> {
@@ -846,9 +847,10 @@ async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
     )
     .await;
     let later = Arc::new(LaterHook(AtomicUsize::new(0)));
+    let no_bash = Arc::new(NoBash(Mutex::new(Vec::new())));
     let mut options = common::bash_options(dir.path());
     let cwd = options.cwd.clone();
-    options.tool_hooks = vec![Arc::new(NoBash), later.clone()];
+    options.tool_policies = vec![no_bash.clone(), later.clone()];
     let session = host.create_session(options).await.unwrap();
     assert_eq!(
         within(session.prompt("run bash")).await.unwrap(),
@@ -858,6 +860,7 @@ async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
     assert_blocked(&entries, "original");
     assert!(!cwd.join("original-marker").exists());
     assert_eq!(later.0.load(Ordering::SeqCst), 0);
+    assert_eq!(*no_bash.0.lock().unwrap(), [session.id()]);
 
     let leaf = entries
         .iter()
@@ -882,6 +885,7 @@ async fn tool_hooks_block_bash_in_sessions_and_forks_before_later_hooks() {
     assert!(!cwd.join("original-marker").exists());
     assert!(!cwd.join("fork-marker").exists());
     assert_eq!(later.0.load(Ordering::SeqCst), 0);
+    assert_eq!(*no_bash.0.lock().unwrap(), [session.id(), fork.id()]);
 }
 
 #[tokio::test]

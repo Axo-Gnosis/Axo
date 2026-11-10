@@ -104,12 +104,12 @@ async fn spawn_tool_yields_structured_result() {
     assert_eq!(
         tool_names(parent_request),
         [
-            "read", "write", "edit", "bash", "grep", "find", "wait", "spawn"
+            "read", "write", "edit", "bash", "grep", "find", "wait", "kill", "spawn", "send"
         ]
     );
     let child_requests: Vec<_> = requests.iter().filter(|r| r.model.id == "child").collect();
     assert_eq!(child_requests.len(), 2);
-    assert_eq!(tool_names(child_requests[0]), ["read", "yield"]);
+    assert_eq!(tool_names(child_requests[0]), ["read", "send", "yield"]);
     let rejected = child_requests[1]
         .transcript
         .iter()
@@ -424,7 +424,7 @@ async fn yield_outcomes() {
 }
 
 #[tokio::test]
-async fn write_agent_url_follows_up_and_escapes() {
+async fn send_follows_up_and_escapes() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(
         dir.path(),
@@ -462,10 +462,33 @@ async fn write_agent_url_follows_up_and_escapes() {
     let weak = Arc::downgrade(&handle.session);
     drop(handle);
     until(|| weak.upgrade().is_none()).await;
-    let schemes = parent.schemes();
-    let agent = schemes.exact("agent://agent_1").unwrap();
+    within(async {
+        while parent.attach(None).await.live.running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    host.api.lane(
+        "m",
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "s1",
+                "send",
+                json!({"to":"agent_1","message":"more please"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("sent")),
+            ScriptedTurn::Reply(reply_text("ack")),
+        ],
+    );
+    within(parent.prompt("Follow up with the child."))
+        .await
+        .unwrap();
+    let parent_lines = journal(&parent);
+    let sent = only(&parent_lines, "send result", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "s1"
+    });
     assert_eq!(
-        within(schemes.write(&agent, "more please")).await.unwrap(),
+        message_text(&parent_lines[sent]),
         "Sent to agent_1. Its reply arrives as a new result."
     );
     entry(
@@ -474,6 +497,7 @@ async fn write_agent_url_follows_up_and_escapes() {
     )
     .await;
     delivered(&parent, "agent_1/2").await;
+    let schemes = parent.schemes();
     let proc = schemes.exact("proc://agent_1").unwrap();
     assert!(
         schemes

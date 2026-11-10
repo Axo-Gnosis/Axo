@@ -32,8 +32,7 @@ use crate::model::{
 };
 use crate::thinking::{MIN_ANSWER_TOKENS, clamp_level, default_thinking_budget, provider_value};
 use crate::transcript::{
-    Transcript, TranscriptToolSupport, render_system_message_update, resolve_transcript_tools,
-    system_message_text,
+    Transcript, render_system_message_update, resolve_transcript_tools, system_message_text,
 };
 use crate::types::{
     AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, StopReason, ThinkingLevel,
@@ -97,7 +96,6 @@ struct ResolvedCompat {
     thinking_token_budget_field: Option<ThinkingTokenBudgetField>,
     supports_strict_mode: bool,
     supports_mid_convo_system_messages: bool,
-    supports_mid_convo_tool_additions: bool,
     cache_control_format: Option<CacheControlFormat>,
     send_session_affinity_headers: bool,
     session_affinity_format: SessionAffinityFormat,
@@ -203,9 +201,6 @@ fn resolve_compat(model: &Model, base_url: &str) -> ResolvedCompat {
         supports_mid_convo_system_messages: compat
             .supports_mid_convo_system_messages
             .unwrap_or(false),
-        supports_mid_convo_tool_additions: compat
-            .supports_mid_convo_tool_additions
-            .unwrap_or(false),
         cache_control_format: compat.cache_control_format.or((provider == "openrouter"
             && model.id.starts_with("anthropic/"))
         .then_some(CacheControlFormat::Anthropic)),
@@ -257,12 +252,7 @@ fn build_params(
     let effort = Some(clamp_level(model, simple.thinking)).filter(|l| *l != ThinkingLevel::Off);
     let resolved = transcript.resolve(compat.supports_mid_convo_system_messages);
     let messages = resolved.messages();
-    let support =
-        if compat.supports_mid_convo_system_messages && compat.supports_mid_convo_tool_additions {
-            TranscriptToolSupport::Additions
-        } else {
-            TranscriptToolSupport::None
-        };
+    let support = model.tool_support();
     let transcript_tools = resolve_transcript_tools(messages, support);
     let mut converted = convert_messages(
         model,
@@ -574,6 +564,18 @@ fn convert_messages(
     compat: &ResolvedCompat,
     folded_system_messages: usize,
 ) -> Vec<Value> {
+    let mut call_names = HashMap::new();
+    if compat.requires_tool_result_name {
+        for message in messages {
+            if let Message::Assistant(assistant) = message {
+                call_names.extend(
+                    assistant
+                        .tool_calls()
+                        .map(|call| (call.id.as_str(), call.name.as_str())),
+                );
+            }
+        }
+    }
     let instruction_role = if model.reasoning && compat.supports_developer_role {
         "developer"
     } else {
@@ -662,8 +664,15 @@ fn convert_messages(
                         "content": text,
                         "tool_call_id": result.tool_call_id,
                     });
-                    if compat.requires_tool_result_name && !result.tool_name.is_empty() {
-                        tool_message["name"] = result.tool_name.clone().into();
+                    if compat.requires_tool_result_name {
+                        // Routed results name the inner tool; the wire must name the model's call.
+                        let name = call_names
+                            .get(result.tool_call_id.as_str())
+                            .copied()
+                            .unwrap_or(&result.tool_name);
+                        if !name.is_empty() {
+                            tool_message["name"] = name.into();
+                        }
                     }
                     params.push(tool_message);
                     if has_images && model.input.contains(&InputKind::Image) {
@@ -1424,5 +1433,61 @@ impl Response {
             }
             self.reply.end_block(index);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ApiKind, Compat, Cost};
+    use crate::types::ToolResultMessage;
+
+    #[test]
+    fn routed_result_uses_the_assistant_call_name() {
+        let model = Model {
+            id: "test".into(),
+            name: "Test".into(),
+            api: ApiKind::OpenAiCompletions,
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![InputKind::Text],
+            cost: Cost::default(),
+            context_window: 200_000,
+            max_tokens: 4096,
+            compat: Compat {
+                requires_tool_result_name: Some(true),
+                ..Default::default()
+            },
+        };
+        let compat = resolve_compat(&model, &model.base_url);
+        let mut assistant = AssistantMessage::empty(&model);
+        assistant.content.push(AssistantBlock::ToolCall(ToolCall {
+            id: "c1".into(),
+            name: "call".into(),
+            arguments: json!({"tool": "probe", "args": {}})
+                .as_object()
+                .unwrap()
+                .clone(),
+            arguments_error: None,
+        }));
+        let result = Message::ToolResult(ToolResultMessage {
+            tool_call_id: "c1".into(),
+            tool_name: "probe".into(),
+            content: vec![UserBlock::Text { text: "ok".into() }],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+            duration_ms: None,
+        });
+        let messages = [Message::Assistant(assistant), result];
+        let converted = convert_messages(&model, &messages, &compat, 0);
+        assert_eq!(converted[0]["tool_calls"][0]["function"]["name"], "call");
+        assert_eq!(converted[1]["tool_call_id"], "c1");
+        assert_eq!(converted[1]["name"], "call");
+
+        let orphaned = convert_messages(&model, &messages[1..], &compat, 0);
+        assert_eq!(orphaned[0]["name"], "probe");
     }
 }

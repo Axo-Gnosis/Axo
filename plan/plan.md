@@ -25,7 +25,7 @@ flowchart LR
 | **1. Codemode, script extensions & agent specs** | Embedded JS sandbox (`rquickjs`), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and child script hooks (rungs 2–5) | **Active focus.** Rungs 0–1 decided; rungs 2+ in discussion |
 | **5. Extensions (Bun host), MCP & `ast_edit`** | Extension contract, Bun stdio host & `@axo/sdk`, `.mcp.json` / host-supplied MCP tool adapter, optional `ast_edit` | Planned |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
-| **Session modes** | Cache-safe mode overlays, durable transitions, call-time tool gating and optional model swaps | Follow-up to the host surface work; design inputs below |
+| **Tool surface & session modes** | Deferred tools, action tools, scoped host policy, cache-safe root mode overlays and completion | **Shipped (A–H).** See [Shipped tracks](#shipped-tracks) |
 
 ---
 
@@ -278,7 +278,8 @@ Key risks to design around when building step 3 (script hooks):
 - **Track 2 (Agents, `spawn`, teams):** Landed in code; settled architecture decisions in [`design.md`](design.md#agents-and-child-sessions-axo) and runtime reference in [`crates/axo/docs/prompts-and-context.md`](../crates/axo/docs/prompts-and-context.md#agent-definitions), [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#child-sessions), and [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#spawning-child-sessions). Grounding research in [`research/subagents.md`](research/subagents.md).
 - **Track 3 (Async `bash`, background jobs & `wait`):** Landed in code; settled decisions in [`design.md`](design.md#settled-core-decisions) and runtime reference in [`crates/axo/docs/configuration.md`](../crates/axo/docs/configuration.md#command-supervision-axosupervision) and [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#background-job-durability). Historical verification log preserved in [`research/track3-supervision.md`](research/track3-supervision.md).
 - **Track 4 (URL scheme registry):** Landed in code; settled decisions in [`design.md`](design.md#settled-core-decisions) and runtime reference in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#3-rust-extension-traits).
-- **Host surface (shipping in this change):** Typed job and child state over one ordered event stream with complete attach snapshots, live command output, persisted switchable root personas, durable host messages, and introspection getters. Settled contracts in [`design.md`](design.md#host-contract-axo); persona and mode grounding in [`research/personas-and-modes.md`](research/personas-and-modes.md). First-class session modes remain follow-up work.
+- **Host surface:** Landed in code: typed job and child state over one ordered event stream with complete attach snapshots, live command output, persisted switchable root personas, durable host messages, and introspection getters. Settled contracts in [`design.md`](design.md#host-contract-axo); persona and mode grounding in [`research/personas-and-modes.md`](research/personas-and-modes.md).
+- **Tool surface & session modes, A–H:** Landed in code: public model tool-change capability (A), deferred dispatch with one inner tool identity (B), `kill`/`send` replacing action writes (C), deferred exposure, read-only `tool://`, `call`, promotion and reconciled catalog notices (D), root mode definitions/catalog (E), scoped `ToolPolicy` replacing session-level `tool_hooks` (F), journal-derived mode selection, boundary effectiveness, reconciled instructions, call-time limits, inherited child limits, model restoration, commands and events (G), and deferred `enter_mode`, schema-validated mode `yield`, typed result review, continuation and shared pending-decision machinery (H). The approved tool-surface/session-mode plan is complete. Settled contracts in [`design.md`](design.md#session-modes-axo) and [`design.md`](design.md#built-in-tools-and-execution-environment-axo); runtime reference in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md), [`crates/axo/docs/prompts-and-context.md`](../crates/axo/docs/prompts-and-context.md), and [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md).
 ---
 
 ## Track 5: Extensions (Bun host), MCP & `ast_edit`
@@ -294,7 +295,7 @@ Key risks to design around when building step 3 (script hooks):
 
 - **Configuration files.** Read the first existing ecosystem project-root file of `.mcp.json`, then `mcp.json`, plus host-supplied user MCP configuration (separate from settings), using the `{ "mcpServers": { name: { command, args, env } | { url, headers } } }` format.
 - **Trust gate.** Project MCP servers require `ProjectAccess::Trust`; at `Read` access they emit a diagnostic rather than starting. Add `project.files.mcp` (default `true`) when MCP lands.
-- **Tool exposure.** Introduce per-tool exposure (`direct`, `codemode` / script-only, `deferred`, `hidden`) so large MCP servers can be callable from `codemode` scripts without flooding the system prompt's tool declarations.
+- **Tool exposure.** Direct and deferred exposure already ship with the tool surface: MCP adapters can reuse the deferred catalog and `call` without flooding native declarations. Codemode/script-only and hidden exposure remain part of this track's design, not additional shipped exposure variants.
 
 ### `ast_edit`
 
@@ -320,20 +321,6 @@ Decisions when resumed:
 1. Use the `agent-client-protocol` crate or handwritten serde types (<1k lines).
 2. Default to `RecoveryPolicy::MarkInterrupted` on interactive open so the user decides whether to resume an interrupted run.
 3. Optional ACP `terminal/create` backend for `bash`.
-
----
-
-## Session modes
-
-Follow-up to the host surface work, separate from root personas. These are the design inputs for the next plan, not modes shipped by this change. Harness comparisons and cache behavior are recorded in [`research/personas-and-modes.md`](research/personas-and-modes.md).
-
-- **Mode definition:** a markdown file whose body holds the instructions, with frontmatter for a tool block policy and an optional model selector.
-- **Durable selection:** `Session::set_mode`, journaled as `mode_change`.
-- **Cache-safe transitions:** enter and leave messages through `Session::post` with `HostDelivery::Quiet`, without changing the system prompt or tool list.
-- **Compaction survival:** re-inject the reminder after compaction while the mode is active; OpenCode re-checks it on every request.
-- **Enforcement:** tool gating at call time, not tool-list removal.
-- **Model selection:** swap to the mode's model on enter and restore the previous model on exit, as with omp's plan role; this is the accepted cache break.
-- **No bundled modes:** axo supplies the mechanism; hosts, users and projects supply mode definitions.
 
 ---
 

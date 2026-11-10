@@ -23,6 +23,7 @@ pub struct AgentConfig {
     pub model: Model,
     pub thinking: ThinkingLevel,
     pub tools: Vec<Arc<dyn Tool>>,
+    pub deferred: Vec<Arc<dyn Tool>>,
     pub hooks: Arc<dyn LoopHooks>,
     pub tool_hooks: Vec<Arc<dyn ToolHooks>>,
     /// The ordered, awaited subscriber; see [`Persist`].
@@ -41,6 +42,7 @@ impl AgentConfig {
             model,
             thinking: ThinkingLevel::Off,
             tools: Vec::new(),
+            deferred: Vec::new(),
             hooks: Arc::new(NoHooks),
             tool_hooks: Vec::new(),
             persist: None,
@@ -89,6 +91,7 @@ pub(crate) struct State {
     pub(crate) model: Model,
     pub(crate) thinking: ThinkingLevel,
     pub(crate) tools: Vec<Arc<dyn Tool>>,
+    pub(crate) deferred: Vec<Arc<dyn Tool>>,
     pub(crate) steering: VecDeque<QueuedMessage>,
     pub(crate) follow_up: VecDeque<QueuedMessage>,
     /// The active run, if any.
@@ -128,6 +131,7 @@ impl Agent {
                 model: cfg.model,
                 thinking: cfg.thinking,
                 tools: cfg.tools,
+                deferred: cfg.deferred,
                 steering: VecDeque::new(),
                 follow_up: VecDeque::new(),
                 run: None,
@@ -319,6 +323,11 @@ impl Agent {
     /// system message.
     pub fn set_tools(&self, t: Vec<Arc<dyn Tool>>) {
         self.lock().tools = t;
+    }
+
+    /// Takes effect from the next turn.
+    pub fn set_deferred(&self, tools: Vec<Arc<dyn Tool>>) {
+        self.lock().deferred = tools;
     }
 
     /// The queued steering and follow-up messages, in delivery order.

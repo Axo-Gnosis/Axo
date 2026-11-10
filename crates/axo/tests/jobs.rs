@@ -492,7 +492,7 @@ async fn host_command_is_listed_and_delivered_once() {
     let factory: ToolFactory = Arc::new(|tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
         Arc::new(LateTool(tools.clone()))
     });
-    options.tools = vec![factory];
+    options.tools = vec![axo::HostTool::direct(factory)];
     let session = axo.create_session(options).await.unwrap();
 
     assert_eq!(
@@ -772,8 +772,8 @@ async fn retained_helpers_return_promptly_and_are_killable() {
             )])),
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c3",
-                "write",
-                json!({"path": "proc://bg_1/kill", "content": ""}),
+                "kill",
+                json!({"id": "bg_1"}),
             )])),
             ScriptedTurn::Reply(reply_text("stopped it")),
         ],

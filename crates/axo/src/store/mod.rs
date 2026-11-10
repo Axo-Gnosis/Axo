@@ -13,8 +13,8 @@ use axo_ai::{Message, Usage};
 
 pub use entry::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
-    RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind, SubmittedCustom,
-    TIMESTAMP_FORMAT, TeamLink, TeamRef,
+    ModeRestore, RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind,
+    SubmittedCustom, TIMESTAMP_FORMAT, TeamLink, TeamRef,
 };
 pub use jsonl::JsonlStore;
 pub(crate) use project::{BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, path_to};

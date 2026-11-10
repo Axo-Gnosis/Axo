@@ -5,8 +5,11 @@ use crate::config::{EffectiveConfig, PromptOverride};
 use crate::context::agents::{AgentSpec, ContextFiles};
 use crate::context::files::{ContextFile, context_file_names, load_context_files};
 use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir, project_root};
+use crate::tools::call::CALL;
+use crate::tools::kill::KILL;
 use crate::tools::output::YIELD;
-use crate::tools::{self, ToolFactory};
+use crate::tools::send::SEND;
+use crate::tools::{self, HostTool};
 use axo_agent::{AgentMessage, QueuedMessage, Tool};
 use axo_ai::{Message, SystemMessage, ToolSpec, now_ms};
 use tokio_util::sync::CancellationToken;
@@ -26,9 +29,14 @@ pub(crate) struct ShapeBase {
     pub project: bool,
     pub builtin: Vec<Arc<dyn Tool>>,
     pub host_tools: Vec<Arc<dyn Tool>>,
-    pub host_tool_factories: Vec<ToolFactory>,
+    pub host_deferred: Vec<Arc<dyn Tool>>,
+    pub host_tool_factories: Vec<HostTool>,
     pub host_sections: Vec<(String, Option<String>)>,
     pub depth: u32,
+    pub has_peers: bool,
+    pub call: Arc<dyn Tool>,
+    pub enter_mode: Option<Arc<dyn Tool>>,
+    pub has_modes: bool,
     pub yield_tool: Option<Arc<dyn Tool>>,
 }
 
@@ -104,29 +112,93 @@ pub(crate) fn shape(
         .map(|(name, _)| (name.clone(), None))
         .collect();
     let mut tools = tools::merge_tools(base.builtin.clone(), &base.host_tools);
+    if base
+        .host_tools
+        .iter()
+        .chain(&base.host_deferred)
+        .any(|tool| tool.name() == CALL)
+    {
+        diagnostics.push(Diagnostic {
+            origin: None,
+            message: "host tool \"call\" is reserved for deferred tools; ignored".into(),
+        });
+    }
+    tools.retain(|tool| tool.name() != CALL);
+    if base.has_modes {
+        if base
+            .host_tools
+            .iter()
+            .chain(&base.host_deferred)
+            .any(|tool| tool.name() == YIELD)
+        {
+            diagnostics.push(Diagnostic {
+                origin: None,
+                message: "host tool \"yield\" is reserved for modes; ignored".into(),
+            });
+        }
+        tools.retain(|tool| tool.name() != YIELD);
+    }
+    let mut deferred: Vec<Arc<dyn Tool>> = Vec::new();
+    for tool in base.host_deferred.iter().chain(base.enter_mode.iter()) {
+        if tool.name() == CALL || (base.has_modes && tool.name() == YIELD) {
+            continue;
+        }
+        if tools.iter().any(|direct| direct.name() == tool.name()) {
+            diagnostics.push(Diagnostic {
+                origin: None,
+                message: format!(
+                    "deferred tool \"{}\" has the name of a direct tool; ignored",
+                    tool.name()
+                ),
+            });
+        } else if !deferred
+            .iter()
+            .any(|previous| previous.name() == tool.name())
+        {
+            deferred.push(tool.clone());
+        }
+    }
     if let Some(spec) = agent
         && let Some(allow) = &spec.tools
     {
         for name in allow {
-            if !tools.iter().any(|tool| tool.name() == name) {
+            if !tools
+                .iter()
+                .chain(&deferred)
+                .any(|tool| tool.name() == name)
+            {
                 diagnostics.push(Diagnostic {
                     origin: spec.path.clone().map(DiagnosticOrigin::Path),
                     message: format!("agent \"{}\": unknown tool \"{name}\"", spec.name),
                 });
             }
         }
-        tools.retain(|tool| allow.iter().any(|name| name == tool.name()));
+        tools.retain(|tool| {
+            matches!(tool.name(), KILL | SEND) || allow.iter().any(|name| name == tool.name())
+        });
+        deferred.retain(|tool| allow.iter().any(|name| name == tool.name()));
     }
     if base.depth >= settings.subagents.max_depth {
         tools.retain(|tool| tool.name() != SPAWN);
     }
+    let has_spawn = tools.iter().any(|tool| tool.name() == SPAWN);
+    let has_bash = tools.iter().any(|tool| tool.name() == "bash");
+    tools.retain(|tool| match tool.name() {
+        KILL => has_bash || has_spawn,
+        SEND => has_spawn || base.has_peers,
+        _ => true,
+    });
     if let Some(yield_tool) = &base.yield_tool {
         tools.retain(|tool| tool.name() != YIELD);
         tools.push(yield_tool.clone());
     }
+    if !deferred.is_empty() || base.has_modes {
+        tools.push(base.call.clone());
+    }
     let shape = PromptShape {
         prompts,
         tools,
+        deferred,
         context_files: nested.startup.clone(),
         agent_sections,
         host_sections: base.host_sections.clone(),
@@ -173,14 +245,6 @@ impl SessionPrompt {
         let mut state = self.state();
         let note = state.note.clone();
         Self::build(&self.sources, &shape, &mut state, note, today());
-    }
-
-    pub(super) fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.shape
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .tools
-            .clone()
     }
 
     fn build(
@@ -287,8 +351,7 @@ impl SessionHooks {
                     .collect::<Sections>()
             });
             let tools: Vec<_> = self
-                .prompt
-                .tools()
+                .declared_tools()
                 .iter()
                 .map(|tool| ToolSpec {
                     name: tool.name().to_owned(),

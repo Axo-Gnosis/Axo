@@ -60,16 +60,8 @@ async fn team_members_message_each_other_and_the_parent() {
         "a",
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
-                (
-                    "w1",
-                    "write",
-                    json!({"path":"agent://b","content":"hello b"}),
-                ),
-                (
-                    "w2",
-                    "write",
-                    json!({"path":"agent://parent","content":"progress"}),
-                ),
+                ("w1", "send", json!({"to":"b","message":"hello b"})),
+                ("w2", "send", json!({"to":"parent","message":"progress"})),
             ])),
             ScriptedTurn::Reply(reply_text("a done")),
         ],
@@ -137,7 +129,7 @@ async fn team_members_message_each_other_and_the_parent() {
     assert_eq!(handle.members[1].0, "b");
     let a_lines = journal(&handle.members[0].1.session);
     for (call, text) in [("w1", "Sent to b."), ("w2", "Sent to your parent.")] {
-        let sent = only(&a_lines, "write result", |v| {
+        let sent = only(&a_lines, "send result", |v| {
             v["type"] == "message" && v["message"]["toolCallId"] == call
         });
         assert_eq!(message_text(&a_lines[sent]), text);
@@ -153,7 +145,7 @@ async fn team_members_message_each_other_and_the_parent() {
     });
     assert_eq!(
         b_lines[mail]["parts"][0]["text"],
-        "Message from a (reply with write agent://a):\n\nhello b"
+        "Message from a (reply with send to \"a\"):\n\nhello b"
     );
     let received = only(&b_lines, "consumed mail", |v| {
         v["type"] == "message" && v["submissionId"] == b_lines[mail]["submissionId"]
@@ -262,8 +254,8 @@ async fn outsider_cannot_message_team_members() {
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c1",
-                "write",
-                json!({"path":"agent://b","content":"hi"}),
+                "send",
+                json!({"to":"b","message":"hi"}),
             )])),
             ScriptedTurn::Reply(reply_text("c done")),
         ],
@@ -293,13 +285,14 @@ async fn outsider_cannot_message_team_members() {
         .await;
     }
     let lines = journal(&outsider.session);
-    let rejected = only(&lines, "outsider write result", |v| {
+    let rejected = only(&lines, "outsider send result", |v| {
         v["type"] == "message" && v["message"]["toolCallId"] == "c1"
     });
     assert_eq!(lines[rejected]["message"]["isError"], true);
-    assert!(message_text(&lines[rejected]).starts_with(
-        "No agent named b. Your subagents are agent://agent_N; your parent is agent://parent."
-    ));
+    assert!(
+        message_text(&lines[rejected])
+            .starts_with("No agent named b. Your subagents are agent_N; your parent is parent.")
+    );
     let b = &team.members.iter().find(|(name, _)| name == "b").unwrap().1;
     assert!(
         !journal(&b.session)
@@ -310,7 +303,7 @@ async fn outsider_cannot_message_team_members() {
 }
 
 #[tokio::test]
-async fn steer_url_starts_a_run_on_an_idle_child() {
+async fn send_steer_starts_a_run_on_an_idle_child() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(
         dir.path(),
@@ -336,10 +329,31 @@ async fn steer_url_starts_a_run_on_an_idle_child() {
         .await
         .unwrap();
     delivered(&parent, "agent_1").await;
-    let schemes = parent.schemes();
-    let steer = schemes.exact("agent://agent_1/steer").unwrap();
+    within(async {
+        while parent.attach(None).await.live.running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    host.api.lane(
+        "m",
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "s1",
+                "send",
+                json!({"to":"agent_1","message":"more","steer":true}),
+            )])),
+            ScriptedTurn::Reply(reply_text("sent")),
+            ScriptedTurn::Reply(reply_text("ack")),
+        ],
+    );
+    within(parent.prompt("Steer the child.")).await.unwrap();
+    let parent_lines = journal(&parent);
+    let sent = only(&parent_lines, "steer result", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "s1"
+    });
     assert_eq!(
-        within(schemes.write(&steer, "more")).await.unwrap(),
+        message_text(&parent_lines[sent]),
         "Steered agent_1: it reads your message after its current tool calls."
     );
     entry(

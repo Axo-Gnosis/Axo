@@ -7,6 +7,7 @@ use axo_agent::{AgentMessage, CustomMessage};
 use axo_ai::{Message, ThinkingLevel, UserBlock};
 use serde_json::{Value, json};
 
+use super::entry::ModeRestore;
 use super::{ContextReplacement, Entry, EntryId, SeqEntry};
 
 // pi `messages.ts:11-24`; baked into the summary message's content because
@@ -37,6 +38,10 @@ pub struct Projection {
     pub thinking: Option<ThinkingLevel>,
     /// The latest root persona selected by `agent_change` on the path.
     pub agent: Option<String>,
+    /// The latest mode selected by `mode_change` on the path.
+    pub mode: Option<String>,
+    /// Selection saved by the latest mode change, cleared by model or thinking changes.
+    pub mode_restore: Option<ModeRestore>,
     processed: usize,
     /// Id of the entry the path ends at.
     leaf: Option<String>,
@@ -96,11 +101,19 @@ impl Projection {
     fn track(&mut self, entry: &Entry) {
         match entry {
             Entry::AgentChange { agent, .. } => self.agent.clone_from(agent),
+            Entry::ModeChange { mode, restore, .. } => {
+                self.mode.clone_from(mode);
+                self.mode_restore.clone_from(restore);
+            }
             Entry::ModelChange {
                 provider, model_id, ..
-            } => self.model = Some(format!("{provider}/{model_id}")),
+            } => {
+                self.model = Some(format!("{provider}/{model_id}"));
+                self.mode_restore = None;
+            }
             Entry::ThinkingLevelChange { thinking_level, .. } => {
                 self.thinking = Some(*thinking_level);
+                self.mode_restore = None;
             }
             _ => {}
         }

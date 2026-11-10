@@ -128,7 +128,7 @@ impl Drop for WaitGuard {
 
 pub(crate) fn mutual_wait(team: &str) -> String {
     format!(
-        "Mutual wait: every running member of {team} is waiting and nothing is pending, so no one can reply. Send what you need with write agent://<name>, or finish with your result."
+        "Mutual wait: every running member of {team} is waiting and nothing is pending, so no one can reply. Send what you need with send, or finish with your result."
     )
 }
 
@@ -162,6 +162,6 @@ pub(crate) fn section(link: &TeamLink) -> String {
         }
     }
     parts.push(roster);
-    parts.push("Message a teammate with write agent://<name> and your parent with write agent://parent; there is no broadcast. Messages from teammates arrive between your steps; to wait for one, call wait. Your final message is your result for your parent.".into());
+    parts.push("Message a teammate or your parent (\"parent\") with send; there is no broadcast. Messages from teammates arrive between your steps; to wait for one, call wait. Your final message is your result for your parent.".into());
     parts.join("\n\n")
 }

@@ -88,7 +88,7 @@ impl Tool for BashTool {
     fn prompt_guidelines(&self) -> &[&str] {
         &[
             "A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes.",
-            "List jobs with read proc:// and stop one with write proc://bg_N/kill (empty content).",
+            "List jobs with read proc:// and stop one with kill.",
         ]
     }
 

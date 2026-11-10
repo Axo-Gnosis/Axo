@@ -249,7 +249,7 @@ fn last_non_additive_tool_change(systems: &[&SystemMessage]) -> Option<usize> {
 
 /// How a transport can express tool changes after the first request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptToolSupport {
+pub enum TranscriptToolSupport {
     /// Only the top-level tool list exists; it always holds the current tools.
     None,
     /// Tools can be added at a later message, but not removed or redefined.

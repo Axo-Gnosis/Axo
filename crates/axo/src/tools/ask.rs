@@ -1,8 +1,8 @@
 //! The `ask` tool (port of omp `tools/ask.ts`) and the registry of questions waiting for
 //! the client.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +14,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::error::Error;
 use crate::session::SessionEvent;
+
+use super::pending::Pending;
 
 pub(crate) const ASK: &str = "ask";
 
@@ -63,15 +65,12 @@ pub(crate) enum AskOutcome {
     Dismissed,
 }
 
-/// A registered call: its questions and the channel that settles it.
-type PendingEntry = (Vec<Question>, oneshot::Sender<AskOutcome>);
-
 /// Questions waiting for the client, keyed by tool-call id. `ask` registers one and
 /// broadcasts `SessionEvent::QuestionPending`; the session's `answer`/`dismiss` settle it
 /// and broadcast `SessionEvent::QuestionResolved`.
 pub(crate) struct PendingQuestions {
     events: broadcast::Sender<SessionEvent>,
-    pending: Mutex<HashMap<String, PendingEntry>>,
+    pending: Pending<Vec<Question>, AskOutcome>,
 }
 
 impl PendingQuestions {
@@ -79,18 +78,14 @@ impl PendingQuestions {
     pub fn new(events: broadcast::Sender<SessionEvent>) -> Self {
         Self {
             events,
-            pending: Mutex::new(HashMap::new()),
+            pending: Pending::default(),
         }
     }
 
     /// Registers `questions` under `call_id` and announces them to the client. A second
     /// registration under the same id replaces the first, whose receiver then closes.
     pub fn ask(&self, call_id: &str, questions: Vec<Question>) -> oneshot::Receiver<AskOutcome> {
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(call_id.to_owned(), (questions.clone(), tx));
+        let rx = self.pending.register(call_id, questions.clone());
         let _ = self.events.send(SessionEvent::QuestionPending {
             call_id: call_id.to_owned(),
             questions,
@@ -110,48 +105,24 @@ impl PendingQuestions {
 
     /// Snapshot of every unanswered call, for clients attaching late.
     pub fn pending(&self) -> Vec<(String, Vec<Question>)> {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|(id, (questions, _))| (id.clone(), questions.clone()))
-            .collect()
+        self.pending.snapshot()
     }
 
     fn settle(&self, call_id: &str, outcome: AskOutcome) -> Result<(), Error> {
-        let (_, tx) = self
-            .take(call_id)
-            .ok_or_else(|| Error::NoPendingQuestion(call_id.to_owned()))?;
-        // A dropped receiver means the tool already gave up (cancelled); nothing to deliver.
-        let _ = tx.send(outcome);
-        Ok(())
-    }
-
-    /// Removes the entry and announces it resolved; `None` when it was already settled.
-    fn take(&self, call_id: &str) -> Option<PendingEntry> {
-        let entry = self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(call_id)?;
+        if !self.pending.settle(call_id, outcome) {
+            return Err(Error::NoPendingQuestion(call_id.to_owned()));
+        }
         let _ = self.events.send(SessionEvent::QuestionResolved {
             call_id: call_id.to_owned(),
         });
-        Some(entry)
+        Ok(())
     }
 
     /// Withdraws `call_id`'s registration once its receiver is gone, so a call that
     /// ends unsettled (cancelled or aborted) leaves no question behind. A newer
     /// registration under the same id still has its receiver and is kept.
     fn withdraw(&self, call_id: &str) {
-        let removed = {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            match pending.get(call_id) {
-                Some((_, tx)) if tx.is_closed() => pending.remove(call_id).is_some(),
-                _ => false,
-            }
-        };
-        if removed {
+        if self.pending.withdraw(call_id) {
             let _ = self.events.send(SessionEvent::QuestionResolved {
                 call_id: call_id.to_owned(),
             });
@@ -318,7 +289,7 @@ impl Tool for AskTool {
             outcome = &mut rx => Some(outcome.map_err(closed)?),
             () = cancel.cancelled() => return Err(ToolError("Ask input was cancelled".into())),
             () = timeout => {
-                if registry.take(&call.id).is_some() {
+                if registry.settle(&call.id, AskOutcome::Dismissed).is_ok() {
                     None
                 } else {
                     // The client settled it in the same instant; honor its outcome.

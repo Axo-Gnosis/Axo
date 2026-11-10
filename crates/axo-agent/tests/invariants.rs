@@ -14,8 +14,8 @@ use axo_agent::{
 };
 use axo_ai::testing::{reply_text, reply_tool_calls, scripted_model};
 use axo_ai::{
-    AssistantBlock, AssistantEvent, AssistantMessage, Message, Model, ScriptedApi, ScriptedTurn,
-    StopReason, ToolResultMessage, UserBlock, UserMessage, now_ms,
+    AssistantBlock, AssistantEvent, AssistantMessage, JsonMap, Message, Model, ScriptedApi,
+    ScriptedTurn, StopReason, ToolCall, ToolResultMessage, UserBlock, UserMessage, now_ms,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -88,6 +88,7 @@ struct Recorder {
     log: Mutex<Vec<(String, usize)>>,
     results: Mutex<Vec<ToolResultMessage>>,
     assistants: Mutex<Vec<AssistantMessage>>,
+    before_calls: Mutex<Vec<ToolCall>>,
     exec_ends: Mutex<Vec<(String, bool)>>,
     /// The `MessageEnd` label and origin of every persisted message, in order.
     origins: Mutex<Vec<(String, MessageOrigin)>>,
@@ -222,6 +223,10 @@ impl ToolHooks for Recorder {
         _cancel: &CancellationToken,
     ) -> Result<ToolCallDecision, ToolError> {
         let id = call.tool_call.id.clone();
+        self.before_calls
+            .lock()
+            .unwrap()
+            .push(call.tool_call.clone());
         if let Some((_, ms)) = self
             .prep_delay_ms
             .iter()
@@ -393,6 +398,40 @@ impl Tool for ProbeTool {
             }],
             ..ToolOutput::default()
         })
+    }
+}
+
+struct Dispatcher {
+    schema: Value,
+}
+
+#[async_trait]
+impl Tool for Dispatcher {
+    fn name(&self) -> &str {
+        "call"
+    }
+
+    fn description(&self) -> &str {
+        "Dispatches a deferred tool."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    fn target(&self, call: &ToolCall) -> Option<(String, JsonMap)> {
+        Some((
+            call.arguments.get("tool")?.as_str()?.to_owned(),
+            call.arguments
+                .get("args")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
+    async fn execute(&self, _cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        panic!("a routed dispatch must never execute the dispatcher")
     }
 }
 
@@ -637,6 +676,7 @@ fn setup(
         log: Mutex::default(),
         results: Mutex::default(),
         assistants: Mutex::default(),
+        before_calls: Mutex::default(),
         exec_ends: Mutex::default(),
         origins: Mutex::default(),
         block: Vec::new(),
@@ -693,6 +733,84 @@ fn text(reply: &str) -> ScriptedTurn {
 // ---------------------------------------------------------------------------------------
 // Invariants
 // ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deferred_dispatch_preserves_inner_tool_identity_and_validation() {
+    let probe = Arc::new(Probe::default());
+    let h = setup(
+        vec![
+            turn(&[
+                (
+                    "valid",
+                    "call",
+                    json!({ "tool": "probe", "args": { "value": "ok" } }),
+                ),
+                (
+                    "invalid",
+                    "call",
+                    json!({ "tool": "probe", "args": { "value": 42 } }),
+                ),
+                ("unknown", "call", json!({ "tool": "nope" })),
+                ("direct", "probe", json!({ "value": "direct" })),
+                (
+                    "wrapper",
+                    "call",
+                    json!({ "tool": "probe", "args": { "value": "ok" }, "extra": true }),
+                ),
+            ]),
+            text("done"),
+        ],
+        vec![Arc::new(Dispatcher {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string" },
+                    "args": { "type": "object" }
+                },
+                "required": ["tool"],
+                "additionalProperties": false
+            }),
+        })],
+        |_| {},
+    );
+    h.agent.set_deferred(vec![Arc::new(ProbeTool {
+        name: "probe",
+        mode: ExecutionMode::Sequential,
+        probe: probe.clone(),
+        schema: json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"]
+        }),
+    })]);
+
+    assert_eq!(h.prompt("go").await, RunOutcome::Done);
+    assert_eq!(probe.started(), ["valid", "direct"]);
+    let before = h.rec.before_calls.lock().unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].name, "probe");
+    assert_eq!(
+        &before[0].arguments,
+        json!({ "value": "ok" }).as_object().unwrap()
+    );
+    assert_eq!(before[1].name, "probe");
+
+    let valid = h.rec.result("valid");
+    assert!(!valid.is_error);
+    assert_eq!(valid.tool_name, "probe");
+    let invalid = h.rec.result("invalid");
+    assert!(invalid.is_error);
+    assert_eq!(invalid.tool_name, "probe");
+    assert!(first_text(&invalid.content).contains("Validation failed for tool \"probe\""));
+    assert_eq!(
+        first_text(&h.rec.result("unknown").content),
+        "Tool nope not found"
+    );
+    let wrapper = h.rec.result("wrapper");
+    assert!(wrapper.is_error);
+    assert!(first_text(&wrapper.content).contains("Validation failed for tool \"call\""));
+    assert_results_adjacent(&h.api.requests()[1].transcript);
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finish_turn_runs_before_turn_end() {

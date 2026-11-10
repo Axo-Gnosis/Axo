@@ -22,6 +22,8 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 
 **2026-11-03 follow-up:** [`track3-supervision.md`](track3-supervision.md) checks Track 3 against actual axo/omp code, session traces, kernel contracts and isolated process-failure probes. It supersedes the older shell study's supervision assumptions; its decisions are implemented; see Track 3 in [plan.md](../plan.md).
 
+**2026-11-09 mode studies** (inputs to the session-modes plan): [`personas-and-modes.md`](personas-and-modes.md) surveys root personas and modes across harnesses; [`mode-lifecycle.md`](mode-lifecycle.md) covers how modes are exited and approved, whether children inherit them, model precedence on entry and exit, and how read-only modes restrict the shell; [`mode-reminders.md`](mode-reminders.md) works out the prompt-cache cost of each way to keep mode instructions in context, including after compaction; [`deferred-tools.md`](deferred-tools.md) dissects omp's `xd://` tool devices and compares deferred-tool mechanisms (Anthropic and OpenAI tool search, Claude Code, Codex, pi exposures, Cursor, Cloudflare Code Mode, MCP `list_changed`).
+
 ## Why a new core
 
 Axome needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:

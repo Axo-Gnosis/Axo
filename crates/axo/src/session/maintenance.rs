@@ -534,6 +534,9 @@ impl SessionHooks {
         }
         self.record_current_selection().await?;
         self.take_system();
+        self.rebase_promoted();
+        self.rebase_mode();
+        self.install_tools();
         self.sync_sections().await?;
         Ok(())
     }
@@ -656,6 +659,9 @@ impl Session {
             hooks.record_current_selection().await?;
             // Pending diffs were relative to the old position; they are recomputed below.
             hooks.take_system();
+            hooks.rebase_promoted();
+            hooks.rebase_mode();
+            hooks.install_tools();
             hooks.sync_sections().await?;
             agent.set_messages(hooks.journal.view().projection.messages.clone());
             Ok(())

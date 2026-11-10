@@ -137,7 +137,7 @@ async fn spawned_child_delivers_once_and_parks() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["read"]
+        ["read", "send"]
     );
     let bytes = std::fs::read_to_string(handle.session.path()).unwrap();
     let header: Value = serde_json::from_str(bytes.lines().next().unwrap()).unwrap();
@@ -318,7 +318,7 @@ async fn child_finishing_while_parent_closed_is_reconciled() {
     let parent = host
         .axo
         .create_session(SessionOptions {
-            tools: vec![factory],
+            tools: vec![axo::HostTool::direct(factory)],
             ..options(dir.path())
         })
         .await
@@ -663,7 +663,7 @@ async fn queued_children_publish_running_and_per_run_usage() {
     let parent = host
         .axo
         .create_session(SessionOptions {
-            tools: vec![factory],
+            tools: vec![axo::HostTool::direct(factory)],
             ..options(dir.path())
         })
         .await

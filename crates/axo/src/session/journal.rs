@@ -17,9 +17,9 @@ use crate::store::{Entry, EntryBase, EntryId, Projection, SeqEntry, SessionWrite
 pub(crate) struct View {
     pub(crate) entries: Vec<SeqEntry>,
     pub(crate) projection: Projection,
-    /// Bumped by every entry except `submission`, `usage`, `model_change` and
-    /// `thinking_level_change`, so work prepared from one view commits only while the
-    /// transcript it read is unchanged.
+    /// Bumped by every entry except `submission`, `usage`, `model_change`,
+    /// `thinking_level_change`, `agent_change` and `mode_change`, so work prepared
+    /// from one view commits only while the transcript it read is unchanged.
     pub(crate) revision: u64,
     pub(crate) ids: HashSet<String>,
 }
@@ -273,6 +273,7 @@ async fn commit(
                         | Entry::Usage { .. }
                         | Entry::ModelChange { .. }
                         | Entry::AgentChange { .. }
+                        | Entry::ModeChange { .. }
                         | Entry::ThinkingLevelChange { .. }
                 ) {
                     view.revision = view.revision.wrapping_add(1);

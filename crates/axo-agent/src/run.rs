@@ -1,5 +1,6 @@
 //! The loop itself (pi `agent/src/agent-loop.ts`).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -31,6 +32,47 @@ use crate::tool::{
     ToolUpdate, ToolUpdates,
 };
 
+pub struct Routed<'a> {
+    pub tool: &'a Arc<dyn Tool>,
+    pub call: Cow<'a, ToolCall>,
+    /// The dispatcher the model called, when the call was redirected.
+    pub via: Option<&'a Arc<dyn Tool>>,
+}
+
+/// The tool `call` runs. `Err` is the model-facing "not found" text.
+pub fn route<'a>(
+    tools: &'a [Arc<dyn Tool>],
+    deferred: &'a [Arc<dyn Tool>],
+    call: &'a ToolCall,
+) -> Result<Routed<'a>, String> {
+    let find = |name: &str| {
+        tools
+            .iter()
+            .chain(deferred)
+            .find(|tool| tool.name() == name)
+            .ok_or_else(|| format!("Tool {name} not found"))
+    };
+    let tool = find(&call.name)?;
+    if let Some((name, arguments)) = tool.target(call) {
+        Ok(Routed {
+            tool: find(&name)?,
+            call: Cow::Owned(ToolCall {
+                id: call.id.clone(),
+                name,
+                arguments,
+                arguments_error: None,
+            }),
+            via: Some(tool),
+        })
+    } else {
+        Ok(Routed {
+            tool,
+            call: Cow::Borrowed(call),
+            via: None,
+        })
+    }
+}
+
 /// How a run starts.
 #[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 pub(crate) enum RunStart {
@@ -59,6 +101,7 @@ pub(crate) async fn run_loop(
         AgentContext {
             messages: state.messages.clone(),
             tools: state.tools.clone(),
+            deferred: state.deferred.clone(),
         }
     };
     let mut run = Run {
@@ -110,7 +153,7 @@ impl Outcome {
 enum Prepared {
     /// Not executed: unknown tool, invalid arguments, blocked, or aborted.
     Immediate(ToolOutput),
-    Ready(Arc<dyn Tool>),
+    Ready(Arc<dyn Tool>, ToolCall),
 }
 
 /// How long a stopped call may take to return on its own before its task is aborted.
@@ -255,7 +298,11 @@ impl Run<'_> {
                         }
                         self.emit(&AgentEvent::TurnStart).await?;
                     }
-                    self.context.tools = agent.lock().tools.clone();
+                    {
+                        let state = agent.lock();
+                        self.context.tools = state.tools.clone();
+                        self.context.deferred = state.deferred.clone();
+                    }
                     prepared.extend(pending.drain(..).map(input));
                     for (message, origin) in declare_tool_changes(&self.context, prepared) {
                         self.add_message(message, origin).await?;
@@ -513,9 +560,8 @@ impl Run<'_> {
         calls: &[ToolCall],
     ) -> Result<(Vec<ToolResultMessage>, bool), Error> {
         let sequential = calls.iter().any(|call| {
-            self.context.tools.iter().any(|tool| {
-                tool.name() == call.name && tool.execution_mode() == ExecutionMode::Sequential
-            })
+            route(&self.context.tools, &self.context.deferred, call)
+                .is_ok_and(|routed| routed.tool.execution_mode() == ExecutionMode::Sequential)
         });
         // The batch terminates only when every produced result asks for it.
         let mut terminates: Vec<bool> = Vec::with_capacity(calls.len());
@@ -527,14 +573,20 @@ impl Run<'_> {
             // Preparation, including `before_tool_call`, runs in source order and clears
             // the whole batch before any call starts.
             for (index, call) in calls.iter().enumerate() {
-                self.emit_start(call).await?;
-                match self.prepare(message, call).await {
+                let routed = route(&self.context.tools, &self.context.deferred, call);
+                let effective = routed.as_ref().map_or(call, |routed| routed.call.as_ref());
+                self.emit_start(effective).await?;
+                let prepared = match &routed {
+                    Ok(routed) => self.prepare(message, call, routed).await,
+                    Err(text) => Prepared::Immediate(error_output(text.clone())),
+                };
+                match prepared {
                     Prepared::Immediate(output) => {
-                        let outcome = Outcome::synthetic(call, output);
+                        let outcome = Outcome::synthetic(effective, output);
                         self.emit_end(&outcome).await?;
                         slots[index] = Some(outcome);
                     }
-                    Prepared::Ready(tool) => ready.push((index, tool, call)),
+                    Prepared::Ready(tool, call) => ready.push((index, tool, call)),
                 }
                 if self.cancel.is_cancelled() {
                     break;
@@ -542,7 +594,7 @@ impl Run<'_> {
             }
             if self.cancel.is_cancelled() {
                 for (index, _, call) in ready {
-                    let outcome = Outcome::synthetic(call, error_output("Operation aborted"));
+                    let outcome = Outcome::synthetic(&call, error_output("Operation aborted"));
                     self.emit_end(&outcome).await?;
                     slots[index] = Some(outcome);
                 }
@@ -569,16 +621,20 @@ impl Run<'_> {
         Ok((results, terminate))
     }
 
-    /// Looks up, validates and clears one call with `before_tool_call`.
-    async fn prepare(&self, message: &AssistantMessage, call: &ToolCall) -> Prepared {
-        let Some(tool) = self
-            .context
-            .tools
-            .iter()
-            .find(|tool| tool.name() == call.name)
-        else {
-            return Prepared::Immediate(error_output(format!("Tool {} not found", call.name)));
-        };
+    /// Validates the dispatcher and target, then clears the routed call with hooks.
+    async fn prepare(
+        &self,
+        message: &AssistantMessage,
+        original: &ToolCall,
+        routed: &Routed<'_>,
+    ) -> Prepared {
+        if let Some(via) = routed.via
+            && let Err(text) = validate_arguments(&**via, original)
+        {
+            return Prepared::Immediate(error_output(text));
+        }
+        let tool = routed.tool;
+        let call = routed.call.as_ref();
         if let Err(text) = validate_arguments(&**tool, call) {
             return Prepared::Immediate(error_output(text));
         }
@@ -610,15 +666,15 @@ impl Run<'_> {
         if self.cancel.is_cancelled() {
             Prepared::Immediate(error_output("Operation aborted"))
         } else {
-            Prepared::Ready(tool.clone())
+            Prepared::Ready(tool.clone(), call.clone())
         }
     }
 
     /// Starts one prepared call on its own task, so the loop never polls tool futures:
     /// a tool waiting on something the loop's `Persist` holds cannot stall the loop. The
     /// call's token is a child of the batch's, so Stop and a failed persist both reach it.
-    fn spawn_call(&self, batch: &mut Batch, index: usize, tool: Arc<dyn Tool>, call: &ToolCall) {
-        let call = Arc::new(call.clone());
+    fn spawn_call(&self, batch: &mut Batch, index: usize, tool: Arc<dyn Tool>, call: ToolCall) {
+        let call = Arc::new(call);
         let invocation =
             ToolInvocationId(self.agent.next_invocation.fetch_add(1, Ordering::Relaxed));
         let call_id: Arc<str> = Arc::from(call.id.as_str());

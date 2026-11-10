@@ -8,6 +8,7 @@ use axo_ai::{AssistantBlock, AssistantMessage, Message, Usage, UserBlock};
 use serde_json::Value;
 
 use crate::store::{Entry, RunOutcome, SeqEntry, TeamRef, run_usage};
+use crate::tools::call::{CALL, target};
 use crate::tools::output::{YIELD, value_text, yielded_value};
 use crate::tools::truncate::{Limits, format_size, truncate_head};
 
@@ -160,7 +161,23 @@ pub(crate) fn run_message(
             message
                 .tool_calls()
                 .find(|call| call.id == result.tool_call_id)
-                .map(|call| yielded_value(schema, &call.arguments))
+                .and_then(|call| {
+                    let arguments = match call.name.as_str() {
+                        YIELD => Some(&call.arguments),
+                        CALL => {
+                            let (name, arguments) = target(call)?;
+                            if name != YIELD {
+                                return None;
+                            }
+                            arguments
+                        }
+                        _ => return None,
+                    };
+                    Some(yielded_value(
+                        schema,
+                        arguments.unwrap_or(&Default::default()),
+                    ))
+                })
         })
     });
     let failure = |reason: &str| {

@@ -210,6 +210,15 @@ fn is_zero(value: &i64) -> bool {
     *value == 0
 }
 
+/// Model and thinking selection to restore when leaving a mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeRestore {
+    pub provider: String,
+    pub model_id: String,
+    pub thinking_level: ThinkingLevel,
+}
+
 /// One line after the header.
 ///
 /// A line whose `type` is unknown, or a known type whose fields do not parse,
@@ -253,6 +262,15 @@ pub enum Entry {
         base: EntryBase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+    },
+    /// The active mode and its saved selection; `None` removes the mode.
+    ModeChange {
+        #[serde(flatten)]
+        base: EntryBase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<ModeRestore>,
     },
     /// Usage outside the transcript (e.g. `cache_warm`); never in context.
     Usage {
@@ -447,7 +465,7 @@ pub enum Entry {
         /// The child run the message reports.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<String>,
-        /// A child's mid-run message (`write agent://parent`), not a run result.
+        /// A child's mid-run message (`send` to parent), not a run result.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         note: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -513,6 +531,7 @@ impl Entry {
             | Entry::ThinkingLevelChange { base, .. }
             | Entry::ModelChange { base, .. }
             | Entry::AgentChange { base, .. }
+            | Entry::ModeChange { base, .. }
             | Entry::Usage { base, .. }
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
@@ -540,6 +559,7 @@ impl Entry {
             | Entry::ThinkingLevelChange { base, .. }
             | Entry::ModelChange { base, .. }
             | Entry::AgentChange { base, .. }
+            | Entry::ModeChange { base, .. }
             | Entry::Usage { base, .. }
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
@@ -623,7 +643,7 @@ pub enum SubmissionKind {
     FollowUp,
     /// Held until a turn boundary or the next run; never starts a run.
     Quiet,
-    /// A teammate's message (`write agent://<name>`): delivered at the next turn boundary or
+    /// A teammate's message (`send`): delivered at the next turn boundary or
     /// by `wait`, never as a steer.
     Mail,
 }

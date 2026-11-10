@@ -4,10 +4,13 @@ pub(crate) mod children;
 mod delivery;
 pub(crate) mod journal;
 mod maintenance;
+mod modes;
+mod policy;
 mod prompt;
 mod resume;
 mod side_files;
 pub(crate) mod spawn;
+mod surface;
 pub(crate) mod team;
 
 use std::collections::HashMap;
@@ -38,6 +41,10 @@ use self::children::{ChildState, SessionTable, TurnBudget};
 use self::delivery::{Activity, enqueue};
 use self::journal::Journal;
 use self::maintenance::Maintenance;
+pub(crate) use self::modes::MODE_NOTICE;
+pub use self::modes::PendingResult;
+use self::policy::{ModeGate, PolicyHook, ScopeCell};
+pub use self::policy::{ToolPolicy, ToolScope};
 use self::prompt::{PromptState, SessionPrompt, ShapeBase, shape};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
@@ -46,12 +53,14 @@ pub use self::spawn::{
     ChildHandle, InlineSpec, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
     SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
 };
+pub(crate) use self::surface::TOOL_CATALOG;
 use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
 use crate::config::{EffectiveConfig, ProjectAccess};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs};
 use crate::context::files::NestedContext;
+use crate::context::modes::ModeSpec;
 use crate::context::prompt::PromptSources;
 use crate::context::skills::{Skill, load_skills};
 use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir};
@@ -72,7 +81,7 @@ use crate::store::{
     SessionWriter, SubmissionKind, project,
 };
 use crate::tools::output::{MAX_YIELD_FAILURES, YIELD, YIELD_NUDGE, YieldState, YieldTool};
-use crate::tools::{self, Answer, PendingQuestions, Question, SessionTools, ToolFactory};
+use crate::tools::{self, Answer, Exposure, HostTool, PendingQuestions, Question, SessionTools};
 
 pub struct SessionOptions {
     /// Ignored by `Axo::open_session`, which uses the cwd in the session header.
@@ -85,6 +94,8 @@ pub struct SessionOptions {
     pub agent: Option<String>,
     /// Agent definitions supplied in code, after every file-defined one; the first name wins.
     pub agents: Vec<AgentSpec>,
+    /// Mode definitions supplied in code, after every file-defined one; the first name wins.
+    pub modes: Vec<ModeSpec>,
     /// Falls back to the session's last level, then `defaultThinkingLevel`; clamped to
     /// the model's supported levels.
     pub thinking: Option<ThinkingLevel>,
@@ -98,12 +109,12 @@ pub struct SessionOptions {
     /// Host prompt sections, applied last; `None` removes a section.
     pub sections: Vec<(String, Option<String>)>,
     /// Host tools, built per session (and per fork) from its `SessionTools`; one named like a built-in replaces it.
-    pub tools: Vec<ToolFactory>,
+    pub tools: Vec<HostTool>,
     /// Ordered host tool policies, inherited by forks.
-    pub tool_hooks: Vec<Arc<dyn ToolHooks>>,
+    pub tool_policies: Vec<Arc<dyn ToolPolicy>>,
     /// Ordered spawn policies; children inherit them.
     pub spawn_hooks: Vec<Arc<dyn SpawnHook>>,
-    /// Host schemes; one named like a built-in replaces it (artifact and file are reserved).
+    /// Host schemes; one named like a built-in replaces it (artifact, file and tool are reserved).
     pub schemes: Vec<Arc<dyn Scheme>>,
     /// What `Axo::open_session` does with a run left unfinished.
     pub recovery: RecoveryPolicy,
@@ -117,13 +128,14 @@ impl Default for SessionOptions {
             model: None,
             agent: None,
             agents: Vec::new(),
+            modes: Vec::new(),
             thinking: None,
             ask_enabled: false,
             project_access: None,
             exec_env: None,
             sections: Vec::new(),
             tools: Vec::new(),
-            tool_hooks: Vec::new(),
+            tool_policies: Vec::new(),
             spawn_hooks: Vec::new(),
             schemes: Vec::new(),
             recovery: RecoveryPolicy::default(),
@@ -222,6 +234,20 @@ pub enum SessionEvent {
     AutoPaused {
         paused: bool,
     },
+    /// The selected session mode changed.
+    Mode {
+        mode: Option<String>,
+    },
+    /// A mode result, optionally waiting for host review.
+    ModeResult {
+        call_id: String,
+        mode: String,
+        result: Value,
+        awaiting_review: bool,
+    },
+    ModeResultResolved {
+        call_id: String,
+    },
 }
 
 /// A prompt with an optional client id that makes resubmission idempotent.
@@ -296,6 +322,8 @@ pub struct LiveSnapshot {
     /// Unanswered `ask` calls by tool-call id. A question raised while attaching can
     /// also arrive as a `QuestionPending` event (duplicated, never missed).
     pub pending_questions: Vec<(String, Vec<Question>)>,
+    /// Mode results currently waiting for host review.
+    pub pending_results: Vec<PendingResult>,
     /// The background jobs, as [`Session::jobs`] returns them.
     pub jobs: Vec<JobInfo>,
     /// Recorded spend, including maintenance and failed assistant requests, without run/job rollups.
@@ -303,6 +331,7 @@ pub struct LiveSnapshot {
     pub model: Model,
     pub thinking: ThinkingLevel,
     pub agent: Option<String>,
+    pub mode: Option<String>,
     pub context: Option<ContextUsage>,
     pub auto_paused: bool,
 }
@@ -325,6 +354,7 @@ pub(crate) struct Inherited {
     pub(crate) docs_dir: Option<PathBuf>,
     pub(crate) harness_name: String,
     pub(crate) agents: Vec<AgentDef>,
+    pub(crate) modes: Vec<Arc<ModeSpec>>,
     pub(crate) agent_diagnostics: Vec<Diagnostic>,
     pub(crate) agent: Option<AgentSpec>,
     pub(crate) streamer: Arc<dyn Streamer>,
@@ -335,9 +365,9 @@ pub(crate) struct Inherited {
     pub(crate) supervisor: Arc<ProcessSupervisor>,
     pub(crate) ask_enabled: bool,
     pub(crate) host_sections: Vec<(String, Option<String>)>,
-    pub(crate) host_tools: Vec<ToolFactory>,
+    pub(crate) host_tools: Vec<HostTool>,
     pub(crate) host_schemes: Vec<Arc<dyn Scheme>>,
-    pub(crate) tool_hooks: Vec<Arc<dyn ToolHooks>>,
+    pub(crate) tool_policies: Vec<Arc<dyn ToolPolicy>>,
     pub(crate) store: Arc<dyn SessionStore>,
     pub(crate) sessions: Arc<SessionTable>,
     pub(crate) spawn_hooks: Vec<Arc<dyn SpawnHook>>,
@@ -390,6 +420,7 @@ struct SessionHooks {
     /// Shared tool state, restored as the selected branch changes.
     tools: Arc<SessionTools>,
     questions: Arc<PendingQuestions>,
+    results: modes::PendingResults,
     shutdown: AtomicBool,
     /// Owns the session file: every entry is appended through it, and every reader takes
     /// its snapshots.
@@ -413,7 +444,10 @@ struct SessionHooks {
     preparing: AtomicUsize,
     prompt: SessionPrompt,
     shape_base: Mutex<ShapeBase>,
+    promoted: Mutex<Vec<String>>,
+    mode: Mutex<modes::ModeState>,
     agent_spec: Mutex<Option<AgentSpec>>,
+    scope: Arc<ScopeCell>,
     /// Set when a run ends other than `Done` or the user stops an active one; finished
     /// job results then wait for the user's next input instead of starting a run.
     auto_paused: AtomicBool,
@@ -464,6 +498,7 @@ async fn run_to_settle(
     hooks: Arc<SessionHooks>,
     request: RunRequest,
 ) -> Result<RunOutcome, Error> {
+    hooks.advance();
     // ponytail: a waiting child holds its slot while its own children queue; nested trees at maxConcurrent can deadlock — release the slot while in wait if maxDepth > 1 becomes common.
     // ponytail: only a team's first runs reserve slots together; later member runs queue one by one
     let _slot = if let Some(child) = &hooks.child {
@@ -938,11 +973,15 @@ impl LoopHooks for SessionHooks {
         if let Some(child) = &self.child {
             child.budget.request();
         }
-        if self
+        let compacted = self
             .automatic(CompactionReason::Threshold, cancel)
             .await
-            .map_err(|error| HookError(error.to_string()))?
-        {
+            .map_err(|error| HookError(error.to_string()))?;
+        let announced = self
+            .announce()
+            .await
+            .map_err(|error| HookError(error.to_string()))?;
+        if compacted || announced {
             Ok(Some(self.projected_messages()))
         } else {
             Ok(None)
@@ -1075,6 +1114,7 @@ impl LoopHooks for SessionHooks {
         turn: TurnContext<'_>,
         _cancel: &CancellationToken,
     ) -> Vec<AgentMessage> {
+        self.advance();
         let mut messages = self.take_system();
         if let Some(child) = &self.child
             && child.budget.requests() == child.budget.limit
@@ -1259,7 +1299,8 @@ impl Persist for SessionHooks {
     }
 }
 
-/// Where `write agent://parent` and `write agent://<teammate>` go from a session.
+/// Where `send` routes parent and teammate messages from a session.
+#[derive(Clone)]
 pub(crate) struct AgentRoutes {
     pub(crate) session_id: String,
     /// `None` for root sessions and forks.
@@ -1271,16 +1312,16 @@ pub(crate) struct LiveSchemes {
     pub(crate) jobs: Arc<JobRegistry>,
     pub(crate) sessions: Arc<SessionTable>,
     pub(crate) store: Arc<dyn SessionStore>,
-    pub(crate) routes: AgentRoutes,
+    pub(crate) deferred: Arc<tools::deferred::Deferred>,
 }
 
 /// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
 /// `artifact://` and `local://` in the side folders beside the session file `path`,
-/// `skill://`, `axo://` docs when `docs_dir` is given, `proc://` and `agent://` when
+/// `skill://`, `axo://` docs when `docs_dir` is given, `proc://`, `agent://` and `tool://` when
 /// `live` is given, then `host` schemes. Open sessions and `Axo::schemes` both build
 /// them here, so given the same effective config a file-backed URL resolves alike
-/// whether its session is open or not; only open sessions get `proc://` and
-/// `agent://` (`Axo::schemes` passes no live state). A child passes its parent's
+/// whether its session is open or not; only open sessions get `proc://`, `agent://`
+/// and `tool://` (`Axo::schemes` passes no live state). A child passes its parent's
 /// `loaded` skills and docs flag, which skips discovery and docs materialization.
 pub(crate) fn session_schemes(
     config: &EffectiveConfig,
@@ -1335,7 +1376,9 @@ pub(crate) fn session_schemes(
             live.jobs,
             live.sessions,
             live.store,
-            live.routes,
+        )));
+        builtins.push(Arc::new(crate::schemes::tool::ToolScheme::new(
+            live.deferred,
         )));
     }
     let artifacts = Arc::new(Artifacts::new(cx.session_dir.join(ARTIFACTS_DIR)));
@@ -1387,6 +1430,7 @@ impl Session {
         inherited
             .sessions
             .register(session_id.clone(), Arc::downgrade(&jobs));
+        let deferred = Arc::new(tools::deferred::Deferred::default());
         let (schemes, skills, skill_diagnostics, docs) = session_schemes(
             config,
             docs_dir.as_deref(),
@@ -1401,11 +1445,7 @@ impl Session {
                 jobs: jobs.clone(),
                 sessions: inherited.sessions.clone(),
                 store: inherited.store.clone(),
-                routes: AgentRoutes {
-                    session_id: session_id.clone(),
-                    parent: link.as_ref().map(|link| link.parent_session_id.clone()),
-                    team: link.as_ref().and_then(|link| link.team.clone()),
-                },
+                deferred: deferred.clone(),
             }),
             inherited.loaded.as_ref(),
         )?;
@@ -1440,6 +1480,7 @@ impl Session {
             NestedContext::disabled(),
             schemes,
             runner,
+            deferred,
         ));
         let yield_state = link
             .as_ref()
@@ -1450,14 +1491,34 @@ impl Session {
                 .as_ref()
                 .map(|team| inherited.sessions.team(&link.parent_session_id, team))
         });
-        let host: Vec<Arc<dyn Tool>> = host_tools
-            .iter()
-            .map(|factory| factory(&session_tools))
-            .collect();
+        let mut host = Vec::new();
+        let mut host_deferred = Vec::new();
+        for tool in host_tools {
+            let instance = (tool.factory)(&session_tools);
+            match tool.exposure {
+                Exposure::Direct => host.push(instance),
+                Exposure::Deferred => host_deferred.push(instance),
+            }
+        }
         let spawn_tool = Arc::new(SpawnTool::new(&inherited.agents, &settings.model_roles));
+        let depth = link.as_ref().map_or(0, |link| link.depth);
+        let routes = AgentRoutes {
+            session_id: session_id.clone(),
+            parent: link.as_ref().map(|link| link.parent_session_id.clone()),
+            team: link.as_ref().and_then(|link| link.team.clone()),
+        };
+        let has_peers = routes.parent.is_some() || routes.team.is_some();
+        let send = (depth < settings.subagents.max_depth || has_peers).then(|| {
+            Arc::new(tools::send::SendTool::new(
+                jobs.clone(),
+                inherited.sessions.clone(),
+                routes,
+            )) as Arc<dyn Tool>
+        });
         let builtin = tools::builtin(
             &session_tools,
             Some(spawn_tool.clone()),
+            send,
             team.clone().map(|team| TeamSeat {
                 team,
                 member: session_id.clone(),
@@ -1467,7 +1528,6 @@ impl Session {
             questions.clone(),
             settings.ask.timeout_ms.map(Duration::from_millis),
         );
-        let depth = link.as_ref().map_or(0, |link| link.depth);
         let yield_tool: Option<Arc<dyn Tool>> = link
             .as_ref()
             .and_then(|link| link.spec.output.as_ref())
@@ -1475,15 +1535,27 @@ impl Session {
             .map(|(output, state)| {
                 Arc::new(YieldTool::new(output, state.clone())) as Arc<dyn Tool>
             });
+        let enter_mode = link
+            .is_none()
+            .then(|| modes::EnterModeTool::new(&inherited.modes))
+            .flatten()
+            .map(Arc::new);
         let shape_base = ShapeBase {
             config: config.clone(),
             cwd: cwd.clone(),
             project,
             builtin,
             host_tools: host,
+            host_deferred,
+            call: Arc::new(tools::call::CallTool::new()),
+            enter_mode: enter_mode
+                .as_ref()
+                .map(|tool| tool.clone() as Arc<dyn Tool>),
             host_tool_factories: host_tools.clone(),
             host_sections: validated_host_sections,
             depth,
+            has_peers,
+            has_modes: link.is_none() && !inherited.modes.is_empty(),
             yield_tool,
         };
         let (prompt_shape, nested, shape_diagnostics) = shape(&shape_base, root_agent);
@@ -1491,13 +1563,39 @@ impl Session {
             .context
             .reset(nested.root, nested.names, &nested.startup);
         let tools = prompt_shape.tools.clone();
+        let selected_mode = if link.is_none() {
+            projection.mode.as_ref().and_then(|name| {
+                inherited
+                    .modes
+                    .iter()
+                    .find(|spec| &spec.name == name)
+                    .cloned()
+            })
+        } else {
+            None
+        };
+        let mode_diagnostic = projection
+            .mode
+            .as_ref()
+            .filter(|_| selected_mode.is_none())
+            .map(|name| Diagnostic {
+                origin: None,
+                message: format!(
+                    "mode \"{name}\" from the session is unavailable; running without it"
+                ),
+            });
         let diagnostics: Vec<_> = shape_diagnostics
             .into_iter()
             .chain(skill_diagnostics)
             .chain(commands::reserved_skill_diagnostics(&skills))
+            .chain(commands::hidden_skill_diagnostics(
+                &skills,
+                &inherited.modes,
+            ))
             .chain(summary_diagnostics)
             .chain(section_diagnostics)
             .chain(inherited.agent_diagnostics.iter().cloned())
+            .chain(mode_diagnostic)
             .collect();
         for diagnostic in &diagnostics {
             warn!("{diagnostic}");
@@ -1513,23 +1611,48 @@ impl Session {
             first_slot: Mutex::new(None),
             link,
         });
+        let scope = Arc::new(Mutex::new(Arc::new(ToolScope {
+            session_id: session_id.clone(),
+            depth,
+            agent: root_agent.cloned(),
+            mode: selected_mode.clone(),
+        })));
         let mut tool_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
         if let Some(child) = &child {
             tool_hooks.push(child.budget.clone());
         }
-        tool_hooks.extend(inherited.tool_hooks.iter().cloned());
+        tool_hooks.push(Arc::new(ModeGate {
+            scope: scope.clone(),
+        }));
+        tool_hooks.extend(inherited.tool_policies.iter().map(|policy| {
+            Arc::new(PolicyHook {
+                scope: scope.clone(),
+                policy: policy.clone(),
+            }) as Arc<dyn ToolHooks>
+        }));
         let hooks = Arc::new_cyclic(|this: &Weak<SessionHooks>| {
             jobs.attach(this.clone() as Weak<dyn JobHost>);
             spawn_tool.attach(this.clone());
+            if let Some(tool) = &enter_mode {
+                tool.attach(this.clone());
+            }
             SessionHooks {
-                events,
+                events: events.clone(),
                 inherited: inherited.clone(),
                 session_id: session_id.clone(),
                 shape_base: Mutex::new(shape_base),
+                promoted: Mutex::new(Vec::new()),
+                mode: Mutex::new(modes::ModeState {
+                    selected: selected_mode.clone(),
+                    yield_tool: modes::ModeYield::for_mode(selected_mode.as_ref(), this.clone()),
+                    effective: selected_mode,
+                }),
                 agent_spec: Mutex::new(root_agent.cloned()),
+                scope,
                 path,
                 tools: session_tools.clone(),
                 questions,
+                results: modes::PendingResults::new(events.clone()),
                 shutdown: AtomicBool::new(false),
                 journal,
                 live: Mutex::new(LiveRun::default()),
@@ -1587,6 +1710,8 @@ impl Session {
             ..AgentConfig::new(inherited.streamer.clone(), model)
         }));
         let _ = hooks.agent.set(Arc::downgrade(&agent));
+        hooks.rebase_promoted();
+        hooks.install_tools();
         if hooks.child.is_some() {
             tokio::spawn(children::park_when_idle(
                 Arc::downgrade(&hooks),
@@ -1829,7 +1954,7 @@ impl Session {
         self.hooks.tools.runner.jobs.list()
     }
 
-    /// Stops job `id` (`bg_N` or `agent_N`), like `write proc://<id>/kill`; false when unknown
+    /// Stops job `id` (`bg_N` or `agent_N`), like `kill`; false when unknown
     /// or no longer running.
     pub fn kill_job(&self, id: &str) -> bool {
         JobId::parse(id).is_some_and(|id| {
@@ -1858,16 +1983,45 @@ impl Session {
         &self.hooks.tools.schemes
     }
 
-    /// The commands a host may offer, in whatever form it picks: built-ins, then this
-    /// session's skills.
+    /// The commands a host may offer: built-ins, modes, then unhidden skills.
     pub fn commands(&self) -> Vec<CommandInfo> {
-        commands::catalog(&self.hooks.prompt.sources.skills)
+        commands::catalog(&self.hooks.prompt.sources.skills, self.modes())
+    }
+
+    /// The mode definitions available to this root session; empty for children.
+    pub fn modes(&self) -> &[Arc<ModeSpec>] {
+        &self.hooks.inherited.modes
+    }
+
+    /// Parses built-in commands first, then commands naming this session's modes.
+    pub fn parse_command(&self, text: &str) -> Option<Result<Command, Error>> {
+        if let Some(command) = Command::parse(text) {
+            return Some(command);
+        }
+        let rest = text.strip_prefix('/')?;
+        let (name, prompt) = match rest.find(char::is_whitespace) {
+            Some(index) => (&rest[..index], rest[index..].trim()),
+            None => (rest, ""),
+        };
+        self.modes().iter().any(|mode| mode.name == name).then(|| {
+            Ok(Command::Mode {
+                name: name.to_owned(),
+                prompt: (!prompt.is_empty()).then(|| prompt.to_owned()),
+            })
+        })
     }
 
     /// Runs a built-in command under its policy: `model`/`thinking` alongside a turn,
     /// `compact`/`shake`/`navigate` only when idle (`Error::Busy` otherwise).
     pub async fn run_command(&self, command: Command) -> Result<(), Error> {
         match command {
+            Command::Mode { name, prompt } => {
+                self.set_mode(Some(&name)).await?;
+                if let Some(prompt) = prompt {
+                    self.steer(prompt).await?;
+                }
+                Ok(())
+            }
             Command::Compact { focus } => self.compact(focus).await,
             Command::Shake { mode } => self.shake(mode).await,
             Command::Model { model } => {
@@ -2012,7 +2166,6 @@ impl Session {
                 hooks.apply_selection(&agent, model, level);
             }
             let (new_shape, nested) = hooks.reshape(spec.clone()).await;
-            let tools = new_shape.tools.clone();
             *hooks
                 .prompt
                 .shape
@@ -2026,13 +2179,14 @@ impl Session {
                 .tools
                 .context
                 .restore(&hooks.journal.view().projection.messages);
-            agent.set_tools(tools);
+            hooks.install_tools();
             *hooks
                 .agent_spec
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = spec;
             hooks.prompt.rebuild();
             hooks.emit_context();
+            hooks.rescope();
             Ok(())
         })
         .await
@@ -2083,16 +2237,24 @@ impl Session {
     /// Replaces host tool factories from the next request, still honoring the persona's
     /// allowlist. Hosts pass tools again on reopen. Changes are cache-heavy on models
     /// without mid-conversation tool changes.
-    pub async fn set_tools(&self, tools: Vec<ToolFactory>) -> Result<(), Error> {
+    pub async fn set_tools(&self, tools: Vec<HostTool>) -> Result<(), Error> {
         if self.hooks.child.is_some() {
             return Err(Error::InvalidInput(
                 "Child sessions keep the prompt and tools they were spawned with".into(),
             ));
         }
-        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+        let hooks = self.hooks.clone();
         detached(async move {
             let _order = hooks.selection_order.lock().await;
-            let host = tools.iter().map(|factory| factory(&hooks.tools)).collect();
+            let mut host = Vec::new();
+            let mut deferred = Vec::new();
+            for tool in &tools {
+                let instance = (tool.factory)(&hooks.tools);
+                match tool.exposure {
+                    Exposure::Direct => host.push(instance),
+                    Exposure::Deferred => deferred.push(instance),
+                }
+            }
             let spec = hooks
                 .agent_spec
                 .lock()
@@ -2104,17 +2266,20 @@ impl Session {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 base.host_tools = host;
+                base.host_deferred = deferred;
                 base.host_tool_factories = tools;
             }
             let (new_shape, _) = hooks.reshape(spec).await;
-            let tools = new_shape.tools;
-            hooks
-                .prompt
-                .shape
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .tools = tools.clone();
-            agent.set_tools(tools);
+            {
+                let mut shape = hooks
+                    .prompt
+                    .shape
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                shape.tools = new_shape.tools;
+                shape.deferred = new_shape.deferred;
+            }
+            hooks.install_tools();
             hooks.prompt.rebuild();
             Ok::<(), Error>(())
         })
@@ -2133,9 +2298,14 @@ impl Session {
         self.hooks.questions.answer(call_id, answers)
     }
 
-    /// Dismisses the pending question of tool call `call_id`; the run is cancelled.
+    /// Dismisses a pending question or mode result; the run is cancelled.
     pub fn dismiss(&self, call_id: &str) -> Result<(), Error> {
-        self.hooks.questions.dismiss(call_id)?;
+        if let Err(error) = self.hooks.questions.dismiss(call_id) {
+            self.hooks
+                .results
+                .settle(call_id, modes::ResultOutcome::Dismissed)
+                .map_err(|_| error)?;
+        }
         self.abort();
         Ok(())
     }
@@ -2174,6 +2344,7 @@ impl Session {
                     model: self.model(),
                     thinking: self.thinking(),
                     agent: self.agent().map(|spec| spec.name),
+                    mode: self.mode().map(|mode| mode.name.clone()),
                     context: self.hooks.context_usage_for(&view.projection),
                     auto_paused: self.hooks.auto_paused.load(Ordering::Acquire),
                     streaming: live.streaming.as_ref().and_then(Accumulator::snapshot),
@@ -2182,6 +2353,7 @@ impl Session {
                     queued_follow_up,
                     messages: view.projection.messages.clone(),
                     pending_questions: self.hooks.questions.pending(),
+                    pending_results: self.hooks.results.snapshot(),
                     jobs,
                     usage: view
                         .entries

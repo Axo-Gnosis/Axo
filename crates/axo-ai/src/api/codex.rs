@@ -17,9 +17,7 @@ use crate::auth::codex::{BASE_URL, account_id};
 use crate::event::AssistantEvent;
 use crate::model::Model;
 use crate::thinking::clamp_level;
-use crate::transcript::{
-    Transcript, TranscriptToolSupport, resolve_transcript_tools, system_message_text,
-};
+use crate::transcript::{Transcript, resolve_transcript_tools, system_message_text};
 use crate::types::{StopReason, ThinkingLevel, Usage, now_ms};
 
 /// pi `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH`.
@@ -153,12 +151,10 @@ fn build_request_body(
         supports_mid_convo_system_messages: compat
             .supports_mid_convo_system_messages
             .unwrap_or(false),
-        supports_additional_tools: compat.supports_additional_tools.unwrap_or(false),
-        supports_tool_search: compat.supports_tool_search.unwrap_or(false),
         supports_strict_mode: compat.supports_strict_mode.unwrap_or(true),
     };
     let resolved = transcript.resolve(options.supports_mid_convo_system_messages);
-    let support: TranscriptToolSupport = options.tool_support();
+    let support = model.tool_support();
     let request_tools = resolve_transcript_tools(&resolved, support).request_tools;
     let input = convert_messages(model, &resolved, &options);
 

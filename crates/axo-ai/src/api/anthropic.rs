@@ -22,7 +22,8 @@ use crate::json::{parse_tool_arguments, parse_with_repair};
 use crate::model::{ApiKind, Model, SessionAffinityFormat};
 use crate::thinking::{MIN_ANSWER_TOKENS, default_thinking_budget};
 use crate::transcript::{
-    Transcript, current_tools, render_system_message_update, system_message_text,
+    Transcript, TranscriptToolSupport, current_tools, render_system_message_update,
+    system_message_text,
 };
 use crate::transform::replace_images;
 use crate::types::{
@@ -85,7 +86,6 @@ struct AnthropicCompat {
     temperature: bool,
     allow_empty_signature: bool,
     mid_convo_system_messages: bool,
-    mid_convo_tool_changes: bool,
 }
 
 impl AnthropicCompat {
@@ -105,7 +105,6 @@ impl AnthropicCompat {
             temperature: compat.supports_temperature.unwrap_or(true),
             allow_empty_signature: compat.allow_empty_signature.unwrap_or(false),
             mid_convo_system_messages: compat.supports_mid_convo_system_messages.unwrap_or(false),
-            mid_convo_tool_changes: compat.supports_mid_convo_tool_changes.unwrap_or(false),
         }
     }
 }
@@ -566,9 +565,8 @@ fn build_params(
     // Native tool changes keep the request-level tool list fixed and define every later
     // tool in a `tool_addition` block. Anthropic rejects a list where every tool is
     // deferred, so an initial active tool must anchor the placeholder.
-    let native_tool_changes = compat.mid_convo_system_messages
-        && compat.mid_convo_tool_changes
-        && !initial_tools.is_empty();
+    let native_tool_changes =
+        model.tool_support() == TranscriptToolSupport::Changes && !initial_tools.is_empty();
     let thinking_disabled = model.reasoning
         && !options.thinking_enabled
         && !matches!(

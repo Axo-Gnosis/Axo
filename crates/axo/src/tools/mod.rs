@@ -3,13 +3,18 @@
 pub(crate) mod ask;
 pub(crate) mod bash;
 pub(crate) mod bash_urls;
+pub(crate) mod call;
+pub(crate) mod deferred;
 pub(crate) mod edit;
 pub(crate) mod files;
 pub(crate) mod find;
 pub(crate) mod grep;
+pub(crate) mod kill;
 mod ledger;
 pub(crate) mod output;
+pub(crate) mod pending;
 pub(crate) mod read;
+pub(crate) mod send;
 pub(crate) mod truncate;
 pub(crate) mod wait;
 pub(crate) mod write;
@@ -38,6 +43,7 @@ use bash::BashTool;
 use edit::EditTool;
 use find::FindTool;
 use grep::GrepTool;
+use kill::KillTool;
 use read::ReadTool;
 use wait::WaitTool;
 use write::WriteTool;
@@ -57,6 +63,7 @@ pub struct SessionTools {
     pub context: NestedContext,
     /// The session's scheme registry.
     pub schemes: Schemes,
+    pub(crate) deferred: Arc<deferred::Deferred>,
     /// Runs every local command in its own supervised container (process group or cgroup).
     pub supervisor: Arc<ProcessSupervisor>,
     pub(crate) runner: CommandRunner,
@@ -66,6 +73,36 @@ pub struct SessionTools {
 /// every fork), so host tools resolve URLs, share the ledger and rewrite bash exactly as
 /// built-ins do.
 pub type ToolFactory = Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>;
+
+/// Whether a host tool is declared directly or discovered through `tool://`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exposure {
+    Direct,
+    Deferred,
+}
+
+/// A session-local tool factory and its model-facing exposure.
+#[derive(Clone)]
+pub struct HostTool {
+    pub factory: ToolFactory,
+    pub exposure: Exposure,
+}
+
+impl HostTool {
+    pub fn direct(factory: ToolFactory) -> Self {
+        Self {
+            factory,
+            exposure: Exposure::Direct,
+        }
+    }
+
+    pub fn deferred(factory: ToolFactory) -> Self {
+        Self {
+            factory,
+            exposure: Exposure::Deferred,
+        }
+    }
+}
 
 /// A tool path located without applying plain-filesystem fallback rules.
 pub enum Located {
@@ -86,6 +123,7 @@ impl SessionTools {
         context: NestedContext,
         schemes: Schemes,
         runner: CommandRunner,
+        deferred: Arc<deferred::Deferred>,
     ) -> Self {
         Self {
             cwd,
@@ -93,6 +131,7 @@ impl SessionTools {
             ledger: FileLedger::default(),
             context,
             schemes,
+            deferred,
             supervisor: runner.supervisor.clone(),
             runner,
         }
@@ -283,11 +322,12 @@ fn clean_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-/// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait`,
-/// followed by `spawn` when supplied and `ask` when `ask` is set.
+/// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait, kill`,
+/// followed by `spawn` and `send` when supplied and `ask` when `ask` is set.
 pub(crate) fn builtin(
     tools: &Arc<SessionTools>,
     spawn: Option<Arc<dyn Tool>>,
+    send: Option<Arc<dyn Tool>>,
     team: Option<TeamSeat>,
     ask: bool,
     questions: Arc<PendingQuestions>,
@@ -301,9 +341,13 @@ pub(crate) fn builtin(
         Arc::new(GrepTool::new(tools.clone())),
         Arc::new(FindTool::new(tools.clone())),
         Arc::new(WaitTool::new(tools.clone(), team)),
+        Arc::new(KillTool::new(tools.clone())),
     ];
     if let Some(spawn) = spawn {
         list.push(spawn);
+    }
+    if let Some(send) = send {
+        list.push(send);
     }
     if ask {
         list.push(Arc::new(AskTool::new(questions, timeout)));

@@ -24,7 +24,9 @@ use crate::tools::output::YIELD_NUDGE;
 
 /// Custom types the engine writes or reads with special meaning; a host message
 /// using one would be mistaken for the engine's own.
-const RESERVED_CUSTOM_TYPES: [&str; 5] = [
+const RESERVED_CUSTOM_TYPES: [&str; 7] = [
+    super::surface::TOOL_CATALOG,
+    super::modes::MODE_NOTICE,
     JOB_RESULT,
     TURN_BUDGET,
     YIELD_NUDGE,
@@ -387,7 +389,7 @@ impl Session {
     /// Saves and queues a teammate's message, read at the next turn boundary; on an idle session it starts a run.
     pub(crate) async fn post_mail(&self, sender: &str, content: &str) -> Result<(), Error> {
         let text = format!(
-            "Message from {sender} (reply with write agent://{sender}):\n\n{}",
+            "Message from {sender} (reply with send to \"{sender}\"):\n\n{}",
             escape_wrappers(content)
         );
         self.queue(SubmissionKind::Mail, text.into(), Some(sender.to_owned()))

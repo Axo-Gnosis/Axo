@@ -373,7 +373,7 @@ impl CommandRunner {
                     // Refused once the command finished meanwhile: it stays in the foreground.
                     if jobs.promote(id, invocation, &call.id, cause) {
                         // The call's cancel no longer reaches the job; the timeout keeps its
-                        // deadline, and proc:// kill or session shutdown stop it.
+                        // deadline, and the kill tool or session shutdown stop it.
                         abandon.0 = None;
                         let snapshot = lock(&shared.shaper).render(None);
                         let snapshot = if snapshot.is_empty() {
@@ -385,7 +385,7 @@ impl CommandRunner {
                         return Ok(ToolOutput {
                             content: vec![UserBlock::Text {
                                 text: format!(
-                                    "{snapshot}\n\nCommand is still running in the background as {name}. Full output: artifact://{artifact}. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://{name}; stop with write proc://{name}/kill."
+                                    "{snapshot}\n\nCommand is still running in the background as {name}. Full output: artifact://{artifact}. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://{name}; stop with kill."
                                 ),
                             }],
                             details: Some(json!({
@@ -608,7 +608,7 @@ impl CommandTask {
                 with_status(
                     body,
                     &match by {
-                        Killer::Model => format!("Command was stopped (proc://{id}/kill)"),
+                        Killer::Model => format!("Command was stopped (kill {id})"),
                         Killer::Host => "Command was stopped by the user".to_owned(),
                     },
                 ),
@@ -660,7 +660,7 @@ impl CommandTask {
             }
             let name = id.to_string();
             text.push_str(&format!(
-                "\n\nProcesses started by this command are still running as {name} (read proc://{name}; stop with write proc://{name}/kill)."
+                "\n\nProcesses started by this command are still running as {name} (read proc://{name}; stop with kill)."
             ));
             if capture_error.is_none() {
                 text.push_str(&format!(

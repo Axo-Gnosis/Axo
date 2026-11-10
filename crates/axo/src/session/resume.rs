@@ -191,12 +191,11 @@ impl Session {
     ) -> Result<Option<Resumption>, Error> {
         let log = self.hooks.journal.view();
         let model = self.hooks.model();
-        let tools = self.hooks.prompt.tools();
+        let tools = self.hooks.declared_tools();
+        let catalog = self.hooks.catalog();
         let replay_of = |call: &ToolCall| {
-            tools
-                .iter()
-                .find(|tool| tool.name() == call.name)
-                .map_or(Replay::Never, |tool| tool.replay(call))
+            axo_agent::route(&tools, &catalog, call)
+                .map_or(Replay::Never, |routed| routed.tool.replay(&routed.call))
         };
         let plan = plan_recovery(&log.entries, &log.projection, &model, &replay_of);
         let recovered = match &plan {
@@ -273,8 +272,13 @@ impl Session {
                 requeue,
             } => {
                 let outputs = command_logs(self.hooks.tools.schemes.artifacts().dir());
+                let routed = |call: ToolCall| match axo_agent::route(&tools, &catalog, &call) {
+                    Ok(routed) => routed.call.into_owned(),
+                    Err(_) => call,
+                };
                 let mut calls: Vec<_> = interrupted
                     .into_iter()
+                    .map(&routed)
                     .map(|call| {
                         let artifact = outputs
                             .get(&command_log_tail(&call.name, &call.id))
@@ -284,7 +288,7 @@ impl Session {
                     .collect();
                 if policy == RecoveryPolicy::MarkInterrupted {
                     // Calls that would have been rerun are not run either.
-                    calls.extend(rerun.into_iter().map(|call| (call, None)));
+                    calls.extend(rerun.into_iter().map(routed).map(|call| (call, None)));
                 }
                 let jobs = &self.hooks.tools.runner.jobs;
                 let mut admitted = Vec::new();

@@ -5,6 +5,7 @@
 pub mod agents;
 pub mod files;
 pub(crate) mod markdown;
+pub mod modes;
 pub(crate) mod prompt;
 pub mod skills;
 

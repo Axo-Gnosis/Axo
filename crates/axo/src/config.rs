@@ -408,6 +408,8 @@ pub struct ConfigLayer {
     /// Agent definition roots, walked recursively for `*.md`. On the project layer
     /// they are honored only at `ProjectAccess::Trust`.
     pub agent_roots: Vec<PathBuf>,
+    /// Mode definition roots, honored on the project layer only at `ProjectAccess::Trust`.
+    pub mode_roots: Vec<PathBuf>,
 }
 
 /// The user's configuration: the layer plus the user's filesystem resources.
@@ -444,6 +446,8 @@ pub struct EffectiveConfig {
     pub skill_roots: Vec<PathBuf>,
     /// Trusted project agent roots, followed by user agent roots.
     pub agent_roots: Vec<PathBuf>,
+    /// Trusted project mode roots, followed by user mode roots.
+    pub mode_roots: Vec<PathBuf>,
     pub context_files: Vec<PathBuf>,
 }
 
@@ -479,12 +483,18 @@ impl EffectiveConfig {
         let mut project_origin = None;
         let mut dev_shell_from_project = false;
         let mut agent_roots = Vec::new();
+        let mut mode_roots = Vec::new();
         if access != ProjectAccess::Ignore && policy.files.config {
             let project = source.project(cwd)?;
             if access == ProjectAccess::Trust {
                 agent_roots.extend(project.agent_roots);
             } else if !project.agent_roots.is_empty() {
                 tracing::warn!(origin = %project.origin, "agent roots need a trusted project; ignored");
+            }
+            if access == ProjectAccess::Trust {
+                mode_roots.extend(project.mode_roots);
+            } else if !project.mode_roots.is_empty() {
+                tracing::warn!(origin = %project.origin, "mode roots need a trusted project; ignored");
             }
             if let Some((mut value, _)) = validate(&project.origin, project.settings)? {
                 let object = value.as_object_mut().expect("validated settings object");
@@ -496,6 +506,7 @@ impl EffectiveConfig {
             prompts.extend(prompt_overrides(project.prompts)?);
         }
         agent_roots.extend(user.agent_roots);
+        mode_roots.extend(user.mode_roots);
         let origin = project_origin.as_deref().unwrap_or(&user.origin);
         let mut settings: Settings =
             serde_json::from_value(merged).map_err(|error| config_error(origin, error))?;
@@ -514,6 +525,7 @@ impl EffectiveConfig {
             prompts,
             skill_roots,
             agent_roots,
+            mode_roots,
             context_files,
         })
     }

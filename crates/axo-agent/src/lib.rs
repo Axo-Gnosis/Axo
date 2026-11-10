@@ -19,6 +19,7 @@ pub use hooks::{
     LoopHooks, NoHooks, ToolCallDecision, ToolHooks, TurnContext, TurnFinish,
 };
 pub use message::{AgentMessage, CustomMessage, QueuedMessage, Unanswered, unanswered_calls};
+pub use run::{Routed, route};
 pub use tool::{
     ExecutionMode, Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
     ToolUpdate, ToolUpdates,

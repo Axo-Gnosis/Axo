@@ -1,7 +1,7 @@
 //! User commands: the built-in session operations and skills a host may offer, their
 //! typed arguments, and the one parser for the `/name args` text form.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use axo_ai::ThinkingLevel;
 use schemars::generate::SchemaSettings;
@@ -9,13 +9,14 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::context::modes::ModeSpec;
 use crate::context::skills::{Skill, next_command_arg};
 use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::error::Error;
 use crate::session::{ShakeMode, normalize_focus};
 use crate::store::EntryId;
 
-/// A built-in session command, decoded and validated.
+/// A built-in session operation or mode command, decoded and validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Compact {
@@ -26,6 +27,10 @@ pub enum Command {
     },
     Model {
         model: String,
+    },
+    Mode {
+        name: String,
+        prompt: Option<String>,
     },
     Thinking {
         level: ThinkingLevel,
@@ -59,6 +64,8 @@ pub enum CommandKind {
     /// `parameters`: JSON Schema object; the text form maps positional words to its properties
     /// in order, and a final `"format": "text"` property takes the rest of the line verbatim.
     Builtin { parameters: Value },
+    /// Enters a mode, optionally with a prompt.
+    Mode { argument_hint: Option<String> },
     /// One free-text argument.
     Skill { argument_hint: Option<String> },
 }
@@ -237,6 +244,10 @@ fn builtin(name: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|builtin| builtin.name == name)
 }
 
+pub(crate) fn is_builtin(name: &str) -> bool {
+    builtin(name).is_some()
+}
+
 impl Builtin {
     fn invalid(&self, message: impl Into<String>) -> Error {
         Error::InvalidCommand {
@@ -321,9 +332,8 @@ impl Command {
     }
 }
 
-/// The built-in commands in table order, then each skill whose name is not reserved by a
-/// built-in, in skill order.
-pub fn catalog(skills: &[Skill]) -> Vec<CommandInfo> {
+/// Built-ins in table order, then modes, then skills not hidden by either.
+pub fn catalog(skills: &[Skill], modes: &[Arc<ModeSpec>]) -> Vec<CommandInfo> {
     let builtins = BUILTINS.iter().map(|builtin| CommandInfo {
         name: builtin.name.to_owned(),
         description: builtin.description.to_owned(),
@@ -334,7 +344,9 @@ pub fn catalog(skills: &[Skill]) -> Vec<CommandInfo> {
     });
     let skills = skills
         .iter()
-        .filter(|skill| builtin(&skill.name).is_none())
+        .filter(|skill| {
+            !is_builtin(&skill.name) && !modes.iter().any(|mode| mode.name == skill.name)
+        })
         .map(|skill| CommandInfo {
             name: skill.name.clone(),
             description: skill.description.clone(),
@@ -343,7 +355,15 @@ pub fn catalog(skills: &[Skill]) -> Vec<CommandInfo> {
                 argument_hint: skill.argument_hint.clone(),
             },
         });
-    builtins.chain(skills).collect()
+    let modes = modes.iter().map(|mode| CommandInfo {
+        name: mode.name.clone(),
+        description: mode.description.clone(),
+        policy: CommandPolicy::Alongside,
+        kind: CommandKind::Mode {
+            argument_hint: mode.argument_hint.clone(),
+        },
+    });
+    builtins.chain(modes).chain(skills).collect()
 }
 
 /// One warning per skill whose name a built-in command reserves.
@@ -355,6 +375,24 @@ pub(crate) fn reserved_skill_diagnostics(skills: &[Skill]) -> Vec<Diagnostic> {
             origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
             message: format!(
                 "skill name \"{name}\" is reserved by the built-in /{name} command; the command catalog lists the built-in",
+                name = skill.name
+            ),
+        })
+        .collect()
+}
+
+/// One warning per skill whose command is hidden by a mode.
+pub(crate) fn hidden_skill_diagnostics(
+    skills: &[Skill],
+    modes: &[Arc<ModeSpec>],
+) -> Vec<Diagnostic> {
+    skills
+        .iter()
+        .filter(|skill| modes.iter().any(|mode| mode.name == skill.name))
+        .map(|skill| Diagnostic {
+            origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
+            message: format!(
+                "skill name \"{name}\" is hidden by the mode /{name}; the command catalog lists the mode",
                 name = skill.name
             ),
         })
@@ -585,7 +623,7 @@ mod tests {
             skill("review", Some("<file>")),
             skill("deploy", None),
         ];
-        let catalog = catalog(&skills);
+        let catalog = catalog(&skills, &[]);
         let names: Vec<&str> = catalog.iter().map(|info| info.name.as_str()).collect();
         assert_eq!(
             names,
@@ -617,6 +655,29 @@ mod tests {
         assert_eq!(
             diagnostics[0].origin,
             Some(DiagnosticOrigin::Path("/skills/compact/SKILL.md".into()))
+        );
+
+        let modes = [Arc::new(ModeSpec {
+            name: "review".into(),
+            argument_hint: Some("task".into()),
+            ..Default::default()
+        })];
+        let catalog = super::catalog(&skills, &modes);
+        assert_eq!(catalog[5].name, "review");
+        assert_eq!(catalog[5].policy, CommandPolicy::Alongside);
+        assert_eq!(
+            catalog[5].kind,
+            CommandKind::Mode {
+                argument_hint: Some("task".into())
+            }
+        );
+        assert_eq!(catalog[6].name, "deploy");
+        assert_eq!(catalog.len(), 7);
+        let diagnostics = hidden_skill_diagnostics(&skills, &modes);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "skill name \"review\" is hidden by the mode /review; the command catalog lists the mode"
         );
     }
 }

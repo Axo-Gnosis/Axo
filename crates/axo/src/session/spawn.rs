@@ -17,15 +17,19 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use super::children::ChildSeed;
+use super::modes::ENTER_MODE;
 use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
+use crate::context::modes::ModeSpec;
 use crate::error::Error;
 use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
 use crate::jobs::child::{ChildMessage, ChildPhase, ChildRun};
 use crate::store::{Entry, Header, Projection, RosterEntry, SpawnLink, TeamLink};
 use crate::tools::ask::ASK;
+use crate::tools::call::CALL;
+use crate::tools::merge_tools;
 use crate::tools::output::YIELD;
 
 pub(crate) const SPAWN: &str = "spawn";
@@ -119,6 +123,8 @@ pub struct SpawnContext<'a> {
     pub spec: &'a AgentSpec,
     /// The catalog name; `None` for inline specs and plain delegates.
     pub agent: Option<&'a str>,
+    /// The parent's effective mode.
+    pub mode: Option<&'a ModeSpec>,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
     pub task: &'a PromptInput,
@@ -167,6 +173,7 @@ pub(super) fn child_inherited(
         docs_dir: parent.docs_dir.clone(),
         harness_name: parent.harness_name.clone(),
         agents: parent.agents.clone(),
+        modes: Vec::new(),
         agent_diagnostics: Vec::new(),
         agent: Some(spec.clone()),
         streamer: parent.streamer.clone(),
@@ -177,7 +184,7 @@ pub(super) fn child_inherited(
         host_sections: base.host_sections.clone(),
         host_tools: base.host_tool_factories.clone(),
         host_schemes: parent.host_schemes.clone(),
-        tool_hooks: parent.tool_hooks.clone(),
+        tool_policies: parent.tool_policies.clone(),
         store: parent.store.clone(),
         sessions: parent.sessions.clone(),
         spawn_hooks: parent.spawn_hooks.clone(),
@@ -233,11 +240,17 @@ impl SessionHooks {
     }
 
     fn parent_tools(&self) -> Vec<String> {
-        self.prompt
-            .tools()
+        let shape = self
+            .prompt
+            .shape
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        shape
+            .tools
             .iter()
+            .chain(&shape.deferred)
             .map(|tool| tool.name())
-            .filter(|name| !matches!(*name, ASK | YIELD))
+            .filter(|name| !matches!(*name, ASK | YIELD | CALL | ENTER_MODE))
             .map(str::to_owned)
             .collect()
     }
@@ -307,6 +320,7 @@ impl SessionHooks {
         team: Option<SpawnTeam<'_>>,
     ) -> Result<Resolved, Error> {
         let settings = &self.inherited.config.settings;
+        let mode = self.effective_mode();
         normalize(&mut spec, &settings.subagents);
         let select = |spec: &AgentSpec| -> Result<_, Error> {
             let cascade = settings.first_model(
@@ -337,6 +351,7 @@ impl SessionHooks {
                 .before_spawn(&SpawnContext {
                     spec: &spec,
                     agent: agent.as_deref(),
+                    mode: mode.as_deref(),
                     model: &model,
                     thinking,
                     task,
@@ -356,6 +371,24 @@ impl SessionHooks {
                     (model, thinking, selector) = select(&spec)?;
                 }
             }
+        }
+        if let Some(mode) = mode
+            && !mode.tools.is_empty()
+        {
+            let tools = spec.tools.get_or_insert_with(|| {
+                let base = self
+                    .shape_base
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                merge_tools(base.builtin.clone(), &base.host_tools)
+                    .iter()
+                    .chain(&base.host_deferred)
+                    .map(|tool| tool.name())
+                    .filter(|name| !matches!(*name, ASK | YIELD | CALL | ENTER_MODE))
+                    .map(str::to_owned)
+                    .collect()
+            });
+            tools.retain(|name| mode.tools.permits(name));
         }
         Ok(Resolved {
             spec,
@@ -770,7 +803,7 @@ fn start_first_run(
     });
 }
 
-const SPAWN_DESCRIPTION: &str = "Spawn a subagent: a separate session that works on task in the background. Returns its id (agent_N) at once; its result arrives automatically as a message when it finishes, so keep working or call wait. Prefer a defined agent; write an inline spec only when none fits; omit agent, spec and members to delegate to a copy of yourself. Leave model unset unless asked or clearly warranted. A team runs several agents at once that can message each other: name a defined team in agent, or list an ad-hoc roster in members; give every member a task, or one per member in tasks. Message a subagent with write agent://agent_N (a follow-up) or write agent://agent_N/steer (a steer); read agent://agent_N for status, agent://agent_N/result for its result, agent://agent_N/transcript for its conversation.";
+const SPAWN_DESCRIPTION: &str = "Spawn a subagent: a separate session that works on task in the background. Returns its id (agent_N) at once; its result arrives automatically as a message when it finishes, so keep working or call wait. Prefer a defined agent; write an inline spec only when none fits; omit agent, spec and members to delegate to a copy of yourself. Leave model unset unless asked or clearly warranted. A team runs several agents at once that can message each other: name a defined team in agent, or list an ad-hoc roster in members; give every member a task, or one per member in tasks. Message a subagent with send (steer: true to interrupt its current work); read agent://agent_N for status, agent://agent_N/result for its result, agent://agent_N/transcript for its conversation.";
 
 pub(super) struct SpawnTool {
     hooks: OnceLock<Weak<SessionHooks>>,
@@ -945,7 +978,7 @@ fn single_output(id: String) -> ToolOutput {
     ToolOutput {
         content: vec![UserBlock::Text {
             text: format!(
-                "Spawned {id}. It works in the background; its result arrives as a message when it finishes. Read agent://{id} for its status; write agent://{id} to send it a follow-up."
+                "Spawned {id}. It works in the background; its result arrives as a message when it finishes. Read agent://{id} for its status; use send to give it a follow-up."
             ),
         }],
         details: Some(json!({"job": id})),
@@ -963,7 +996,7 @@ fn team_output(team: &str, members: impl Iterator<Item = (String, String)>) -> T
     ToolOutput {
         content: vec![UserBlock::Text {
             text: format!(
-                "Spawned team {team}: {list}. Members work in the background and can message each other; each member's result arrives as a message when it finishes. Read agent://<id> for a member's status; write agent://<id> to message one."
+                "Spawned team {team}: {list}. Members work in the background and can message each other; each member's result arrives as a message when it finishes. Read agent://<id> for a member's status; use send to message one."
             ),
         }],
         details: Some(json!({"team": team, "jobs": jobs})),

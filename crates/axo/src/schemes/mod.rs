@@ -5,6 +5,7 @@ pub mod artifact;
 pub(crate) mod dir;
 pub(crate) mod proc;
 pub(crate) mod skill;
+pub(crate) mod tool;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,7 @@ pub(crate) fn check_harness_name(name: &str) -> Result<(), crate::Error> {
     }
     if matches!(
         name,
-        "artifact" | "file" | "skill" | "local" | "proc" | "agent"
+        "artifact" | "file" | "skill" | "local" | "proc" | "agent" | "tool"
     ) {
         return Err(crate::Error::Scheme(format!(
             "Harness name {name} is reserved"
@@ -94,9 +95,8 @@ pub trait Scheme: Send + Sync {
         Err(ToolError(format!("{url} cannot be read")))
     }
 
-    /// Called only for [`Target::Virtual`]. `content` is the write tool's required
-    /// content; action writes (such as `proc://bg_1/kill`) receive `""`.
-    /// Returns the tool result text.
+    /// Called only for [`Target::Virtual`]. Stores `content` at `url` so a later
+    /// read returns it; actions are tools, not writes. Returns the tool result text.
     async fn write(
         &self,
         url: &SchemeUrl,
@@ -107,7 +107,7 @@ pub trait Scheme: Send + Sync {
     }
 
     /// May a `write` through this scheme run again after a crash left its outcome unknown?
-    /// File targets are safe (`write` skips identical content); virtual writes that act must stay `Never`.
+    /// File targets are safe (`write` skips identical content); virtual writes default to `Never`.
     fn write_replay(&self) -> Replay {
         Replay::Never
     }
@@ -124,7 +124,7 @@ pub struct Schemes {
 impl Schemes {
     /// Applies host handlers in order, replacing matching built-ins in place.
     /// `artifact://` is always registered first and backed by `artifacts`;
-    /// `artifact` and `file` are reserved and cannot be supplied by a host.
+    /// `artifact`, `file` and `tool` are reserved and cannot be supplied by a host.
     pub fn new(
         context: SchemeContext,
         artifacts: Arc<artifact::Artifacts>,
@@ -138,7 +138,7 @@ impl Schemes {
             if !HOST_NAME.is_match(name) {
                 return Err(crate::Error::Scheme(format!("Invalid scheme name: {name}")));
             }
-            if matches!(name, "artifact" | "file") {
+            if matches!(name, "artifact" | "file" | "tool") {
                 return Err(crate::Error::Scheme(format!(
                     "Scheme {name}:// is reserved"
                 )));

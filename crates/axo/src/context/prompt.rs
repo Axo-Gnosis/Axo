@@ -20,12 +20,12 @@ use crate::context::skills::{Skill, escape_xml};
 pub type Sections = IndexMap<String, String>;
 
 /// Neutralizes text that opens or closes one of axo's own wrapper tags (system prompt
-/// sections, skill blocks, project instructions, summarizer boundaries) by turning its `<` into `&lt;`.
+/// sections, mode instructions, skill blocks, project instructions, summarizer boundaries) by turning its `<` into `&lt;`.
 pub(crate) fn escape_wrappers(text: &str) -> Cow<'_, str> {
     // ponytail: fixed list; add host section names if hosts report spoofing
     static TAGS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|delegation|system|docs|team|tools|schemes|work|prose|project_context|cwd|dev_shell|date)\b",
+            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|delegation|system|docs|team|tools|schemes|work|prose|project_context|cwd|dev_shell|date|mode)\b",
         )
         .expect("constant wrapper pattern")
     });
@@ -65,6 +65,7 @@ pub(crate) struct PromptShape {
     pub prompts: IndexMap<String, PromptOverride>,
     /// Active tools; their guidelines make the `tools` section.
     pub tools: Vec<Arc<dyn Tool>>,
+    pub deferred: Vec<Arc<dyn Tool>>,
     pub context_files: Vec<ContextFile>,
     /// Sections the persona disables (`None`), applied before host sections.
     pub agent_sections: Vec<(String, Option<String>)>,
@@ -279,6 +280,7 @@ mod tests {
         let mut shape = PromptShape {
             prompts,
             tools: Vec::new(),
+            deferred: Vec::new(),
             context_files: Vec::new(),
             agent_sections: Vec::new(),
             host_sections: Vec::new(),

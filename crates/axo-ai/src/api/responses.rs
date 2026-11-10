@@ -31,26 +31,7 @@ use crate::types::{
 pub(crate) struct ConvertOptions {
     /// Later system messages are sent in place; otherwise the caller collapsed them.
     pub supports_mid_convo_system_messages: bool,
-    pub supports_additional_tools: bool,
-    pub supports_tool_search: bool,
     pub supports_strict_mode: bool,
-}
-
-impl ConvertOptions {
-    /// How this transport expresses tool changes (pi `getResponsesToolSupport`).
-    ///
-    /// `additional_tools` items accumulate: a later item adds tools and replaces same-name
-    /// definitions, but cannot remove one. So every tool is declared in `additional_tools`
-    /// items and removals are announced as text. Synthetic tool search can only add tools.
-    pub fn tool_support(&self) -> TranscriptToolSupport {
-        if self.supports_mid_convo_system_messages && self.supports_additional_tools {
-            TranscriptToolSupport::Changes
-        } else if self.supports_tool_search {
-            TranscriptToolSupport::Additions
-        } else {
-            TranscriptToolSupport::None
-        }
-    }
 }
 
 /// Convert a resolved transcript (see `Transcript::resolve`) into Responses `input` items.
@@ -59,7 +40,7 @@ pub(crate) fn convert_messages(
     messages: &[Message],
     options: &ConvertOptions,
 ) -> Vec<Value> {
-    let support = options.tool_support();
+    let support = model.tool_support();
     let transcript_tools = resolve_transcript_tools(messages, support);
     let instruction_role = if model.reasoning && model.compat.supports_developer_role != Some(false)
     {

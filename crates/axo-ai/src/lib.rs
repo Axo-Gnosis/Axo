@@ -36,7 +36,7 @@ pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use retry::{is_fatal_error, is_retryable_error};
 #[cfg(feature = "testing")]
 pub use testing::{RecordedRequest, ScriptedApi, ScriptedTurn};
-pub use transcript::Transcript;
+pub use transcript::{Transcript, TranscriptToolSupport};
 pub use transform::transform_messages;
 pub use types::{
     AssistantBlock, AssistantMessage, JsonMap, Message, ProviderFailure, ReasoningReplay,

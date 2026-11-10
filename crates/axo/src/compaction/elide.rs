@@ -13,6 +13,7 @@ use super::Limits;
 use crate::Error;
 use crate::context::skills::Skill;
 use crate::schemes::artifact::Artifacts;
+use crate::session::{MODE_NOTICE, TOOL_CATALOG};
 use crate::store::{
     BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, ContextReplacement, Entry, EntryId, Projection,
     SeqEntry,
@@ -113,7 +114,10 @@ pub(crate) fn prepare(
         };
         if protected.contains(&index)
             || matches!(message, AgentMessage::Llm(Message::System(_)))
-            || matches!(message, AgentMessage::Custom(custom) if custom.custom_type == COMPACTION_SUMMARY_TYPE || custom.custom_type == BRANCH_SUMMARY_TYPE)
+            || matches!(message, AgentMessage::Custom(custom) if matches!(
+                custom.custom_type.as_str(),
+                COMPACTION_SUMMARY_TYPE | BRANCH_SUMMARY_TYPE | MODE_NOTICE | TOOL_CATALOG
+            ))
             || (matches!(mode, ElisionMode::Elide | ElisionMode::Clearing { .. })
                 && age_protected.contains(&index))
         {

@@ -590,10 +590,12 @@ mod tests {
                     ci: false,
                     promote_after: Duration::from_secs(60),
                 },
+                Arc::new(crate::tools::deferred::Deferred::default()),
             ));
             Self {
                 tools: crate::tools::builtin(
                     &session,
+                    None,
                     None,
                     None,
                     false,

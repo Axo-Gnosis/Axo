@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_ai::{ToolCall, UserBlock};
+use axo_ai::{JsonMap, ToolCall, UserBlock};
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,12 @@ pub trait Tool: Send + Sync {
     /// Bullets for the system prompt's `tools` section.
     fn prompt_guidelines(&self) -> &[&str] {
         &[]
+    }
+    /// For a dispatcher: the tool this call names and that tool's arguments. The loop runs
+    /// that tool in this call's place (its validation, execution mode, hooks and `execute`);
+    /// this tool's `execute` never runs for such a call.
+    fn target(&self, _call: &ToolCall) -> Option<(String, JsonMap)> {
+        None
     }
     /// Runs one validated call on its own task. An `Err` becomes an error result the
     /// model sees; a tool that reports a failure with output (e.g. a failing command)

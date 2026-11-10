@@ -21,6 +21,8 @@ use crate::tool::{Tool, ToolError, ToolOutput};
 pub struct AgentContext {
     pub messages: Vec<AgentMessage>,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Callable tools omitted from the model's declared tool list.
+    pub deferred: Vec<Arc<dyn Tool>>,
 }
 
 /// A maintenance-hook failure, displayed without wrapping.

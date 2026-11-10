@@ -28,6 +28,8 @@ pub enum Error {
     NoModel,
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    #[error("Mode not found: {0}")]
+    ModeNotFound(String),
     /// `SessionOptions::agent` names no agent definition, or names a team.
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
@@ -77,6 +79,8 @@ pub enum Error {
     /// `answer`/`dismiss` named a tool call with no pending question.
     #[error("No pending question for tool call: {0}")]
     NoPendingQuestion(String),
+    #[error("No pending mode result for tool call: {0}")]
+    NoPendingResult(String),
     /// Another writer holds the session's lock.
     #[error("Session is open in another process: {}", path.display())]
     SessionBusy { path: PathBuf },

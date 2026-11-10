@@ -1,4 +1,4 @@
-//! `proc://`: lists, inspects and stops the session's background jobs.
+//! `proc://`: lists and inspects the session's background jobs.
 
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axo_agent::ToolError;
 
 use super::{Scheme, SchemeContext, SchemeUrl, Target};
-use crate::jobs::{JobId, JobKind, JobRegistry, Killer, headline};
+use crate::jobs::{JobId, JobKind, JobRegistry, headline};
 
 pub struct ProcScheme {
     pub jobs: Arc<JobRegistry>,
@@ -16,28 +16,18 @@ pub struct ProcScheme {
 enum ProcPath {
     List,
     Job(JobId),
-    Kill(JobId),
 }
 
 fn parse(path: &str) -> Option<ProcPath> {
     if path.is_empty() {
         return Some(ProcPath::List);
     }
-    let (job, action) = match path.split_once('/') {
-        Some((job, action)) => (job, Some(action)),
-        None => (path, None),
-    };
-    let id = JobId::parse(job)?;
-    match action {
-        None => Some(ProcPath::Job(id)),
-        Some("kill") => Some(ProcPath::Kill(id)),
-        Some(_) => None,
-    }
+    JobId::parse(path).map(ProcPath::Job)
 }
 
 fn unsupported(url: &SchemeUrl) -> ToolError {
     ToolError(format!(
-        "Unsupported proc:// path: {}. Use proc://, proc://<id> or proc://<id>/kill.",
+        "Unsupported proc:// path: {}. Use proc:// or proc://<id>.",
         url.path
     ))
 }
@@ -49,7 +39,7 @@ impl Scheme for ProcScheme {
     }
 
     fn prompt_doc(&self) -> &str {
-        "proc:// background jobs and subagents: read proc:// lists them, read proc://bg_N or proc://agent_N shows one, write proc://<id>/kill (empty content) stops it."
+        "proc:// background jobs and subagents: read proc:// lists them, read proc://bg_N or proc://agent_N shows one; stop one with kill."
     }
 
     async fn resolve(&self, _url: &SchemeUrl, _cx: &SchemeContext) -> Result<Target, ToolError> {
@@ -131,22 +121,6 @@ impl Scheme for ProcScheme {
                 }
                 Ok(text)
             }
-            ProcPath::Kill(_) => Err(ToolError(format!("{url} cannot be read"))),
-        }
-    }
-
-    async fn write(
-        &self,
-        url: &SchemeUrl,
-        _content: &str,
-        _cx: &SchemeContext,
-    ) -> Result<String, ToolError> {
-        match parse(&url.path).ok_or_else(|| unsupported(url))? {
-            ProcPath::Kill(id) if self.jobs.kill(id, Killer::Model) => {
-                Ok(format!("Stopping {id}."))
-            }
-            ProcPath::Kill(id) => Ok(format!("{id} is not running.")),
-            ProcPath::List | ProcPath::Job(_) => Err(ToolError(format!("{url} is read-only"))),
         }
     }
 }
