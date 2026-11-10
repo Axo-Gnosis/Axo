@@ -1,6 +1,6 @@
 # Research behind axo
 
-Findings gathered on 2026-10-21, before any code was written.
+Initial pi/omp findings gathered on 2026-10-21, before any code was written; later studies and axo measurements below are dated individually.
 
 - **Sources:** source reading and small measurements against pi 1.3.0 (`earendil-works/pi` at commit `02726086`) and omp 18.12.2. omp is oh-my-pi, a pi fork.
 - **Labels:** claims marked [INFERENCE] were not verified directly.

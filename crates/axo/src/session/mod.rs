@@ -2377,7 +2377,7 @@ impl Session {
     /// its parent. The fork runs with this session's resolved configuration. Forking at a
     /// user message copies the path to its parent and returns the message's parts to edit
     /// and resubmit. A live fork shares this session's child-run slots; a fork of a child
-    /// also keeps its agent prompt, without `ask` or host sections. Reopening the fork with
+    /// also keeps its inherited host sections (with `ask` disabled). Reopening the fork with
     /// `Axo::open_session` resolves it as an independent root.
     pub async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error> {
         let Selection { model, thinking } = self.hooks.selection();

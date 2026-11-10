@@ -107,7 +107,7 @@ pub trait Scheme: Send + Sync {
     }
 
     /// May a `write` through this scheme run again after a crash left its outcome unknown?
-    /// File targets are safe (`write` skips identical content); virtual writes default to `Never`.
+    /// Defaults to `Never`; override with `Safe` when repeating a write is idempotent (such as `local://`).
     fn write_replay(&self) -> Replay {
         Replay::Never
     }

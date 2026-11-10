@@ -8,10 +8,10 @@ A host implements `ConfigSource` and passes it to `AxoBuilder::config(Arc<dyn Co
 
 | Method | Signature | Contract |
 | :--- | :--- | :--- |
-| `user` | `fn user(&self) -> Result<UserConfig, Error>` | Called once per `Axo::create_session`, `Axo::open_session`, and `Axo::schemes`, before any other `ConfigSource` call |
+| `user` | `fn user(&self) -> Result<UserConfig, Error>` | Called once per `Axo::create_session`, `Axo::open_session`, `Axo::schemes`, and `Axo::catalog`, before any other `ConfigSource` call |
 | `project` | `fn project(&self, cwd: &Path) -> Result<ConfigLayer, Error>` | The project contribution for a session in `cwd`; the project root is `axo::context::project_root(cwd)` (the git root, or `cwd` outside a repository). Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust` and the user's `project.files.config` is `true` |
 
-An error from either method fails that `create_session`, `open_session`, or `schemes` call as returned. Hosts report an unreadable path as `Error::Io { path, source }`, invalid content they parse (for example malformed JSONC) as `Error::Config { origin, message }`, and any other acquisition failure as `Error::Host(Box::new(err))`, which carries the host's own error.
+An error from either method fails that `create_session`, `open_session`, `schemes`, or `catalog` call as returned. Hosts report an unreadable path as `Error::Io { path, source }`, invalid content they parse (for example malformed JSONC) as `Error::Config { origin, message }`, and any other acquisition failure as `Error::Host(Box::new(err))`, which carries the host's own error.
 
 | Type | Fields | Meaning |
 | :--- | :--- | :--- |
@@ -26,7 +26,7 @@ Definition roots are Rust fields on `ConfigLayer`, not keys in the settings JSON
 
 ### Evaluation (`EffectiveConfig::resolve`)
 
-`EffectiveConfig::resolve(source: &dyn ConfigSource, cwd: &Path, access: Option<ProjectAccess>) -> Result<EffectiveConfig, Error>` is the single evaluator. `Axo` calls it with `SessionOptions::project_access` as `access`; hosts may call it directly, for example to preview what a session would get.
+`EffectiveConfig::resolve(source: &dyn ConfigSource, cwd: &Path, access: Option<ProjectAccess>) -> Result<EffectiveConfig, Error>` is the single evaluator. `Axo` calls it with `SessionOptions::project_access` as `access` (including from `Axo::catalog` to preview config and definitions without creating a session); hosts may also call it directly.
 
 1. **Sample the user layer:** `source.user()`.
 2. **Validate the user settings on their own:** `None` or `null` is no settings; a non-object is `Error::Config { origin, message: "expected a JSON object" }`; a value that does not deserialize as `Settings` is `Error::Config` with the layer's `origin` and the deserializer's message. The valid object is merged over the defaults.
@@ -41,7 +41,7 @@ Unknown keys are ignored in every layer.
 
 ### Lifecycle
 
-- **Sampling:** every `Axo::create_session`, `Axo::open_session`, and `Axo::schemes` call samples `user()` afresh and computes access from that same sample, so a policy or settings change applies to the next session start without rebuilding `Axo`.
+- **Sampling:** every `Axo::create_session`, `Axo::open_session`, `Axo::schemes`, and `Axo::catalog` call samples `user()` afresh and computes access from that same sample, so a policy or settings change applies to the next session start without rebuilding `Axo`.
 - **Per session:** a session keeps the `EffectiveConfig` it started with. Settings, prompt overrides (including `SYSTEM`, `WORK`, and `PROSE` when the system prompt is rebuilt for a new date or dev-shell note), skill roots, and context-file paths are fixed at create or open.
 - **Forks:** `Session::fork` inherits the parent's resolved `EffectiveConfig` and never calls the source.
 - **Children:** `Session::spawn` and `Session::spawn_team` inherit the parent's resolved configuration without sampling the source, applying the child defaults below. The resolved `AgentSpec` is saved in each child's header and reused on revival; agent-file edits do not change an existing child.
@@ -73,9 +73,7 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 
 With `homeAgentsDir: true` in the user layer, axo also reads the ecosystem files `~/.agents/AGENTS.md` (before `UserConfig::context_files`) and `~/.agents/skills/` (after `UserConfig::skill_roots`).
 
-Mode result handling belongs to the definition, not the settings JSON. `result` is optional; when present, `ModeResult` defaults to a string `schema`, `review: false`, and `then: None`. A mode's `yield` executes only while that mode is both selected and effective. `review: true` keeps a valid `yield` waiting for the host's `accept_result`, `revise_result`, or `dismiss` decision. Acceptance (or an unreviewed result) exits only if the same mode is still selected when the tool finishes; it never clears a replacement mode. `then` supplies continuation text unless acceptance supplies a host message. With neither continuation, successful completion requests run termination. No `result` means no mode `yield`; the mode stays active until host selection or a mode switch ends it. See [Model entry and result review](extending.md#model-entry-and-result-review) for snapshot/event handling, errors, cancellation, and batch termination.
-
-`disable-model-invocation: true` in frontmatter (`ModeSpec::disable_model_invocation` in Rust) removes a definition from `enter_mode`, not from host selection or mode commands. Any loaded root modes reserve `yield` against both direct and deferred host tools, including while no mode is active; conflicting host registrations are ignored with a diagnostic. Independently of modes or deferred catalog contents, `call` is always reserved: direct and deferred host registrations with that name are ignored with `host tool "call" is reserved for deferred tools; ignored`.
+Mode result handling and `disable-model-invocation` belong to each mode definition rather than the settings JSON (`ModeResult` defaults to a string `schema`, `review: false`, and `then: None`). See [Mode definitions](prompts-and-context.md#mode-definitions) for frontmatter, reserved `call`/`yield` names, and model entry, and [Model entry and result review](extending.md#model-entry-and-result-review) for review decisions, continuation, and events.
 
 The `drive` example requires `--dir <dir>`; `memory` uses it only with `--model`. Both ship a host with a JSONC `settings.jsonc` user layer (whose `extendedContext` boolean the example itself reads for `ModelsOptions::extended_context`), `prompts/<NAME>.md` overrides, `skills/`, `AGENTS.md`, `models.jsonc`, `auth.json`, `sessions/`, and `cache/` (both `cache_dir`s). That layout belongs to the examples, not to axo.
 
@@ -197,9 +195,7 @@ Child model selection considers `SpawnRequest::model`, the named agent's entry i
 
 An agent's explicit context-file map or `false` overrides the child default. Omitted or `true` on the agent uses `subagents.contextFiles`. Children always disable `ask` and inherit the current host prompt sections; see [Child prompts](prompts-and-context.md#child-prompts).
 
-For a single child, `SpawnRequest::output` (or the model's call-level `output`) overrides the selected agent's result schema before spawn hooks run. Team calls have no call-level model or output override; each member resolves its own model and schema from its agent or inline spec. An agent returned by a replacing hook keeps its own schema. Output schemas apply only to children, not root personas; see [Spawning and returning results](prompts-and-context.md#spawning-and-returning-results) for `yield`, wrapping non-object schemas, and failure handling.
-
-Children spawned under a root's effective mode inherit its tool restrictions in their persisted spec after spawn hooks, not its mode identity or instructions. Those restrictions remain after the parent exits the mode. The parent's `ask`, `yield`, `call`, and `enter_mode` are excluded from the tools available for child selection; children get their own dispatcher when needed and their own `yield` when they have an output schema. See [Root-session modes](extending.md#root-session-modes).
+See [Spawning child sessions](extending.md#spawning-child-sessions) and [Spawning and returning results](prompts-and-context.md#spawning-and-returning-results) for call-level `output` overrides, team resolution, and child tool filtering, and [Root-session modes](extending.md#root-session-modes) for inherited mode tool limits.
 
 ### Project access (`project` / `axo::ProjectSettings`)
 

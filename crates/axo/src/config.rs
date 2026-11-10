@@ -428,7 +428,7 @@ pub struct UserConfig {
 /// any other acquisition failure as `Error::Host(Box::new(err))`.
 // ponytail: blocking calls; make async if a host needs network-backed config
 pub trait ConfigSource: Send + Sync {
-    /// Called once per `create_session`, `open_session` and `Axo::schemes`, before anything else.
+    /// Called once per `create_session`, `open_session`, `Axo::schemes`, and `Axo::catalog`, before anything else.
     fn user(&self) -> Result<UserConfig, Error>;
     /// The project contribution for a session in `cwd`. The project root is `axo::context::project_root(cwd)`.
     /// Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust`
