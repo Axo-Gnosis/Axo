@@ -49,7 +49,6 @@ impl Scheme for ToolScheme {
                 "No deferred tool named {name}; read tool:// to list them."
             ))
         })?;
-        self.deferred.request(name);
         let mut text = format!("# {}\n\n{}", tool.name(), tool.description());
         let guidelines = tool.prompt_guidelines();
         if !guidelines.is_empty() {

@@ -21,7 +21,7 @@ use super::modes::ENTER_MODE;
 use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
-use crate::context::modes::{ModeSpec, ToolLimits};
+use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
 use crate::error::Error;
 use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
@@ -126,6 +126,8 @@ pub struct SpawnContext<'a> {
     pub mode: Option<&'a ModeSpec>,
     /// The inherited tool ceiling the child will run under.
     pub limits: &'a ToolLimits,
+    /// The parent's effective bash access, under `mode`; the child's ceiling, never loosened below.
+    pub bash: BashAccess,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
     pub task: &'a PromptInput,
@@ -175,6 +177,7 @@ pub(super) fn child_inherited(
         harness_name: parent.harness_name.clone(),
         agents: parent.agents.clone(),
         modes: Vec::new(),
+        keywords: Vec::new(),
         agent_diagnostics: Vec::new(),
         agent: Some(spec.clone()),
         streamer: parent.streamer.clone(),
@@ -216,6 +219,7 @@ struct Resolved {
     thinking: ThinkingLevel,
     selector: Option<String>,
     limits: ToolLimits,
+    bash: BashAccess,
 }
 
 struct Launch {
@@ -333,6 +337,7 @@ impl SessionHooks {
                 .map(|mode| mode.tools.clone())
                 .unwrap_or_default(),
         };
+        let bash = self.bash_with(mode.as_deref());
         normalize(&mut spec, &settings.subagents);
         let select = |spec: &AgentSpec| -> Result<_, Error> {
             let cascade = settings.first_model(
@@ -365,6 +370,7 @@ impl SessionHooks {
                     agent: agent.as_deref(),
                     mode: mode.as_deref(),
                     limits: &limits,
+                    bash,
                     model: &model,
                     thinking,
                     task,
@@ -392,6 +398,7 @@ impl SessionHooks {
             thinking,
             selector,
             limits,
+            bash,
         })
     }
 
@@ -416,6 +423,7 @@ impl SessionHooks {
                 thinking,
                 selector,
                 limits,
+                bash,
             } = resolved;
             let link = SpawnLink {
                 parent_session_id: self.session_id.clone(),
@@ -425,6 +433,7 @@ impl SessionHooks {
                 model: selector,
                 spec,
                 limits,
+                bash,
                 team,
             };
             header.spawn = Some(link.clone());
@@ -473,6 +482,8 @@ impl SessionHooks {
                     // Live from creation; the session table re-pins and parks it later.
                     resident: true,
                     progress: None,
+                    unread_mail: 0,
+                    tree_usage: Default::default(),
                     team: link.team.as_ref().map(TeamLink::team_ref),
                 })
             })

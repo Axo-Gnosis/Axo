@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use axo::context::DiagnosticOrigin;
-use axo::context::agents::AgentDef;
+use axo::context::agents::{AgentDef, AgentSpec};
 use axo::{
     Axo, Command, ConfigLayer, Error, JsonlStore, ProjectAccess, SessionOptions, Settings, Target,
 };
@@ -182,9 +182,17 @@ async fn root_agent_applies_its_switches() {
         })
         .unwrap();
     let sections = persona_system.sections.as_ref().unwrap();
+    let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
+    assert_eq!(&keys[..2], ["system", "agent"]);
+    assert!(
+        sections["system"]
+            .as_deref()
+            .unwrap()
+            .starts_with("<system>\nYou are a coding agent running in ")
+    );
     assert_eq!(
-        sections["system"].as_deref(),
-        Some("<system>\nPersona body.\n</system>")
+        sections["agent"].as_deref(),
+        Some("<agent>\nPersona body.\n</agent>")
     );
     assert!(!sections.contains_key("project_context"));
     assert!(!sections.contains_key("skills"));
@@ -246,6 +254,50 @@ async fn root_agent_applies_its_switches() {
         })
         .await
         .unwrap();
+
+    // Host-bundled markdown parses like a root file, minus the path and diagnostic origin.
+    let persona_text = std::fs::read_to_string(dir.join("agents/persona.md")).unwrap();
+    let (parsed, problems) = AgentSpec::parse("persona", &persona_text);
+    assert!(problems.is_empty(), "{problems:?}");
+    let loaded = session
+        .agents()
+        .iter()
+        .find_map(|definition| match definition {
+            AgentDef::Agent(spec) if spec.name == "persona" => Some(spec.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(loaded.path, Some(dir.join("agents/persona.md")));
+    assert_eq!(
+        parsed,
+        Some(AgentSpec {
+            path: None,
+            ..loaded
+        })
+    );
+    let (named, _) = AgentSpec::parse("fallback", "---\nname: chosen\n---\nBody.");
+    assert_eq!(named.unwrap().name, "chosen");
+    let (team, problems) = AgentSpec::parse(
+        "crew",
+        "---\nname: Bad_Crew\nextra: 1\nmembers:\n  - agent: persona\n---\n",
+    );
+    assert_eq!(team, None);
+    assert_eq!(
+        problems
+            .iter()
+            .map(|problem| (problem.origin.clone(), problem.message.as_str()))
+            .collect::<Vec<_>>(),
+        [(None, "team definitions load only from agent roots")]
+    );
+    let (empty, problems) = AgentSpec::parse("fallback", "---\nname: \"\"\n---\nBody.");
+    assert_eq!(empty, None);
+    assert!(!problems.is_empty());
+    let (bare, problems) = AgentSpec::parse("bare", "No frontmatter.");
+    assert_eq!(bare, None);
+    assert_eq!(problems[0].message, "missing YAML frontmatter");
+    let (broken, problems) = AgentSpec::parse("broken", "---\nname: [unclosed\n---\nbody\n");
+    assert_eq!(broken, None);
+    assert!(!problems.is_empty() && problems.iter().all(|problem| problem.origin.is_none()));
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ use crate::config::{
 };
 use crate::context::Diagnostic;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, load_agents};
+use crate::context::keywords::{KeywordSpec, load_keywords};
 use crate::context::modes::{ModeSpec, load_modes};
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
@@ -45,11 +46,12 @@ pub struct Axo {
     sessions: Arc<SessionTable>,
 }
 
-/// Configuration, agent definitions and mode definitions resolved without starting a session.
+/// Configuration and agent, mode and keyword definitions resolved without starting a session.
 pub struct Catalog {
     pub config: Arc<EffectiveConfig>,
     pub agents: Vec<AgentDef>,
     pub modes: Vec<Arc<ModeSpec>>,
+    pub keywords: Vec<Arc<KeywordSpec>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -297,6 +299,7 @@ impl Axo {
         project_access: Option<ProjectAccess>,
         agents: &[AgentSpec],
         modes: &[ModeSpec],
+        keywords: &[KeywordSpec],
     ) -> Result<Catalog, Error> {
         let config = Arc::new(EffectiveConfig::resolve(
             &*self.config,
@@ -306,10 +309,13 @@ impl Axo {
         let (agents, mut diagnostics) = load_agents(&config.agent_roots, agents);
         let (modes, mode_diagnostics) = load_modes(&config.mode_roots, modes);
         diagnostics.extend(mode_diagnostics);
+        let (keywords, keyword_diagnostics) = load_keywords(&config.keyword_roots, keywords);
+        diagnostics.extend(keyword_diagnostics);
         Ok(Catalog {
             config,
             agents,
             modes: modes.into_iter().map(Arc::new).collect(),
+            keywords: keywords.into_iter().map(Arc::new).collect(),
             diagnostics,
         })
     }
@@ -336,6 +342,7 @@ impl Axo {
             agent,
             agents,
             modes,
+            keywords,
             thinking,
             ask_enabled,
             project_access,
@@ -352,8 +359,9 @@ impl Axo {
             config,
             agents,
             modes,
+            keywords,
             diagnostics: mut agent_diagnostics,
-        } = self.catalog(&cwd, project_access, &agents, &modes)?;
+        } = self.catalog(&cwd, project_access, &agents, &modes, &keywords)?;
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
@@ -436,6 +444,7 @@ impl Axo {
                 harness_name: self.name.clone(),
                 agents,
                 modes,
+                keywords,
                 agent_diagnostics,
                 agent,
                 streamer: self.streamer.clone(),

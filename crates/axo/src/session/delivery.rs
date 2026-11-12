@@ -1,5 +1,6 @@
+use std::ops::Range;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, PoisonError, Weak};
 
 use async_trait::async_trait;
 use axo_agent::{Agent, AgentMessage, CustomMessage, QueuedMessage, RunOutcome};
@@ -10,8 +11,10 @@ use uuid::Uuid;
 use super::journal::{self, View};
 use super::{
     HostDelivery, HostMessage, MaintenanceKind, PromptRequest, PromptResult, RunRequest, Session,
-    SessionHooks, detached, run_to_settle,
+    SessionEvent, SessionHooks, detached, run_to_settle,
 };
+use crate::config::ModelChoice;
+use crate::context::keywords::{self, KeywordSpec};
 use crate::context::prompt::escape_wrappers;
 use crate::error::Error;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
@@ -201,6 +204,72 @@ impl SessionHooks {
         );
         delivery
     }
+
+    /// The keywords that fire in this session now: none for children or with keywords
+    /// off; otherwise every loaded one not disabled whose required tools are all listed
+    /// and allowed in the current mode.
+    pub(super) fn active_keywords(&self) -> Vec<Arc<KeywordSpec>> {
+        let settings = &self.inherited.config.settings.keywords;
+        if self.child.is_some() || !settings.enabled || self.inherited.keywords.is_empty() {
+            return Vec::new();
+        }
+        let tools = self.tool_infos();
+        self.inherited
+            .keywords
+            .iter()
+            .filter(|keyword| {
+                !settings.disabled.contains(&keyword.name)
+                    && keyword.requires_tools.iter().all(|name| {
+                        tools
+                            .iter()
+                            .any(|tool| tool.name == *name && tool.allowed_in_mode)
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The active keywords typed in `parts`, deduplicated in text order. Only `Text`
+    /// parts count, never a skill's expansion: a message's leading `/command` token is
+    /// skipped.
+    pub(super) fn matched_keywords(&self, parts: &[PromptPart]) -> Vec<Arc<KeywordSpec>> {
+        if !parts
+            .iter()
+            .any(|part| matches!(part, PromptPart::Text { .. }))
+        {
+            return Vec::new();
+        }
+        let active = self.active_keywords();
+        let mut matched: Vec<Arc<KeywordSpec>> = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let PromptPart::Text { text } = part else {
+                continue;
+            };
+            for (name, _) in keyword_spans(text, index == 0, &active) {
+                if !matched.iter().any(|keyword| keyword.name == name)
+                    && let Some(keyword) = active.iter().find(|keyword| keyword.name == name)
+                {
+                    matched.push(keyword.clone());
+                }
+            }
+        }
+        matched
+    }
+
+    /// The model selector of the first matched keyword that names one, resolved like
+    /// `/model`'s; resolution errors return before anything is written.
+    fn keyword_choice(&self, matched: &[Arc<KeywordSpec>]) -> Result<Option<ModelChoice>, Error> {
+        matched
+            .iter()
+            .find_map(|keyword| keyword.model.as_deref())
+            .map(|selector| {
+                self.inherited
+                    .config
+                    .settings
+                    .resolve_model(&self.inherited.models, selector)
+            })
+            .transpose()
+    }
 }
 
 impl Session {
@@ -229,9 +298,13 @@ impl Session {
         if let Some(existing) = self.admit(request_id).await? {
             return Ok(PromptResult::Duplicate(existing));
         }
+        // Keywords match and their model resolves before any file work or write.
+        let keywords = self.hooks.matched_keywords(&request.input.parts);
+        let choice = self.hooks.keyword_choice(&keywords)?;
         self.hooks.preparing.fetch_add(1, Ordering::AcqRel);
         let preparing = Preparing(self.hooks.clone());
-        let (Prepared { parts, saved }, content) = self.prepare(request.input.parts).await?;
+        let (Prepared { parts, saved }, content) =
+            self.prepare(request.input.parts, &keywords).await?;
         let (entry, message) = submission(
             SubmissionKind::Prompt,
             parts,
@@ -279,6 +352,14 @@ impl Session {
             saved.keep();
             drop(preparing);
             hooks.set_auto_paused(false);
+            // A keyword's model applies like `/model`: recorded after the submission,
+            // before the run's first request.
+            if let Some(choice) = choice
+                && let Err(error) = hooks.select_choice(&agent, choice).await
+            {
+                hooks.release_or_deliver();
+                return Err(error);
+            }
             // Pending job results precede the user's message.
             let messages = hooks.run_input(hooks.reserve_delivery(), Some(message));
             let outcome = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await?;
@@ -313,13 +394,19 @@ impl Session {
         submitted(&self.hooks.journal.view(), Some(request_id)).ok_or(Error::Busy)
     }
 
-    /// Validates `parts`, saves handed-over content, and renders the model blocks; runs
-    /// before anything is written so file and image work never stalls a running turn.
-    async fn prepare(&self, parts: Vec<PromptPart>) -> Result<(Prepared, Vec<UserBlock>), Error> {
+    /// Validates `parts`, saves handed-over content, and renders the model blocks with
+    /// the `keywords` matched in them; runs before anything is written so file and image
+    /// work never stalls a running turn.
+    async fn prepare(
+        &self,
+        parts: Vec<PromptPart>,
+        keywords: &[Arc<KeywordSpec>],
+    ) -> Result<(Prepared, Vec<UserBlock>), Error> {
         let prepared = prepare(parts, &self.hooks.tools).await?;
         let content = render(
             &prepared.parts,
             &self.hooks.prompt.sources.skills,
+            keywords,
             &self.hooks.tools,
         )
         .await;
@@ -383,10 +470,18 @@ impl Session {
                 timestamp: now_ms(),
             }),
         };
-        self.queue_message(kind, entry, queued, None).await
+        self.queue_message(kind, entry, queued, None, None).await
     }
 
-    /// Saves and queues a teammate's message, read at the next turn boundary; on an idle session it starts a run.
+    /// Lifts the auto-pause a Stop or an unfinished run left, so pending job results
+    /// wake an idle session again; starts their delivery run now if the session is idle.
+    pub fn resume_wakes(&self) {
+        self.hooks.set_auto_paused(false);
+        JobHost::results_ready(&*self.hooks);
+    }
+
+    /// Saves and queues a teammate's message, read at the next turn boundary; on an idle
+    /// session it starts a run unless the session is auto-paused, where it stays unread.
     pub(crate) async fn post_mail(&self, sender: &str, content: &str) -> Result<(), Error> {
         let text = format!(
             "Message from {sender} (reply with send to \"{sender}\"):\n\n{}",
@@ -397,34 +492,50 @@ impl Session {
     }
 
     /// Saves the submission and hands its message to the queue for `kind`.
-    /// `saved` files stay only once the entry is written.
+    /// `saved` files stay only once the entry is written. Keywords match in steers and
+    /// follow-ups, never in mail.
     async fn queue(
         &self,
         kind: SubmissionKind,
         input: PromptInput,
         sender: Option<String>,
     ) -> Result<(), Error> {
-        let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
+        let keywords = if matches!(kind, SubmissionKind::Steer | SubmissionKind::FollowUp) {
+            self.hooks.matched_keywords(&input.parts)
+        } else {
+            Vec::new()
+        };
+        let choice = self.hooks.keyword_choice(&keywords)?;
+        let (Prepared { parts, saved }, content) = self.prepare(input.parts, &keywords).await?;
         let (entry, message) = submission(kind, parts, content, None, sender);
-        self.queue_message(kind, entry, message, Some(saved)).await
+        self.queue_message(kind, entry, message, Some(saved), choice)
+            .await
     }
 
+    /// Writes `entry`, applies a keyword's model `choice`, then queues `message`.
     async fn queue_message(
         &self,
         kind: SubmissionKind,
         entry: Entry,
         message: QueuedMessage,
         saved: Option<SavedFiles>,
+        choice: Option<ModelChoice>,
     ) -> Result<(), Error> {
         let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
         detached(async move {
-            // Awaits only the journal, which never waits on the session.
+            // Awaits only the journal and the selection order, which never wait on the
+            // session.
             let _order = hooks.queue_order.lock().await;
             hooks.append(vec![entry]).await?;
             if let Some(saved) = saved {
                 saved.keep();
             }
-            if kind != SubmissionKind::Quiet {
+            if let Some(choice) = choice {
+                hooks.select_choice(&agent, choice).await?;
+            }
+            // Only the user's (or host's) own input lifts an auto-pause; teammate mail
+            // waits unread on a paused member until `resume_wakes` or user input.
+            if !matches!(kind, SubmissionKind::Quiet | SubmissionKind::Mail) {
                 hooks.set_auto_paused(false);
             }
             enqueue(&agent, &hooks, kind, message);
@@ -439,7 +550,7 @@ impl Session {
 
     /// Validates and renders a new child's task; writes nothing.
     pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
-        let (Prepared { parts, saved }, content) = self.prepare(input.parts).await?;
+        let (Prepared { parts, saved }, content) = self.prepare(input.parts, &[]).await?;
         let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None);
         Ok(FirstPrompt {
             entry,
@@ -481,9 +592,60 @@ impl JobHost for SessionHooks {
         self.deliver_if_idle();
     }
 
+    fn mail_changed(&self, unread: u32) {
+        if let Some(parent) = self.parent_registry() {
+            parent.child_mail(&self.session_id, unread);
+        }
+    }
+
+    /// Emits and pushes the tree total when it changed. Held under `last_tree` throughout,
+    /// so concurrent changes emit and push in order; locks are only ever taken upward
+    /// (child, then parent), so the tree cannot deadlock.
+    fn tree_changed(&self) {
+        let mut last = self
+            .last_tree
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let usage = self.tree_usage();
+        if *last == usage {
+            return;
+        }
+        *last = usage.clone();
+        let _ = self.events.send(SessionEvent::TreeUsage {
+            usage: usage.clone(),
+        });
+        if let Some(parent) = self.parent_registry() {
+            parent.child_tree_usage(&self.session_id, usage);
+        }
+    }
+
     async fn journal(&self, entry: Entry) -> Result<(), Error> {
         self.append(vec![entry]).await.map(drop)
     }
+}
+
+/// The `active` keywords in one typed text, as names and byte ranges into `text` in text
+/// order. `first` marks a message's first part, whose leading `/command` token names a
+/// skill or mode rather than prose.
+pub(super) fn keyword_spans(
+    text: &str,
+    first: bool,
+    active: &[Arc<KeywordSpec>],
+) -> Vec<(String, Range<usize>)> {
+    if active.is_empty() {
+        return Vec::new();
+    }
+    let start = if first && text.starts_with('/') {
+        text.find(char::is_whitespace).unwrap_or(text.len())
+    } else {
+        0
+    };
+    keywords::find(&text[start..], |name| {
+        active.iter().any(|keyword| keyword.name == name)
+    })
+    .into_iter()
+    .map(|(name, range)| (name, range.start + start..range.end + start))
+    .collect()
 }
 
 pub(super) fn enqueue(

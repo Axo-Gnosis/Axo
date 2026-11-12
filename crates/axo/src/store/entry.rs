@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::context::agents::AgentSpec;
-use crate::context::modes::ToolLimits;
+use crate::context::modes::{BashAccess, ToolLimits};
 use crate::input::PromptPart;
 
 /// The `version` written into new session headers.
@@ -106,6 +106,9 @@ pub struct SpawnLink {
     /// Tool limits of the root mode this child was spawned under; every descendant inherits them.
     #[serde(default, skip_serializing_if = "ToolLimits::is_empty")]
     pub limits: ToolLimits,
+    /// The parent's effective bash access at spawn; a ceiling every descendant inherits.
+    #[serde(default, skip_serializing_if = "BashAccess::is_full")]
+    pub bash: BashAccess,
     /// The member's team; `None` outside teams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<TeamLink>,
@@ -119,6 +122,9 @@ pub struct TeamRef {
     pub id: String,
     /// The roster name.
     pub member: String,
+    /// The catalog team; `None` for ad-hoc teams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A team member's place in its team; stored in its spawn link.
@@ -143,6 +149,7 @@ impl TeamLink {
         TeamRef {
             id: self.id.clone(),
             member: self.member.clone(),
+            name: self.name.clone(),
         }
     }
 }

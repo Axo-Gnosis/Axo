@@ -27,6 +27,10 @@ pub(crate) struct ChildRun {
     pub(crate) phase: ChildPhase,
     pub(crate) resident: bool,
     pub(crate) progress: Option<ChildProgress>,
+    /// Mail queued in the child's own registry and not yet taken; 0 when rebuilt.
+    pub(crate) unread_mail: u32,
+    /// Whole-subtree usage of the child's own journal plus its descendants'.
+    pub(crate) tree_usage: Usage,
     pub(crate) team: Option<TeamRef>,
 }
 

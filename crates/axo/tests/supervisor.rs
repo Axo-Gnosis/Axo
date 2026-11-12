@@ -11,7 +11,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use axo::StaticEnv;
-use axo::exec::host::{ExecSpec, ProcessSupervisor, Supervision, find_on_path};
+use axo::exec::host::{
+    ExecSpec, OutputError, ProcessSupervisor, Sandbox, Supervision, find_on_path,
+};
 use common::dead;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -29,9 +31,13 @@ fn main() -> ExitCode {
         println!("supervisor: unusable_root_fails_closed ... ok");
         dropping_a_group_process_kills_its_group().await;
         println!("supervisor: dropping_a_group_process_kills_its_group ... ok");
+        sandbox_writes_only_beneath_writable(Supervision::ProcessGroup).await;
+        println!("supervisor: sandbox_writes_only_beneath_writable (group) ... ok");
         if std::env::var_os("AXO_TEST_CGROUP").is_some() {
             dropping_a_process_kills_detached_descendants().await;
             println!("supervisor: dropping_a_process_kills_detached_descendants ... ok");
+            sandbox_writes_only_beneath_writable(cgroup()).await;
+            println!("supervisor: sandbox_writes_only_beneath_writable (cgroup) ... ok");
         } else {
             println!(
                 "supervisor: cgroup cases skipped (set AXO_TEST_CGROUP=1 inside a delegated cgroup to run them)"
@@ -51,6 +57,7 @@ fn bash(script: &str, cwd: &Path) -> ExecSpec {
         args: vec!["-c".into(), script.into()],
         cwd: cwd.to_path_buf(),
         env: (*env).clone(),
+        sandbox: None,
     }
 }
 
@@ -164,4 +171,75 @@ async fn unusable_root_fails_closed() {
         "{error}"
     );
     assert!(!marker.exists());
+}
+
+/// The real kernel boundary: a sandboxed command reads anywhere but writes only beneath
+/// `writable`. Without Landlock ABI 3 the spawn must fail closed instead.
+async fn sandbox_writes_only_beneath_writable(supervision: Supervision) {
+    // The denied directory must not sit beneath a granted path, so it lives in the
+    // target dir rather than the system temp dir (which may be `/tmp`).
+    let repo = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let local = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let writable = vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/dev/null"),
+        local.path().to_path_buf(),
+    ];
+    assert!(
+        !writable.iter().any(|dir| repo.path().starts_with(dir)),
+        "{:?} must lie outside the writable paths {writable:?}",
+        repo.path()
+    );
+    let in_tmp = PathBuf::from(format!("/tmp/axo-sandbox-{}", unique_name()));
+    let supervisor = ProcessSupervisor::new(supervision);
+    let run = |script: String| {
+        let mut spec = bash(&script, repo.path());
+        spec.sandbox = Some(Sandbox {
+            writable: writable.clone(),
+        });
+        let supervisor = supervisor.clone();
+        async move { supervisor.output(spec, None).await }
+    };
+
+    let denied = match run("touch x".into()).await {
+        Err(OutputError::Failed(error)) => {
+            assert!(
+                error.contains("read-only bash needs Linux Landlock"),
+                "{error}"
+            );
+            println!("supervisor: Landlock unavailable, sandbox fails closed: {error}");
+            assert!(!repo.path().join("x").exists());
+            return;
+        }
+        other => other.unwrap(),
+    };
+    assert!(!denied.status.success());
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+    assert!(!repo.path().join("x").exists());
+
+    for script in [
+        format!("touch {}", in_tmp.display()),
+        format!("touch {}/y", local.path().display()),
+        "echo hi > /dev/null".to_string(),
+    ] {
+        let output = run(script.clone()).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(in_tmp.exists());
+    assert!(local.path().join("y").exists());
+    std::fs::remove_file(&in_tmp).unwrap();
+}
+
+/// A name unique to this process and moment.
+fn unique_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
 }

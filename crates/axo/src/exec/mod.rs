@@ -2,6 +2,7 @@
 
 pub mod devshell;
 pub mod host;
+mod sandbox;
 pub mod supervisor;
 
 use std::collections::BTreeMap;

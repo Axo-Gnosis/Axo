@@ -5,7 +5,7 @@ mod common;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use axo::{HostTool, SessionTools, ToolFactory};
+use axo::{Exposure, HostTool, Session, SessionTools, ToolFactory};
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::{current_system_message, current_system_prompt};
@@ -59,6 +59,15 @@ fn declared(request: &RecordedRequest) -> Vec<String> {
         .into_iter()
         .map(|tool| tool.name)
         .collect()
+}
+
+/// The `Session::tools` entry named `name`.
+fn tool_info(session: &Session, name: &str) -> axo::SessionToolInfo {
+    session
+        .tools()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| panic!("{name} is listed"))
 }
 
 fn user_text(message: &Message) -> String {
@@ -345,6 +354,23 @@ async fn reading_tool_docs_promotes_only_on_native_tool_change_models() {
         let mut opts = options(dir.path());
         opts.tools = vec![deferred("probe")];
         let session = host.axo.create_session(opts).await.unwrap();
+        // Host inspection reads the same docs without promoting the tool.
+        let docs = session.schemes().exact("tool://probe").unwrap();
+        assert!(
+            session
+                .schemes()
+                .read(&docs)
+                .await
+                .unwrap()
+                .contains("Returns the supplied value.")
+        );
+        let read = tool_info(&session, "read");
+        assert_eq!(read.exposure, Exposure::Direct);
+        assert!(!read.promoted && read.allowed_in_mode);
+        let probe = tool_info(&session, "probe");
+        assert_eq!(probe.exposure, Exposure::Deferred);
+        assert!(!probe.promoted && probe.allowed_in_mode);
+        assert_eq!(probe.summary, "Returns the supplied value.");
         within(session.prompt("Read probe documentation and run it."))
             .await
             .unwrap();
@@ -383,6 +409,12 @@ async fn reading_tool_docs_promotes_only_on_native_tool_change_models() {
             }
         }
         assert!(successful_result(&requests[2], "invoke").contains("probe executed: birch"));
+        let probe = tool_info(&session, "probe");
+        assert_eq!(probe.exposure, Exposure::Deferred);
+        assert_eq!(
+            probe.promoted, native,
+            "only the model's read promotes, and only on native tool-change models"
+        );
         session.shutdown().await;
     }
 }

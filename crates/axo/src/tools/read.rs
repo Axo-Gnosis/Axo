@@ -96,6 +96,9 @@ impl Tool for ReadTool {
             }
             Located::Virtual { url } => {
                 let text = self.tools.schemes.read(&url).await?;
+                if url.scheme == "tool" && !url.path.is_empty() {
+                    self.tools.deferred.request(&url.path);
+                }
                 if cancel.is_cancelled() {
                     return Err(ToolError("Operation aborted".into()));
                 }

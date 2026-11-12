@@ -2,6 +2,7 @@
 //! Command execution and background delivery are shared with host tools through
 //! [`SessionTools::run_command`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use axo_ai::{ToolCall, UserBlock};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::exec::host::{ExecSpec, find_on_path};
+use crate::exec::host::{ExecSpec, Sandbox, find_on_path};
 use crate::jobs::command::{HEAD_BYTES, TAIL_BYTES};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use crate::tools::{CommandRequest, SessionTools};
@@ -150,11 +151,33 @@ impl Tool for BashTool {
         let bash = find_on_path("bash", &resolved.env, &tools.cwd)
             .ok_or_else(|| ToolError("bash not found on PATH".into()))?;
 
+        let mut env = (*resolved.env).clone();
+        let sandbox = if !tools.bash_access().is_full() {
+            // Writes stay possible only in scratch space: /tmp, the session's `local://`
+            // dir and an absolute `TMPDIR`.
+            let local = tools.schemes.context().session_dir.join("local");
+            tokio::fs::create_dir_all(&local)
+                .await
+                .map_err(|err| ToolError(format!("Cannot create {}: {err}", local.display())))?;
+            let mut writable = vec!["/tmp".into(), "/dev/null".into(), local];
+            if let Some(tmp) = env.get(std::ffi::OsStr::new("TMPDIR")).map(PathBuf::from)
+                && tmp.is_absolute()
+                && tmp.exists()
+            {
+                writable.push(tmp);
+            }
+            // `git status` would otherwise refresh `.git/index` under a lock file.
+            env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+            Some(Sandbox { writable })
+        } else {
+            None
+        };
         let spec = ExecSpec {
             program: bash,
             args: vec!["-c".into(), script.into_owned().into()],
             cwd: tools.cwd.clone(),
-            env: (*resolved.env).clone(),
+            env,
+            sandbox,
         };
         let result = tools
             .run_command(

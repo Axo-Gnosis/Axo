@@ -49,6 +49,7 @@ impl Tool for LateTool {
             args: vec!["-c".into(), "sleep 1; echo late".into()],
             cwd: tools.cwd.clone(),
             env: (*resolved.env).clone(),
+            sandbox: None,
         };
         tools
             .run_command(
@@ -61,6 +62,31 @@ impl Tool for LateTool {
                 },
             )
             .await
+    }
+}
+
+/// Runs until its call is cancelled.
+struct Hang;
+
+#[async_trait]
+impl Tool for Hang {
+    fn name(&self) -> &str {
+        "hang"
+    }
+
+    fn description(&self) -> &str {
+        "Waits until cancelled."
+    }
+
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: LazyLock<Value> =
+            LazyLock::new(|| json!({"type": "object", "properties": {}}));
+        &PARAMETERS
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        cx.cancel.cancelled().await;
+        Err(ToolError("Operation aborted".into()))
     }
 }
 
@@ -776,6 +802,13 @@ async fn retained_helpers_return_promptly_and_are_killable() {
                 json!({"id": "bg_1"}),
             )])),
             ScriptedTurn::Reply(reply_text("stopped it")),
+            // A retained helper delivers nothing, so no wake consumes a turn between runs.
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c4",
+                "kill",
+                json!({"id": "bg_1"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("already stopped")),
         ],
     )
     .await;
@@ -832,6 +865,31 @@ async fn retained_helpers_return_promptly_and_are_killable() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let lines = journal(&session);
+    let kill = only(&lines, "kill result", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "c3"
+    });
+    assert_eq!(
+        lines[kill]["message"]["details"],
+        json!({"id": "bg_1", "stopping": true})
+    );
+
+    // A never-promoted job leaves the registry once its container closes.
+    until(|| session.jobs().iter().all(|job| job.id != "bg_1")).await;
+    assert_eq!(
+        within(session.prompt("Stop it again.")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let entries = session.attach(None).await.missed;
+    assert_eq!(tool_text(&entries, "c4"), "bg_1 is not running.");
+    let lines = journal(&session);
+    let again = only(&lines, "second kill result", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "c4"
+    });
+    assert_eq!(
+        lines[again]["message"]["details"],
+        json!({"id": "bg_1", "stopping": false})
+    );
     session.shutdown().await;
 }
 
@@ -998,4 +1056,80 @@ async fn shutdown_interrupts_background_commands() {
             .await
             .contains("Command was interrupted when the session closed")
     );
+}
+
+#[tokio::test]
+async fn resume_wakes_delivers_results_an_abort_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (axo, api) = scripted(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "sleep 1; echo done", "async": true}),
+            )])),
+            ScriptedTurn::Reply(reply_tool_calls(&[("c2", "hang", json!({}))])),
+            ScriptedTurn::Reply(reply_text("it printed done")),
+        ],
+    )
+    .await;
+    let mut options = bash_options(dir.path());
+    let factory: ToolFactory =
+        Arc::new(|_: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Hang) });
+    options.tools = vec![axo::HostTool::direct(factory)];
+    let session = axo.create_session(options).await.unwrap();
+
+    // Abort while the hang tool runs; the background job is still pending then.
+    let mut events = session.attach(None).await.events;
+    let stop = async {
+        loop {
+            if let SessionEvent::Agent(AgentEvent::ToolExecutionStart { name, .. }) =
+                events.recv().await.unwrap()
+                && name == "hang"
+            {
+                session.abort();
+                return;
+            }
+        }
+    };
+    let (outcome, ()) = within(async { tokio::join!(session.prompt("start"), stop) }).await;
+    assert!(matches!(outcome.unwrap(), RunOutcome::Aborted(_)));
+    assert!(session.attach(None).await.live.auto_paused);
+
+    // The job ends while paused: nothing delivers it.
+    until(|| {
+        matches!(
+            session.jobs()[0].kind,
+            JobKind::Command { exit: Some(_), .. }
+        )
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(api.requests().len(), 2, "auto-pause holds the result");
+
+    let after = last_seq(&session).await;
+    let mut events = session.attach(None).await.events;
+    session.resume_wakes();
+    within(async {
+        loop {
+            if let SessionEvent::AutoPaused { paused } = events.recv().await.unwrap() {
+                assert!(!paused);
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(!session.attach(None).await.live.auto_paused);
+    await_run_end(&session, after).await;
+    let requests = api.requests();
+    assert_eq!(requests.len(), 3);
+    let users = user_texts(&requests[2]);
+    assert!(
+        users
+            .iter()
+            .any(|text| text.contains("Background job results:") && text.contains("done")),
+        "{users:#?}"
+    );
+    session.shutdown().await;
 }

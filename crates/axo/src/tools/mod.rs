@@ -22,6 +22,7 @@ pub(crate) mod write;
 use ignore::WalkBuilder;
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
+use crate::context::modes::BashAccess;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::jobs::command::CommandRunner;
@@ -67,6 +69,8 @@ pub struct SessionTools {
     /// Runs every local command in its own supervised container (process group or cgroup).
     pub supervisor: Arc<ProcessSupervisor>,
     pub(crate) runner: CommandRunner,
+    /// The effective scope's bash access, kept current by the session on every rescope.
+    pub(crate) read_only_bash: AtomicBool,
 }
 
 /// Builds a host tool for one session from that session's shared state (called again for
@@ -134,6 +138,16 @@ impl SessionTools {
             deferred,
             supervisor: runner.supervisor.clone(),
             runner,
+            read_only_bash: AtomicBool::new(false),
+        }
+    }
+
+    /// The bash access of the session's current scope (agent, mode and child ceiling).
+    pub fn bash_access(&self) -> BashAccess {
+        if self.read_only_bash.load(Ordering::Acquire) {
+            BashAccess::ReadOnly
+        } else {
+            BashAccess::Full
         }
     }
 

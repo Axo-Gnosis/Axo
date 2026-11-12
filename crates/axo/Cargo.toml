@@ -21,6 +21,7 @@ image.workspace = true
 indexmap.workspace = true
 jiff.workspace = true
 jsonschema.workspace = true
+landlock.workspace = true
 rand.workspace = true
 regex.workspace = true
 rustix.workspace = true

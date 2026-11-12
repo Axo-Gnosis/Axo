@@ -25,6 +25,7 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::exec::EnvMap;
+use crate::exec::sandbox::spawn_restricted;
 use crate::exec::supervisor::{self, CGROUP_MOUNT, RELEASE};
 
 /// How long a job's processes get between SIGTERM and SIGKILL.
@@ -87,6 +88,25 @@ pub struct ExecSpec {
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
     pub env: EnvMap,
+    /// Kernel-enforced write restriction for the command and its descendants;
+    /// `None` runs unrestricted.
+    pub sandbox: Option<Sandbox>,
+}
+
+/// The command may read and execute anywhere but write only beneath `writable`
+/// (missing paths are skipped). Enforced with Linux Landlock ABI 3 (Linux 6.2+);
+/// without it, spawning fails.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sandbox {
+    pub writable: Vec<PathBuf>,
+}
+
+/// Spawns `command`, under `sandbox` when one is set.
+fn start(mut command: Command, sandbox: Option<&Sandbox>) -> Result<Child, String> {
+    match sandbox {
+        None => command.spawn().map_err(|err| err.to_string()),
+        Some(sandbox) => spawn_restricted(sandbox, move || command.spawn()),
+    }
 }
 
 /// Runs every local command in its own container, as selected by [`Supervision`]:
@@ -231,17 +251,17 @@ fn probe(cgroup_root: Option<&Path>) -> Result<PathBuf, String> {
 /// `Process` owns the group, so cancellation cannot leak anything.
 fn spawn_group(spec: ExecSpec) -> Result<Process, String> {
     let failed = |err: String| format!("Failed to start {}: {err}", spec.program.display());
-    let mut root = Command::new(&spec.program)
-        .args(&spec.args)
+    let mut root = Command::new(&spec.program);
+    root.args(&spec.args)
         .current_dir(&spec.cwd)
         .env_clear()
         .envs(&spec.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|err| failed(err.to_string()))?;
+        .process_group(0);
+    // Only the command is sandboxed; the guard below is axo's own and stays unrestricted.
+    let mut root = start(root, spec.sandbox.as_ref()).map_err(failed)?;
     let Some(pgid) = root
         .id()
         .and_then(|id| i32::try_from(id).ok())
@@ -329,8 +349,8 @@ async fn spawn_cgroup(
     // The supervisor inherits axo's own (trusted) environment, which a host
     // executable may need to start at all. The command environment travels over
     // stdin and is applied only after cgroup entry, at `exec`.
-    let root = Command::new(program)
-        .args(args)
+    let mut root = Command::new(program);
+    root.args(args)
         .arg("enter")
         .arg(&dir)
         .arg(&spec.program)
@@ -342,8 +362,15 @@ async fn spawn_cgroup(
         .process_group(0)
         // Before it reads its environment to EOF the root is outside the cgroup, so
         // only a direct kill reaches it.
-        .kill_on_drop(true)
-        .spawn();
+        .kill_on_drop(true);
+    // `enter` itself runs sandboxed and must still write its job's `cgroup.procs`;
+    // the guardian stays unrestricted.
+    let sandbox = spec.sandbox.as_ref().map(|sandbox| {
+        let mut writable = sandbox.writable.clone();
+        writable.push(dir.clone());
+        Sandbox { writable }
+    });
+    let root = start(root, sandbox.as_ref());
     let mut root = match root {
         Ok(root) => root,
         Err(err) => {

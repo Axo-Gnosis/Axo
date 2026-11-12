@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::context::markdown::{self, name_problems, split_frontmatter};
+use crate::context::markdown::{self, derived_name, namespaced_name_problems, split_frontmatter};
 use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
 
 /// One discovered skill.
@@ -78,8 +78,10 @@ pub fn load_skills(
 }
 
 /// Every `SKILL.md` under `root`. A directory holding one is a skill root and is not
-/// descended further; dotfiles, `node_modules` and `.gitignore`/`.ignore`/`.fdignore`
-/// matches are skipped, and symlinks are followed.
+/// descended further, so skills never nest; dotfiles, `node_modules` and
+/// `.gitignore`/`.ignore`/`.fdignore` matches are skipped, and symlinks are followed.
+/// A skill without a frontmatter `name` takes its directory's root-relative path joined
+/// by `:` (`plan/roadmap/SKILL.md` → `plan:roadmap`).
 fn load_skills_from_dir(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<Skill> {
     if !root.is_dir() {
         return Vec::new();
@@ -91,11 +93,11 @@ fn load_skills_from_dir(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<S
     walker
         .flatten()
         .filter(|entry| entry.file_name() == "SKILL.md" && entry.path().is_file())
-        .filter_map(|entry| load_skill_file(entry.path(), diagnostics))
+        .filter_map(|entry| load_skill_file(root, entry.path(), diagnostics))
         .collect()
 }
 
-fn load_skill_file(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<Skill> {
+fn load_skill_file(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<Skill> {
     let mut warn = |message: String| {
         diagnostics.push(Diagnostic {
             origin: Some(DiagnosticOrigin::Path(path.to_path_buf())),
@@ -139,13 +141,9 @@ fn load_skill_file(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<Ski
         .and_then(serde_norway::Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            path.parent()
-                .and_then(Path::file_name)
-                .map(|dir| dir.to_string_lossy().into_owned())
-        })
+        .or_else(|| path.parent().map(|dir| derived_name(root, dir)))
         .unwrap_or_default();
-    for problem in name_problems(&name) {
+    for problem in namespaced_name_problems(&name) {
         warn(problem);
     }
 

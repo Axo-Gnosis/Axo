@@ -1032,3 +1032,391 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
         "rejected spawns must not admit children"
     );
 }
+
+mod keywords {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use axo::context::keywords::{KeywordMatch, KeywordSpec};
+    use axo::{Command, Entry, PromptPart, Session, SessionOptions};
+    use axo_agent::RunOutcome;
+    use axo_ai::testing::{RecordedRequest, reply_text};
+    use axo_ai::{Message, ScriptedTurn, UserBlock};
+    use serde_json::{Value, json};
+
+    use crate::common::{self, Host, delivered, entry, options, request, until, within};
+
+    const BLOCK: &str = "<keyword name=\"orchestrate\">\nDelegate.\n</keyword>";
+
+    fn orchestrate() -> KeywordSpec {
+        KeywordSpec {
+            name: "orchestrate".into(),
+            model: Some("@conduct".into()),
+            requires_tools: vec!["spawn".into()],
+            body: "Delegate.".into(),
+            ..Default::default()
+        }
+    }
+
+    fn keyword_options(dir: &Path, keyword: KeywordSpec) -> SessionOptions {
+        SessionOptions {
+            keywords: vec![keyword],
+            ..options(dir)
+        }
+    }
+
+    /// A host with models `m`, `c` and `child`, the `conduct` role on `test/c`, and `extra`
+    /// merged into the settings.
+    async fn keyword_host(dir: &Path, extra: Value, turns: Vec<ScriptedTurn>) -> Host {
+        let mut settings = json!({"modelRoles": {"conduct": "test/c"}});
+        for (key, value) in extra.as_object().unwrap() {
+            settings[key] = value.clone();
+        }
+        common::host(
+            dir,
+            json!([{"id":"m"},{"id":"c"},{"id":"child"}]),
+            settings,
+            turns,
+        )
+        .await
+    }
+
+    fn texts(content: &[UserBlock]) -> Vec<String> {
+        content
+            .iter()
+            .filter_map(UserBlock::as_text)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every user message of `request`, as its text blocks.
+    fn users(request: &RecordedRequest) -> Vec<Vec<String>> {
+        request
+            .transcript
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(texts(&user.content)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn keyword_blocks(request: &RecordedRequest) -> usize {
+        users(request)
+            .iter()
+            .flatten()
+            .filter(|text| text.starts_with("<keyword"))
+            .count()
+    }
+
+    /// Journal positions of `model_change` entries selecting `test/c`.
+    fn conduct_changes(lines: &[Value]) -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line["type"] == "model_change" && line["modelId"] == "c")
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn run_ends(session: &Session) -> usize {
+        common::journal(session)
+            .iter()
+            .filter(|line| line["type"] == "run_end")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn typed_keywords_select_the_model_before_the_run_and_join_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = keyword_host(
+            dir.path(),
+            json!({}),
+            vec![ScriptedTurn::Reply(reply_text("ok")); 3],
+        )
+        .await;
+        let session = host
+            .axo
+            .create_session(keyword_options(dir.path(), orchestrate()))
+            .await
+            .unwrap();
+        assert_eq!(session.keywords().len(), 1);
+        assert_eq!(
+            session
+                .keyword_matches("please orchestrate this, not `orchestrate` or foo/orchestrate"),
+            [KeywordMatch {
+                name: "orchestrate".into(),
+                range: 7..18,
+            }]
+        );
+
+        assert_eq!(
+            within(session.prompt("orchestrate the fix")).await.unwrap(),
+            RunOutcome::Done
+        );
+        let requests = host.api.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].model.id, "c",
+            "the keyword's model runs the turn"
+        );
+        assert_eq!(
+            users(&requests[0]).last().unwrap(),
+            &["orchestrate the fix", BLOCK]
+        );
+        let lines = common::journal(&session);
+        let submission = common::only(&lines, "submission", |line| line["type"] == "submission");
+        assert_eq!(
+            serde_json::from_value::<Vec<PromptPart>>(lines[submission]["parts"].clone()).unwrap(),
+            [PromptPart::Text {
+                text: "orchestrate the fix".into()
+            }],
+            "the submission keeps the typed parts"
+        );
+        let changes = conduct_changes(&lines);
+        let first_reply = lines
+            .iter()
+            .position(|line| line["type"] == "message" && line["message"]["role"] == "assistant")
+            .unwrap();
+        assert!(
+            matches!(changes.as_slice(), [change] if submission < *change && *change < first_reply),
+            "one model change between the submission and the reply: {changes:?}"
+        );
+
+        // Steers and follow-ups on an idle root fire the same way.
+        let back = || Command::Model {
+            model: "test/m".into(),
+        };
+        session.run_command(back()).await.unwrap();
+        within(session.steer("now orchestrate")).await.unwrap();
+        until(|| run_ends(&session) == 2).await;
+        session.run_command(back()).await.unwrap();
+        within(session.follow_up("orchestrate again"))
+            .await
+            .unwrap();
+        until(|| run_ends(&session) == 3).await;
+        let requests = host.api.requests();
+        assert_eq!(requests.len(), 3);
+        for (request, text) in requests[1..]
+            .iter()
+            .zip(["now orchestrate", "orchestrate again"])
+        {
+            assert_eq!(request.model.id, "c");
+            assert_eq!(users(request).last().unwrap(), &[text, BLOCK]);
+        }
+        assert_eq!(conduct_changes(&common::journal(&session)).len(), 3);
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_keyword_steers_keep_their_block_across_requeue_without_reselecting() {
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = keyword_host(
+                dir.path(),
+                json!({}),
+                vec![
+                    ScriptedTurn::HangUntilCancel,
+                    ScriptedTurn::Reply(reply_text("one")),
+                    ScriptedTurn::Reply(reply_text("two")),
+                ],
+            )
+            .await;
+            let mut session = host
+                .axo
+                .create_session(keyword_options(dir.path(), orchestrate()))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
+                    .await
+                    .is_err(),
+                "the first run hangs until cancelled"
+            );
+            within(session.steer("orchestrate later")).await.unwrap();
+            entry(
+                &session,
+                |entry| matches!(entry, Entry::ModelChange { model_id, .. } if model_id == "c"),
+            )
+            .await;
+            session.abort();
+            entry(&session, |entry| {
+                matches!(
+                    entry,
+                    Entry::RunEnd {
+                        outcome: axo::RunOutcome::Aborted,
+                        ..
+                    }
+                )
+            })
+            .await;
+            if reopen {
+                let path = session.path().to_path_buf();
+                session.shutdown().await;
+                drop(session);
+                // No `model` override: the reopened session keeps its journaled model.
+                session = host
+                    .axo
+                    .open_session(
+                        &path,
+                        SessionOptions {
+                            model: None,
+                            ..keyword_options(dir.path(), orchestrate())
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                within(session.prompt("answer now")).await.unwrap(),
+                RunOutcome::Done
+            );
+            let requests = host.api.requests();
+            let last = requests.last().unwrap();
+            assert_eq!(last.model.id, "c", "reopen = {reopen}");
+            let steer: Vec<_> = users(last)
+                .into_iter()
+                .filter(|texts| {
+                    texts
+                        .first()
+                        .is_some_and(|text| text == "orchestrate later")
+                })
+                .collect();
+            assert_eq!(steer, [["orchestrate later", BLOCK]], "reopen = {reopen}");
+            assert_eq!(
+                conduct_changes(&common::journal(&session)).len(),
+                1,
+                "requeued input is not re-selected; reopen = {reopen}"
+            );
+            session.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unavailable_keywords_never_fire() {
+        let missing_tool = KeywordSpec {
+            requires_tools: vec!["no_such_tool".into()],
+            ..orchestrate()
+        };
+        for (settings, keyword) in [
+            (
+                json!({"keywords": {"disabled": ["orchestrate"]}}),
+                orchestrate(),
+            ),
+            (json!({"keywords": {"enabled": false}}), orchestrate()),
+            (json!({}), missing_tool),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = keyword_host(
+                dir.path(),
+                settings.clone(),
+                vec![ScriptedTurn::Reply(reply_text("ok"))],
+            )
+            .await;
+            let session = host
+                .axo
+                .create_session(keyword_options(dir.path(), keyword))
+                .await
+                .unwrap();
+            assert_eq!(
+                session.keywords().len(),
+                1,
+                "inactive definitions stay listed"
+            );
+            assert!(
+                session.keyword_matches("orchestrate the fix").is_empty(),
+                "{settings}"
+            );
+            within(session.prompt("orchestrate the fix")).await.unwrap();
+            let requests = host.api.requests();
+            assert_eq!(requests[0].model.id, "m", "{settings}");
+            assert_eq!(
+                users(&requests[0]).last().unwrap(),
+                &["orchestrate the fix"],
+                "{settings}"
+            );
+            assert!(
+                conduct_changes(&common::journal(&session)).is_empty(),
+                "{settings}"
+            );
+            session.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn only_typed_root_text_fires_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("skills").join("orchestrate");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\ndescription: Orchestrate work\n---\nPlease orchestrate everything.\n",
+        )
+        .unwrap();
+        let host = keyword_host(
+            dir.path(),
+            json!({}),
+            vec![ScriptedTurn::Reply(reply_text("ok")); 8],
+        )
+        .await;
+        host.api
+            .lane("child", vec![ScriptedTurn::Reply(reply_text("done")); 2]);
+        let session = host
+            .axo
+            .create_session(keyword_options(dir.path(), orchestrate()))
+            .await
+            .unwrap();
+
+        // Quiet host text, pasted text, and a skill's command token and expanded body.
+        within(session.post(axo::HostMessage {
+            custom_type: "host-note".into(),
+            text: "orchestrate the fix".into(),
+            display: false,
+            delivery: axo::HostDelivery::Quiet,
+        }))
+        .await
+        .unwrap();
+        within(session.prompt("go")).await.unwrap();
+        within(session.prompt(vec![PromptPart::Paste {
+            text: "orchestrate the fix".into(),
+        }]))
+        .await
+        .unwrap();
+        assert!(session.keyword_matches("/orchestrate go").is_empty());
+        within(session.prompt("/orchestrate go")).await.unwrap();
+        assert!(
+            users(host.api.requests().last().unwrap())
+                .iter()
+                .flatten()
+                .any(|text| text.contains("Please orchestrate everything.")),
+            "the skill expanded"
+        );
+
+        // Children never fire keywords, neither from their task nor from steers.
+        let handle = session
+            .spawn(request("orchestrate the task"))
+            .await
+            .unwrap();
+        handle.session.steer("orchestrate more").await.unwrap();
+        delivered(&session, &handle.job).await;
+        assert!(handle.session.keywords().is_empty());
+        assert!(
+            handle
+                .session
+                .keyword_matches("orchestrate more")
+                .is_empty()
+        );
+        assert!(conduct_changes(&common::journal(&handle.session)).is_empty());
+
+        let requests = host.api.requests();
+        assert!(requests.iter().any(|request| request.model.id == "child"));
+        for request in &requests {
+            assert_eq!(keyword_blocks(request), 0, "{:?}", users(request));
+            assert_ne!(request.model.id, "c");
+        }
+        assert!(conduct_changes(&common::journal(&session)).is_empty());
+        session.shutdown().await;
+    }
+}

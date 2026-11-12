@@ -4,9 +4,10 @@ use axo_agent::{AgentMessage, Tool};
 use axo_ai::{Message, TranscriptToolSupport, UserBlock};
 use serde_json::json;
 
-use super::{SessionHooks, journal};
+use super::{SessionHooks, SessionToolInfo, journal};
 use crate::error::Error;
 use crate::store::Entry;
+use crate::tools::Exposure;
 use crate::tools::deferred::summary;
 use crate::tools::output::YIELD;
 
@@ -54,6 +55,45 @@ impl SessionHooks {
             }
         }
         tools
+    }
+
+    /// Direct tools, then catalog tools not already direct; never requests a promotion.
+    pub(super) fn tool_infos(&self) -> Vec<SessionToolInfo> {
+        let direct = self
+            .prompt
+            .shape
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .tools
+            .clone();
+        let catalog = self.catalog();
+        let promoted = self
+            .promoted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mode = self.effective_mode();
+        let deferred = catalog
+            .iter()
+            .filter(|tool| !direct.iter().any(|entry| entry.name() == tool.name()));
+        direct
+            .iter()
+            .map(|tool| (tool, Exposure::Direct))
+            .chain(deferred.map(|tool| (tool, Exposure::Deferred)))
+            .map(|(tool, exposure)| {
+                let name = tool.name();
+                SessionToolInfo {
+                    name: name.to_owned(),
+                    summary: summary(tool.as_ref()),
+                    description: tool.description().to_owned(),
+                    parameters: tool.parameters().clone(),
+                    exposure,
+                    promoted: promoted.iter().any(|entry| entry == name),
+                    allowed_in_mode: name == YIELD
+                        || mode.as_ref().is_none_or(|mode| mode.tools.permits(name)),
+                }
+            })
+            .collect()
     }
 
     pub(super) fn install_tools(&self) {

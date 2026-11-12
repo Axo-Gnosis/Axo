@@ -24,11 +24,12 @@ pub use config::{
     PromptOverride, RetrySettings, Settings, SubagentSettings, SummaryRequest, UserConfig,
 };
 pub use context::agents::{AgentSpec, RunAs};
-pub use context::modes::{ModeResult, ModeSpec, ToolLimits};
+pub use context::keywords::{KeywordMatch, KeywordSettings, KeywordSpec};
+pub use context::modes::{BashAccess, ModeResult, ModeSpec, ToolLimits};
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
-pub use exec::host::{OutputError, ProcessSupervisor, Supervision};
+pub use exec::host::{OutputError, ProcessSupervisor, Sandbox, Supervision};
 pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
 pub use jobs::{
@@ -39,9 +40,9 @@ pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     Attach, ChildHandle, ContextUsage, Fork, HostDelivery, HostMessage, InlineSpec, LiveSnapshot,
     MaintenanceKind, NavigateOptions, PendingResult, PromptRequest, PromptResult, RecoveryPolicy,
-    Session, SessionEvent, SessionOptions, ShakeMode, SpawnContext, SpawnDecision, SpawnHook,
-    SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy,
-    ToolScope,
+    ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode,
+    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle,
+    TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,

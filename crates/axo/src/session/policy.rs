@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::SessionHooks;
 use crate::context::agents::AgentSpec;
-use crate::context::modes::ModeSpec;
+use crate::context::modes::{BashAccess, ModeSpec};
 use crate::tools::output::YIELD;
 
 /// The session a tool call runs in, as host policies see it.
@@ -22,6 +23,24 @@ pub struct ToolScope {
     pub agent: Option<AgentSpec>,
     /// The mode in effect for this call.
     pub mode: Option<Arc<ModeSpec>>,
+    /// Effective bash access: `ReadOnly` when `agent`, `mode`, or the spawn ceiling is.
+    pub bash: BashAccess,
+}
+
+/// `ReadOnly` when any of the agent, the mode, or the inherited ceiling is.
+pub(super) fn effective_bash(
+    agent: Option<&AgentSpec>,
+    mode: Option<&ModeSpec>,
+    ceiling: BashAccess,
+) -> BashAccess {
+    if !ceiling.is_full()
+        || agent.is_some_and(|agent| !agent.bash.is_full())
+        || mode.is_some_and(|mode| !mode.bash.is_full())
+    {
+        BashAccess::ReadOnly
+    } else {
+        BashAccess::Full
+    }
 }
 
 /// Ordered host tool policy, with the session's persona and effective mode.
@@ -113,17 +132,40 @@ impl ToolHooks for ModeGate {
 }
 
 impl SessionHooks {
+    /// This session's effective bash access; children spawned now inherit it as their ceiling.
+    pub(super) fn bash_with(&self, mode: Option<&ModeSpec>) -> BashAccess {
+        let child = self.child.as_ref().map(|child| &child.link);
+        let agent = self
+            .agent_spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        effective_bash(
+            agent.as_ref().or(child.map(|link| &link.spec)),
+            mode,
+            child.map_or(BashAccess::Full, |link| link.bash),
+        )
+    }
+
     pub(super) fn rescope(&self) {
+        let link = self.child.as_ref().map(|child| &child.link);
+        let mode = self.effective_mode();
+        let bash = self.bash_with(mode.as_deref());
         let scope = ToolScope {
             session_id: self.session_id.clone(),
-            depth: self.child.as_ref().map_or(0, |child| child.link.depth),
+            depth: link.map_or(0, |link| link.depth),
             agent: self
                 .agent_spec
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
-            mode: self.effective_mode(),
+                .clone()
+                .or_else(|| link.map(|link| link.spec.clone())),
+            mode,
+            bash,
         };
-        *self.scope.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(scope);
+        let mut current = self.scope.lock().unwrap_or_else(PoisonError::into_inner);
+        self.tools
+            .read_only_bash
+            .store(!bash.is_full(), Ordering::Release);
+        *current = Arc::new(scope);
     }
 }

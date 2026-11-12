@@ -13,19 +13,20 @@ Start-time diagnostics for context files, skills, agent and mode definitions, to
 | # | Section | Source |
 | :--- | :--- | :--- |
 | 1 | `delegation` | Children only: fixed bundled `crates/axo/prompts/DELEGATION.md`; always first, not overridable or removable |
-| 2 | `system` | Non-empty selected agent body, else `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
-| 3 | `docs` | `"<name>'s documentation, including how to extend it: <name>://README.md"` (`name` defaults to `axo`; materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
-| 4 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the direct tools in the prompt shape, formatted as `- {rule}` bullets; deferred-tool promotions do not add guidelines here |
-| 5 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
-| 6 | `work` | `WORK` override (no bundled default; omitted unless provided) |
-| 7 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
-| 8 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
-| 9 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
-| 10 | `team` | Team members only: fixed identity, charter, member brief, ordered roster and messaging guidance |
-| 11 | `cwd` | `sources.cwd.display()` |
-| 12 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
-| 13 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
-| 14 | `<host sections>` | Entries from `SessionOptions::sections`, as later changed by `Session::set_section`: `Some(body)` inserts or replaces in place, `None` removes the section; children inherit the parent's live host sections at spawn |
+| 2 | `system` | `SYSTEM` override, else bundled `crates/axo/prompts/SYSTEM.md` |
+| 3 | `agent` | Trimmed, non-empty body of the root persona or the child's resolved spec; omitted when there is none |
+| 4 | `docs` | `"<name>'s documentation, including how to extend it: <name>://README.md"` (`name` defaults to `axo`; materialized from the bundled docs; only when the host set `AxoBuilder::cache_dir`) |
+| 5 | `tools` | Deduplicated, trimmed `Tool::prompt_guidelines()` from the direct tools in the prompt shape, formatted as `- {rule}` bullets; deferred-tool promotions do not add guidelines here |
+| 6 | `schemes` | URL path guidance and one bullet per scheme's non-empty prompt documentation |
+| 7 | `work` | `WORK` override (no bundled default; omitted unless provided) |
+| 8 | `prose` | `PROSE` override, else bundled `crates/axo/prompts/PROSE.md` |
+| 9 | `project_context` | `<project_instructions path="…">\n{content}\n</project_instructions>` blocks joined by `\n\n` |
+| 10 | `skills` | Skill catalog with `skill://<name>` locations when `read` or `bash` is active and at least one skill has `disable_model_invocation == false` |
+| 11 | `team` | Team members only: fixed identity, charter, member brief, ordered roster and messaging guidance |
+| 12 | `cwd` | `sources.cwd.display()` |
+| 13 | `dev_shell` | Trimmed `Resolved::prompt_note` from the active `ExecEnv` (`"Commands run inside the Nix dev shell of {dir}; its tools are already on PATH."`). Direnv and host environments add no note |
+| 14 | `date` | Local date formatted as `%Y-%m-%d`, refreshed when a prompt runs on a new day |
+| 15 | `<host sections>` | Entries from `SessionOptions::sections`, as later changed by `Session::set_section`: `Some(body)` inserts or replaces in place, `None` removes the section; children inherit the parent's live host sections at spawn |
 
 The fixed child sections are inserted after overrides: `delegation` first, and `team` immediately before `cwd` (at the end if `cwd` is absent). An agent's section switches cannot remove them.
 
@@ -53,7 +54,7 @@ The name `call` is always reserved for the dispatcher: host direct or deferred t
 
 Before a request, changes in deferred names are announced as a persisted, non-display `tool_catalog` custom message with `details.added` and `details.removed` name arrays. Reconciliation folds additions and removals from **all surviving catalog notices in projection order**, rather than using a latest-notice snapshot, then compares that announced set with the current catalog. It lists additions with summaries and removed names, rather than changing the system prompt. Summaries use the first non-blank description line, remove control characters and stop at 200 characters; the announcement explicitly treats summaries as descriptions, not instructions. Changes to descriptions alone do not produce a name-change announcement.
 
-The reserved, read-only `tool://` scheme lists the current deferred catalog, including tools already promoted to direct declarations. An empty catalog reads `No deferred tools.`. `read tool://<name>` returns the full description, guidelines, JSON Schema, and a `call` example; an unknown name reports `No deferred tool named <name>; read tool:// to list them.`. Writes fail with `tool:// is read-only; run a deferred tool with call.`. Reading a named tool also requests promotion; merely listing the catalog does not.
+The reserved, read-only `tool://` scheme lists the current deferred catalog, including tools already promoted to direct declarations. An empty catalog reads `No deferred tools.`. `read tool://<name>` returns the full description, guidelines, JSON Schema, and a `call` example; an unknown name reports `No deferred tool named <name>; read tool:// to list them.`. Writes fail with `tool:// is read-only; run a deferred tool with call.`. Only the model's `read` tool requests promotion, and only after it successfully reads a named tool; listing the catalog does not. Reading the scheme itself has no side effects, so hosts can inspect `tool://` through `Session::schemes` (or list tools with `Session::tools`) without promoting anything.
 
 Use `call {"tool":"name","args":{…}}`: `tool` is required and `args` is an optional object defaulting to `{}`. Routing resolves against the effective direct and deferred tools, retaining the original call id while using the target name and arguments for execution and results (see [Implementing `axo_agent::Tool`](extending.md#implementing-axo_agenttool) for routing identity). A missing target fails with `Tool <name> not found`; `call` is not an allowlist bypass. Dispatch is one hop, not recursive.
 
@@ -145,8 +146,9 @@ Review the code for correctness and report actionable findings.
 | `sections` | Section-name-to-boolean map: `false` removes that section; `true` changes nothing. Names follow the [host section rule](#host-section-validation); invalid names are diagnosed and removed. Host sections (`SessionOptions::sections` / `Session::set_section`, inherited by children) can restore removed sections (appended after core sections rather than returning to their original position); children's fixed `delegation` and `team` sections cannot be removed |
 | `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. For children, defines the result returned through `yield`; ignored for root sessions |
 | `maxTurns` | Model requests per child run before the wrap-up turn; omitted uses `subagents.maxTurns` (default 50). Ignored for root sessions. The tool list stays unchanged; budget enforcement blocks calls through an internal hook, except `yield` |
+| `bash` | `full` (default) or `readOnly`. `readOnly` runs every `bash` command of a root persona or child using this definition under the [read-only bash](#read-only-bash) filesystem restriction |
 
-The trimmed body replaces the `system` section when non-empty; an empty body keeps the configured or bundled `SYSTEM`. Agent bodies are used verbatim, without harness-name substitution, and do not change `WORK`, `PROSE`, or summarizer prompt overrides.
+The trimmed body becomes the `agent` section, placed right after `system`; the `system` section keeps the configured or bundled `SYSTEM` either way, and an empty body omits `agent`. Like any core section, `sections: { agent: false }` removes it. Agent bodies are used verbatim, without harness-name substitution, and do not change `SYSTEM`, `WORK`, `PROSE`, or summarizer prompt overrides. The `agent` tag belongs to the protected wrapper set escaped in deliveries.
 
 Unreadable files, malformed frontmatter, invalid names or schemas, and collisions produce `Diagnostic` entries and skip the affected definition. Unknown frontmatter keys produce diagnostics but keep an otherwise valid definition; the compatibility keys `blocking`, `spawns`, and `thinkingLevel` are silently ignored. Programmatic specs receive the same name, section, schema, and collision checks, and their bodies are trimmed. File diagnostics carry `DiagnosticOrigin::Path`; programmatic diagnostics have no origin and name the agent in the message.
 
@@ -156,11 +158,13 @@ Unreadable files, malformed frontmatter, invalid names or schemas, and collision
 
 `SessionOptions::agents: Vec<AgentSpec>` adds definitions supplied in code; the public types live in `axo::context::agents`, and `AgentSpec` and `RunAs` are also re-exported from `axo`. `Session::agents() -> &[AgentDef]` exposes the loaded agent and team catalog. Forks inherit the live persona and catalog. On reopen, pass programmatic definitions and host sections/tools again; these are host inputs, not serialized definitions.
 
-`Axo::catalog(cwd, project_access, agents, modes)` takes the working directory, optional project access, an agent-spec slice and a mode-spec slice. It resolves the same configuration and definitions without creating a session, performs blocking file I/O, and returns `Result<Catalog, Error>` with `Catalog { config, agents, modes, diagnostics }`; modes are shared `Arc<ModeSpec>` values and model roles live in `config.settings.model_roles`.
+`AgentSpec::parse(default_name, markdown) -> (Option<AgentSpec>, Vec<Diagnostic>)` parses an agent definition from markdown text through the same parser as agent files, so hosts can `include_str!` bundled definitions and pass them through `SessionOptions::agents` or `Axo::catalog`. `default_name` is used only when frontmatter has no `name` key; an explicit empty `name` is invalid (agent files instead treat it as absent and use the file stem). A team definition (frontmatter `members`) returns `None` with only the diagnostic `team definitions load only from agent roots`, checked before any other key or name validation. Otherwise validation happens during the `parse` call: missing frontmatter (`missing YAML frontmatter`; agent files without frontmatter are skipped silently instead), malformed YAML, non-mapping frontmatter, mistyped fields, invalid names and invalid output schemas return `None` with diagnostics; unknown keys and invalid section names produce diagnostics but keep the spec, minus the bad sections. The spec has no `path`, and diagnostics have no origin. Only name collisions are left to loading; because file roots load before programmatic specs and the first name wins, a user or project agent file with the same name overrides a bundled definition.
+
+`Axo::catalog(cwd, project_access, agents, modes, keywords)` takes the working directory, optional project access, and agent-spec, mode-spec and keyword-spec slices. It resolves the same configuration and definitions without creating a session, performs blocking file I/O, and returns `Result<Catalog, Error>` with `Catalog { config, agents, modes, keywords, diagnostics }`; modes and keywords are shared `Arc<ModeSpec>` / `Arc<KeywordSpec>` values, diagnostics from every loader are merged, and model roles live in `config.settings.model_roles`.
 
 ### Child prompts
 
-`Session::spawn` and the model's `spawn` tool select a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask`, `yield`, `call`, and `enter_mode`, but does not copy the parent's agent body or transcript: an empty child body uses the inherited `SYSTEM` override or bundled default. Inline tool lists must be subsets of the parent's available tools excluding those four tools. Named agents use their own allowlists over built-in and host tools. The child's own surface adds required `yield` and `call` under the normal rules; it does not inherit the parent's dispatcher or mode-entry tool.
+`Session::spawn` and the model's `spawn` tool select a catalog agent, an `InlineSpec`, or a plain delegate. A plain delegate keeps the parent's available tools except `ask`, `yield`, `call`, and `enter_mode`, but does not copy the parent's agent body or transcript: its `system` section is the inherited `SYSTEM` override or bundled default, and with an empty body it has no `agent` section. Inline tool lists must be subsets of the parent's available tools excluding those four tools. Named agents use their own allowlists over built-in and host tools. The child's own surface adds required `yield` and `call` under the normal rules; it does not inherit the parent's dispatcher or mode-entry tool.
 
 A named agent with `runAs: root` fails spawning with `Error::AgentNotSubagent`. Team definitions referencing one are dropped with a root-only-member diagnostic.
 
@@ -206,6 +210,8 @@ Modes add root-session instructions and call-time tool limits without replacing 
 
 `load_modes` recursively walks roots in sorted file-name order with the shared skill/agent hidden-file, ignore and symlink rules, loading `*.md` files. Missing roots and files without leading YAML frontmatter are skipped; an empty frontmatter block is valid. Canonical paths are deduplicated. Files precede programmatic specs, and the first mode name wins. Modes have their own namespace, separate from agents and teams.
 
+A mode file without a frontmatter `name` takes its path relative to its root, with directories joined by `:` and the `.md` extension dropped: `plan.md` is `plan`, and `plan/roadmap.md` is `plan:roadmap`. The derived name is selected and listed like any other, so `/plan:roadmap go` parses to `Command::Mode { name: "plan:roadmap", prompt: Some("go") }`.
+
 ```markdown
 ---
 name: plan
@@ -220,23 +226,26 @@ result:
   schema: {type: string}
   review: true
   then: Implement the approved plan.
-bash: read-only
+bash: readOnly
 ---
 Produce a concrete plan.
 ```
 
 | Key | Stored meaning |
 | :--- | :--- |
-| `name` | Defaults to the file stem when omitted or empty; same strict name rules as agent definitions |
+| `name` | Defaults to the name derived from the file's path (above) when omitted or empty. Mode names are namespaced: at most 64 characters in total, split on `:` into non-empty segments, each following the agent-definition character and hyphen rules (lowercase ASCII letters, digits, and hyphens; no leading, trailing, or consecutive hyphens). Violations drop the definition |
 | `description` | Optional listing text, default empty |
 | `argument-hint` | Optional string copied into command metadata |
 | `disable-model-invocation` | Boolean, default false; true excludes the mode from `enter_mode`, without affecting host selection or command listing |
 | `model` | Optional model selector, resolved on selection rather than during definition loading; mode-owned model/thinking changes can be restored on exit |
 | `tools` | `ToolLimits`: optional `allow` list and `deny` list (default empty). `ToolLimits::permits` requires membership in `allow` when set, and always rejects names in `deny`; omitted allow permits any name not denied, empty allow permits none |
 | `result` | Optional `ModeResult`; when present, `schema` defaults to a string JSON Schema, `review` to false, and `then` to no continuation text. Mounts a deferred `yield` while the mode is effective; review waits for the host before acceptance ends the mode |
+| `bash` | `full` (default) or `readOnly`. `readOnly` puts the root's `bash` under the [read-only bash](#read-only-bash) restriction while the mode is effective, from the next request boundary like tool limits, and becomes a sticky ceiling for children spawned under it |
 | Other keys | Preserved in `ModeSpec::extra` as host policy data, without unknown-key diagnostics |
 
-Bodies are trimmed and file definitions retain their path. Unreadable files, malformed frontmatter, invalid names, invalid result schemas, built-in command names and duplicate mode names produce diagnostics and skip the definition. Programmatic specs receive the same validation and body trimming. File diagnostics have `DiagnosticOrigin::Path`; programmatic diagnostics have no origin and identify the mode. Result schemas are compiled for validity at load time.
+Bodies are trimmed and file definitions retain their path. Unreadable files, malformed frontmatter, invalid names, invalid result schemas, built-in command names and duplicate mode names produce diagnostics and skip the definition. Programmatic specs receive the same validation and body trimming. File diagnostics have `DiagnosticOrigin::Path`; programmatic diagnostics have no origin and identify the mode. Result schemas are compiled for validity when a definition is parsed (file loading or `ModeSpec::parse`) and again when a programmatic spec is loaded.
+
+`ModeSpec::parse(default_name, markdown) -> (Option<ModeSpec>, Vec<Diagnostic>)` parses a mode definition from markdown text through the same parser as mode files, for host-bundled `include_str!` definitions passed through `SessionOptions::modes` or `Axo::catalog`. `default_name` is used as-is only when frontmatter has no `name` key; no folder derivation applies, and an explicit empty `name` is invalid (mode files instead treat it as absent and derive the name). Validation happens during the `parse` call: missing frontmatter (`missing YAML frontmatter`; mode files without frontmatter are skipped silently instead), malformed YAML, mistyped fields, invalid names, built-in command names and invalid result schemas return `None` with diagnostics. Diagnostics have no origin and messages are prefixed `mode "<default_name>": `; the spec has no `path`. Only name collisions are left to loading; since mode files precede programmatic specs and the first name wins, a user or project mode file with the same name overrides the bundled definition.
 
 `Session::modes()` and `Catalog::modes` expose shared mode definitions. `Session::commands()` lists built-ins first, modes second (`CommandKind::Mode` with `CommandPolicy::Alongside` and the argument hint), then skills not hidden by either. A skill with a mode's name still loads, but is omitted from that command catalog and gets a path diagnostic: `skill name "<name>" is hidden by the mode /<name>; the command catalog lists the mode`. Ordinary prompt skill expansion is unchanged. `Command::parse` / `Command::decode` handle built-ins only; use `Session::parse_command` for mode commands.
 
@@ -282,9 +291,79 @@ Ending an announced mode emits `Mode "<name>" has ended; its instructions and to
 
 Mode allow/deny limits gate execution rather than removing ordinary tool declarations or guidelines, preserving the stable prompt/tool prefix for caching. Deny wins over allow, and an empty allow list permits no ordinary tools. The gate checks the routed target name, so deferred `call` dispatch does not bypass it. A blocked call reports `<tool> is unavailable in mode "<name>".` without terminating the run. `yield` is exempt from this gate; host policies may still reject calls. Mode extras remain host policy data, not built-in enforcement.
 
-Children do not inherit the mode body or catalog and cannot select a root mode; instead, descendants inherit the active mode's tool limits as a persisted ceiling that also filters `kill` and `send` while keeping the child's own `yield` and `call` (see [Root-session modes](extending.md#root-session-modes)).
+Children do not inherit the mode body or catalog and cannot select a root mode; instead, descendants inherit the active mode's tool limits as a persisted ceiling that also filters `kill` and `send` while keeping the child's own `yield` and `call` (see [Root-session modes](extending.md#root-session-modes)). A `bash: readOnly` mode likewise becomes the [read-only bash](#read-only-bash) ceiling of children spawned under it.
 
 See [Root modes](sessions-and-compaction.md#root-modes) for branch/reopen behavior and model restoration.
+
+## Keyword definitions
+
+A keyword fires when its name appears as a standalone prose word in text the user typed to a root session. Its body joins that user message the way a `/skill` expansion does, and its optional `model` is applied exactly as if the user had run `/model <selector>`.
+
+Hosts supply directories through `ConfigLayer::keyword_roots` and programmatic `KeywordSpec` values through `SessionOptions::keywords`; no `.agents/` keyword directory is discovered implicitly. Trusted project roots precede user roots, each in supplied order. Project roots require `ProjectAccess::Trust`; at `Read` they are ignored with a warning, and at `Ignore` or with `project.files.config: false` the project layer is not requested.
+
+`load_keywords` recursively walks roots in sorted file-name order with the shared skill/agent/mode hidden-file, ignore and symlink rules, loading `*.md` files. Missing roots and files without leading YAML frontmatter are skipped; an empty frontmatter block is valid. Canonical paths are deduplicated. Files precede programmatic specs, and the first keyword name wins; later collisions produce diagnostics. Keywords have their own namespace, separate from agents, teams, modes and skills.
+
+```markdown
+---
+name: orchestrate
+description: Delegate the work to subagents.
+requiresTools: [spawn]
+model: "@conduct"
+---
+Split the task into independent pieces and delegate each one with spawn.
+```
+
+| Key | Meaning |
+| :--- | :--- |
+| `name` | Defaults to the file stem when omitted or empty; directories add no namespace, so `team/orchestrate.md` is `orchestrate`. Uses the agent name rule: non-empty, at most 64 characters, only lowercase ASCII letters, digits, and hyphens; no leading, trailing, or consecutive hyphens. Violations drop the definition |
+| `description` | Optional listing text for hosts, default empty |
+| `requiresTools` | Optional list of tool names, default empty; the keyword is active only while every listed tool is available (see [Active keywords](#active-keywords)) |
+| `model` | Optional [model selector](configuration.md#model-selectors) (`provider/model`, `@role`, either with `:thinking`, or `:thinking` alone), resolved when the keyword fires rather than during loading. There is no separate thinking key: the selector's suffix sets effort, as in `@conduct:high` or `:max` |
+| Other keys | Preserved in `KeywordSpec::extra` as host data, without unknown-key diagnostics |
+
+Bodies are trimmed and file definitions retain their `path`. A definition whose body is empty and that has no `model` is skipped with diagnostic `keyword needs a body or a model`; a model-only keyword with an empty body is valid. Unreadable files, malformed frontmatter, mistyped fields, invalid names and duplicate names produce diagnostics and skip the definition. Unlike mode names, keyword names are not checked against built-in command names. Programmatic specs receive the same validation and body trimming. File diagnostics have `DiagnosticOrigin::Path`; programmatic diagnostics have no origin and are prefixed `keyword "<name>":`.
+
+`KeywordSpec::parse(default_name, markdown) -> (Option<KeywordSpec>, Vec<Diagnostic>)` parses a keyword definition from markdown text through the same parser as keyword files, for host-bundled `include_str!` definitions passed through `SessionOptions::keywords` or `Axo::catalog`. `default_name` is used as-is only when frontmatter has no `name` key; an explicit empty `name` is invalid (keyword files instead treat it as absent and use the file stem). Validation happens during the `parse` call: missing frontmatter (`missing YAML frontmatter`; keyword files without frontmatter are skipped silently instead), malformed YAML, mistyped fields, invalid names, and a definition with neither body nor model return `None` with diagnostics. Diagnostics have no origin and the spec has no `path`. Because file roots load before programmatic specs and the first name wins, user and project files override bundled keywords by name.
+
+### Active keywords
+
+Only active keywords fire. A keyword is active when all of these hold:
+- the session is a root; children never match keywords;
+- [`keywords.enabled`](configuration.md#keywords-keywords--keywordsettings) is `true` and the name is not listed in `keywords.disabled`;
+- every `requiresTools` name appears in `Session::tools()` (direct or deferred) with `allowed_in_mode`, so a mode whose limits block a required tool deactivates the keyword while it is effective. Host `ToolPolicy` decisions are not consulted.
+
+### Matching
+
+Keywords are matched in user-typed text only: `Session::prompt`, `Session::prompt_with`, `Session::steer`, and `Session::follow_up` on a root session, including the prompt `Session::run_command` passes to `steer` after selecting a mode (`/plan orchestrate the fix`). They are never matched in `Session::post` host messages of any delivery, teammate mail, a child's first task, or a child's steers and follow-ups, so the model's `send` tool never fires keywords.
+
+Within a submission, each `PromptPart::Text` is matched on its own; `Paste`, `File`, `Content`, and `Saved` parts never fire. When the first part starts with `/`, its first whitespace-delimited token (the skill or command name) is skipped, so `/orchestrate` alone fires nothing, and an expanded skill body is never matched.
+
+In each text:
+1. **Masked regions** never match. Fenced code: a line whose trimmed start begins with three backticks or `~~~` opens a fence that runs through the next line starting with the same marker; an unclosed fence masks to the end. Inline code: outside fences, a run of N backticks through the next run of exactly N backticks; an unmatched run is literal text. Tags: `<`, an optional `/`, and an ASCII letter, through the next `>` on the same line.
+2. **Candidates** are maximal runs of ASCII letters, digits, `_`, and `-`. A run matches only if it equals an active keyword name exactly. Matching is case-sensitive, and the run is never split, so `Orchestrate`, `foo_orchestrate`, and `--orchestrate` do not match `orchestrate`.
+3. **Rejected** runs: the byte before is one of `/ \ : . @ # $ ~`; the byte after is one of `/ \ : (`; or the byte after is `.` followed by an ASCII letter, digit, or `_`. So `foo/orchestrate`, `foo::orchestrate`, `orchestrate()`, and `orchestrate.rs` stay plain text, while `please orchestrate this`, `orchestrate.` at a sentence end, and `(orchestrate)` match.
+
+### Injection
+
+Matched keywords are deduplicated by name in text order. Each one with a non-empty body adds a `Text` block to the rendered user message, right after the first text block and before any image blocks:
+
+```xml
+<keyword name="orchestrate">
+Split the task into independent pieces and delegate each one with spawn.
+</keyword>
+```
+
+The blocks belong to the user message itself rather than a separate message, so they stay with it through queued delivery and compaction. The `submission` entry stores the original parts unchanged: like `<skill>` expansions, keyword blocks exist only in the model's user message, and hosts that display submission parts never show them. The `keyword` tag belongs to the protected wrapper set escaped by `escape_wrappers` in deliveries. Recovery re-renders requeued root `Prompt`, `Steer`, and `FollowUp` submissions without host custom metadata by matching their parts again against the current definitions and active set.
+
+### Keyword models
+
+The first matched keyword in text order that declares a `model` decides the selection; later keywords' models are ignored, though their bodies still join the message. The selector is resolved with `Settings::resolve_model` right after matching, before input preparation or any write (for `prompt_with`, after the duplicate `request_id` and `Error::Busy` checks): a resolution error (`Error::UnknownModelRole`, `Error::InvalidModelSelector`, `Error::ModelNotFound`, …) returns from the submitting call, as with `/model`, and nothing is saved, neither `Content` files nor journal entries. The resolved choice is then applied by the same path as `Session::run_command(Command::Model …)`, after the submission entry is journaled and before the prompt's run starts or the steer or follow-up is queued, so the model request for that message already uses it. A thinking-only selector changes only the thinking level.
+
+The change is persistent: like `/model`, it journals `Entry::ModelChange` (or `Entry::ThinkingLevelChange` for a thinking-only selector), stays in effect for later messages, and inside a mode behaves exactly as `/model` would there. Recovery never applies it again, because the change entry is already in the journal.
+
+### Hosts
+
+`Session::keywords() -> &[Arc<KeywordSpec>]` returns every loaded definition, including disabled and inactive ones, so settings can render toggles; it is empty for children. `Catalog::keywords` exposes the same definitions without a session. `Session::keyword_matches(text) -> Vec<KeywordMatch>` treats `text` as a message's first typed text part (a leading `/` token is skipped, as on submission), runs the matcher above against the current active set, and returns `KeywordMatch { name, range }` in text order, where `range` is a byte range into `text`, so a composer can highlight exactly the words that will fire. It is empty for children.
 
 ## Skills (`crates/axo/src/context/skills.rs`)
 
@@ -297,7 +376,7 @@ See [Root modes](sessions-and-compaction.md#root-modes) for branch/reopen behavi
 
 Within each root:
 - Every `SKILL.md` under the root is a skill, visited in sorted file-name order. Dot-entries, `node_modules`, and `.gitignore`/`.ignore`/`.fdignore` matches are skipped, and symlinks are followed.
-- Once a directory contains `SKILL.md`, that file defines the skill and `load_skills` does not recurse deeper into that directory.
+- Once a directory contains `SKILL.md`, that file defines the skill and `load_skills` does not recurse deeper into that directory: a `SKILL.md` below another skill's directory is never discovered, so namespaced skills such as `plan/roadmap/SKILL.md` must not sit beneath a `plan/SKILL.md`.
 - The same `SKILL.md` reached twice (a symlink or overlapping roots) is skipped silently (compared by canonical path). Symlink loops are skipped by the walker.
 - First skill name wins; later skills with the same name are skipped with a `Diagnostic`.
 
@@ -317,7 +396,7 @@ Skill body with optional $ARGUMENTS, $@, $1, ${@:2}, ${1:-default} placeholders.
 ```
 
 - `description` is required (missing or empty descriptions skip the skill with a `Diagnostic`). An unreadable file or invalid YAML frontmatter also skips the skill with a `Diagnostic`.
-- `name` defaults to the parent directory name. Names longer than 64 characters, empty or outside `[a-z0-9-]`, starting or ending with `-`, or containing `--` emit a `Diagnostic` but still load, and so do descriptions longer than 1024 characters.
+- `name` defaults to the `SKILL.md`'s parent directory relative to its root, with directories joined by `:`: `review/SKILL.md` is `review`, and `plan/roadmap/SKILL.md` is `plan:roadmap`, invoked as `/plan:roadmap` and located at `skill://plan:roadmap`. Names follow the namespaced rule for [mode definitions](#mode-definitions): longer than 64 characters in total, an empty `:` segment, or a segment that is outside `[a-z0-9-]`, starts or ends with `-`, or contains `--` emits a `Diagnostic` but still loads, and so do descriptions longer than 1024 characters.
 - `argument-hint` is optional placeholder text an app shows after `/name` until arguments are typed (`Skill::argument_hint`, trimmed; empty or non-string values become `None`). It is the only skill-argument metadata: a skill takes one free-text argument and has no typed parameters.
 - `disable-model-invocation: true` omits the skill from the `<skills>` system-prompt section while keeping `/name` user expansion active.
 - A skill named like a [built-in command](#user-commands-cratesaxosrccommandsrs) (`compact`, `shake`, `model`, `thinking`, `navigate`) still loads, but session start logs the warning diagnostic `skill name "<name>" is reserved by the built-in /<name> command; the command catalog lists the built-in`, and the skill is left out of `Session::commands()`. Prompt text `/<name>` still expands the skill; a host that parses typed commands with `Command::parse` first runs the built-in instead.
@@ -368,7 +447,7 @@ Host messages sent with `Session::post(HostMessage { custom_type, text, display,
 - `Saved`: must still resolve to an existing `local://` file (`File not found: {url}`), so apps can resubmit parts returned by `Session::fork`. `image` is re-derived from the file's bytes; the value sent is ignored.
 - `Text` / `Paste`: unchanged.
 
-**Rendering** produces the user message: one `Text` block (all parts flattened, a skill command expanded when the message starts with typed `/` text), then for each `Saved { image: true }` in order a `Text` block with its URL (plus any resize hints, one per line) and an `Image` block, processed like `read` does for images. When an image cannot be read or processed, that pair becomes one `Text` block `"{url}\n{message}"` (for example `[image unavailable: …]`) and the message still sends. There is no model-capability check here: requests to text-only models turn images into placeholders.
+**Rendering** produces the user message: one `Text` block (all parts flattened, a skill command expanded when the message starts with typed `/` text), then one `<keyword>` `Text` block per matched [keyword](#injection) with a body, then for each `Saved { image: true }` in order a `Text` block with its URL (plus any resize hints, one per line) and an `Image` block, processed like `read` does for images. When an image cannot be read or processed, that pair becomes one `Text` block `"{url}\n{message}"` (for example `[image unavailable: …]`) and the message still sends. There is no model-capability check here: requests to text-only models turn images into placeholders.
 
 The `submission` entry stores the prepared parts (with `Saved`, never `Content`), so apps can redraw chips after reload or fork; see [JSONL format](sessions-and-compaction.md#jsonl-format-format_version--1).
 
@@ -396,6 +475,16 @@ Every completed foreground result (not aborted or unstartable calls, which fail 
 
 **Capture loss.** If writing the output spool fails, the command keeps running and the result shows the bounded output already captured, with `[Output capture failed: {err}. Showing partial output only.]` appended and no artifact URL.
 
+### Read-only bash
+
+A mode or agent definition with top-level `bash: readOnly` restricts the filesystem writes of `bash` commands. A session's effective access is `ReadOnly` when any of these declares it: its root persona or, for a child, its own spec; its effective root mode; or its persisted child ceiling. The ceiling (`SpawnLink::bash`) is the spawning parent's effective access at spawn time: for a root parent its persona or the mode applied to that spawn, for a child parent its own ceiling or spec. Descendants inherit it at every depth, and it does not relax when the parent later leaves the mode or the definition changes.
+
+A read-only command may read and execute anywhere but write only beneath `/tmp`, `/dev/null`, the session's own `local://` directory (`<session>/local`, created on demand), and the resolved environment's `TMPDIR` when that is an absolute path that exists. Every other write, including creating, deleting, renaming or truncating files, fails with “Permission denied”. The command also runs with `GIT_OPTIONAL_LOCKS=0`, so `git status` and similar read-only git commands do not need to write `.git/index.lock`. Foreground and background commands, retained helpers, and every descendant process inherit the restriction.
+
+Enforcement uses Linux Landlock and fails closed: on a kernel without Landlock ABI 3 (Linux 6.2+), or where the ruleset cannot be fully enforced, the command does not start and the call fails with `read-only bash needs Linux Landlock ABI 3 (Linux 6.2+): <error>`. Only the command's process tree is restricted; axo applies the ruleset on a fresh thread per command that exits after spawning it, so the harness itself and dev-shell capture stay unrestricted. Writes made through axo's own `write` and `edit` tools are governed by tool allowlists and mode limits, not by this setting.
+
+This is a filesystem write boundary, not a general sandbox: a read-only command can still read any file the user can, use the network, signal processes, and ask services reachable over sockets (a daemon, a remote host) to write on its behalf. Combine it with tool limits and host `ToolPolicy` checks when those matter.
+
 ### `wait`
 
 `wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. Any tool batch containing `wait` runs one call at a time, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
@@ -420,7 +509,7 @@ Reading a finished job's result here does not consume it; its delivery still fol
 
 ### `kill`
 
-`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
+`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Both results carry `details: {"id": "<id>", "stopping": <bool>}`, where `stopping` is true only when a running command or a busy child was signalled. Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
 
 There are no proc action paths: reads of a `/kill` suffix are unsupported, and all proc writes fail with `<url> is read-only`.
 
@@ -446,7 +535,9 @@ Reads never consume pending deliveries. Every agent write fails with `<url> is r
 | `send {"to":"agent_1","message":"…"}` | Uses `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_1. Its reply arrives as a new result.` |
 | `send {"to":"agent_1","message":"…","steer":true}` | Uses `Session::steer`, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_1: it reads your message after its current tool calls.` |
 | `send {"to":"parent","message":"…"}` | Sends a mid-run note without ending the child's run; returns `Sent to your parent.`. Delivery is at the parent's next turn boundary or through `wait`, never a steer; an idle parent wakes subject to its Stop latch |
-| `send {"to":"reviewer","message":"…"}` | Sends durable mail to that teammate in the sender's roster; returns `Sent to reviewer.`. Mail is read at the next turn boundary, wakes `wait`, and starts an idle receiver's run. It never steers or waits for completion |
+| `send {"to":"reviewer","message":"…"}` | Sends durable mail to that teammate in the sender's roster; returns `Sent to reviewer.`. Mail is read at the next turn boundary, wakes `wait`, and starts an idle receiver's run unless the receiver is auto-paused, where it stays unread until the receiver's user input or `Session::resume_wakes`. It never steers or waits for completion |
+
+Every successful send carries `details: {"to": "<to>", "kind": "<kind>"}`, where `kind` is `followUp` (child without `steer`), `steer` (child with `steer: true`), `note` (`parent`), or `mail` (teammate).
 
 Blank text fails with `message must not be blank`. Steering a non-child destination fails with `Only your subagents can be steered; send to <to> without steer.`. An unknown child id reports `No agent <id>`. Parent errors distinguish `This session has no parent.`, `Your parent session is not open; nothing was sent.`, and `Your parent no longer tracks this session; nothing was sent.`; roots and forks have no parent route. Self-mail fails with `You are <to>; send to a teammate or to parent.`. Other unknown destinations report `No agent named <to>. Your subagents are agent_N`, followed by the available parent and teammate routes. Non-team children cannot message siblings by name.
 

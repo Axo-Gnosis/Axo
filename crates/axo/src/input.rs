@@ -3,11 +3,13 @@
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axo_ai::UserBlock;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::context::keywords::KeywordSpec;
 use crate::context::skills::{Skill, expand_skill_command};
 use crate::error::Error;
 use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, process_image};
@@ -280,11 +282,13 @@ fn numbered(name: &str, copy: u32) -> String {
 }
 
 /// The model blocks for prepared parts: one text (a skill command expanded when the message
-/// starts with typed `/` text), then each saved image as its URL plus pixels. Image failures
-/// become text so the message still sends.
+/// starts with typed `/` text), then a `<keyword>` block per matched keyword with a body,
+/// then each saved image as its URL plus pixels. Image failures become text so the
+/// message still sends.
 pub(crate) async fn render(
     parts: &[PromptPart],
     skills: &[Skill],
+    keywords: &[Arc<KeywordSpec>],
     tools: &SessionTools,
 ) -> Vec<UserBlock> {
     let text = match command_text(parts) {
@@ -292,6 +296,17 @@ pub(crate) async fn render(
         None => flatten(parts),
     };
     let mut blocks = vec![UserBlock::Text { text }];
+    blocks.extend(
+        keywords
+            .iter()
+            .filter(|keyword| !keyword.body.is_empty())
+            .map(|keyword| UserBlock::Text {
+                text: format!(
+                    "<keyword name=\"{}\">\n{}\n</keyword>",
+                    keyword.name, keyword.body
+                ),
+            }),
+    );
     for part in parts {
         let PromptPart::Saved { url, image: true } = part else {
             continue;

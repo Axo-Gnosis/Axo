@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::context::markdown::{self, name_problems, split_frontmatter};
+use crate::context::modes::BashAccess;
 use crate::context::prompt::valid_section_name;
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
@@ -57,6 +58,9 @@ pub struct AgentSpec {
     /// Model requests per child run before the wrap-up turn; `None` uses `subagents.maxTurns`. Ignored for root sessions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// `ReadOnly` confines `bash` writes, here and in every descendant this agent spawns.
+    #[serde(default, skip_serializing_if = "BashAccess::is_full")]
+    pub bash: BashAccess,
     /// The prompt (trimmed).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
@@ -174,6 +178,8 @@ struct Frontmatter {
     sections: IndexMap<String, bool>,
     output: Option<Value>,
     max_turns: Option<u32>,
+    #[serde(default)]
+    bash: BashAccess,
     members: Option<Vec<RawMember>>,
 }
 
@@ -279,6 +285,28 @@ pub fn load_agents(
     (definitions, diagnostics)
 }
 
+impl AgentSpec {
+    /// Parses a markdown agent definition supplied by the host (for example a bundled `include_str!`).
+    /// `default_name` applies only when the frontmatter has no `name` key; an explicit empty `name` is
+    /// invalid. Team definitions (frontmatter `members`) load only from agent roots and yield `None`
+    /// before any other validation. Diagnostics carry no origin and `path` stays `None`.
+    pub fn parse(default_name: &str, markdown: &str) -> (Option<AgentSpec>, Vec<Diagnostic>) {
+        let mut diagnostics = Vec::new();
+        let def = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {
+            diagnostics.push(Diagnostic {
+                origin: None,
+                message,
+            })
+        });
+        // Path-less teams are rejected inside `parse_markdown`.
+        let spec = match def {
+            Some(AgentDef::Agent(spec)) => Some(spec),
+            Some(AgentDef::Team(_)) | None => None,
+        };
+        (spec, diagnostics)
+    }
+}
+
 fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -287,8 +315,29 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
             return None;
         }
     };
-    let (yaml, body) = split_frontmatter(&raw);
-    let yaml = yaml?;
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    parse_markdown(&raw, stem, Some(path), warn)
+}
+
+/// Shared by root files and [`AgentSpec::parse`]; `fallback_name` applies when the frontmatter has no
+/// `name` (root files also treat an empty `name` as absent; host markdown must not).
+fn parse_markdown(
+    raw: &str,
+    fallback_name: String,
+    path: Option<&Path>,
+    warn: &mut impl FnMut(String),
+) -> Option<AgentDef> {
+    let (yaml, body) = split_frontmatter(raw);
+    let Some(yaml) = yaml else {
+        // Root files without frontmatter are not definitions (READMEs, notes); host markdown must be one.
+        if path.is_none() {
+            warn("missing YAML frontmatter".into());
+        }
+        return None;
+    };
     let value = if yaml.trim().is_empty() {
         Value::Object(Default::default())
     } else {
@@ -305,6 +354,10 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
         return None;
     };
     let is_team = mapping.contains_key("members");
+    if is_team && path.is_none() {
+        warn("team definitions load only from agent roots".into());
+        return None;
+    }
     let known: &[&str] = if is_team {
         &["name", "description", "members"]
     } else {
@@ -318,6 +371,7 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
             "sections",
             "output",
             "maxTurns",
+            "bash",
         ]
     };
     for key in mapping.keys() {
@@ -334,14 +388,10 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
             return None;
         }
     };
-    let name = frontmatter
-        .name
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+    let name = match frontmatter.name {
+        Some(name) if !name.is_empty() || path.is_none() => name,
+        _ => fallback_name,
+    };
     if !valid_name(&name, warn) {
         return None;
     }
@@ -360,7 +410,7 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
                 })
                 .collect(),
             body,
-            path: Some(path.to_path_buf()),
+            path: path.map(Path::to_path_buf),
         }));
     }
     let mut spec = AgentSpec {
@@ -381,8 +431,9 @@ fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
         sections: frontmatter.sections,
         output: frontmatter.output,
         max_turns: frontmatter.max_turns,
+        bash: frontmatter.bash,
         body,
-        path: Some(path.to_path_buf()),
+        path: path.map(Path::to_path_buf),
     };
     validate_agent(&mut spec, warn).then_some(AgentDef::Agent(spec))
 }

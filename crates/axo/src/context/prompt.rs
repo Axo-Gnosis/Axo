@@ -15,17 +15,17 @@ use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
 /// A built prompt: section name → rendered `<name>\n{body}\n</name>`, in prompt order
-/// `delegation, system, docs, tools, schemes, work, prose, project_context, skills, team, cwd, dev_shell, date, <host sections>`,
+/// `delegation, system, agent, docs, tools, schemes, work, prose, project_context, skills, team, cwd, dev_shell, date, <host sections>`,
 /// with empty sections omitted.
 pub type Sections = IndexMap<String, String>;
 
 /// Neutralizes text that opens or closes one of axo's own wrapper tags (system prompt
-/// sections, mode instructions, skill blocks, project instructions, summarizer boundaries) by turning its `<` into `&lt;`.
+/// sections, mode instructions, skill and keyword blocks, project instructions, summarizer boundaries) by turning its `<` into `&lt;`.
 pub(crate) fn escape_wrappers(text: &str) -> Cow<'_, str> {
     // ponytail: fixed list; add host section names if hosts report spoofing
     static TAGS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|delegation|system|docs|team|tools|schemes|work|prose|project_context|cwd|dev_shell|date|mode)\b",
+            r"(?i)<\s*/?\s*(?:conversation|previous-summary|project_instructions|available_skills|skills|skill|keyword|delegation|system|agent|docs|team|tools|schemes|work|prose|project_context|cwd|dev_shell|date|mode)\b",
         )
         .expect("constant wrapper pattern")
     });
@@ -61,8 +61,10 @@ pub(crate) struct PromptSources {
 /// Inputs which change when the host switches a session's persona, sections or tools.
 #[derive(Clone)]
 pub(crate) struct PromptShape {
-    /// Config prompt overrides plus the persona's `SYSTEM` body, keyed by prompt name.
+    /// Config prompt overrides, keyed by prompt name.
     pub prompts: IndexMap<String, PromptOverride>,
+    /// The persona or subagent body (trimmed, non-empty): the `agent` section.
+    pub agent: Option<String>,
     /// Active tools; their guidelines make the `tools` section.
     pub tools: Vec<Arc<dyn Tool>>,
     pub deferred: Vec<Arc<dyn Tool>>,
@@ -105,6 +107,9 @@ pub(crate) fn build_sections(
     let prose = prompt_file("PROSE", BUNDLED_PROSE);
 
     bodies.insert("system".into(), system);
+    if let Some(agent) = &shape.agent {
+        bodies.insert("agent".into(), agent.clone());
+    }
     if sources.docs {
         let name = &sources.name;
         bodies.insert(
@@ -279,6 +284,7 @@ mod tests {
         };
         let mut shape = PromptShape {
             prompts,
+            agent: Some("Persona.".into()),
             tools: Vec::new(),
             deferred: Vec::new(),
             context_files: Vec::new(),
@@ -293,7 +299,8 @@ mod tests {
         sources.docs = true;
         let sections = build_sections(&sources, &shape, None, "2026-10-22");
         let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
-        assert_eq!(&keys[..2], &["system", "docs"]);
+        assert_eq!(&keys[..3], &["system", "agent", "docs"]);
+        assert_eq!(sections["agent"], "<agent>\nPersona.\n</agent>");
 
         sources.delegation = true;
         for override_ in [Some("Host replacement.".into()), None] {

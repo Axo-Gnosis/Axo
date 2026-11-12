@@ -15,14 +15,14 @@ An error from either method fails that `create_session`, `open_session`, `scheme
 
 | Type | Fields | Meaning |
 | :--- | :--- | :--- |
-| `ConfigLayer` | `origin: String`, `settings: Option<Value>`, `prompts: IndexMap<String, PromptOverride>`, `agent_roots: Vec<PathBuf>`, `mode_roots: Vec<PathBuf>` | One raw, unvalidated contribution. `origin` names the layer in errors and warnings (a path, a URL, `"host defaults"`, …). `settings` is the [settings](#settings-axosettings) object; `None` and `Some(Value::Null)` both mean no settings. `prompts` is keyed by a `PROMPT_NAMES` entry: a missing key means no override, an empty text is an override. Agent and mode roots are explicit directories, honored on the project layer only at `Trust` |
+| `ConfigLayer` | `origin: String`, `settings: Option<Value>`, `prompts: IndexMap<String, PromptOverride>`, `agent_roots: Vec<PathBuf>`, `mode_roots: Vec<PathBuf>`, `keyword_roots: Vec<PathBuf>` | One raw, unvalidated contribution. `origin` names the layer in errors and warnings (a path, a URL, `"host defaults"`, …). `settings` is the [settings](#settings-axosettings) object; `None` and `Some(Value::Null)` both mean no settings. `prompts` is keyed by a `PROMPT_NAMES` entry: a missing key means no override, an empty text is an override. Agent, mode, and keyword roots are explicit directories, honored on the project layer only at `Trust` |
 | `PromptOverride` | `origin: String`, `text: String` | One prompt override as the host holds it; `text` is untrimmed, axo trims it |
 | `UserConfig` | `layer: ConfigLayer`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>` | The user's layer plus the user's filesystem resources: skill roots searched after project `.agents/skills` and before `~/.agents/skills`, and context files loaded after `~/.agents/AGENTS.md` and before the project walk (missing files are skipped) |
-| `EffectiveConfig` | `access: ProjectAccess`, `settings: Settings`, `prompts: IndexMap<String, PromptOverride>`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>`, `agent_roots: Vec<PathBuf>`, `mode_roots: Vec<PathBuf>` | What one session runs with: the effective access, merged and filtered settings (`defaultModel` still unresolved; see `EffectiveConfig::default_model`), trimmed prompt overrides (the project's wins per name), user skill roots and context files, and agent and mode roots (trusted project roots first, then user roots) |
+| `EffectiveConfig` | `access: ProjectAccess`, `settings: Settings`, `prompts: IndexMap<String, PromptOverride>`, `skill_roots: Vec<PathBuf>`, `context_files: Vec<PathBuf>`, `agent_roots: Vec<PathBuf>`, `mode_roots: Vec<PathBuf>`, `keyword_roots: Vec<PathBuf>` | What one session runs with: the effective access, merged and filtered settings (`defaultModel` still unresolved; see `EffectiveConfig::default_model`), trimmed prompt overrides (the project's wins per name), user skill roots and context files, and agent, mode, and keyword roots (trusted project roots first, then user roots) |
 
 `PROMPT_NAMES` lists the overridable prompts: `SYSTEM`, `WORK`, `PROSE` (system prompt sections; an empty override disables the section) and `SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY` (summarizer prompts; an empty override records a `Diagnostic` and keeps the bundled prompt). See [`prompts-and-context.md`](prompts-and-context.md).
 
-Definition roots are Rust fields on `ConfigLayer`, not keys in the settings JSON. This type has no serde representation: axo defines no `modeRoots` configuration key. Hosts choose how to acquire `mode_roots` and populate the layer.
+Definition roots are Rust fields on `ConfigLayer`, not keys in the settings JSON. This type has no serde representation: axo defines no `modeRoots` or `keywordRoots` configuration key. Hosts choose how to acquire `mode_roots` and `keyword_roots` and populate the layer. A project layer's non-empty agent, mode, or keyword roots below `Trust` are ignored with a `tracing` warning carrying its `origin`.
 
 ### Evaluation (`EffectiveConfig::resolve`)
 
@@ -70,6 +70,7 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 | User skills and context files | `UserConfig::skill_roots`, `UserConfig::context_files` | Skill roots (`<root>/<skill>/SKILL.md`) and user-wide instruction files, in the order given |
 | Agent definitions | `ConfigLayer::agent_roots` | Explicit roots recursively searched for frontmatter-bearing `*.md` files; trusted project roots precede user roots. No implicit `.agents/` discovery. See [Agent definitions](prompts-and-context.md#agent-definitions) |
 | Mode definitions | `ConfigLayer::mode_roots`, `SessionOptions::modes` | Explicit roots recursively searched for markdown definitions, followed by programmatic `ModeSpec` values; trusted project roots precede user roots. Root sessions select modes through `Session::set_mode`, `Command::Mode`, or deferred `enter_mode` when model invocation is enabled. Instructions, tool limits, and mode `yield` become effective at the next request boundary. See [Mode definitions](prompts-and-context.md#mode-definitions) for metadata and [Root-session modes](extending.md#root-session-modes) for selection, model restoration, host review, events, and child limits |
+| Keyword definitions | `ConfigLayer::keyword_roots`, `SessionOptions::keywords` | Explicit roots recursively searched for markdown definitions, followed by programmatic `KeywordSpec` values; trusted project roots precede user roots. A root session matches active keyword names in user-typed prose, adds their bodies to that user message, and applies the first matched keyword's `model` like `/model`. The [`keywords`](#keywords-keywords--keywordsettings) settings switch them off globally or by name. See [Keyword definitions](prompts-and-context.md#keyword-definitions) |
 
 With `homeAgentsDir: true` in the user layer, axo also reads the ecosystem files `~/.agents/AGENTS.md` (before `UserConfig::context_files`) and `~/.agents/skills/` (after `UserConfig::skill_roots`).
 
@@ -124,6 +125,10 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
   "ask": {
     "timeoutMs": null
   },
+  "keywords": {
+    "enabled": true,
+    "disabled": []
+  },
   "compaction": {
     "enabled": true,
     "maxContext": 400000,
@@ -161,6 +166,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
 | `bash` | `bash` | See below | User or project | Supervised subprocess and dev-shell execution (`BashSettings`) |
 | `ask` | `ask` | See below | User or project | Question tool configuration (`AskSettings`) |
+| `keywords` | `keywords` | See below | User or project | Keyword matching switches (`KeywordSettings`) |
 | `project` | `project` | See below | User only | Project access boundaries and policy (`ProjectSettings`) |
 | `compaction` | `compaction` | See below | User or project | Session compaction triggers and reserve (`CompactionSettings`) |
 | `retry` | `retry` | See below | User or project | Transient model request retry policy (`RetrySettings`) |
@@ -168,7 +174,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 
 ### Model selectors
 
-Model strings in `SessionOptions::model`, `defaultModel`, agent and mode definitions, and `/model` accept `provider/model`, `@role`, either with `:thinking`, or `:thinking` alone. A bare model ID is not looked up. Exact model matches are tried before splitting a final thinking suffix, so IDs such as `ollama/qwen3:8b` remain intact.
+Model strings in `SessionOptions::model`, `defaultModel`, agent, mode, and keyword definitions, and `/model` accept `provider/model`, `@role`, either with `:thinking`, or `:thinking` alone. A bare model ID is not looked up. Exact model matches are tried before splitting a final thinking suffix, so IDs such as `ollama/qwen3:8b` remain intact.
 
 For example, user settings `"modelRoles": {"bard": "anthropic/claude-sonnet-4-5:high"}` make `@bard:low` choose that model with low thinking. The selector's suffix overrides the role value's suffix. An unknown role is `Error::UnknownModelRole`; a role naming another role, or an invalid thinking-only or role suffix, is `Error::InvalidModelSelector`. An unmatched plain selector is `Error::ModelNotFound`. Hosts can call `Settings::resolve_model(&Models, selector)` to obtain a `ModelChoice` containing a model, a thinking level, or both.
 
@@ -300,6 +306,15 @@ Hosts that keep the default need no routing at all: `Axo::builder(models, store)
 - **Per command, process-group mode:** the command starts with `process_group(0)`, so its pgid is its pid. The guard is `sh -c 'read _; kill -KILL -- -"$0"' <pgid>` holding a pipe from axo, started in its own process group as well: if axo dies, the pipe closes and the guard kills the group; when the job closes normally axo kills the guard first. The guard is best effort (if `sh` cannot start, a warning is logged and the command still runs), and losing the guard never kills the job. Because neither the command nor the guard shares the host's foreground process group, a Ctrl-C or SIGTSTP at the host's terminal reaches no job and no watcher.
 - **Per command, cgroup mode:** each command gets `<root>/axo-job-<uuidv7>`. A `guard` process stays in axo's own cgroup and watches axo through a pidfd while axo watches it; whichever survives the other writes `cgroup.kill` and removes the directory, so detached (`setsid`, double-forked, `nohup`) descendants never outlive both. Only the simultaneous death of axo and the guardian leaves a job behind. The command itself starts as `enter`, which joins the job cgroup, verifies the move, and then `exec`s the program. The guardian and the `enter` root each start in their own process group (`process_group(0)`), like the command in process-group mode, so terminal signals aimed at the host reach neither. The supervisor process inherits the host's own (trusted) launch environment, which a wrapped host executable may need to start at all; the command environment travels over `enter`'s stdin and is applied only after cgroup entry, at `exec`, so nothing in the job environment (such as `LD_PRELOAD`) runs before the process is inside its cgroup. `enter` exits 125 when it cannot read its environment or join and verify the cgroup, 127 when the program is not found, and 126 for other `exec` failures.
 - **Descendants:** in process-group mode, in-group descendants stay supervised, drained to the command's artifact, inspectable through `proc://`, and stoppable with `kill` (see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs)); `setsid` escapees need cgroup mode. When the host is PID 1 or a child subreaper, a job's leftover processes are reparented to it; axo reaps those zombies itself (a non-blocking `waitpgid` on the job's group) so the container empties and the job can close instead of hanging on them.
+
+### Keywords (`keywords` / `KeywordSettings`)
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `keywords.enabled` | `enabled` | `true` | `false` stops every keyword from firing: nothing is matched, injected, or highlighted by `Session::keyword_matches` |
+| `keywords.disabled` | `disabled` | `[]` | Keyword names that never fire. Unknown names are ignored. Like any array, a project value replaces the user's list rather than extending it |
+
+Both keys apply only to root sessions; children never match keywords. Disabled keywords still load and appear in `Session::keywords()` and `Catalog::keywords`, so hosts can render toggles. Settings are fixed for the session's lifetime (see [Lifecycle](#lifecycle)). See [Keyword definitions](prompts-and-context.md#keyword-definitions) for matching and model selection.
 
 ### Question tool (`ask` / `axo::AskSettings`)
 

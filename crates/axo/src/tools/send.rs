@@ -44,7 +44,12 @@ impl SendTool {
         }
     }
 
-    async fn send(&self, to: &str, content: &str, steer: bool) -> Result<String, ToolError> {
+    async fn send(
+        &self,
+        to: &str,
+        content: &str,
+        steer: bool,
+    ) -> Result<(String, &'static str), ToolError> {
         if content.trim().is_empty() {
             return Err(ToolError("message must not be blank".into()));
         }
@@ -80,7 +85,7 @@ impl SendTool {
                 .await
                 .map_err(|error| ToolError(error.to_string()))?;
             return if sent {
-                Ok("Sent to your parent.".into())
+                Ok(("Sent to your parent.".into(), "note"))
             } else {
                 Err(ToolError(
                     "Your parent no longer tracks this session; nothing was sent.".into(),
@@ -105,15 +110,19 @@ impl SendTool {
                     .steer(content.to_owned())
                     .await
                     .map_err(|error| ToolError(error.to_string()))?;
-                Ok(format!(
-                    "Steered {id}: it reads your message after its current tool calls."
+                Ok((
+                    format!("Steered {id}: it reads your message after its current tool calls."),
+                    "steer",
                 ))
             } else {
                 child
                     .follow_up(content.to_owned())
                     .await
                     .map_err(|error| ToolError(error.to_string()))?;
-                Ok(format!("Sent to {id}. Its reply arrives as a new result."))
+                Ok((
+                    format!("Sent to {id}. Its reply arrives as a new result."),
+                    "followUp",
+                ))
             };
         }
         if let Some(team) = &self.routes.team {
@@ -130,7 +139,7 @@ impl SendTool {
                     .post_mail(&team.member, content)
                     .await
                     .map_err(|error| ToolError(error.to_string()))?;
-                return Ok(format!("Sent to {to}."));
+                return Ok((format!("Sent to {to}."), "mail"));
             }
         }
         let mut message = format!("No agent named {to}. Your subagents are agent_N");
@@ -179,9 +188,10 @@ impl Tool for SendTool {
             .get("steer")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let text = self.send(to, content, steer).await?;
+        let (text, kind) = self.send(to, content, steer).await?;
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
+            details: Some(json!({ "to": to, "kind": kind })),
             ..ToolOutput::default()
         })
     }

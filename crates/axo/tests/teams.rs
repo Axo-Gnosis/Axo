@@ -3,13 +3,14 @@ mod common;
 use std::path::Path;
 
 use axo::{
-    AgentSpec, Entry, JobKind, SessionOptions, SpawnRequest, TeamHandle, TeamMemberRequest,
-    TeamRef, TeamRequest,
+    AgentSpec, Entry, JobKind, SessionEvent, SessionOptions, SpawnRequest, TeamHandle,
+    TeamMemberRequest, TeamRef, TeamRequest,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn};
 use common::{delivered, entry, host, journal, message_text, only, options, until, within};
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 fn team_options(dir: &Path) -> SessionOptions {
     SessionOptions {
@@ -78,6 +79,28 @@ async fn team_members_message_each_other_and_the_parent() {
         .create_session(team_options(dir.path()))
         .await
         .unwrap();
+    // b's own mail count on its row: posted mail shows as 1 until b takes it.
+    let mut events = parent.attach(None).await.events;
+    let b_mail = tokio::spawn(async move {
+        let mut counts: Vec<u32> = Vec::new();
+        loop {
+            match events.recv().await {
+                Ok(SessionEvent::Job(job)) if job.id == "agent_2" => {
+                    let JobKind::Child { unread_mail, .. } = job.kind else {
+                        continue;
+                    };
+                    if counts.last() != Some(&unread_mail) {
+                        counts.push(unread_mail);
+                    }
+                    if counts.ends_with(&[1, 0]) {
+                        return counts;
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return counts,
+            }
+        }
+    });
     let handle: TeamHandle = parent
         .spawn_team(TeamRequest {
             members: vec![
@@ -106,6 +129,8 @@ async fn team_members_message_each_other_and_the_parent() {
         )
         .await;
     }
+    let counts = within(b_mail).await.unwrap();
+    assert!(counts.ends_with(&[1, 0]), "{counts:?}");
 
     let lines = journal(&parent);
     let note = only(&lines, "parent note", |v| {
@@ -122,17 +147,27 @@ async fn team_members_message_each_other_and_the_parent() {
     let a = jobs.iter().find(|job| job.id == "agent_1").unwrap();
     assert!(matches!(
         &a.kind,
-        JobKind::Child { team: Some(team), .. }
-            if team == &TeamRef { id: "team_1".into(), member: "a".into() }
+        JobKind::Child { team: Some(team), unread_mail: 0, .. }
+            if team == &TeamRef { id: "team_1".into(), member: "a".into(), name: None }
     ));
+    let b = jobs.iter().find(|job| job.id == "agent_2").unwrap();
+    assert!(matches!(&b.kind, JobKind::Child { unread_mail: 0, .. }));
     assert_eq!(handle.members[0].0, "a");
     assert_eq!(handle.members[1].0, "b");
     let a_lines = journal(&handle.members[0].1.session);
-    for (call, text) in [("w1", "Sent to b."), ("w2", "Sent to your parent.")] {
+    for (call, text, details) in [
+        ("w1", "Sent to b.", json!({"to": "b", "kind": "mail"})),
+        (
+            "w2",
+            "Sent to your parent.",
+            json!({"to": "parent", "kind": "note"}),
+        ),
+    ] {
         let sent = only(&a_lines, "send result", |v| {
             v["type"] == "message" && v["message"]["toolCallId"] == call
         });
         assert_eq!(message_text(&a_lines[sent]), text);
+        assert_eq!(a_lines[sent]["message"]["details"], details);
         assert!(
             !a_lines[sent]["message"]["isError"]
                 .as_bool()
@@ -176,6 +211,143 @@ async fn team_members_message_each_other_and_the_parent() {
 }
 
 #[tokio::test]
+async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ack")); 6],
+    )
+    .await;
+    host.api.lane(
+        "a",
+        vec![
+            ScriptedTurn::Reply(reply_text("a done")),
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "w1",
+                "send",
+                json!({"to":"b","message":"hello b"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("a sent")),
+        ],
+    );
+    // b's first run fails, which auto-pauses it.
+    host.api.lane(
+        "b",
+        vec![
+            ScriptedTurn::Error("boom".into()),
+            ScriptedTurn::Reply(reply_text("b read mail")),
+        ],
+    );
+    let parent = host
+        .axo
+        .create_session(team_options(dir.path()))
+        .await
+        .unwrap();
+    let handle = parent
+        .spawn_team(TeamRequest {
+            members: vec![
+                TeamMemberRequest {
+                    name: "a".into(),
+                    agent: Some("alpha".into()),
+                    ..Default::default()
+                },
+                TeamMemberRequest {
+                    name: "b".into(),
+                    agent: Some("beta".into()),
+                    ..Default::default()
+                },
+            ],
+            tasks: [("a".into(), "start".into()), ("b".into(), "start".into())].into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (a, b) = (&handle.members[0].1, &handle.members[1].1);
+    for member in [a, b] {
+        entry(
+            &parent,
+            |entry| matches!(entry, Entry::JobEnd { job_id, .. } if job_id == &member.job),
+        )
+        .await;
+    }
+    let unread = || {
+        parent
+            .jobs()
+            .into_iter()
+            .find(|job| job.id == b.job)
+            .and_then(|job| match job.kind {
+                JobKind::Child { unread_mail, .. } => Some(unread_mail),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let live = b.session.attach(None).await.live;
+    assert!(live.auto_paused && !live.running);
+    assert_eq!(unread(), 0);
+
+    // a mails the paused b: the mail stays unread and starts no run.
+    within(a.session.steer("Mail b.")).await.unwrap();
+    let a_sent = format!("{}/2", a.job);
+    entry(
+        &parent,
+        |entry| matches!(entry, Entry::JobEnd { job_id, text, .. } if job_id == &a_sent && text == "a sent"),
+    )
+    .await;
+    until(|| unread() == 1).await;
+    let attached = b.session.attach(None).await;
+    assert!(attached.live.auto_paused && !attached.live.running);
+    let b_requests = || {
+        host.api
+            .requests()
+            .iter()
+            .filter(|r| r.model.id == "b")
+            .count()
+    };
+    assert_eq!(b_requests(), 1);
+    let lines = journal(&b.session);
+    let mail = only(&lines, "mail submission", |v| {
+        v["type"] == "submission" && v["kind"] == "mail"
+    });
+    assert!(
+        !lines
+            .iter()
+            .any(|v| v["type"] == "message" && v["submissionId"] == lines[mail]["submissionId"])
+    );
+
+    // An explicit wake lifts the pause and delivers the mail.
+    let mut events = attached.events;
+    b.session.resume_wakes();
+    within(async {
+        loop {
+            match events.recv().await {
+                Ok(SessionEvent::AutoPaused { paused: false }) => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("closed before unpause"),
+            }
+        }
+    })
+    .await;
+    let b_read = format!("{}/2", b.job);
+    entry(
+        &parent,
+        |entry| matches!(entry, Entry::JobEnd { job_id, text, .. } if job_id == &b_read && text == "b read mail"),
+    )
+    .await;
+    until(|| unread() == 0).await;
+    assert_eq!(b_requests(), 2);
+    let lines = journal(&b.session);
+    let mail = only(&lines, "mail submission", |v| {
+        v["type"] == "submission" && v["kind"] == "mail"
+    });
+    only(&lines, "consumed mail", |v| {
+        v["type"] == "message" && v["submissionId"] == lines[mail]["submissionId"]
+    });
+    parent.shutdown().await;
+}
+
+#[tokio::test]
 async fn mutual_wait_fails_both_waits() {
     let dir = tempfile::tempdir().unwrap();
     pair_files(dir.path());
@@ -205,6 +377,21 @@ async fn mutual_wait_fails_both_waits() {
         })
         .await
         .unwrap();
+    for (_, member) in &handle.members {
+        let job = parent
+            .jobs()
+            .into_iter()
+            .find(|job| job.id == member.job)
+            .unwrap();
+        assert!(
+            matches!(
+                &job.kind,
+                JobKind::Child { team: Some(TeamRef { id, name: Some(name), .. }), .. }
+                    if id == "team_1" && name == "pair"
+            ),
+            "{job:?}"
+        );
+    }
     for ((_, member), call) in handle.members.iter().zip(["wa", "wb"]) {
         entry(
             &parent,

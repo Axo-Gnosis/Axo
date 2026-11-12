@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
 
-use super::{Selection, Session, SessionEvent, SessionHooks, detached, journal};
+use super::{ResultResolution, Selection, Session, SessionEvent, SessionHooks, detached, journal};
 use crate::context::modes::ModeSpec;
 use crate::error::Error;
 use crate::store::{Entry, ModeRestore};
@@ -404,22 +404,29 @@ impl PendingResults {
     }
 
     pub(super) fn settle(&self, call_id: &str, outcome: ResultOutcome) -> Result<(), Error> {
+        let resolution = match outcome {
+            ResultOutcome::Accepted(_) => ResultResolution::Accepted,
+            ResultOutcome::Revise(_) => ResultResolution::Revised,
+            ResultOutcome::Dismissed => ResultResolution::Dismissed,
+            ResultOutcome::Superseded => ResultResolution::Superseded,
+        };
         if !self.pending.settle(call_id, outcome) {
             return Err(Error::NoPendingResult(call_id.to_owned()));
         }
-        self.resolved(call_id);
+        self.resolved(call_id, resolution);
         Ok(())
     }
 
-    fn resolved(&self, call_id: &str) {
+    fn resolved(&self, call_id: &str, outcome: ResultResolution) {
         let _ = self.events.send(SessionEvent::ModeResultResolved {
             call_id: call_id.to_owned(),
+            outcome,
         });
     }
 
     fn withdraw(&self, call_id: &str) {
         if self.pending.withdraw(call_id) {
-            self.resolved(call_id);
+            self.resolved(call_id, ResultResolution::Withdrawn);
         }
     }
 
@@ -514,6 +521,15 @@ impl Tool for ModeYield {
         }
         let spec = self.mode.result.as_ref().expect("mode result");
         let result = yielded_value(&spec.schema, &cx.call.arguments);
+        let details = |outcome: &str| {
+            Some(json!({ "mode": self.mode.name, "outcome": outcome, "result": result }))
+        };
+        let failed = |outcome: &str, text: &str| ToolOutput {
+            content: vec![UserBlock::Text { text: text.into() }],
+            details: details(outcome),
+            is_error: true,
+            ..ToolOutput::default()
+        };
         let message = if spec.review {
             // The receiver must drop before this guard, including on cancellation.
             let _withdraw = WithdrawResult {
@@ -523,13 +539,16 @@ impl Tool for ModeYield {
             let mut rx = hooks.results.register(PendingResult {
                 call_id: cx.call.id.clone(),
                 mode: self.mode.name.clone(),
-                result,
+                result: result.clone(),
             });
             drop(order);
+            // A decision wins over cancellation: `Session::dismiss` settles the review and
+            // then cancels the run, so both are ready together; the decided outcome is still
+            // returned, and the loop's cooperative join journals it with its details.
             let outcome = tokio::select! {
                 biased;
-                _ = cx.cancel.cancelled() => return Err(ToolError("Operation aborted".into())),
                 outcome = &mut rx => outcome,
+                _ = cx.cancel.cancelled() => return Err(ToolError("Operation aborted".into())),
             };
             match outcome {
                 Ok(ResultOutcome::Accepted(message)) => message,
@@ -540,15 +559,17 @@ impl Tool for ModeYield {
                                 "The result was not accepted. Revise it and call yield again.\n\n{feedback}"
                             ),
                         }],
+                        details: details("revised"),
                         ..ToolOutput::default()
                     });
                 }
                 Ok(ResultOutcome::Dismissed) => {
-                    return Err(ToolError("The result was dismissed by the user".into()));
+                    return Ok(failed("dismissed", "The result was dismissed by the user"));
                 }
                 Ok(ResultOutcome::Superseded) | Err(_) => {
-                    return Err(ToolError(
-                        "The mode ended before this result was reviewed.".into(),
+                    return Ok(failed(
+                        "superseded",
+                        "The mode ended before this result was reviewed.",
                     ));
                 }
             }
@@ -556,7 +577,7 @@ impl Tool for ModeYield {
             let _ = hooks.events.send(SessionEvent::ModeResult {
                 call_id: cx.call.id.clone(),
                 mode: self.mode.name.clone(),
-                result,
+                result: result.clone(),
                 awaiting_review: false,
             });
             drop(order);
@@ -572,6 +593,7 @@ impl Tool for ModeYield {
         }
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
+            details: details("accepted"),
             terminate: next.is_none(),
             ..ToolOutput::default()
         })

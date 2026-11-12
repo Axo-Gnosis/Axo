@@ -39,6 +39,11 @@ pub(crate) trait JobHost: Send + Sync {
     fn results_ready(&self);
     /// Appends a job record through the session's write path.
     async fn journal(&self, entry: Entry) -> Result<(), Error>;
+    /// The session's unread mail count changed to `unread`; called outside the registry's
+    /// state lock, serialized so the last call carries the current count.
+    fn mail_changed(&self, unread: u32);
+    /// A child row's `tree_usage` changed; called outside the registry's state lock.
+    fn tree_changed(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -192,7 +197,13 @@ pub enum JobKind {
         model: String,
         team: Option<TeamRef>,
         resident: bool,
-        progress: Option<ChildProgress>,
+        /// Boxed so a child row stays near a command row's size.
+        progress: Option<Box<ChildProgress>>,
+        /// Teammate mail waiting in the child's own queue; kept while the child is idle.
+        unread_mail: u32,
+        /// The child's whole-subtree usage: its own journal (maintenance included) plus
+        /// every descendant's.
+        tree_usage: Usage,
     },
 }
 
@@ -203,6 +214,8 @@ pub struct ChildProgress {
     pub wrapping_up: bool,
     pub yield_failures: u32,
     pub usage: Usage,
+    /// Tools executing now, in start order; parallel calls list each.
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -316,9 +329,10 @@ impl JobMessage {
     }
 }
 
+/// `Child` is boxed: a `ChildRun` is over twice a `CommandRun`, and most rows are commands.
 enum Kind {
     Command(CommandRun),
-    Child(ChildRun),
+    Child(Box<ChildRun>),
 }
 
 struct Job {
@@ -373,7 +387,9 @@ impl Job {
                     model: run.model.clone(),
                     team: run.team.clone(),
                     resident: run.resident,
-                    progress: run.progress.clone(),
+                    progress: run.progress.clone().map(Box::new),
+                    unread_mail: run.unread_mail,
+                    tree_usage: run.tree_usage.clone(),
                 },
             ),
         };
@@ -442,6 +458,8 @@ pub struct JobRegistry {
     changed: watch::Sender<u64>,
     events: broadcast::Sender<SessionEvent>,
     host: OnceLock<Weak<dyn JobHost>>,
+    /// Serializes `JobHost::mail_changed` calls; never held with `state`.
+    mail_notify: Mutex<()>,
     sessions: Arc<SessionTable>,
 }
 
@@ -598,7 +616,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                     jobs.insert(
                         id,
                         Job {
-                            kind: Kind::Child(ChildRun {
+                            kind: Kind::Child(Box::new(ChildRun {
                                 session_id: child_session_id.clone(),
                                 call_id: call_id.clone(),
                                 depth: child_depth,
@@ -609,8 +627,10 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                                 phase: ChildPhase::Idle,
                                 resident: false,
                                 progress: None,
+                                unread_mail: 0,
+                                tree_usage: Usage::default(),
                                 team: team.clone(),
-                            }),
+                            })),
                             admission: Admission::Pending,
                             messages: BTreeMap::new(),
                         },
@@ -885,6 +905,7 @@ impl JobRegistry {
             changed: watch::Sender::new(0),
             events,
             host: OnceLock::new(),
+            mail_notify: Mutex::new(()),
             sessions,
         });
         (registry, unended)
@@ -1440,14 +1461,28 @@ impl JobRegistry {
     pub(crate) fn post_mail(&self, message: QueuedMessage) {
         self.lock().mail.push_back(message);
         self.bump();
+        self.mail_changed();
     }
 
     pub(crate) fn take_mail(&self) -> Vec<QueuedMessage> {
         let messages: Vec<_> = self.lock().mail.drain(..).collect();
         if !messages.is_empty() {
             self.bump();
+            self.mail_changed();
         }
         messages
+    }
+
+    /// Reports the current mail count to the host. Each call re-reads the count under
+    /// `mail_notify`, so whichever concurrent post/take notifies last sends the final count.
+    fn mail_changed(&self) {
+        let Some(host) = self.host() else { return };
+        let _order = self
+            .mail_notify
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let unread = u32::try_from(self.lock().mail.len()).unwrap_or(u32::MAX);
+        host.mail_changed(unread);
     }
 
     /// Ids of the queued mail messages.
@@ -1589,7 +1624,7 @@ impl JobRegistry {
         state.jobs.insert(
             id,
             Job {
-                kind: Kind::Child(run),
+                kind: Kind::Child(Box::new(run)),
                 admission: Admission::Pending,
                 messages: BTreeMap::new(),
             },
@@ -1820,6 +1855,69 @@ impl JobRegistry {
             }
         }
         self.bump();
+    }
+
+    /// Sets the tools child `child_session_id` is executing; ignored until it has progress.
+    pub(crate) fn child_tools(&self, child_session_id: &str, tools: Vec<String>) {
+        {
+            let mut state = self.lock();
+            if let Some(progress) = state.jobs.values_mut().find_map(|job| match &mut job.kind {
+                Kind::Child(run) if run.session_id == child_session_id => run.progress.as_mut(),
+                _ => None,
+            }) {
+                progress.tools = tools;
+            }
+        }
+        self.bump();
+    }
+
+    /// Sets child `child_session_id`'s unread mail count.
+    pub(crate) fn child_mail(&self, child_session_id: &str, unread: u32) {
+        for job in self.lock().jobs.values_mut() {
+            if let Kind::Child(run) = &mut job.kind
+                && run.session_id == child_session_id
+            {
+                run.unread_mail = unread;
+                break;
+            }
+        }
+        self.bump();
+    }
+
+    /// Sets child `child_session_id`'s subtree usage; on a change, announces the row and
+    /// tells the host after the state lock is released.
+    pub(crate) fn child_tree_usage(&self, child_session_id: &str, usage: Usage) {
+        let changed = self
+            .lock()
+            .jobs
+            .values_mut()
+            .any(|job| match &mut job.kind {
+                Kind::Child(run)
+                    if run.session_id == child_session_id && run.tree_usage != usage =>
+                {
+                    run.tree_usage = usage.clone();
+                    true
+                }
+                _ => false,
+            });
+        if !changed {
+            return;
+        }
+        self.bump();
+        if let Some(host) = self.host() {
+            host.tree_changed();
+        }
+    }
+
+    /// Sum of every child row's `tree_usage`.
+    pub(crate) fn children_tree_usage(&self) -> Usage {
+        let mut total = Usage::default();
+        for job in self.lock().jobs.values() {
+            if let Kind::Child(run) = &job.kind {
+                total += &run.tree_usage;
+            }
+        }
+        total
     }
 
     pub(crate) fn set_resident(&self, child_session_id: &str, resident: bool) {

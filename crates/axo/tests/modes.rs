@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use axo::{
-    Command, Entry, EntryId, HostTool, ModeResult, ModeSpec, SessionEvent, SessionOptions,
-    SessionTools, ToolFactory, ToolLimits, ToolPolicy, ToolScope,
+    BashAccess, Command, Entry, EntryId, HostTool, ModeResult, ModeSpec, ResultResolution,
+    SessionEvent, SessionOptions, SessionTools, ToolFactory, ToolLimits, ToolPolicy, ToolScope,
 };
 use axo_agent::{
     AgentMessage, BeforeToolCallContext, Tool, ToolCallDecision, ToolContext, ToolError, ToolOutput,
@@ -652,6 +652,74 @@ async fn mode_command_journals_entry_and_starts_its_user_text() {
     session.shutdown().await;
 }
 
+#[tokio::test]
+async fn nested_definitions_derive_namespaced_command_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mode = dir.path().join("modes/plan");
+    std::fs::create_dir_all(&mode).unwrap();
+    std::fs::write(
+        mode.join("roadmap.md"),
+        "---\ndescription: Roadmap\n---\nRoadmap mode.",
+    )
+    .unwrap();
+    let skill = dir.path().join("skills/plan/roadmap");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\ndescription: Roadmap skill\n---\nRoadmap $1\n",
+    )
+    .unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ok"))],
+    )
+    .await;
+    host.config.user.lock().unwrap().layer.mode_roots = vec![dir.path().join("modes")];
+    // A host-bundled definition of the same name yields to the file one.
+    let (bundled, diagnostics) = ModeSpec::parse(
+        "plan:roadmap",
+        "---\ndescription: Bundled\n---\nBundled mode.",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let session = host
+        .axo
+        .create_session(SessionOptions {
+            modes: vec![bundled.unwrap()],
+            ..options(dir.path())
+        })
+        .await
+        .unwrap();
+    let modes: Vec<_> = session
+        .modes()
+        .iter()
+        .map(|mode| (mode.name.as_str(), mode.description.as_str()))
+        .collect();
+    assert_eq!(modes, [("plan:roadmap", "Roadmap")]);
+    assert_eq!(
+        session
+            .parse_command("/plan:roadmap go")
+            .expect("recognized mode")
+            .unwrap(),
+        Command::Mode {
+            name: "plan:roadmap".into(),
+            prompt: Some("go".into())
+        }
+    );
+    within(session.prompt("/plan:roadmap notes")).await.unwrap();
+    let requests = host.api.requests();
+    let users: Vec<_> = requests[0].transcript.iter().map(user_text).collect();
+    assert!(
+        users
+            .iter()
+            .any(|text| text.contains("<skill name=\"plan:roadmap\"")
+                && text.contains("Roadmap notes")),
+        "{users:?}"
+    );
+    session.shutdown().await;
+}
+
 fn result_options(dir: &Path, review: bool, then: Option<&str>) -> SessionOptions {
     let mut opts = mode_options(dir);
     opts.modes[0].result = Some(ModeResult {
@@ -689,16 +757,109 @@ async fn next_mode_result(
 async fn result_resolved(
     events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
     expected: &str,
+    expected_outcome: ResultResolution,
 ) {
     within(async {
         loop {
-            if let SessionEvent::ModeResultResolved { call_id } = events.recv().await.unwrap() {
+            if let SessionEvent::ModeResultResolved { call_id, outcome } =
+                events.recv().await.unwrap()
+            {
                 assert_eq!(call_id, expected);
+                assert_eq!(outcome, expected_outcome);
                 return;
             }
         }
     })
     .await;
+}
+
+/// The only tool result journaled for `call_id`, as the session file holds it.
+fn only_result(lines: &[Value], call_id: &str) -> Value {
+    let index = common::only(lines, call_id, |line| {
+        line["type"] == "message" && line["message"]["toolCallId"] == call_id
+    });
+    lines[index]["message"].clone()
+}
+
+#[tokio::test]
+async fn pending_review_survives_reopening_and_records_its_outcome() {
+    for revise in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(
+            dir.path(),
+            json!([{"id":"m"}]),
+            json!({}),
+            vec![
+                ScriptedTurn::Reply(reply_tool_calls(&[(
+                    "final",
+                    "call",
+                    json!({"tool":"yield", "args":{"plan":"ready"}}),
+                )])),
+                ScriptedTurn::Reply(reply_text("revising")),
+            ],
+        )
+        .await;
+        let session = Arc::new(
+            host.axo
+                .create_session(result_options(dir.path(), true, None))
+                .await
+                .unwrap(),
+        );
+        session.set_mode(Some("plan")).await.unwrap();
+        let mut events = session.attach(None).await.events;
+        let run = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("Plan only.").await }
+        });
+        assert_eq!(next_mode_result(&mut events).await.0, "final");
+        let path = session.path().to_path_buf();
+        session.shutdown().await;
+        result_resolved(&mut events, "final", ResultResolution::Withdrawn).await;
+        let _ = within(run).await.unwrap();
+        assert!(
+            !journal(&session)
+                .iter()
+                .any(|line| line["message"]["toolCallId"] == "final"),
+            "shutdown must leave the yield unanswered for recovery"
+        );
+        drop(session);
+
+        let mut opts = result_options(dir.path(), true, None);
+        opts.recovery = axo::RecoveryPolicy::Resume;
+        let reopened = host.axo.open_session(&path, opts).await.unwrap();
+        let mut attached = reopened.attach(None).await;
+        if attached.live.pending_results.is_empty() {
+            next_mode_result(&mut attached.events).await;
+            attached = reopened.attach(None).await;
+        }
+        assert_eq!(attached.live.mode.as_deref(), Some("plan"));
+        assert_eq!(attached.live.pending_results.len(), 1);
+        assert_eq!(attached.live.pending_results[0].call_id, "final");
+        assert_eq!(
+            attached.live.pending_results[0].result,
+            json!({"plan":"ready"})
+        );
+        let mut events = attached.events;
+        let (outcome, resolution) = if revise {
+            reopened
+                .revise_result("final", "Add tests.".into())
+                .unwrap();
+            ("revised", ResultResolution::Revised)
+        } else {
+            reopened.accept_result("final", None).unwrap();
+            ("accepted", ResultResolution::Accepted)
+        };
+        result_resolved(&mut events, "final", resolution).await;
+        common::entry(&reopened, |entry| matches!(entry, Entry::RunEnd { .. })).await;
+        assert_eq!(reopened.mode().is_some(), revise);
+        let result = only_result(&journal(&reopened), "final");
+        assert_eq!(result["isError"], false);
+        assert_eq!(
+            result["details"],
+            json!({"mode":"plan","outcome":outcome,"result":{"plan":"ready"}})
+        );
+        reopened.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -754,7 +915,7 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
     session
         .revise_result("draft", "Include rollback.".into())
         .unwrap();
-    result_resolved(&mut events, "draft").await;
+    result_resolved(&mut events, "draft", ResultResolution::Revised).await;
     assert_eq!(
         next_mode_result(&mut events).await,
         (
@@ -776,7 +937,7 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
     session
         .accept_result("revised", Some("Go implement it.".into()))
         .unwrap();
-    result_resolved(&mut events, "revised").await;
+    result_resolved(&mut events, "revised", ResultResolution::Accepted).await;
     within(run).await.unwrap().unwrap();
     assert!(session.mode().is_none());
     assert!(
@@ -839,10 +1000,54 @@ async fn accepting_without_a_continuation_ends_the_run() {
         )
     );
     session.accept_result("final-plan", None).unwrap();
-    result_resolved(&mut events, "final-plan").await;
+    result_resolved(&mut events, "final-plan", ResultResolution::Accepted).await;
     within(run).await.unwrap().unwrap();
     assert!(session.mode().is_none());
     assert!(session.attach(None).await.live.pending_results.is_empty());
+    assert_eq!(host.api.requests().len(), 1);
+    session.shutdown().await;
+}
+
+/// `Session::dismiss` settles the review and aborts the run at once: the yield must still
+/// journal its typed dismissal rather than losing it to the cancellation.
+#[tokio::test]
+async fn dismissing_a_reviewed_result_records_its_outcome_and_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_tool_calls(&[(
+            "final-plan",
+            "call",
+            json!({"tool":"yield", "args":{"plan":"ready"}}),
+        )]))],
+    )
+    .await;
+    let session = Arc::new(
+        host.axo
+            .create_session(result_options(dir.path(), true, None))
+            .await
+            .unwrap(),
+    );
+    session.set_mode(Some("plan")).await.unwrap();
+    let mut events = session.attach(None).await.events;
+    let run = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Plan only.").await }
+    });
+    assert_eq!(next_mode_result(&mut events).await.0, "final-plan");
+    session.dismiss("final-plan").unwrap();
+    result_resolved(&mut events, "final-plan", ResultResolution::Dismissed).await;
+    let _ = within(run).await.unwrap();
+    assert_eq!(session.mode().unwrap().name, "plan");
+    assert!(session.attach(None).await.live.pending_results.is_empty());
+    let result = only_result(&journal(&session), "final-plan");
+    assert_eq!(result["isError"], true);
+    assert_eq!(
+        result["details"],
+        json!({"mode":"plan","outcome":"dismissed","result":{"plan":"ready"}})
+    );
     assert_eq!(host.api.requests().len(), 1);
     session.shutdown().await;
 }
@@ -892,7 +1097,7 @@ async fn configured_result_continuation_runs_after_reviewed_and_unreviewed_yield
         );
         if review {
             session.accept_result("final-plan", None).unwrap();
-            result_resolved(&mut events, "final-plan").await;
+            result_resolved(&mut events, "final-plan", ResultResolution::Accepted).await;
         }
         within(run).await.unwrap().unwrap();
         assert!(session.mode().is_none());
@@ -1113,5 +1318,93 @@ async fn elision_keeps_old_mode_instructions_in_context() {
         "shaking must not discard an active mode's instructions",
     );
     assert_eq!(session.mode().unwrap().name, "plan");
+    session.shutdown().await;
+}
+
+/// The tool result for `call_id` in `request`, as `(is_error, text)`.
+fn tool_result(request: &RecordedRequest, call_id: &str) -> (bool, String) {
+    request
+        .transcript
+        .iter()
+        .find_map(|message| match message {
+            Message::ToolResult(result) if result.tool_call_id == call_id => Some((
+                result.is_error,
+                result
+                    .content
+                    .iter()
+                    .filter_map(UserBlock::as_text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing result for {call_id}"))
+}
+
+#[tokio::test]
+async fn read_only_bash_mode_denies_writes_but_runs_git_status() {
+    // Not the system temp dir: the sandbox grants /tmp, which would hide the denial.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    assert!(!dir.path().starts_with("/tmp"), "{:?}", dir.path());
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[
+                ("touch", "bash", json!({"command": "touch foo"})),
+                ("status", "bash", json!({"command": "git status --short"})),
+                (
+                    "local",
+                    "bash",
+                    json!({"command": "printf note > local://note.md && cat local://note.md"}),
+                ),
+            ])),
+            ScriptedTurn::Reply(reply_text("inspected")),
+        ],
+    )
+    .await;
+    let opts = SessionOptions {
+        modes: vec![ModeSpec {
+            name: "inspect".into(),
+            description: "Inspect without writing.".into(),
+            body: "Inspect only.".into(),
+            bash: BashAccess::ReadOnly,
+            ..Default::default()
+        }],
+        ..common::bash_options(dir.path())
+    };
+    let cwd = opts.cwd.clone();
+    std::fs::write(cwd.join("tracked"), "x").unwrap();
+    for args in [&["init", "-q"][..], &["add", "tracked"]] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .status()
+            .expect("git on PATH");
+        assert!(status.success(), "git {args:?}");
+    }
+    let session = host.axo.create_session(opts).await.unwrap();
+    session.set_mode(Some("inspect")).await.unwrap();
+    within(session.prompt("Look around.")).await.unwrap();
+
+    let requests = host.api.requests();
+    let (touch_failed, touch) = tool_result(&requests[1], "touch");
+    assert!(touch_failed, "{touch}");
+    assert!(!cwd.join("foo").exists());
+    if touch.contains("read-only bash needs Linux Landlock") {
+        // No Landlock ABI 3 on this kernel: every read-only command fails closed.
+        let (status_failed, status) = tool_result(&requests[1], "status");
+        assert!(status_failed && status.contains("read-only bash needs Linux Landlock"));
+    } else {
+        assert!(touch.contains("Permission denied"), "{touch}");
+        let (status_failed, status) = tool_result(&requests[1], "status");
+        assert!(!status_failed, "{status}");
+        assert!(status.contains("A  tracked"), "{status}");
+        assert!(!cwd.join(".git/index.lock").exists());
+        let (local_failed, local) = tool_result(&requests[1], "local");
+        assert!(!local_failed, "{local}");
+        assert!(local.contains("note"), "{local}");
+    }
     session.shutdown().await;
 }

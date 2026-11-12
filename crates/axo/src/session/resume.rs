@@ -54,8 +54,9 @@ impl Session {
     }
 
     /// The user messages of requeued `submission` entries, rendered from their parts
-    /// (skills re-expanded, images re-read) and queued under their submission ids so
-    /// their `message` entries carry them.
+    /// (skills re-expanded, keywords re-matched, images re-read) and queued under their
+    /// submission ids so their `message` entries carry them. A keyword's model is not
+    /// applied again: its change was recorded when the submission was.
     async fn requeued(&self, requeue: Vec<SeqEntry>) -> Vec<(SubmissionKind, QueuedMessage)> {
         let mut queued = Vec::new();
         for seq in requeue {
@@ -82,10 +83,17 @@ impl Session {
                         timestamp: now_ms(),
                     })
                 } else {
+                    let keywords = match kind {
+                        SubmissionKind::Prompt
+                        | SubmissionKind::Steer
+                        | SubmissionKind::FollowUp => self.hooks.matched_keywords(&parts),
+                        SubmissionKind::Mail | SubmissionKind::Quiet => Vec::new(),
+                    };
                     AgentMessage::Llm(Message::User(UserMessage {
                         content: render(
                             &parts,
                             &self.hooks.prompt.sources.skills,
+                            &keywords,
                             &self.hooks.tools,
                         )
                         .await,

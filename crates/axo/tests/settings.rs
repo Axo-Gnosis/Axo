@@ -24,6 +24,7 @@ fn layer(origin: &str, settings: Option<&str>) -> ConfigLayer {
         prompts: IndexMap::new(),
         agent_roots: Vec::new(),
         mode_roots: Vec::new(),
+        keyword_roots: Vec::new(),
     }
 }
 

@@ -54,13 +54,15 @@ impl Tool for KillTool {
             .unwrap_or("");
         let id = JobId::parse(id)
             .ok_or_else(|| ToolError(format!("{id} is not a job id; use bg_N or agent_N")))?;
-        let text = if self.tools.runner.jobs.kill(id, Killer::Model) {
+        let stopping = self.tools.runner.jobs.kill(id, Killer::Model);
+        let text = if stopping {
             format!("Stopping {id}.")
         } else {
             format!("{id} is not running.")
         };
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
+            details: Some(json!({ "id": id.to_string(), "stopping": stopping })),
             ..ToolOutput::default()
         })
     }

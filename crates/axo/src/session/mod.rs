@@ -31,6 +31,7 @@ use axo_ai::{
     ToolCall, ToolResultMessage, Usage, UserBlock,
 };
 use futures::FutureExt;
+use futures::future::{BoxFuture, join_all};
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
@@ -43,7 +44,7 @@ use self::journal::Journal;
 use self::maintenance::Maintenance;
 pub(crate) use self::modes::MODE_NOTICE;
 pub use self::modes::PendingResult;
-use self::policy::{ModeGate, PolicyHook, ScopeCell};
+use self::policy::{ModeGate, PolicyHook, ScopeCell, effective_bash};
 pub use self::policy::{ToolPolicy, ToolScope};
 use self::prompt::{PromptState, SessionPrompt, ShapeBase, shape};
 use self::resume::Resumption;
@@ -57,10 +58,11 @@ pub(crate) use self::surface::TOOL_CATALOG;
 use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo};
 use crate::compaction::{self, Limits};
-use crate::config::{EffectiveConfig, ProjectAccess};
+use crate::config::{EffectiveConfig, ModelChoice, ProjectAccess};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs};
 use crate::context::files::NestedContext;
-use crate::context::modes::ModeSpec;
+use crate::context::keywords::{KeywordMatch, KeywordSpec};
+use crate::context::modes::{BashAccess, ModeSpec};
 use crate::context::prompt::PromptSources;
 use crate::context::skills::{Skill, load_skills};
 use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir};
@@ -96,6 +98,8 @@ pub struct SessionOptions {
     pub agents: Vec<AgentSpec>,
     /// Mode definitions supplied in code, after every file-defined one; the first name wins.
     pub modes: Vec<ModeSpec>,
+    /// Keyword definitions supplied in code, after every file-defined one; the first name wins.
+    pub keywords: Vec<KeywordSpec>,
     /// Falls back to the session's last level, then `defaultThinkingLevel`; clamped to
     /// the model's supported levels.
     pub thinking: Option<ThinkingLevel>,
@@ -129,6 +133,7 @@ impl Default for SessionOptions {
             agent: None,
             agents: Vec::new(),
             modes: Vec::new(),
+            keywords: Vec::new(),
             thinking: None,
             ask_enabled: false,
             project_access: None,
@@ -245,9 +250,45 @@ pub enum SessionEvent {
         result: Value,
         awaiting_review: bool,
     },
+    /// A pending review left the pending list, with how it ended.
     ModeResultResolved {
         call_id: String,
+        outcome: ResultResolution,
     },
+    /// The session's whole-tree spend changed: its own entries plus every descendant's.
+    TreeUsage {
+        usage: Usage,
+    },
+}
+
+/// How a pending mode result review ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultResolution {
+    /// `Session::accept_result`.
+    Accepted,
+    /// `Session::revise_result`.
+    Revised,
+    /// `Session::dismiss`.
+    Dismissed,
+    /// A mode change ended the mode before review.
+    Superseded,
+    /// The `yield` call was cancelled while waiting.
+    Withdrawn,
+}
+
+/// One tool as [`Session::tools`] lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionToolInfo {
+    pub name: String,
+    /// The description's first non-blank line, as the deferred catalog shows it.
+    pub summary: String,
+    pub description: String,
+    pub parameters: Value,
+    pub exposure: Exposure,
+    /// A deferred tool the model has loaded into its tool list.
+    pub promoted: bool,
+    /// Whether the effective mode's tool limits permit calling it.
+    pub allowed_in_mode: bool,
 }
 
 /// A prompt with an optional client id that makes resubmission idempotent.
@@ -328,6 +369,8 @@ pub struct LiveSnapshot {
     pub jobs: Vec<JobInfo>,
     /// Recorded spend, including maintenance and failed assistant requests, without run/job rollups.
     pub usage: Usage,
+    /// `usage` plus every descendant session's own recorded spend, maintenance included.
+    pub tree_usage: Usage,
     pub model: Model,
     pub thinking: ThinkingLevel,
     pub agent: Option<String>,
@@ -355,6 +398,8 @@ pub(crate) struct Inherited {
     pub(crate) harness_name: String,
     pub(crate) agents: Vec<AgentDef>,
     pub(crate) modes: Vec<Arc<ModeSpec>>,
+    /// Every loaded keyword definition, disabled ones included; empty for children.
+    pub(crate) keywords: Vec<Arc<KeywordSpec>>,
     pub(crate) agent_diagnostics: Vec<Diagnostic>,
     pub(crate) agent: Option<AgentSpec>,
     pub(crate) streamer: Arc<dyn Streamer>,
@@ -458,6 +503,11 @@ struct SessionHooks {
     agent: OnceLock<Weak<Agent>>,
     /// These hooks, for tasks that deliver job results.
     this: Weak<SessionHooks>,
+    /// Σ `Entry::usage` over this session's journal; seeded at start, grown by `after_append`.
+    own_usage: Mutex<Usage>,
+    /// The tree total last emitted as `TreeUsage` (and pushed to the parent's row); held
+    /// while computing and pushing, so an older total never lands after a newer one.
+    last_tree: Mutex<Usage>,
 }
 
 /// The open run's live state, updated and relayed under the same lock.
@@ -580,16 +630,97 @@ fn detached<T: Send + 'static>(
     }
 }
 
+/// Σ `Entry::usage` over `entries`: maintenance and failed requests included, run and job
+/// rollups not.
+fn entries_usage<'a>(entries: impl IntoIterator<Item = &'a SeqEntry>) -> Usage {
+    let mut total = Usage::default();
+    for usage in entries.into_iter().filter_map(|seq| seq.entry.usage()) {
+        total += usage;
+    }
+    total
+}
+
+/// The own usage of the session file at `path` (spawn depth `depth`) plus, while
+/// `depth < max_depth`, every child it started, read recursively from their files. Parked
+/// files are immutable, so this equals what the live tree would report. An unreadable file
+/// counts as zero.
+fn subtree_usage<'a>(
+    store: &'a dyn SessionStore,
+    path: &'a Path,
+    depth: u32,
+    max_depth: u32,
+) -> BoxFuture<'a, Usage> {
+    Box::pin(async move {
+        let (header, entries) = match store.open_read(path).await {
+            Ok(read) => read,
+            Err(err) => {
+                warn!(
+                    %err,
+                    path = %path.display(),
+                    "child session unreadable; its usage counts as zero"
+                );
+                return Usage::default();
+            }
+        };
+        let mut usage = entries_usage(&entries);
+        if depth < max_depth {
+            // Only children this session owns; a fork's copied `child_start`s are its source's.
+            let children = entries.iter().filter_map(|seq| match &seq.entry {
+                Entry::ChildStart {
+                    session_id,
+                    child_path,
+                    ..
+                } if *session_id == header.id => {
+                    Some(subtree_usage(store, child_path, depth + 1, max_depth))
+                }
+                _ => None,
+            });
+            for child in join_all(children).await {
+                usage += &child;
+            }
+        }
+        usage
+    })
+}
+
 impl SessionHooks {
     fn live(&self) -> MutexGuard<'_, LiveRun> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Keep live state and its event on the same side of an attach snapshot.
-    fn relay_live(&self, event: &AgentEvent, update: impl FnOnce(&mut LiveRun)) {
+    fn relay_live<T>(&self, event: &AgentEvent, update: impl FnOnce(&mut LiveRun) -> T) -> T {
         let mut live = self.live();
-        update(&mut live);
+        let out = update(&mut live);
         let _ = self.events.send(SessionEvent::Agent(event.clone()));
+        out
+    }
+
+    /// The parent's registry when this session is a child whose parent is live.
+    fn parent_registry(&self) -> Option<Arc<JobRegistry>> {
+        let child = self.child.as_ref()?;
+        self.inherited
+            .sessions
+            .registry(&child.link.parent_session_id)
+    }
+
+    /// Own usage plus every child row's tree total.
+    fn tree_usage(&self) -> Usage {
+        let mut usage = self
+            .own_usage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        usage += &self.tools.runner.jobs.children_tree_usage();
+        usage
+    }
+
+    /// Show a child's executing tools on its parent's job row, so hosts see them without
+    /// subscribing to the child.
+    fn publish_child_tools(&self, tools: Vec<String>) {
+        if let Some(parent) = self.parent_registry() {
+            parent.child_tools(&self.session_id, tools);
+        }
     }
 
     fn selection(&self) -> Selection {
@@ -639,7 +770,7 @@ impl SessionHooks {
     }
 
     /// Re-derives the file ledger and context tracker once a batch moved or rewrote the
-    /// transcript.
+    /// transcript, and adds the batch's recorded usage to the session's own.
     fn after_append(&self, appended: &[SeqEntry]) {
         if appended.iter().any(|seq| seq.entry.rewrites_context()) {
             let view = self.journal.view();
@@ -657,6 +788,20 @@ impl SessionHooks {
                 )
         }) {
             self.emit_context();
+        }
+        let mut changed = false;
+        {
+            let mut own = self
+                .own_usage
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for usage in appended.iter().filter_map(|seq| seq.entry.usage()) {
+                *own += usage;
+                changed = true;
+            }
+        }
+        if changed {
+            JobHost::tree_changed(self);
         }
     }
 
@@ -930,6 +1075,27 @@ impl SessionHooks {
         Ok(applied)
     }
 
+    /// Applies a resolved `/model` selector: its model (with any thinking level), or a
+    /// thinking level alone. Persistent, recorded like any selection change.
+    pub(super) async fn select_choice(
+        &self,
+        agent: &Agent,
+        choice: ModelChoice,
+    ) -> Result<(), Error> {
+        match choice.model {
+            Some(model) => self.select_model(agent, model, choice.thinking).await,
+            None => self
+                .select_thinking(
+                    agent,
+                    choice
+                        .thinking
+                        .expect("a selector without a model names a thinking level"),
+                )
+                .await
+                .map(drop),
+        }
+    }
+
     /// [`SessionHooks::record_selection`] against the current position.
     async fn record_current_selection(&self) -> Result<(), Error> {
         let (model, thinking, agent) = {
@@ -950,6 +1116,14 @@ impl SessionHooks {
             .and_then(|child| child.output.as_ref())
             .is_some_and(|output| output.nudge())
     }
+}
+
+/// Executing tool names in start order.
+fn tool_names(live: &LiveRun) -> Vec<String> {
+    live.tool_calls
+        .iter()
+        .map(|call| call.name.clone())
+        .collect()
 }
 
 #[async_trait]
@@ -1236,10 +1410,7 @@ impl Persist for SessionHooks {
                 };
                 if matches!(message, AgentMessage::Llm(Message::Assistant(_)))
                     && let Some(child) = &self.child
-                    && let Some(parent) = self
-                        .inherited
-                        .sessions
-                        .registry(&child.link.parent_session_id)
+                    && let Some(parent) = self.parent_registry()
                     && open
                 {
                     let turns = child.budget.requests();
@@ -1254,6 +1425,7 @@ impl Persist for SessionHooks {
                                 .as_ref()
                                 .map_or(0, |output| output.failures()),
                             usage,
+                            tools: Vec::new(),
                         },
                     );
                 }
@@ -1263,20 +1435,24 @@ impl Persist for SessionHooks {
                 name,
                 args,
             } => {
-                self.relay_live(event, |live| {
+                let tools = self.relay_live(event, |live| {
                     live.tool_calls.push(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),
                         arguments: args.clone(),
                         arguments_error: None,
                     });
+                    tool_names(live)
                 });
+                self.publish_child_tools(tools);
                 return Ok(());
             }
             AgentEvent::ToolExecutionEnd { call_id, .. } => {
-                self.relay_live(event, |live| {
+                let tools = self.relay_live(event, |live| {
                     live.tool_calls.retain(|call| &call.id != call_id);
+                    tool_names(live)
                 });
+                self.publish_child_tools(tools);
                 return Ok(());
             }
             AgentEvent::AgentEnd { .. } => {
@@ -1284,6 +1460,7 @@ impl Persist for SessionHooks {
                     live.streaming = None;
                     live.tool_calls.clear();
                 });
+                self.publish_child_tools(Vec::new());
                 return Ok(());
             }
             _ => {}
@@ -1427,6 +1604,21 @@ impl Session {
             inherited.sessions.clone(),
             events.clone(),
         );
+        // Before the host attaches, so seeding never notifies; a revived child pushes its
+        // reseeded total to its parent once started.
+        let store = inherited.store.as_ref();
+        let max_depth = settings.subagents.max_depth;
+        let child_depth = link.as_ref().map_or(1, |link| link.depth + 1);
+        let seeds = jobs.children().into_iter().map(|child| async move {
+            let usage = subtree_usage(store, &child.path, child_depth, max_depth).await;
+            (child.session_id, usage)
+        });
+        for (child, usage) in join_all(seeds).await {
+            jobs.child_tree_usage(&child, usage);
+        }
+        let own_usage = entries_usage(&entries);
+        let mut tree_usage = own_usage.clone();
+        tree_usage += &jobs.children_tree_usage();
         inherited
             .sessions
             .register(session_id.clone(), Arc::downgrade(&jobs));
@@ -1615,11 +1807,25 @@ impl Session {
             first_slot: Mutex::new(None),
             link,
         });
+        let scope_agent = root_agent
+            .cloned()
+            .or_else(|| child.as_ref().map(|child| child.link.spec.clone()));
+        let bash = effective_bash(
+            scope_agent.as_ref(),
+            selected_mode.as_deref(),
+            child
+                .as_ref()
+                .map_or(BashAccess::Full, |child| child.link.bash),
+        );
+        session_tools
+            .read_only_bash
+            .store(!bash.is_full(), Ordering::Release);
         let scope = Arc::new(Mutex::new(Arc::new(ToolScope {
             session_id: session_id.clone(),
             depth,
-            agent: root_agent.cloned(),
+            agent: scope_agent,
             mode: selected_mode.clone(),
+            bash,
         })));
         let mut tool_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
         if let Some(child) = &child {
@@ -1699,6 +1905,8 @@ impl Session {
                 auto_paused: AtomicBool::new(false),
                 agent: OnceLock::new(),
                 this: this.clone(),
+                own_usage: Mutex::new(own_usage),
+                last_tree: Mutex::new(tree_usage),
                 child,
             }
         });
@@ -1722,6 +1930,14 @@ impl Session {
                 hooks.activity.subscribe(),
                 jobs.subscribe(),
             ));
+            // Reseeded from the journal; the parent's row may hold an older total.
+            let last = hooks
+                .last_tree
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(parent) = hooks.parent_registry() {
+                parent.child_tree_usage(&hooks.session_id, last.clone());
+            }
         }
 
         let session = Session {
@@ -1981,6 +2197,12 @@ impl Session {
         self.hooks.tools.runner.jobs.background(call_id)
     }
 
+    /// The tools this session exposes: direct ones in prompt order, then deferred catalog
+    /// entries. Reading it promotes nothing.
+    pub fn tools(&self) -> Vec<SessionToolInfo> {
+        self.hooks.tool_infos()
+    }
+
     /// This session's URL schemes: recognize with `exact`, resolve files with `resolve`,
     /// or read UTF-8 text from either file or virtual targets with `read`.
     pub fn schemes(&self) -> &Schemes {
@@ -1995,6 +2217,22 @@ impl Session {
     /// The mode definitions available to this root session; empty for children.
     pub fn modes(&self) -> &[Arc<ModeSpec>] {
         &self.hooks.inherited.modes
+    }
+
+    /// Every keyword definition loaded for this root session, disabled ones included;
+    /// empty for children.
+    pub fn keywords(&self) -> &[Arc<KeywordSpec>] {
+        &self.hooks.inherited.keywords
+    }
+
+    /// The keywords that would fire in `text` typed as a message right now, as byte ranges
+    /// into `text`. A leading `/command` token is skipped, as on submission.
+    pub fn keyword_matches(&self, text: &str) -> Vec<KeywordMatch> {
+        let active = self.hooks.active_keywords();
+        delivery::keyword_spans(text, true, &active)
+            .into_iter()
+            .map(|(name, range)| KeywordMatch { name, range })
+            .collect()
     }
 
     /// Parses built-in commands first, then commands naming this session's modes.
@@ -2034,23 +2272,8 @@ impl Session {
                     .config
                     .settings
                     .resolve_model(&self.inherited.models, &model)?;
-                match choice.model {
-                    Some(model) => {
-                        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-                        detached(
-                            async move { hooks.select_model(&agent, model, choice.thinking).await },
-                        )
-                        .await
-                    }
-                    None => self
-                        .set_thinking(
-                            choice
-                                .thinking
-                                .expect("a selector without a model names a thinking level"),
-                        )
-                        .await
-                        .map(drop),
-                }
+                let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
+                detached(async move { hooks.select_choice(&agent, choice).await }).await
             }
             Command::Thinking { level } => self.set_thinking(level).await.map(drop),
             Command::Navigate {
@@ -2319,17 +2542,30 @@ impl Session {
         self.hooks.context_usage()
     }
 
+    /// This session's own recorded spend plus every descendant's, maintenance included;
+    /// `SessionEvent::TreeUsage` reports changes.
+    pub fn tree_usage(&self) -> Usage {
+        self.hooks.tree_usage()
+    }
+
     /// The entries after `from` (all with `None`), the live state and an event receiver,
     /// all taken at one point of the append order: no entry is missed or duplicated.
     /// Never waits on a write in flight.
     pub async fn attach(&self, from: Option<u64>) -> Attach {
-        // Entries publish under the journal lock, live updates relay under the live lock
-        // and job rows announce under the registry lock: subscribing inside all three
-        // splits every event into before (in the snapshot) or after (received).
+        // Entries publish under the journal lock, live updates relay under the live lock,
+        // job rows announce under the registry lock and tree totals emit under `last_tree`:
+        // subscribing inside all four splits every event into before (in the snapshot) or
+        // after (received).
         self.hooks.journal.read(|view| {
             let live = self.hooks.live();
             let activity = *self.hooks.activity.borrow();
             let (queued_steering, queued_follow_up) = self.agent.queued();
+            let _tree = self
+                .hooks
+                .last_tree
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let tree_usage = self.hooks.tree_usage();
             let (jobs, events) = self
                 .hooks
                 .tools
@@ -2359,14 +2595,8 @@ impl Session {
                     pending_questions: self.hooks.questions.pending(),
                     pending_results: self.hooks.results.snapshot(),
                     jobs,
-                    usage: view
-                        .entries
-                        .iter()
-                        .filter_map(|seq| seq.entry.usage())
-                        .fold(Usage::default(), |mut total, usage| {
-                            total += usage;
-                            total
-                        }),
+                    usage: entries_usage(&view.entries),
+                    tree_usage,
                 },
                 events,
             }

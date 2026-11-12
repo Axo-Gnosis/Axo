@@ -244,6 +244,7 @@ impl Inner {
             args: args.into_iter().map(Into::into).collect(),
             cwd: cwd.to_path_buf(),
             env: (*self.base).clone(),
+            sandbox: None,
         }
     }
 
@@ -389,6 +390,7 @@ impl Inner {
             args: args.iter().map(OsString::from).collect(),
             cwd: dir.to_path_buf(),
             env: env.clone(),
+            sandbox: None,
         };
         let timeout = Duration::from_millis(self.settings.dev_shell_timeout_ms);
         let deadline = tokio::time::Instant::now() + timeout;

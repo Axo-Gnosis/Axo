@@ -65,7 +65,7 @@ Every local command runs in a host-selected container (`Supervision::ProcessGrou
 
 ### Sectioned system prompt, context files & skills
 
-The system prompt is assembled into named `<section>` blocks (`delegation` for children, `system`, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `team` for team members, `cwd`, `dev_shell`, `date`, plus host sections). Startup and tool execution discover instructions, skills, and personas across user and project roots. See [System prompt sections](crates/axo/docs/prompts-and-context.md#system-prompt-sections), [Context files](crates/axo/docs/prompts-and-context.md#context-files-cratesaxosrccontextfilesrs), and [Skills](crates/axo/docs/prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
+The system prompt is assembled into named `<section>` blocks (`delegation` for children, `system`, `agent` for a persona or child spec body, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `team` for team members, `cwd`, `dev_shell`, `date`, plus host sections). Startup and tool execution discover instructions, skills, and personas across user and project roots. See [System prompt sections](crates/axo/docs/prompts-and-context.md#system-prompt-sections), [Context files](crates/axo/docs/prompts-and-context.md#context-files-cratesaxosrccontextfilesrs), and [Skills](crates/axo/docs/prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
 
 Hosts can switch a root persona and replace live host sections and tools; see [Session control methods](crates/axo/docs/extending.md#session-control-methods).
 

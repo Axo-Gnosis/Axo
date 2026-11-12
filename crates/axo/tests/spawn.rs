@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use axo::{Entry, RecoveryPolicy, SessionOptions, SpawnRequest};
+use axo::{BashAccess, Entry, ModeSpec, RecoveryPolicy, SessionOptions, SpawnRequest};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, UserBlock};
 use common::{
@@ -554,4 +554,54 @@ async fn follow_up_on_idle_session_starts_a_run() {
         "two"
     );
     session.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_only_bash_ceiling_outlives_the_parent_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}, {"id":"child"}]),
+        json!({}),
+        vec![],
+    )
+    .await;
+    let parent = host
+        .axo
+        .create_session(SessionOptions {
+            modes: vec![ModeSpec {
+                name: "inspect".into(),
+                description: "Inspect without writing.".into(),
+                bash: BashAccess::ReadOnly,
+                ..Default::default()
+            }],
+            ..options(dir.path())
+        })
+        .await
+        .unwrap();
+    parent.set_mode(Some("inspect")).await.unwrap();
+    let restricted = within(parent.spawn(request("Inspect only.")))
+        .await
+        .unwrap();
+    parent.set_mode(None).await.unwrap();
+    let free = within(parent.spawn(request("Inspect freely.")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        restricted.session.spawn_link().unwrap().bash,
+        BashAccess::ReadOnly
+    );
+    assert_eq!(free.session.spawn_link().unwrap().bash, BashAccess::Full);
+    // The ceiling is durable: it lives in the child's header.
+    let header = |session: &axo::Session| -> Value {
+        let text = std::fs::read_to_string(session.path()).unwrap();
+        serde_json::from_str(text.lines().next().unwrap()).unwrap()
+    };
+    until(|| restricted.session.path().exists() && free.session.path().exists()).await;
+    assert_eq!(header(&restricted.session)["spawn"]["bash"], "readOnly");
+    assert!(header(&free.session)["spawn"].get("bash").is_none());
+    restricted.session.shutdown().await;
+    free.session.shutdown().await;
+    parent.shutdown().await;
 }

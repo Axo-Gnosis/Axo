@@ -76,6 +76,8 @@ async fn spawned_child_delivers_once_and_parks() {
                         team,
                         resident,
                         progress,
+                        unread_mail,
+                        tree_usage: _,
                     } = kind
                     else {
                         panic!("expected a child job");
@@ -87,6 +89,7 @@ async fn spawned_child_delivers_once_and_parks() {
                     assert_eq!(model, "test/child");
                     assert_eq!(team, None);
                     assert!(resident);
+                    assert_eq!(unread_mail, 0);
                     if let Some(progress) = progress {
                         assert!(progress.turns <= progress.max_turns + 1);
                     }
@@ -126,10 +129,17 @@ async fn spawned_child_delivers_once_and_parks() {
         })
         .unwrap();
     let sections = system.sections.as_ref().unwrap();
-    assert!(sections.contains_key("delegation"));
+    let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
+    assert_eq!(&keys[..3], ["delegation", "system", "agent"]);
+    assert!(
+        sections["system"]
+            .as_deref()
+            .unwrap()
+            .starts_with("<system>\nYou are a coding agent running in ")
+    );
     assert_eq!(
-        sections["system"].as_deref(),
-        Some("<system>\nYou check things.\n</system>")
+        sections["agent"].as_deref(),
+        Some("<agent>\nYou check things.\n</agent>")
     );
     assert_eq!(
         system
@@ -639,6 +649,12 @@ async fn queued_children_publish_running_and_per_run_usage() {
         total_tokens: 20,
         ..Default::default()
     };
+    // The second child reads before blocking, so its row shows the live tool.
+    let mut read_gate = reply_tool_calls(&[
+        ("r0", "read", json!({"path":"missing.txt"})),
+        ("g1", "gate", json!({})),
+    ]);
+    read_gate.usage = gate.usage.clone();
     let mut done = reply_text("done");
     done.usage = Usage {
         input: 23,
@@ -651,7 +667,7 @@ async fn queued_children_publish_running_and_per_run_usage() {
         vec![
             ScriptedTurn::Reply(gate.clone()),
             ScriptedTurn::Reply(done.clone()),
-            ScriptedTurn::Reply(gate),
+            ScriptedTurn::Reply(read_gate),
             ScriptedTurn::Reply(done),
         ],
     );
@@ -670,7 +686,7 @@ async fn queued_children_publish_running_and_per_run_usage() {
         .unwrap();
     let spawn = |task| SpawnRequest {
         spec: Some(InlineSpec {
-            tools: Some(vec!["gate".into()]),
+            tools: Some(vec!["gate".into(), "read".into()]),
             ..Default::default()
         }),
         ..request(task)
@@ -694,13 +710,25 @@ async fn queued_children_publish_running_and_per_run_usage() {
     ));
     let mut events = parent.attach(None).await.events;
     release.notify_one();
+    let mut running = false;
     within(async {
         loop {
             match events.recv().await {
-                Ok(SessionEvent::Job(job))
-                    if job.id == second.job && job.status == JobStatus::Running =>
-                {
-                    break;
+                Ok(SessionEvent::Job(job)) if job.id == second.job => {
+                    running |= job.status == JobStatus::Running;
+                    let JobKind::Child {
+                        progress: Some(progress),
+                        ..
+                    } = job.kind
+                    else {
+                        continue;
+                    };
+                    // The first live tool row is the read; the gate keeps the run open.
+                    if !progress.tools.is_empty() {
+                        assert!(running);
+                        assert_eq!(progress.tools, ["read"]);
+                        break;
+                    }
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
@@ -734,6 +762,19 @@ async fn queued_children_publish_running_and_per_run_usage() {
             serde_json::to_value(&expected).unwrap()
         );
     }
+    // After the run, no tool is executing on either row.
+    for child in [&first, &second] {
+        until(|| {
+            parent.jobs().iter().any(|job| {
+                job.id == child.job
+                    && matches!(
+                        &job.kind,
+                        JobKind::Child { progress: Some(progress), .. } if progress.tools.is_empty()
+                    )
+            })
+        })
+        .await;
+    }
     // Wait for the run consuming the final child result, not an earlier idle wake.
     until(|| {
         let lines = journal(&parent);
@@ -766,6 +807,214 @@ async fn queued_children_publish_running_and_per_run_usage() {
         }
     }
     assert!(runs > 0);
+    parent.shutdown().await;
+}
+
+fn costed(text: &str, total: u64) -> ScriptedTurn {
+    let mut reply = reply_text(text);
+    reply.usage = Usage {
+        input: total - 1,
+        output: 1,
+        total_tokens: total,
+        ..Default::default()
+    };
+    ScriptedTurn::Reply(reply)
+}
+
+/// Σ `Entry::usage` over a session's full journal, maintenance included.
+async fn own_usage(axo: &axo::Axo, path: &std::path::Path) -> Usage {
+    let (_, entries) = axo.open_session_read(path).await.unwrap();
+    let mut usage = Usage::default();
+    for seq in &entries {
+        if let Some(spent) = seq.entry.usage() {
+            usage += spent;
+        }
+    }
+    usage
+}
+
+fn run_ends(session: &axo::Session) -> usize {
+    journal(session)
+        .iter()
+        .filter(|v| v["type"] == "run_end")
+        .count()
+}
+
+fn sum(parts: &[&Usage]) -> Usage {
+    let mut total = Usage::default();
+    for part in parts {
+        total += part;
+    }
+    total
+}
+
+#[tokio::test]
+async fn tree_usage_counts_descendants_and_child_compaction_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([
+            {"id":"m"},
+            {"id":"child", "contextWindow":100_000, "maxTokens":4096},
+            {"id":"grand"},
+        ]),
+        json!({
+            "subagents": {"maxDepth": 2},
+            "compaction": {
+                "enabled": false,
+                "maxContext": null,
+                "reserveTokens": 1024,
+                "keepRecentTokens": 0,
+                "summaryRequest": "separate",
+            },
+        }),
+        // One idle wake per delivered child run.
+        vec![costed("ack one", 100), costed("ack two", 200)],
+    )
+    .await;
+    // The child's summaries come from its own model lane (`Selection` of the compacting
+    // session). With `keepRecentTokens: 0` the cut lands on "child ack", splitting its turn:
+    // one request summarizes the history, a second the split turn's prefix (the grandchild
+    // result). Each reply must be smaller than what it replaces, so the history is padded.
+    // The measured turns are realistic: compaction must shrink the context below the last
+    // measured total, and the estimate after it still carries the replayed system prompt
+    // and tool definitions, which a toy baseline would not cover.
+    host.api.lane(
+        "child",
+        vec![
+            costed(&"child findings ".repeat(20), 10_000),
+            // The idle wake consuming the grandchild's result.
+            costed("child ack", 20_000),
+            costed("brief", 50),
+            costed("gist", 40),
+        ],
+    );
+    host.api.lane("grand", vec![costed("grand done", 10_000)]);
+    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
+    let path = parent.path().to_path_buf();
+    let mut events = parent.attach(None).await.events;
+
+    let child = parent.spawn(request("check")).await.unwrap();
+    delivered(&parent, &child.job).await;
+    until(|| run_ends(&parent) == 1).await;
+    let grand = child
+        .session
+        .spawn(SpawnRequest {
+            model: Some("test/grand".into()),
+            ..request("dig deeper")
+        })
+        .await
+        .unwrap();
+    assert_eq!(grand.session.spawn_link().unwrap().depth, 2);
+    delivered(&child.session, &grand.job).await;
+    until(|| run_ends(&child.session) == 2).await;
+    until(|| run_ends(&parent) == 2).await;
+    within(child.session.compact(None)).await.unwrap();
+
+    let parent_own = own_usage(&host.axo, parent.path()).await;
+    let child_own = own_usage(&host.axo, child.session.path()).await;
+    let grand_own = own_usage(&host.axo, grand.session.path()).await;
+    assert_eq!(parent_own.total_tokens, 300);
+    assert_eq!(grand_own.total_tokens, 10_000);
+    // The child's own spend includes its compaction requests, which `JobEnd` excludes.
+    let child_lines = journal(&child.session);
+    let compactions: Vec<_> = child_lines
+        .iter()
+        .filter(|v| v["type"] == "compaction")
+        .collect();
+    assert_eq!(compactions.len(), 1, "{child_lines:#?}");
+    // Both summary requests succeed on the first attempt: no failed-attempt usage.
+    assert!(
+        !child_lines.iter().any(|v| v["type"] == "usage"),
+        "{child_lines:#?}"
+    );
+    let compaction: Usage = serde_json::from_value(compactions[0]["usage"].clone()).unwrap();
+    assert_eq!(compaction.total_tokens, 90);
+    assert_eq!(child_own.total_tokens, 30_000 + 90);
+    // Each child run reports `JobEnd` (`agent_1`, then `agent_1/2`), never maintenance.
+    let run_ref = format!("{}/", child.job);
+    let mut reported = Usage::default();
+    let mut runs = 0;
+    for line in journal(&parent).iter().filter(|v| {
+        v["type"] == "job_end"
+            && v["jobId"]
+                .as_str()
+                .is_some_and(|id| id == child.job || id.starts_with(&run_ref))
+    }) {
+        let usage: Usage = serde_json::from_value(line["usage"].clone()).unwrap();
+        reported += &usage;
+        runs += 1;
+    }
+    assert_eq!(runs, 2);
+    assert_eq!(
+        reported.total_tokens, 30_000,
+        "job_end usage omits maintenance"
+    );
+
+    let child_tree = sum(&[&child_own, &grand_own]);
+    let expected = sum(&[&parent_own, &child_tree]);
+    until(|| parent.tree_usage() == expected).await;
+    assert_eq!(child.session.tree_usage(), child_tree);
+    assert_eq!(grand.session.tree_usage(), grand_own);
+    assert_eq!(child.session.attach(None).await.live.tree_usage, child_tree);
+    let row_usage = |session: &axo::Session, job: &str| {
+        session
+            .jobs()
+            .into_iter()
+            .find(|row| row.id == job)
+            .and_then(|row| match row.kind {
+                JobKind::Child { tree_usage, .. } => Some(tree_usage),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(row_usage(&parent, &child.job), child_tree);
+    assert_eq!(row_usage(&child.session, &grand.job), grand_own);
+    // Emitted totals only grow, never past the full tree, and end at it.
+    within(async {
+        let mut last: Option<Usage> = None;
+        loop {
+            match events.recv().await {
+                Ok(SessionEvent::TreeUsage { usage }) => {
+                    assert!(usage.total_tokens <= expected.total_tokens, "{usage:?}");
+                    if let Some(last) = &last {
+                        assert_ne!(last, &usage, "unchanged totals are not re-emitted");
+                        assert!(usage.total_tokens >= last.total_tokens);
+                    }
+                    if usage == expected {
+                        break;
+                    }
+                    last = Some(usage);
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
+            }
+        }
+    })
+    .await;
+    assert_eq!(parent.attach(None).await.live.tree_usage, expected);
+
+    parent.shutdown().await;
+    drop(grand);
+    drop(child);
+    drop(parent);
+    let parent = host
+        .axo
+        .open_session(&path, options(dir.path()))
+        .await
+        .unwrap();
+    // Seeded recursively from the parked journals: no compaction lost, nothing doubled.
+    assert_eq!(parent.attach(None).await.live.tree_usage, expected);
+    assert_eq!(parent.tree_usage(), expected);
+    let child_row = parent
+        .jobs()
+        .into_iter()
+        .find(|row| matches!(row.kind, JobKind::Child { .. }))
+        .unwrap();
+    let JobKind::Child { tree_usage, .. } = child_row.kind else {
+        unreachable!()
+    };
+    assert_eq!(tree_usage, child_tree);
     parent.shutdown().await;
 }
 

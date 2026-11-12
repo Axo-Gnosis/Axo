@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::context::agents::ContextFiles;
+use crate::context::keywords::KeywordSettings;
 use crate::context::project_root;
 use crate::error::Error;
 
@@ -39,6 +40,7 @@ pub struct Settings {
     pub compaction: CompactionSettings,
     pub retry: RetrySettings,
     pub subagents: SubagentSettings,
+    pub keywords: KeywordSettings,
 }
 
 impl Default for Settings {
@@ -58,6 +60,7 @@ impl Default for Settings {
             compaction: CompactionSettings::default(),
             retry: RetrySettings::default(),
             subagents: SubagentSettings::default(),
+            keywords: KeywordSettings::default(),
         }
     }
 }
@@ -410,6 +413,8 @@ pub struct ConfigLayer {
     pub agent_roots: Vec<PathBuf>,
     /// Mode definition roots, honored on the project layer only at `ProjectAccess::Trust`.
     pub mode_roots: Vec<PathBuf>,
+    /// Keyword definition roots, honored on the project layer only at `ProjectAccess::Trust`.
+    pub keyword_roots: Vec<PathBuf>,
 }
 
 /// The user's configuration: the layer plus the user's filesystem resources.
@@ -448,6 +453,8 @@ pub struct EffectiveConfig {
     pub agent_roots: Vec<PathBuf>,
     /// Trusted project mode roots, followed by user mode roots.
     pub mode_roots: Vec<PathBuf>,
+    /// Trusted project keyword roots, followed by user keyword roots.
+    pub keyword_roots: Vec<PathBuf>,
     pub context_files: Vec<PathBuf>,
 }
 
@@ -484,6 +491,7 @@ impl EffectiveConfig {
         let mut dev_shell_from_project = false;
         let mut agent_roots = Vec::new();
         let mut mode_roots = Vec::new();
+        let mut keyword_roots = Vec::new();
         if access != ProjectAccess::Ignore && policy.files.config {
             let project = source.project(cwd)?;
             if access == ProjectAccess::Trust {
@@ -496,6 +504,11 @@ impl EffectiveConfig {
             } else if !project.mode_roots.is_empty() {
                 tracing::warn!(origin = %project.origin, "mode roots need a trusted project; ignored");
             }
+            if access == ProjectAccess::Trust {
+                keyword_roots.extend(project.keyword_roots);
+            } else if !project.keyword_roots.is_empty() {
+                tracing::warn!(origin = %project.origin, "keyword roots need a trusted project; ignored");
+            }
             if let Some((mut value, _)) = validate(&project.origin, project.settings)? {
                 let object = value.as_object_mut().expect("validated settings object");
                 filter_project(object, USER_ONLY_KEYS, &project.origin);
@@ -507,6 +520,7 @@ impl EffectiveConfig {
         }
         agent_roots.extend(user.agent_roots);
         mode_roots.extend(user.mode_roots);
+        keyword_roots.extend(user.keyword_roots);
         let origin = project_origin.as_deref().unwrap_or(&user.origin);
         let mut settings: Settings =
             serde_json::from_value(merged).map_err(|error| config_error(origin, error))?;
@@ -526,6 +540,7 @@ impl EffectiveConfig {
             skill_roots,
             agent_roots,
             mode_roots,
+            keyword_roots,
             context_files,
         })
     }

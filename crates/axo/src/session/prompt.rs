@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::config::{EffectiveConfig, PromptOverride};
+use crate::config::EffectiveConfig;
 use crate::context::agents::{AgentSpec, ContextFiles};
 use crate::context::files::{ContextFile, context_file_names, load_context_files};
 use crate::context::modes::ToolLimits;
@@ -95,19 +95,6 @@ pub(crate) fn shape(
             startup,
         }
     };
-    let mut prompts = base.config.prompts.clone();
-    if let Some(spec) = agent.filter(|spec| !spec.body.is_empty()) {
-        prompts.insert(
-            "SYSTEM".into(),
-            PromptOverride {
-                origin: spec.path.as_ref().map_or_else(
-                    || format!("agent {}", spec.name),
-                    |path| path.display().to_string(),
-                ),
-                text: spec.body.clone(),
-            },
-        );
-    }
     let agent_sections = agent
         .into_iter()
         .flat_map(|spec| &spec.sections)
@@ -204,7 +191,11 @@ pub(crate) fn shape(
         tools.push(base.call.clone());
     }
     let shape = PromptShape {
-        prompts,
+        prompts: base.config.prompts.clone(),
+        agent: agent
+            .map(|spec| spec.body.trim())
+            .filter(|body| !body.is_empty())
+            .map(str::to_owned),
         tools,
         deferred,
         context_files: nested.startup.clone(),
