@@ -4,48 +4,20 @@
 mod common;
 
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axo::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore};
 use axo::{SessionEvent, SessionOptions, ToolFactory};
-use axo_agent::{
-    AgentEvent, AgentMessage, CustomMessage, RunOutcome, Tool, ToolContext, ToolError, ToolOutput,
-};
+use axo_agent::{AgentEvent, AgentMessage, CustomMessage, RunOutcome, Tool};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ToolResultMessage, UserBlock};
-use common::{options, tool_text, within};
-use serde_json::{Value, json};
+use common::{Hang, options, tool_text, within};
+use serde_json::json;
 
 /// Covers the gap between `job_end` and an idle-wake delivery run starting, which is
 /// a spawned task, not a timer.
 const DELIVERY_GRACE: Duration = Duration::from_millis(250);
-
-/// Runs until its call is cancelled.
-struct Hang;
-
-#[async_trait]
-impl Tool for Hang {
-    fn name(&self) -> &str {
-        "hang"
-    }
-
-    fn description(&self) -> &str {
-        "Waits until cancelled."
-    }
-
-    fn parameters(&self) -> &Value {
-        static PARAMETERS: LazyLock<Value> =
-            LazyLock::new(|| json!({"type": "object", "properties": {}}));
-        &PARAMETERS
-    }
-
-    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        cx.cancel.cancelled().await;
-        Err(ToolError("Operation aborted".into()))
-    }
-}
 
 fn bash_options(dir: &Path) -> SessionOptions {
     let mut options = common::bash_options(dir);

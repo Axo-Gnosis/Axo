@@ -96,6 +96,30 @@ impl SessionHooks {
             .collect()
     }
 
+    pub(super) fn tool_allowed_in_mode(&self, name: &str) -> bool {
+        let mode = self.effective_mode();
+        if name != YIELD && !mode.as_ref().is_none_or(|mode| mode.tools.permits(name)) {
+            return false;
+        }
+        if name == YIELD
+            && self
+                .mode
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .yield_tool
+                .is_some()
+        {
+            return true;
+        }
+        let shape = self
+            .prompt
+            .shape
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        shape.tools.iter().any(|tool| tool.name() == name)
+            || shape.deferred.iter().any(|tool| tool.name() == name)
+    }
+
     pub(super) fn install_tools(&self) {
         let catalog = self.catalog();
         // ponytail: unmounting a promoted tool re-sends the tool list on add-only models; keep a refusing stub if hosts unmount often

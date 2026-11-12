@@ -1859,16 +1859,22 @@ impl JobRegistry {
 
     /// Sets the tools child `child_session_id` is executing; ignored until it has progress.
     pub(crate) fn child_tools(&self, child_session_id: &str, tools: Vec<String>) {
-        {
-            let mut state = self.lock();
-            if let Some(progress) = state.jobs.values_mut().find_map(|job| match &mut job.kind {
+        let changed = self
+            .lock()
+            .jobs
+            .values_mut()
+            .find_map(|job| match &mut job.kind {
                 Kind::Child(run) if run.session_id == child_session_id => run.progress.as_mut(),
                 _ => None,
-            }) {
+            })
+            .is_some_and(|progress| {
+                let changed = progress.tools != tools;
                 progress.tools = tools;
-            }
+                changed
+            });
+        if changed {
+            self.bump();
         }
-        self.bump();
     }
 
     /// Sets child `child_session_id`'s unread mail count.

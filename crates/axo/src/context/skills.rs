@@ -8,7 +8,9 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::context::markdown::{self, derived_name, namespaced_name_problems, split_frontmatter};
+use crate::context::markdown::{
+    self, derived_dir_name, namespaced_name_problems, split_frontmatter,
+};
 use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
 
 /// One discovered skill.
@@ -141,7 +143,7 @@ fn load_skill_file(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) 
         .and_then(serde_norway::Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
-        .or_else(|| path.parent().map(|dir| derived_name(root, dir)))
+        .or_else(|| path.parent().map(|dir| derived_dir_name(root, dir)))
         .unwrap_or_default();
     for problem in namespaced_name_problems(&name) {
         warn(problem);

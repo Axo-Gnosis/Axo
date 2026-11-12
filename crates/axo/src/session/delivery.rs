@@ -102,7 +102,7 @@ impl SessionHooks {
     }
 
     /// Whether finished job results may start a run of their own.
-    fn may_deliver(&self) -> bool {
+    pub(super) fn may_deliver(&self) -> bool {
         !self.auto_paused.load(Ordering::Acquire)
             && !self.shutdown.load(Ordering::Acquire)
             && self.preparing.load(Ordering::Acquire) == 0
@@ -213,17 +213,15 @@ impl SessionHooks {
         if self.child.is_some() || !settings.enabled || self.inherited.keywords.is_empty() {
             return Vec::new();
         }
-        let tools = self.tool_infos();
         self.inherited
             .keywords
             .iter()
             .filter(|keyword| {
                 !settings.disabled.contains(&keyword.name)
-                    && keyword.requires_tools.iter().all(|name| {
-                        tools
-                            .iter()
-                            .any(|tool| tool.name == *name && tool.allowed_in_mode)
-                    })
+                    && keyword
+                        .requires_tools
+                        .iter()
+                        .all(|name| self.tool_allowed_in_mode(name))
             })
             .cloned()
             .collect()

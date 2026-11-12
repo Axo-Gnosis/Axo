@@ -230,6 +230,8 @@ async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
                 json!({"to":"b","message":"hello b"}),
             )])),
             ScriptedTurn::Reply(reply_text("a sent")),
+            ScriptedTurn::Reply(reply_tool_calls(&[("w2", "wait", json!({}))])),
+            ScriptedTurn::Reply(reply_text("a wait failed")),
         ],
     );
     // b's first run fails, which auto-pauses it.
@@ -316,6 +318,23 @@ async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
             .any(|v| v["type"] == "message" && v["submissionId"] == lines[mail]["submissionId"])
     );
 
+    // Waiting while b is paused with unread mail still detects mutual wait.
+    within(a.session.steer("Wait on b.")).await.unwrap();
+    let a_waited = format!("{}/3", a.job);
+    entry(
+        &parent,
+        |entry| matches!(entry, Entry::JobEnd { job_id, text, .. } if job_id == &a_waited && text == "a wait failed"),
+    )
+    .await;
+    let a_lines = journal(&a.session);
+    let waited = only(&a_lines, "mutual wait on paused teammate", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "w2"
+    });
+    assert_eq!(a_lines[waited]["message"]["isError"], true);
+    assert!(
+        message_text(&a_lines[waited])
+            .starts_with("Mutual wait: every running member of team_1 is waiting")
+    );
     // An explicit wake lifts the pause and delivers the mail.
     let mut events = attached.events;
     b.session.resume_wakes();

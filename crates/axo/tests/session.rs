@@ -1038,7 +1038,7 @@ mod keywords {
     use std::time::Duration;
 
     use axo::context::keywords::{KeywordMatch, KeywordSpec};
-    use axo::{Command, Entry, PromptPart, Session, SessionOptions};
+    use axo::{Command, Entry, PromptPart, SessionOptions};
     use axo_agent::RunOutcome;
     use axo_ai::testing::{RecordedRequest, reply_text};
     use axo_ai::{Message, ScriptedTurn, UserBlock};
@@ -1120,13 +1120,6 @@ mod keywords {
             .collect()
     }
 
-    fn run_ends(session: &Session) -> usize {
-        common::journal(session)
-            .iter()
-            .filter(|line| line["type"] == "run_end")
-            .count()
-    }
-
     #[tokio::test]
     async fn typed_keywords_select_the_model_before_the_run_and_join_the_message() {
         let dir = tempfile::tempdir().unwrap();
@@ -1190,12 +1183,12 @@ mod keywords {
         };
         session.run_command(back()).await.unwrap();
         within(session.steer("now orchestrate")).await.unwrap();
-        until(|| run_ends(&session) == 2).await;
+        until(|| common::run_ends(&session) == 2).await;
         session.run_command(back()).await.unwrap();
         within(session.follow_up("orchestrate again"))
             .await
             .unwrap();
-        until(|| run_ends(&session) == 3).await;
+        until(|| common::run_ends(&session) == 3).await;
         let requests = host.api.requests();
         assert_eq!(requests.len(), 3);
         for (request, text) in requests[1..]

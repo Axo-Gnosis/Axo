@@ -91,7 +91,7 @@ impl TeamState {
             let jobs = &session.hooks.tools.runner.jobs;
             activity.maintenance.is_none()
                 && (!activity.running || waiting.contains(id))
-                && !jobs.has_pending()
+                && !(session.hooks.may_deliver() && jobs.has_pending())
                 && jobs.running_admitted().is_empty()
         });
         if !stuck || !waiting.contains(member) {

@@ -19,7 +19,7 @@ use axo::{Entry, SeqEntry};
 use axo_agent::{AgentEvent, RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
-use common::{axo, bash_options, dead, journal, only, tool_text, until, within};
+use common::{Hang, axo, bash_options, dead, journal, only, tool_text, until, within};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -62,31 +62,6 @@ impl Tool for LateTool {
                 },
             )
             .await
-    }
-}
-
-/// Runs until its call is cancelled.
-struct Hang;
-
-#[async_trait]
-impl Tool for Hang {
-    fn name(&self) -> &str {
-        "hang"
-    }
-
-    fn description(&self) -> &str {
-        "Waits until cancelled."
-    }
-
-    fn parameters(&self) -> &Value {
-        static PARAMETERS: LazyLock<Value> =
-            LazyLock::new(|| json!({"type": "object", "properties": {}}));
-        &PARAMETERS
-    }
-
-    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        cx.cancel.cancelled().await;
-        Err(ToolError("Operation aborted".into()))
     }
 }
 

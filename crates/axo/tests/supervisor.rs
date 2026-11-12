@@ -190,7 +190,7 @@ async fn sandbox_writes_only_beneath_writable(supervision: Supervision) {
         "{:?} must lie outside the writable paths {writable:?}",
         repo.path()
     );
-    let in_tmp = PathBuf::from(format!("/tmp/axo-sandbox-{}", unique_name()));
+    let in_tmp = PathBuf::from(format!("/tmp/axo-sandbox-{}", uuid::Uuid::now_v7()));
     let supervisor = ProcessSupervisor::new(supervision);
     let run = |script: String| {
         let mut spec = bash(&script, repo.path());
@@ -233,13 +233,4 @@ async fn sandbox_writes_only_beneath_writable(supervision: Supervision) {
     assert!(in_tmp.exists());
     assert!(local.path().join("y").exists());
     std::fs::remove_file(&in_tmp).unwrap();
-}
-
-/// A name unique to this process and moment.
-fn unique_name() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{}-{nanos}", std::process::id())
 }

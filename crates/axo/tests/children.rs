@@ -12,7 +12,7 @@ use axo::{
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, Usage, UserBlock};
-use common::{delivered, entry, host, journal, only, options, request, until, within};
+use common::{delivered, entry, host, journal, only, options, request, run_ends, until, within};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 
@@ -831,13 +831,6 @@ async fn own_usage(axo: &axo::Axo, path: &std::path::Path) -> Usage {
         }
     }
     usage
-}
-
-fn run_ends(session: &axo::Session) -> usize {
-    journal(session)
-        .iter()
-        .filter(|v| v["type"] == "run_end")
-        .count()
 }
 
 fn sum(parts: &[&Usage]) -> Usage {

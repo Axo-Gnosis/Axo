@@ -3,15 +3,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axo::{
     Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, Session, SessionEvent, SessionOptions,
     SpawnRequest, StaticEnv, UserConfig,
 };
 use axo::{Entry, JsonlStore, SeqEntry, SessionStore};
-use axo_agent::AgentMessage;
+use axo_agent::{AgentMessage, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::reply_text;
 use axo_ai::{
     FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ProviderFailure,
@@ -302,4 +303,37 @@ pub fn request(task: &str) -> SpawnRequest {
 /// The first text block of a raw `message` entry.
 pub fn message_text(line: &Value) -> &str {
     line["message"]["content"][0]["text"].as_str().unwrap()
+}
+
+/// The number of `run_end` entries in the session's journal.
+pub fn run_ends(session: &Session) -> usize {
+    journal(session)
+        .iter()
+        .filter(|line| line["type"] == "run_end")
+        .count()
+}
+
+/// Runs until its call is cancelled.
+pub struct Hang;
+
+#[async_trait]
+impl Tool for Hang {
+    fn name(&self) -> &str {
+        "hang"
+    }
+
+    fn description(&self) -> &str {
+        "Waits until cancelled."
+    }
+
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: LazyLock<Value> =
+            LazyLock::new(|| json!({"type": "object", "properties": {}}));
+        &PARAMETERS
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        cx.cancel.cancelled().await;
+        Err(ToolError("Operation aborted".into()))
+    }
 }

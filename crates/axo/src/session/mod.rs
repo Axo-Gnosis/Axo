@@ -831,6 +831,9 @@ impl SessionHooks {
         let _live = self.live();
         if self.auto_paused.swap(paused, Ordering::AcqRel) != paused {
             let _ = self.events.send(SessionEvent::AutoPaused { paused });
+            if let Some(team) = self.child.as_ref().and_then(|child| child.team.as_ref()) {
+                team.bump();
+            }
         }
     }
 

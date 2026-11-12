@@ -103,6 +103,28 @@ pub(crate) fn derived_name(root: &Path, path: &Path) -> String {
     parts.join(":")
 }
 
+/// The name of a skill directory `dir` with no frontmatter `name`: its path relative
+/// to `root` with directory components joined by `:` (`plan/roadmap` → `plan:roadmap`,
+/// `next.js` → `next.js`). A directory outside `root` (or `root` itself) falls back to
+/// `dir.file_name()`.
+pub(crate) fn derived_dir_name(root: &Path, dir: &Path) -> String {
+    let Some(relative) = dir
+        .strip_prefix(root)
+        .ok()
+        .filter(|relative| relative.components().next().is_some())
+    else {
+        return dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    };
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 fn length_problem(name: &str) -> Option<String> {
     let length = name.chars().count();
     (length > MAX_NAME_LENGTH)
@@ -175,5 +197,15 @@ mod tests {
         assert_eq!(derived_name(root, &root.join("plan.md")), "plan");
         assert_eq!(derived_name(root, &root.join("review")), "review");
         assert_eq!(derived_name(root, Path::new("/elsewhere/x.md")), "x");
+        assert_eq!(derived_dir_name(root, &root.join("review")), "review");
+        assert_eq!(
+            derived_dir_name(root, &root.join("plan/roadmap")),
+            "plan:roadmap"
+        );
+        assert_eq!(derived_dir_name(root, &root.join("next.js")), "next.js");
+        assert_eq!(
+            derived_dir_name(root, Path::new("/elsewhere/next.js")),
+            "next.js"
+        );
     }
 }
