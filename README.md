@@ -112,6 +112,8 @@ Without `.config(..)`, sessions run on default settings with no project layer. W
 
 `AxoBuilder::name("axome")?` renames the docs scheme and section and the bundled `SYSTEM`/`SUMMARY` self-references; the default is `axo`. Prompt overrides remain verbatim, and crate names do not change.
 
+Hosts can list provider metadata with `Models::providers()` and inspect credential provenance with `Models::credential_source()` without exposing secrets, validating keys, or refreshing OAuth tokens. See [Models & Credentials](crates/axo/docs/configuration.md#models-axo_aimodelsconfig--credentials).
+
 Durable server hosts can opt into cgroup supervision (`Supervision::Cgroup`), where commands run in cgroup v2 jobs and the host routes arguments in `main` to `axo::exec::supervisor::run`. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) for the synchronous routing `main` example and failure details.
 
 ---

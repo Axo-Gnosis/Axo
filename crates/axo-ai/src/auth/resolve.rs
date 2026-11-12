@@ -7,6 +7,7 @@ use futures::FutureExt;
 
 use crate::auth::{Credential, CredentialStore, ModelAuth, codex};
 use crate::error::Error;
+use crate::models::CredentialSource;
 use crate::types::now_ms;
 
 /// What `resolve_auth` needs to know about one provider.
@@ -102,6 +103,34 @@ fn env_name_prefix_len(text: &str) -> usize {
         .count()
 }
 
+fn env_credential(
+    info: &ProviderAuth,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<(&str, String)> {
+    info.env.iter().find_map(|name| {
+        env(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| (name.as_str(), value))
+    })
+}
+
+pub(crate) async fn credential_source(
+    info: &ProviderAuth,
+    store: &dyn CredentialStore,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<CredentialSource, Error> {
+    if info.config_api_key.is_some() {
+        return Ok(CredentialSource::Config);
+    }
+    Ok(match store.get(&info.id).await? {
+        Some(Credential::ApiKey { .. }) => CredentialSource::ApiKey,
+        Some(Credential::Oauth { .. }) => CredentialSource::Oauth,
+        None => env_credential(info, env)
+            .map(|(name, _)| CredentialSource::Env(name.to_owned()))
+            .unwrap_or(CredentialSource::None),
+    })
+}
+
 /// Resolves config keys and headers together, then falls back to stored credentials
 /// (refreshing OAuth tokens that expire within 5 minutes) and provider environment variables.
 pub(crate) async fn resolve_auth(
@@ -143,10 +172,7 @@ pub(crate) async fn resolve_auth(
     auth.api_key = match stored {
         Some(Credential::ApiKey { key }) => Some(key),
         Some(Credential::Oauth { access, .. }) => Some(access),
-        None => info
-            .env
-            .iter()
-            .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty())),
+        None => env_credential(&info, |name| std::env::var(name).ok()).map(|(_, value)| value),
     };
     if auth.api_key.is_none() && info.requires_key {
         return Err(Error::NoApiKey {
@@ -195,4 +221,113 @@ async fn refresh(
     })
     .await
     .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
+
+    #[tokio::test]
+    async fn credential_sources_follow_auth_order_without_resolving_or_refreshing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
+        let mut info = ProviderAuth {
+            id: "custom".into(),
+            config_api_key: Some("!must not execute".into()),
+            env: vec!["EMPTY".into(), "FIRST".into(), "SECOND".into()],
+            requires_key: false,
+        };
+        let env = |name: &str| {
+            Some(
+                if name == "EMPTY" {
+                    ""
+                } else {
+                    "environment-key"
+                }
+                .to_owned(),
+            )
+        };
+        store
+            .set(
+                &info.id,
+                Credential::ApiKey {
+                    key: "stored".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            credential_source(&info, store.as_ref(), env).await.unwrap(),
+            CredentialSource::Config
+        );
+        info.config_api_key = None;
+        assert_eq!(
+            credential_source(&info, store.as_ref(), env).await.unwrap(),
+            CredentialSource::ApiKey
+        );
+        let expired = Credential::Oauth {
+            access: "expired".into(),
+            refresh: "must not refresh".into(),
+            expires: 0,
+            extra: Default::default(),
+        };
+        store.set(&info.id, expired.clone()).await.unwrap();
+        assert_eq!(
+            credential_source(&info, store.as_ref(), env).await.unwrap(),
+            CredentialSource::Oauth
+        );
+        assert_eq!(store.get(&info.id).await.unwrap(), Some(expired));
+        store.remove(&info.id).await.unwrap();
+        assert_eq!(
+            credential_source(&info, store.as_ref(), env).await.unwrap(),
+            CredentialSource::Env("FIRST".into())
+        );
+        assert_eq!(
+            credential_source(&info, store.as_ref(), |_| Some(String::new()))
+                .await
+                .unwrap(),
+            CredentialSource::None
+        );
+        assert_eq!(
+            credential_source(&info, store.as_ref(), |_| None)
+                .await
+                .unwrap(),
+            CredentialSource::None
+        );
+
+        let models = Models::load(ModelsOptions {
+            cache_dir: None,
+            extended_context: false,
+            config: ModelsConfig::parse_jsonc(r#"{"providers":{"custom":{}}}"#).unwrap(),
+            credentials: store,
+            http_client: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            models.credential_source("custom").await.unwrap(),
+            CredentialSource::None
+        );
+        assert!(matches!(
+            models.credential_source("unknown").await,
+            Err(Error::Config(message)) if message == "unknown provider: unknown"
+        ));
+        let providers = models.providers();
+        assert!(providers.windows(2).all(|pair| pair[0].id < pair[1].id));
+        let custom = providers.iter().find(|info| info.id == "custom").unwrap();
+        assert!(custom.env.is_empty());
+        assert!(!custom.requires_key);
+        assert!(!custom.oauth);
+        assert!(
+            providers
+                .iter()
+                .any(|info| info.id == codex::PROVIDER && info.oauth)
+        );
+        assert!(
+            providers
+                .iter()
+                .all(|info| info.oauth == (info.id == codex::PROVIDER))
+        );
+    }
 }

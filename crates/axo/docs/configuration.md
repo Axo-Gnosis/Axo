@@ -388,6 +388,8 @@ The host builds `Models` and passes it to `Axo::builder`; axo never loads models
   3. The provider's `env` variable names from the models.dev catalog (for example `$ANTHROPIC_API_KEY`).
   4. Custom providers absent from the catalog may run without an API key, including those using `"anthropic-messages"`. There is no per-request API-key override; `Models::auth(&model)` uses the same provider-owned resolution.
 
+Hosts can inspect every known provider with `Models::providers()`, which returns `ProviderInfo` sorted by ID, including environment variable names, whether a key is required, and whether Codex OAuth is supported. `Models::credential_source(provider)` returns `CredentialSource` in the same precedence order: config key, stored API key or OAuth credential, first non-empty environment variable (with its name), or none. It reads the current credential store but never resolves config values, refreshes tokens, validates credentials, or makes network requests; an unknown provider returns `Error::Config`.
+
 ### Tool-list capabilities
 
 `Model::tool_support() -> TranscriptToolSupport` is the shared adapter and session capability check for changing tools after the first request without losing the cached prefix. `TranscriptToolSupport` is exported from `axo_ai`: `None` means a current top-level list only; `Additions` permits later additions; `Changes` also permits removal and redefinition.

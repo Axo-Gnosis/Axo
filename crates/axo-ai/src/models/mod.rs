@@ -18,7 +18,7 @@ use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
 use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions, Streamer};
-use crate::auth::resolve::{ProviderAuth, resolve_auth};
+use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{CredentialStore, ModelAuth};
 use crate::error::Error;
 use crate::event::{AssistantEvent, timed};
@@ -28,6 +28,25 @@ use crate::transform::transform_messages;
 use crate::types::{AssistantMessage, StopReason};
 
 use self::config::{ModelsConfig, merge_compat};
+
+/// Public provider metadata without credential values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInfo {
+    pub id: String,
+    pub env: Vec<String>,
+    pub requires_key: bool,
+    pub oauth: bool,
+}
+
+/// Where a provider's credential comes from, without resolving or validating it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialSource {
+    Config,
+    ApiKey,
+    Oauth,
+    Env(String),
+    None,
+}
 
 pub struct ModelsOptions {
     /// Where `models.dev.json` is cached; `None` runs without the catalog.
@@ -241,6 +260,35 @@ impl Models {
 
     pub fn all(&self) -> impl Iterator<Item = &Model> {
         self.models.iter()
+    }
+
+    /// Every known provider, sorted by id. OAuth is supported only by OpenAI Codex.
+    pub fn providers(&self) -> Vec<ProviderInfo> {
+        let mut providers: Vec<_> = self
+            .providers
+            .values()
+            .map(|info| ProviderInfo {
+                id: info.id.clone(),
+                env: info.env.clone(),
+                requires_key: info.requires_key,
+                oauth: info.id == crate::auth::codex::PROVIDER,
+            })
+            .collect();
+        providers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        providers
+    }
+
+    /// Where the provider's credential would come from now, in auth order.
+    /// Never resolves config values, refreshes OAuth tokens, or validates credentials.
+    pub async fn credential_source(&self, provider: &str) -> Result<CredentialSource, Error> {
+        let info = self
+            .providers
+            .get(provider)
+            .ok_or_else(|| Error::Config(format!("unknown provider: {provider}")))?;
+        credential_source(info, self.credentials.as_ref(), |name| {
+            std::env::var(name).ok()
+        })
+        .await
     }
 
     /// Resolve the key, headers and base-URL override for a request to `model`.

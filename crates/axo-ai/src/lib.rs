@@ -31,7 +31,7 @@ pub use error::Error;
 pub use event::{Accumulator, AssistantEvent};
 pub use model::{ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap};
 pub use models::config::ModelsConfig;
-pub use models::{Models, ModelsOptions};
+pub use models::{CredentialSource, Models, ModelsOptions, ProviderInfo};
 pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use retry::{is_fatal_error, is_retryable_error};
 #[cfg(feature = "testing")]
