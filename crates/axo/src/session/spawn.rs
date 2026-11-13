@@ -22,6 +22,7 @@ use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
 use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
+use crate::coordination::SpawnReceipt;
 use crate::error::Error;
 use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
@@ -91,6 +92,27 @@ pub struct ChildHandle {
     /// The parent's row, `agent_N`.
     pub job: String,
     pub session: Arc<Session>,
+}
+
+impl ChildHandle {
+    pub fn receipt(&self) -> SpawnReceipt {
+        SpawnReceipt::Child {
+            job: self.job.clone(),
+        }
+    }
+}
+
+impl TeamHandle {
+    pub fn receipt(&self) -> SpawnReceipt {
+        SpawnReceipt::Team {
+            team: self.team.clone(),
+            jobs: self
+                .members
+                .iter()
+                .map(|(name, child)| (name.clone(), child.job.clone()))
+                .collect(),
+        }
+    }
 }
 
 /// Host spawn policy; hooks run in order, the first `Block` wins and `Replace` feeds the next hook.
@@ -990,7 +1012,10 @@ fn single_output(id: String) -> ToolOutput {
                 "Spawned {id}. It works in the background; its result arrives as a message when it finishes. Read agent://{id} for its status; use send to give it a follow-up."
             ),
         }],
-        details: Some(json!({"job": id})),
+        details: Some(
+            serde_json::to_value(SpawnReceipt::Child { job: id })
+                .expect("serializable spawn receipt"),
+        ),
         ..ToolOutput::default()
     }
 }
@@ -1008,7 +1033,13 @@ fn team_output(team: &str, members: impl Iterator<Item = (String, String)>) -> T
                 "Spawned team {team}: {list}. Members work in the background and can message each other; each member's result arrives as a message when it finishes. Read agent://<id> for a member's status; use send to message one."
             ),
         }],
-        details: Some(json!({"team": team, "jobs": jobs})),
+        details: Some(
+            serde_json::to_value(SpawnReceipt::Team {
+                team: team.to_owned(),
+                jobs,
+            })
+            .expect("serializable spawn receipt"),
+        ),
         ..ToolOutput::default()
     }
 }

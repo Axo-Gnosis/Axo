@@ -61,6 +61,14 @@ pub(crate) fn ledger_access(result: &ToolResultMessage) -> Option<(String, FileA
 pub struct FileLedger(Mutex<HashMap<PathBuf, String>>);
 
 impl FileLedger {
+    /// Copies the session's recorded hashes without touching disk or changing freshness.
+    pub fn snapshot(&self) -> HashMap<PathBuf, String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The SHA-256 of `content`, base64url without padding.
     pub fn hash(content: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(&Sha256::digest(content)[..])

@@ -20,6 +20,7 @@ fn project(origin: &str, system: &str, settings: Option<Value>) -> ConfigLayer {
     ConfigLayer {
         origin: origin.into(),
         settings,
+        skill_roots: Vec::new(),
         agent_roots: Vec::new(),
         mode_roots: Vec::new(),
         keyword_roots: Vec::new(),

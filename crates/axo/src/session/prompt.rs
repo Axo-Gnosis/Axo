@@ -395,7 +395,92 @@ impl SessionHooks {
     }
 }
 
+/// Builder state and transcript state are intentionally separate; neither is a wire receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptInspection {
+    /// Most recent local build, possibly awaiting recording.
+    pub latest_built: Option<indexmap::IndexMap<String, String>>,
+    /// Sections replayed from the currently selected recorded transcript.
+    pub recorded: Option<indexmap::IndexMap<String, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFilesInspection {
+    /// Startup loader inventory. Overrides may omit these from `project_context`.
+    pub startup: Vec<ContextFile>,
+    /// Nested instruction blocks remaining in the selected transcript's tool results.
+    /// Compaction/navigation may remove previously loaded files.
+    pub projected_nested: Vec<ContextFile>,
+}
+
 impl Session {
+    /// Inspects local builder and recorded prompt state without rebuilding or I/O.
+    pub fn inspect_prompt(&self) -> PromptInspection {
+        let view = self.hooks.journal.view();
+        let recorded =
+            axo_ai::transcript::replay_system_message(view.projection.messages.iter().filter_map(
+                |message| match message {
+                    AgentMessage::Llm(Message::System(system)) => Some(system),
+                    _ => None,
+                },
+            ))
+            .map(|system| {
+                system
+                    .sections
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(name, body)| body.map(|body| (name, body)))
+                    .collect()
+            });
+        PromptInspection {
+            latest_built: self.hooks.prompt.sections(),
+            recorded,
+        }
+    }
+
+    /// Inspects loaded startup files and recorded nested blocks, never rereading disk.
+    /// This is not the set of files guaranteed to appear in a provider request.
+    pub fn context_files(&self) -> ContextFilesInspection {
+        let startup = self
+            .hooks
+            .prompt
+            .shape
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .context_files
+            .clone();
+        let view = self.hooks.journal.view();
+        let projected_nested = view
+            .projection
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Llm(Message::ToolResult(result)) => Some(result),
+                _ => None,
+            })
+            .flat_map(|result| &result.content)
+            .filter_map(|block| {
+                let axo_ai::UserBlock::Text { text } = block else {
+                    return None;
+                };
+                let (path, content) = ContextFile::parse(text)?;
+                Some(ContextFile {
+                    path,
+                    content: content.to_owned(),
+                })
+            })
+            .collect();
+        ContextFilesInspection {
+            startup,
+            projected_nested,
+        }
+    }
+
+    /// Read-only copy of recorded full-file hashes, keyed by canonical file path.
+    pub fn file_ledger(&self) -> std::collections::HashMap<PathBuf, String> {
+        self.hooks.tools.ledger.snapshot()
+    }
+
     /// Drops the cached project environment and resolves it again now. When its prompt
     /// note or the date changed, the prompt diff reaches the model before its next request.
     pub async fn reload_exec_env(&self) {

@@ -305,9 +305,9 @@ impl ProjectSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectFiles {
-    /// Project `.agents/skills`.
+    /// Project `.agents/skills` discovery and explicit project skill roots.
     pub skills: bool,
-    /// The host's project layer (`ConfigSource::project`): its settings and prompt overrides.
+    /// Acquisition of the host's project layer (`ConfigSource::project`).
     pub config: bool,
 }
 
@@ -408,6 +408,9 @@ pub struct ConfigLayer {
     pub settings: Option<Value>,
     /// Overrides keyed by a `PROMPT_NAMES` entry. A missing key means no override; an empty text is an override.
     pub prompts: IndexMap<String, PromptOverride>,
+    /// Skill roots searched after project `.agents/skills` and before home fallback.
+    /// Project roots precede user roots at `Read` or `Trust` when `project.files.skills` is enabled.
+    pub skill_roots: Vec<PathBuf>,
     /// Agent definition roots, walked recursively for `*.md`. On the project layer
     /// they are honored only at `ProjectAccess::Trust`.
     pub agent_roots: Vec<PathBuf>,
@@ -421,8 +424,6 @@ pub struct ConfigLayer {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UserConfig {
     pub layer: ConfigLayer,
-    /// Skill roots searched after project `.agents/skills` and before `~/.agents/skills`.
-    pub skill_roots: Vec<PathBuf>,
     /// Context files loaded after `~/.agents/AGENTS.md` and before the project walk; missing files are skipped.
     pub context_files: Vec<PathBuf>,
 }
@@ -448,6 +449,7 @@ pub struct EffectiveConfig {
     pub settings: Settings,
     /// Trimmed. The project's override wins per name.
     pub prompts: IndexMap<String, PromptOverride>,
+    /// Allowed project skill roots, followed by user skill roots.
     pub skill_roots: Vec<PathBuf>,
     /// Trusted project agent roots, followed by user agent roots.
     pub agent_roots: Vec<PathBuf>,
@@ -473,7 +475,6 @@ impl EffectiveConfig {
 
         let UserConfig {
             layer: user,
-            skill_roots,
             context_files,
         } = source.user()?;
         let mut merged = json!({ "contextFiles": default_context_files() });
@@ -489,11 +490,15 @@ impl EffectiveConfig {
 
         let mut project_origin = None;
         let mut dev_shell_from_project = false;
+        let mut skill_roots = Vec::new();
         let mut agent_roots = Vec::new();
         let mut mode_roots = Vec::new();
         let mut keyword_roots = Vec::new();
         if access != ProjectAccess::Ignore && policy.files.config {
             let project = source.project(cwd)?;
+            if policy.files.skills {
+                skill_roots.extend(project.skill_roots);
+            }
             if access == ProjectAccess::Trust {
                 agent_roots.extend(project.agent_roots);
             } else if !project.agent_roots.is_empty() {
@@ -518,6 +523,7 @@ impl EffectiveConfig {
             }
             prompts.extend(prompt_overrides(project.prompts)?);
         }
+        skill_roots.extend(user.skill_roots);
         agent_roots.extend(user.agent_roots);
         mode_roots.extend(user.mode_roots);
         keyword_roots.extend(user.keyword_roots);

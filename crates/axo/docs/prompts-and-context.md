@@ -2,6 +2,8 @@
 
 `axo` represents the system prompt and tool set as `SystemMessage` entries inside the transcript (`crates/axo/src/context/prompt.rs`). Replaying the transcript reconstructs the exact prompt and tool definitions at any point in a session, and mid-session updates emit a diff `SystemMessage` containing only changed sections (`Some(rendered)`) or removed sections (`None`).
 
+Hosts inspect this without rebuilding or I/O through `Session::inspect_prompt`: `latest_built` is the local builder's latest sections, possibly awaiting recording; `recorded` replays sections from the selected transcript. Neither claims to be the exact provider-wire request. `Session::context_files` separately reports startup loader inventory and nested blocks remaining in projected tool results; section overrides can hide loaded startup files. `Session::file_ledger` exposes recorded full-file hashes, not fresh disk reads.
+
 Provider requests use `Transcript::new` with the system prompt and tool declarations already carried by `Message::System` entries. Construction removes failed or aborted assistant turns and their tool results from the request; the persisted session history retains them.
 
 Start-time diagnostics for context files, skills, agent and mode definitions, tool allowlists, schemes and bundled docs, prompt overrides, host sections, and reserved or hidden command names remain available to the host through `session.diagnostics()` (`&[Diagnostic]`) and are still logged as warnings. Runtime `NestedContext` read errors are only logged, not retained in this startup snapshot.
@@ -263,7 +265,7 @@ When any modes are loaded for a root, host direct or deferred tools named `yield
 
 ### Mode notices and call-time limits
 
-`Session::mode()` returns the selected mode, including a selection waiting for the next request boundary. Selection alone does not start a model run. A change during an in-flight request leaves that request's tool batch under the previous effective mode. At the next boundary, the selected mode becomes effective and is exposed through `ToolScope::mode` and to the model's `spawn` calls through `SpawnContext::mode`. Host spawns apply the selected mode immediately.
+`Session::mode()` returns the selected mode; `Session::effective_mode()`, `LiveSnapshot::effective_mode`, and `SessionEvent::EffectiveMode` expose the boundary-effective mode. Selection alone does not start a run or change an in-flight tool batch's policies. At the next boundary it becomes effective for `ToolScope::mode` and model `spawn` through `SpawnContext::mode`. Host spawns apply the selected mode immediately.
 
 Instructions enter context as a persisted `Entry::CustomMessage` of reserved type `mode_notice`, with `display: false` and `details: {"mode": "<name>"}` (null on exit), not as a replacement system section. Before each request, reconciliation compares the effective name with the most recent projected mode notice's name. It does not compare bodies or hashes. If compaction removes the notice, the next request reannounces an active mode; if the latest notice still names the effective mode, no duplicate is appended.
 
@@ -371,7 +373,7 @@ The change is persistent: like `/model`, it journals `Entry::ModelChange` (or `E
 
 `load_skills` scans roots in this order (child sessions reuse their parent's loaded skills instead of discovering again):
 1. `<dir>/.agents/skills` for each directory from `cwd` up to `project_root(cwd)` (when `project` is `true` and `project.files.skills` is `true`).
-2. The host's `UserConfig::skill_roots`, in order.
+2. The host's `ConfigLayer::skill_roots`: allowed project roots first, then user roots, preserving each layer's order. Project roots require `Read` or `Trust`, the user's `project.files.skills`, and project-layer acquisition through `project.files.config`; user roots are unaffected by these gates.
 3. `~/.agents/skills` (when `home_agents_dir` is `true`).
 
 Within each root:
@@ -489,7 +491,7 @@ This is a filesystem write boundary, not a general sandbox: a read-only command 
 
 `wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. Any tool batch containing `wait` runs one call at a time, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
 
-When results are returned, `details: {"jobs": ["bg_1", "agent_2/3", …]}` identifies the individual messages consumed, just like automatic `job_result` delivery. Message text remains in the tool result and corresponding journal entries.
+Successful waits serialize `WaitReceipt` into details: `{"reason":"results","jobs":["bg_1","agent_2/3",…]}` identifies consumed messages; `reason` is `mail`, `interrupted` (steer), or `idle` for other wake paths, with empty `jobs` omitted. Stop and mutual-wait errors remain errors. Message text stays in the tool result and journal entries.
 
 Incoming teammate mail also wakes `wait`. With no row results to return, it responds `New messages arrived; they follow this result.`; the queued mail is delivered immediately after the tool batch, not embedded in that tool result. Outside a team, no running admitted jobs and no mail returns `No background jobs are running.` immediately.
 
@@ -532,12 +534,12 @@ Reads never consume pending deliveries. Every agent write fails with `<url> is r
 
 | Destination | Behavior |
 | :--- | :--- |
-| `send {"to":"agent_1","message":"…"}` | Uses `Session::follow_up`, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_1. Its reply arrives as a new result.` |
-| `send {"to":"agent_1","message":"…","steer":true}` | Uses `Session::steer`, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_1: it reads your message after its current tool calls.` |
+| `send {"to":"agent_1","message":"…"}` | Routes a durable child follow-up, reviving a parked child if needed. An idle child starts a run; an active one queues the message until it would otherwise finish. Returns `Sent to agent_1. Its reply arrives as a new result.` |
+| `send {"to":"agent_1","message":"…","steer":true}` | Routes a durable child steer, reviving a parked child if needed. Read after the current tool calls finish; an idle child starts a run. Returns `Steered agent_1: it reads your message after its current tool calls.` |
 | `send {"to":"parent","message":"…"}` | Sends a mid-run note without ending the child's run; returns `Sent to your parent.`. Delivery is at the parent's next turn boundary or through `wait`, never a steer; an idle parent wakes subject to its Stop latch |
 | `send {"to":"reviewer","message":"…"}` | Sends durable mail to that teammate in the sender's roster; returns `Sent to reviewer.`. Mail is read at the next turn boundary, wakes `wait`, and starts an idle receiver's run unless the receiver is auto-paused, where it stays unread until the receiver's user input or `Session::resume_wakes`. It never steers or waits for completion |
 
-Every successful send carries `details: {"to": "<to>", "kind": "<kind>"}`, where `kind` is `followUp` (child without `steer`), `steer` (child with `steer: true`), `note` (`parent`), or `mail` (teammate).
+Every successful send serializes `SendReceipt`: `{"to":"<to>","kind":"<kind>","sessionId":"<destination session>","receipt":{"type":"submission"|"message","id":"…"}}`. `kind` is `followUp`, `steer`, `note`, or `mail`; the identity names the saved submission or parent's job-message reference. Hosts use `Session::send` with identical routing. Child inputs and teammate mail retain originating-session `SubmissionProvenance`; see [Coordination receipts](extending.md#coordination-receipts).
 
 Blank text fails with `message must not be blank`. Steering a non-child destination fails with `Only your subagents can be steered; send to <to> without steer.`. An unknown child id reports `No agent <id>`. Parent errors distinguish `This session has no parent.`, `Your parent session is not open; nothing was sent.`, and `Your parent no longer tracks this session; nothing was sent.`; roots and forks have no parent route. Self-mail fails with `You are <to>; send to a teammate or to parent.`. Other unknown destinations report `No agent named <to>. Your subagents are agent_N`, followed by the available parent and teammate routes. Non-team children cannot message siblings by name.
 

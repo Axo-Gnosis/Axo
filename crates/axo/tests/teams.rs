@@ -155,29 +155,56 @@ async fn team_members_message_each_other_and_the_parent() {
     assert_eq!(handle.members[0].0, "a");
     assert_eq!(handle.members[1].0, "b");
     let a_lines = journal(&handle.members[0].1.session);
-    for (call, text, details) in [
-        ("w1", "Sent to b.", json!({"to": "b", "kind": "mail"})),
+    let b_lines = journal(&handle.members[1].1.session);
+    let mail = only(&b_lines, "mail submission", |v| {
+        v["type"] == "submission" && v["kind"] == "mail"
+    });
+    for (call, text, expected) in [
+        (
+            "w1",
+            "Sent to b.",
+            axo::SendReceipt {
+                to: "b".into(),
+                kind: axo::SendKind::Mail,
+                session_id: handle.members[1].1.session.id().into(),
+                receipt: axo::SendIdentity::Submission(
+                    b_lines[mail]["submissionId"].as_str().unwrap().into(),
+                ),
+            },
+        ),
         (
             "w2",
             "Sent to your parent.",
-            json!({"to": "parent", "kind": "note"}),
+            axo::SendReceipt {
+                to: "parent".into(),
+                kind: axo::SendKind::Note,
+                session_id: parent.id().into(),
+                receipt: axo::SendIdentity::Message("agent_1".into()),
+            },
         ),
     ] {
         let sent = only(&a_lines, "send result", |v| {
             v["type"] == "message" && v["message"]["toolCallId"] == call
         });
         assert_eq!(message_text(&a_lines[sent]), text);
-        assert_eq!(a_lines[sent]["message"]["details"], details);
+        let receipt: axo::SendReceipt =
+            serde_json::from_value(a_lines[sent]["message"]["details"].clone()).unwrap();
+        assert_eq!(receipt, expected);
         assert!(
             !a_lines[sent]["message"]["isError"]
                 .as_bool()
                 .unwrap_or(false)
         );
     }
-    let b_lines = journal(&handle.members[1].1.session);
-    let mail = only(&b_lines, "mail submission", |v| {
-        v["type"] == "submission" && v["kind"] == "mail"
-    });
+    assert_eq!(b_lines[mail]["sender"], "a");
+    assert_eq!(
+        b_lines[mail]["provenance"],
+        json!({
+            "sessionId": handle.members[0].1.session.id(),
+            "route": "mail",
+            "name": "a",
+        })
+    );
     assert_eq!(
         b_lines[mail]["parts"][0]["text"],
         "Message from a (reply with send to \"a\"):\n\nhello b"

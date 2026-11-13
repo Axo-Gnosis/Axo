@@ -7,8 +7,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use axo::{
-    BashAccess, Command, Entry, EntryId, HostTool, ModeResult, ModeSpec, ResultResolution,
-    SessionEvent, SessionOptions, SessionTools, ToolFactory, ToolLimits, ToolPolicy, ToolScope,
+    AcceptResultOptions, BashAccess, Command, Entry, EntryId, HostTool, ModeResult, ModeSpec,
+    ResultResolution, SessionEvent, SessionOptions, SessionTools, ToolFactory, ToolLimits,
+    ToolPolicy, ToolScope,
 };
 use axo_agent::{
     AgentMessage, BeforeToolCallContext, Tool, ToolCallDecision, ToolContext, ToolError, ToolOutput,
@@ -846,7 +847,9 @@ async fn pending_review_survives_reopening_and_records_its_outcome() {
                 .unwrap();
             ("revised", ResultResolution::Revised)
         } else {
-            reopened.accept_result("final", None).unwrap();
+            reopened
+                .accept_result("final", AcceptResultOptions::default())
+                .unwrap();
             ("accepted", ResultResolution::Accepted)
         };
         result_resolved(&mut events, "final", resolution).await;
@@ -854,10 +857,19 @@ async fn pending_review_survives_reopening_and_records_its_outcome() {
         assert_eq!(reopened.mode().is_some(), revise);
         let result = only_result(&journal(&reopened), "final");
         assert_eq!(result["isError"], false);
-        assert_eq!(
-            result["details"],
-            json!({"mode":"plan","outcome":outcome,"result":{"plan":"ready"}})
-        );
+        assert_eq!(result["details"]["mode"], "plan");
+        assert_eq!(result["details"]["outcome"], outcome);
+        assert_eq!(result["details"]["result"], json!({"plan":"ready"}));
+        if !revise {
+            assert_eq!(
+                result["details"]["original_result"],
+                json!({"plan":"ready"})
+            );
+            assert_eq!(
+                result["details"]["accepted_result"],
+                json!({"plan":"ready"})
+            );
+        }
         reopened.shutdown().await;
     }
 }
@@ -934,8 +946,26 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
         json!({"plan":"revised draft"})
     );
     assert!(common::tool_text(&attached.missed, "draft").contains("Include rollback."));
+    assert!(
+        session
+            .accept_result(
+                "revised",
+                AcceptResultOptions {
+                    replacement: Some(json!({"plan": 123})),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(session.attach(None).await.live.pending_results.len(), 1);
     session
-        .accept_result("revised", Some("Go implement it.".into()))
+        .accept_result(
+            "revised",
+            AcceptResultOptions {
+                replacement: Some(json!({"plan": "host edited plan"})),
+                message: Some("Go implement it.".into()),
+            },
+        )
         .unwrap();
     result_resolved(&mut events, "revised", ResultResolution::Accepted).await;
     within(run).await.unwrap().unwrap();
@@ -948,6 +978,16 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
     let attached = session.attach(None).await;
     assert!(attached.live.pending_results.is_empty());
     assert!(common::tool_text(&attached.missed, "revised").contains("Go implement it."));
+    let result = only_result(&journal(&session), "revised");
+    assert_eq!(
+        result["details"]["original_result"],
+        json!({"plan":"revised draft"})
+    );
+    assert_eq!(
+        result["details"]["accepted_result"],
+        json!({"plan":"host edited plan"})
+    );
+    assert!(common::tool_text(&attached.missed, "revised").contains("host edited plan"));
     let requests = host.api.requests();
     assert_eq!(requests.len(), 3);
     assert!(
@@ -957,6 +997,23 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
             .any(|message| { user_text(message).contains("Mode \"plan\" has ended") })
     );
     session.shutdown().await;
+    let path = session.path().to_path_buf();
+    drop(session);
+    let reopened = host
+        .axo
+        .open_session(&path, result_options(dir.path(), true, None))
+        .await
+        .unwrap();
+    let recorded = only_result(&journal(&reopened), "revised");
+    assert_eq!(
+        recorded["details"]["original_result"],
+        json!({"plan":"revised draft"})
+    );
+    assert_eq!(
+        recorded["details"]["accepted_result"],
+        json!({"plan":"host edited plan"})
+    );
+    reopened.shutdown().await;
 }
 
 #[tokio::test]
@@ -999,7 +1056,9 @@ async fn accepting_without_a_continuation_ends_the_run() {
             true
         )
     );
-    session.accept_result("final-plan", None).unwrap();
+    session
+        .accept_result("final-plan", AcceptResultOptions::default())
+        .unwrap();
     result_resolved(&mut events, "final-plan", ResultResolution::Accepted).await;
     within(run).await.unwrap().unwrap();
     assert!(session.mode().is_none());
@@ -1096,7 +1155,9 @@ async fn configured_result_continuation_runs_after_reviewed_and_unreviewed_yield
             )
         );
         if review {
-            session.accept_result("final-plan", None).unwrap();
+            session
+                .accept_result("final-plan", AcceptResultOptions::default())
+                .unwrap();
             result_resolved(&mut events, "final-plan", ResultResolution::Accepted).await;
         }
         within(run).await.unwrap().unwrap();

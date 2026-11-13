@@ -931,7 +931,7 @@ async fn host_job_api_reports_and_kills() {
     );
 
     let before_kill = last_seq(&session).await;
-    assert!(session.kill_job("bg_1"));
+    assert!(session.kill_job("bg_1").stopping);
     common::delivered(&session, "bg_1").await;
     until(|| {
         session.jobs().iter().any(|job| {
@@ -958,12 +958,12 @@ async fn host_job_api_reports_and_kills() {
     await_jobs(&mut events, &mut rows, &failed).await;
     // The result lands before the container closes; once closed, nothing is left to stop.
     let deadline = Instant::now() + Duration::from_secs(3);
-    while session.kill_job("bg_1") {
+    while session.kill_job("bg_1").stopping {
         assert!(Instant::now() < deadline, "bg_1 never closed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!session.kill_job("bg_9"), "unknown job");
-    assert!(!session.kill_job("x"), "invalid id");
+    assert!(!session.kill_job("bg_9").stopping, "unknown job");
+    assert!(!session.kill_job("x").stopping, "invalid id");
 
     // `proc://` renders the same states as before the host API existed.
     assert_eq!(

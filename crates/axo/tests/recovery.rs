@@ -77,6 +77,7 @@ impl Log {
             parts,
             request_id: None,
             sender: None,
+            provenance: None,
             custom: None,
         })
     }
@@ -534,7 +535,10 @@ fn once_only_task() -> String {
 
 async fn retry(events: &mut broadcast::Receiver<SessionEvent>) -> (u32, u64) {
     loop {
-        if let SessionEvent::Retry { attempt, delay_ms } = events.recv().await.unwrap() {
+        if let SessionEvent::Retry {
+            attempt, delay_ms, ..
+        } = events.recv().await.unwrap()
+        {
             return (attempt, delay_ms);
         }
     }

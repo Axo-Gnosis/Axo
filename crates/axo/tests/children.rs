@@ -1030,8 +1030,8 @@ async fn kill_before_child_run_starts_aborts_it() {
     until(|| host.api.requests().iter().any(|r| r.model.id == "child")).await;
     // Claimed, but waiting for the only run slot: no agent run exists yet.
     let queued = parent.spawn(request("queued")).await.unwrap();
-    assert!(parent.kill_job(&queued.job));
-    assert!(parent.kill_job(&held.job));
+    assert!(parent.kill_job(&queued.job).stopping);
+    assert!(parent.kill_job(&held.job).stopping);
     entry(&queued.session, |entry| {
         matches!(entry, Entry::RunEnd { .. })
     })
@@ -1065,14 +1065,26 @@ async fn steer_right_after_spawn_keeps_the_task_first() {
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ok")); 2],
+        vec![ScriptedTurn::Reply(reply_text("ok")); 8],
     )
     .await;
     host.api
-        .lane("child", vec![ScriptedTurn::Reply(reply_text("done")); 2]);
+        .lane("child", vec![ScriptedTurn::Reply(reply_text("done")); 4]);
     let parent = host.axo.create_session(options(dir.path())).await.unwrap();
     let handle = parent.spawn(request("the task")).await.unwrap();
-    handle.session.steer("extra").await.unwrap();
+    let sent = parent.send(&handle.job, "extra", true).await.unwrap();
+    assert_eq!(sent.session_id, handle.session.id());
+    assert_eq!(sent.kind, axo::SendKind::Steer);
+    let axo::SendIdentity::Submission(id) = sent.receipt else {
+        panic!("child steer must identify its durable submission");
+    };
+    let lines = journal(&handle.session);
+    let submitted = only(&lines, "routed steer", |v| {
+        v["type"] == "submission" && v["submissionId"] == id
+    });
+    assert_eq!(lines[submitted]["provenance"]["sessionId"], parent.id());
+    assert_eq!(lines[submitted]["provenance"]["route"], "steer");
+    assert!(lines[submitted].get("sender").is_none());
     delivered(&parent, "agent_1").await;
     let requests = host.api.requests();
     let first = requests
@@ -1080,5 +1092,31 @@ async fn steer_right_after_spawn_keeps_the_task_first() {
         .find(|r| r.model.id == "child")
         .expect("a child request");
     assert!(request_text(first).contains("the task"));
+    let sent = parent.send(&handle.job, "follow-up", false).await.unwrap();
+    assert_eq!(sent.kind, axo::SendKind::FollowUp);
+    let axo::SendIdentity::Submission(id) = sent.receipt else {
+        panic!("child follow-up must identify its durable submission");
+    };
+    let lines = journal(&handle.session);
+    let submitted = only(&lines, "routed follow-up", |v| v["submissionId"] == id);
+    assert_eq!(lines[submitted]["provenance"]["sessionId"], parent.id());
+    assert_eq!(lines[submitted]["provenance"]["route"], "followUp");
+    assert!(lines[submitted].get("sender").is_none());
+    let sent = handle
+        .session
+        .send("parent", "a note", false)
+        .await
+        .unwrap();
+    assert_eq!(sent.session_id, parent.id());
+    assert_eq!(sent.kind, axo::SendKind::Note);
+    let axo::SendIdentity::Message(id) = sent.receipt else {
+        panic!("parent note must identify its durable result message");
+    };
+    let lines = journal(&parent);
+    let note = only(&lines, "routed note", |v| {
+        v["type"] == "job_end" && v["jobId"] == id
+    });
+    assert_eq!(lines[note]["text"], "a note");
+    assert_eq!(lines[note]["note"], true);
     parent.shutdown().await;
 }

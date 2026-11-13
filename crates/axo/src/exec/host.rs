@@ -44,13 +44,43 @@ pub fn find_on_path(name: &str, env: &EnvMap, cwd: &Path) -> Option<PathBuf> {
         })
 }
 
-async fn pump(mut reader: impl AsyncRead + Unpin + Send + 'static, tx: mpsc::Sender<Vec<u8>>) {
+/// Origin of captured bytes. Historical logs without labels are explicitly merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+    Merged,
+}
+
+/// Raw bytes from one pipe read; cross-pipe ordering is capture order, not process time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputChunk {
+    pub stream: OutputStream,
+    pub bytes: Vec<u8>,
+}
+
+async fn pump(
+    mut reader: impl AsyncRead + Unpin + Send + 'static,
+    stream: OutputStream,
+    tx: mpsc::Sender<io::Result<OutputChunk>>,
+) {
     let mut buf = vec![0; 64 * 1024];
     loop {
         match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
             Ok(n) => {
-                if tx.send(buf[..n].to_vec()).await.is_err() {
+                if tx
+                    .send(Ok(OutputChunk {
+                        stream,
+                        bytes: buf[..n].to_vec(),
+                    }))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -496,10 +526,9 @@ impl Watch {
 }
 
 impl Process {
-    /// Takes the root's piped stdout and stderr and forwards their chunks, interleaved
-    /// as they arrive, into one channel that closes when both pipes reach EOF. Dropping
-    /// the `JoinSet` stops the readers.
-    pub fn capture_output(&mut self) -> (mpsc::Receiver<Vec<u8>>, JoinSet<()>) {
+    /// Takes both pipes and forwards labeled raw chunks in capture order.
+    /// Read errors are delivered explicitly; dropping the `JoinSet` stops the readers.
+    pub fn capture_output(&mut self) -> (mpsc::Receiver<io::Result<OutputChunk>>, JoinSet<()>) {
         capture(self.stdout.take(), self.stderr.take())
     }
 
@@ -593,14 +622,14 @@ impl Drop for Process {
 fn capture(
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
-) -> (mpsc::Receiver<Vec<u8>>, JoinSet<()>) {
+) -> (mpsc::Receiver<io::Result<OutputChunk>>, JoinSet<()>) {
     let (tx, rx) = mpsc::channel(64);
     let mut readers = JoinSet::new();
     if let Some(stdout) = stdout {
-        readers.spawn(pump(stdout, tx.clone()));
+        readers.spawn(pump(stdout, OutputStream::Stdout, tx.clone()));
     }
     if let Some(stderr) = stderr {
-        readers.spawn(pump(stderr, tx));
+        readers.spawn(pump(stderr, OutputStream::Stderr, tx));
     }
     (rx, readers)
 }

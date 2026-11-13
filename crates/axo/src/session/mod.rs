@@ -1,6 +1,7 @@
 //! A conversation with one agent in one working directory, saved as it happens.
 
 pub(crate) mod children;
+pub(crate) mod coordination;
 mod delivery;
 pub(crate) mod journal;
 mod maintenance;
@@ -39,13 +40,15 @@ use tracing::warn;
 use uuid::Uuid;
 
 use self::children::{ChildState, SessionTable, TurnBudget};
-use self::delivery::{Activity, enqueue};
+pub use self::delivery::Activity;
+use self::delivery::{ActivityState, enqueue};
 use self::journal::Journal;
 use self::maintenance::Maintenance;
 pub(crate) use self::modes::MODE_NOTICE;
-pub use self::modes::PendingResult;
+pub use self::modes::{AcceptResultOptions, PendingResult};
 use self::policy::{ModeGate, PolicyHook, ScopeCell, effective_bash};
 pub use self::policy::{ToolPolicy, ToolScope};
+pub use self::prompt::{ContextFilesInspection, PromptInspection};
 use self::prompt::{PromptState, SessionPrompt, ShapeBase, shape};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
@@ -205,6 +208,8 @@ pub enum MaintenanceKind {
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Agent(AgentEvent),
+    /// Authoritative ownership state, including maintenance and navigation.
+    Activity(Activity),
     /// An entry was appended to the session.
     Entry(SeqEntry),
     /// An `ask` call is waiting for `Session::answer` or `Session::dismiss`.
@@ -226,6 +231,9 @@ pub enum SessionEvent {
     Retry {
         attempt: u32,
         delay_ms: u64,
+        max_retries: u32,
+        error: Option<String>,
+        failure: Option<axo_ai::ProviderFailure>,
     },
     /// A listed job appeared or changed.
     Job(JobInfo),
@@ -241,6 +249,10 @@ pub enum SessionEvent {
     },
     /// The selected session mode changed.
     Mode {
+        mode: Option<String>,
+    },
+    /// The selected mode reached a request boundary.
+    EffectiveMode {
         mode: Option<String>,
     },
     /// A mode result, optionally waiting for host review.
@@ -375,6 +387,7 @@ pub struct LiveSnapshot {
     pub thinking: ThinkingLevel,
     pub agent: Option<String>,
     pub mode: Option<String>,
+    pub effective_mode: Option<String>,
     pub context: Option<ContextUsage>,
     pub auto_paused: bool,
 }
@@ -475,7 +488,7 @@ struct SessionHooks {
     /// The live model and thinking level.
     selection: watch::Sender<Selection>,
     /// Who owns the session; `shutdown` waits on it going idle.
-    activity: watch::Sender<Activity>,
+    activity: ActivityState,
     /// Held across a steer or follow-up's write, so the agent queues them in journal order.
     queue_order: tokio::sync::Mutex<()>,
     /// Durable host messages held until a run's next delivery boundary.
@@ -1245,6 +1258,9 @@ impl LoopHooks for SessionHooks {
                     let _ = self.events.send(SessionEvent::Retry {
                         attempt: retries + 1,
                         delay_ms: delay.as_millis() as u64,
+                        max_retries: self.inherited.config.settings.retry.max_retries,
+                        error: response.error_message.clone(),
+                        failure: response.failure.clone(),
                     });
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(Error::MaintenanceAborted),
@@ -1873,7 +1889,7 @@ impl Session {
                     model: model.clone(),
                     thinking,
                 }),
-                activity: watch::Sender::new(Activity::default()),
+                activity: ActivityState::new(events.clone()),
                 queue_order: tokio::sync::Mutex::new(()),
                 quiet: Mutex::new(Vec::new()),
                 selection_order: tokio::sync::Mutex::new(()),
@@ -2177,22 +2193,29 @@ impl Session {
         self.hooks.tools.runner.jobs.list()
     }
 
-    /// Stops job `id` (`bg_N` or `agent_N`), like `kill`; false when unknown
-    /// or no longer running.
-    pub fn kill_job(&self, id: &str) -> bool {
-        JobId::parse(id).is_some_and(|id| {
+    /// Stops job `id` (`bg_N` or `agent_N`), reporting whether it was running.
+    pub fn kill_job(&self, id: &str) -> crate::coordination::KillReceipt {
+        let stopping = JobId::parse(id).is_some_and(|id| {
             self.hooks
                 .tools
                 .runner
                 .jobs
                 .kill(id, crate::jobs::Killer::Host)
-        })
+        });
+        crate::coordination::KillReceipt {
+            id: id.to_owned(),
+            stopping,
+        }
     }
 
     /// Opens a command's flushed raw output, including commands still in the foreground.
     /// A handle remains readable after the command's spool is unlinked.
     pub fn command_output(&self, call_id: &str) -> Option<crate::jobs::CommandOutput> {
-        self.hooks.tools.runner.jobs.command_output(call_id)
+        self.hooks
+            .tools
+            .runner
+            .jobs
+            .command_output(call_id, self.hooks.tools.schemes.artifacts().dir())
     }
 
     /// Requests promotion of a foreground command. A command that finishes first stays foreground.
@@ -2545,6 +2568,12 @@ impl Session {
         self.hooks.context_usage()
     }
 
+    /// Whether a run, maintenance or navigation currently owns the session.
+    /// Observing idle does not reserve it against future submissions or background wakes.
+    pub fn is_running(&self) -> bool {
+        self.hooks.activity.borrow().running
+    }
+
     /// This session's own recorded spend plus every descendant's, maintenance included;
     /// `SessionEvent::TreeUsage` reports changes.
     pub fn tree_usage(&self) -> Usage {
@@ -2559,9 +2588,14 @@ impl Session {
         // job rows announce under the registry lock and tree totals emit under `last_tree`:
         // subscribing inside all four splits every event into before (in the snapshot) or
         // after (received).
+        let activity = self.hooks.activity.borrow();
         self.hooks.journal.read(|view| {
             let live = self.hooks.live();
-            let activity = *self.hooks.activity.borrow();
+            let mode = self
+                .hooks
+                .mode
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let (queued_steering, queued_follow_up) = self.agent.queued();
             let _tree = self
                 .hooks
@@ -2587,7 +2621,8 @@ impl Session {
                     model: self.model(),
                     thinking: self.thinking(),
                     agent: self.agent().map(|spec| spec.name),
-                    mode: self.mode().map(|mode| mode.name.clone()),
+                    mode: mode.selected.as_ref().map(|mode| mode.name.clone()),
+                    effective_mode: mode.effective.as_ref().map(|mode| mode.name.clone()),
                     context: self.hooks.context_usage_for(&view.projection),
                     auto_paused: self.hooks.auto_paused.load(Ordering::Acquire),
                     streaming: live.streaming.as_ref().and_then(Accumulator::snapshot),

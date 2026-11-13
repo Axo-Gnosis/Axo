@@ -386,6 +386,7 @@ fn submission(id: &str, parent: Option<&str>) -> Entry {
         }],
         request_id: None,
         sender: None,
+        provenance: None,
         custom: None,
     }
 }

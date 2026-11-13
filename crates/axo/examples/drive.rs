@@ -447,7 +447,9 @@ fn print_maintenance(event: &SessionEvent) {
         } => {
             println!("[maintenance-end] {kind:?} aborted={aborted} error={error:?}");
         }
-        SessionEvent::Retry { attempt, delay_ms } => {
+        SessionEvent::Retry {
+            attempt, delay_ms, ..
+        } => {
             println!("[retry] attempt={attempt} delay_ms={delay_ms}");
         }
         _ => {}

@@ -7,6 +7,7 @@ use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::UserBlock;
 use serde_json::{Value, json};
 
+use crate::coordination::KillReceipt;
 use crate::jobs::{JobId, Killer};
 use crate::tools::SessionTools;
 
@@ -62,7 +63,13 @@ impl Tool for KillTool {
         };
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
-            details: Some(json!({ "id": id.to_string(), "stopping": stopping })),
+            details: Some(
+                serde_json::to_value(KillReceipt {
+                    id: id.to_string(),
+                    stopping,
+                })
+                .expect("serializable kill receipt"),
+            ),
             ..ToolOutput::default()
         })
     }

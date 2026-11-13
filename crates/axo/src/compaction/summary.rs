@@ -12,12 +12,12 @@ use futures::StreamExt;
 use indexmap::IndexMap;
 use tokio_util::sync::CancellationToken;
 
-use crate::Error;
 use crate::config::{PromptOverride, RetrySettings, SummaryRequest};
 use crate::context::prompt::escape_wrappers;
 use crate::context::{Diagnostic, DiagnosticOrigin, lower_messages};
 use crate::recovery::retry_delay;
 use crate::tools::truncate::truncate_line;
+use crate::{Error, SessionEvent};
 
 const TOO_LARGE: &str = "Separate compaction cannot fit this model's context window. Rewind to an earlier point in the session and compact there.";
 const NOT_FINISHED: &str = "Summary response must finish normally without tool calls";
@@ -112,6 +112,7 @@ pub(crate) struct SummaryContext<'a> {
     pub reply: u64,
     pub prompts: &'a SummaryPrompts,
     pub retry: RetrySettings,
+    pub events: &'a tokio::sync::broadcast::Sender<SessionEvent>,
 }
 
 #[derive(Debug)]
@@ -434,6 +435,13 @@ async fn request(
             }
             if message.stop_reason == StopReason::Error {
                 if let Some(delay) = retry_delay(&context.retry, &message, retry) {
+                    let _ = context.events.send(SessionEvent::Retry {
+                        attempt: retry + 1,
+                        delay_ms: delay.as_millis() as u64,
+                        max_retries: context.retry.max_retries,
+                        error: message.error_message.clone(),
+                        failure: message.failure.clone(),
+                    });
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(SummaryFailure::aborted()),
                         _ = tokio::time::sleep(delay) => {}

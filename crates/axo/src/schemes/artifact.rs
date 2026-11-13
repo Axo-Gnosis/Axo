@@ -100,10 +100,10 @@ impl Artifacts {
 
     /// Paths still owned by writers, which forks must copy instead of hard-linking.
     pub fn live(&self) -> HashSet<PathBuf> {
-        self.live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        live.iter()
+            .flat_map(|path| [path.clone(), stream_index_path(path)])
+            .collect()
     }
 
     /// Finds the first artifact with exactly this numeric prefix.
@@ -116,7 +116,7 @@ impl Artifacts {
                 entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix))
+                    .is_some_and(|name| name.starts_with(&prefix) && !name.ends_with(".streams"))
             })
             .map(|entry| entry.path())
     }
@@ -143,6 +143,13 @@ fn parse_id(digits: &str) -> Option<u64> {
 
 fn numeric_prefix(name: &str) -> Option<u64> {
     parse_id(name.split_once('.')?.0)
+}
+
+/// Sidecar span index; bytes themselves remain only in the original artifact.
+pub(crate) fn stream_index_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".streams");
+    PathBuf::from(name)
 }
 
 /// A command artifact's suffix: unsafe call-ID bytes become uppercase `%XX` escapes.

@@ -29,11 +29,12 @@ pub struct Skill {
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
 /// Discovers skills in order: `.agents/skills` from `cwd` up to the git root (skipped when
-/// `project` is false), each of `user_roots`, then `<home_agents>/skills`. The
-/// first skill with a given name wins; later ones, name-rule violations and skills dropped
-/// for a missing `description` become diagnostics. Blocking filesystem I/O.
+/// `project` is false), each of `explicit_roots` (allowed project roots then user roots),
+/// then `<home_agents>/skills`. The first skill with a given name wins; later ones,
+/// name-rule violations and skills dropped for a missing `description` become diagnostics.
+/// Blocking filesystem I/O. `project` only gates implicit discovery; callers filter explicit roots.
 pub fn load_skills(
-    user_roots: &[PathBuf],
+    explicit_roots: &[PathBuf],
     home_agents: Option<&Path>,
     cwd: &Path,
     project: bool,
@@ -48,7 +49,7 @@ pub fn load_skills(
                 .map(|dir| dir.join(".agents").join("skills")),
         );
     }
-    roots.extend(user_roots.iter().cloned());
+    roots.extend(explicit_roots.iter().cloned());
     roots.extend(home_agents.map(|home| home.join("skills")));
 
     let mut skills: Vec<Skill> = Vec::new();
@@ -322,6 +323,32 @@ mod tests {
     use super::*;
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn discovery_prefers_project_then_explicit_roots_then_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let home = dir.path().join("home-agents");
+        let roots = [
+            cwd.join(".agents/skills"),
+            dir.path().join("project-skills"),
+            dir.path().join("user-skills"),
+            home.join("skills"),
+        ];
+        for root in &roots {
+            let skill = root.join("shared");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "---\ndescription: shared\n---\n").unwrap();
+        }
+        for first in 0..roots.len() {
+            let explicit = &roots[first.clamp(1, 3)..3];
+            let (skills, diagnostics) = load_skills(explicit, Some(&home), &cwd, first == 0);
+            assert_eq!(skills.len(), 1);
+            assert_eq!(skills[0].path, roots[first].join("shared/SKILL.md"));
+            assert_eq!(diagnostics.len(), roots.len() - first - 1);
+        }
     }
 
     #[test]

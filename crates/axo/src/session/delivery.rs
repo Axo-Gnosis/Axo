@@ -48,9 +48,50 @@ pub(super) struct FirstPrompt {
 /// maintenance also names itself. Only compare-and-set transitions claim it, so two
 /// owners never both win.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct Activity {
-    pub(super) running: bool,
-    pub(super) maintenance: Option<MaintenanceKind>,
+pub struct Activity {
+    pub running: bool,
+    pub maintenance: Option<MaintenanceKind>,
+}
+
+/// Publishes under the watch write lock, so attach cannot miss a transition.
+pub(super) struct ActivityState {
+    state: tokio::sync::watch::Sender<Activity>,
+    events: tokio::sync::broadcast::Sender<SessionEvent>,
+}
+
+impl ActivityState {
+    pub(super) fn new(events: tokio::sync::broadcast::Sender<SessionEvent>) -> Self {
+        Self {
+            state: tokio::sync::watch::Sender::new(Activity::default()),
+            events,
+        }
+    }
+
+    pub(super) fn borrow(&self) -> tokio::sync::watch::Ref<'_, Activity> {
+        self.state.borrow()
+    }
+
+    pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<Activity> {
+        self.state.subscribe()
+    }
+
+    pub(super) fn send_if_modified(&self, update: impl FnOnce(&mut Activity) -> bool) -> bool {
+        self.state.send_if_modified(|state| {
+            let before = *state;
+            let changed = update(state);
+            if *state != before {
+                let _ = self.events.send(SessionEvent::Activity(*state));
+            }
+            changed
+        })
+    }
+
+    pub(super) fn send_modify(&self, update: impl FnOnce(&mut Activity)) {
+        self.send_if_modified(|state| {
+            update(state);
+            true
+        });
+    }
 }
 
 /// A `running` claim outside a run; dropping it releases the session (or starts pending
@@ -143,30 +184,35 @@ impl SessionHooks {
     pub(super) fn release_or_deliver(&self) {
         // The claim a Stop targeted ends here; a Stop never carries over to the next owner.
         self.stop_requested.store(false, Ordering::Release);
-        if self.may_deliver()
-            && let Some((agent, hooks)) = self.owners()
-        {
-            // A steer or follow-up queued while idle, or after the run's last drain point,
-            // starts the next run; the rest drain at that run's drain points.
-            let queued = agent.take_next_input();
-            if !queued.is_empty() {
-                let mut messages = self.run_input(self.reserve_delivery(), None);
-                messages.extend(queued);
-                tokio::spawn(async move {
-                    if let Err(err) =
-                        run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await
-                    {
-                        warn!(%err, "follow-up run failed");
-                    }
-                });
-                return;
+        self.activity.send_if_modified(|activity| {
+            // Queue draining and the idle decision share the ownership lock. A sender
+            // either joins this chain or claims a genuinely idle session afterwards.
+            if !self.auto_paused.load(Ordering::Acquire)
+                && !self.shutdown.load(Ordering::Acquire)
+                && self.preparing.load(Ordering::Acquire) == 0
+                && activity.maintenance.is_none()
+                && let Some((agent, hooks)) = self.owners()
+            {
+                let queued = agent.take_next_input();
+                if !queued.is_empty() {
+                    let mut messages = self.run_input(self.reserve_delivery(), None);
+                    messages.extend(queued);
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await
+                        {
+                            warn!(%err, "follow-up run failed");
+                        }
+                    });
+                    return false;
+                }
+                if self.start_delivery(agent, hooks) {
+                    return false;
+                }
             }
-            if self.start_delivery(agent, hooks) {
-                return;
-            }
-        }
-        self.activity
-            .send_modify(|activity| activity.running = false);
+            activity.running = false;
+            true
+        });
         // A result that became pending meanwhile found `running` set and left its
         // delivery to this transition.
         self.deliver_if_idle();
@@ -413,14 +459,17 @@ impl Session {
 
     /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::Steer, input.into(), None).await
+        self.queue(SubmissionKind::Steer, input.into(), None, None)
+            .await
+            .map(drop)
     }
 
     /// Saves and queues a user message delivered when the active run would otherwise end;
     /// on an idle session it starts a run.
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::FollowUp, input.into(), None)
+        self.queue(SubmissionKind::FollowUp, input.into(), None, None)
             .await
+            .map(drop)
     }
 
     /// Posts a durable custom message without expanding skills. This is the cache-safe
@@ -453,6 +502,7 @@ impl Session {
             }],
             request_id: None,
             sender: None,
+            provenance: None,
             custom: Some(SubmittedCustom {
                 custom_type: message.custom_type.clone(),
                 display: message.display,
@@ -480,13 +530,32 @@ impl Session {
 
     /// Saves and queues a teammate's message, read at the next turn boundary; on an idle
     /// session it starts a run unless the session is auto-paused, where it stays unread.
-    pub(crate) async fn post_mail(&self, sender: &str, content: &str) -> Result<(), Error> {
+    pub(crate) async fn post_mail(
+        &self,
+        sender: &str,
+        content: &str,
+        provenance: crate::coordination::SubmissionProvenance,
+    ) -> Result<String, Error> {
         let text = format!(
             "Message from {sender} (reply with send to \"{sender}\"):\n\n{}",
             escape_wrappers(content)
         );
-        self.queue(SubmissionKind::Mail, text.into(), Some(sender.to_owned()))
-            .await
+        self.queue(
+            SubmissionKind::Mail,
+            text.into(),
+            Some(sender.to_owned()),
+            Some(provenance),
+        )
+        .await
+    }
+
+    pub(super) async fn queue_routed(
+        &self,
+        kind: SubmissionKind,
+        input: PromptInput,
+        provenance: crate::coordination::SubmissionProvenance,
+    ) -> Result<String, Error> {
+        self.queue(kind, input, None, Some(provenance)).await
     }
 
     /// Saves the submission and hands its message to the queue for `kind`.
@@ -497,7 +566,8 @@ impl Session {
         kind: SubmissionKind,
         input: PromptInput,
         sender: Option<String>,
-    ) -> Result<(), Error> {
+        provenance: Option<crate::coordination::SubmissionProvenance>,
+    ) -> Result<String, Error> {
         let keywords = if matches!(kind, SubmissionKind::Steer | SubmissionKind::FollowUp) {
             self.hooks.matched_keywords(&input.parts)
         } else {
@@ -505,9 +575,18 @@ impl Session {
         };
         let choice = self.hooks.keyword_choice(&keywords)?;
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &keywords).await?;
-        let (entry, message) = submission(kind, parts, content, None, sender);
+        let (mut entry, message) = submission(kind, parts, content, None, sender);
+        if let Entry::Submission {
+            provenance: recorded,
+            ..
+        } = &mut entry
+        {
+            *recorded = provenance;
+        }
+        let id = message.id.clone().expect("submission id");
         self.queue_message(kind, entry, message, Some(saved), choice)
-            .await
+            .await?;
+        Ok(id)
     }
 
     /// Writes `entry`, applies a keyword's model `choice`, then queues `message`.
@@ -681,6 +760,7 @@ fn submission(
         parts,
         request_id,
         sender,
+        provenance: None,
         custom: None,
     };
     let message = AgentMessage::Llm(Message::User(UserMessage {

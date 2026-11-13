@@ -162,6 +162,9 @@ impl SessionHooks {
                 mode.effective = mode.selected.clone();
                 mode.yield_tool =
                     super::modes::ModeYield::for_mode(mode.effective.as_ref(), self.this.clone());
+                let _ = self.events.send(super::SessionEvent::EffectiveMode {
+                    mode: mode.effective.as_ref().map(|spec| spec.name.clone()),
+                });
             }
             !same
         };

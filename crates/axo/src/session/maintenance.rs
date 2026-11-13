@@ -198,6 +198,7 @@ impl SessionHooks {
             reply: limits.reply,
             prompts: &self.maintenance.prompts,
             retry: self.inherited.config.settings.retry.clone(),
+            events: &self.events,
         };
         match generate(context).await {
             Ok(summary) => Ok(Ok((summary, model))),

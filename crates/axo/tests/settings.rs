@@ -22,6 +22,7 @@ fn layer(origin: &str, settings: Option<&str>) -> ConfigLayer {
         origin: origin.to_owned(),
         settings: settings.map(|text| serde_json::from_str(text).unwrap()),
         prompts: IndexMap::new(),
+        skill_roots: Vec::new(),
         agent_roots: Vec::new(),
         mode_roots: Vec::new(),
         keyword_roots: Vec::new(),
@@ -171,7 +172,7 @@ fn read_acquires_the_project_once_after_the_user() {
     let source = TestConfig::new(None, Some(r#"{ "bash": { "ci": false } }"#));
     {
         let mut user = source.user.lock().unwrap();
-        user.skill_roots = vec![PathBuf::from("/u/skills")];
+        user.layer.skill_roots = vec![PathBuf::from("/u/skills")];
         user.context_files = vec![PathBuf::from("/u/AGENTS.md")];
     }
 
@@ -191,6 +192,54 @@ fn read_acquires_the_project_once_after_the_user() {
         source.take_calls(),
         ["user".to_owned(), format!("project:{CWD}")]
     );
+}
+
+#[test]
+fn skill_roots_follow_project_gates_without_disabling_user_roots() {
+    for access in [
+        ProjectAccess::Ignore,
+        ProjectAccess::Read,
+        ProjectAccess::Trust,
+    ] {
+        for config_enabled in [false, true] {
+            for skills_enabled in [false, true] {
+                let source = TestConfig::user_only(None);
+                {
+                    let mut user = source.user.lock().unwrap();
+                    user.layer.settings = Some(serde_json::json!({
+                        "project": { "files": {
+                            "config": config_enabled, "skills": skills_enabled
+                        } }
+                    }));
+                    user.layer.skill_roots =
+                        vec![PathBuf::from("/u/first"), PathBuf::from("/u/second")];
+                }
+                let acquired = access != ProjectAccess::Ignore && config_enabled;
+                if acquired {
+                    let mut project = layer(
+                        "project",
+                        Some(r#"{ "project": { "files": { "skills": true } } }"#),
+                    );
+                    project.skill_roots =
+                        vec![PathBuf::from("/p/first"), PathBuf::from("/p/second")];
+                    source.set_project(cwd(), project);
+                }
+                let config = source.resolve(access).unwrap();
+                let mut expected = Vec::new();
+                if acquired && skills_enabled {
+                    expected.extend([PathBuf::from("/p/first"), PathBuf::from("/p/second")]);
+                }
+                expected.extend([PathBuf::from("/u/first"), PathBuf::from("/u/second")]);
+                assert_eq!(config.skill_roots, expected);
+                assert_eq!(config.settings.project.files.skills, skills_enabled);
+                let mut calls = vec!["user".to_owned()];
+                if acquired {
+                    calls.push(format!("project:{CWD}"));
+                }
+                assert_eq!(source.take_calls(), calls);
+            }
+        }
+    }
 }
 
 #[test]

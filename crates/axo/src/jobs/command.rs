@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -18,8 +18,10 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use super::{CommandExit, JobId, JobRegistry, Killer, Mode, Promotion};
-use crate::exec::host::{Container, ExecSpec, Process, ProcessSupervisor};
-use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail};
+use crate::exec::host::{
+    Container, ExecSpec, OutputChunk, OutputStream, Process, ProcessSupervisor,
+};
+use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail, stream_index_path};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// Inline output keeps the first `HEAD_*` and the last `TAIL_*`; together they are pi's
@@ -165,6 +167,8 @@ pub struct OutputProgress {
     pub bytes: u64,
     /// No further output will be written.
     pub done: bool,
+    /// Capture failed or an indexed retained log was not cleanly closed.
+    pub capture_failed: bool,
 }
 
 /// A command's raw merged stdout and stderr, readable while it runs.
@@ -172,22 +176,160 @@ pub struct CommandOutput {
     job: String,
     artifact: u64,
     file: Arc<std::fs::File>,
+    index: Option<Arc<std::fs::File>>,
     progress: watch::Receiver<OutputProgress>,
 }
+
+/// Bytes per stream-index record: an 8-byte LE end offset, then a 1-byte tag.
+const INDEX_RECORD: u64 = 9;
+/// Records per batched index read while scanning for chunks.
+const INDEX_BATCH: u64 = 512;
 
 impl CommandOutput {
     pub(super) fn new(
         job: String,
         artifact: u64,
         file: std::fs::File,
+        index: Option<std::fs::File>,
         progress: watch::Receiver<OutputProgress>,
     ) -> Self {
         Self {
             job,
             artifact,
             file: Arc::new(file),
+            index: index.map(Arc::new),
             progress,
         }
+    }
+
+    /// Opens a retained log, including copied fork logs and historical unlabelled logs.
+    /// An absent terminal index record means capture may be partial.
+    pub fn open(job: String, artifact: u64, path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path)?;
+        let bytes = file.metadata()?.len();
+        let index = match std::fs::File::open(stream_index_path(path)) {
+            Ok(file) => Some(file),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        let mut capture_failed = false;
+        if let Some(index) = &index {
+            let len = index.metadata()?.len();
+            let mut record = [0; INDEX_RECORD as usize];
+            capture_failed = len < INDEX_RECORD || len % INDEX_RECORD != 0;
+            if !capture_failed {
+                index.read_exact_at(&mut record, len - INDEX_RECORD)?;
+                capture_failed =
+                    record[8] != 3 || u64::from_le_bytes(record[..8].try_into().unwrap()) != bytes;
+            }
+        }
+        let (_, progress) = watch::channel(OutputProgress {
+            bytes,
+            done: true,
+            capture_failed,
+        });
+        Ok(Self::new(job, artifact, file, index, progress))
+    }
+
+    /// Reads labeled raw chunks over a byte range clamped once to the flushed prefix. Missing metadata is `Merged`.
+    /// The index is binary-searched, then scanned in fixed batches; each span is read straight into its chunk.
+    pub async fn read_chunks(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> std::io::Result<Vec<OutputChunk>> {
+        // Clamp before reading index metadata: progress is published only after its records.
+        let range = self.clamp(range);
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let file = self.file.clone();
+        let index = self.index.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(index) = index else {
+                let bytes = read_span(&file, range)?;
+                return Ok(if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![OutputChunk {
+                        stream: OutputStream::Merged,
+                        bytes,
+                    }]
+                });
+            };
+            let records = index.metadata()?.len() / INDEX_RECORD;
+            let boundary_at = |n: u64| -> std::io::Result<u64> {
+                let mut end = [0; 8];
+                index.read_exact_at(&mut end, n * INDEX_RECORD)?;
+                Ok(u64::from_le_bytes(end))
+            };
+            // The search trusts the boundary order that the scan below validates.
+            let (mut first, mut high) = (0, records);
+            while first < high {
+                let mid = first + (high - first) / 2;
+                if boundary_at(mid)? > range.start {
+                    high = mid;
+                } else {
+                    first = mid + 1;
+                }
+            }
+            let mut previous = if first == 0 {
+                0
+            } else {
+                boundary_at(first - 1)?
+            };
+            let mut chunks = Vec::new();
+            let mut covered = range.start;
+            let mut buffer = [0; (INDEX_RECORD * INDEX_BATCH) as usize];
+            let mut next = first;
+            'scan: while next < records {
+                let count = (records - next).min(INDEX_BATCH);
+                let batch = &mut buffer[..(count * INDEX_RECORD) as usize];
+                index.read_exact_at(batch, next * INDEX_RECORD)?;
+                next += count;
+                for record in batch.as_chunks::<{ INDEX_RECORD as usize }>().0 {
+                    let boundary = u64::from_le_bytes(record[..8].try_into().unwrap());
+                    let stream = match record[8] {
+                        1 => OutputStream::Stdout,
+                        2 => OutputStream::Stderr,
+                        3 | 4 => break 'scan,
+                        _ => return Err(std::io::Error::other("invalid output stream index")),
+                    };
+                    if boundary < previous {
+                        return Err(std::io::Error::other("unordered output stream index"));
+                    }
+                    let from = previous.max(range.start);
+                    let to = boundary.min(range.end);
+                    if from < to {
+                        let bytes = read_span(&file, from..to)?;
+                        let short = (bytes.len() as u64) < to - from;
+                        if !bytes.is_empty() {
+                            chunks.push(OutputChunk { stream, bytes });
+                        }
+                        if short {
+                            return Ok(chunks);
+                        }
+                        covered = to;
+                    }
+                    previous = boundary;
+                    if boundary >= range.end {
+                        break 'scan;
+                    }
+                }
+            }
+            if covered < range.end {
+                let bytes = read_span(&file, covered..range.end)?;
+                if !bytes.is_empty() {
+                    chunks.push(OutputChunk {
+                        stream: OutputStream::Merged,
+                        bytes,
+                    });
+                }
+            }
+            Ok(chunks)
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     /// The command's job id, including before it is listed.
@@ -207,36 +349,44 @@ impl CommandOutput {
 
     /// Reads raw bytes, clamping the range to the flushed output prefix.
     pub async fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<Vec<u8>> {
-        let end = range.end.min(self.progress.borrow().bytes);
-        let start = range.start.min(end);
+        let range = self.clamp(range);
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
-            let len = usize::try_from(end - start).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "output range is too large",
-                )
-            })?;
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(len)
-                .map_err(std::io::Error::other)?;
-            bytes.resize(len, 0);
-            let mut read = 0;
-            while read < len {
-                match file.read_at(&mut bytes[read..], start + read as u64) {
-                    Ok(0) => break,
-                    Ok(n) => read += n,
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => return Err(err),
-                }
-            }
-            bytes.truncate(read);
-            Ok(bytes)
-        })
-        .await
-        .map_err(std::io::Error::other)?
+        tokio::task::spawn_blocking(move || read_span(&file, range))
+            .await
+            .map_err(std::io::Error::other)?
     }
+
+    /// Clamps `range` to one snapshot of the flushed prefix.
+    fn clamp(&self, range: std::ops::Range<u64>) -> std::ops::Range<u64> {
+        let end = range.end.min(self.progress.borrow().bytes);
+        range.start.min(end)..end
+    }
+}
+
+/// Reads `range` from `file`, stopping early at end of file.
+fn read_span(file: &std::fs::File, range: std::ops::Range<u64>) -> std::io::Result<Vec<u8>> {
+    let len = usize::try_from(range.end - range.start).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output range is too large",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(std::io::Error::other)?;
+    bytes.resize(len, 0);
+    let mut read = 0;
+    while read < len {
+        match file.read_at(&mut bytes[read..], range.start + read as u64) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    bytes.truncate(read);
+    Ok(bytes)
 }
 
 pub(crate) struct CommandRunner {
@@ -276,6 +426,17 @@ impl CommandRunner {
             .await
             .map_err(|err| ToolError(err.to_string()))?;
         let spool = live.take_file();
+        let index_path = stream_index_path(&artifact_path);
+        let index = match File::create(&index_path).await {
+            Ok(index) => index,
+            Err(err) => {
+                drop(spool);
+                let _ = tokio::fs::remove_file(&artifact_path).await;
+                return Err(ToolError(format!(
+                    "Failed to create output stream index: {err}"
+                )));
+            }
+        };
         spec.env.extend(
             NON_INTERACTIVE_ENV
                 .iter()
@@ -291,6 +452,7 @@ impl CommandRunner {
             Err(msg) => {
                 drop(spool);
                 let _ = tokio::fs::remove_file(&artifact_path).await;
+                let _ = tokio::fs::remove_file(&index_path).await;
                 return Err(ToolError(msg));
             }
         };
@@ -331,6 +493,7 @@ impl CommandRunner {
                 shared: shared.clone(),
                 process,
                 spool: Some(spool),
+                index: Some(index),
                 spool_path: artifact_path,
                 artifact,
                 timeout,
@@ -476,6 +639,7 @@ struct CommandTask {
     shared: Arc<CommandShared>,
     process: Process,
     spool: Option<File>,
+    index: Option<File>,
     spool_path: PathBuf,
     artifact: u64,
     timeout: Option<Duration>,
@@ -494,6 +658,7 @@ impl CommandTask {
             shared,
             mut process,
             mut spool,
+            mut index,
             spool_path,
             artifact,
             timeout,
@@ -511,9 +676,13 @@ impl CommandTask {
         loop {
             tokio::select! {
                 chunk = chunks.recv(), if pipes_open => match chunk {
-                    Some(chunk) => {
-                        lock(&shared.shaper).push(&chunk);
-                        write_spool(&mut spool, &mut capture_error, &shared.output, &chunk).await;
+                    Some(Ok(chunk)) => {
+                        lock(&shared.shaper).push(&chunk.bytes);
+                        write_spool(&mut spool, &mut index, &mut capture_error, &shared.output, &chunk).await;
+                    }
+                    Some(Err(err)) => {
+                        capture_error = Some(err.to_string());
+                        shared.output.progress.send_modify(|p| p.capture_failed = true);
                     }
                     None => {
                         pipes_open = false;
@@ -564,20 +733,17 @@ impl CommandTask {
             shaper.finish();
             shaper.truncated()
         };
-        if let Some(file) = &mut spool
-            && (truncated || retained || promoted)
-            && let Err(err) = file.flush().await
-        {
-            tracing::warn!(path = %spool_path.display(), %err, "bash output spool failed");
-            spool = None;
-            capture_error = Some(err.to_string());
-        }
-        let keep = capture_error.is_none() && (truncated || retained || promoted);
+        // The model gets a log URL only for complete captures; retained and promoted rows
+        // reference their log through the journal regardless, so partial logs stay readable there.
+        let full_output =
+            (truncated && capture_error.is_none()).then(|| format!("artifact://{artifact}"));
+        let keep = full_output.is_some() || retained || promoted;
         if !keep {
             spool = None;
             let _ = tokio::fs::remove_file(&spool_path).await;
+            index = None;
+            let _ = tokio::fs::remove_file(stream_index_path(&spool_path)).await;
         }
-        let full_output = (keep && truncated).then(|| format!("artifact://{artifact}"));
         let body = lock(&shared.shaper).render(full_output.as_deref());
         let ended_at = axo_ai::now_ms();
 
@@ -694,8 +860,12 @@ impl CommandTask {
                 loop {
                     tokio::select! {
                         chunk = chunks.recv(), if pipes_open => match chunk {
-                            Some(chunk) => {
-                                write_spool(&mut spool, &mut capture_error, &shared.output, &chunk).await;
+                            Some(Ok(chunk)) => {
+                                write_spool(&mut spool, &mut index, &mut capture_error, &shared.output, &chunk).await;
+                            }
+                            Some(Err(err)) => {
+                                capture_error = Some(err.to_string());
+                                shared.output.progress.send_modify(|p| p.capture_failed = true);
                             }
                             None => pipes_open = false,
                         },
@@ -709,19 +879,52 @@ impl CommandTask {
             }
             let deadline = Instant::now() + EXIT_IDLE;
             if pipes_open {
-                while let Ok(Some(chunk)) = timeout_at(deadline, chunks.recv()).await {
-                    write_spool(&mut spool, &mut capture_error, &shared.output, &chunk).await;
+                loop {
+                    match timeout_at(deadline, chunks.recv()).await {
+                        Ok(Some(Ok(chunk))) => {
+                            write_spool(
+                                &mut spool,
+                                &mut index,
+                                &mut capture_error,
+                                &shared.output,
+                                &chunk,
+                            )
+                            .await
+                        }
+                        Ok(Some(Err(err))) => {
+                            capture_error = Some(err.to_string());
+                            shared
+                                .output
+                                .progress
+                                .send_modify(|p| p.capture_failed = true);
+                        }
+                        Ok(None) => {
+                            pipes_open = false;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             if let Some(killer) = killer {
                 let _ = killer.await;
             }
-            // A capture failure now leaves the spool as the true prefix it already was.
-            if let Some(file) = &mut spool {
-                let _ = file.flush().await;
-            }
         }
         drop(readers);
+        if let Some(index) = &mut index {
+            let bytes = shared.output.progress.borrow().bytes;
+            let failed = capture_error.is_some() || pipes_open;
+            if write_span(index, bytes, if failed { 4 } else { 3 })
+                .await
+                .is_err()
+                || failed
+            {
+                shared
+                    .output
+                    .progress
+                    .send_modify(|p| p.capture_failed = true);
+            }
+        }
         drop(spool);
         process.close().await;
         drop(live);
@@ -742,34 +945,56 @@ fn with_status(text: String, line: &str) -> String {
     }
 }
 
-/// Writes `chunk` to the spool; a failure closes the spool and records the capture loss
-/// while the command keeps running.
+/// Appends a span only after its raw bytes have been flushed.
+async fn write_span(index: &mut File, end: u64, tag: u8) -> std::io::Result<()> {
+    let mut record = [0; INDEX_RECORD as usize];
+    record[..8].copy_from_slice(&end.to_le_bytes());
+    record[8] = tag;
+    index.write_all(&record).await?;
+    index.flush().await
+}
+
+/// Failures retain the readable prefix and never invent labels for unindexed bytes.
 async fn write_spool(
     spool: &mut Option<File>,
+    index: &mut Option<File>,
     capture_error: &mut Option<String>,
     output: &OutputState,
-    chunk: &[u8],
+    chunk: &OutputChunk,
 ) {
     let mut written = 0;
     if let Some(file) = spool {
         let result = async {
-            file.write_all(chunk).await?;
-            file.flush().await
+            file.write_all(&chunk.bytes).await?;
+            file.flush().await?;
+            written = chunk.bytes.len() as u64;
+            if let Some(index) = index {
+                let end = output.progress.borrow().bytes + written;
+                let tag = match chunk.stream {
+                    OutputStream::Stdout => 1,
+                    OutputStream::Stderr => 2,
+                    OutputStream::Merged => unreachable!("pipe capture always has an origin"),
+                };
+                write_span(index, end, tag).await?;
+            }
+            Ok::<_, std::io::Error>(())
         }
         .await;
-        match result {
-            Ok(()) => written = chunk.len() as u64,
-            Err(err) => {
-                tracing::warn!(path = %output.path.display(), %err, "bash output spool failed");
-                *spool = None;
-                *capture_error = Some(err.to_string());
-            }
+        if let Err(err) = result {
+            tracing::warn!(path = %output.path.display(), %err, "bash output capture failed");
+            // Discard an unflushed partial write so the raw artifact is exactly the
+            // published prefix. A failed index remains a valid labeled prefix.
+            let prefix = output.progress.borrow().bytes + written;
+            let _ = file.set_len(prefix).await;
+            *spool = None;
+            *index = None;
+            *capture_error = Some(err.to_string());
         }
     }
-    // Notifies even without a spool: the foreground waiter renders from the shaper.
-    output
-        .progress
-        .send_modify(|progress| progress.bytes += written);
+    output.progress.send_modify(|progress| {
+        progress.bytes += written;
+        progress.capture_failed = capture_error.is_some();
+    });
 }
 
 /// Streaming output with bounded memory: the head is kept until it is
@@ -928,6 +1153,208 @@ fn clean_segment(raw: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_stream_index_preserves_raw_prefix_without_false_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.log");
+        let state = OutputState {
+            path: path.clone(),
+            progress: watch::Sender::new(OutputProgress::default()),
+        };
+        let mut spool = Some(File::create(&path).await.unwrap());
+        std::fs::write(stream_index_path(&path), []).unwrap();
+        // A real failing sink exercises index failure after successful raw capture.
+        let mut index = Some(File::options().write(true).open("/dev/full").await.unwrap());
+        let mut error = None;
+        let chunk = OutputChunk {
+            stream: OutputStream::Stderr,
+            bytes: vec![0xff, 0, 42],
+        };
+        write_spool(&mut spool, &mut index, &mut error, &state, &chunk).await;
+        assert!(error.is_some());
+        assert!(state.progress.borrow().capture_failed);
+        assert_eq!(state.progress.borrow().bytes, 3);
+        assert_eq!(std::fs::read(&path).unwrap(), chunk.bytes);
+        assert!(spool.is_none());
+        assert!(index.is_none());
+        let replay = CommandOutput::open("bg_0".into(), 0, &path).unwrap();
+        assert!(replay.progress().borrow().capture_failed);
+        assert_eq!(
+            replay.read_chunks(0..3).await.unwrap(),
+            vec![OutputChunk {
+                stream: OutputStream::Merged,
+                bytes: chunk.bytes,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_streams_survive_retained_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.bash.streams.log");
+        let state = OutputState {
+            path: path.clone(),
+            progress: watch::Sender::new(OutputProgress::default()),
+        };
+        let mut spool = Some(File::create(&path).await.unwrap());
+        let mut index = Some(File::create(stream_index_path(&path)).await.unwrap());
+        let supervisor = ProcessSupervisor::new(crate::exec::host::Supervision::ProcessGroup);
+        let mut process = supervisor
+            .spawn(ExecSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '\\377out\\000'; printf '\\376err\\000' >&2".into(),
+                ],
+                cwd: dir.path().to_owned(),
+                env: Default::default(),
+                sandbox: None,
+            })
+            .await
+            .unwrap();
+        let (mut chunks, readers) = process.capture_output();
+        let mut error = None;
+        let mut captured = Vec::new();
+        while let Some(chunk) = chunks.recv().await {
+            let chunk = chunk.unwrap();
+            write_spool(&mut spool, &mut index, &mut error, &state, &chunk).await;
+            captured.push(chunk);
+        }
+        assert!(process.wait().await.unwrap().success());
+        process.close().await;
+        drop(readers);
+        assert!(error.is_none());
+        let bytes = state.progress.borrow().bytes;
+        write_span(index.as_mut().unwrap(), bytes, 3).await.unwrap();
+        drop(spool);
+        drop(index);
+
+        // Replay is independent of the original job registry and writers.
+        let replay = CommandOutput::open("bg_0".into(), 0, &path).unwrap();
+        assert!(!replay.progress().borrow().capture_failed);
+        let replayed = replay.read_chunks(0..u64::MAX).await.unwrap();
+        assert_eq!(replayed, captured);
+        for (stream, expected) in [
+            (OutputStream::Stdout, b"\xffout\0".as_slice()),
+            (OutputStream::Stderr, b"\xfeerr\0".as_slice()),
+        ] {
+            let actual: Vec<_> = replayed
+                .iter()
+                .filter(|c| c.stream == stream)
+                .flat_map(|c| c.bytes.iter().copied())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        let merged: Vec<_> = captured
+            .iter()
+            .flat_map(|c| c.bytes.iter().copied())
+            .collect();
+        assert_eq!(replay.read(0..u64::MAX).await.unwrap(), merged);
+        let sliced: Vec<_> = replay
+            .read_chunks(1..bytes - 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|c| c.bytes)
+            .collect();
+        assert_eq!(sliced, merged[1..merged.len() - 1]);
+
+        // A fork copies both files; an interrupted copy has honest partial metadata.
+        let fork = dir.path().join("fork.log");
+        std::fs::copy(&path, &fork).unwrap();
+        std::fs::copy(stream_index_path(&path), stream_index_path(&fork)).unwrap();
+        let forked = CommandOutput::open("bg_0".into(), 0, &fork).unwrap();
+        assert_eq!(forked.read_chunks(0..bytes).await.unwrap(), captured);
+        let sidecar = std::fs::OpenOptions::new()
+            .write(true)
+            .open(stream_index_path(&fork))
+            .unwrap();
+        sidecar
+            .set_len(sidecar.metadata().unwrap().len() - 9)
+            .unwrap();
+        assert!(
+            CommandOutput::open("bg_0".into(), 0, &fork)
+                .unwrap()
+                .progress()
+                .borrow()
+                .capture_failed
+        );
+        std::fs::remove_file(stream_index_path(&fork)).unwrap();
+        let historical = CommandOutput::open("bg_0".into(), 0, &fork).unwrap();
+        assert_eq!(
+            historical.read_chunks(0..bytes).await.unwrap(),
+            vec![OutputChunk {
+                stream: OutputStream::Merged,
+                bytes: merged
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_chunks_labels_every_window_of_a_long_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.log");
+        let (mut raw, mut index, mut labels) = (Vec::new(), Vec::new(), Vec::new());
+        for n in 0..3000u64 {
+            let stream = if n % 2 == 0 {
+                OutputStream::Stdout
+            } else {
+                OutputStream::Stderr
+            };
+            let len = (n % 3 + 1) as usize;
+            raw.extend(std::iter::repeat_n(n as u8, len));
+            labels.extend(std::iter::repeat_n(stream, len));
+            index.extend((raw.len() as u64).to_le_bytes());
+            index.push(if n % 2 == 0 { 1 } else { 2 });
+        }
+        let total = raw.len() as u64;
+        index.extend(total.to_le_bytes());
+        index.push(3);
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::write(stream_index_path(&path), &index).unwrap();
+        let flushed = total - 5;
+        let (_tx, rx) = watch::channel(OutputProgress {
+            bytes: flushed,
+            done: false,
+            capture_failed: false,
+        });
+        let output = CommandOutput::new(
+            "bg_0".into(),
+            0,
+            std::fs::File::open(&path).unwrap(),
+            Some(std::fs::File::open(stream_index_path(&path)).unwrap()),
+            rx,
+        );
+        for range in [
+            0..1,
+            0..u64::MAX,
+            7..4000,
+            total - 20..total + 10,
+            3000..3000,
+            // Reversed on purpose: start past end must clamp to an empty read.
+            std::ops::Range {
+                start: 5000,
+                end: 10,
+            },
+        ] {
+            let end = range.end.min(flushed);
+            let start = range.start.min(end);
+            let chunks = output.read_chunks(range.clone()).await.unwrap();
+            let mut at = start as usize;
+            for chunk in &chunks {
+                assert!(!chunk.bytes.is_empty(), "{range:?}");
+                let labelled = &labels[at..at + chunk.bytes.len()];
+                assert!(
+                    labelled.iter().all(|label| *label == chunk.stream),
+                    "{range:?}"
+                );
+                assert_eq!(chunk.bytes, raw[at..at + chunk.bytes.len()], "{range:?}");
+                at += chunk.bytes.len();
+            }
+            assert_eq!(at, end as usize, "{range:?}");
+        }
+    }
 
     /// Command output shaped for the model.
     #[derive(Debug, Clone, PartialEq, Eq)]

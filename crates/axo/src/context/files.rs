@@ -28,7 +28,7 @@ impl ContextFile {
         )
     }
 
-    fn parse(text: &str) -> Option<(PathBuf, &str)> {
+    pub(crate) fn parse(text: &str) -> Option<(PathBuf, &str)> {
         let (path, content) = text
             .strip_prefix("<project_instructions path=\"")?
             .split_once("\">\n")?;

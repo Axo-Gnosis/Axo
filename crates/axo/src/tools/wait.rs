@@ -7,6 +7,7 @@ use axo_agent::{ExecutionMode, Replay, Tool, ToolContext, ToolError, ToolOutput}
 use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 
+use crate::coordination::{WaitReason, WaitReceipt};
 use crate::jobs::render_results;
 use crate::session::team::{TeamSeat, WaitGuard, mutual_wait};
 use crate::tools::SessionTools;
@@ -30,9 +31,12 @@ impl WaitTool {
     }
 }
 
-fn text(text: String) -> ToolOutput {
+fn text(text: String, reason: WaitReason, jobs: Vec<String>) -> ToolOutput {
     ToolOutput {
         content: vec![UserBlock::Text { text }],
+        details: Some(
+            serde_json::to_value(WaitReceipt { reason, jobs }).expect("serializable wait receipt"),
+        ),
         ..ToolOutput::default()
     }
 }
@@ -77,11 +81,15 @@ impl Tool for WaitTool {
             if steer.is_pending() {
                 let running = jobs.running_admitted();
                 let ids: Vec<String> = running.iter().map(ToString::to_string).collect();
-                return Ok(text(format!(
-                    "Wait interrupted by a new message; {} background job(s) still running: {}.",
-                    ids.len(),
-                    ids.join(", ")
-                )));
+                return Ok(text(
+                    format!(
+                        "Wait interrupted by a new message; {} background job(s) still running: {}.",
+                        ids.len(),
+                        ids.join(", ")
+                    ),
+                    WaitReason::Interrupted,
+                    vec![],
+                ));
             }
             let results = jobs.reserve_for(invocation);
             if !results.is_empty() {
@@ -89,18 +97,19 @@ impl Tool for WaitTool {
                     .iter()
                     .map(|result| result.msg.to_string())
                     .collect();
-                return Ok(ToolOutput {
-                    details: Some(json!({"jobs": refs})),
-                    ..text(render_results(&results))
-                });
+                return Ok(text(render_results(&results), WaitReason::Results, refs));
             }
             if jobs.has_mail() {
-                return Ok(text(MAIL_ARRIVED.into()));
+                return Ok(text(MAIL_ARRIVED.into(), WaitReason::Mail, vec![]));
             }
             match &self.team {
                 None => {
                     if jobs.running_admitted().is_empty() {
-                        return Ok(text("No background jobs are running.".into()));
+                        return Ok(text(
+                            "No background jobs are running.".into(),
+                            WaitReason::Idle,
+                            vec![],
+                        ));
                     }
                 }
                 Some(seat) => {

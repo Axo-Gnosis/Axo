@@ -423,6 +423,9 @@ pub enum Entry {
         /// The teammate that submitted this input, if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender: Option<String>,
+        /// Originating session and routing mode for inter-agent submissions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<crate::coordination::SubmissionProvenance>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         custom: Option<SubmittedCustom>,
     },

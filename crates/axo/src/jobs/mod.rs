@@ -11,7 +11,7 @@ use command::{CommandRun, OutputState, Phase, RegisterCommand, Stop};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use async_trait::async_trait;
@@ -570,6 +570,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                                     progress: watch::Sender::new(OutputProgress {
                                         bytes: 0,
                                         done: true,
+                                        capture_failed: false,
                                     }),
                                 }),
                                 artifact: *artifact,
@@ -1554,7 +1555,11 @@ impl JobRegistry {
             .collect()
     }
 
-    pub(crate) fn command_output(&self, call_id: &str) -> Option<CommandOutput> {
+    pub(crate) fn command_output(
+        &self,
+        call_id: &str,
+        artifacts_dir: &Path,
+    ) -> Option<CommandOutput> {
         let state = self.lock();
         state.jobs.iter().find_map(|(id, job)| {
             let Kind::Command(run) = &job.kind else {
@@ -1563,11 +1568,23 @@ impl JobRegistry {
             if run.call_id != call_id {
                 return None;
             }
+            if run.output.path.as_os_str().is_empty() {
+                let path = artifacts_dir.join(format!(
+                    "{}.{}",
+                    run.artifact,
+                    crate::schemes::artifact::command_log_tail(&run.tool, &run.call_id)
+                ));
+                return CommandOutput::open(id.to_string(), run.artifact, &path).ok();
+            }
             let file = std::fs::File::open(&run.output.path).ok()?;
             Some(CommandOutput::new(
                 id.to_string(),
                 run.artifact,
                 file,
+                std::fs::File::open(crate::schemes::artifact::stream_index_path(
+                    &run.output.path,
+                ))
+                .ok(),
                 run.output.progress.subscribe(),
             ))
         })
@@ -1975,24 +1992,26 @@ impl JobRegistry {
         child_session_id: &str,
         message: ChildMessage,
         wake: bool,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<MessageRef>, Error> {
         let (msg, entry) =
             {
                 let mut state = self.lock();
                 let Some((id, job)) = state.jobs.iter_mut().find(|(_, job)| {
                 job.admission != Admission::Never
                     && matches!(&job.kind, Kind::Child(run) if run.session_id == child_session_id)
-            }) else { return Ok(false) };
+            }) else { return Ok(None) };
                 if !message.note
-                    && message.run_id.as_ref().is_some_and(|run_id| {
-                        job.messages
-                            .values()
-                            .any(|m| m.run_id.as_ref() == Some(run_id))
+                    && let Some((seq, _)) = job.messages.iter().find(|(_, saved)| {
+                        message.run_id.is_some() && saved.run_id == message.run_id
                     })
                 {
-                    return Ok(true);
+                    return Ok(Some(MessageRef {
+                        job: *id,
+                        seq: *seq,
+                    }));
                 }
                 let seq = job.messages.last_key_value().map_or(1, |(seq, _)| seq + 1);
+                let msg = MessageRef { job: *id, seq };
                 if job.admission == Admission::Pending {
                     job.messages.insert(
                         seq,
@@ -2014,9 +2033,8 @@ impl JobRegistry {
                     }
                     drop(state);
                     self.bump();
-                    return Ok(true);
+                    return Ok(Some(msg));
                 }
-                let msg = MessageRef { job: *id, seq };
                 let entry = Entry::JobEnd {
                     base: journal::base(),
                     job_id: msg.to_string(),
@@ -2057,7 +2075,7 @@ impl JobRegistry {
                     job.messages.remove(&msg.seq);
                 }
                 self.bump();
-                return Ok(false);
+                return Ok(None);
             };
             if let Err(error) = host.journal(entry).await {
                 if let Some(job) = self.lock().jobs.get_mut(&msg.job) {
@@ -2078,7 +2096,7 @@ impl JobRegistry {
         if wake {
             self.results_ready();
         }
-        Ok(true)
+        Ok(Some(msg))
     }
 
     pub(crate) fn open(&self) -> bool {

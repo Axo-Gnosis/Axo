@@ -59,6 +59,8 @@ Hosts spawn asynchronous children with `Session::spawn` and teams with `Session:
 
 Every local command runs in a host-selected container (`Supervision::ProcessGroup` or `Supervision::Cgroup`); long commands continue as `bg_N` background jobs delivered exactly once. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) and [Background Job Durability](crates/axo/docs/sessions-and-compaction.md#background-job-durability).
 
+Hosts can read live or retained output as raw merged bytes or stdout/stderr-tagged chunks through `CommandOutput`, with durable `.streams` sidecars. Ordering is capture order, not guaranteed cross-stream write chronology. See [Background jobs for hosts](crates/axo/docs/extending.md#background-jobs-for-hosts).
+
 ### Cache-aware compaction & `/shake`
 
 `axo` manages context pressure through append-only context edits, manual `/shake` elision, and one-action-per-pass automatic clearing or prompt-cached summarization. See [Automatic Compaction](crates/axo/docs/sessions-and-compaction.md#automatic-compaction-cratesaxosrccompaction).
@@ -67,11 +69,13 @@ Every local command runs in a host-selected container (`Supervision::ProcessGrou
 
 The system prompt is assembled into named `<section>` blocks (`delegation` for children, `system`, `agent` for a persona or child spec body, `docs`, `tools`, `schemes`, `work`, `prose`, `project_context`, `skills`, `team` for team members, `cwd`, `dev_shell`, `date`, plus host sections). Startup and tool execution discover instructions, skills, and personas across user and project roots. See [System prompt sections](crates/axo/docs/prompts-and-context.md#system-prompt-sections), [Context files](crates/axo/docs/prompts-and-context.md#context-files-cratesaxosrccontextfilesrs), and [Skills](crates/axo/docs/prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
 
-Hosts can switch a root persona and replace live host sections and tools; see [Session control methods](crates/axo/docs/extending.md#session-control-methods).
+Hosts can switch a root persona, replace live host sections and tools, and inspect built versus recorded prompt sections, context-file inventories, and the file ledger. Skill roots belong to user and project `ConfigLayer`s; project roots require the skills gate at `Read` or `Trust`. See [Session control methods](crates/axo/docs/extending.md#session-control-methods).
 
 ### Deferred tools, policies & session modes
 
 Hosts supply `Vec<HostTool>` with explicit `HostTool::direct` or `HostTool::deferred` exposure, documented at `tool://`, invoked through `call` with inner-tool identity, and promoted when [`Model::tool_support()`](crates/axo/docs/configuration.md#tool-list-capabilities) allows; `SessionOptions::tool_policies` runs ordered `ToolPolicy` checks over `ToolScope`. Root sessions load `ModeSpec` definitions for branch-scoped, boundary-effective instruction overlays, call-time tool limits (persisted onto spawned descendants), model restoration, and optional host-reviewed `yield` results. See [Deferred tools](crates/axo/docs/prompts-and-context.md#deferred-tools), [Mode definitions](crates/axo/docs/prompts-and-context.md#mode-definitions), and [Root-session modes](crates/axo/docs/extending.md#root-session-modes).
+
+Typed host surfaces expose session activity (an idle observation is not a reservation), selected versus effective modes, schema-validated edited result acceptance, retry failure details, and shared coordination receipts through `Session::send` and `Session::kill_job`. See [Session events](crates/axo/docs/extending.md#sessionevent) and [Coordination receipts](crates/axo/docs/extending.md#coordination-receipts).
 
 ### Nix flake & direnv dev shells (`DevShellEnv`)
 

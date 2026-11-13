@@ -75,9 +75,9 @@ impl TestConfig {
                 layer: ConfigLayer {
                     origin: "user".into(),
                     settings: Some(settings),
+                    skill_roots: vec![dir.join("skills")],
                     ..Default::default()
                 },
-                skill_roots: vec![dir.join("skills")],
                 context_files: vec![dir.join("AGENTS.md")],
             }),
             ..Default::default()

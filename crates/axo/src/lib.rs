@@ -6,6 +6,7 @@ mod commands;
 mod compaction;
 mod config;
 pub mod context;
+mod coordination;
 mod error;
 pub mod exec;
 mod input;
@@ -27,9 +28,15 @@ pub use context::agents::{AgentSpec, RunAs};
 pub use context::keywords::{KeywordMatch, KeywordSettings, KeywordSpec};
 pub use context::modes::{BashAccess, ModeResult, ModeSpec, ToolLimits};
 pub use context::{Diagnostic, DiagnosticOrigin};
+pub use coordination::{
+    KillReceipt, SendIdentity, SendKind, SendReceipt, SpawnReceipt, SubmissionProvenance,
+    WaitReason, WaitReceipt,
+};
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
-pub use exec::host::{OutputError, ProcessSupervisor, Sandbox, Supervision};
+pub use exec::host::{
+    OutputChunk, OutputError, OutputStream, ProcessSupervisor, Sandbox, Supervision,
+};
 pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
 pub use jobs::{
@@ -38,11 +45,12 @@ pub use jobs::{
 };
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
-    Attach, ChildHandle, ContextUsage, Fork, HostDelivery, HostMessage, InlineSpec, LiveSnapshot,
-    MaintenanceKind, NavigateOptions, PendingResult, PromptRequest, PromptResult, RecoveryPolicy,
-    ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode,
-    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle,
-    TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
+    AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
+    HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
+    PendingResult, PromptInspection, PromptRequest, PromptResult, RecoveryPolicy, ResultResolution,
+    Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision,
+    SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
+    ToolPolicy, ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,

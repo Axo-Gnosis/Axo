@@ -338,11 +338,31 @@ impl Session {
         self.hooks.selected_mode()
     }
 
-    /// Accepts a pending mode result. A message overrides the mode's continuation.
-    pub fn accept_result(&self, call_id: &str, message: Option<String>) -> Result<(), Error> {
+    /// The mode applied at the latest request boundary, not a pending selection.
+    pub fn effective_mode(&self) -> Option<Arc<ModeSpec>> {
+        self.hooks.effective_mode()
+    }
+
+    /// Accepts a review, optionally replacing its value and continuation.
+    /// Invalid replacements leave the review pending.
+    pub fn accept_result(&self, call_id: &str, options: AcceptResultOptions) -> Result<(), Error> {
+        if let Some(value) = &options.replacement {
+            let pending = self
+                .hooks
+                .results
+                .snapshot()
+                .into_iter()
+                .find(|pending| pending.call_id == call_id)
+                .ok_or_else(|| Error::NoPendingResult(call_id.to_owned()))?;
+            let validator = jsonschema::validator_for(&pending.schema)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            validator
+                .validate(value)
+                .map_err(|error| Error::InvalidInput(format!("Invalid mode result: {error}")))?;
+        }
         self.hooks
             .results
-            .settle(call_id, ResultOutcome::Accepted(message))
+            .settle(call_id, ResultOutcome::Accepted(options))
     }
 
     /// Keeps the mode active and asks the model to revise its result.
@@ -356,16 +376,25 @@ impl Session {
     }
 }
 
+/// Host review edits; `None` preserves the model's original value or mode continuation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AcceptResultOptions {
+    pub replacement: Option<Value>,
+    pub message: Option<String>,
+}
+
 /// A mode result waiting for the host's review.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingResult {
     pub call_id: String,
     pub mode: String,
     pub result: Value,
+    /// The original mode's result schema, used to validate host replacements.
+    pub schema: Value,
 }
 
 pub(super) enum ResultOutcome {
-    Accepted(Option<String>),
+    Accepted(AcceptResultOptions),
     Revise(String),
     Dismissed,
     Superseded,
@@ -530,6 +559,7 @@ impl Tool for ModeYield {
             is_error: true,
             ..ToolOutput::default()
         };
+        let mut accepted = result.clone();
         let message = if spec.review {
             // The receiver must drop before this guard, including on cancellation.
             let _withdraw = WithdrawResult {
@@ -540,6 +570,7 @@ impl Tool for ModeYield {
                 call_id: cx.call.id.clone(),
                 mode: self.mode.name.clone(),
                 result: result.clone(),
+                schema: spec.schema.clone(),
             });
             drop(order);
             // A decision wins over cancellation: `Session::dismiss` settles the review and
@@ -551,7 +582,12 @@ impl Tool for ModeYield {
                 _ = cx.cancel.cancelled() => return Err(ToolError("Operation aborted".into())),
             };
             match outcome {
-                Ok(ResultOutcome::Accepted(message)) => message,
+                Ok(ResultOutcome::Accepted(options)) => {
+                    if let Some(replacement) = options.replacement {
+                        accepted = replacement;
+                    }
+                    options.message
+                }
                 Ok(ResultOutcome::Revise(feedback)) => {
                     return Ok(ToolOutput {
                         content: vec![UserBlock::Text {
@@ -587,13 +623,21 @@ impl Tool for ModeYield {
         detached(async move { hooks.leave_mode(&mode).await }).await?;
         let next = message.or_else(|| spec.then.clone());
         let mut text = format!("Result accepted. Mode \"{}\" has ended.", self.mode.name);
+        if accepted != result {
+            text.push_str(&format!(
+                "\nThe host edited your result. The accepted value is:\n{accepted}"
+            ));
+        }
         if let Some(next) = &next {
             text.push_str("\n\n");
             text.push_str(next);
         }
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
-            details: details("accepted"),
+            details: Some(json!({
+                "mode": self.mode.name, "outcome": "accepted",
+                "result": accepted, "original_result": result, "accepted_result": accepted
+            })),
             terminate: next.is_none(),
             ..ToolOutput::default()
         })

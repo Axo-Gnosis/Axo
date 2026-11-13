@@ -431,6 +431,7 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
                 }],
                 request_id: None,
                 sender: None,
+                provenance: None,
                 custom: None,
             })
             .await

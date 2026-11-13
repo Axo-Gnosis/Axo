@@ -6,6 +6,8 @@ This directory documents the implemented behavior and public APIs of the workspa
 
 The harness name defaults to `axo`. `AxoBuilder::name` changes the documentation scheme name and the text of the `docs` section (the section key stays `docs`) and the bundled `SYSTEM`/`SUMMARY` self-references; materialized docs use the chosen URL scheme, while Rust crate names stay unchanged.
 
+Host introspection includes activity and effective-mode snapshots/events, built versus recorded prompt sections, context-file inventories and file hashes, edited result acceptance, rich retry events, typed coordination receipts and routed sends, and durable stdout/stderr-tagged output. See [Session controls](extending.md#session-control-methods), [Coordination receipts](extending.md#coordination-receipts), and [Output](extending.md#background-jobs-for-hosts). Explicit skills now belong to user and project `ConfigLayer`s; [configuration](configuration.md#configuration-source-axoconfigsource) defines their gates and precedence.
+
 ## Reference Guides
 
 | Document | Covers |
