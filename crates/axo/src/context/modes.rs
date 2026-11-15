@@ -26,6 +26,9 @@ pub struct ModeSpec {
     pub tools: ToolLimits,
     /// `ReadOnly` confines `bash` writes to temp dirs and the session's `local/`.
     pub bash: BashAccess,
+    /// Where `write` and `edit` may write: scheme URL prefixes and directory paths
+    /// (relative to the session cwd or absolute). `None`: unrestricted; empty: nothing.
+    pub writes: Option<Vec<String>>,
     /// How the model finishes the mode; `None`: only the host ends it.
     pub result: Option<ModeResult>,
     /// Frontmatter keys axo does not know, for host policies.
@@ -106,6 +109,8 @@ struct Frontmatter {
     model: Option<String>,
     tools: ToolLimits,
     bash: BashAccess,
+    #[serde(deserialize_with = "markdown::write_entries")]
+    writes: Option<Vec<String>>,
     result: Option<ModeResult>,
     #[serde(flatten)]
     extra: Map<String, Value>,
@@ -235,6 +240,7 @@ fn parse_markdown(
         model: frontmatter.model,
         tools: frontmatter.tools,
         bash: frontmatter.bash,
+        writes: frontmatter.writes,
         result: frontmatter.result,
         extra: frontmatter.extra,
         body,
@@ -256,6 +262,10 @@ fn validate(spec: &ModeSpec, warn: &mut impl FnMut(String)) -> bool {
             "mode name \"{name}\" is reserved by the built-in /{name} command",
             name = spec.name
         ));
+        return false;
+    }
+    if let Some(problem) = markdown::writes_problem(spec.writes.as_deref()) {
+        warn(problem);
         return false;
     }
     if let Some(result) = &spec.result
@@ -300,6 +310,7 @@ mod tests {
                     deny: vec!["write".into()],
                 },
                 bash: BashAccess::ReadOnly,
+                writes: None,
                 result: Some(ModeResult {
                     schema: json!({"type": "object", "properties": {"plan": {"type": "string"}}}),
                     review: true,
@@ -372,5 +383,40 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn writes_lists_parse_and_reject_null_or_empty_entries() {
+        for (frontmatter, expected) in [
+            (
+                "writes: [local://, plans]",
+                Some(vec!["local://".to_owned(), "plans".to_owned()]),
+            ),
+            ("writes: []", Some(vec![])),
+            ("description: d", None),
+        ] {
+            let (spec, diagnostics) =
+                ModeSpec::parse("draft", &format!("---\n{frontmatter}\n---\nBody"));
+            assert!(diagnostics.is_empty(), "{frontmatter}: {diagnostics:?}");
+            assert_eq!(spec.unwrap().writes, expected, "{frontmatter}");
+        }
+        let (spec, diagnostics) = ModeSpec::parse("draft", "---\nwrites:\n---\nBody");
+        assert_eq!(spec, None);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("writes must be a list, not null")
+        );
+        let (spec, diagnostics) =
+            ModeSpec::parse("draft", "---\nwrites: [plans, \" \"]\n---\nBody");
+        assert_eq!(spec, None);
+        assert_eq!(
+            diagnostics,
+            vec![Diagnostic {
+                origin: None,
+                message: "mode \"draft\": writes entries must not be empty".into()
+            }]
+        );
     }
 }

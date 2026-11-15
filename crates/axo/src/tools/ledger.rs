@@ -12,21 +12,39 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedMutexGuard;
-/// The key two paths to the same file share: the deepest existing ancestor canonicalized,
-/// with the missing tail re-appended, so a file not created yet keys the same through a
-/// symlinked parent. Falls back to the path itself when no ancestor resolves.
+
+use super::folded;
+
+/// Symlink hops `file_key` follows by hand, as many as Linux follows itself.
+const SYMLINK_HOPS: usize = 40;
+
+/// The key two paths to the same file share: the deepest ancestor that resolves is
+/// canonicalized and the missing tail re-appended, so a file not created yet keys the
+/// same through a symlinked parent. A symlink that does not resolve (its target is
+/// missing) is followed by hand, so the key is where a write through it would land.
+/// Falls back to the path itself when nothing resolves or a link loops.
 pub(crate) fn file_key(path: &Path) -> PathBuf {
-    path.ancestors()
-        .find_map(|ancestor| {
-            let canonical = std::fs::canonicalize(ancestor).ok()?;
+    let mut path = path.to_path_buf();
+    for _ in 0..SYMLINK_HOPS {
+        let step = path.ancestors().find_map(|ancestor| {
             let tail = path.strip_prefix(ancestor).ok()?;
-            Some(if tail.as_os_str().is_empty() {
-                canonical
-            } else {
-                canonical.join(tail)
-            })
-        })
-        .unwrap_or_else(|| path.to_path_buf())
+            if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+                // Folded: a link target may put `..` in the missing tail.
+                return Some(Ok(folded(&canonical.join(tail))));
+            }
+            let target = std::fs::read_link(ancestor).ok()?;
+            // Rebuilt from components, not `join(tail)`: an empty tail would leave a
+            // trailing separator, and `read_link` follows a link spelled `link/`.
+            let next = ancestor.parent()?.join(target);
+            Some(Err(next.components().chain(tail.components()).collect()))
+        });
+        match step {
+            Some(Ok(key)) => return key,
+            Some(Err(next)) => path = next,
+            None => return path,
+        }
+    }
+    path
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -557,50 +557,88 @@ async fn follow_up_on_idle_session_starts_a_run() {
 }
 
 #[tokio::test]
-async fn read_only_bash_ceiling_outlives_the_parent_mode() {
+async fn bash_and_write_ceilings_outlive_the_parent_mode() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(
         dir.path(),
-        json!([{"id":"m"}, {"id":"child"}]),
+        json!([{"id":"m"}, {"id":"child"}, {"id":"scoped"}]),
         json!({}),
         vec![],
     )
     .await;
-    let parent = host
-        .axo
-        .create_session(SessionOptions {
-            modes: vec![ModeSpec {
-                name: "inspect".into(),
-                description: "Inspect without writing.".into(),
-                bash: BashAccess::ReadOnly,
-                ..Default::default()
-            }],
-            ..options(dir.path())
-        })
-        .await
-        .unwrap();
+    host.api.lane(
+        "scoped",
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "w",
+                "write",
+                json!({"path": "src.rs", "content": "escaped"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("refused")),
+        ],
+    );
+    let opts = SessionOptions {
+        modes: vec![ModeSpec {
+            name: "inspect".into(),
+            description: "Inspect without writing.".into(),
+            bash: BashAccess::ReadOnly,
+            writes: Some(vec!["local://".into(), "plans".into()]),
+            ..Default::default()
+        }],
+        ..options(dir.path())
+    };
+    let cwd = opts.cwd.clone();
+    let parent = host.axo.create_session(opts).await.unwrap();
     parent.set_mode(Some("inspect")).await.unwrap();
-    let restricted = within(parent.spawn(request("Inspect only.")))
-        .await
-        .unwrap();
+    let restricted = within(parent.spawn(SpawnRequest {
+        model: Some("test/scoped".into()),
+        ..request("Inspect only.")
+    }))
+    .await
+    .unwrap();
     parent.set_mode(None).await.unwrap();
     let free = within(parent.spawn(request("Inspect freely.")))
         .await
         .unwrap();
 
+    let restricted_link = restricted.session.spawn_link().unwrap();
+    assert_eq!(restricted_link.bash, BashAccess::ReadOnly);
     assert_eq!(
-        restricted.session.spawn_link().unwrap().bash,
-        BashAccess::ReadOnly
+        restricted_link.writes,
+        Some(vec![
+            "local://".to_owned(),
+            cwd.join("plans").to_string_lossy().into_owned()
+        ])
     );
-    assert_eq!(free.session.spawn_link().unwrap().bash, BashAccess::Full);
-    // The ceiling is durable: it lives in the child's header.
+    let free_link = free.session.spawn_link().unwrap();
+    assert_eq!(free_link.bash, BashAccess::Full);
+    assert_eq!(free_link.writes, None);
+    // The ceilings are durable: they live in the child's header.
     let header = |session: &axo::Session| -> Value {
         let text = std::fs::read_to_string(session.path()).unwrap();
         serde_json::from_str(text.lines().next().unwrap()).unwrap()
     };
     until(|| restricted.session.path().exists() && free.session.path().exists()).await;
-    assert_eq!(header(&restricted.session)["spawn"]["bash"], "readOnly");
-    assert!(header(&free.session)["spawn"].get("bash").is_none());
+    let (restricted_header, free_header) = (header(&restricted.session), header(&free.session));
+    assert_eq!(restricted_header["spawn"]["bash"], "readOnly");
+    assert_eq!(
+        restricted_header["spawn"]["writes"],
+        json!(restricted_link.writes)
+    );
+    assert!(free_header["spawn"].get("bash").is_none());
+    assert!(free_header["spawn"].get("writes").is_none());
+
+    // The child is bound by the ceiling although the parent has left the mode.
+    let written = |v: &Value| v["type"] == "message" && v["message"]["toolCallId"] == "w";
+    until(|| journal(&restricted.session).iter().any(written)).await;
+    let lines = journal(&restricted.session);
+    let result = &lines[only(&lines, "write result", written)];
+    assert_eq!(result["message"]["isError"], true);
+    assert!(
+        message_text(result).contains("is outside the write scope (local://, "),
+        "{result}"
+    );
+    assert!(!cwd.join("src.rs").exists());
     restricted.session.shutdown().await;
     free.session.shutdown().await;
     parent.shutdown().await;

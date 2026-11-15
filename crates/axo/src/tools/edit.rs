@@ -106,7 +106,9 @@ impl Tool for EditTool {
                 "Edit tool input is invalid. edits must contain at least one replacement.".into(),
             ));
         }
-        let (absolute, label) = match self.tools.locate(&path).await? {
+        let located = self.tools.locate(&path).await?;
+        self.tools.check_write(&located).await?;
+        let (absolute, label) = match located {
             Located::File {
                 url,
                 path,
@@ -506,7 +508,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -890,5 +892,33 @@ mod tests {
         let recorded = ledger.recorded(&real.join("new.txt"));
         assert!(recorded.is_some());
         assert_eq!(recorded, ledger.recorded(&link.join("new.txt")));
+    }
+
+    #[test]
+    fn dangling_symlinks_key_by_their_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::create_dir(root.join("in")).expect("mkdir");
+        let link = |name: &str, target: &Path| {
+            let link = root.join("in").join(name);
+            std::os::unix::fs::symlink(target, &link).expect("symlink");
+            link
+        };
+        let gone = root.join("gone.txt");
+        for (name, target) in [
+            ("abs", gone.as_path()),
+            ("rel", Path::new("../gone.txt")),
+            ("fold", Path::new("nope/../../gone.txt")),
+            ("chain", Path::new("rel")),
+        ] {
+            assert_eq!(crate::tools::file_key(&link(name, target)), gone, "{name}");
+        }
+        let dir_link = link("dir", &root.join("newdir"));
+        assert_eq!(
+            crate::tools::file_key(&dir_link.join("x")),
+            root.join("newdir/x")
+        );
+        let looped = link("loop", Path::new("loop"));
+        assert_eq!(crate::tools::file_key(&looped), looped);
     }
 }

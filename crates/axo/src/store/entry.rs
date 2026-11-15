@@ -109,6 +109,10 @@ pub struct SpawnLink {
     /// The parent's effective bash access at spawn; a ceiling every descendant inherits.
     #[serde(default, skip_serializing_if = "BashAccess::is_full")]
     pub bash: BashAccess,
+    /// The parent's effective write scope at spawn; a ceiling every descendant inherits.
+    /// `local://` means the child's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes: Option<Vec<String>>,
     /// The member's team; `None` outside teams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<TeamLink>,
@@ -418,6 +422,9 @@ pub enum Entry {
         /// Old sessions stored text-only `content` blocks, which read as `Text` parts.
         #[serde(alias = "content")]
         parts: Vec<PromptPart>,
+        /// Names of the keywords that fired for this submission, deduplicated, in first-occurrence order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keywords: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
         /// The teammate that submitted this input, if any.

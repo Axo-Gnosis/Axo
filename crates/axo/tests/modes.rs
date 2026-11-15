@@ -1469,3 +1469,90 @@ async fn read_only_bash_mode_denies_writes_but_runs_git_status() {
     }
     session.shutdown().await;
 }
+
+#[tokio::test]
+async fn mode_write_scope_confines_write_and_edit_by_real_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let call = |id: &'static str, path: &str| (id, "write", json!({"path": path, "content": id}));
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[
+                call("outside", "src.rs"),
+                call("plans", "plans/a.md"),
+                call("local", "local://p.md"),
+                call("escape", "plans/out/x"),
+                call("dangling", "plans/dangling"),
+                (
+                    "edit",
+                    "edit",
+                    json!({"path": "kept.txt", "edits": [{"oldText": "kept", "newText": "gone"}]}),
+                ),
+            ])),
+            ScriptedTurn::Reply(reply_text("scoped")),
+            ScriptedTurn::Reply(reply_tool_calls(&[call("sealed", "local://p.md")])),
+            ScriptedTurn::Reply(reply_text("sealed")),
+            ScriptedTurn::Reply(reply_tool_calls(&[call("free", "src.rs")])),
+            ScriptedTurn::Reply(reply_text("free")),
+        ],
+    )
+    .await;
+    let mode = |name: &str, writes: &[&str]| ModeSpec {
+        name: name.into(),
+        description: "Write only where allowed.".into(),
+        writes: Some(writes.iter().map(|entry| (*entry).to_owned()).collect()),
+        ..Default::default()
+    };
+    let opts = SessionOptions {
+        modes: vec![mode("scoped", &["local://", "plans"]), mode("sealed", &[])],
+        ..options(dir.path())
+    };
+    let cwd = opts.cwd.clone();
+    std::fs::write(cwd.join("kept.txt"), "kept").unwrap();
+    std::fs::create_dir(cwd.join("plans")).unwrap();
+    std::os::unix::fs::symlink("..", cwd.join("plans/out")).unwrap();
+    std::os::unix::fs::symlink(cwd.join("leak.rs"), cwd.join("plans/dangling")).unwrap();
+    let session = host.axo.create_session(opts).await.unwrap();
+    session.set_mode(Some("scoped")).await.unwrap();
+    within(session.prompt("Write around.")).await.unwrap();
+    assert!(!cwd.join("src.rs").exists());
+    session.set_mode(Some("sealed")).await.unwrap();
+    within(session.prompt("Write nothing.")).await.unwrap();
+    session.set_mode(None).await.unwrap();
+    within(session.prompt("Write freely.")).await.unwrap();
+
+    let requests = host.api.requests();
+    for id in ["outside", "escape", "dangling", "edit"] {
+        let (failed, text) = tool_result(&requests[1], id);
+        assert!(
+            failed && text.contains("is outside the write scope ("),
+            "{id}: {text}"
+        );
+    }
+    assert!(!cwd.join("x").exists());
+    assert!(!cwd.join("leak.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("kept.txt")).unwrap(),
+        "kept"
+    );
+    for id in ["plans", "local"] {
+        let (failed, text) = tool_result(&requests[1], id);
+        assert!(!failed, "{id}: {text}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("plans/a.md")).unwrap(),
+        "plans"
+    );
+    let (failed, text) = tool_result(&requests[3], "sealed");
+    assert!(failed, "{text}");
+    assert_eq!(
+        text,
+        "local://p.md is outside the write scope (no writes allowed)"
+    );
+    let (failed, text) = tool_result(&requests[5], "free");
+    assert!(!failed, "{text}");
+    assert_eq!(std::fs::read_to_string(cwd.join("src.rs")).unwrap(), "free");
+    session.shutdown().await;
+}

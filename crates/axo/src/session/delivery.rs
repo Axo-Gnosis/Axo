@@ -355,6 +355,7 @@ impl Session {
             content,
             request.request_id.clone(),
             None,
+            &keywords,
         );
         let mut entry = Some(entry);
         let mut duplicate = None;
@@ -500,6 +501,7 @@ impl Session {
             parts: vec![PromptPart::Text {
                 text: message.text.clone(),
             }],
+            keywords: Vec::new(),
             request_id: None,
             sender: None,
             provenance: None,
@@ -575,7 +577,7 @@ impl Session {
         };
         let choice = self.hooks.keyword_choice(&keywords)?;
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &keywords).await?;
-        let (mut entry, message) = submission(kind, parts, content, None, sender);
+        let (mut entry, message) = submission(kind, parts, content, None, sender, &keywords);
         if let Entry::Submission {
             provenance: recorded,
             ..
@@ -628,7 +630,7 @@ impl Session {
     /// Validates and renders a new child's task; writes nothing.
     pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &[]).await?;
-        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None);
+        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None, &[]);
         Ok(FirstPrompt {
             entry,
             message,
@@ -751,6 +753,7 @@ fn submission(
     content: Vec<UserBlock>,
     request_id: Option<String>,
     sender: Option<String>,
+    keywords: &[Arc<KeywordSpec>],
 ) -> (Entry, QueuedMessage) {
     let submission_id = Uuid::now_v7().to_string();
     let entry = Entry::Submission {
@@ -758,6 +761,10 @@ fn submission(
         submission_id: submission_id.clone(),
         kind,
         parts,
+        keywords: keywords
+            .iter()
+            .map(|keyword| keyword.name.clone())
+            .collect(),
         request_id,
         sender,
         provenance: None,

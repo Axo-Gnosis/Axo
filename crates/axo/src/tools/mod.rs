@@ -18,12 +18,13 @@ pub(crate) mod send;
 pub(crate) mod truncate;
 pub(crate) mod wait;
 pub(crate) mod write;
+pub(crate) mod writes;
 
 use ignore::WalkBuilder;
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
@@ -71,6 +72,9 @@ pub struct SessionTools {
     pub(crate) runner: CommandRunner,
     /// The effective scope's bash access, kept current by the session on every rescope.
     pub(crate) read_only_bash: AtomicBool,
+    /// The effective write scope, kept current by the session on every rescope; read it
+    /// through `write_scope`. Never held across an await.
+    pub(crate) writes: Mutex<Option<Vec<String>>>,
 }
 
 /// Builds a host tool for one session from that session's shared state (called again for
@@ -139,6 +143,7 @@ impl SessionTools {
             supervisor: runner.supervisor.clone(),
             runner,
             read_only_bash: AtomicBool::new(false),
+            writes: Mutex::new(None),
         }
     }
 
@@ -217,18 +222,23 @@ impl SessionTools {
                 .unwrap_or_else(|| PathBuf::from(path)),
             (path, _) => PathBuf::from(path),
         };
-        let mut resolved = PathBuf::new();
-        for component in self.cwd.join(expanded).components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    resolved.pop();
-                }
-                component => resolved.push(component),
-            }
-        }
-        resolved
+        folded(&self.cwd.join(expanded))
     }
+}
+
+/// `path` with `.` dropped and `..` popping the component before it, without touching disk.
+pub(crate) fn folded(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                folded.pop();
+            }
+            component => folded.push(component),
+        }
+    }
+    folded
 }
 
 /// Tries macOS screenshot variants for a plain filesystem read path that does not exist.

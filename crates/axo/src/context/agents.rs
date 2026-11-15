@@ -61,6 +61,11 @@ pub struct AgentSpec {
     /// `ReadOnly` confines `bash` writes, here and in every descendant this agent spawns.
     #[serde(default, skip_serializing_if = "BashAccess::is_full")]
     pub bash: BashAccess,
+    /// Where `write` and `edit` may write: scheme URL prefixes and directory paths
+    /// (relative to the session cwd or absolute). `None`: unrestricted; empty: nothing.
+    /// Spawned descendants inherit it as a ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writes: Option<Vec<String>>,
     /// The prompt (trimmed).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
@@ -180,6 +185,8 @@ struct Frontmatter {
     max_turns: Option<u32>,
     #[serde(default)]
     bash: BashAccess,
+    #[serde(default, deserialize_with = "markdown::write_entries")]
+    writes: Option<Vec<String>>,
     members: Option<Vec<RawMember>>,
 }
 
@@ -372,6 +379,7 @@ fn parse_markdown(
             "output",
             "maxTurns",
             "bash",
+            "writes",
         ]
     };
     for key in mapping.keys() {
@@ -432,6 +440,7 @@ fn parse_markdown(
         output: frontmatter.output,
         max_turns: frontmatter.max_turns,
         bash: frontmatter.bash,
+        writes: frontmatter.writes,
         body,
         path: path.map(Path::to_path_buf),
     };
@@ -456,6 +465,10 @@ fn validate_agent(spec: &mut AgentSpec, warn: &mut impl FnMut(String)) -> bool {
             false
         }
     });
+    if let Some(problem) = markdown::writes_problem(spec.writes.as_deref()) {
+        warn(problem);
+        return false;
+    }
     if let Some(schema) = &spec.output
         && let Err(error) = jsonschema::validator_for(schema)
     {

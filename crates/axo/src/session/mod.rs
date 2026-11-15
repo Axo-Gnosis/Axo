@@ -46,7 +46,7 @@ use self::journal::Journal;
 use self::maintenance::Maintenance;
 pub(crate) use self::modes::MODE_NOTICE;
 pub use self::modes::{AcceptResultOptions, PendingResult};
-use self::policy::{ModeGate, PolicyHook, ScopeCell, effective_bash};
+use self::policy::{ModeGate, PolicyHook, ScopeCell, effective_bash, effective_writes};
 pub use self::policy::{ToolPolicy, ToolScope};
 pub use self::prompt::{ContextFilesInspection, PromptInspection};
 use self::prompt::{PromptState, SessionPrompt, ShapeBase, shape};
@@ -1839,12 +1839,25 @@ impl Session {
         session_tools
             .read_only_bash
             .store(!bash.is_full(), Ordering::Release);
+        let writes = effective_writes(
+            &session_tools,
+            scope_agent.as_ref(),
+            selected_mode.as_deref(),
+            child
+                .as_ref()
+                .and_then(|child| child.link.writes.as_deref()),
+        );
+        *session_tools
+            .writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = writes.clone();
         let scope = Arc::new(Mutex::new(Arc::new(ToolScope {
             session_id: session_id.clone(),
             depth,
             agent: scope_agent,
             mode: selected_mode.clone(),
             bash,
+            writes,
         })));
         let mut tool_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
         if let Some(child) = &child {

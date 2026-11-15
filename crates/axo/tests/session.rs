@@ -429,6 +429,7 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
                 parts: vec![PromptPart::Text {
                     text: "second".into(),
                 }],
+                keywords: Vec::new(),
                 request_id: None,
                 sender: None,
                 provenance: None,
@@ -1168,6 +1169,11 @@ mod keywords {
             }],
             "the submission keeps the typed parts"
         );
+        assert_eq!(
+            lines[submission]["keywords"],
+            json!(["orchestrate"]),
+            "the submission records the fired keyword"
+        );
         let changes = conduct_changes(&lines);
         let first_reply = lines
             .iter()
@@ -1204,8 +1210,38 @@ mod keywords {
     }
 
     #[tokio::test]
+    async fn model_only_keywords_are_recorded_without_a_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = keyword_host(
+            dir.path(),
+            json!({}),
+            vec![ScriptedTurn::Reply(reply_text("ok"))],
+        )
+        .await;
+        let model_only = KeywordSpec {
+            body: String::new(),
+            ..orchestrate()
+        };
+        let session = host
+            .axo
+            .create_session(keyword_options(dir.path(), model_only))
+            .await
+            .unwrap();
+        within(session.prompt("orchestrate the fix")).await.unwrap();
+        let requests = host.api.requests();
+        assert_eq!(requests[0].model.id, "c");
+        assert_eq!(keyword_blocks(&requests[0]), 0);
+        let lines = common::journal(&session);
+        let submission = common::only(&lines, "submission", |line| line["type"] == "submission");
+        assert_eq!(lines[submission]["keywords"], json!(["orchestrate"]));
+        session.shutdown().await;
+    }
+
+    /// Reopening renders a requeued submission's recorded keywords, even once keywords are
+    /// switched off.
+    #[tokio::test]
     async fn queued_keyword_steers_keep_their_block_across_requeue_without_reselecting() {
-        for reopen in [false, true] {
+        for (reopen, disable) in [(false, false), (true, false), (true, true)] {
             let dir = tempfile::tempdir().unwrap();
             let host = keyword_host(
                 dir.path(),
@@ -1249,6 +1285,12 @@ mod keywords {
                 let path = session.path().to_path_buf();
                 session.shutdown().await;
                 drop(session);
+                if disable {
+                    host.config.user.lock().unwrap().layer.settings = Some(json!({
+                        "modelRoles": {"conduct": "test/c"},
+                        "keywords": {"enabled": false},
+                    }));
+                }
                 // No `model` override: the reopened session keeps its journaled model.
                 session = host
                     .axo
@@ -1261,6 +1303,11 @@ mod keywords {
                     )
                     .await
                     .unwrap();
+                assert_eq!(
+                    session.keyword_matches("orchestrate").is_empty(),
+                    disable,
+                    "disable = {disable}"
+                );
             }
 
             assert_eq!(

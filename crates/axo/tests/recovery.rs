@@ -75,6 +75,7 @@ impl Log {
             submission_id: id.into(),
             kind,
             parts,
+            keywords: Vec::new(),
             request_id: None,
             sender: None,
             provenance: None,

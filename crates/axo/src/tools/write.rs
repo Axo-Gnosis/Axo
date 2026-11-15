@@ -83,7 +83,9 @@ impl Tool for WriteTool {
         let WriteArgs { path, content } =
             serde_json::from_value(Value::Object(call.arguments.clone()))
                 .map_err(|error| ToolError(error.to_string()))?;
-        let (absolute, label) = match self.tools.locate(&path).await? {
+        let located = self.tools.locate(&path).await?;
+        self.tools.check_write(&located).await?;
+        let (absolute, label) = match located {
             Located::File {
                 url,
                 path,

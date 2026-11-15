@@ -150,6 +150,8 @@ pub struct SpawnContext<'a> {
     pub limits: &'a ToolLimits,
     /// The parent's effective bash access, under `mode`; the child's ceiling, never loosened below.
     pub bash: BashAccess,
+    /// The parent's effective write scope, under `mode`; the child's ceiling, never loosened below.
+    pub writes: Option<&'a [String]>,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
     pub task: &'a PromptInput,
@@ -242,6 +244,7 @@ struct Resolved {
     selector: Option<String>,
     limits: ToolLimits,
     bash: BashAccess,
+    writes: Option<Vec<String>>,
 }
 
 struct Launch {
@@ -360,6 +363,7 @@ impl SessionHooks {
                 .unwrap_or_default(),
         };
         let bash = self.bash_with(mode.as_deref());
+        let writes = self.writes_with(mode.as_deref());
         normalize(&mut spec, &settings.subagents);
         let select = |spec: &AgentSpec| -> Result<_, Error> {
             let cascade = settings.first_model(
@@ -393,6 +397,7 @@ impl SessionHooks {
                     mode: mode.as_deref(),
                     limits: &limits,
                     bash,
+                    writes: writes.as_deref(),
                     model: &model,
                     thinking,
                     task,
@@ -421,6 +426,7 @@ impl SessionHooks {
             selector,
             limits,
             bash,
+            writes,
         })
     }
 
@@ -446,6 +452,7 @@ impl SessionHooks {
                 selector,
                 limits,
                 bash,
+                writes,
             } = resolved;
             let link = SpawnLink {
                 parent_session_id: self.session_id.clone(),
@@ -456,6 +463,7 @@ impl SessionHooks {
                 spec,
                 limits,
                 bash,
+                writes,
                 team,
             };
             header.spawn = Some(link.clone());

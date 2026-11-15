@@ -298,6 +298,31 @@ async fn root_agent_applies_its_switches() {
     let (broken, problems) = AgentSpec::parse("broken", "---\nname: [unclosed\n---\nbody\n");
     assert_eq!(broken, None);
     assert!(!problems.is_empty() && problems.iter().all(|problem| problem.origin.is_none()));
+    for (frontmatter, expected) in [
+        (
+            "writes: [local://, plans]",
+            Some(vec!["local://".to_owned(), "plans".to_owned()]),
+        ),
+        ("writes: []", Some(vec![])),
+        ("description: d", None),
+    ] {
+        let (spec, problems) =
+            AgentSpec::parse("scoped", &format!("---\n{frontmatter}\n---\nBody."));
+        assert!(problems.is_empty(), "{frontmatter}: {problems:?}");
+        assert_eq!(spec.unwrap().writes, expected, "{frontmatter}");
+    }
+    // An explicit null is not "unrestricted", and an empty entry would mean the cwd.
+    let (null, problems) = AgentSpec::parse("scoped", "---\nwrites:\n---\nBody.");
+    assert_eq!(null, None);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0]
+            .message
+            .contains("writes must be a list, not null")
+    );
+    let (empty, problems) = AgentSpec::parse("scoped", "---\nwrites: [\"\"]\n---\nBody.");
+    assert_eq!(empty, None);
+    assert_eq!(problems[0].message, "writes entries must not be empty");
 }
 
 #[tokio::test]

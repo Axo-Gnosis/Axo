@@ -54,9 +54,10 @@ impl Session {
     }
 
     /// The user messages of requeued `submission` entries, rendered from their parts
-    /// (skills re-expanded, keywords re-matched, images re-read) and queued under their
-    /// submission ids so their `message` entries carry them. A keyword's model is not
-    /// applied again: its change was recorded when the submission was.
+    /// (skills re-expanded, recorded keywords rendered from their current definitions,
+    /// images re-read) and queued under their submission ids so their `message` entries
+    /// carry them. A keyword's model is not applied again: its change was recorded when
+    /// the submission was.
     async fn requeued(&self, requeue: Vec<SeqEntry>) -> Vec<(SubmissionKind, QueuedMessage)> {
         let mut queued = Vec::new();
         for seq in requeue {
@@ -64,6 +65,7 @@ impl Session {
                 submission_id,
                 kind,
                 parts,
+                keywords: names,
                 custom,
                 ..
             } = seq.entry
@@ -83,12 +85,20 @@ impl Session {
                         timestamp: now_ms(),
                     })
                 } else {
-                    let keywords = match kind {
-                        SubmissionKind::Prompt
-                        | SubmissionKind::Steer
-                        | SubmissionKind::FollowUp => self.hooks.matched_keywords(&parts),
-                        SubmissionKind::Mail | SubmissionKind::Quiet => Vec::new(),
-                    };
+                    // Recorded names, not a re-match: the journal and the injected text
+                    // agree even when keyword settings changed since. A name whose
+                    // definition is gone is skipped.
+                    let keywords: Vec<_> = names
+                        .iter()
+                        .filter_map(|name| {
+                            self.hooks
+                                .inherited
+                                .keywords
+                                .iter()
+                                .find(|keyword| keyword.name == *name)
+                                .cloned()
+                        })
+                        .collect();
                     AgentMessage::Llm(Message::User(UserMessage {
                         content: render(
                             &parts,

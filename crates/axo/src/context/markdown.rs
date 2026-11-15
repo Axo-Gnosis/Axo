@@ -3,10 +3,28 @@
 use std::path::Path;
 
 use ignore::WalkBuilder;
+use serde::Deserialize;
 
 use crate::tools::files::{normalize_to_lf, split_bom};
 
 const MAX_NAME_LENGTH: usize = 64;
+
+/// A `writes` list; an explicit null is an error rather than "unrestricted". Read through
+/// `Option` because YAML deserializers accept a null as an empty sequence ("no writes").
+pub(crate) fn write_entries<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Option::<Vec<String>>::deserialize(d)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("writes must be a list, not null"))
+}
+
+/// The problem with a `writes` list, if any: an empty entry would resolve to the cwd.
+pub(crate) fn writes_problem(writes: Option<&[String]>) -> Option<String> {
+    writes
+        .is_some_and(|writes| writes.iter().any(|entry| entry.trim().is_empty()))
+        .then(|| "writes entries must not be empty".to_owned())
+}
 
 /// pi `extractFrontmatter`: BOM stripped, newlines normalized to `\n`; returns the YAML
 /// between the leading `---` and the next `\n---` (if any), and the trimmed body.

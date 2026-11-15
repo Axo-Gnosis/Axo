@@ -384,6 +384,7 @@ fn submission(id: &str, parent: Option<&str>) -> Entry {
         parts: vec![PromptPart::Text {
             text: "hello".into(),
         }],
+        keywords: Vec::new(),
         request_id: None,
         sender: None,
         provenance: None,
