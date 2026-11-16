@@ -282,6 +282,8 @@ pub enum ResultResolution {
     Revised,
     /// `Session::dismiss`.
     Dismissed,
+    /// A steer arrived while the review was pending.
+    Steered,
     /// A mode change ended the mode before review.
     Superseded,
     /// The `yield` call was cancelled while waiting.
@@ -368,8 +370,8 @@ pub struct LiveSnapshot {
     pub running: bool,
     pub streaming: Option<AssistantMessage>,
     pub pending_tool_calls: Vec<ToolCall>,
-    pub queued_steering: Vec<AgentMessage>,
-    pub queued_follow_up: Vec<AgentMessage>,
+    /// Steers, then follow-ups, each in delivery order.
+    pub queued: Vec<QueuedInput>,
     /// The projected conversation at this point in the append order, from the journal's view.
     pub messages: Vec<AgentMessage>,
     /// Unanswered `ask` calls by tool-call id. A question raised while attaching can
@@ -390,6 +392,38 @@ pub struct LiveSnapshot {
     pub effective_mode: Option<String>,
     pub context: Option<ContextUsage>,
     pub auto_paused: bool,
+}
+
+/// One steer or follow-up waiting in the agent's queues.
+#[derive(Debug, Clone)]
+pub struct QueuedInput {
+    pub submission_id: String,
+    /// `Prompt` (input requeued when the session reopened) is delivered like `Steer`.
+    pub kind: SubmissionKind,
+    pub parts: Vec<PromptPart>,
+}
+
+impl QueuedInput {
+    /// The submission `id` as recorded in `entries`.
+    pub(super) fn find(entries: &[SeqEntry], id: String) -> Option<Self> {
+        entries
+            .iter()
+            .rev()
+            .find_map(|seq| match &seq.entry {
+                Entry::Submission {
+                    submission_id,
+                    kind,
+                    parts,
+                    ..
+                } if *submission_id == id => Some((*kind, parts.clone())),
+                _ => None,
+            })
+            .map(|(kind, parts)| Self {
+                submission_id: id,
+                kind,
+                parts,
+            })
+    }
 }
 
 /// A new session copied from a point of another.
@@ -506,8 +540,8 @@ struct SessionHooks {
     mode: Mutex<modes::ModeState>,
     agent_spec: Mutex<Option<AgentSpec>>,
     scope: Arc<ScopeCell>,
-    /// Set when a run ends other than `Done` or the user stops an active one; finished
-    /// job results then wait for the user's next input instead of starting a run.
+    /// Holds queued input and finished job results until the user's next input or
+    /// `resume_wakes`. A Stop latches when pressed; a run that fails latches when it settles.
     auto_paused: AtomicBool,
     /// Set by a Stop while the session is claimed; the next run start honors it, so a Stop
     /// before the run begins is not lost.
@@ -899,14 +933,18 @@ impl SessionHooks {
 
     /// Closes the run with `run_end` (none after a shutdown) and releases the session
     /// for the next run, or starts delivering pending job results. Reservations and
-    /// admissions the run never committed are released first; a run that did not end
-    /// `Done`, or a failed `run_end`, pauses automatic delivery until the user acts.
+    /// admissions the run never committed are released first. A failed run, or a failed
+    /// `run_end`, pauses automatic delivery until the user acts; a Stop already latched
+    /// when pressed, so input sent since then still starts the next run.
     async fn settle(
         &self,
         result: Result<RunOutcome, axo_agent::Error>,
     ) -> Result<RunOutcome, Error> {
         self.tools.runner.jobs.release_uncommitted();
-        if !matches!(result, Ok(RunOutcome::Done)) {
+        if !matches!(
+            result,
+            Ok(RunOutcome::Done | RunOutcome::Aborted(CancelReason::User))
+        ) {
             self.set_auto_paused(true);
         }
         let run_id = {
@@ -2327,9 +2365,9 @@ impl Session {
         }
     }
 
-    /// Stops the active run (`CancelReason::User`). Stopping an active run pauses
-    /// automatic delivery of job results until the user's next input; an idle Stop
-    /// changes nothing.
+    /// Stops the active run (`CancelReason::User`). Stopping an active run holds queued
+    /// input and job results until the user's next input or `resume_wakes`; input sent
+    /// after the Stop starts the next run once this one settles. An idle Stop changes nothing.
     pub fn abort(&self) {
         if self.hooks.activity.borrow().running {
             self.hooks.set_auto_paused(true);
@@ -2610,7 +2648,12 @@ impl Session {
                 .mode
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let (queued_steering, queued_follow_up) = self.agent.queued();
+            let queued = self
+                .agent
+                .queued_ids()
+                .into_iter()
+                .filter_map(|id| QueuedInput::find(&view.entries, id))
+                .collect();
             let _tree = self
                 .hooks
                 .last_tree
@@ -2641,8 +2684,7 @@ impl Session {
                     auto_paused: self.hooks.auto_paused.load(Ordering::Acquire),
                     streaming: live.streaming.as_ref().and_then(Accumulator::snapshot),
                     pending_tool_calls: live.tool_calls.clone(),
-                    queued_steering,
-                    queued_follow_up,
+                    queued,
                     messages: view.projection.messages.clone(),
                     pending_questions: self.hooks.questions.pending(),
                     pending_results: self.hooks.results.snapshot(),

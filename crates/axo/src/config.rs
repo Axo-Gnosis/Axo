@@ -50,7 +50,7 @@ impl Default for Settings {
             model_roles: IndexMap::new(),
             default_thinking_level: ThinkingLevel::Medium,
             home_agents_dir: false,
-            steering_mode: QueueMode::OneAtATime,
+            steering_mode: QueueMode::All,
             follow_up_mode: QueueMode::OneAtATime,
             context_files: default_context_files(),
             nested_context_files: true,

@@ -47,10 +47,10 @@ pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
 pub use session::{
     AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
     HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
-    PendingResult, PromptInspection, PromptRequest, PromptResult, RecoveryPolicy, ResultResolution,
-    Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision,
-    SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest,
-    ToolPolicy, ToolScope,
+    PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput, RecoveryPolicy,
+    ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode,
+    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle,
+    TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,

@@ -270,6 +270,7 @@ async fn commit(
                 if !matches!(
                     seq.entry,
                     Entry::Submission { .. }
+                        | Entry::SubmissionWithdrawn { .. }
                         | Entry::Usage { .. }
                         | Entry::ModelChange { .. }
                         | Entry::AgentChange { .. }

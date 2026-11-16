@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use super::journal::{self, View};
 use super::{
-    HostDelivery, HostMessage, MaintenanceKind, PromptRequest, PromptResult, RunRequest, Session,
-    SessionEvent, SessionHooks, detached, run_to_settle,
+    HostDelivery, HostMessage, MaintenanceKind, PromptRequest, PromptResult, QueuedInput,
+    RunRequest, Session, SessionEvent, SessionHooks, detached, run_to_settle,
 };
 use crate::config::ModelChoice;
 use crate::context::keywords::{self, KeywordSpec};
@@ -473,6 +473,37 @@ impl Session {
             .map(drop)
     }
 
+    /// Takes a queued steer or follow-up back before it is delivered and returns its parts
+    /// for the host to edit and resubmit. `Error::NotQueued` once it was delivered.
+    pub async fn withdraw(&self, submission_id: &str) -> Result<Vec<PromptPart>, Error> {
+        let (hooks, agent, id) = (
+            self.hooks.clone(),
+            self.agent.clone(),
+            submission_id.to_owned(),
+        );
+        // Detached, so a dropped caller cannot leave the message removed but not recorded.
+        detached(async move {
+            let Some(QueuedInput { kind, parts, .. }) =
+                QueuedInput::find(&hooks.journal.view().entries, id.clone())
+            else {
+                return Err(Error::NotQueued(id));
+            };
+            let Some(message) = agent.remove_queued(&id) else {
+                return Err(Error::NotQueued(id));
+            };
+            let tombstone = Entry::SubmissionWithdrawn {
+                base: journal::base(),
+                submission_id: id,
+            };
+            if let Err(error) = hooks.append(vec![tombstone]).await {
+                enqueue(&agent, &hooks, kind, message);
+                return Err(error);
+            }
+            Ok(parts)
+        })
+        .await
+    }
+
     /// Posts a durable custom message without expanding skills. This is the cache-safe
     /// channel for host instructions: it changes neither the system prompt nor tools.
     /// Quiet messages wait for a turn boundary or the next run and never start a run.
@@ -523,11 +554,13 @@ impl Session {
         self.queue_message(kind, entry, queued, None, None).await
     }
 
-    /// Lifts the auto-pause a Stop or an unfinished run left, so pending job results
-    /// wake an idle session again; starts their delivery run now if the session is idle.
+    /// Lifts the pause a Stop or a failed run left and, on an idle session, starts a run
+    /// with the held steers or follow-ups, else with pending job results and mail.
     pub fn resume_wakes(&self) {
         self.hooks.set_auto_paused(false);
-        JobHost::results_ready(&*self.hooks);
+        if self.hooks.claim_idle() {
+            self.hooks.release_or_deliver();
+        }
     }
 
     /// Saves and queues a teammate's message, read at the next turn boundary; on an idle

@@ -287,6 +287,7 @@ Key risks to design around when building step 3 (script hooks):
 
 ## Track 5: Extensions (Bun host), MCP & `ast_edit`
 - **File-change snapshots (Axome review card):** Landed in code: `write` and `edit` of file targets record typed `details.change` (`FileChange` with before/after `SnapshotBlob`s and a `LineDiff`) through the shared `SessionTools::record_change`, storing raw bytes as content-addressed, never-pruned blobs under `<session>/snapshots/`; `edit`'s legacy `diff`/`patch`/`first_changed_line` keys are gone and it refuses non-UTF-8 files. Hosts read blobs (`Session::read_snapshot`, lock-free `Axo::read_snapshot`) and squash ranges (`squash`, `squash_changes`); forks link only the blobs their path references. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#file-changes-for-hosts).
+- **Queue control (Axome stuck steers):** Landed in code: input sent after a Stop is delivered when the stopped run settles (a Stop latches when pressed, a failed run when it settles); `Session::resume_wakes` also sends held steers and follow-ups; `steeringMode` defaults to `"all"`; `Session::withdraw` takes queued input back, recorded as `Entry::SubmissionWithdrawn` so reopening never requeues it; `LiveSnapshot::queued` lists `QueuedInput` with submission ids; a queued steer settles a pending `ask` question or reviewed `yield` (`ResultResolution::Steered`) instead of waiting behind it. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#queued-input-for-hosts).
 
 ### Extension contract & Bun host
 

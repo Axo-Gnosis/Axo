@@ -1697,6 +1697,35 @@ async fn steer_signal_is_pending_until_drained() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_the_only_steer_clears_the_signal() {
+    let tool = Arc::new(SteerTool {
+        started: Notify::new(),
+        seen: Mutex::default(),
+        schema: json!({ "type": "object" }),
+    });
+    let h = setup(
+        vec![turn(&[("c1", "steer", json!({}))]), text("done")],
+        vec![tool.clone() as Arc<dyn Tool>],
+        |_| {},
+    );
+    h.agent.steer(QueuedMessage {
+        message: user("withdrawn"),
+        id: Some("s1".into()),
+    });
+    assert!(h.agent.remove_queued("unknown").is_none());
+    let removed = h.agent.remove_queued("s1").expect("queued steer");
+    assert_eq!(removed.id.as_deref(), Some("s1"));
+    assert!(h.agent.remove_queued("s1").is_none());
+
+    assert_eq!(h.prompt("go").await, RunOutcome::Done);
+    assert_eq!(*tool.seen.lock().unwrap(), [false]);
+    assert_eq!(
+        h.request(1),
+        labels(&["user:go", "assistant:ToolUse", "result:c1"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn message_end_origins_follow_the_persisted_result() {
     let tool = Arc::new(OriginTool {
         agent: OnceLock::new(),

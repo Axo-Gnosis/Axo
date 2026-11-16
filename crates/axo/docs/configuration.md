@@ -107,7 +107,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
   },
   "defaultThinkingLevel": "medium",
   "homeAgentsDir": false,
-  "steeringMode": "one-at-a-time",
+  "steeringMode": "all",
   "followUpMode": "one-at-a-time",
   "nestedContextFiles": true,
   "contextFiles": {
@@ -163,7 +163,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
 | `modelRoles` | `model_roles` | `{}` | User only | Role name → selector (`provider/model[:thinking]` or `:thinking`); expanded by `@role`. A role cannot name another role. Ignored with a warning in project settings |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |
-| `steeringMode` | `steering_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
+| `steeringMode` | `steering_mode` | `"all"` | User or project | `QueueMode::All` (`"all"`, every queued steer enters at the next drain point) or `QueueMode::OneAtATime` (`"one-at-a-time"`, one per drain point) |
 | `followUpMode` | `follow_up_mode` | `"one-at-a-time"` | User or project | `QueueMode::OneAtATime` (`"one-at-a-time"`) or `QueueMode::All` (`"all"`) |
 | `contextFiles` | `context_files` | 5 built-in names | User or project | Ordered map of relative paths to booleans merged onto the built-in default map |
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
@@ -324,6 +324,8 @@ Both keys apply only to root sessions; children never match keywords. Disabled k
 | Key | Rust field | Default | Meaning |
 | :--- | :--- | :--- | :--- |
 | `ask.timeoutMs` | `timeout_ms` | `None` | Optional timeout in milliseconds for `ask` tool calls. When it elapses, each question auto-selects its `recommended` option (or the first option if none is valid), and the answer is marked `(auto-selected after timeout)` |
+
+A queued steer settles a pending question instead of waiting behind it: `ask` returns a non-error result, "The user did not answer. They sent a message instead; it follows this result.", with `details.outcome == "steered"`, and the steer is delivered right after. See [Queued input for hosts](extending.md#queued-input-for-hosts).
 
 ### Compaction (`compaction` / `axo::CompactionSettings`)
 

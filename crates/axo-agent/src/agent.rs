@@ -250,6 +250,22 @@ impl Agent {
             .collect()
     }
 
+    /// Removes the queued steering or follow-up message with this id; `None` once it was
+    /// drained. Removing the last steering message clears the steer signal under the same lock.
+    pub fn remove_queued(&self, id: &str) -> Option<QueuedMessage> {
+        let mut state = self.lock();
+        let is = |m: &QueuedMessage| m.id.as_deref() == Some(id);
+        if let Some(at) = state.steering.iter().position(is) {
+            let removed = state.steering.remove(at);
+            if state.steering.is_empty() {
+                self.steer_pending.send_replace(false);
+            }
+            return removed;
+        }
+        let at = state.follow_up.iter().position(is)?;
+        state.follow_up.remove(at)
+    }
+
     /// Takes the next messages of the steering (`true`) or follow-up queue per its mode.
     /// Draining the last steering message clears the steer signal under the same lock.
     pub(crate) fn take_queued(&self, steering: bool) -> Vec<QueuedMessage> {

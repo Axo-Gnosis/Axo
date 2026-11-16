@@ -233,7 +233,8 @@ pub enum RecoveryPlan {
 /// Unconsumed submissions, flagged `true` when held: named by the last `run_end`'s
 /// `queued` rather than written after it. Submissions since the last run settled are
 /// pending (an open run's own prompt is written before its `run_start`); earlier
-/// leftovers not named by that `run_end` were dropped with their run.
+/// leftovers not named by that `run_end` were dropped with their run. A delivered or
+/// withdrawn submission is consumed wherever its `message` or tombstone sits.
 fn unconsumed_submissions(entries: &[SeqEntry]) -> impl Iterator<Item = (bool, &SeqEntry)> {
     let end = entries
         .iter()
@@ -249,6 +250,9 @@ fn unconsumed_submissions(entries: &[SeqEntry]) -> impl Iterator<Item = (bool, &
             Entry::Message {
                 submission_id: Some(id),
                 ..
+            }
+            | Entry::SubmissionWithdrawn {
+                submission_id: id, ..
             } => Some(id.as_str()),
             _ => None,
         })
@@ -800,6 +804,21 @@ mod tests {
                 wake: true,
             }
         );
+    }
+
+    #[test]
+    fn withdrawn_submission_is_not_requeued() {
+        let mut log = Log::default();
+        log.user("s1", SubmissionKind::Prompt, "first");
+        log.run_start("r1");
+        log.submission("s2", SubmissionKind::Steer, "taken back");
+        log.run_end_queued("r1", &["s2"]);
+        log.push(|base| Entry::SubmissionWithdrawn {
+            base,
+            submission_id: "s2".into(),
+        });
+
+        assert_eq!(log.plan(), RecoveryPlan::None);
     }
 
     #[test]

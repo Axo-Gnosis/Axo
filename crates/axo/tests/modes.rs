@@ -1112,6 +1112,59 @@ async fn dismissing_a_reviewed_result_records_its_outcome_and_aborts() {
 }
 
 #[tokio::test]
+async fn steer_settles_a_pending_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "final-plan",
+                "call",
+                json!({"tool":"yield", "args":{"plan":"ready"}}),
+            )])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    )
+    .await;
+    let session = Arc::new(
+        host.axo
+            .create_session(result_options(dir.path(), true, None))
+            .await
+            .unwrap(),
+    );
+    session.set_mode(Some("plan")).await.unwrap();
+    let mut events = session.attach(None).await.events;
+    let run = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Plan only.").await }
+    });
+    assert_eq!(next_mode_result(&mut events).await.0, "final-plan");
+    session.steer("do x instead").await.unwrap();
+    result_resolved(&mut events, "final-plan", ResultResolution::Steered).await;
+    assert_eq!(
+        within(run).await.unwrap().unwrap(),
+        axo_agent::RunOutcome::Done
+    );
+    assert_eq!(session.mode().unwrap().name, "plan");
+    let live = session.attach(None).await.live;
+    assert!(live.pending_results.is_empty());
+    assert!(!live.auto_paused);
+    let result = only_result(&journal(&session), "final-plan");
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["details"]["outcome"], "steered");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("sent a message instead")
+    );
+    assert_eq!(host.api.requests().len(), 2);
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn configured_result_continuation_runs_after_reviewed_and_unreviewed_yields() {
     for review in [true, false] {
         let dir = tempfile::tempdir().unwrap();

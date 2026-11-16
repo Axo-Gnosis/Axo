@@ -436,6 +436,12 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         custom: Option<SubmittedCustom>,
     },
+    /// A queued submission the host took back before delivery; reopening never requeues it.
+    SubmissionWithdrawn {
+        #[serde(flatten)]
+        base: EntryBase,
+        submission_id: String,
+    },
     /// A command promoted to a background job; never in context.
     JobStart {
         #[serde(flatten)]
@@ -566,6 +572,7 @@ impl Entry {
             | Entry::RunEnd { base, .. }
             | Entry::RunResumed { base, .. }
             | Entry::Submission { base, .. }
+            | Entry::SubmissionWithdrawn { base, .. }
             | Entry::JobStart { base, .. }
             | Entry::ChildStart { base, .. }
             | Entry::JobEnd { base, .. } => Some(base),
@@ -594,6 +601,7 @@ impl Entry {
             | Entry::RunEnd { base, .. }
             | Entry::RunResumed { base, .. }
             | Entry::Submission { base, .. }
+            | Entry::SubmissionWithdrawn { base, .. }
             | Entry::JobStart { base, .. }
             | Entry::ChildStart { base, .. }
             | Entry::JobEnd { base, .. } => Some(base),

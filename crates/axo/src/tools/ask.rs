@@ -58,11 +58,12 @@ pub struct Answer {
     pub custom: Option<String>,
 }
 
-/// How a pending `ask` call was settled by the client.
+/// How a pending `ask` call was settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AskOutcome {
     Answered(Vec<Answer>),
     Dismissed,
+    Steered,
 }
 
 /// Questions waiting for the client, keyed by tool-call id. `ask` registers one and
@@ -225,6 +226,18 @@ impl AskTool {
     }
 }
 
+fn steered() -> ToolOutput {
+    ToolOutput {
+        content: vec![UserBlock::Text {
+            text: "The user did not answer. They sent a message instead; it follows this result."
+                .into(),
+        }],
+        details: Some(json!({ "outcome": "steered" })),
+        is_error: false,
+        terminate: false,
+    }
+}
+
 #[async_trait]
 impl Tool for AskTool {
     fn name(&self) -> &str {
@@ -244,7 +257,12 @@ impl Tool for AskTool {
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ToolContext { call, cancel, .. } = cx;
+        let ToolContext {
+            call,
+            cancel,
+            mut steer,
+            ..
+        } = cx;
         let AskParams { questions } = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
 
@@ -269,6 +287,9 @@ impl Tool for AskTool {
         if questions.is_empty() {
             return Err(ToolError("questions must not be empty".into()));
         }
+        if steer.is_pending() {
+            return Ok(steered());
+        }
 
         let registry = &self.questions;
         let _withdraw = Withdraw {
@@ -288,6 +309,14 @@ impl Tool for AskTool {
         let outcome = tokio::select! {
             outcome = &mut rx => Some(outcome.map_err(closed)?),
             () = cancel.cancelled() => return Err(ToolError("Ask input was cancelled".into())),
+            () = steer.pending() => {
+                if registry.settle(&call.id, AskOutcome::Steered).is_ok() {
+                    Some(AskOutcome::Steered)
+                } else {
+                    // The client settled it in the same instant; honor its outcome.
+                    Some(rx.await.map_err(closed)?)
+                }
+            }
             () = timeout => {
                 if registry.settle(&call.id, AskOutcome::Dismissed).is_ok() {
                     None
@@ -303,6 +332,7 @@ impl Tool for AskTool {
                 return Err(ToolError("Ask tool was cancelled by the user".into()));
             }
             Some(AskOutcome::Answered(answers)) => answers,
+            Some(AskOutcome::Steered) => return Ok(steered()),
             None => Vec::new(),
         };
 

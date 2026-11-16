@@ -81,6 +81,10 @@ pub enum Error {
     NoPendingQuestion(String),
     #[error("No pending mode result for tool call: {0}")]
     NoPendingResult(String),
+    /// `withdraw` named a submission that was already delivered, withdrawn, or never queued
+    /// as a steer or follow-up.
+    #[error("Submission is not queued: {0}")]
+    NotQueued(String),
     /// Another writer holds the session's lock.
     #[error("Session is open in another process: {}", path.display())]
     SessionBusy { path: PathBuf },

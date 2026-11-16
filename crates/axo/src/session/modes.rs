@@ -398,6 +398,7 @@ pub(super) enum ResultOutcome {
     Revise(String),
     Dismissed,
     Superseded,
+    Steered,
 }
 
 pub(super) struct PendingResults {
@@ -438,6 +439,7 @@ impl PendingResults {
             ResultOutcome::Revise(_) => ResultResolution::Revised,
             ResultOutcome::Dismissed => ResultResolution::Dismissed,
             ResultOutcome::Superseded => ResultResolution::Superseded,
+            ResultOutcome::Steered => ResultResolution::Steered,
         };
         if !self.pending.settle(call_id, outcome) {
             return Err(Error::NoPendingResult(call_id.to_owned()));
@@ -559,8 +561,21 @@ impl Tool for ModeYield {
             is_error: true,
             ..ToolOutput::default()
         };
+        let steered = || {
+            ToolOutput {
+            content: vec![UserBlock::Text {
+                text: "The result was not reviewed: the user sent a message instead; it follows this result. The mode is still active; call yield again when the result is ready.".into(),
+            }],
+            details: details("steered"),
+            ..ToolOutput::default()
+        }
+        };
         let mut accepted = result.clone();
         let message = if spec.review {
+            if cx.steer.is_pending() {
+                drop(order);
+                return Ok(steered());
+            }
             // The receiver must drop before this guard, including on cancellation.
             let _withdraw = WithdrawResult {
                 registry: &hooks.results,
@@ -576,10 +591,15 @@ impl Tool for ModeYield {
             // A decision wins over cancellation: `Session::dismiss` settles the review and
             // then cancels the run, so both are ready together; the decided outcome is still
             // returned, and the loop's cooperative join journals it with its details.
+            let mut steer = cx.steer.clone();
             let outcome = tokio::select! {
                 biased;
                 outcome = &mut rx => outcome,
                 _ = cx.cancel.cancelled() => return Err(ToolError("Operation aborted".into())),
+                _ = steer.pending() => match hooks.results.settle(&cx.call.id, ResultOutcome::Steered) {
+                    Ok(()) => Ok(ResultOutcome::Steered),
+                    Err(_) => rx.await,
+                },
             };
             match outcome {
                 Ok(ResultOutcome::Accepted(options)) => {
@@ -599,6 +619,7 @@ impl Tool for ModeYield {
                         ..ToolOutput::default()
                     });
                 }
+                Ok(ResultOutcome::Steered) => return Ok(steered()),
                 Ok(ResultOutcome::Dismissed) => {
                     return Ok(failed("dismissed", "The result was dismissed by the user"));
                 }

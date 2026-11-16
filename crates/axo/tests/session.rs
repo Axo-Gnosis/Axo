@@ -295,6 +295,235 @@ async fn input_queued_when_a_run_stops_survives_reopening() {
     }
 }
 
+/// Returns once its call is cancelled, after a delay, so input can arrive between a Stop
+/// and the run settling.
+struct StopsSlowly;
+
+#[async_trait::async_trait]
+impl axo_agent::Tool for StopsSlowly {
+    fn name(&self) -> &str {
+        "stops_slowly"
+    }
+
+    fn description(&self) -> &str {
+        "Waits until cancelled, then lingers."
+    }
+
+    fn parameters(&self) -> &serde_json::Value {
+        static PARAMETERS: std::sync::LazyLock<serde_json::Value> =
+            std::sync::LazyLock::new(|| json!({"type": "object", "properties": {}}));
+        &PARAMETERS
+    }
+
+    async fn execute(
+        &self,
+        cx: axo_agent::ToolContext,
+    ) -> Result<axo_agent::ToolOutput, ToolError> {
+        cx.cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Err(ToolError("Operation aborted".into()))
+    }
+}
+
+fn user_texts(request: &axo_ai::testing::RecordedRequest) -> Vec<&str> {
+    request
+        .transcript
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .flat_map(|user| user.content.iter().filter_map(UserBlock::as_text))
+        .collect()
+}
+
+#[tokio::test]
+async fn input_after_stop_starts_the_next_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[("c1", "stops_slowly", json!({}))])),
+            ScriptedTurn::Reply(reply_text("ok")),
+        ],
+    )
+    .await;
+    let mut opts = options(dir.path());
+    let factory: axo::ToolFactory =
+        Arc::new(|_: &Arc<axo::SessionTools>| -> Arc<dyn axo_agent::Tool> {
+            Arc::new(StopsSlowly)
+        });
+    opts.tools = vec![axo::HostTool::direct(factory)];
+    let session = Arc::new(host.axo.create_session(opts).await.unwrap());
+    let mut events = session.attach(None).await.events;
+    let run = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("start").await }
+    });
+    within(async {
+        loop {
+            if let SessionEvent::Agent(axo_agent::AgentEvent::ToolExecutionStart { .. }) =
+                events.recv().await.unwrap()
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    within(session.steer("early")).await.unwrap();
+    session.abort();
+    within(session.steer("late")).await.unwrap();
+    assert!(matches!(
+        within(run).await.unwrap().unwrap(),
+        RunOutcome::Aborted(_)
+    ));
+
+    common::entry(&session, |entry| {
+        matches!(
+            entry,
+            Entry::RunEnd {
+                outcome: axo::RunOutcome::Done,
+                ..
+            }
+        )
+    })
+    .await;
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 2, "the input sent after Stop starts a run");
+    let users = user_texts(&requests[1]);
+    assert!(
+        users.contains(&"early") && users.contains(&"late"),
+        "{users:?}"
+    );
+    assert!(!session.attach(None).await.live.auto_paused);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn resume_wakes_sends_held_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::HangUntilCancel,
+            ScriptedTurn::Reply(reply_text("ok")),
+        ],
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
+            .await
+            .is_err()
+    );
+    within(session.steer("held")).await.unwrap();
+    session.abort();
+    common::entry(&session, |entry| matches!(entry, Entry::RunEnd { .. })).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(host.api.requests().len(), 1, "the Stop holds the steer");
+
+    let live = session.attach(None).await.live;
+    assert!(live.auto_paused && !live.running);
+    let [held] = live.queued.as_slice() else {
+        panic!("one held input: {:?}", live.queued);
+    };
+    assert_eq!(held.kind, SubmissionKind::Steer);
+    assert_eq!(
+        held.parts,
+        [PromptPart::Text {
+            text: "held".into()
+        }]
+    );
+
+    session.resume_wakes();
+    common::entry(&session, |entry| {
+        matches!(
+            entry,
+            Entry::RunEnd {
+                outcome: axo::RunOutcome::Done,
+                ..
+            }
+        )
+    })
+    .await;
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(user_texts(&requests[1]).contains(&"held"));
+    assert!(session.attach(None).await.live.queued.is_empty());
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn withdrawn_input_is_never_delivered() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = common::host(
+            dir.path(),
+            json!([{"id": "m"}]),
+            json!({}),
+            vec![
+                ScriptedTurn::HangUntilCancel,
+                ScriptedTurn::Reply(reply_text("unexpected")),
+            ],
+        )
+        .await;
+        let mut session = host.axo.create_session(options(dir.path())).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
+                .await
+                .is_err()
+        );
+        within(session.steer("oops")).await.unwrap();
+        let id = session.attach(None).await.live.queued[0]
+            .submission_id
+            .clone();
+        // Withdrawn while held by the Stop: the run_end names it, the tombstone follows.
+        session.abort();
+        common::entry(&session, |entry| matches!(entry, Entry::RunEnd { .. })).await;
+
+        assert_eq!(
+            within(session.withdraw(&id)).await.unwrap(),
+            [PromptPart::Text {
+                text: "oops".into()
+            }]
+        );
+        let attached = session.attach(None).await;
+        assert!(attached.live.queued.is_empty());
+        let tombstones = attached
+            .missed
+            .iter()
+            .filter(|seq| {
+                matches!(&seq.entry, Entry::SubmissionWithdrawn { submission_id, .. } if *submission_id == id)
+            })
+            .count();
+        assert_eq!(tombstones, 1);
+        assert!(matches!(
+            within(session.withdraw(&id)).await,
+            Err(axo::Error::NotQueued(_))
+        ));
+
+        if reopen {
+            let path = session.path().to_path_buf();
+            session.shutdown().await;
+            drop(session);
+            session = host
+                .axo
+                .open_session(&path, options(dir.path()))
+                .await
+                .unwrap();
+            assert!(session.attach(None).await.live.queued.is_empty());
+        }
+        session.resume_wakes();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(host.api.requests().len(), 1, "withdrawn input never runs");
+        session.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn dropping_a_prompt_future_still_settles_its_run() {
     let dir = tempfile::tempdir().unwrap();
