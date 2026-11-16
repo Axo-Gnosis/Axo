@@ -7,20 +7,16 @@ use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::UserBlock;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use similar::{ChangeTag, TextDiff};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::tools::files::{
     detect_line_ending, error_code, fs_error, normalize_to_lf, restore_line_endings, split_bom,
 };
-use crate::tools::{FileAccess, Located, SessionTools, lock_file};
+use crate::tools::{Located, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &[
     "When changing several places in one file, use one edit call with several entries in edits[].",
 ];
-
-/// Lines of context around changes in the display diff and the patch.
-const CONTEXT_LINES: usize = 4;
 
 #[derive(Deserialize)]
 struct EditArgs {
@@ -166,8 +162,12 @@ impl Tool for EditTool {
 
         // The BOM is stripped before matching (the model never includes it in oldText) and
         // the file's line ending restored after.
-        let raw = String::from_utf8_lossy(&bytes);
-        let (bom, content) = split_bom(&raw);
+        let raw = std::str::from_utf8(&bytes).map_err(|_| {
+            ToolError(format!(
+                "Could not edit file: {path}. File is not valid UTF-8."
+            ))
+        })?;
+        let (bom, content) = split_bom(raw);
         let ending = detect_line_ending(content);
         let base = normalize_to_lf(content);
         let block_count = edits.len();
@@ -180,33 +180,26 @@ impl Tool for EditTool {
         tokio::fs::write(&absolute, &final_content)
             .await
             .map_err(|error| ToolError(fs_error(&error, "open", shown)))?;
-        let ledger =
-            self.tools
-                .ledger
-                .record(&absolute, final_content.as_bytes(), FileAccess::Modify);
+        let details = self
+            .tools
+            .record_change(
+                &absolute,
+                label.as_deref(),
+                Some(bytes),
+                final_content.into_bytes(),
+            )
+            .await;
         if let Some(error) = aborted() {
             return Err(error);
         }
 
-        let diff = TextDiff::from_lines(base.as_str(), new_content.as_str());
-        let (display, first_changed_line) = display_diff(&diff, &base, &new_content);
-        let patch = diff
-            .unified_diff()
-            .context_radius(CONTEXT_LINES)
-            .header(path, path)
-            .to_string();
         let mut content = vec![UserBlock::Text {
             text: format!("Successfully replaced {block_count} block(s) in {path}."),
         }];
         content.extend(self.tools.context.attach(&absolute).await);
         Ok(ToolOutput {
             content,
-            details: Some(json!({
-                "diff": display,
-                "patch": patch,
-                "first_changed_line": first_changed_line,
-                "ledger": ledger,
-            })),
+            details: Some(details),
             ..ToolOutput::default()
         })
     }
@@ -426,83 +419,6 @@ fn apply_preserving_unchanged_lines(
     Ok(result)
 }
 
-/// The display diff with line numbers and up to 4 context lines around changes, and the
-/// first changed line in the new file (pi `generateDiffString`).
-fn display_diff(diff: &TextDiff<'_, '_, str>, old: &str, new: &str) -> (String, Option<usize>) {
-    let mut parts: Vec<(ChangeTag, Vec<&str>)> = Vec::new();
-    for change in diff.iter_all_changes() {
-        let value = change.value();
-        let line = value.strip_suffix('\n').unwrap_or(value);
-        match parts.last_mut() {
-            Some((tag, lines)) if *tag == change.tag() => lines.push(line),
-            _ => parts.push((change.tag(), vec![line])),
-        }
-    }
-
-    let width = old
-        .split('\n')
-        .count()
-        .max(new.split('\n').count())
-        .to_string()
-        .len();
-    let mut output: Vec<String> = Vec::new();
-    let (mut old_line, mut new_line) = (1, 1);
-    let mut last_was_change = false;
-    let mut first_changed_line = None;
-
-    for (i, (tag, lines)) in parts.iter().enumerate() {
-        match tag {
-            ChangeTag::Insert => {
-                first_changed_line.get_or_insert(new_line);
-                for line in lines {
-                    output.push(format!("+{new_line:>width$} {line}"));
-                    new_line += 1;
-                }
-                last_was_change = true;
-            }
-            ChangeTag::Delete => {
-                first_changed_line.get_or_insert(new_line);
-                for line in lines {
-                    output.push(format!("-{old_line:>width$} {line}"));
-                    old_line += 1;
-                }
-                last_was_change = true;
-            }
-            ChangeTag::Equal => {
-                let next_is_change = parts
-                    .get(i + 1)
-                    .is_some_and(|(next, _)| *next != ChangeTag::Equal);
-                let count = lines.len();
-                let (leading, trailing) = match (last_was_change, next_is_change) {
-                    (true, true) if count <= CONTEXT_LINES * 2 => (count, 0),
-                    (true, true) => (CONTEXT_LINES, CONTEXT_LINES),
-                    (true, false) => (count.min(CONTEXT_LINES), 0),
-                    (false, true) => (0, count.min(CONTEXT_LINES)),
-                    (false, false) => (0, 0),
-                };
-                let skipped = count - leading - trailing;
-                for line in &lines[..leading] {
-                    output.push(format!(" {old_line:>width$} {line}"));
-                    old_line += 1;
-                    new_line += 1;
-                }
-                if skipped > 0 && (last_was_change || next_is_change) {
-                    output.push(format!(" {:>width$} ...", ""));
-                }
-                old_line += skipped;
-                new_line += skipped;
-                for line in &lines[count - trailing..] {
-                    output.push(format!(" {old_line:>width$} {line}"));
-                    old_line += 1;
-                    new_line += 1;
-                }
-                last_was_change = false;
-            }
-        }
-    }
-    (output.join("\n"), first_changed_line)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -552,6 +468,7 @@ mod tests {
 
     struct Fixture {
         dir: TempDir,
+        session: Arc<SessionTools>,
         tools: Vec<Arc<dyn Tool>>,
     }
 
@@ -593,6 +510,7 @@ mod tests {
                     promote_after: Duration::from_secs(60),
                 },
                 Arc::new(crate::tools::deferred::Deferred::default()),
+                crate::tools::SnapshotStore::new(dir.path().join("snapshots")),
             ));
             Self {
                 tools: crate::tools::builtin(
@@ -604,6 +522,7 @@ mod tests {
                     Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
                     None,
                 ),
+                session,
                 dir,
             }
         }
@@ -663,6 +582,74 @@ mod tests {
             self.call("edit", json!({ "path": name, "edits": edits }))
                 .await
         }
+    }
+
+    fn change(output: &ToolOutput) -> Value {
+        output.details.as_ref().expect("details")["change"].clone()
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_record_changes_with_stored_snapshots() {
+        let fx = Fixture::new();
+        let created = fx
+            .call("write", json!({ "path": "a.txt", "content": "one\ntwo\n" }))
+            .await;
+        let created = change(&created);
+        assert_eq!(created["created"], true);
+        assert!(created.get("before").is_none());
+        assert_eq!(created["after"]["bytes"], 8);
+        assert_eq!(created["diff"]["additions"], 2);
+        assert_eq!(created["diff"]["deletions"], 0);
+        assert!(created["diff"].get("patch").is_none());
+        let written = created["after"]["sha256"].as_str().unwrap();
+        assert_eq!(
+            fx.session.snapshots.read(written).await.unwrap(),
+            b"one\ntwo\n"
+        );
+
+        let edited = fx.edit("a.txt", &[("two", "2")]).await;
+        let ledger = &edited.details.as_ref().unwrap()["ledger"];
+        let edited = change(&edited);
+        assert_eq!(edited["before"]["sha256"], written);
+        assert_eq!(edited["diff"]["additions"], 1);
+        assert_eq!(edited["diff"]["deletions"], 1);
+        assert_eq!(edited["diff"]["firstChangedLine"], 2);
+        let patch = edited["diff"]["patch"].as_str().unwrap();
+        assert!(patch.contains("-two") && patch.contains("+2"), "{patch}");
+        assert_eq!(ledger["sha256"], edited["after"]["sha256"]);
+
+        let unchanged = fx
+            .call("write", json!({ "path": "a.txt", "content": "one\n2\n" }))
+            .await;
+        let details = unchanged.details.unwrap();
+        assert!(details.get("ledger").is_some());
+        assert!(details.get("change").is_none());
+    }
+
+    #[tokio::test]
+    async fn non_utf8_files_refuse_edit_and_snapshot_as_binary() {
+        let fx = Fixture::new();
+        let original = [0xff, 0xfe, b'a'];
+        fx.put("b.bin", &original);
+        fx.read("b.bin").await;
+        let refused = fx.edit("b.bin", &[("a", "b")]).await;
+        assert!(refused.is_error);
+        assert_eq!(
+            refused.content,
+            vec![UserBlock::Text {
+                text: "Could not edit file: b.bin. File is not valid UTF-8.".into()
+            }]
+        );
+        assert_eq!(fx.get("b.bin"), original);
+
+        let written = fx
+            .call("write", json!({ "path": "b.bin", "content": "text\n" }))
+            .await;
+        let written = change(&written);
+        assert_eq!(written["before"]["binary"], true);
+        assert!(written.get("diff").is_none());
+        let before = written["before"]["sha256"].as_str().unwrap();
+        assert_eq!(fx.session.snapshots.read(before).await.unwrap(), original);
     }
 
     #[test]

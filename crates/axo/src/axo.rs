@@ -27,6 +27,7 @@ use crate::session::{
 use crate::store::{
     Header, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
 };
+use crate::tools::{FileChange, SnapshotStore, SquashedChange};
 
 pub struct Axo {
     name: String,
@@ -247,6 +248,22 @@ impl Axo {
     /// Reads a saved session without locking it.
     pub async fn open_session_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error> {
         self.store.open_read(path).await
+    }
+
+    /// The snapshot blob `sha256` of a session file (open, closed, or child), digest
+    /// verified. Takes no lock.
+    pub async fn read_snapshot(&self, session: &Path, sha256: &str) -> Result<Vec<u8>, Error> {
+        SnapshotStore::for_session(session).read(sha256).await
+    }
+
+    /// `SnapshotStore::squash` over a session file's blobs: the net change per file across
+    /// `changes`. Takes no lock.
+    pub async fn squash_changes(
+        &self,
+        session: &Path,
+        changes: &[FileChange],
+    ) -> Vec<SquashedChange> {
+        SnapshotStore::for_session(session).squash(changes).await
     }
 
     /// Sessions started in `cwd`, most recently modified first.

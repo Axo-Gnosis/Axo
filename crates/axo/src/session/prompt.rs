@@ -481,6 +481,19 @@ impl Session {
         self.hooks.tools.ledger.snapshot()
     }
 
+    /// The snapshot blob `sha256` of this session, digest verified.
+    pub async fn read_snapshot(&self, sha256: &str) -> Result<Vec<u8>, Error> {
+        self.hooks.tools.snapshots.read(sha256).await
+    }
+
+    /// The net change per file across `changes`, re-diffed from this session's blobs.
+    pub async fn squash_changes(
+        &self,
+        changes: &[tools::FileChange],
+    ) -> Vec<tools::SquashedChange> {
+        self.hooks.tools.snapshots.squash(changes).await
+    }
+
     /// Drops the cached project environment and resolves it again now. When its prompt
     /// note or the date changed, the prompt diff reaches the model before its next request.
     pub async fn reload_exec_env(&self) {

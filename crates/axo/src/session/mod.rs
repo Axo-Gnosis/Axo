@@ -1692,6 +1692,7 @@ impl Session {
             schemes,
             runner,
             deferred,
+            crate::tools::SnapshotStore::for_session(&path),
         ));
         let yield_state = link
             .as_ref()
@@ -2717,10 +2718,25 @@ impl Session {
         let mut writer = self.inherited.store.create(header).await?;
         let parent_dir = self.hooks.path.with_extension("");
         let child_dir = writer.path().with_extension("");
+        // The blobs the fork's path references: its file changes stay reviewable.
+        let snapshots = path
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message {
+                    message: AgentMessage::Llm(Message::ToolResult(result)),
+                    ..
+                } => tools::file_change(result),
+                _ => None,
+            })
+            .flat_map(|change| change.before.into_iter().chain([change.after]))
+            .filter(|blob| blob.omitted.is_none())
+            .map(|blob| blob.sha256)
+            .collect();
         copy_for_fork(
             &parent_dir,
             &child_dir,
             self.hooks.tools.schemes.artifacts().live(),
+            snapshots,
         )
         .await;
         let mut entries = Vec::with_capacity(path.len() + 1);

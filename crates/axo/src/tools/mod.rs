@@ -4,6 +4,7 @@ pub(crate) mod ask;
 pub(crate) mod bash;
 pub(crate) mod bash_urls;
 pub(crate) mod call;
+mod changes;
 pub(crate) mod deferred;
 pub(crate) mod edit;
 pub(crate) mod files;
@@ -15,6 +16,7 @@ pub(crate) mod output;
 pub(crate) mod pending;
 pub(crate) mod read;
 pub(crate) mod send;
+pub(crate) mod snapshots;
 pub(crate) mod truncate;
 pub(crate) mod wait;
 pub(crate) mod write;
@@ -29,7 +31,7 @@ use std::time::Duration;
 
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
@@ -52,8 +54,12 @@ use wait::WaitTool;
 use write::WriteTool;
 
 pub use crate::jobs::command::CommandRequest;
+pub use changes::{
+    FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_change, squash,
+};
 pub use ledger::{FileAccess, FileLedger, lock_file};
 pub(crate) use ledger::{file_key, ledger_access};
+pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
 
 /// State shared by one session's tools; each tool holds an `Arc` of it.
 pub struct SessionTools {
@@ -75,6 +81,8 @@ pub struct SessionTools {
     /// The effective write scope, kept current by the session on every rescope; read it
     /// through `write_scope`. Never held across an await.
     pub(crate) writes: Mutex<Option<Vec<String>>>,
+    /// Before/after bytes of this session's file mutations.
+    pub snapshots: SnapshotStore,
 }
 
 /// Builds a host tool for one session from that session's shared state (called again for
@@ -132,6 +140,7 @@ impl SessionTools {
         schemes: Schemes,
         runner: CommandRunner,
         deferred: Arc<deferred::Deferred>,
+        snapshots: SnapshotStore,
     ) -> Self {
         Self {
             cwd,
@@ -144,6 +153,57 @@ impl SessionTools {
             runner,
             read_only_bash: AtomicBool::new(false),
             writes: Mutex::new(None),
+            snapshots,
+        }
+    }
+
+    /// Records a completed write of `after` to `path`: updates the ledger, stores the
+    /// before and after bytes, and returns the tool result `details` (`ledger`, plus
+    /// `change` when the bytes differ). `before` is the content read under the same
+    /// `lock_file` guard, `None` for a new file; call it while still holding that guard.
+    pub async fn record_change(
+        &self,
+        path: &Path,
+        url: Option<&str>,
+        before: Option<Vec<u8>>,
+        after: Vec<u8>,
+    ) -> Value {
+        let after_sha = FileLedger::hash(&after);
+        let ledger = self
+            .ledger
+            .record_hash(path, after_sha.clone(), FileAccess::Modify);
+        if before.as_deref() == Some(after.as_slice()) {
+            return json!({ "ledger": ledger });
+        }
+        let before_blob = match &before {
+            Some(bytes) => {
+                let sha256 = FileLedger::hash(bytes);
+                Some(self.blob(sha256, bytes).await)
+            }
+            None => None,
+        };
+        let after_blob = self.blob(after_sha, &after).await;
+        let created = before.is_none();
+        let label = (!created).then(|| url.map_or_else(|| path.display().to_string(), Into::into));
+        let diff = changes::line_diff(before.unwrap_or_default(), after, label).await;
+        let change = FileChange {
+            path: path.to_string_lossy().into_owned(),
+            key: file_key(path).to_string_lossy().into_owned(),
+            url: url.map(Into::into),
+            created,
+            before: before_blob,
+            after: after_blob,
+            diff,
+        };
+        json!({ "ledger": ledger, "change": change })
+    }
+
+    async fn blob(&self, sha256: String, bytes: &[u8]) -> SnapshotBlob {
+        SnapshotBlob {
+            omitted: self.snapshots.put(&sha256, bytes).await,
+            sha256,
+            bytes: bytes.len() as u64,
+            binary: changes::is_binary(bytes),
         }
     }
 

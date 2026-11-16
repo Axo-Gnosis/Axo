@@ -286,6 +286,7 @@ Key risks to design around when building step 3 (script hooks):
 ---
 
 ## Track 5: Extensions (Bun host), MCP & `ast_edit`
+- **File-change snapshots (Axome review card):** Landed in code: `write` and `edit` of file targets record typed `details.change` (`FileChange` with before/after `SnapshotBlob`s and a `LineDiff`) through the shared `SessionTools::record_change`, storing raw bytes as content-addressed, never-pruned blobs under `<session>/snapshots/`; `edit`'s legacy `diff`/`patch`/`first_changed_line` keys are gone and it refuses non-UTF-8 files. Hosts read blobs (`Session::read_snapshot`, lock-free `Axo::read_snapshot`) and squash ranges (`squash`, `squash_changes`); forks link only the blobs their path references. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#file-changes-for-hosts).
 
 ### Extension contract & Bun host
 

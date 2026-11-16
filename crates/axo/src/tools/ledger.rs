@@ -95,17 +95,21 @@ impl FileLedger {
     /// Records `content` as this session's view of `path`, returning the record for the
     /// tool result's `details.ledger` (see `restore`).
     pub fn record(&self, path: &Path, content: &[u8], access: FileAccess) -> Value {
-        let hash = Self::hash(content);
+        self.record_hash(path, Self::hash(content), access)
+    }
+
+    /// `record` for content whose hash the caller already has.
+    pub(crate) fn record_hash(&self, path: &Path, sha256: String, access: FileAccess) -> Value {
         let record = serde_json::to_value(LedgerRecord {
             path: path.to_string_lossy().into_owned(),
-            sha256: hash.clone(),
+            sha256: sha256.clone(),
             access: Some(access),
         })
         .expect("ledger records serialize");
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(file_key(path), hash);
+            .insert(file_key(path), sha256);
         record
     }
 

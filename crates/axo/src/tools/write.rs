@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tools::files::fs_error;
-use crate::tools::{FileAccess, Located, SessionTools, lock_file};
+use crate::tools::{Located, SessionTools, lock_file};
 
 const GUIDELINES: &[&str] = &["Use write only for new files or complete rewrites."];
 
@@ -128,12 +128,15 @@ impl Tool for WriteTool {
         // holds this content: rewriting it changes nothing and needs no read (this also lets
         // a write replayed after a crash finish). A new file needs no prior read; any other
         // read failure is reported rather than overwriting a file the session cannot see.
-        match tokio::fs::read(&absolute).await {
-            Ok(current) if current == content.as_bytes() => {}
-            Ok(current) => self.tools.ledger.check_fresh(&absolute, path, &current)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+        let before = match tokio::fs::read(&absolute).await {
+            Ok(current) if current == content.as_bytes() => Some(current),
+            Ok(current) => {
+                self.tools.ledger.check_fresh(&absolute, path, &current)?;
+                Some(current)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(ToolError(fs_error(&error, "open", shown))),
-        }
+        };
 
         if let Some(dir) = absolute.parent() {
             tokio::fs::create_dir_all(dir).await.map_err(|error| {
@@ -150,10 +153,10 @@ impl Tool for WriteTool {
         tokio::fs::write(&absolute, &content)
             .await
             .map_err(|error| ToolError(fs_error(&error, "open", shown)))?;
-        let ledger = self
+        let details = self
             .tools
-            .ledger
-            .record(&absolute, content.as_bytes(), FileAccess::Modify);
+            .record_change(&absolute, label.as_deref(), before, content.into_bytes())
+            .await;
         if let Some(error) = aborted() {
             return Err(error);
         }
@@ -164,7 +167,7 @@ impl Tool for WriteTool {
         content.extend(self.tools.context.attach(&absolute).await);
         Ok(ToolOutput {
             content,
-            details: Some(json!({ "ledger": ledger })),
+            details: Some(details),
             ..ToolOutput::default()
         })
     }

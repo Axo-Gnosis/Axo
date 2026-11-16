@@ -3,17 +3,26 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::tools::SnapshotStore;
+use crate::tools::snapshots::SNAPSHOTS_DIR;
+
 /// Session side folders, relative to `<session_dir>` (the session file path without `.jsonl`).
 pub(super) const ARTIFACTS_DIR: &str = "artifacts";
 pub(super) const LOCAL_DIR: &str = "local";
 
 /// Copies a session's side files into its fork. Finished artifacts are made read-only and
 /// hard-linked (copy fallback); `live` spools, still being written by running jobs, are
-/// copied as a snapshot and only the copy is made read-only. Scratch files are copied under
+/// copied as a snapshot and only the copy is made read-only. Only the `snapshots` blobs the
+/// fork's path references are linked (copy fallback). Scratch files are copied under
 /// the per-file lock `write`/`edit` hold, so a concurrent tool write is never copied half-done.
 /// Best effort: an entry that cannot be carried over is logged and skipped, so one bad file
 /// never costs the fork the rest.
-pub(super) async fn copy_for_fork(parent_dir: &Path, child_dir: &Path, live: HashSet<PathBuf>) {
+pub(super) async fn copy_for_fork(
+    parent_dir: &Path,
+    child_dir: &Path,
+    live: HashSet<PathBuf>,
+    snapshots: HashSet<String>,
+) {
     let parent = parent_dir.to_path_buf();
     let child = child_dir.to_path_buf();
     let files = tokio::task::spawn_blocking(move || {
@@ -21,6 +30,11 @@ pub(super) async fn copy_for_fork(parent_dir: &Path, child_dir: &Path, live: Has
             &parent.join(ARTIFACTS_DIR),
             &child.join(ARTIFACTS_DIR),
             &live,
+        );
+        link_snapshots(
+            &parent.join(SNAPSHOTS_DIR),
+            &child.join(SNAPSHOTS_DIR),
+            &snapshots,
         );
         let mut files = Vec::new();
         list_local(
@@ -119,6 +133,32 @@ fn link_artifacts(source: &Path, destination: &Path, live: &HashSet<PathBuf>) {
     }
 }
 
+/// Blobs are read-only from the moment they are stored, so linking needs no chmod. Named
+/// blobs only, never a directory scan: blobs off the fork path and temp files stay behind.
+fn link_snapshots(source: &Path, destination: &Path, hashes: &HashSet<String>) {
+    if hashes.is_empty() {
+        return;
+    }
+    if let Err(error) = fs::create_dir_all(destination) {
+        return skip(destination, &error);
+    }
+    let (source, destination) = (
+        SnapshotStore::new(source.to_path_buf()),
+        SnapshotStore::new(destination.to_path_buf()),
+    );
+    for hash in hashes {
+        let (Some(blob), Some(target)) = (source.blob_path(hash), destination.blob_path(hash))
+        else {
+            continue;
+        };
+        if fs::hard_link(&blob, &target).is_err()
+            && let Err(error) = fs::copy(&blob, &target)
+        {
+            skip(&blob, &error);
+        }
+    }
+}
+
 fn list_local(source: &Path, destination: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
     let metadata = match fs::symlink_metadata(source) {
         Ok(metadata) => metadata,
@@ -153,6 +193,7 @@ fn list_local(source: &Path, destination: &Path, relative: &Path, files: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::FileLedger;
     #[cfg(unix)]
     #[tokio::test]
     async fn fork_copy_skips_unreadable_files_snapshots_live_spools_and_keeps_the_rest() {
@@ -172,7 +213,17 @@ mod tests {
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
         // Root reads mode 0o000 files, so the skip assertion only holds unprivileged.
         let enforced = fs::read(&unreadable).is_err();
-        copy_for_fork(parent.path(), child.path(), HashSet::from([live.clone()])).await;
+        let blobs = SnapshotStore::new(parent.path().join("snapshots"));
+        let (kept, dropped) = (FileLedger::hash(b"kept"), FileLedger::hash(b"dropped"));
+        assert_eq!(blobs.put(&kept, b"kept").await, None);
+        assert_eq!(blobs.put(&dropped, b"dropped").await, None);
+        copy_for_fork(
+            parent.path(),
+            child.path(),
+            HashSet::from([live.clone()]),
+            HashSet::from([kept.clone()]),
+        )
+        .await;
 
         let ino = |path: &Path| fs::metadata(path).unwrap().ino();
         assert_eq!(
@@ -185,6 +236,11 @@ mod tests {
         assert!(fs::metadata(&snapshot).unwrap().permissions().readonly());
         assert!(!fs::metadata(&live).unwrap().permissions().readonly());
         assert!(child.path().join("local/b.md").exists());
+        assert_eq!(
+            ino(&parent.path().join("snapshots").join(&kept)),
+            ino(&child.path().join("snapshots").join(&kept))
+        );
+        assert!(!child.path().join("snapshots").join(&dropped).exists());
         if enforced {
             assert!(!child.path().join("local/a.md").exists());
         }

@@ -59,7 +59,9 @@ pub use store::{
     TIMESTAMP_FORMAT, TeamLink, TeamRef, project,
 };
 pub use tools::{
-    Answer, CommandRequest, Exposure, HostTool, Question, QuestionOption, SessionTools, ToolFactory,
+    Answer, CommandRequest, Exposure, FileChange, HostTool, LineDiff, MAX_SNAPSHOT_BYTES, Omitted,
+    Question, QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange,
+    ToolFactory, file_change, squash,
 };
 
 #[cfg(doctest)]
