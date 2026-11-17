@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 
-use crate::auth::{Credential, CredentialStore, ModelAuth, codex};
+use crate::api::RequestRewrite;
+use crate::auth::provider::ProviderLogin;
+use crate::auth::{Credential, CredentialStore, ModelAuth};
 use crate::error::Error;
 use crate::models::CredentialSource;
 use crate::types::now_ms;
 
 /// What `resolve_auth` needs to know about one provider.
-#[derive(Debug)]
 pub(crate) struct ProviderAuth {
     pub id: String,
     /// The raw `apiKey` from `models.jsonc`; resolved here with [`resolve_config_value`].
@@ -20,6 +21,9 @@ pub(crate) struct ProviderAuth {
     pub env: Vec<String>,
     /// `false` lets the provider run without any key (`api_key: None`).
     pub requires_key: bool,
+    /// Login and OAuth refresh; without it an expired OAuth credential cannot be refreshed.
+    pub login: Option<Arc<dyn ProviderLogin>>,
+    pub rewrite: Option<Arc<dyn RequestRewrite>>,
 }
 
 /// OAuth tokens are refreshed when they expire within this window.
@@ -136,7 +140,6 @@ pub(crate) async fn credential_source(
 pub(crate) async fn resolve_auth(
     info: Arc<ProviderAuth>,
     store: Arc<dyn CredentialStore>,
-    http: reqwest::Client,
     headers: BTreeMap<String, String>,
 ) -> Result<ModelAuth, Error> {
     let mut auth = if info.config_api_key.is_some() || !headers.is_empty() {
@@ -165,15 +168,36 @@ pub(crate) async fn resolve_auth(
     }
     let stored = match store.get(&info.id).await? {
         Some(Credential::Oauth { expires, .. }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
-            refresh(&info, &store, &http).await?
+            refresh(&info, &store).await?
         }
         other => other,
     };
-    auth.api_key = match stored {
-        Some(Credential::ApiKey { key }) => Some(key),
-        Some(Credential::Oauth { access, .. }) => Some(access),
-        None => env_credential(&info, |name| std::env::var(name).ok()).map(|(_, value)| value),
-    };
+    match stored {
+        Some(Credential::ApiKey { key }) => auth.api_key = Some(key),
+        Some(Credential::Oauth {
+            access,
+            headers,
+            base_url,
+            ..
+        }) => {
+            auth.api_key = Some(access);
+            auth.base_url = base_url;
+            // `models.jsonc` headers win over the credential's.
+            for (name, value) in headers {
+                if !auth
+                    .headers
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(&name))
+                {
+                    auth.headers.insert(name, value);
+                }
+            }
+        }
+        None => {
+            auth.api_key =
+                env_credential(&info, |name| std::env::var(name).ok()).map(|(_, value)| value);
+        }
+    }
     if auth.api_key.is_none() && info.requires_key {
         return Err(Error::NoApiKey {
             provider: info.id.clone(),
@@ -188,17 +212,16 @@ pub(crate) async fn resolve_auth(
 async fn refresh(
     info: &ProviderAuth,
     store: &Arc<dyn CredentialStore>,
-    http: &reqwest::Client,
 ) -> Result<Option<Credential>, Error> {
-    if info.id != codex::PROVIDER {
+    let Some(login) = info.login.clone() else {
         return Err(Error::Auth(format!(
             "OAuth credential for provider {} has expired and cannot be refreshed",
             info.id
         )));
-    }
+    };
     // The lock and the rotated token live together in one spawned update: a cancelled request
     // can neither release the lock mid-refresh nor drop the new credential before it is saved.
-    let (store, http, provider) = (Arc::clone(store), http.clone(), info.id.clone());
+    let (store, provider) = (Arc::clone(store), info.id.clone());
     tokio::spawn(async move {
         store
             .update(
@@ -206,10 +229,10 @@ async fn refresh(
                 Box::new(move |current: Option<Credential>| {
                     async move {
                         match current {
-                            Some(Credential::Oauth {
-                                refresh, expires, ..
-                            }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
-                                codex::refresh(&http, &refresh).await.map(Some)
+                            Some(credential @ Credential::Oauth { expires, .. })
+                                if now_ms() + REFRESH_MARGIN_MS >= expires =>
+                            {
+                                login.refresh(credential).await.map(Some)
                             }
                             _ => Ok(None),
                         }
@@ -220,12 +243,13 @@ async fn refresh(
             .await
     })
     .await
-    .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))?
+    .map_err(|err| Error::Auth(format!("{} token refresh error: {err}", info.id)))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::codex;
     use crate::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 
     #[tokio::test]
@@ -237,6 +261,8 @@ mod tests {
             config_api_key: Some("!must not execute".into()),
             env: vec!["EMPTY".into(), "FIRST".into(), "SECOND".into()],
             requires_key: false,
+            login: None,
+            rewrite: None,
         };
         let env = |name: &str| {
             Some(
@@ -270,6 +296,8 @@ mod tests {
             access: "expired".into(),
             refresh: "must not refresh".into(),
             expires: 0,
+            headers: Default::default(),
+            base_url: None,
             extra: Default::default(),
         };
         store.set(&info.id, expired.clone()).await.unwrap();
@@ -318,16 +346,16 @@ mod tests {
         let custom = providers.iter().find(|info| info.id == "custom").unwrap();
         assert!(custom.env.is_empty());
         assert!(!custom.requires_key);
-        assert!(!custom.oauth);
+        assert!(!custom.login);
         assert!(
             providers
                 .iter()
-                .any(|info| info.id == codex::PROVIDER && info.oauth)
+                .any(|info| info.id == codex::PROVIDER && info.login)
         );
         assert!(
             providers
                 .iter()
-                .all(|info| info.oauth == (info.id == codex::PROVIDER))
+                .all(|info| info.login == (info.id == codex::PROVIDER))
         );
     }
 }

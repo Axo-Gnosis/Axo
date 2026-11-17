@@ -1,6 +1,7 @@
 //! Credentials and the auth seam every provider request goes through.
 
 pub mod codex;
+pub mod provider;
 pub mod resolve;
 pub mod store;
 
@@ -14,7 +15,8 @@ use serde_json::{Map, Value};
 use crate::error::Error;
 
 /// What auth resolution hands to an adapter: the key (if any), extra headers, and a
-/// base URL override.
+/// base URL override. A stored OAuth credential contributes its access token, `headers`
+/// and `base_url`; `models.jsonc` headers win over the credential's.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelAuth {
     pub api_key: Option<String>,
@@ -22,7 +24,8 @@ pub struct ModelAuth {
     pub base_url: Option<String>,
 }
 
-/// A stored credential (`auth.json` value).
+/// A stored credential (`auth.json` value). An OAuth credential carries everything a request
+/// needs (token, extra headers, base URL), so requests never call the provider for auth.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {
@@ -34,6 +37,12 @@ pub enum Credential {
         refresh: String,
         /// Expiry in milliseconds since the epoch.
         expires: i64,
+        /// Extra request headers this credential authorizes with.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+        /// Base URL override for requests made with this credential.
+        #[serde(default, rename = "baseUrl", skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
         /// Provider-specific fields, e.g. Codex `accountId`.
         #[serde(flatten)]
         extra: Map<String, Value>,

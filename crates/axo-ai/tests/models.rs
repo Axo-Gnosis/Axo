@@ -153,7 +153,7 @@ async fn command_api_keys_are_configuration_errors() {
     .await
     .unwrap();
     assert!(matches!(
-        models.auth(models.find("openai-codex/gpt-6-sol").unwrap()).await,
+        models.auth(&models.find("openai-codex/gpt-6-sol").unwrap()).await,
         Err(Error::Config(message)) if message.contains("command config values")
     ));
 }

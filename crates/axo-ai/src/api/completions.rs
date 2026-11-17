@@ -15,13 +15,15 @@ use std::ops::ControlFlow;
 
 use futures::stream::BoxStream;
 use indexmap::IndexMap;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{read_sse, send};
+use crate::api::http::{prepare, read_sse, send};
 use crate::api::sse::SseEvent;
-use crate::api::{ABORTED, Api, Reply, SimpleStreamOptions, StreamOptions, header_map, respond};
+use crate::api::{
+    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
+};
 use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
 use crate::event::AssistantEvent;
@@ -1131,11 +1133,24 @@ impl Response {
     ) -> Result<StopReason, String> {
         let base_url = opts.base_url(&self.model);
         let compat = resolve_compat(&self.model, base_url);
-        let headers = build_headers(&compat, opts)?;
+        let mut headers = build_headers(&compat, opts)?;
+        // `RequestBuilder::json` set this only when absent; the rewrite sees the final headers.
+        headers
+            .entry(reqwest::header::CONTENT_TYPE)
+            .or_insert(HeaderValue::from_static("application/json"));
         let params = build_params(&self.model, transcript, &opts.simple, &compat, base_url);
-        let url = format!("{base_url}/chat/completions");
+        let request = ProviderRequest {
+            url: format!("{base_url}/chat/completions"),
+            headers,
+            body: params,
+        };
+        let prepared = prepare(opts.rewrite.as_deref(), &self.model, request, cancel).await?;
         let response = send(
-            || http.post(&url).headers(headers.clone()).json(&params),
+            || {
+                http.post(&prepared.url)
+                    .headers(prepared.headers.clone())
+                    .body(prepared.body.clone())
+            },
             cancel,
             &mut self.reply,
             http_error_message,

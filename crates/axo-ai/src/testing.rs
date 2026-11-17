@@ -100,11 +100,17 @@ impl ScriptedApi {
 
 /// Read a JSON HTTP request from a finite test-server connection.
 pub fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
+    read_http_request_parts(stream).1
+}
+
+/// Read an HTTP request from a finite test-server connection: the head (request line and
+/// headers, as text) and the JSON body.
+pub fn read_http_request_parts(stream: &mut TcpStream) -> (String, serde_json::Value) {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let mut bytes = Vec::new();
-    let (body_start, length) = loop {
+    let (head_end, length) = loop {
         let mut chunk = [0; 4096];
         let count = stream.read(&mut chunk).unwrap();
         assert_ne!(count, 0);
@@ -119,16 +125,20 @@ pub fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
                 .unwrap();
-            break (end + 4, length);
+            break (end, length);
         }
     };
+    let body_start = head_end + 4;
     while bytes.len() < body_start + length {
         let mut chunk = [0; 4096];
         let count = stream.read(&mut chunk).unwrap();
         assert_ne!(count, 0);
         bytes.extend_from_slice(&chunk[..count]);
     }
-    serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap()
+    (
+        String::from_utf8(bytes[..head_end].to_vec()).unwrap(),
+        serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap(),
+    )
 }
 
 impl Streamer for ScriptedApi {

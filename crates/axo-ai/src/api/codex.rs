@@ -6,13 +6,12 @@
 use std::ops::ControlFlow;
 
 use futures::stream::BoxStream;
-use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{read_sse, send};
+use crate::api::http::{Prepared, prepare, read_sse, send};
 use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
-use crate::api::{Api, Reply, StreamOptions, header_map, respond};
+use crate::api::{Api, ProviderRequest, Reply, StreamOptions, header_map, respond};
 use crate::auth::codex::{BASE_URL, account_id};
 use crate::event::AssistantEvent;
 use crate::model::Model;
@@ -43,13 +42,6 @@ impl CodexApi {
     }
 }
 
-/// A fully built request: everything that can fail before sending has failed here.
-struct CodexRequest {
-    url: String,
-    headers: HeaderMap,
-    body: String,
-}
-
 impl Api for CodexApi {
     fn stream(
         &self,
@@ -59,13 +51,15 @@ impl Api for CodexApi {
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         let request = build_request(model, &transcript, &opts);
+        let rewrite = opts.rewrite.clone();
         let http = self.http.clone();
         let owned_model = model.clone();
         respond(model, cancel, move |mut reply, cancel| async move {
-            let result = match request {
-                Ok(request) => drive(&http, &owned_model, request, &cancel, &mut reply).await,
-                Err(message) => Err(message),
-            };
+            let result = async {
+                let prepared = prepare(rewrite.as_deref(), &owned_model, request?, &cancel).await?;
+                drive(&http, &owned_model, prepared, &cancel, &mut reply).await
+            }
+            .await;
             (reply, result)
         })
     }
@@ -75,15 +69,13 @@ fn build_request(
     model: &Model,
     transcript: &Transcript,
     opts: &StreamOptions,
-) -> Result<CodexRequest, String> {
+) -> Result<ProviderRequest, String> {
     let token = opts
         .auth
         .api_key
         .as_deref()
         .filter(|key| !key.is_empty())
         .ok_or_else(|| format!("No API key for provider: {}", model.provider))?;
-    let account_id =
-        account_id(token).ok_or_else(|| "Failed to extract accountId from token".to_owned())?;
     let session_id: Option<String> = opts
         .simple
         .session_id
@@ -92,10 +84,11 @@ fn build_request(
     let body = build_request_body(model, transcript, opts, session_id.as_deref());
 
     // Defaults first so auth and caller headers can override them; the auth and
-    // protocol headers always win.
+    // protocol headers always win. The account id derived from a ChatGPT token is only a
+    // default: a credential's `chatgpt-account-id` header replaces it, and other tokens
+    // send none.
     let mut protocol_headers = vec![
         ("Authorization".to_owned(), Some(format!("Bearer {token}"))),
-        ("chatgpt-account-id".to_owned(), Some(account_id)),
         (
             "OpenAI-Beta".to_owned(),
             Some("responses=experimental".to_owned()),
@@ -112,11 +105,11 @@ fn build_request(
             ("x-client-request-id".to_owned(), Some(session_id)),
         ]);
     }
-    let headers = header_map([
-        std::iter::once(("originator".to_owned(), Some("axo".to_owned())))
-            .chain(opts.configured_headers())
-            .chain(protocol_headers),
-    ])?;
+    let headers = header_map([[("originator".to_owned(), Some("axo".to_owned()))]
+        .into_iter()
+        .chain(account_id(token).map(|id| ("chatgpt-account-id".to_owned(), Some(id))))
+        .chain(opts.configured_headers())
+        .chain(protocol_headers)])?;
 
     let base_url = opts.base_url(model);
     let base_url = if base_url.trim().is_empty() {
@@ -132,11 +125,7 @@ fn build_request(
         format!("{base_url}/codex/responses")
     };
 
-    Ok(CodexRequest {
-        url,
-        headers,
-        body: body.to_string(),
-    })
+    Ok(ProviderRequest { url, headers, body })
 }
 
 /// pi `buildRequestBody`, with `streamSimple`'s thinking-level handling.
@@ -219,7 +208,7 @@ fn build_request_body(
 async fn drive(
     http: &reqwest::Client,
     model: &Model,
-    request: CodexRequest,
+    request: Prepared,
     cancel: &CancellationToken,
     reply: &mut Reply,
 ) -> Result<StopReason, String> {

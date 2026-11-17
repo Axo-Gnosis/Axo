@@ -13,6 +13,8 @@ fn oauth(access: &str, refresh: &str, expires: i64) -> Credential {
         access: access.into(),
         refresh: refresh.into(),
         expires,
+        headers: Default::default(),
+        base_url: None,
         extra: Default::default(),
     }
 }

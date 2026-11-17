@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::TcpListener;
 use std::thread::JoinHandle;
 
-use axo_ai::testing::read_http_request;
+use axo_ai::testing::read_http_request_parts;
 use axo_ai::{
     AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, Compat, CompletionsApi,
     Cost, InputKind, Message, Model, ModelAuth, SimpleStreamOptions, StreamOptions, SystemMessage,
@@ -14,7 +15,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 // One finite request: connection-close avoids a server task surviving a failed assertion.
-fn server(status: u16, headers: &str, body: &str) -> (String, JoinHandle<Value>) {
+fn server(status: u16, headers: &str, body: &str) -> (String, JoinHandle<(String, Value)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let response = format!(
@@ -23,9 +24,9 @@ fn server(status: u16, headers: &str, body: &str) -> (String, JoinHandle<Value>)
     );
     let thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let body = read_http_request(&mut stream);
+        let request = read_http_request_parts(&mut stream);
         stream.write_all(response.as_bytes()).unwrap();
-        body
+        request
     });
     (url, thread)
 }
@@ -48,6 +49,15 @@ fn model(api: ApiKind, base_url: String) -> Model {
 }
 
 async fn request(api: ApiKind, url: String, choice: Option<ToolChoice>) -> AssistantMessage {
+    request_with(api, url, choice, BTreeMap::new()).await
+}
+
+async fn request_with(
+    api: ApiKind,
+    url: String,
+    choice: Option<ToolChoice>,
+    headers: BTreeMap<String, String>,
+) -> AssistantMessage {
     let client = reqwest::Client::new();
     let adapter: Box<dyn Api> = match api {
         ApiKind::AnthropicMessages => Box::new(AnthropicApi::new(client)),
@@ -78,8 +88,10 @@ async fn request(api: ApiKind, url: String, choice: Option<ToolChoice>) -> Assis
                 },
                 auth: ModelAuth {
                     api_key: Some(format!("header.{payload}.signature")),
+                    headers,
                     ..Default::default()
                 },
+                rewrite: None,
             },
             CancellationToken::new(),
         )
@@ -105,7 +117,7 @@ async fn tool_disabling_keeps_definitions_and_supported_wire_fields() {
                 r#"{"error":{"message":"unsupported request"}}"#,
             );
             request(api, url, choice).await;
-            let body = server.join().unwrap();
+            let (_, body) = server.join().unwrap();
             assert!(!body["tools"].as_array().unwrap().is_empty());
             let expected = match choice {
                 Some(ToolChoice::None) => Some("none"),
@@ -204,4 +216,29 @@ async fn codex_preserves_context_overflow_failure() {
         Some("context_length_exceeded")
     );
     assert!(axo_ai::is_context_overflow(&output, 200_000));
+}
+
+#[tokio::test]
+async fn codex_account_id_header_comes_from_the_credential_else_the_token() {
+    for (headers, expected) in [
+        (
+            BTreeMap::from([(
+                "chatgpt-account-id".to_owned(),
+                "from-credential".to_owned(),
+            )]),
+            "from-credential",
+        ),
+        (BTreeMap::new(), "test"),
+    ] {
+        let (url, server) = server(400, "", r#"{"error":{"message":"stop"}}"#);
+        request_with(ApiKind::OpenAiCodexResponses, url, None, headers).await;
+        let (head, _) = server.join().unwrap();
+        let values: Vec<_> = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+            .map(|(_, value)| value.trim())
+            .collect();
+        assert_eq!(values, [expected]);
+    }
 }

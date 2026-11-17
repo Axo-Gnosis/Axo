@@ -60,8 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let model = models
         .find(&model_id)
-        .ok_or_else(|| format!("unknown model: {model_id}"))?
-        .clone();
+        .ok_or_else(|| format!("unknown model: {model_id}"))?;
 
     let tool = ToolSpec {
         name: "get_weather".into(),

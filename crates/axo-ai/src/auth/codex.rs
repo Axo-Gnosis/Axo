@@ -3,9 +3,11 @@
 //! Port of pi `auth/oauth/openai-codex.ts`, `pkce.ts` and `callback-server.ts`; the device-code
 //! flow is not ported.
 
+use std::collections::BTreeMap;
 use std::pin::pin;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE_NO_PAD, URL_SAFE_PAD_INDIFFERENT};
 use serde_json::{Map, Value};
@@ -14,7 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-use crate::auth::{Credential, CredentialStore};
+use crate::auth::Credential;
+use crate::auth::provider::{LoginInteraction, LoginPrompt, ProviderLogin};
 use crate::error::Error;
 use crate::types::now_ms;
 
@@ -34,94 +37,111 @@ pub const BASE_URL: &str = "https://chatgpt.com/backend-api";
 const PROVIDER_NAME: &str = "OpenAI";
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15); // pi DEFAULT_OAUTH_REFRESH_TIMEOUT_MS
 
-/// Runs the browser login and stores the credential under `openai-codex`.
-///
-/// `on_url` receives the authorize URL to open. The loopback callback on `127.0.0.1:1455` races
-/// `manual`, which may yield a pasted redirect URL, `code#state`, a query string or a raw code;
-/// `None` means no manual input will come. When port 1455 is taken (it is shared with the Codex
-/// CLI) only `manual` is used.
-pub async fn login(
-    http: &reqwest::Client,
-    store: &dyn CredentialStore,
-    on_url: &(dyn Fn(&str) + Send + Sync),
-    manual: impl Future<Output = Option<String>> + Send,
-) -> Result<(), Error> {
-    let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-    let challenge = URL_SAFE_NO_PAD.encode(&Sha256::digest(verifier.as_bytes())[..]);
-    let state: String = rand::random::<[u8; 16]>()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+/// OpenAI Codex login and refresh, the built-in [`ProviderLogin`] for `openai-codex`.
+pub struct CodexLogin {
+    http: reqwest::Client,
+}
 
-    let mut url = Url::parse(AUTHORIZE_URL).expect("authorize URL is valid");
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", REDIRECT_URI)
-        .append_pair("scope", SCOPE)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &state)
-        .append_pair("id_token_add_organizations", "true")
-        .append_pair("codex_cli_simplified_flow", "true")
-        .append_pair("originator", ORIGINATOR);
-
-    let listener = match TcpListener::bind(CALLBACK_ADDR).await {
-        Ok(listener) => Some(listener),
-        Err(err) => {
-            tracing::warn!("OAuth callback server unavailable on {CALLBACK_ADDR}: {err}");
-            None
-        }
-    };
-    on_url(url.as_str());
-
-    let manual = pin!(manual);
-    let input = match &listener {
-        Some(listener) => {
-            let mut callback = pin!(wait_for_callback(listener, &state));
-            let input = tokio::select! {
-                code = &mut callback => return exchange_and_store(http, store, &code?, &verifier).await,
-                input = manual => input,
-            };
-            match input {
-                Some(input) => input,
-                // No manual input will arrive: keep waiting for the browser.
-                None => return exchange_and_store(http, store, &callback.await?, &verifier).await,
-            }
-        }
-        None => manual.await.unwrap_or_default(),
-    };
-    let (code, parsed_state) = parse_authorization_input(&input);
-    if parsed_state.is_some_and(|parsed| parsed != state) {
-        return Err(Error::Auth("State mismatch".into()));
+impl CodexLogin {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self { http }
     }
-    let code = code.ok_or_else(|| Error::Auth("Missing authorization code".into()))?;
-    exchange_and_store(http, store, &code, &verifier).await
 }
 
-/// Refreshes an OpenAI Codex access token; the result carries the rotated refresh token.
-pub async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Credential, Error> {
-    let response = token_request(
-        http,
-        &[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", CLIENT_ID),
-        ],
-    )
-    .timeout(REFRESH_TIMEOUT)
-    .send()
-    .await
-    .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))?;
-    credential_from_response(response, "refresh").await
+#[async_trait]
+impl ProviderLogin for CodexLogin {
+    /// The browser login. The authorize URL goes to `open_url`; the loopback callback on
+    /// `127.0.0.1:1455` races a `prompt` for a pasted redirect URL, `code#state`, a query
+    /// string or a raw code (a prompt `Err` means no manual input will come). When port 1455
+    /// is taken (it is shared with the Codex CLI) only the prompt is used.
+    async fn login(&self, interaction: &dyn LoginInteraction) -> Result<Credential, Error> {
+        let http = &self.http;
+        let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+        let challenge = URL_SAFE_NO_PAD.encode(&Sha256::digest(verifier.as_bytes())[..]);
+        let state: String = rand::random::<[u8; 16]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let mut url = Url::parse(AUTHORIZE_URL).expect("authorize URL is valid");
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", CLIENT_ID)
+            .append_pair("redirect_uri", REDIRECT_URI)
+            .append_pair("scope", SCOPE)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &state)
+            .append_pair("id_token_add_organizations", "true")
+            .append_pair("codex_cli_simplified_flow", "true")
+            .append_pair("originator", ORIGINATOR);
+
+        let listener = match TcpListener::bind(CALLBACK_ADDR).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                tracing::warn!("OAuth callback server unavailable on {CALLBACK_ADDR}: {err}");
+                None
+            }
+        };
+        interaction.open_url(url.as_str(), None).await;
+
+        let manual = pin!(async {
+            interaction
+                .prompt(&LoginPrompt {
+                    message: "Paste the redirect URL or authorization code".into(),
+                    placeholder: None,
+                    secret: false,
+                })
+                .await
+                .ok()
+        });
+        let input = match &listener {
+            Some(listener) => {
+                let mut callback = pin!(wait_for_callback(listener, &state));
+                let input = tokio::select! {
+                    code = &mut callback => return exchange(http, &code?, &verifier).await,
+                    input = manual => input,
+                };
+                match input {
+                    Some(input) => input,
+                    // No manual input will arrive: keep waiting for the browser.
+                    None => return exchange(http, &callback.await?, &verifier).await,
+                }
+            }
+            None => manual.await.unwrap_or_default(),
+        };
+        let (code, parsed_state) = parse_authorization_input(&input);
+        if parsed_state.is_some_and(|parsed| parsed != state) {
+            return Err(Error::Auth("State mismatch".into()));
+        }
+        let code = code.ok_or_else(|| Error::Auth("Missing authorization code".into()))?;
+        exchange(http, &code, &verifier).await
+    }
+
+    /// Refreshes the access token; the result carries the rotated refresh token.
+    async fn refresh(&self, credential: Credential) -> Result<Credential, Error> {
+        let Credential::Oauth { refresh, .. } = credential else {
+            return Err(Error::Auth(
+                "OpenAI Codex credential is not an OAuth credential".into(),
+            ));
+        };
+        let response = token_request(
+            &self.http,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", CLIENT_ID),
+            ],
+        )
+        .timeout(REFRESH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| Error::Auth(format!("OpenAI Codex token refresh error: {err}")))?;
+        credential_from_response(response, "refresh").await
+    }
 }
 
-async fn exchange_and_store(
-    http: &reqwest::Client,
-    store: &dyn CredentialStore,
-    code: &str,
-    verifier: &str,
-) -> Result<(), Error> {
+async fn exchange(http: &reqwest::Client, code: &str, verifier: &str) -> Result<Credential, Error> {
     let response = token_request(
         http,
         &[
@@ -134,8 +154,7 @@ async fn exchange_and_store(
     )
     .send()
     .await?;
-    let credential = credential_from_response(response, "exchange").await?;
-    store.set(PROVIDER, credential).await
+    credential_from_response(response, "exchange").await
 }
 
 /// A form-encoded POST to the token endpoint (reqwest is built without its `form` helper).
@@ -151,7 +170,8 @@ fn token_request(http: &reqwest::Client, params: &[(&str, &str)]) -> reqwest::Re
         .body(body)
 }
 
-/// Reads a token response into a credential with a validated ChatGPT `accountId`.
+/// Reads a token response into a credential that carries the ChatGPT account id as its
+/// `chatgpt-account-id` header.
 async fn credential_from_response(
     response: reqwest::Response,
     operation: &str,
@@ -192,6 +212,8 @@ async fn credential_from_response(
         access: access.to_owned(),
         refresh: refresh.to_owned(),
         expires,
+        headers: BTreeMap::from([("chatgpt-account-id".to_owned(), account_id.clone())]),
+        base_url: None,
         extra: Map::from_iter([("accountId".to_owned(), Value::String(account_id))]),
     })
 }

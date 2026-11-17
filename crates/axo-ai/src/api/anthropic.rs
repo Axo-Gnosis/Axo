@@ -12,9 +12,11 @@ use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{read_sse, send};
+use crate::api::http::{prepare, read_sse, send};
 use crate::api::sse::SseEvent;
-use crate::api::{ABORTED, Api, Reply, SimpleStreamOptions, StreamOptions, header_map, respond};
+use crate::api::{
+    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
+};
 use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
 use crate::event::AssistantEvent;
@@ -209,12 +211,21 @@ async fn run(
     );
     let headers = request_headers(opts, &compat, api_key, &betas)?;
     let url = format!("{}/v1/messages?beta=true", opts.base_url(model));
-    let body = serde_json::to_string(&built.params).map_err(|error| error.to_string())?;
+    let request = ProviderRequest {
+        url,
+        headers,
+        body: built.params,
+    };
+    let prepared = prepare(opts.rewrite.as_deref(), model, request, cancel).await?;
 
     // ponytail: the body is copied per attempt; switch to `bytes::Bytes` if large
     // transcripts make this show up.
     let response = send(
-        || http.post(&url).headers(headers.clone()).body(body.clone()),
+        || {
+            http.post(&prepared.url)
+                .headers(prepared.headers.clone())
+                .body(prepared.body.clone())
+        },
         cancel,
         reply,
         error_response_message,

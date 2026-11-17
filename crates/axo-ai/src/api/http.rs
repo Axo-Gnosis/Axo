@@ -13,7 +13,8 @@ use reqwest::{RequestBuilder, Response};
 use tokio_util::sync::CancellationToken;
 
 use super::sse::{SseDecoder, SseEvent};
-use super::{ABORTED, Reply};
+use super::{ABORTED, ProviderRequest, Reply, RequestRewrite};
+use crate::model::Model;
 
 /// The shared client: rustls, HTTP/2, no global timeout (streams can run long), idle
 /// pooled connections closed after 90 s.
@@ -88,6 +89,36 @@ pub(crate) async fn send_with_retry(
             _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// A request ready to send: the provider's rewrite has run and the body is serialized.
+pub(crate) struct Prepared {
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: String,
+}
+
+/// Runs the provider's rewrite (once per request, before any retry) and serializes the
+/// body. A failed or cancelled rewrite sends nothing.
+pub(crate) async fn prepare(
+    rewrite: Option<&dyn RequestRewrite>,
+    model: &Model,
+    request: ProviderRequest,
+    cancel: &CancellationToken,
+) -> Result<Prepared, String> {
+    let request = match rewrite {
+        None => request,
+        Some(rewrite) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
+            result = rewrite.rewrite(model, request) => result.map_err(|error| error.to_string())?,
+        },
+    };
+    Ok(Prepared {
+        body: request.body.to_string(),
+        url: request.url,
+        headers: request.headers,
+    })
 }
 
 /// Send and capture failure metadata before each adapter formats its own error.

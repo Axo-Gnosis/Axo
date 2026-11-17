@@ -9,6 +9,7 @@ pub(crate) mod responses;
 pub(crate) mod sse;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use futures::channel::mpsc::{self, UnboundedSender};
 use futures::stream::{self, BoxStream};
@@ -17,6 +18,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::ModelAuth;
+use crate::error::Error;
 use crate::event::{AssistantEvent, parse_tool_args};
 use crate::model::Model;
 use crate::transcript::Transcript;
@@ -79,10 +81,22 @@ pub struct SimpleStreamOptions {
     pub headers: BTreeMap<String, Option<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub struct StreamOptions {
     pub simple: SimpleStreamOptions,
     pub auth: ModelAuth,
+    /// The provider's level-2 request rewrite, run once per request before sending.
+    pub rewrite: Option<Arc<dyn RequestRewrite>>,
+}
+
+impl std::fmt::Debug for StreamOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamOptions")
+            .field("simple", &self.simple)
+            .field("auth", &self.auth)
+            .field("rewrite", &self.rewrite.is_some())
+            .finish()
+    }
 }
 
 impl StreamOptions {
@@ -109,6 +123,25 @@ impl StreamOptions {
             .unwrap_or(&model.base_url)
             .trim_end_matches('/')
     }
+}
+
+/// A provider request as the standard adapter built it, before it is sent.
+#[derive(Debug, Clone)]
+pub struct ProviderRequest {
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: serde_json::Value,
+}
+
+/// The level-2 hook: rewrite the URL, headers and body of a provider request. axo still
+/// sends it and parses the response.
+#[async_trait::async_trait]
+pub trait RequestRewrite: Send + Sync {
+    async fn rewrite(
+        &self,
+        model: &Model,
+        request: ProviderRequest,
+    ) -> Result<ProviderRequest, Error>;
 }
 
 pub(crate) fn header_map(

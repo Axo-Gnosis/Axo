@@ -187,7 +187,7 @@ fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
     }
     if let Some(model) = models.find(selector) {
         return Ok(ModelChoice {
-            model: Some(model.clone()),
+            model: Some(model),
             thinking: None,
         });
     }
@@ -196,7 +196,7 @@ fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
         && let Some(model) = models.find(prefix)
     {
         return Ok(ModelChoice {
-            model: Some(model.clone()),
+            model: Some(model),
             thinking: Some(thinking),
         });
     }
