@@ -11,9 +11,8 @@ use tokio_util::sync::CancellationToken;
 use super::SessionHooks;
 use crate::context::agents::AgentSpec;
 use crate::context::modes::{BashAccess, ModeSpec};
-use crate::tools::SessionTools;
 use crate::tools::output::YIELD;
-use crate::tools::writes;
+use crate::tools::{SessionTools, WriteScope, writes};
 
 /// The session a tool call runs in, as host policies see it.
 #[derive(Debug, Clone)]
@@ -27,9 +26,8 @@ pub struct ToolScope {
     pub mode: Option<Arc<ModeSpec>>,
     /// Effective bash access: `ReadOnly` when `agent`, `mode`, or the spawn ceiling is.
     pub bash: BashAccess,
-    /// Effective write scope: the intersection of the agent's, the mode's and the spawn
-    /// ceiling; `None`: unrestricted.
-    pub writes: Option<Vec<String>>,
+    /// Effective write scope: the agent's, the mode's and the spawn ceiling's layers; `None`: unrestricted.
+    pub writes: Option<WriteScope>,
 }
 
 /// `ReadOnly` when any of the agent, the mode, or the inherited ceiling is.
@@ -48,23 +46,32 @@ pub(super) fn effective_bash(
     }
 }
 
-/// The intersection of the present layers, normalized; `None` when no layer restricts.
-/// The ceiling is already normalized.
+/// Normalized layers in enforcement order; `None` when no layer restricts.
 pub(super) fn effective_writes(
     tools: &SessionTools,
     agent: Option<&AgentSpec>,
     mode: Option<&ModeSpec>,
-    ceiling: Option<&[String]>,
-) -> Option<Vec<String>> {
-    [
+    ceiling: Option<&WriteScope>,
+) -> Option<WriteScope> {
+    let mut layers = Vec::new();
+    for raw in [
         agent.and_then(|agent| agent.writes.as_deref()),
         mode.and_then(|mode| mode.writes.as_deref()),
     ]
     .into_iter()
     .flatten()
-    .map(|raw| writes::normalize(tools, raw))
-    .chain(ceiling.map(<[_]>::to_vec))
-    .reduce(|a, b| writes::intersect(&a, &b))
+    {
+        let layer = writes::normalize(tools, raw);
+        if !layers.contains(&layer) {
+            layers.push(layer);
+        }
+    }
+    for layer in ceiling.into_iter().flat_map(|scope| &scope.layers) {
+        if !layers.contains(layer) {
+            layers.push(layer.clone());
+        }
+    }
+    (!layers.is_empty()).then_some(WriteScope { layers })
 }
 
 /// Ordered host tool policy, with the session's persona and effective mode.
@@ -171,7 +178,7 @@ impl SessionHooks {
     }
 
     /// This session's effective write scope; children spawned now inherit it as their ceiling.
-    pub(super) fn writes_with(&self, mode: Option<&ModeSpec>) -> Option<Vec<String>> {
+    pub(super) fn writes_with(&self, mode: Option<&ModeSpec>) -> Option<WriteScope> {
         let child = self.child.as_ref().map(|child| &child.link);
         let agent = self
             .agent_spec
@@ -181,7 +188,7 @@ impl SessionHooks {
             &self.tools,
             agent.as_ref().or(child.map(|link| &link.spec)),
             mode,
-            child.and_then(|link| link.writes.as_deref()),
+            child.and_then(|link| link.writes.as_ref()),
         )
     }
 

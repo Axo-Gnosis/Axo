@@ -145,6 +145,7 @@ name = "axo-ai"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axo-ai",
  "base64",
  "futures",
  "indexmap",

@@ -87,6 +87,10 @@ async fn load(dir: &tempfile::TempDir) -> (Models, Arc<FileCredentialStore>) {
 
 /// Streams one request and returns its terminal event.
 async fn stream(models: &Models, model: &Model) -> AssistantEvent {
+    stream_events(models, model).await.pop().unwrap()
+}
+
+async fn stream_events(models: &Models, model: &Model) -> Vec<AssistantEvent> {
     let transcript = Transcript::new(vec![Message::System(SystemMessage {
         content: vec![TextBlock {
             text: "test".into(),
@@ -100,10 +104,8 @@ async fn stream(models: &Models, model: &Model) -> AssistantEvent {
         SimpleStreamOptions::default(),
         CancellationToken::new(),
     )
-    .collect::<Vec<_>>()
+    .collect()
     .await
-    .pop()
-    .unwrap()
 }
 
 fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
@@ -301,15 +303,25 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
         }
     }
     assert_eq!(login.refreshes.load(Ordering::SeqCst), 1);
+
+    // 4. Unregister removes the provider and its models, even for callers holding an old model.
+    let stale = models.find("scripted/anthropic").unwrap();
+    assert!(models.unregister("scripted"));
+    assert!(models.find("scripted/anthropic").is_none());
+    assert!(!models.providers().iter().any(|info| info.id == "scripted"));
     assert!(matches!(
         store.get("scripted").await.unwrap(),
         Some(Credential::Oauth { access, .. }) if access == "access-1"
     ));
-
-    // 4. Unregister removes the provider and its models.
-    assert!(models.unregister("scripted"));
-    assert!(models.find("scripted/anthropic").is_none());
-    assert!(!models.providers().iter().any(|info| info.id == "scripted"));
+    let events = stream_events(&models, &stale).await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [AssistantEvent::Error { message, .. }]
+                if message.error_message.as_deref() == Some("Unknown model: scripted/anthropic")
+        ),
+        "unexpected events: {events:?}"
+    );
 
     // 5. A registration replaces a built-in provider of the same id; unregister restores it.
     let codex = |models: &Models| {
@@ -337,6 +349,50 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
     assert!(models.find("openai-codex/gpt-6-sol").is_some());
     assert!(models.find("openai-codex/only").is_none());
     assert!(codex(&models).login);
+}
+
+#[tokio::test]
+async fn config_base_url_beats_the_credential() {
+    let (url, server) = server(1);
+    let dir = tempfile::tempdir().unwrap();
+    let (models, store) = load(&dir).await;
+    let credential_url = "http://127.0.0.1:9";
+    let credential = oauth("access", "refresh", i64::MAX, "1", credential_url);
+    store.set("scripted", credential).await.unwrap();
+    let config = ModelsConfig::parse_jsonc(
+        &json!({"providers": {"scripted": {
+            "api": "openai-completions",
+            "baseUrl": url,
+            "models": [{"id": "only"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    models.reload(config, false).await.unwrap();
+    let model = models.find("scripted/only").unwrap();
+    assert_eq!(models.auth(&model).await.unwrap().base_url, None);
+    let AssistantEvent::Error { message, .. } = stream(&models, &model).await else {
+        panic!("expected the test server's error");
+    };
+    let error = message.error_message.as_deref();
+    assert!(
+        error.is_some_and(|error| error.contains("stop")),
+        "unexpected provider error: {error:?}"
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(
+        header(&requests[0].0, "authorization"),
+        Some("Bearer access")
+    );
+
+    models.reload(ModelsConfig::default(), false).await.unwrap();
+    models
+        .register(provider("scripted", vec![model.clone()]))
+        .unwrap();
+    assert_eq!(
+        models.auth(&model).await.unwrap().base_url.as_deref(),
+        Some(credential_url)
+    );
 }
 
 struct FailingRewrite;

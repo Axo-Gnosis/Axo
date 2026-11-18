@@ -149,7 +149,7 @@ Review the code for correctness and report actionable findings.
 | `output` | JSON Schema, compiled for validity at load. Invalid schemas drop the definition. For children, defines the result returned through `yield`; ignored for root sessions |
 | `maxTurns` | Model requests per child run before the wrap-up turn; omitted uses `subagents.maxTurns` (default 50). Ignored for root sessions. The tool list stays unchanged; budget enforcement blocks calls through an internal hook, except `yield` |
 | `bash` | `full` (default) or `readOnly`. `readOnly` runs every `bash` command of a root persona or child using this definition under the [read-only bash](#read-only-bash) filesystem restriction |
-| `writes` | List of scheme URL prefixes and directory paths (relative to the session cwd or absolute) that `write` and `edit` may write under; omitted is unrestricted and `[]` permits nothing. Applies to a root persona or child using this definition and becomes a ceiling for its descendants; see [Write scope](#write-scope) |
+| `writes` | List of scheme URL prefixes and directory paths (relative to the session cwd or absolute) that `write` and `edit` may write under. Omitted adds no restriction; `[]` permits nothing. Applies to a root persona or child using this definition and becomes a ceiling for its descendants; see [Write scope](#write-scope) |
 
 The trimmed body becomes the `agent` section, placed right after `system`; the `system` section keeps the configured or bundled `SYSTEM` either way, and an empty body omits `agent`. Like any core section, `sections: { agent: false }` removes it. Agent bodies are used verbatim, without harness-name substitution, and do not change `SYSTEM`, `WORK`, `PROSE`, or summarizer prompt overrides. The `agent` tag belongs to the protected wrapper set escaped in deliveries.
 
@@ -491,16 +491,18 @@ This is a filesystem write boundary, not a general sandbox: a read-only command 
 
 ### Write scope
 
-A mode or agent definition with top-level `writes: [...]` limits where the built-in `write` and `edit` tools may write. Each entry is a registered scheme URL prefix (`local://`, `local://notes`) or a directory path, relative to the session cwd or absolute; an entry with an unknown scheme permits nothing. Omitting `writes` leaves writes unrestricted, `writes: []` permits none, and an explicit null or an empty entry is a definition error.
+A mode or agent definition with top-level `writes: [...]` limits where the built-in `write` and `edit` tools may write. Each entry is a registered scheme URL prefix (`local://`, `local://notes`) or a directory path, relative to the session cwd or absolute; an entry with an unknown scheme permits nothing. Omitting `writes` adds no layer, `writes: []` adds a layer that permits nothing, and an explicit null or an empty entry is a definition error.
 
 ```yaml
 writes: [local://, plans]
 bash: readOnly
 ```
 
-A session's effective scope is the intersection of its root persona or, for a child, its own spec; its effective root mode; and its persisted child ceiling. Of each pair of overlapping entries the narrower survives, and a path never overlaps a URL. The ceiling (`SpawnLink::writes`) is the spawning parent's effective scope at spawn time; descendants inherit it at every depth and it does not relax when the parent later leaves the mode. Path entries are stored absolute, while `local://` entries stay symbolic: in a child they mean the child's own `local://` directory.
+The effective write scope keeps the root persona (or the child's own spec), the effective root mode, and any inherited ceiling as separate layers. A target must be permitted by at least one entry in every layer. With no layers, the write scope is unrestricted. The ceiling (`SpawnLink::writes`) holds the spawning parent's effective layers at spawn time; descendants inherit them at every depth, even if the parent later leaves the mode. Directory entries are stored as absolute paths, while `local://` entries stay symbolic and resolve to the child's own local directory.
 
-`write` and `edit` check the target before any I/O and fail with `<target> is outside the write scope (<entries>)`, or `<target> is outside the write scope (no writes allowed)` for an empty scope. File-backed targets, including file-backed scheme URLs such as `local://`, compare by real path: symlinks are resolved, including a link whose target does not exist yet, so a symlink inside an allowed directory cannot lead outside it. The check runs once, before the write: it constrains where a `write` or `edit` call points, and is not containment against another process that replaces a path component with a symlink while the call is in flight. A virtual scheme target passes only under a matching URL entry. Host file-mutating tools apply the same check through `SessionTools::check_write`.
+For file targets, axo compares the real path of the target with the real path of each candidate directory. A URL entry that resolves to a file-backed location is treated like its directory, so filesystem paths and file-backed URLs can satisfy the same layer. Symlinks are resolved in the target and in the roots, even when a link's destination does not yet exist. For a virtual target, only a URL entry of the same scheme can match, on path segment boundaries, and the target must not contain a `..` segment.
+
+`write` and `edit` check before accessing the target's contents. The first layer that rejects the target produces `<target> is outside the write scope (<entries>)`, or `<target> is outside the write scope (no writes allowed)` if that layer is empty. This is a point-in-time check, not containment against another process replacing a path component while the call is in flight. Host file-mutating tools apply the same check through `SessionTools::check_write`.
 
 `writes` does not confine `bash`; a definition that wants its shell writes contained too also sets `bash: readOnly`.
 

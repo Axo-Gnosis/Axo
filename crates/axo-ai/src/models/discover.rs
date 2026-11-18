@@ -31,7 +31,7 @@ pub(crate) async fn discover(
     base_url: &str,
     headers: BTreeMap<String, String>,
 ) -> Vec<String> {
-    let result = match resolve_auth(Arc::clone(&provider), credentials, headers).await {
+    let result = match resolve_auth(Arc::clone(&provider), credentials, headers, true).await {
         Ok(auth) => list(http, base_url, auth).await,
         Err(error) => Err(error),
     };

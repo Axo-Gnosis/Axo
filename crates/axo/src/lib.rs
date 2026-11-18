@@ -35,7 +35,8 @@ pub use coordination::{
 pub use error::Error;
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{
-    OutputChunk, OutputError, OutputStream, ProcessSupervisor, Sandbox, Supervision,
+    OutputChunk, OutputError, OutputStream, Pipe, PipeChunk, ProcessSupervisor, Sandbox,
+    Supervision,
 };
 pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
 pub use input::{PromptInput, PromptPart};
@@ -61,7 +62,7 @@ pub use store::{
 pub use tools::{
     Answer, CommandRequest, Exposure, FileChange, HostTool, LineDiff, MAX_SNAPSHOT_BYTES, Omitted,
     Question, QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange,
-    ToolFactory, file_change, squash,
+    ToolFactory, WriteRoot, WriteScope, file_change, squash,
 };
 
 #[cfg(doctest)]

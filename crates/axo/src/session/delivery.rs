@@ -115,6 +115,20 @@ impl Drop for Preparing {
         }
     }
 }
+
+fn spawn_run(
+    agent: Arc<Agent>,
+    hooks: Arc<SessionHooks>,
+    messages: Vec<QueuedMessage>,
+    failed: &'static str,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await {
+            warn!(%err, "{failed}");
+        }
+    });
+}
+
 impl SessionHooks {
     /// The agent and these hooks, while the session lives.
     fn owners(&self) -> Option<(Arc<Agent>, Arc<SessionHooks>)> {
@@ -144,10 +158,14 @@ impl SessionHooks {
 
     /// Whether finished job results may start a run of their own.
     pub(super) fn may_deliver(&self) -> bool {
+        self.deliverable(&self.activity.borrow())
+    }
+
+    fn deliverable(&self, activity: &Activity) -> bool {
         !self.auto_paused.load(Ordering::Acquire)
             && !self.shutdown.load(Ordering::Acquire)
             && self.preparing.load(Ordering::Acquire) == 0
-            && self.activity.borrow().maintenance.is_none()
+            && activity.maintenance.is_none()
     }
 
     /// Claims the idle session; false while a run, maintenance or navigation owns it.
@@ -170,11 +188,7 @@ impl SessionHooks {
             return false;
         }
         let messages = self.run_input(delivery, None);
-        tokio::spawn(async move {
-            if let Err(err) = run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await {
-                warn!(%err, "job result delivery run failed");
-            }
-        });
+        spawn_run(agent, hooks, messages, "job result delivery run failed");
         true
     }
 
@@ -184,35 +198,39 @@ impl SessionHooks {
     pub(super) fn release_or_deliver(&self) {
         // The claim a Stop targeted ends here; a Stop never carries over to the next owner.
         self.stop_requested.store(false, Ordering::Release);
+        let mut next = None;
         self.activity.send_if_modified(|activity| {
             // Queue draining and the idle decision share the ownership lock. A sender
             // either joins this chain or claims a genuinely idle session afterwards.
-            if !self.auto_paused.load(Ordering::Acquire)
-                && !self.shutdown.load(Ordering::Acquire)
-                && self.preparing.load(Ordering::Acquire) == 0
-                && activity.maintenance.is_none()
+            if self.deliverable(activity)
                 && let Some((agent, hooks)) = self.owners()
             {
                 let queued = agent.take_next_input();
-                if !queued.is_empty() {
-                    let mut messages = self.run_input(self.reserve_delivery(), None);
-                    messages.extend(queued);
-                    tokio::spawn(async move {
-                        if let Err(err) =
-                            run_to_settle(agent, hooks, RunRequest::Prompt(messages)).await
-                        {
-                            warn!(%err, "follow-up run failed");
-                        }
-                    });
-                    return false;
-                }
-                if self.start_delivery(agent, hooks) {
+                let delivery = if !queued.is_empty() || self.tools.runner.jobs.has_pending() {
+                    self.reserve_delivery()
+                } else {
+                    Vec::new()
+                };
+                if !queued.is_empty() || !delivery.is_empty() {
+                    next = Some((agent, hooks, delivery, queued));
                     return false;
                 }
             }
             activity.running = false;
             true
         });
+        if let Some((agent, hooks, delivery, queued)) = next {
+            let failed = if queued.is_empty() {
+                "job result delivery run failed"
+            } else {
+                "follow-up run failed"
+            };
+            // Rebuilding the prompt can call host tools; run it outside the activity lock.
+            let mut messages = self.run_input(delivery, None);
+            messages.extend(queued);
+            spawn_run(agent, hooks, messages, failed);
+            return;
+        }
         // A result that became pending meanwhile found `running` set and left its
         // delivery to this transition.
         self.deliver_if_idle();
@@ -355,6 +373,7 @@ impl Session {
             content,
             request.request_id.clone(),
             None,
+            None,
             &keywords,
         );
         let mut entry = Some(entry);
@@ -473,9 +492,9 @@ impl Session {
             .map(drop)
     }
 
-    /// Takes a queued steer or follow-up back before it is delivered and returns its parts
-    /// for the host to edit and resubmit. `Error::NotQueued` once it was delivered.
-    pub async fn withdraw(&self, submission_id: &str) -> Result<Vec<PromptPart>, Error> {
+    /// Takes a queued steer or follow-up back before it is delivered and returns it for
+    /// the host to edit and resubmit. `Error::NotQueued` once it was delivered or withdrawn.
+    pub async fn withdraw(&self, submission_id: &str) -> Result<QueuedInput, Error> {
         let (hooks, agent, id) = (
             self.hooks.clone(),
             self.agent.clone(),
@@ -483,9 +502,9 @@ impl Session {
         );
         // Detached, so a dropped caller cannot leave the message removed but not recorded.
         detached(async move {
-            let Some(QueuedInput { kind, parts, .. }) =
-                QueuedInput::find(&hooks.journal.view().entries, id.clone())
-            else {
+            // Wait for a submission being appended to reach the agent's queue.
+            let order = hooks.queue_order.lock().await;
+            let Some(input) = QueuedInput::find(&hooks.journal.view().entries, id.clone()) else {
                 return Err(Error::NotQueued(id));
             };
             let Some(message) = agent.remove_queued(&id) else {
@@ -496,10 +515,14 @@ impl Session {
                 submission_id: id,
             };
             if let Err(error) = hooks.append(vec![tombstone]).await {
-                enqueue(&agent, &hooks, kind, message);
+                enqueue(&agent, &hooks, input.kind, message);
+                drop(order);
+                if hooks.claim_idle() {
+                    hooks.release_or_deliver();
+                }
                 return Err(error);
             }
-            Ok(parts)
+            Ok(input)
         })
         .await
     }
@@ -610,14 +633,8 @@ impl Session {
         };
         let choice = self.hooks.keyword_choice(&keywords)?;
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &keywords).await?;
-        let (mut entry, message) = submission(kind, parts, content, None, sender, &keywords);
-        if let Entry::Submission {
-            provenance: recorded,
-            ..
-        } = &mut entry
-        {
-            *recorded = provenance;
-        }
+        let (entry, message) =
+            submission(kind, parts, content, None, sender, provenance, &keywords);
         let id = message.id.clone().expect("submission id");
         self.queue_message(kind, entry, message, Some(saved), choice)
             .await?;
@@ -663,7 +680,15 @@ impl Session {
     /// Validates and renders a new child's task; writes nothing.
     pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &[]).await?;
-        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None, &[]);
+        let (entry, message) = submission(
+            SubmissionKind::Prompt,
+            parts,
+            content,
+            None,
+            None,
+            None,
+            &[],
+        );
         Ok(FirstPrompt {
             entry,
             message,
@@ -786,6 +811,7 @@ fn submission(
     content: Vec<UserBlock>,
     request_id: Option<String>,
     sender: Option<String>,
+    provenance: Option<crate::coordination::SubmissionProvenance>,
     keywords: &[Arc<KeywordSpec>],
 ) -> (Entry, QueuedMessage) {
     let submission_id = Uuid::now_v7().to_string();
@@ -800,7 +826,7 @@ fn submission(
             .collect(),
         request_id,
         sender,
-        provenance: None,
+        provenance,
         custom: None,
     };
     let message = AgentMessage::Llm(Message::User(UserMessage {

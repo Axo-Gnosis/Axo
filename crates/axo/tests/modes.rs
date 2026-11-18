@@ -857,19 +857,18 @@ async fn pending_review_survives_reopening_and_records_its_outcome() {
         assert_eq!(reopened.mode().is_some(), revise);
         let result = only_result(&journal(&reopened), "final");
         assert_eq!(result["isError"], false);
-        assert_eq!(result["details"]["mode"], "plan");
-        assert_eq!(result["details"]["outcome"], outcome);
-        assert_eq!(result["details"]["result"], json!({"plan":"ready"}));
-        if !revise {
-            assert_eq!(
-                result["details"]["original_result"],
-                json!({"plan":"ready"})
-            );
-            assert_eq!(
-                result["details"]["accepted_result"],
-                json!({"plan":"ready"})
-            );
-        }
+        let expected = if revise {
+            json!({"mode":"plan","outcome":outcome,"result":{"plan":"ready"}})
+        } else {
+            json!({
+                "mode": "plan",
+                "outcome": outcome,
+                "result": {"plan":"ready"},
+                "originalResult": {"plan":"ready"},
+                "acceptedResult": {"plan":"ready"},
+            })
+        };
+        assert_eq!(result["details"], expected);
         reopened.shutdown().await;
     }
 }
@@ -979,14 +978,14 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
     assert!(attached.live.pending_results.is_empty());
     assert!(common::tool_text(&attached.missed, "revised").contains("Go implement it."));
     let result = only_result(&journal(&session), "revised");
-    assert_eq!(
-        result["details"]["original_result"],
-        json!({"plan":"revised draft"})
-    );
-    assert_eq!(
-        result["details"]["accepted_result"],
-        json!({"plan":"host edited plan"})
-    );
+    let expected = json!({
+        "mode": "plan",
+        "outcome": "accepted",
+        "result": {"plan":"host edited plan"},
+        "originalResult": {"plan":"revised draft"},
+        "acceptedResult": {"plan":"host edited plan"},
+    });
+    assert_eq!(result["details"], expected);
     assert!(common::tool_text(&attached.missed, "revised").contains("host edited plan"));
     let requests = host.api.requests();
     assert_eq!(requests.len(), 3);
@@ -1005,14 +1004,7 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
         .await
         .unwrap();
     let recorded = only_result(&journal(&reopened), "revised");
-    assert_eq!(
-        recorded["details"]["original_result"],
-        json!({"plan":"revised draft"})
-    );
-    assert_eq!(
-        recorded["details"]["accepted_result"],
-        json!({"plan":"host edited plan"})
-    );
+    assert_eq!(recorded["details"], expected);
     reopened.shutdown().await;
 }
 

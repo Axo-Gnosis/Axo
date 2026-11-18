@@ -28,6 +28,7 @@ use crate::input::PromptInput;
 use crate::jobs::JobRegistry;
 use crate::jobs::child::{ChildMessage, ChildPhase, ChildRun};
 use crate::store::{Entry, Header, Projection, RosterEntry, SpawnLink, TeamLink};
+use crate::tools::WriteScope;
 use crate::tools::ask::ASK;
 use crate::tools::call::CALL;
 use crate::tools::output::YIELD;
@@ -151,7 +152,7 @@ pub struct SpawnContext<'a> {
     /// The parent's effective bash access, under `mode`; the child's ceiling, never loosened below.
     pub bash: BashAccess,
     /// The parent's effective write scope, under `mode`; the child's ceiling, never loosened below.
-    pub writes: Option<&'a [String]>,
+    pub writes: Option<&'a WriteScope>,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
     pub task: &'a PromptInput,
@@ -244,7 +245,7 @@ struct Resolved {
     selector: Option<String>,
     limits: ToolLimits,
     bash: BashAccess,
-    writes: Option<Vec<String>>,
+    writes: Option<WriteScope>,
 }
 
 struct Launch {
@@ -397,7 +398,7 @@ impl SessionHooks {
                     mode: mode.as_deref(),
                     limits: &limits,
                     bash,
-                    writes: writes.as_deref(),
+                    writes: writes.as_ref(),
                     model: &model,
                     thinking,
                     task,

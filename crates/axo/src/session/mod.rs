@@ -401,6 +401,8 @@ pub struct QueuedInput {
     /// `Prompt` (input requeued when the session reopened) is delivered like `Steer`.
     pub kind: SubmissionKind,
     pub parts: Vec<PromptPart>,
+    /// `Some` for a host `post` message; resubmit it with `Session::post`, not `steer`.
+    pub custom: Option<store::SubmittedCustom>,
 }
 
 impl QueuedInput {
@@ -414,14 +416,16 @@ impl QueuedInput {
                     submission_id,
                     kind,
                     parts,
+                    custom,
                     ..
-                } if *submission_id == id => Some((*kind, parts.clone())),
+                } if *submission_id == id => Some((*kind, parts.clone(), custom.clone())),
                 _ => None,
             })
-            .map(|(kind, parts)| Self {
+            .map(|(kind, parts, custom)| Self {
                 submission_id: id,
                 kind,
                 parts,
+                custom,
             })
     }
 }
@@ -1882,9 +1886,7 @@ impl Session {
             &session_tools,
             scope_agent.as_ref(),
             selected_mode.as_deref(),
-            child
-                .as_ref()
-                .and_then(|child| child.link.writes.as_deref()),
+            child.as_ref().and_then(|child| child.link.writes.as_ref()),
         );
         *session_tools
             .writes

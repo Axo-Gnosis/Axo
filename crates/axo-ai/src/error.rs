@@ -14,6 +14,9 @@ pub enum Error {
     /// A config file (`models.jsonc`, a config value) could not be parsed or resolved.
     #[error("{0}")]
     Config(String),
+    /// The model is not in the registry (its provider was unregistered or replaced, or a reload dropped it).
+    #[error("Unknown model: {provider}/{model}")]
+    UnknownModel { provider: String, model: String },
     #[error("No API key for provider: {provider}")]
     NoApiKey { provider: String },
     /// Login, token exchange, refresh or credential lookup failed.

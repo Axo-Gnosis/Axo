@@ -30,6 +30,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+axo-ai = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

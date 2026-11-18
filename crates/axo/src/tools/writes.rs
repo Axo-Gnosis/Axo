@@ -1,45 +1,62 @@
 //! Write scope: where `write`, `edit` and host file-mutating tools may write.
-//!
-//! A normalized entry is an absolute directory path, or a registered scheme URL prefix
-//! `scheme://path` without a trailing `/`. `local://` stays symbolic: in a child it
-//! means the child's own local dir.
 
-use std::path::Path;
+use std::fmt::{self, Write as _};
+use std::path::PathBuf;
 use std::sync::PoisonError;
 
 use axo_agent::ToolError;
+use serde::{Deserialize, Serialize};
 
 use super::{Located, SessionTools, file_key};
 
+/// One place a scope layer permits writes under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteRoot {
+    /// An absolute directory.
+    Path(PathBuf),
+    /// A registered scheme URL prefix `scheme://path` without a trailing `/`.
+    /// `local://` stays symbolic: in a child it means the child's own local dir.
+    Url(String),
+}
+
+impl fmt::Display for WriteRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path(path) => fmt::Display::fmt(&path.display(), f),
+            Self::Url(url) => f.write_str(url),
+        }
+    }
+}
+
+/// A write scope: a target must be permitted by every layer (persona or child spec,
+/// mode, and each inherited ceiling layer). An empty layer permits nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WriteScope {
+    pub layers: Vec<Vec<WriteRoot>>,
+}
+
 /// `raw` entries as absolute paths (relative ones against the cwd) or URL prefixes. An
 /// unknown scheme or an empty entry is dropped, so it permits nothing.
-pub(crate) fn normalize(tools: &SessionTools, raw: &[String]) -> Vec<String> {
+pub(crate) fn normalize(tools: &SessionTools, raw: &[String]) -> Vec<WriteRoot> {
     raw.iter()
         .map(|entry| entry.trim())
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| match tools.parse_url(entry) {
-            Ok(Some(url)) => Some(format!(
+            Ok(Some(url)) => Some(WriteRoot::Url(format!(
                 "{}://{}",
                 url.scheme,
                 url.path.trim_end_matches('/')
-            )),
-            Ok(None) => Some(tools.resolve_path(entry).to_string_lossy().into_owned()),
+            ))),
+            Ok(None) => Some(WriteRoot::Path(tools.resolve_path(entry))),
             Err(_) => None,
         })
         .collect()
 }
 
-/// Whether normalized `inner` lies under normalized `outer`; a path never lies under a URL
-/// or the reverse.
-fn within(inner: &str, outer: &str) -> bool {
-    match (
-        Path::new(inner).is_absolute(),
-        Path::new(outer).is_absolute(),
-    ) {
-        (true, true) => return Path::new(inner).starts_with(outer),
-        (false, false) => {}
-        _ => return false,
-    }
+/// Whether `inner` lies at or under the same scheme's `outer` URL prefix.
+fn url_within(inner: &str, outer: &str) -> bool {
     let (Some((inner_scheme, inner_path)), Some((outer_scheme, outer_path))) =
         (inner.split_once("://"), outer.split_once("://"))
     else {
@@ -53,113 +70,92 @@ fn within(inner: &str, outer: &str) -> bool {
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
-/// The entries permitted by both `a` and `b`: of each overlapping pair, the narrower.
-pub(crate) fn intersect(a: &[String], b: &[String]) -> Vec<String> {
-    let mut both: Vec<String> = Vec::new();
-    for x in a {
-        for y in b {
-            let narrower = if within(x, y) {
-                x
-            } else if within(y, x) {
-                y
-            } else {
-                continue;
-            };
-            if !both.contains(narrower) {
-                both.push(narrower.clone());
-            }
-        }
+fn outside_scope(shown: impl fmt::Display, roots: &[WriteRoot]) -> ToolError {
+    let [first, rest @ ..] = roots else {
+        return ToolError(format!(
+            "{shown} is outside the write scope (no writes allowed)"
+        ));
+    };
+    let mut message = format!("{shown} is outside the write scope ({first}");
+    for root in rest {
+        write!(message, ", {root}").expect("writing to a String cannot fail");
     }
-    both
+    message.push(')');
+    ToolError(message)
 }
 
 impl SessionTools {
     /// The session's current effective write scope (agent, mode and child ceiling);
     /// `None`: unrestricted.
-    pub fn write_scope(&self) -> Option<Vec<String>> {
+    pub fn write_scope(&self) -> Option<WriteScope> {
         self.writes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    /// Refuses a target outside the write scope. `write` and `edit` call it; host tools
-    /// that mutate files must too. File-backed targets compare by real path (`file_key`),
-    /// so a symlink inside an allowed directory, dangling or not, cannot escape it; the
-    /// check is point-in-time, not containment against a concurrent process swapping
-    /// symlinks; a virtual target passes only under a matching URL entry.
+    /// Refuses a target outside any layer of the write scope. `write` and `edit` call
+    /// it; host tools that mutate files must too. File-backed targets compare by real
+    /// path (`file_key`), so a symlink inside an allowed directory, dangling or not,
+    /// cannot escape it. The check is point-in-time, not containment against a
+    /// concurrent process swapping symlinks. Virtual targets match only URL entries.
     pub async fn check_write(&self, target: &Located) -> Result<(), ToolError> {
-        let Some(scope) = self.write_scope() else {
+        let Some(scope) = self.write_scope().filter(|scope| !scope.layers.is_empty()) else {
             return Ok(());
         };
-        let shown = match target {
+        match target {
             Located::Virtual { url } => {
-                let shown = url.to_string();
-                let key = shown.trim_end_matches('/');
-                if !url.path.split('/').any(|segment| segment == "..")
-                    && scope.iter().any(|entry| within(key, entry))
-                {
-                    return Ok(());
-                }
-                shown
-            }
-            Located::File { url, path, .. } => {
-                if !scope.is_empty() {
-                    let real = file_key(path);
-                    for entry in &scope {
-                        let root = if Path::new(entry).is_absolute() {
-                            Path::new(entry).to_path_buf()
-                        } else if let Ok(Located::File { path, .. }) = self.locate(entry).await {
-                            path
-                        } else {
-                            continue;
-                        };
-                        if real.starts_with(file_key(&root)) {
-                            return Ok(());
-                        }
+                let key = format!("{}://{}", url.scheme, url.path.trim_end_matches('/'));
+                let has_parent = url.path.split('/').any(|segment| segment == "..");
+                for layer in &scope.layers {
+                    if has_parent
+                        || !layer.iter().any(
+                            |root| matches!(root, WriteRoot::Url(entry) if url_within(&key, entry)),
+                        )
+                    {
+                        return Err(outside_scope(url, layer));
                     }
                 }
-                url.as_ref()
-                    .map_or_else(|| path.display().to_string(), ToString::to_string)
             }
-        };
-        Err(ToolError(if scope.is_empty() {
-            format!("{shown} is outside the write scope (no writes allowed)")
-        } else {
-            format!("{shown} is outside the write scope ({})", scope.join(", "))
-        }))
+            Located::File { url, path, .. } => {
+                let real = file_key(path);
+                'layers: for layer in &scope.layers {
+                    for root in layer {
+                        let root = match root {
+                            WriteRoot::Path(path) => file_key(path),
+                            WriteRoot::Url(url) => match self.locate(url).await {
+                                Ok(Located::File { path, .. }) => file_key(&path),
+                                _ => continue,
+                            },
+                        };
+                        if real.starts_with(root) {
+                            continue 'layers;
+                        }
+                    }
+                    return Err(match url {
+                        Some(url) => outside_scope(url, layer),
+                        None => outside_scope(path.display(), layer),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::intersect;
-
-    fn strings(entries: &[&str]) -> Vec<String> {
-        entries.iter().map(|entry| (*entry).to_owned()).collect()
-    }
+    use super::url_within;
 
     #[test]
-    fn intersection_keeps_the_narrower_of_each_overlap() {
-        for (a, b, both) in [
-            (
-                &["local://", "/p"][..],
-                &["/p/plans"][..],
-                &["/p/plans"][..],
-            ),
-            (&["local://"], &["local://notes"], &["local://notes"]),
-            (&["local://notes"], &["local://"], &["local://notes"]),
-            (&["local://no"], &["local://notes"], &[]),
-            (&["/a"], &["/b"], &[]),
-            (&["/a"], &["/ab"], &[]),
-            (&["local://"], &["/a"], &[]),
-            (&["local://"], &["artifact://"], &[]),
+    fn url_prefix_respects_segment_boundaries() {
+        for (inner, outer, expected) in [
+            ("local://notes", "local://", true),
+            ("local://notes/a", "local://notes", true),
+            ("local://notes", "local://no", false),
+            ("local://x", "artifact://", false),
         ] {
-            assert_eq!(
-                intersect(&strings(a), &strings(b)),
-                strings(both),
-                "{a:?} ∩ {b:?}"
-            );
+            assert_eq!(url_within(inner, outer), expected, "{inner} under {outer}");
         }
     }
 }

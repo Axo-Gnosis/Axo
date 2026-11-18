@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{CommandExit, JobId, JobRegistry, Killer, Mode, Promotion};
 use crate::exec::host::{
-    Container, ExecSpec, OutputChunk, OutputStream, Process, ProcessSupervisor,
+    Container, ExecSpec, OutputChunk, OutputStream, Pipe, PipeChunk, Process, ProcessSupervisor,
 };
 use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail, stream_index_path};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
@@ -182,6 +182,11 @@ pub struct CommandOutput {
 
 /// Bytes per stream-index record: an 8-byte LE end offset, then a 1-byte tag.
 const INDEX_RECORD: u64 = 9;
+/// Tag byte of a stream-index record: the origin of the span it ends, or the terminal record.
+const TAG_STDOUT: u8 = 1;
+const TAG_STDERR: u8 = 2;
+const TAG_END: u8 = 3;
+const TAG_FAILED: u8 = 4;
 /// Records per batched index read while scanning for chunks.
 const INDEX_BATCH: u64 = 512;
 
@@ -220,8 +225,8 @@ impl CommandOutput {
             capture_failed = len < INDEX_RECORD || len % INDEX_RECORD != 0;
             if !capture_failed {
                 index.read_exact_at(&mut record, len - INDEX_RECORD)?;
-                capture_failed =
-                    record[8] != 3 || u64::from_le_bytes(record[..8].try_into().unwrap()) != bytes;
+                capture_failed = record[8] != TAG_END
+                    || u64::from_le_bytes(record[..8].try_into().unwrap()) != bytes;
             }
         }
         let (_, progress) = watch::channel(OutputProgress {
@@ -290,9 +295,9 @@ impl CommandOutput {
                 for record in batch.as_chunks::<{ INDEX_RECORD as usize }>().0 {
                     let boundary = u64::from_le_bytes(record[..8].try_into().unwrap());
                     let stream = match record[8] {
-                        1 => OutputStream::Stdout,
-                        2 => OutputStream::Stderr,
-                        3 | 4 => break 'scan,
+                        TAG_STDOUT => OutputStream::Stdout,
+                        TAG_STDERR => OutputStream::Stderr,
+                        TAG_END | TAG_FAILED => break 'scan,
                         _ => return Err(std::io::Error::other("invalid output stream index")),
                     };
                     if boundary < previous {
@@ -914,7 +919,7 @@ impl CommandTask {
         if let Some(index) = &mut index {
             let bytes = shared.output.progress.borrow().bytes;
             let failed = capture_error.is_some() || pipes_open;
-            if write_span(index, bytes, if failed { 4 } else { 3 })
+            if write_span(index, bytes, if failed { TAG_FAILED } else { TAG_END })
                 .await
                 .is_err()
                 || failed
@@ -960,7 +965,7 @@ async fn write_spool(
     index: &mut Option<File>,
     capture_error: &mut Option<String>,
     output: &OutputState,
-    chunk: &OutputChunk,
+    chunk: &PipeChunk,
 ) {
     let mut written = 0;
     if let Some(file) = spool {
@@ -970,10 +975,9 @@ async fn write_spool(
             written = chunk.bytes.len() as u64;
             if let Some(index) = index {
                 let end = output.progress.borrow().bytes + written;
-                let tag = match chunk.stream {
-                    OutputStream::Stdout => 1,
-                    OutputStream::Stderr => 2,
-                    OutputStream::Merged => unreachable!("pipe capture always has an origin"),
+                let tag = match chunk.pipe {
+                    Pipe::Stdout => TAG_STDOUT,
+                    Pipe::Stderr => TAG_STDERR,
                 };
                 write_span(index, end, tag).await?;
             }
@@ -1167,8 +1171,8 @@ mod tests {
         // A real failing sink exercises index failure after successful raw capture.
         let mut index = Some(File::options().write(true).open("/dev/full").await.unwrap());
         let mut error = None;
-        let chunk = OutputChunk {
-            stream: OutputStream::Stderr,
+        let chunk = PipeChunk {
+            pipe: Pipe::Stderr,
             bytes: vec![0xff, 0, 42],
         };
         write_spool(&mut spool, &mut index, &mut error, &state, &chunk).await;
@@ -1219,7 +1223,13 @@ mod tests {
         while let Some(chunk) = chunks.recv().await {
             let chunk = chunk.unwrap();
             write_spool(&mut spool, &mut index, &mut error, &state, &chunk).await;
-            captured.push(chunk);
+            captured.push(OutputChunk {
+                stream: match chunk.pipe {
+                    Pipe::Stdout => OutputStream::Stdout,
+                    Pipe::Stderr => OutputStream::Stderr,
+                },
+                bytes: chunk.bytes,
+            });
         }
         assert!(process.wait().await.unwrap().success());
         process.close().await;

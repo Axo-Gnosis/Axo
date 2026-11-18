@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 
-use crate::api::RequestRewrite;
 use crate::auth::provider::ProviderLogin;
 use crate::auth::{Credential, CredentialStore, ModelAuth};
 use crate::error::Error;
@@ -23,7 +22,6 @@ pub(crate) struct ProviderAuth {
     pub requires_key: bool,
     /// Login and OAuth refresh; without it an expired OAuth credential cannot be refreshed.
     pub login: Option<Arc<dyn ProviderLogin>>,
-    pub rewrite: Option<Arc<dyn RequestRewrite>>,
 }
 
 /// OAuth tokens are refreshed when they expire within this window.
@@ -141,6 +139,7 @@ pub(crate) async fn resolve_auth(
     info: Arc<ProviderAuth>,
     store: Arc<dyn CredentialStore>,
     headers: BTreeMap<String, String>,
+    config_base_url: bool,
 ) -> Result<ModelAuth, Error> {
     let mut auth = if info.config_api_key.is_some() || !headers.is_empty() {
         let info = Arc::clone(&info);
@@ -181,8 +180,10 @@ pub(crate) async fn resolve_auth(
             ..
         }) => {
             auth.api_key = Some(access);
-            auth.base_url = base_url;
-            // `models.jsonc` headers win over the credential's.
+            // `models.jsonc` headers and base URL win over the credential's.
+            if !config_base_url {
+                auth.base_url = base_url;
+            }
             for (name, value) in headers {
                 if !auth
                     .headers
@@ -262,7 +263,6 @@ mod tests {
             env: vec!["EMPTY".into(), "FIRST".into(), "SECOND".into()],
             requires_key: false,
             login: None,
-            rewrite: None,
         };
         let env = |name: &str| {
             Some(

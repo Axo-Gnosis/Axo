@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axo_ai::ToolResultMessage;
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
@@ -17,6 +18,7 @@ const CONTEXT_LINES: usize = 4;
 const MAX_INLINE_PATCH_BYTES: usize = 64 * 1024;
 /// Bounds diffing pathological inputs; past it the diff is coarser, never wrong.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(1);
+const SQUASH_CONCURRENCY: usize = 8;
 
 /// One file mutation by a file tool: `details.change` on its result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +191,8 @@ fn diff_text(before: &[u8], after: &[u8], label: Option<&str>) -> Option<LineDif
 }
 
 /// Net change per file over `changes` in order, ordered by each file's first appearance;
-/// files that end where they began are dropped. Pure, no I/O.
+/// a file that ends where it began is dropped unless it was created or its history is
+/// discontinuous. Pure, no I/O.
 pub fn squash<'a>(changes: impl IntoIterator<Item = &'a FileChange>) -> Vec<SquashedChange> {
     let mut squashed: Vec<SquashedChange> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
@@ -232,26 +235,36 @@ impl SnapshotStore {
     pub async fn squash(&self, changes: &[FileChange]) -> Vec<SquashedChange> {
         let mut squashed = squash(changes);
         let stored = |blob: &SnapshotBlob| !blob.binary && blob.omitted.is_none();
-        for file in &mut squashed {
-            if file.mutations < 2
-                || !stored(&file.after)
-                || file.before.as_ref().is_some_and(|blob| !stored(blob))
-            {
-                continue;
-            }
-            let before = match &file.before {
-                Some(blob) => self.read(&blob.sha256).await,
-                None => Ok(Vec::new()),
-            };
-            let blobs = match (before, self.read(&file.after.sha256).await) {
-                (Ok(before), Ok(after)) => (before, after),
-                (Err(error), _) | (_, Err(error)) => {
-                    tracing::warn!(path = %file.path, %error, "could not read file snapshots");
-                    continue;
-                }
-            };
-            let label = (!file.created).then(|| file.url.as_ref().unwrap_or(&file.path).clone());
-            file.diff = line_diff(blobs.0, blobs.1, label).await;
+        let diffs = squashed
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| {
+                file.mutations >= 2
+                    && stored(&file.after)
+                    && file.before.as_ref().is_none_or(stored)
+            })
+            .map(|(index, file)| async move {
+                let before = match &file.before {
+                    Some(blob) => self.read(&blob.sha256).await,
+                    None => Ok(Vec::new()),
+                };
+                let (before, after) = match (before, self.read(&file.after.sha256).await) {
+                    (Ok(before), Ok(after)) => (before, after),
+                    (Err(error), _) | (_, Err(error)) => {
+                        tracing::warn!(path = %file.path, %error, "could not read file snapshots");
+                        return (index, None);
+                    }
+                };
+                let label =
+                    (!file.created).then(|| file.url.as_ref().unwrap_or(&file.path).clone());
+                (index, line_diff(before, after, label).await)
+            });
+        let diffs = stream::iter(diffs)
+            .buffer_unordered(SQUASH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (index, diff) in diffs {
+            squashed[index].diff = diff;
         }
         squashed
     }
@@ -323,9 +336,20 @@ mod tests {
         }
         let run = [
             change("f", Some("a\nb\nc\n"), "a\nB\nc\n"),
+            change("single", None, "a\nb\nc\n"),
+            change("created", None, "a\nB\nc\n"),
             change("f", Some("a\nB\nc\n"), "a\nB\nc\nd\ne\n"),
+            change("created", Some("a\nB\nc\n"), "a\nb\nc\n"),
         ];
-        let [file] = store.squash(&run).await.try_into().unwrap();
+        let [file, single, created] = store.squash(&run).await.try_into().unwrap();
+        assert_eq!(
+            [&file.key, &single.key, &created.key],
+            ["f", "single", "created"]
+        );
+        assert_eq!(single.diff, run[1].diff);
+        let created_diff = created.diff.unwrap();
+        assert_eq!((created_diff.additions, created_diff.deletions), (3, 0));
+        assert_eq!(created_diff.patch, None);
         let diff = file.diff.unwrap();
         assert_eq!((diff.additions, diff.deletions), (3, 1));
         assert_eq!(diff.first_changed_line, Some(2));

@@ -1,12 +1,17 @@
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use axo::{BashAccess, Entry, ModeSpec, RecoveryPolicy, SessionOptions, SpawnRequest};
+use axo::{
+    AgentSpec, BashAccess, Entry, HostTool, ModeSpec, RecoveryPolicy, SessionOptions, SessionTools,
+    SpawnRequest, WriteRoot, WriteScope,
+};
+use axo_agent::Tool;
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, UserBlock};
 use common::{
-    delivered, entry, host, journal, message_text, only, options, request, until, within,
+    Hang, delivered, entry, host, journal, message_text, only, options, request, tool_text, until,
+    within,
 };
 use serde_json::{Value, json};
 
@@ -605,10 +610,12 @@ async fn bash_and_write_ceilings_outlive_the_parent_mode() {
     assert_eq!(restricted_link.bash, BashAccess::ReadOnly);
     assert_eq!(
         restricted_link.writes,
-        Some(vec![
-            "local://".to_owned(),
-            cwd.join("plans").to_string_lossy().into_owned()
-        ])
+        Some(WriteScope {
+            layers: vec![vec![
+                WriteRoot::Url("local://".into()),
+                WriteRoot::Path(cwd.join("plans")),
+            ]],
+        })
     );
     let free_link = free.session.spawn_link().unwrap();
     assert_eq!(free_link.bash, BashAccess::Full);
@@ -641,5 +648,91 @@ async fn bash_and_write_ceilings_outlive_the_parent_mode() {
     assert!(!cwd.join("src.rs").exists());
     restricted.session.shutdown().await;
     free.session.shutdown().await;
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}, {"id":"child"}]),
+        json!({}),
+        vec![],
+    )
+    .await;
+    host.api.lane(
+        "child",
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "ok",
+                "write",
+                json!({"path": "plans/ok.md", "content": "ready"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    );
+
+    let captured_tools = Arc::new(Mutex::new(None));
+    let opts = SessionOptions {
+        agents: vec![AgentSpec {
+            name: "planner".into(),
+            writes: Some(vec!["plans/ok.md".into(), "plans/linked".into()]),
+            ..Default::default()
+        }],
+        modes: vec![ModeSpec {
+            name: "plan".into(),
+            description: "Write only in plans.".into(),
+            writes: Some(vec!["plans".into()]),
+            ..Default::default()
+        }],
+        tools: vec![HostTool::direct(Arc::new({
+            let captured_tools = captured_tools.clone();
+            move |tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
+                *captured_tools.lock().unwrap() = Some(tools.clone());
+                Arc::new(Hang)
+            }
+        }))],
+        ..options(dir.path())
+    };
+    let cwd = opts.cwd.clone();
+    std::fs::create_dir(cwd.join("plans")).unwrap();
+    std::fs::create_dir(cwd.join("outside")).unwrap();
+    std::os::unix::fs::symlink("../outside", cwd.join("plans/linked")).unwrap();
+    std::os::unix::fs::symlink("plans/ok.md", cwd.join("ok-alias.md")).unwrap();
+
+    let parent = host.axo.create_session(opts).await.unwrap();
+    assert!(captured_tools.lock().unwrap().take().is_some());
+    parent.set_mode(Some("plan")).await.unwrap();
+    let child = within(parent.spawn(SpawnRequest {
+        agent: Some("planner".into()),
+        ..request("Write the plan.")
+    }))
+    .await
+    .unwrap();
+    let tools = captured_tools.lock().unwrap().take().unwrap();
+
+    // Each denied target is allowed by just one layer. Check policy without writing.
+    for path in ["plans/unlisted.md", "plans/linked/unlisted.md"] {
+        let target = tools.locate(path).await.unwrap();
+        let error = tools.check_write(&target).await.unwrap_err();
+        assert!(
+            error.0.contains("is outside the write scope ("),
+            "{path}: {error}"
+        );
+    }
+    entry(&child.session, |entry| {
+        matches!(entry, Entry::RunEnd { .. })
+    })
+    .await;
+    tool_text(&child.session.attach(None).await.missed, "ok");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("plans/ok.md")).unwrap(),
+        "ready"
+    );
+    // Both layers permit this alias even though its spelling is outside plans/.
+    let alias = tools.locate("ok-alias.md").await.unwrap();
+    tools.check_write(&alias).await.unwrap();
+    child.session.shutdown().await;
     parent.shutdown().await;
 }

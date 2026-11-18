@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::context::agents::AgentSpec;
 use crate::context::modes::{BashAccess, ToolLimits};
 use crate::input::PromptPart;
+use crate::tools::WriteScope;
 
 /// The `version` written into new session headers.
 pub const FORMAT_VERSION: u32 = 1;
@@ -111,11 +112,28 @@ pub struct SpawnLink {
     pub bash: BashAccess,
     /// The parent's effective write scope at spawn; a ceiling every descendant inherits.
     /// `local://` means the child's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub writes: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_write_ceiling"
+    )]
+    pub writes: Option<WriteScope>,
     /// The member's team; `None` outside teams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<TeamLink>,
+}
+
+fn deserialize_write_ceiling<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<WriteScope>, D::Error> {
+    let scope = Option::<WriteScope>::deserialize(deserializer)?;
+    // Legacy `[]` denied all writes; treating it as zero layers would allow all writes.
+    if scope.as_ref().is_some_and(|scope| scope.layers.is_empty()) {
+        return Err(serde::de::Error::custom(
+            "a persisted write ceiling must contain at least one layer",
+        ));
+    }
+    Ok(scope)
 }
 
 /// A team member's identity in its parent's registry.
@@ -709,4 +727,31 @@ fn user_content<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<UserBl
         Content::Text(text) => vec![UserBlock::Text { text }],
         Content::Blocks(blocks) => blocks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn persisted_write_ceiling_rejects_zero_layers() {
+        let mut link = json!({"parentSessionId": "parent", "depth": 1, "spec": {}});
+        let read = |link: &Value| SpawnLink::deserialize(link).map(|link| link.writes);
+
+        assert_eq!(read(&link).unwrap(), None);
+        link["writes"] = Value::Null;
+        assert_eq!(read(&link).unwrap(), None);
+
+        link["writes"] = json!([]);
+        assert!(read(&link).is_err());
+
+        link["writes"] = json!([[]]);
+        assert_eq!(
+            read(&link).unwrap(),
+            Some(WriteScope {
+                layers: vec![Vec::new()],
+            })
+        );
+    }
 }

@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
-use crate::api::{ABORTED, Api, SimpleStreamOptions, StreamOptions, Streamer};
+use crate::api::{ABORTED, Api, RequestRewrite, SimpleStreamOptions, StreamOptions, Streamer};
 use crate::auth::codex::{self, CodexLogin};
 use crate::auth::provider::{LoginInteraction, Provider, ProviderLogin};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
@@ -63,8 +63,9 @@ pub struct ModelsOptions {
 }
 
 /// The model registry. One instance serves the host's lifetime: `reload` rebuilds the loaded
-/// catalog in place, and `register`/`unregister` add and remove runtime providers, so open
-/// sessions and registrations survive configuration changes.
+/// catalog in place, and `register`/`unregister` add and remove runtime providers.
+/// Each request resolves the current model and provider by provider/id; a missing model
+/// fails with `Error::UnknownModel`. Resolution does not update a session's own model copy.
 pub struct Models {
     state: RwLock<State>,
     /// Serializes `reload` so an older load never overwrites a newer one.
@@ -119,11 +120,22 @@ struct Loaded {
     providers: HashMap<String, Arc<ProviderAuth>>,
     /// Raw `models.jsonc` header values per (provider, model id), resolved at request time.
     config_headers: HashMap<(String, String), BTreeMap<String, String>>,
+    /// (Provider, model id) whose base URL `models.jsonc` set.
+    config_base_urls: HashSet<(String, String)>,
 }
 
 struct Registered {
     auth: Arc<ProviderAuth>,
     models: Vec<Model>,
+    rewrite: Option<Arc<dyn RequestRewrite>>,
+}
+
+struct Request {
+    model: Model,
+    auth: Arc<ProviderAuth>,
+    headers: BTreeMap<String, String>,
+    rewrite: Option<Arc<dyn RequestRewrite>>,
+    config_base_url: bool,
 }
 
 impl Models {
@@ -205,16 +217,24 @@ impl Models {
             env,
             requires_key,
             login,
-            rewrite,
         });
         let mut state = self.write();
-        state.registered.insert(id, Registered { auth, models });
+        state.registered.insert(
+            id,
+            Registered {
+                auth,
+                models,
+                rewrite,
+            },
+        );
         state.rebuild();
         Ok(())
     }
 
     /// Removes a registered provider; a loaded provider of that id is visible again. Returns
-    /// whether a registration existed. Requests already started finish on what they started with.
+    /// whether a registration existed. Requests already started keep their model and provider;
+    /// the next request resolves them again and fails with `Error::UnknownModel` if the model
+    /// is no longer present.
     pub fn unregister(&self, provider: &str) -> bool {
         let mut state = self.write();
         let removed = state.registered.remove(provider).is_some();
@@ -291,8 +311,14 @@ impl Models {
 
     /// Resolve the key, headers and base-URL override for a request to `model`.
     pub async fn auth(&self, model: &Model) -> Result<ModelAuth, Error> {
-        let (info, headers) = self.request_auth(model);
-        resolve_auth(info, self.credentials.clone(), headers).await
+        let request = self.request(model)?;
+        resolve_auth(
+            request.auth,
+            self.credentials.clone(),
+            request.headers,
+            request.config_base_url,
+        )
+        .await
     }
 
     fn read(&self) -> RwLockReadGuard<'_, State> {
@@ -314,36 +340,46 @@ impl Models {
             .ok_or_else(|| Error::Config(format!("unknown provider: {id}")))
     }
 
-    /// The provider and raw `models.jsonc` headers a request to `model` starts with. A model
-    /// whose provider is unknown (e.g. unregistered since) gets a keyless provider that fails
-    /// with `NoApiKey`.
-    fn request_auth(&self, model: &Model) -> (Arc<ProviderAuth>, BTreeMap<String, String>) {
+    /// What a request to `model` runs with now: the registry's current definition of that
+    /// provider/id and its provider. `UnknownModel` when the registry no longer has it.
+    fn request(&self, model: &Model) -> Result<Request, Error> {
         let state = self.read();
+        let model = state
+            .snapshot
+            .iter()
+            .find(|current| current.provider == model.provider && current.id == model.id)
+            .ok_or_else(|| Error::UnknownModel {
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+            })?;
         if let Some(registered) = state.registered.get(&model.provider) {
-            return (Arc::clone(&registered.auth), BTreeMap::new());
+            return Ok(Request {
+                model: model.clone(),
+                auth: Arc::clone(&registered.auth),
+                headers: BTreeMap::new(),
+                rewrite: registered.rewrite.clone(),
+                config_base_url: false,
+            });
         }
-        let info = state
+        let auth = state
             .loaded
             .providers
             .get(&model.provider)
             .cloned()
-            .unwrap_or_else(|| {
-                Arc::new(ProviderAuth {
-                    id: model.provider.clone(),
-                    config_api_key: None,
-                    env: Vec::new(),
-                    requires_key: true,
-                    login: None,
-                    rewrite: None,
-                })
-            });
-        let headers = state
-            .loaded
-            .config_headers
-            .get(&(model.provider.clone(), model.id.clone()))
-            .cloned()
-            .unwrap_or_default();
-        (info, headers)
+            .ok_or_else(|| Error::Config(format!("unknown provider: {}", model.provider)))?;
+        let key = (model.provider.clone(), model.id.clone());
+        Ok(Request {
+            model: model.clone(),
+            auth,
+            headers: state
+                .loaded
+                .config_headers
+                .get(&key)
+                .cloned()
+                .unwrap_or_default(),
+            rewrite: None,
+            config_base_url: state.loaded.config_base_urls.contains(&key),
+        })
     }
 }
 
@@ -374,7 +410,6 @@ async fn build(
                 requires_key: true,
                 login: (id == codex::PROVIDER)
                     .then(|| Arc::new(CodexLogin::new(http.clone())) as Arc<dyn ProviderLogin>),
-                rewrite: None,
             };
             (id, Arc::new(info))
         })
@@ -395,7 +430,6 @@ async fn build(
                 env: Vec::new(),
                 requires_key: false,
                 login: None,
-                rewrite: None,
             })
         });
     }
@@ -418,6 +452,7 @@ async fn build(
         .collect();
 
     let mut config_headers: HashMap<(String, String), BTreeMap<String, String>> = HashMap::new();
+    let mut config_base_urls = HashSet::new();
     for (provider_id, provider) in &config.providers {
         // Provider-level fields patch every model the provider already has.
         for model in models
@@ -426,6 +461,7 @@ async fn build(
         {
             if let Some(base_url) = &provider.base_url {
                 model.base_url = base_url.clone();
+                config_base_urls.insert((provider_id.clone(), model.id.clone()));
             }
             if let Some(api) = provider.api {
                 model.api = api;
@@ -478,7 +514,12 @@ async fn build(
                         .iter_mut()
                         .find(|model| &model.provider == provider_id && model.id == config.id)
                     {
-                        Some(model) => config.patch.apply(model, headers)?,
+                        Some(model) => {
+                            config.patch.apply(model, headers)?;
+                            if config.patch.base_url.is_some() {
+                                config_base_urls.insert((provider_id.clone(), config.id.clone()));
+                            }
+                        }
                         None => {
                             let mut model = new_model(
                                 &config.id,
@@ -487,6 +528,7 @@ async fn build(
                             )?;
                             headers.extend(provider.headers.clone());
                             config.patch.apply(&mut model, headers)?;
+                            config_base_urls.insert((provider_id.clone(), config.id.clone()));
                             models.push(model);
                         }
                     }
@@ -499,6 +541,7 @@ async fn build(
                         config_headers
                             .insert((provider_id.clone(), id.clone()), provider.headers.clone());
                     }
+                    config_base_urls.insert((provider_id.clone(), id.clone()));
                     models.push(model);
                 }
             }
@@ -513,6 +556,9 @@ async fn build(
                     .entry((provider_id.clone(), model_id.clone()))
                     .or_default();
                 patch.apply(model, headers)?;
+                if patch.base_url.is_some() {
+                    config_base_urls.insert((provider_id.clone(), model_id.clone()));
+                }
             }
         }
     }
@@ -522,6 +568,7 @@ async fn build(
         models,
         providers,
         config_headers,
+        config_base_urls,
     })
 }
 
@@ -533,16 +580,22 @@ impl Streamer for Models {
         opts: SimpleStreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
-        let transcript = transform_messages(transcript, model);
-        let model = model.clone();
-        let api: Arc<dyn Api> = match model.api {
+        let request = match self.request(model) {
+            Ok(request) => request,
+            Err(error) => return failed(model, StopReason::Error, error.to_string()),
+        };
+        let transcript = transform_messages(transcript, &request.model);
+        let api: Arc<dyn Api> = match request.model.api {
             ApiKind::AnthropicMessages => self.anthropic.clone(),
             ApiKind::OpenAiCompletions => self.completions.clone(),
             ApiKind::OpenAiCodexResponses => self.codex.clone(),
         };
-        let (info, headers) = self.request_auth(&model);
-        let rewrite = info.rewrite.clone();
-        let auth = resolve_auth(info, self.credentials.clone(), headers);
+        let auth = resolve_auth(
+            request.auth,
+            self.credentials.clone(),
+            request.headers,
+            request.config_base_url,
+        );
         stream::once(async move {
             // A refresh in progress keeps running in its own spawned task.
             let auth = tokio::select! {
@@ -550,28 +603,29 @@ impl Streamer for Models {
                 () = cancel.cancelled() => None,
                 auth = auth => Some(auth),
             };
-            let (reason, error) = match auth {
-                Some(Ok(auth)) => {
-                    return timed(api.stream(
-                        &model,
-                        transcript,
-                        StreamOptions {
-                            simple: opts,
-                            auth,
-                            rewrite,
-                        },
-                        cancel,
-                    ));
-                }
-                Some(Err(error)) => (StopReason::Error, error.to_string()),
-                None => (StopReason::Aborted, ABORTED.to_owned()),
-            };
-            let mut message = AssistantMessage::empty(&model);
-            message.stop_reason = reason;
-            message.error_message = Some(error);
-            stream::iter([AssistantEvent::Error { reason, message }]).boxed()
+            match auth {
+                Some(Ok(auth)) => timed(api.stream(
+                    &request.model,
+                    transcript,
+                    StreamOptions {
+                        simple: opts,
+                        auth,
+                        rewrite: request.rewrite,
+                    },
+                    cancel,
+                )),
+                Some(Err(error)) => failed(&request.model, StopReason::Error, error.to_string()),
+                None => failed(&request.model, StopReason::Aborted, ABORTED.to_owned()),
+            }
         })
         .flatten()
         .boxed()
     }
+}
+
+fn failed(model: &Model, reason: StopReason, error: String) -> BoxStream<'static, AssistantEvent> {
+    let mut message = AssistantMessage::empty(model);
+    message.stop_reason = reason;
+    message.error_message = Some(error);
+    stream::iter([AssistantEvent::Error { reason, message }]).boxed()
 }

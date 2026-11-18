@@ -477,6 +477,26 @@ async fn withdrawn_input_is_never_delivered() {
                 .await
                 .is_err()
         );
+        within(session.post(axo::HostMessage {
+            custom_type: "host_note".into(),
+            text: "withdraw this host message".into(),
+            display: true,
+            delivery: axo::HostDelivery::Steer,
+        }))
+        .await
+        .unwrap();
+        let host_id = session.attach(None).await.live.queued[0]
+            .submission_id
+            .clone();
+        let withdrawn = within(session.withdraw(&host_id)).await.unwrap();
+        assert_eq!(
+            withdrawn.custom,
+            Some(axo::SubmittedCustom {
+                custom_type: "host_note".into(),
+                display: true,
+            })
+        );
+
         within(session.steer("oops")).await.unwrap();
         let id = session.attach(None).await.live.queued[0]
             .submission_id
@@ -485,12 +505,14 @@ async fn withdrawn_input_is_never_delivered() {
         session.abort();
         common::entry(&session, |entry| matches!(entry, Entry::RunEnd { .. })).await;
 
+        let withdrawn = within(session.withdraw(&id)).await.unwrap();
         assert_eq!(
-            within(session.withdraw(&id)).await.unwrap(),
+            withdrawn.parts,
             [PromptPart::Text {
                 text: "oops".into()
             }]
         );
+        assert!(withdrawn.custom.is_none());
         let attached = session.attach(None).await;
         assert!(attached.live.queued.is_empty());
         let tombstones = attached

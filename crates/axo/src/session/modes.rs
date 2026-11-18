@@ -657,7 +657,7 @@ impl Tool for ModeYield {
             content: vec![UserBlock::Text { text }],
             details: Some(json!({
                 "mode": self.mode.name, "outcome": "accepted",
-                "result": accepted, "original_result": result, "accepted_result": accepted
+                "result": accepted, "originalResult": result, "acceptedResult": accepted
             })),
             terminate: next.is_none(),
             ..ToolOutput::default()

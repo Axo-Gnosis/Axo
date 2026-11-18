@@ -16,7 +16,7 @@ use crate::error::Error;
 
 /// What auth resolution hands to an adapter: the key (if any), extra headers, and a
 /// base URL override. A stored OAuth credential contributes its access token, `headers`
-/// and `base_url`; `models.jsonc` headers win over the credential's.
+/// and `base_url`; `models.jsonc` headers and base URL win over the credential's.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelAuth {
     pub api_key: Option<String>,
@@ -25,7 +25,8 @@ pub struct ModelAuth {
 }
 
 /// A stored credential (`auth.json` value). An OAuth credential carries everything a request
-/// needs (token, extra headers, base URL), so requests never call the provider for auth.
+/// needs (token, extra headers, base URL); one that expires within the refresh margin is
+/// first refreshed through its provider's `ProviderLogin::refresh`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {

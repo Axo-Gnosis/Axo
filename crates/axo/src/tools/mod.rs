@@ -60,6 +60,7 @@ pub use changes::{
 pub use ledger::{FileAccess, FileLedger, lock_file};
 pub(crate) use ledger::{file_key, ledger_access};
 pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
+pub use writes::{WriteRoot, WriteScope};
 
 /// State shared by one session's tools; each tool holds an `Arc` of it.
 pub struct SessionTools {
@@ -80,7 +81,7 @@ pub struct SessionTools {
     pub(crate) read_only_bash: AtomicBool,
     /// The effective write scope, kept current by the session on every rescope; read it
     /// through `write_scope`. Never held across an await.
-    pub(crate) writes: Mutex<Option<Vec<String>>>,
+    pub(crate) writes: Mutex<Option<WriteScope>>,
     /// Before/after bytes of this session's file mutations.
     pub snapshots: SnapshotStore,
 }
