@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::auth::CredentialStore;
 use crate::auth::resolve::{ProviderAuth, resolve_auth};
-use crate::auth::{CredentialStore, ModelAuth};
 use crate::error::Error;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,35 +23,15 @@ struct ListedModel {
     id: String,
 }
 
-/// Model ids the provider's server lists; empty (after a warning) when the request fails.
+/// Model ids the provider's server lists.
 pub(crate) async fn discover(
     http: &reqwest::Client,
     provider: Arc<ProviderAuth>,
     credentials: Arc<dyn CredentialStore>,
     base_url: &str,
     headers: BTreeMap<String, String>,
-) -> Vec<String> {
-    let result = match resolve_auth(Arc::clone(&provider), credentials, headers, true).await {
-        Ok(auth) => list(http, base_url, auth).await,
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(ids) => ids,
-        Err(error) => {
-            tracing::warn!(
-                "model discovery for provider {} at {base_url} failed: {error}",
-                provider.id
-            );
-            Vec::new()
-        }
-    }
-}
-
-async fn list(
-    http: &reqwest::Client,
-    base_url: &str,
-    auth: ModelAuth,
 ) -> Result<Vec<String>, Error> {
+    let auth = resolve_auth(provider, credentials, headers, true).await?;
     let mut request = http
         .get(format!("{}/models", base_url.trim_end_matches('/')))
         .timeout(TIMEOUT);

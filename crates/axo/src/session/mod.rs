@@ -534,6 +534,9 @@ struct SessionHooks {
     /// Held across a selection change's write and its apply, so changes take effect in
     /// journal order and only once durable.
     selection_order: tokio::sync::Mutex<()>,
+    /// The registry's definition of the selected model when it was last applied; a different
+    /// one now means the registry changed. `None` when the registry does not have the model.
+    registry_model: Mutex<Option<Model>>,
     maintenance: Maintenance,
     /// Prompts between their fast-path admission and their run start; idle-wake delivery
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
@@ -1102,11 +1105,60 @@ impl SessionHooks {
             agent.set_thinking(level);
         }
         agent.set_model(model.clone());
+        *self
+            .registry_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = self.registry_definition(&model);
         self.selection.send_replace(Selection {
             model,
             thinking: level,
         });
         self.emit_context();
+    }
+
+    fn registry_definition(&self, model: &Model) -> Option<Model> {
+        self.inherited
+            .models
+            .find(&format!("{}/{}", model.provider, model.id))
+    }
+
+    /// Adopts the registry's definition of the selected model when it changed since this session
+    /// last applied one, so limits, prices and thinking levels from a reload or refresh apply
+    /// from the next request. A copy the host set stays while the registry is unchanged, and so
+    /// does a model the registry no longer has (its request then fails with `UnknownModel`).
+    async fn follow_registry(&self) -> Result<(), Error> {
+        let _order = self.selection_order.lock().await;
+        let current = self.selection();
+        let all = self.inherited.models.all();
+        let Some(now) = all
+            .iter()
+            .find(|model| model.provider == current.model.provider && model.id == current.model.id)
+        else {
+            return Ok(());
+        };
+        let applied = self
+            .registry_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            == Some(now);
+        if applied {
+            return Ok(());
+        }
+        let Some(agent) = self.agent.get().and_then(Weak::upgrade) else {
+            return Ok(());
+        };
+        // Provider and id are unchanged, so only a clamped thinking level is journaled.
+        let level = clamp_level(now, current.thinking);
+        if level != current.thinking {
+            self.append(vec![Entry::ThinkingLevelChange {
+                base: journal::base(),
+                thinking_level: level,
+            }])
+            .await?;
+        }
+        self.apply_selection(&agent, now.clone(), level);
+        Ok(())
     }
 
     /// Records `level`, clamped to the model, then applies it once written; returns the
@@ -1205,6 +1257,9 @@ impl LoopHooks for SessionHooks {
         if let Some(child) = &self.child {
             child.budget.request();
         }
+        self.follow_registry()
+            .await
+            .map_err(|error| HookError(error.to_string()))?;
         let compacted = self
             .automatic(CompactionReason::Threshold, cancel)
             .await
@@ -1947,6 +2002,11 @@ impl Session {
                 queue_order: tokio::sync::Mutex::new(()),
                 quiet: Mutex::new(Vec::new()),
                 selection_order: tokio::sync::Mutex::new(()),
+                registry_model: Mutex::new(
+                    inherited
+                        .models
+                        .find(&format!("{}/{}", model.provider, model.id)),
+                ),
                 maintenance: Maintenance {
                     settings: settings.compaction.clone(),
                     prompts: summary_prompts,

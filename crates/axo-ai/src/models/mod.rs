@@ -1,24 +1,27 @@
-//! The model registry: models.dev catalog + built-in Codex models + `models.jsonc`, plus
-//! providers a host registers at runtime, with auth resolution and dispatch to the wire APIs.
+//! The model registry: models.dev catalog + Codex models + `models.jsonc`, plus providers a
+//! host registers at runtime, with auth resolution and dispatch to the wire APIs.
 
 pub mod catalog;
+pub mod codex;
 pub mod config;
 pub mod discover;
 pub mod rules;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
 use crate::api::{ABORTED, Api, RequestRewrite, SimpleStreamOptions, StreamOptions, Streamer};
-use crate::auth::codex::{self, CodexLogin};
+use crate::auth::codex::{self as codex_auth, CodexLogin};
 use crate::auth::provider::{LoginInteraction, Provider, ProviderLogin};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{CredentialStore, ModelAuth};
@@ -29,7 +32,11 @@ use crate::transcript::Transcript;
 use crate::transform::transform_messages;
 use crate::types::{AssistantMessage, StopReason};
 
+use self::codex::CodexModel;
 use self::config::{ModelsConfig, merge_compat};
+
+/// Seconds between automatic refreshes unless `ModelsConfig::refresh_interval` says otherwise.
+const DEFAULT_REFRESH_INTERVAL: u64 = 2 * 60 * 60;
 
 /// Public provider metadata without credential values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +59,8 @@ pub enum CredentialSource {
 }
 
 pub struct ModelsOptions {
-    /// Where `models.dev.json` is cached; `None` runs without the catalog.
+    /// Where the models.dev catalog is cached; `None` runs without the catalog, does no
+    /// catalog I/O, and never refreshes on a timer.
     pub cache_dir: Option<PathBuf>,
     /// Run catalog and built-in models at their full window even past a context price tier.
     pub extended_context: bool,
@@ -63,19 +71,39 @@ pub struct ModelsOptions {
 }
 
 /// The model registry. One instance serves the host's lifetime: `reload` rebuilds the loaded
-/// catalog in place, and `register`/`unregister` add and remove runtime providers.
-/// Each request resolves the current model and provider by provider/id; a missing model
-/// fails with `Error::UnknownModel`. Resolution does not update a session's own model copy.
+/// catalog in place from new configuration, `refresh` (also run on a timer, see
+/// `ModelsConfig::refresh_interval`) from fresh catalog and Codex model data, and
+/// `register`/`unregister` add and remove runtime providers. Each request resolves the
+/// current model and provider by provider/id; a missing model fails with
+/// `Error::UnknownModel`.
 pub struct Models {
-    state: RwLock<State>,
-    /// Serializes `reload` so an older load never overwrites a newer one.
-    reloading: tokio::sync::Mutex<()>,
-    cache_dir: Option<PathBuf>,
-    credentials: Arc<dyn CredentialStore>,
-    http: reqwest::Client,
+    shared: Arc<Shared>,
     anthropic: Arc<AnthropicApi>,
     completions: Arc<CompletionsApi>,
     codex: Arc<CodexApi>,
+    /// The refresh timer; replaced by `reload`, aborted on drop.
+    timer: Mutex<Option<AbortHandle>>,
+}
+
+/// What the refresh timer shares with `Models`.
+struct Shared {
+    state: RwLock<State>,
+    /// Serializes `reload` and `refresh`, and holds what the next rebuild starts from.
+    inputs: tokio::sync::Mutex<Inputs>,
+    cache_dir: Option<PathBuf>,
+    credentials: Arc<dyn CredentialStore>,
+    http: reqwest::Client,
+}
+
+struct Inputs {
+    config: ModelsConfig,
+    extended_context: bool,
+    /// The last Codex model list discovered or read from the cache; `None` uses the floor.
+    codex: Option<Vec<CodexModel>>,
+    /// The catalog as last fetched or read from the cache, mapped; `None` when there is none.
+    catalog: Option<Arc<rules::CatalogModels>>,
+    /// When that catalog was fetched; `None` when unknown or there is no catalog.
+    catalog_fetched: Option<Instant>,
 }
 
 struct State {
@@ -141,43 +169,110 @@ struct Request {
 impl Models {
     pub async fn load(opts: ModelsOptions) -> Result<Models, Error> {
         let http = opts.http_client.unwrap_or_else(crate::api::http::client);
-        let loaded = build(
-            opts.cache_dir.as_deref(),
-            opts.extended_context,
-            &opts.config,
-            &opts.credentials,
-            &http,
-        )
-        .await?;
-        Ok(Models {
-            state: RwLock::new(State::new(loaded)),
-            reloading: tokio::sync::Mutex::new(()),
-            cache_dir: opts.cache_dir,
-            credentials: opts.credentials,
+        let mut inputs = Inputs {
+            config: opts.config,
+            extended_context: opts.extended_context,
+            codex: None,
+            catalog: None,
+            catalog_fetched: None,
+        };
+        let mut age = Duration::ZERO;
+        if let Some(dir) = opts.cache_dir.as_deref() {
+            inputs.codex = codex::read(dir).await;
+            match catalog::read(dir).await {
+                Some((cached, cached_age)) => {
+                    inputs.catalog = Some(Arc::new(rules::map_catalog(&cached)));
+                    inputs.catalog_fetched = Instant::now().checked_sub(cached_age);
+                    age = cached_age;
+                }
+                // A failed first fetch retries at the next interval, not in a loop.
+                None => {
+                    if let Err(error) =
+                        gather(&http, Some(dir), &opts.credentials, false, &mut inputs).await
+                    {
+                        tracing::warn!(
+                            "models.dev catalog unavailable, continuing without it: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        let loaded = build(&inputs, &opts.credentials, &http, &|_| Vec::new()).await?;
+        let refresh_interval = inputs.config.refresh_interval;
+        let models = Models {
+            shared: Arc::new(Shared {
+                state: RwLock::new(State::new(loaded)),
+                inputs: tokio::sync::Mutex::new(inputs),
+                cache_dir: opts.cache_dir,
+                credentials: opts.credentials,
+                http: http.clone(),
+            }),
             anthropic: Arc::new(AnthropicApi::new(http.clone())),
             completions: Arc::new(CompletionsApi::new(http.clone())),
-            codex: Arc::new(CodexApi::new(http.clone())),
-            http,
-        })
+            codex: Arc::new(CodexApi::new(http)),
+            timer: Mutex::new(None),
+        };
+        models.start_timer(refresh_interval, age);
+        Ok(models)
     }
 
     /// Rebuilds the loaded catalog from `config` in place, re-running model discovery; call it
-    /// after `models.jsonc` or a stored key changes. Registrations are kept. On `Err` nothing
-    /// changes.
+    /// after `models.jsonc` or a stored key changes. Uses the catalog already loaded, without
+    /// reading the cache or fetching, and restarts the refresh timer. Registrations are kept.
+    /// On `Err` nothing changes.
     pub async fn reload(&self, config: ModelsConfig, extended_context: bool) -> Result<(), Error> {
-        let _reloading = self.reloading.lock().await;
-        let loaded = build(
-            self.cache_dir.as_deref(),
+        let shared = &self.shared;
+        let mut inputs = shared.inputs.lock().await;
+        let candidate = Inputs {
+            config,
             extended_context,
-            &config,
-            &self.credentials,
-            &self.http,
-        )
+            codex: inputs.codex.clone(),
+            catalog: inputs.catalog.clone(),
+            catalog_fetched: inputs.catalog_fetched,
+        };
+        let loaded = build(&candidate, &shared.credentials, &shared.http, &|id| {
+            shared.loaded_ids(id)
+        })
         .await?;
-        let mut state = self.write();
-        state.loaded = loaded;
-        state.rebuild();
+        let refresh_interval = candidate.config.refresh_interval;
+        let age = candidate
+            .catalog_fetched
+            .map_or(Duration::MAX, |at| at.elapsed());
+        *inputs = candidate;
+        shared.replace(loaded);
+        drop(inputs);
+        self.start_timer(refresh_interval, age);
         Ok(())
+    }
+
+    /// Fetches the catalog, re-runs model discovery, and rebuilds in place. On a catalog
+    /// failure the previous catalog stays and the error is returned; a provider whose
+    /// discovery fails keeps its previous models. Registrations are kept.
+    pub async fn refresh(&self) -> Result<(), Error> {
+        self.shared.refresh().await
+    }
+
+    /// Restarts the refresh timer: the first refresh once the cache is `interval` old, then
+    /// every `interval`. No timer without a cache directory or with an interval of 0.
+    fn start_timer(&self, refresh_interval: Option<u64>, age: Duration) {
+        let interval = Duration::from_secs(refresh_interval.unwrap_or(DEFAULT_REFRESH_INTERVAL));
+        let task = (self.shared.cache_dir.is_some() && !interval.is_zero()).then(|| {
+            let shared = Arc::clone(&self.shared);
+            tokio::spawn(async move {
+                tokio::time::sleep(interval.saturating_sub(age)).await;
+                loop {
+                    if let Err(error) = shared.refresh().await {
+                        tracing::warn!("model refresh failed: {error}");
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            })
+            .abort_handle()
+        });
+        let mut timer = self.timer.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(previous) = std::mem::replace(&mut *timer, task) {
+            previous.abort();
+        }
     }
 
     /// Adds `provider` and its models, replacing an earlier registration of the same id. While
@@ -218,7 +313,7 @@ impl Models {
             requires_key,
             login,
         });
-        let mut state = self.write();
+        let mut state = self.shared.write();
         state.registered.insert(
             id,
             Registered {
@@ -236,7 +331,7 @@ impl Models {
     /// the next request resolves them again and fails with `Error::UnknownModel` if the model
     /// is no longer present.
     pub fn unregister(&self, provider: &str) -> bool {
-        let mut state = self.write();
+        let mut state = self.shared.write();
         let removed = state.registered.remove(provider).is_some();
         if removed {
             state.rebuild();
@@ -255,12 +350,12 @@ impl Models {
 
     /// Every model: loaded models of providers that are not replaced, then registered ones.
     pub fn all(&self) -> Arc<[Model]> {
-        Arc::clone(&self.read().snapshot)
+        Arc::clone(&self.shared.read().snapshot)
     }
 
     /// Every known provider, loaded and registered, sorted by id.
     pub fn providers(&self) -> Vec<ProviderInfo> {
-        let state = self.read();
+        let state = self.shared.read();
         let mut providers: BTreeMap<&str, &ProviderAuth> = state
             .loaded
             .providers
@@ -288,7 +383,7 @@ impl Models {
     /// Never resolves config values, refreshes OAuth tokens, or validates credentials.
     pub async fn credential_source(&self, provider: &str) -> Result<CredentialSource, Error> {
         let info = self.provider(provider)?;
-        credential_source(&info, self.credentials.as_ref(), |name| {
+        credential_source(&info, self.shared.credentials.as_ref(), |name| {
             std::env::var(name).ok()
         })
         .await
@@ -306,7 +401,18 @@ impl Models {
                 Error::Auth(format!("provider {provider} does not support login"))
             })?;
         let credential = login.login(interaction).await?;
-        self.credentials.set(provider, credential).await
+        self.shared.credentials.set(provider, credential).await?;
+        // A new ChatGPT login may unlock a different Codex model list.
+        if provider == codex_auth::PROVIDER && !self.shared.read().registered.contains_key(provider)
+        {
+            let shared = Arc::clone(&self.shared);
+            tokio::spawn(async move {
+                if let Err(error) = shared.refresh().await {
+                    tracing::warn!("model refresh failed: {error}");
+                }
+            });
+        }
+        Ok(())
     }
 
     /// Resolve the key, headers and base-URL override for a request to `model`.
@@ -314,24 +420,16 @@ impl Models {
         let request = self.request(model)?;
         resolve_auth(
             request.auth,
-            self.credentials.clone(),
+            self.shared.credentials.clone(),
             request.headers,
             request.config_base_url,
         )
         .await
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, State> {
-        self.state.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, State> {
-        self.state.write().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// The provider registered under `id`, else the loaded one.
     fn provider(&self, id: &str) -> Result<Arc<ProviderAuth>, Error> {
-        let state = self.read();
+        let state = self.shared.read();
         state
             .registered
             .get(id)
@@ -343,7 +441,7 @@ impl Models {
     /// What a request to `model` runs with now: the registry's current definition of that
     /// provider/id and its provider. `UnknownModel` when the registry no longer has it.
     fn request(&self, model: &Model) -> Result<Request, Error> {
-        let state = self.read();
+        let state = self.shared.read();
         let model = state
             .snapshot
             .iter()
@@ -383,34 +481,211 @@ impl Models {
     }
 }
 
-/// Builds the loaded catalog: models.dev and built-in models, patched and extended by
-/// `models.jsonc`, with discovered models of `openai-completions` config providers.
-async fn build(
+impl Drop for Models {
+    fn drop(&mut self) {
+        let timer = self.timer.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(timer) = timer.take() {
+            timer.abort();
+        }
+    }
+}
+
+impl Shared {
+    fn read(&self) -> RwLockReadGuard<'_, State> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn replace(&self, loaded: Loaded) {
+        let mut state = self.write();
+        state.loaded = loaded;
+        state.rebuild();
+    }
+
+    /// Ids of the loaded models of `provider`, kept when its discovery fails.
+    fn loaded_ids(&self, provider: &str) -> Vec<String> {
+        self.read()
+            .loaded
+            .models
+            .iter()
+            .filter(|model| model.provider == provider)
+            .map(|model| model.id.clone())
+            .collect()
+    }
+
+    async fn refresh(&self) -> Result<(), Error> {
+        let mut inputs = self.inputs.lock().await;
+        let codex_replaced = self.read().registered.contains_key(codex_auth::PROVIDER);
+        let result = gather(
+            &self.http,
+            self.cache_dir.as_deref(),
+            &self.credentials,
+            codex_replaced,
+            &mut inputs,
+        )
+        .await;
+        // A failed catalog fetch leaves `inputs.catalog`, so discovery changes still apply.
+        let loaded = build(&inputs, &self.credentials, &self.http, &|id| {
+            self.loaded_ids(id)
+        })
+        .await?;
+        self.replace(loaded);
+        result
+    }
+}
+
+/// Downloads the Codex model list (unless a registration replaces `openai-codex`) and the
+/// catalog concurrently, saves them to the cache, and records them in `inputs`. The catalog
+/// is skipped without a cache directory. `Err` is a catalog failure and leaves
+/// `inputs.catalog` and the catalog cache as they were; a Codex failure only logs and keeps
+/// `inputs.codex`.
+async fn gather(
+    http: &reqwest::Client,
     cache_dir: Option<&Path>,
-    extended_context: bool,
+    credentials: &Arc<dyn CredentialStore>,
+    codex_replaced: bool,
+    inputs: &mut Inputs,
+) -> Result<(), Error> {
+    let codex = async {
+        if codex_replaced {
+            None
+        } else {
+            discover_codex(http, cache_dir, credentials, &inputs.config).await
+        }
+    };
+    let catalog = async {
+        match cache_dir {
+            Some(dir) => {
+                let url = inputs.config.catalog_url.as_deref().unwrap_or(catalog::URL);
+                fetch_catalog(http, dir, url).await.map(Some)
+            }
+            None => Ok(None),
+        }
+    };
+    let (codex, catalog) = futures::future::join(codex, catalog).await;
+    // Before `catalog?`, so a catalog failure does not discard the Codex list.
+    if let Some(list) = codex {
+        inputs.codex = Some(list);
+    }
+    if let Some(mapped) = catalog? {
+        inputs.catalog = Some(Arc::new(mapped));
+        inputs.catalog_fetched = Some(Instant::now());
+    }
+    Ok(())
+}
+
+/// Downloads and maps the catalog at `url` and saves it under `dir`. A feed that maps to no
+/// model (its schema drifted) is an error and is not saved.
+async fn fetch_catalog(
+    http: &reqwest::Client,
+    dir: &Path,
+    url: &str,
+) -> Result<rules::CatalogModels, Error> {
+    let (bytes, catalog) = catalog::fetch(http, url).await?;
+    let mapped = rules::map_catalog(&catalog);
+    if mapped.models.is_empty() {
+        return Err(Error::Config(
+            "models.dev catalog has no usable models".into(),
+        ));
+    }
+    if let Err(error) = catalog::write_atomic(&catalog::path(dir), &bytes).await {
+        tracing::warn!(
+            "cannot write models.dev cache in {}: {error}",
+            dir.display()
+        );
+    }
+    Ok(mapped)
+}
+
+/// The account's current Codex list. `None` without Codex credentials, or after a warning
+/// when the request fails.
+async fn discover_codex(
+    http: &reqwest::Client,
+    cache_dir: Option<&Path>,
+    credentials: &Arc<dyn CredentialStore>,
     config: &ModelsConfig,
+) -> Option<Vec<CodexModel>> {
+    let provider = config.providers.get(codex_auth::PROVIDER);
+    let config_base_url = provider.and_then(|provider| provider.base_url.clone());
+    let auth = catalog_provider_auth(codex_auth::PROVIDER.to_owned(), Vec::new(), config, http);
+    let headers = provider
+        .map(|provider| provider.headers.clone())
+        .unwrap_or_default();
+    let resolved = resolve_auth(
+        Arc::new(auth),
+        Arc::clone(credentials),
+        headers,
+        config_base_url.is_some(),
+    )
+    .await;
+    let result = match resolved {
+        Err(Error::NoApiKey { .. }) => return None,
+        Err(error) => Err(error),
+        Ok(auth) => {
+            let base_url = config_base_url
+                .or_else(|| auth.base_url.clone())
+                .unwrap_or_else(|| codex_auth::BASE_URL.to_owned());
+            codex::discover(http, &base_url, auth).await
+        }
+    };
+    match result {
+        Ok(list) => {
+            if let Some(dir) = cache_dir
+                && let Err(error) = codex::write(dir, &list).await
+            {
+                tracing::warn!(
+                    "cannot write the Codex model cache in {}: {error}",
+                    dir.display()
+                );
+            }
+            Some(list)
+        }
+        Err(error) => {
+            tracing::warn!("Codex model discovery failed, keeping the previous list: {error}");
+            None
+        }
+    }
+}
+
+/// How a catalog or Codex provider authenticates: its env vars, the `models.jsonc` key, and
+/// the built-in login for `openai-codex`.
+fn catalog_provider_auth(
+    id: String,
+    env: Vec<String>,
+    config: &ModelsConfig,
+    http: &reqwest::Client,
+) -> ProviderAuth {
+    ProviderAuth {
+        config_api_key: config.providers.get(&id).and_then(|p| p.api_key.clone()),
+        env,
+        requires_key: true,
+        login: (id == codex_auth::PROVIDER)
+            .then(|| Arc::new(CodexLogin::new(http.clone())) as Arc<dyn ProviderLogin>),
+        id,
+    }
+}
+
+/// Builds the loaded catalog from `inputs`: models.dev and Codex models, patched and extended
+/// by `models.jsonc`, with discovered models of `openai-completions` config providers. A
+/// provider whose discovery fails keeps the ids `previous` returns for it.
+async fn build(
+    inputs: &Inputs,
     credentials: &Arc<dyn CredentialStore>,
     http: &reqwest::Client,
+    previous: &(dyn Fn(&str) -> Vec<String> + Sync),
 ) -> Result<Loaded, Error> {
-    let catalog = match cache_dir {
-        Some(dir) => catalog::load(dir, http).await,
-        None => None,
-    };
-    let (mut models, envs) = rules::build(catalog.as_ref());
-    if !extended_context {
+    let config = &inputs.config;
+    let (mut models, envs) = rules::build(inputs.catalog.as_deref(), inputs.codex.as_deref());
+    if !inputs.extended_context {
         models.iter_mut().for_each(rules::cap_at_price_tier);
     }
     let mut providers: HashMap<String, Arc<ProviderAuth>> = envs
         .into_iter()
         .map(|(id, env)| {
-            let info = ProviderAuth {
-                id: id.clone(),
-                env,
-                config_api_key: config.providers.get(&id).and_then(|p| p.api_key.clone()),
-                requires_key: true,
-                login: (id == codex::PROVIDER)
-                    .then(|| Arc::new(CodexLogin::new(http.clone())) as Arc<dyn ProviderLogin>),
-            };
+            let info = catalog_provider_auth(id.clone(), env, config, http);
             (id, Arc::new(info))
         })
         .collect();
@@ -433,22 +708,29 @@ async fn build(
             })
         });
     }
+    let results = futures::future::join_all(to_discover.iter().map(|(id, provider)| {
+        discover::discover(
+            http,
+            Arc::clone(&providers[id.as_str()]),
+            Arc::clone(credentials),
+            provider.base_url.as_deref().unwrap_or_default(),
+            provider.headers.clone(),
+        )
+    }))
+    .await;
     let discovered: HashMap<&str, Vec<String>> = to_discover
         .iter()
-        .map(|(id, _)| id.as_str())
-        .zip(
-            futures::future::join_all(to_discover.iter().map(|(id, provider)| {
+        .zip(results)
+        .map(|((id, provider), result)| {
+            let ids = result.unwrap_or_else(|error| {
                 let base_url = provider.base_url.as_deref().unwrap_or_default();
-                discover::discover(
-                    http,
-                    Arc::clone(&providers[id.as_str()]),
-                    Arc::clone(credentials),
-                    base_url,
-                    provider.headers.clone(),
-                )
-            }))
-            .await,
-        )
+                tracing::warn!(
+                    "model discovery for provider {id} at {base_url} failed, keeping its previous models: {error}"
+                );
+                previous(id)
+            });
+            (id.as_str(), ids)
+        })
         .collect();
 
     let mut config_headers: HashMap<(String, String), BTreeMap<String, String>> = HashMap::new();
@@ -592,7 +874,7 @@ impl Streamer for Models {
         };
         let auth = resolve_auth(
             request.auth,
-            self.credentials.clone(),
+            self.shared.credentials.clone(),
             request.headers,
             request.config_base_url,
         );

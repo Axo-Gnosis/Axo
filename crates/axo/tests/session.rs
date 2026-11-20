@@ -1008,6 +1008,48 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
 }
 
 #[tokio::test]
+async fn sessions_follow_registry_changes_but_keep_host_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let turns = ["one", "two"].map(|text| ScriptedTurn::Reply(reply_text(text)));
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m", "contextWindow": 200000}]),
+        json!({}),
+        turns.into(),
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    let config = json!({"providers": {"test": {
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "models": [{"id": "m", "contextWindow": 50000}],
+    }}});
+    host.models
+        .reload(serde_json::from_value(config).unwrap(), false)
+        .await
+        .unwrap();
+    within(session.prompt("first")).await.unwrap();
+    assert_eq!(session.model().context_window, 50_000);
+    let lines = common::journal(&session);
+    let prompt = lines
+        .iter()
+        .position(|line| line["type"] == "message")
+        .unwrap();
+    assert!(
+        lines[prompt..]
+            .iter()
+            .all(|line| line["type"] != "model_change"),
+        "{lines:#?}"
+    );
+
+    let mut copy = session.model();
+    copy.context_window = 30_000;
+    session.set_model(copy).await.unwrap();
+    within(session.prompt("second")).await.unwrap();
+    assert_eq!(session.model().context_window, 30_000);
+}
+
+#[tokio::test]
 async fn tool_policies_block_bash_in_sessions_and_forks_before_later_policies() {
     struct NoBash(Mutex<Vec<String>>);
 

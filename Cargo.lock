@@ -147,6 +147,7 @@ dependencies = [
  "async-trait",
  "axo-ai",
  "base64",
+ "bytes",
  "futures",
  "indexmap",
  "jiff",

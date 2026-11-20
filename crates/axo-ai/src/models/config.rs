@@ -15,6 +15,12 @@ use crate::model::{ApiKind, CostTier, InputKind, Model, ThinkingLevelMap};
 pub struct ModelsConfig {
     #[serde(default)]
     pub providers: IndexMap<String, ProviderConfig>,
+    /// Seconds between automatic refreshes; `None` is 7200, `0` disables the timer.
+    #[serde(default)]
+    pub refresh_interval: Option<u64>,
+    /// Where the models.dev v2 catalog is fetched from; `None` is the public feed.
+    #[serde(default)]
+    pub catalog_url: Option<String>,
 }
 
 impl ModelsConfig {
