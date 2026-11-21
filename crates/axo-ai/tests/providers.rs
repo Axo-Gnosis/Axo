@@ -1,6 +1,7 @@
 //! The runtime provider seam: a host-registered provider logs in, refreshes and rewrites
 //! requests on all three wire APIs; registration replaces and restores built-in providers;
-//! `reload` keeps registrations.
+//! `reload` keeps registrations; owned provider layers stack over runtime registrations and
+//! reserve unavailable providers without running them.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -14,8 +15,9 @@ use axo_ai::testing::read_http_request_parts;
 use axo_ai::{
     ApiKind, AssistantEvent, Compat, Cost, Credential, CredentialStore, DeviceCode, Error,
     FileCredentialStore, InputKind, LoginInteraction, LoginPrompt, LoginSelect, Message, Model,
-    Models, ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderRequest, RequestRewrite,
-    SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript, now_ms,
+    Models, ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderOrigin, ProviderRequest,
+    RequestRewrite, SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
+    is_retryable_error, now_ms,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -476,4 +478,218 @@ async fn reload_keeps_registrations_and_survives_bad_config() {
     ));
     assert!(models.find("custom/one").is_some());
     assert!(models.find("scripted/only").is_some());
+}
+
+/// Asserts a terminal, non-retryable `provider_unavailable` failure naming `reason`.
+fn assert_unavailable(event: AssistantEvent, reason: &str) {
+    let AssistantEvent::Error { message, .. } = event else {
+        panic!("not an error: {event:?}");
+    };
+    assert!(message.error_message.as_deref().unwrap().contains(reason));
+    let failure = message.failure.as_ref().unwrap();
+    assert_eq!(failure.code.as_deref(), Some("provider_unavailable"));
+    assert_eq!(failure.should_retry, Some(false));
+    // The reason matches the transient patterns ("timed out"), yet is never retried.
+    assert!(!is_retryable_error(&message));
+}
+
+#[tokio::test]
+async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let models = Arc::new(load(&dir).await.0);
+    let native = model(
+        "lab",
+        "native",
+        ApiKind::OpenAiCompletions,
+        "http://127.0.0.1:9",
+    );
+    models.register(provider("lab", vec![native])).unwrap();
+    let a_model = model("lab", "a", ApiKind::OpenAiCompletions, "http://127.0.0.1:9");
+    let b_model = model("lab", "b", ApiKind::AnthropicMessages, "http://127.0.0.1:9");
+
+    let a = models.provider_layer();
+    assert_eq!(a.hidden("lab"), Some(ProviderOrigin::Registered));
+    assert_eq!(a.hidden("nothing"), None);
+    a.replace(vec![(provider("lab", vec![a_model.clone()]), None)])
+        .unwrap();
+    assert_eq!(models.find("lab/a"), Some(a_model.clone()));
+    assert!(models.find("lab/native").is_none());
+
+    let b = models.provider_layer();
+    assert_eq!(b.hidden("lab"), Some(ProviderOrigin::Layer));
+    b.replace(vec![(provider("lab", vec![b_model.clone()]), None)])
+        .unwrap();
+    assert_eq!(models.find("lab/b"), Some(b_model));
+    assert!(models.find("lab/a").is_none());
+    assert_eq!(
+        models
+            .providers()
+            .iter()
+            .filter(|info| info.id == "lab")
+            .count(),
+        1
+    );
+
+    // An invalid replacement changes nothing: wrong model owner, then a repeated id.
+    let stray = model(
+        "other",
+        "x",
+        ApiKind::OpenAiCompletions,
+        "http://127.0.0.1:9",
+    );
+    assert!(matches!(
+        b.replace(vec![
+            (provider("fresh", Vec::new()), None),
+            (provider("lab", vec![stray]), None),
+        ]),
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        b.replace(vec![
+            (provider("fresh", Vec::new()), None),
+            (provider("fresh", Vec::new()), None),
+        ]),
+        Err(Error::Config(message)) if message.contains("duplicate provider id")
+    ));
+    assert!(models.find("lab/b").is_some());
+    assert!(!models.providers().iter().any(|info| info.id == "fresh"));
+
+    // The host changes its native registration and reloads while it is hidden.
+    let changed = model(
+        "lab",
+        "changed",
+        ApiKind::OpenAiCompletions,
+        "http://127.0.0.1:9",
+    );
+    models
+        .register(provider("lab", vec![changed.clone()]))
+        .unwrap();
+    models.reload(ModelsConfig::default(), false).await.unwrap();
+    assert!(models.find("lab/changed").is_none());
+    assert!(models.find("lab/b").is_some());
+
+    // An empty replacement removes the newer layer's providers; dropping the older layer
+    // reveals exactly the current native registration.
+    b.replace(Vec::new()).unwrap();
+    assert_eq!(models.find("lab/a"), Some(a_model));
+    drop(a);
+    assert_eq!(models.find("lab/changed"), Some(changed));
+    assert!(models.find("lab/a").is_none());
+    assert!(models.find("lab/native").is_none());
+    drop(b);
+    assert!(models.find("lab/changed").is_some());
+}
+
+struct UnreachableLogin;
+
+#[async_trait]
+impl ProviderLogin for UnreachableLogin {
+    async fn login(&self, _interaction: &dyn LoginInteraction) -> Result<Credential, Error> {
+        panic!("an unavailable provider must not log in");
+    }
+
+    async fn refresh(&self, _credential: Credential) -> Result<Credential, Error> {
+        panic!("an unavailable provider must not refresh");
+    }
+}
+
+#[tokio::test]
+async fn unavailable_layer_provider_stays_selectable_and_fails_before_auth() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let (models, _) = load(&dir).await;
+    let models = Arc::new(models);
+    let lab = model("lab", "only", ApiKind::OpenAiCompletions, &url);
+    let reason = "extension lab-provider timed out (group personal)";
+    let layer = models.provider_layer();
+    // Requires a key and has none: the unavailable check comes first.
+    layer
+        .replace(vec![(
+            Provider {
+                requires_key: true,
+                login: Some(Arc::new(UnreachableLogin)),
+                rewrite: Some(Arc::new(FailingRewrite)),
+                ..provider("lab", vec![lab.clone()])
+            },
+            Some(reason.into()),
+        )])
+        .unwrap();
+
+    assert_eq!(models.find("lab/only"), Some(lab.clone()));
+    assert!(matches!(
+        models.auth(&lab).await,
+        Err(Error::ProviderUnavailable { provider, reason: r }) if provider == "lab" && r == reason
+    ));
+    assert!(matches!(
+        models.login("lab", &ScriptedInteraction::default()).await,
+        Err(Error::ProviderUnavailable { .. })
+    ));
+    assert_unavailable(stream(&models, &lab).await, reason);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    assert!(!layer.set_unavailable("other", None));
+    assert!(layer.set_unavailable("lab", None));
+    assert!(matches!(
+        models.auth(&lab).await,
+        Err(Error::NoApiKey { provider }) if provider == "lab"
+    ));
+}
+
+struct InterruptedRefresh;
+
+#[async_trait]
+impl ProviderLogin for InterruptedRefresh {
+    async fn login(&self, _interaction: &dyn LoginInteraction) -> Result<Credential, Error> {
+        unreachable!()
+    }
+
+    async fn refresh(&self, _credential: Credential) -> Result<Credential, Error> {
+        Err(Error::ProviderUnavailable {
+            provider: "lab".into(),
+            reason: "extension lab-provider stopped".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn interrupted_refresh_keeps_its_typed_error_through_the_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let (models, store) = load(&dir).await;
+    let models = Arc::new(models);
+    let lab = model("lab", "only", ApiKind::OpenAiCompletions, &url);
+    let layer = models.provider_layer();
+    layer
+        .replace(vec![(
+            Provider {
+                requires_key: true,
+                login: Some(Arc::new(InterruptedRefresh)),
+                ..provider("lab", vec![lab.clone()])
+            },
+            None,
+        )])
+        .unwrap();
+    let expiring = oauth("access-0", "refresh-0", now_ms() + 60_000, "0", &url);
+    store.set("lab", expiring.clone()).await.unwrap();
+
+    assert!(matches!(
+        models.auth(&lab).await,
+        Err(Error::ProviderUnavailable { .. })
+    ));
+    assert_unavailable(
+        stream(&models, &lab).await,
+        "extension lab-provider stopped",
+    );
+    assert_eq!(store.get("lab").await.unwrap(), Some(expiring));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }

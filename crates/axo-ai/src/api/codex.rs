@@ -56,7 +56,14 @@ impl Api for CodexApi {
         let owned_model = model.clone();
         respond(model, cancel, move |mut reply, cancel| async move {
             let result = async {
-                let prepared = prepare(rewrite.as_deref(), &owned_model, request?, &cancel).await?;
+                let prepared = prepare(
+                    rewrite.as_deref(),
+                    &owned_model,
+                    request?,
+                    &cancel,
+                    &mut reply,
+                )
+                .await?;
                 drive(&http, &owned_model, prepared, &cancel, &mut reply).await
             }
             .await;

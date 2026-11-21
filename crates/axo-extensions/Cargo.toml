@@ -1,0 +1,43 @@
+[package]
+name = "axo-extensions"
+version = "0.1.0"
+description = "axo's extension bridge: supervised Bun runners contributing providers to the axo-ai registry"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axo = { path = "../axo" }
+axo-ai = { path = "../axo-ai" }
+base64.workspace = true
+futures.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axo-ai = { path = "../axo-ai", features = ["testing"] }
+rustix.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "bridge"
+path = "tests/bridge.rs"
+harness = false
+
+[[test]]
+name = "bun_provider"
+path = "tests/bun_provider.rs"
+harness = false
+
+[lints]
+workspace = true

@@ -25,11 +25,12 @@ Architecture, active plans, and runtime reference docs live in dedicated files�
 
 ## Crate Boundaries
 
-Dependency flow is strictly downward (`axo` -> `axo-agent` -> `axo-ai`):
+Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -> `axo-ai`):
 
 - **`crates/axo-ai`**: LLM wire layer—message/transcript model, streaming adapters, model catalog, auth, cross-model transforms, error/overflow classification.
 - **`crates/axo-agent`**: Stateful turn loop, tool execution (`Tool`), deferred-tool routing (`route`), host tool-policy hooks (`ToolHooks`), loop-driver contract (`LoopHooks`), immutable event sink (`Persist`), queues, and cancellation.
 - **`crates/axo`**: Coding-agent harness—`Axo` host, `Session`, JSONL tree store & projection, recovery, compaction, context/skills, root session modes, scoped `ToolPolicy`, deferred tools (`call`, `tool://`), `ExecEnv`, command supervision (`ProcessSupervisor`), background jobs, the command catalog, URL `schemes`, and built-in tools.
+- **`crates/axo-extensions`**: Optional extension bridge above `axo`—`Extensions` manager, static `extension.json` discovery, supervised Bun runners (`runner.ts`) and their wire protocol, contributing providers through `ProviderLayer`. Nothing below may depend on it.
 
 ## Code Invariants
 
@@ -54,5 +55,5 @@ cargo fmt --check
 ```
 
 - **Offline deterministic tests**: All `cargo test` suites must run offline without API keys or network access. Use `crates/*/examples/` for live model smoke runs.
-- **Doc & supervision gates**: `cargo test -p axo --test doc_identifiers` rejects backticked identifiers in README.md, AGENTS.md, and `crates/axo/docs/` that do not exist in source. Cgroup supervision tests run only with `$AXO_TEST_CGROUP=1` in a delegated cgroup.
+- **Doc & supervision gates**: `cargo test -p axo --test doc_identifiers` rejects backticked identifiers in README.md, AGENTS.md, and `crates/axo/docs/` that do not exist in source. Cgroup supervision tests run only with `$AXO_TEST_CGROUP=1` in a delegated cgroup. Real-Bun acceptance (`cargo test -p axo-extensions --test bun_provider`) runs only with `$AXO_TEST_BUN` set to an absolute Bun path.
 - **Reuse test harnesses**: Use `axo_ai::testing::ScriptedApi` (under `features = ["testing"]`) for mocked model turns and `crates/axo/tests/common/mod.rs` (helpers `axo`, `axo_with`, `host`, `options`, `bash_options`, `tool_text`, `dead`, `within`, `until`, `entry`, `delivered`, `request`, `journal`, `only`, `transient`, `message_text`, and the in-memory `ConfigSource` fixture behind `Host::config`) for session tests in `tempfile::tempdir()`.

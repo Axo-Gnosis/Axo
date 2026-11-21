@@ -24,6 +24,12 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 
 **2026-11-09 mode studies** (inputs to the session-modes plan): [`personas-and-modes.md`](personas-and-modes.md) surveys root personas and modes across harnesses; [`mode-lifecycle.md`](mode-lifecycle.md) covers how modes are exited and approved, whether children inherit them, model precedence on entry and exit, and how read-only modes restrict the shell; [`mode-reminders.md`](mode-reminders.md) works out the prompt-cache cost of each way to keep mode instructions in context, including after compaction; [`deferred-tools.md`](deferred-tools.md) dissects omp's `xd://` tool devices and compares deferred-tool mechanisms (Anthropic and OpenAI tool search, Claude Code, Codex, pi exposures, Cursor, Cloudflare Code Mode, MCP `list_changed`).
 
+**2026-11-15 extension studies:** [`extensions.md`](extensions.md) compares OMP, pi, Octet, Claude Code Mods, Goose, OpenCode V2 and Zed (authoring, packaging, placement, transport, capabilities, lifetimes, conflicts and failures). [`bun-topology.md`](bun-topology.md) measures shared-loop versus Worker placement, with and without `smol`, on Bun 1.4.4. These dated observations remain historical baselines.
+
+**2026-11-16 follow-up and decisions:** [provider research](extensions.md#provider-follow-up-2026-11-16) distinguishes pi/OMP host-owned refresh, OpenCode **v1** plugin-owned fetch/refresh, and Octet's unimplemented extension-login lifecycle. Source evidence is not live subscription qualification. [Process measurements](bun-topology.md#process-placement-follow-up-2026-11-16) add process-per-extension and two-process grouping on a different workload; raw probes were not retained. The [approved direction](extensions.md#approved-direction-2026-11-16) is one supervised Bun process per extension, optional user grouping, no Workers, and public Rust parity within contribution/session scope—not all host powers. Living documentation is aligned now; [Phase 1](extensions.md#delivery-phases) is solely the Rust provider/login seam, followed by TS bridge/providers, session capabilities/commands, and packaging/install. These are plans, not implemented runtime claims.
+
+**Coordination specification:** [Swarm](swarm.md) defines shared boards, selective wakeups, independent members, lifecycle, permissions, and recovery without assuming a particular implementation.
+
 ## Why a new core
 
 Axome needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:
@@ -130,14 +136,20 @@ The conclusion behind axo: the loop itself is small (tau's is 604 lines, goose-a
 
 ## Plugin mechanisms considered
 
-| Mechanism | Tools | Hooks | State / spawn | Installable | Isolated | Verdict |
+Initial 2026-10-21 survey, corrected by the dated evidence and 2026-11-16 decisions in [`extensions.md`](extensions.md) and [`bun-topology.md`](bun-topology.md). Fault containment and recoverability are not security boundaries. Restricted guest imports can limit code's powers; a Bun process or Worker does not do that by itself. Capability columns describe potential API reach, not an implemented axo bridge.
+
+| Mechanism | Tools | Hooks | State / spawn | Installable | Fault-isolated | Verdict |
 |---|---|---|---|---|---|---|
 | Compiled-in Rust | ✓ | ✓ | ✓ | ✗ | ✗ | Yes, for hosts and first-party features |
 | Dynamic libraries (`.so`) | ✓ | ✓ | ✓ | ✓ | ✗ | No: no stable ABI, panics, crashes |
-| Separate process over stdio | ✓ | ✓ | ✓ | ✓ | ✓ | Yes, as the Bun extension host |
-| MCP | ✓ | ✗ | ✗ | ✓ | ✓ | Yes, as a tools-only adapter |
-| WASM (wasmtime / Extism) | ✓ | ✓, async is clumsy | ✓ | ✓ | ✓ sandboxed | Not now |
-| Embedded scripting (Lua, Rhai, QuickJS, `deno_core`) | ✓ | ✓ | ✓ | ✓ | ✗ | Not now; embedded JS remains possible later |
+| Bun runtime (TS/JS), shared event loop | ✓ | ✓ | ✓ | ✓ | A blocking/exiting extension stops all extensions in that Bun process, **not the separate Rust host** | User opt-in grouping only; shared failure domain |
+| Bun Workers, one per extension | ✓ | ✓ | ✓ | ✓ | JS fault containment observed; no hard kill for a Wasm loop; native-crash/OOM isolation not provided | Not selected |
+| Separate Bun process per extension | ✓ | ✓ | ✓ | ✓ | Independent supervised kill/native-fault boundary; quotas separate, not a sandbox | Selected default; host supplies Bun, transport chosen in Phase 2; follow-up workload measured |
+| MCP | ✓ | ✗ | ✗ | ✓ | Depends on transport (can run in process) | Deferred tool/resource/prompt interoperability adapter, not the definition of full axo extensions |
+| WASM (wasmtime / Extism) | ✓ | Host-defined | ✓ | ✓ | Depends on host limits/imports; Zed source did not establish a per-call kill or memory cap | Not the selected extension environment |
+| Embedded scripting (QuickJS, Boa, Lua, Rhai, `deno_core`) | ✓ | ✓ | ✓ | ✓ | ✗ | For codemode's sandboxed model-written scripts (Track 1), not as the full extension runtime |
 | Declarative files | Partly | Shell hooks only | ✗ | ✓ | ✓ | Yes, through the `.agents/` convention |
 
-A stdio round trip costs well under a millisecond, while model calls take seconds. So an out-of-process host is no bottleneck for turn- and tool-level hooks. [INFERENCE: no per-token hooks are planned.]
+Bun extension code runs outside axo's Rust process. A failed shared group makes its dependent operations unavailable, not the entire Rust event loop; failures still need explicit propagation. The default is one process per extension; grouping is user-selected, with no unique crash blame or exact individual memory attribution inside a group. Even dedicated-process RSS/PSS is process accounting, not exact allocation attribution. No memory cap is enabled by default. See [settled placement and failure policy](bun-topology.md#settled-direction).
+
+The earlier sub-millisecond stdio estimate was an inference, not a bridge measurement. Turn/tool-level RPC may be amortized against model latency [INFERENCE], but callbacks and streaming still need bridge-specific assessment. The original probe measured in-process and Worker messaging; the follow-up used stdio calls, but neither establishes the cost of a future axo bridge.

@@ -1144,7 +1144,14 @@ impl Response {
             headers,
             body: params,
         };
-        let prepared = prepare(opts.rewrite.as_deref(), &self.model, request, cancel).await?;
+        let prepared = prepare(
+            opts.rewrite.as_deref(),
+            &self.model,
+            request,
+            cancel,
+            &mut self.reply,
+        )
+        .await?;
         let response = send(
             || {
                 http.post(&prepared.url)

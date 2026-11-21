@@ -216,7 +216,7 @@ async fn run(
         headers,
         body: built.params,
     };
-    let prepared = prepare(opts.rewrite.as_deref(), model, request, cancel).await?;
+    let prepared = prepare(opts.rewrite.as_deref(), model, request, cancel, reply).await?;
 
     // ponytail: the body is copied per attempt; switch to `bytes::Bytes` if large
     // transcripts make this show up.

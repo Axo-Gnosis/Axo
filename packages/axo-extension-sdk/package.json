@@ -1,0 +1,17 @@
+{
+  "name": "@axo/extension-sdk",
+  "version": "0.1.0",
+  "description": "Type-only author contract for axo provider extensions",
+  "license": "MIT",
+  "type": "module",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts"
+    }
+  },
+  "files": [
+    "index.ts"
+  ],
+  "sideEffects": false
+}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/axo-ai", "crates/axo-agent", "crates/axo"]
+members = ["crates/axo-ai", "crates/axo-agent", "crates/axo", "crates/axo-extensions"]
 
 [workspace.package]
 edition = "2024"

@@ -1,3 +1,5 @@
+use crate::types::ProviderFailure;
+
 /// Every error `axo-ai` returns.
 ///
 /// Provider streams never return errors: failures end the stream with an
@@ -22,4 +24,21 @@ pub enum Error {
     /// Login, token exchange, refresh or credential lookup failed.
     #[error("{0}")]
     Auth(String),
+    /// The provider is reserved but cannot run now (`ProviderLayer::set_unavailable`, or its
+    /// login, refresh or rewrite callback was interrupted). Never retried automatically.
+    #[error("provider {provider}: {reason}")]
+    ProviderUnavailable { provider: String, reason: String },
+}
+
+impl Error {
+    /// The structured failure a terminal message carries for this error: only
+    /// `ProviderUnavailable` has one, coded `provider_unavailable` and not retryable, so its
+    /// text never reaches the transient-error patterns.
+    pub fn provider_failure(&self) -> Option<ProviderFailure> {
+        matches!(self, Error::ProviderUnavailable { .. }).then(|| ProviderFailure {
+            code: Some("provider_unavailable".into()),
+            should_retry: Some(false),
+            ..ProviderFailure::default()
+        })
+    }
 }

@@ -155,6 +155,12 @@ impl Axo {
         }
     }
 
+    /// The supervisor every local command runs under, for hosts that run other
+    /// processes (such as extension runners) in the same containers.
+    pub fn supervisor(&self) -> Arc<ProcessSupervisor> {
+        self.supervisor.clone()
+    }
+
     /// Samples the configuration source, resolves the model, thinking level, exec
     /// environment, tools and system prompt, and returns an idle session. Its file is
     /// created on the first submission. Resolving the exec environment may capture a Nix

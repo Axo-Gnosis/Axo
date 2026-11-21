@@ -21,8 +21,9 @@ pub use axo::{Axo, AxoBuilder, Catalog};
 pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
-    EffectiveConfig, ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings,
-    PromptOverride, RetrySettings, Settings, SubagentSettings, SummaryRequest, UserConfig,
+    EffectiveConfig, EnabledExtension, ExtensionListError, ModelChoice, PROMPT_NAMES,
+    ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride, RetrySettings, Settings,
+    SubagentSettings, SummaryRequest, UserConfig,
 };
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::keywords::{KeywordMatch, KeywordSettings, KeywordSpec};

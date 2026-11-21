@@ -3,8 +3,8 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use axo::{
-    ConfigLayer, DevShellMode, EffectiveConfig, Error, ProjectAccess, ProjectSettings,
-    PromptOverride, Settings, UserConfig,
+    ConfigLayer, DevShellMode, EffectiveConfig, EnabledExtension, Error, ExtensionListError,
+    ProjectAccess, ProjectSettings, PromptOverride, Settings, UserConfig,
 };
 use common::TestConfig;
 use indexmap::IndexMap;
@@ -550,6 +550,100 @@ fn project_layers_never_set_user_only_keys() {
     );
     assert!(!settings.home_agents_dir);
     assert_eq!(settings.project, ProjectSettings::default());
+}
+
+#[test]
+fn extensions_come_only_from_user_settings_at_every_access() {
+    let alpha = || EnabledExtension {
+        id: "alpha".into(),
+        group: Some("personal".into()),
+    };
+    let lab = || EnabledExtension {
+        id: "lab-provider".into(),
+        group: None,
+    };
+    let user =
+        r#"{ "extensions": [{ "id": "lab-provider" }, { "id": "alpha", "group": "personal" }] }"#;
+    // The project tries to enable new code, reorder the user's list and regroup it.
+    let project = r#"{ "extensions": [
+        { "id": "evil" }, { "id": "alpha", "group": "other" }, { "id": "lab-provider" }
+    ] }"#;
+    for access in [ProjectAccess::Read, ProjectAccess::Trust] {
+        let source = TestConfig::new(Some(user), Some(project));
+        assert_eq!(
+            source.load(access).unwrap().extensions,
+            [lab(), alpha()],
+            "{access:?}"
+        );
+        source.set_user(None);
+        assert!(
+            source.load(access).unwrap().extensions.is_empty(),
+            "{access:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_extension_lists_are_rejected_against_their_layer_before_filtering() {
+    for invalid in [
+        r#"[{ "id": "" }]"#,
+        r#"[{ "id": "." }]"#,
+        r#"[{ "id": ".." }]"#,
+        r#"[{ "id": "a/b" }]"#,
+        r#"[{ "id": "a\\b" }]"#,
+        r#"[{ "id": "Upper" }]"#,
+        r#"[{ "id": "-lead" }]"#,
+        r#"[{ "id": "ok", "group": "" }]"#,
+        r#"[{ "id": "ok", "group": ".." }]"#,
+        r#"[{ "id": "ok", "group": "a/b" }]"#,
+        r#"[{ "id": "dup" }, { "id": "dup", "group": "g" }]"#,
+        r#"[{ "group": "g" }]"#,
+        r#"{ "id": "ok" }"#,
+    ] {
+        let invalid = format!(r#"{{ "extensions": {invalid} }}"#);
+        for access in [ProjectAccess::Read, ProjectAccess::Trust] {
+            let source = TestConfig::new(Some(&invalid), Some("{}"));
+            assert_eq!(origin_of(source.load(access)), "user", "{invalid}");
+            // Projects never set extensions, yet an invalid list still fails their layer.
+            let source = TestConfig::new(Some("{}"), Some(&invalid));
+            assert_eq!(origin_of(source.load(access)), "project", "{invalid}");
+        }
+    }
+}
+
+#[test]
+fn typed_extension_lists_use_the_settings_validator() {
+    let enabled = |id: &str, group: Option<&str>| EnabledExtension {
+        id: id.into(),
+        group: group.map(Into::into),
+    };
+    assert_eq!(
+        EnabledExtension::validate_all(&[
+            enabled("lab-provider", None),
+            enabled("a1.b_c-d", Some("personal")),
+            enabled("0", Some("personal")),
+        ]),
+        Ok(())
+    );
+    assert_eq!(
+        EnabledExtension::validate_all(&[enabled("..", None)]),
+        Err(ExtensionListError::InvalidId("..".into()))
+    );
+    assert_eq!(
+        EnabledExtension::validate_all(&[enabled("ok", Some("a/b"))]),
+        Err(ExtensionListError::InvalidGroup {
+            id: "ok".into(),
+            group: "a/b".into()
+        })
+    );
+    let duplicate = EnabledExtension::validate_all(&[
+        enabled("dup", None),
+        enabled("other", None),
+        enabled("dup", Some("g")),
+    ])
+    .unwrap_err();
+    assert_eq!(duplicate, ExtensionListError::Duplicate("dup".into()));
+    assert!(duplicate.to_string().contains("\"dup\""));
 }
 
 #[test]

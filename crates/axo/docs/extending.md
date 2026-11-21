@@ -1,6 +1,6 @@
 # Embedding & Extending axo
 
-`axo` is a library with no configuration directory of its own. Hosts customize it by supplying configuration through `ConfigSource` and resources through `Axo::builder`, and extend it in Rust by embedding `axo`, `axo-agent`, and `axo-ai`. Repositories and users customize sessions through the ecosystem `.agents/` and `AGENTS.md` conventions and whatever the host exposes.
+`axo` is a library with no configuration directory of its own. Hosts customize it by supplying configuration through `ConfigSource` and resources through `Axo::builder`, and extend it in Rust by embedding `axo`, `axo-agent`, and `axo-ai`. Hosts that load TypeScript/JavaScript provider packages add the `axo-extensions` crate (see [Provider extensions](#4-provider-extensions-axo-extensions)). Repositories and users customize sessions through the ecosystem `.agents/` and `AGENTS.md` conventions and whatever the host exposes.
 
 ## 1. Configuration and Declarative Files
 
@@ -665,3 +665,215 @@ Commands run through `SessionTools::run_command` have the same background behavi
 | `Run` | Everything else: assistant replies, tool-change declarations, messages returned by `prepare_next_turn`, and synthetic tool results (blocked, failed-preparation, unanswered, or aborted before they started) |
 
 An executed result keeps its `Tool` origin exactly when it is the result persisted. `Session`'s `Persist` maps `Input(Some(id))` to the submission id (or, for a job delivery message, to the jobs it delivers) and `Tool(invocation)` to the jobs that call delivered or started, so receipts never depend on comparing message text (see [Background Job Durability](sessions-and-compaction.md#background-job-durability)).
+
+## 4. Provider extensions (`axo-extensions`)
+
+The `axo-extensions` crate lets a host load trusted TypeScript/JavaScript packages that contribute **providers** to its `Models` registry, run by supervised Bun processes. It sits above `axo` and `axo-ai` (neither depends on it) and uses only their public APIs: `Models::provider_layer`, `Axo::supervisor`, and `Settings::extensions`. An extension declares its providers and models statically and may implement three callbacks: `login`, `refresh`, and `rewrite`. Every inference request is still built, sent, retried, and parsed by axo's Rust adapters; model bytes and SSE events never pass through Bun. Extensions provide no tools, session hooks, prompt sections, or package installation.
+
+### Host setup and lifecycle
+
+`Extensions::new(models, supervisor, options)` takes the same `Arc<Models>` the host gave `Axo::builder`, the supervisor from `Axo::supervisor()` (so runners share the host's `Supervision` mode), and `ExtensionOptions`. It does no I/O. The example uses `rust,ignore` because `axo`'s own doctests cannot link `axo-extensions`:
+
+```rust,ignore
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axo::{Axo, EffectiveConfig, EnvMap, JsonlStore, ProjectAccess};
+use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
+use axo_extensions::{ExtensionEvent, ExtensionOptions, Extensions};
+use tokio::sync::broadcast::error::RecvError;
+
+let state = PathBuf::from("/var/lib/my-host");
+let models = Arc::new(
+    Models::load(ModelsOptions {
+        http_client: None,
+        cache_dir: Some(state.join("cache")),
+        extended_context: false,
+        config: ModelsConfig::default(),
+        credentials: Arc::new(FileCredentialStore::new(state.join("credentials.json"))),
+    })
+    .await?,
+);
+let axo = Axo::builder(Arc::clone(&models), Arc::new(JsonlStore::new(state.join("sessions"))))
+    .config(Arc::new(HostConfig))
+    .build();
+
+let extensions = Extensions::new(
+    Arc::clone(&models),
+    axo.supervisor(),
+    ExtensionOptions {
+        // Absolute paths only; `None` leaves every extension `Unavailable`.
+        bun: Some(PathBuf::from("/opt/bun/bin/bun")),
+        roots: vec![state.join("extensions")],
+        data_root: state.join("extension-data"),
+        // Keep it short: `<runtime_dir>/<private dir>/rpc` must fit a Unix socket path.
+        runtime_dir: PathBuf::from("/run/my-host"),
+        // The runner's whole environment; nothing is inherited.
+        env: Arc::new(EnvMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), state.join("extension-home").into_os_string()),
+        ])),
+    },
+);
+
+// Subscribe first so the initial reconciliation's events are seen.
+let mut events = extensions.subscribe();
+// `extensions` is user-only, so resolving at `Ignore` reads no project.
+let settings = EffectiveConfig::resolve(&HostConfig, &state, Some(ProjectAccess::Ignore))?.settings;
+extensions.configure(&settings.extensions).await?;
+// Only now create or reopen sessions that select extension models.
+
+let snapshot = (extensions.status(), extensions.collisions(), extensions.diagnostics());
+tokio::spawn(async move {
+    loop {
+        match events.recv().await {
+            Ok(ExtensionEvent::StateChanged(status)) => { /* id, group, generation, phase, reason */ }
+            Ok(ExtensionEvent::Shadowed { provider, winner, hidden }) => {}
+            Ok(ExtensionEvent::Diagnostic(diagnostic)) => {}
+            // Missed events: reread status(), collisions() and diagnostics().
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => break,
+        }
+    }
+});
+
+// ... sessions, logins and requests through `axo` and `models` as usual ...
+
+extensions.shutdown().await;
+```
+
+| Item | Signature | Behavior |
+| :--- | :--- | :--- |
+| `ExtensionOptions` | `bun: Option<PathBuf>`, `roots: Vec<PathBuf>`, `data_root: PathBuf`, `runtime_dir: PathBuf`, `env: Arc<EnvMap>` | Host choices, all absolute paths. Package roots are searched in order; each extension's data directory is `<data_root>/<id>`; each runner generation gets a private directory under `runtime_dir`; `env` is the runner's complete environment (plus the bridge's own variables). Nothing is discovered from the working directory, `PATH`, project layers, or home directories. To change options, build a new manager and `shutdown` the old one |
+| `Extensions::configure` | `async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError>` | Validates the list (as settings do) and the options, rescans every enabled package, and publishes the whole ordered winner set as one layer replacement. Starts no runner. `Err` (`BridgeError::InvalidConfig`, `InvalidOptions`, `ShutDown`, or `Registry`) changes nothing; problems with one package are reported through `status` instead. Also the explicit rescan: call it again after the user's list or a package's manifest changes; it compares declarations, so a code-only change needs `reload`. Serialized with `retry`, `reload` and `shutdown`, and completed even if the caller's future is dropped |
+| `Extensions::status` | `fn status(&self) -> Vec<ExtensionStatus>` | One `ExtensionStatus { id, group, generation, phase, reason }` per enabled extension, in enabled order, including shadowed ones. `reason` is a safe, human-readable string |
+| `Extensions::collisions` | `fn collisions(&self) -> Vec<ProviderCollision>` | Every `ProviderCollision { provider, winner, hidden }`: `winner` is an extension ID; `hidden` is `Hidden::Extension(id)` for a shadowed extension or `Hidden::Host(ProviderOrigin)` for a host contributor: `Layer` (an older provider layer), `Registered` (a `Models::register` provider), or `Loaded` (the loaded catalog). A snapshot from the last `configure`, `retry` or `reload`; later registry changes and newer provider layers are not reflected until the next one |
+| `Extensions::diagnostics` | `fn diagnostics(&self) -> Vec<ExtensionDiagnostic>` | Non-fatal discovery findings `{ id, message }`, such as the same package under several roots |
+| `Extensions::subscribe` | `fn subscribe(&self) -> broadcast::Receiver<ExtensionEvent>` | `StateChanged(ExtensionStatus)`, `Shadowed { provider, winner, hidden }`, and `Diagnostic(ExtensionDiagnostic)` for committed changes only; `Shadowed` is emitted only by `configure`, `retry` and `reload`. The channel is bounded; after `RecvError::Lagged`, reread the three snapshots, which never depend on a subscription |
+| `Extensions::retry` | `async fn retry(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then re-arms `id` if it is load-disabled or its placement is `Disabled` or `Unavailable`: a load-disabled member is reloaded alone (its group peers keep their own load failures, and the shared process is recycled), and a placement disabled by its crash budget restarts cold with a fresh budget. `BridgeError::UnknownExtension` for an ID that is not enabled; `ShutDown` after shutdown |
+| `Extensions::reload` | `async fn reload(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the next callback imports the package's current code, whatever its phase. Group peers share the runner and are recycled with it; their own load failures are kept, `id`'s is cleared. Same errors as `retry` |
+| `Extensions::shutdown` | `async fn shutdown(&self)` | Closes admission, fails pending callbacks, kills and reaps every runner, and removes the manager's providers (revealing whatever they hid). Idempotent. Dropping `Extensions` instead fences every provider immediately and tears runners down without waiting; only `shutdown` promises reaping before it returns |
+
+Await the first `configure` before creating or reopening sessions that select extension models: until then their providers are not in the registry, so those models cannot be selected or run. Listing, `Models::find`, and creating or reopening a session never start Bun; a runner starts only when a login, refresh, or rewrite callback is needed, and stays up for every session afterward. A provider declared without `rewrite` therefore starts Bun only for `Models::login` and for refreshing an expiring OAuth credential, never for ordinary requests.
+
+### Packages and manifests
+
+For each enabled ID, and only those, the manager reads `<root>/<id>/extension.json` from the first root in `roots` order where that path exists. A later copy is ignored with an `ExtensionDiagnostic`; a first copy that exists but cannot be read still claims the slot rather than falling through to a later root. The manifest is UTF-8 JSON, unknown fields are rejected, and nothing is executed to read it:
+
+```json
+{
+  "id": "lab-provider",
+  "entry": "index.ts",
+  "providers": [
+    {
+      "id": "lab",
+      "models": [
+        {
+          "id": "m",
+          "name": "Lab model",
+          "api": "openai-completions",
+          "provider": "lab",
+          "baseUrl": "http://127.0.0.1:8080/v1",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 128000,
+          "maxTokens": 8192
+        }
+      ],
+      "env": [],
+      "requiresKey": true,
+      "login": true,
+      "rewrite": true
+    }
+  ]
+}
+```
+
+- **`id`** must equal the directory name. **`entry`** is a package-relative regular file that must resolve inside the package; the package directory itself may be a host-made symlink, but the entry may not escape it. This is discovery hygiene, not a sandbox.
+- **Providers:** `models` use the `axo_ai::Model` JSON shape (`thinkingLevelMap` and `compat` optional), each naming its enclosing provider, and are checked by the same validation as `Models::register`. `env` defaults to `[]`, `requiresKey` to `true`, and `login` and `rewrite` to `false`. Provider IDs follow the registry rules and may not repeat within a manifest. `login: true` makes `Models::login` available and routes OAuth refreshes to the extension; `rewrite: true` routes every inference request's `ProviderRequest` through it. Credentials are stored and selected by `Models` exactly as for Rust providers.
+- **Not admitted:** a missing, unreadable, or invalid manifest on first sight leaves that extension `Unavailable` with a reason and claims no provider, so it can neither hide nor stop anything else.
+- **Admitted but not runnable:** with a valid manifest, the declared providers are published even when the entry file is missing or Bun is unusable. They are listed and selectable but unavailable (see below), with the reason on the extension's status. Bun is checked again on every `configure`, `retry` and `reload`, so a repaired install at the same path recovers without a retry loop.
+- **Failed rescans:** if a previously admitted package's manifest becomes unreadable or invalid, the manager keeps its last accepted declarations in memory, unavailable, so a broken refresh never silently reveals what it hid. Nothing is cached on disk: after a host restart an unreadable manifest is simply not admitted.
+
+### Winners, collisions and unavailability
+
+For each provider ID the **last enabled extension declaring it wins**. The manager owns one `ProviderLayer`, newer than any created before it, so a winning extension provider hides a `Models::register` provider and the loaded catalog provider of the same ID (and older layers). Hidden providers are untouched and reappear exactly when the winner goes away: removing the extension from the list, a changed valid declaration, a reorder, or `shutdown`. A failing or crashed winner stays the winner; the hidden provider is never used as a fallback.
+
+While an extension is `Disabled` or `Unavailable`, its providers stay in `Models::find`, `Models::all`, and `Models::providers` (with their declared login capability), but `Models::login`, `Models::auth`, and requests fail with `Error::ProviderUnavailable` before any credential lookup, naming the extension (and group); see [Unavailable providers](configuration.md#runtime-providers-login-and-reload). A request whose callback cannot run because the runner is starting, restarting, or shutting down fails the same way.
+
+`configure` keeps a placement, its live runner, and its crash budget when its members and declarations are unchanged; a priority-only reorder changes only the activation order for later generations. A placement whose setup failed (`Unavailable`) is rebuilt cold instead, so corrected host inputs are re-checked; its members' load failures carry over. Changing a placement's members, an entry, or a declaration replaces it: the old runner's pending callbacks fail before the new providers are published, and an old provider handle that a request still holds fails at once instead of reaching the new winner. A provider that loses its winner is retired the same way even when its runner keeps serving other providers.
+
+### Trust boundary
+
+- **Who enables code:** only the user-only `extensions` setting (or a typed list from the host) enables an extension, and only packages under host-supplied `roots` can load. Project layers cannot enable, reorder, or group extensions at any access level (see [Extensions](configuration.md#extensions-extensions--axoenabledextension)). A host that wants project-provided extensions must authorize those roots itself; a session's discovered project files are never published as global providers.
+- **What runs:** extensions are trusted code. The runner is an ordinary OS process with the host user's rights and the `ExtensionOptions::env` environment, started without a sandbox (`ExecSpec::sandbox` is `None`); it may read files and use the network like any program. The data directory `<data_root>/<id>` is created (mode `0700` when new) before activation and passed to the extension as `dataDir`; it is a convenience, not isolation.
+- **No acquisition:** axo never downloads Bun, the SDK, or dependencies. Each runner directory carries a `bunfig.toml` with `install.auto = "disable"`, so importing a package that is not already present fails activation instead of fetching it. An extension may still make its own network calls.
+- **Secrets:** the bridge writes its socket path, a random per-generation nonce, and the generation number into the runner environment (`AXO_EXTENSION_SOCKET`, `AXO_EXTENSION_NONCE`, `AXO_EXTENSION_GENERATION`); the runner deletes them from its environment before importing extension code. Credentials never appear on a command line. Runner stdout and stderr are drained and discarded. Error messages name the extension, provider, and method; they never include tokens, headers, request bodies, prompt answers, or author exception text.
+
+### Runners and supervision
+
+Extensions are placed per **placement**: an ungrouped extension gets its own runner; all members of a `group` share one. One lifecycle owner per placement starts, watches, restarts, and disables its runner.
+
+| `ExtensionPhase` | Meaning |
+| :--- | :--- |
+| `Cold` | Declarations published; no runner yet, or none needed since every member of the placement failed to load (those members show `Disabled`) |
+| `Starting` | The first callback is starting a runner; that callback waits for activation, while others arriving meanwhile fail naming the extension |
+| `Ready` | The runner answered its handshake and the member activated |
+| `Restarting` | The runner failed and a new generation is starting immediately; callbacks arriving meanwhile fail |
+| `Disabled` | The member's own import or activation failed, or the placement spent its crash budget. Stays so until `retry` or `reload`, or until the member is removed and re-enabled |
+| `Unavailable` | Cannot run: not admitted, no or unusable Bun, an entry that failed discovery, or a host/filesystem setup failure such as an overlong socket path. No automatic retry; the next `configure`, `retry` or `reload` re-checks |
+
+- **Start:** each generation gets a fresh private directory below `runtime_dir` (mode `0700`) holding the runner source embedded in the crate, `bunfig.toml`, and the listening socket `rpc`, bound before spawn. The supervisor runs `<bun> run <dir>/runner.ts` with that directory as working directory and no shell. The runner must connect and present the nonce within 15 s; the listener is then closed and the socket path removed. The directory is removed when the generation ends. The socket path is limited to 107 bytes.
+- **Activation:** members activate one at a time in enabled order, each with its own 15 s deadline. The runner imports the entry by file URL and calls its default export with `{ id, dataDir }`; the returned handlers must match the manifest exactly. A clean import or activation failure disables **that member only** (its group peers keep running, and its hidden provider stays hidden). A runner that dies or hangs during activation counts as a placement failure.
+- **Heartbeat:** the bridge pings every 2 s and answers come from the JS event loop, so a synchronous loop that blocks it is detected: 10 s without a pong kills the runner.
+- **Crash budget:** runner exit, socket EOF, protocol violation, failed handshake, or a missed heartbeat is one failure for the whole placement, counted once per generation. Failures 1 and 2 within a rolling 300 s window restart immediately with a new generation; the 3rd disables every member not already load-disabled, with a reason naming the group and its members. Older failures age out. Shutdown, reconfiguration, a caller cancelling, a callback deadline, and an author's method error do not count.
+- **Teardown:** a failed generation fails all its pending callbacks with their own extension's name, kills the runner's container, and waits for it to close before starting a replacement. No callback is replayed on the new generation.
+- **Supervision mode:** runners are `ProcessSupervisor` containers of the host's `Supervision`. With `Supervision::ProcessGroup` killing the runner kills its process group, including children it spawned normally, but a descendant that leaves the group (`setsid`, double fork) survives the runner, shutdown, and the host, as with any process-group command. With `Supervision::Cgroup` every descendant, detached or not, stays in the runner's job cgroup and dies with it, and the job directory is removed. Runners are not session jobs: they are never listed under `proc://` and survive session shutdown; they belong to the `Extensions` manager.
+- **Limits:** one runner per placement serves every session; there are no per-session processes, Workers, memory or CPU limits. A group shares fate: one member's crash or hang restarts, and eventually disables, the whole group.
+
+### Callbacks and failure contracts
+
+| Callback | Deadline | Interrupted (runner death, restart, retirement, deadline, no live runner) | Author error or invalid result |
+| :--- | :--- | :--- | :--- |
+| `login` | None: waits on the human. Dropping the `Models::login` future cancels it, aborting the author's signal and withdrawing outstanding questions | `Error::ProviderUnavailable`; nothing stored | `Error::Auth` naming extension, provider, and method; nothing stored |
+| `refresh` | 60 s, including a cold start. It runs inside the credential store's locked update and continues when only a waiting stream is cancelled, so its rotated credential is still saved | `Error::ProviderUnavailable`; the lock is released and nothing is saved | `Error::Auth`; nothing saved |
+| `rewrite` | 60 s, including a cold start | The stream ends with one `AssistantEvent::Error` carrying the `provider_unavailable`, `should_retry: false` failure; no HTTP request is sent and neither axo nor the session retries it | The stream ends with an `AssistantEvent::Error` naming the extension; nothing is sent |
+
+**Interruption versus an accepted request.** The boundary is the rewrite's reply. If Bun dies, hangs, or is replaced **before** the reply is accepted, the request fails as above and is never resent; the next independent request uses the restarted runner once it is `Ready`. **After** the reply is accepted, the request belongs to Rust: transport retries, the HTTP response, and the whole SSE stream continue normally even if Bun is killed mid-stream, and nothing is re-sent or aborted on its account. A reply that arrives after its provider was retired is discarded. A callback whose deadline passes is failed and cancelled without restarting a runner that still answers heartbeats.
+
+Replies are validated before use. A credential must have the `Credential` JSON shape; a request must have an `http:` or `https:` URL, valid header names and values, and stay within the frame limit. Request headers travel as ordered `[name, value]` pairs, so duplicate headers keep their order, and non-UTF-8 values travel as `{ "base64": "..." }`.
+
+### Author SDK
+
+`packages/axo-extension-sdk` (package `@axo/extension-sdk`) contains only TypeScript types; an extension never needs it at runtime and may be a plain JS module. The entry's default export receives `{ id, dataDir }` and returns, possibly asynchronously, a record keyed by the manifest's provider IDs. A provider declared with `login: true` must supply `login` and `refresh`; `rewrite: true` requires `rewrite`; extra providers or undeclared methods fail activation. There is no dynamic model registration, credential listing, or per-request auth hook.
+
+```ts
+import type { Extension } from "@axo/extension-sdk";
+
+export default (async ({ id, dataDir }) => ({
+  lab: {
+    async login(ui, signal) {
+      await ui.deviceCode({ userCode: "ABCD", verificationUrl: "http://127.0.0.1:8080/device" });
+      const answer = await ui.prompt({ message: "Code", secret: false }, signal);
+      return { type: "oauth", access: "…", refresh: "…", expires: Date.now() + 3_600_000 };
+    },
+    async refresh(credential, signal) {
+      return { ...credential, access: "…", expires: Date.now() + 3_600_000 };
+    },
+    async rewrite(model, request, signal) {
+      return { ...request, headers: [...request.headers, ["x-extra", "yes"]] };
+    },
+  },
+})) satisfies Extension;
+```
+
+- **Login interaction:** `ui.openUrl(url, instructions?)`, `ui.deviceCode({ userCode, verificationUrl, expiresInSeconds? })`, and `ui.progress(message)` resolve once the host's `LoginInteraction` has shown them; `ui.prompt({ message, placeholder?, secret }, signal?)` and `ui.select({ message, options: [{ id, label }] }, signal?)` resolve with the answer. A per-question signal withdraws just that question (for example when a browser callback wins); the login's own signal withdraws all of them. A login replies only after its display calls were delivered.
+- **Credentials:** `{ type: "api_key", key }` or `{ type: "oauth", access, refresh, expires, headers?, baseUrl?, ...providerFields }` with `expires` in milliseconds since the epoch. axo stores what `login` returns, refreshes it within 5 minutes of expiry, and sends its access token, headers, and base URL as for any OAuth provider.
+- **Rewrite:** receives the read-only model and the `ProviderRequest` axo's adapter built (`url`, ordered `headers`, JSON `body`) and returns the complete replacement. It runs once per inference request, before transport retries; model discovery is never rewritten.
+- **Signals:** each callback's signal aborts when the caller cancels, the call's deadline passes, or the runner's generation is retired.
+
+### Wire protocol
+
+`runner.ts` (embedded in the crate) and the Rust peer speak over one Unix-socket connection per generation, never stdin or stdout. Frames are a 4-byte big-endian length plus UTF-8 JSON, bounded by `MAX_FRAME` (64 MiB) in both directions: a received frame is rejected by its length prefix before its body is allocated, and a frame to send is rejected after serialization; an oversized local request fails only that call. After the `hello` (protocol 1, nonce, generation), every frame carries the generation as a decimal string: `call` (`id`, `ext`, `method`, `args`, optional `parent`), terminal `ok` or `error`, `cancel`, and `ping`/`pong`. Rust calls `activate`, `login`, `refresh`, and `rewrite`; the runner calls `openUrl`, `deviceCode`, `prompt`, `select`, and `progress`, only with a live login of the same extension as `parent`. Calls are served concurrently, so a pending prompt never blocks heartbeats, cancellations, or other callbacks. A malformed frame, wrong generation, duplicate live ID, or wrong-direction method ends that generation and counts as a placement failure; an ordinary method error does not.

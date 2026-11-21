@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use axo_agent::QueueMode;
 use axo_ai::{Model, Models, ThinkingLevel};
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use crate::context::agents::ContextFiles;
@@ -41,6 +41,10 @@ pub struct Settings {
     pub retry: RetrySettings,
     pub subagents: SubagentSettings,
     pub keywords: KeywordSettings,
+    /// Extensions to load, in priority order: the last one declaring a provider ID wins it.
+    /// User settings only.
+    #[serde(deserialize_with = "enabled_extensions")]
+    pub extensions: Vec<EnabledExtension>,
 }
 
 impl Default for Settings {
@@ -61,8 +65,77 @@ impl Default for Settings {
             retry: RetrySettings::default(),
             subagents: SubagentSettings::default(),
             keywords: KeywordSettings::default(),
+            extensions: Vec::new(),
         }
     }
+}
+
+/// One extension the user enabled. Members sharing a `group` share one runner process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnabledExtension {
+    pub id: String,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// Why a list of enabled extensions is not a valid configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExtensionListError {
+    #[error(
+        "invalid extension id {0:?}: expected a lower-case ASCII letter or digit followed by letters, digits, '-', '_' or '.'"
+    )]
+    InvalidId(String),
+    #[error(
+        "extension {id:?} has invalid group {group:?}: expected a lower-case ASCII letter or digit followed by letters, digits, '-', '_' or '.'"
+    )]
+    InvalidGroup { id: String, group: String },
+    #[error("extension {0:?} is enabled more than once")]
+    Duplicate(String),
+}
+
+impl EnabledExtension {
+    /// Checks every ID and group name and rejects a repeated ID. Settings run this while
+    /// deserializing; hosts passing a typed list run it themselves.
+    pub fn validate_all(extensions: &[EnabledExtension]) -> Result<(), ExtensionListError> {
+        let mut seen = std::collections::HashSet::with_capacity(extensions.len());
+        for extension in extensions {
+            if !valid_extension_name(&extension.id) {
+                return Err(ExtensionListError::InvalidId(extension.id.clone()));
+            }
+            if let Some(group) = &extension.group
+                && !valid_extension_name(group)
+            {
+                return Err(ExtensionListError::InvalidGroup {
+                    id: extension.id.clone(),
+                    group: group.clone(),
+                });
+            }
+            if !seen.insert(extension.id.as_str()) {
+                return Err(ExtensionListError::Duplicate(extension.id.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[a-z0-9][a-z0-9._-]*`: never empty, `.`/`..` or a path separator.
+fn valid_extension_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn enabled_extensions<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<EnabledExtension>, D::Error> {
+    let extensions = Vec::<EnabledExtension>::deserialize(deserializer)?;
+    EnabledExtension::validate_all(&extensions).map_err(serde::de::Error::custom)?;
+    Ok(extensions)
 }
 
 /// Child-session budgets and defaults. User settings only.
@@ -471,7 +544,13 @@ impl EffectiveConfig {
         cwd: &Path,
         access: Option<ProjectAccess>,
     ) -> Result<Self, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir", "modelRoles", "subagents"];
+        const USER_ONLY_KEYS: &[&str] = &[
+            "project",
+            "homeAgentsDir",
+            "modelRoles",
+            "subagents",
+            "extensions",
+        ];
 
         let UserConfig {
             layer: user,

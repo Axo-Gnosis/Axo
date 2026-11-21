@@ -99,19 +99,26 @@ pub(crate) struct Prepared {
 }
 
 /// Runs the provider's rewrite (once per request, before any retry) and serializes the
-/// body. A failed or cancelled rewrite sends nothing.
+/// body. A failed or cancelled rewrite sends nothing; a failed rewrite's typed failure
+/// (e.g. an unavailable extension provider) lands on `reply` before the error is erased.
 pub(crate) async fn prepare(
     rewrite: Option<&dyn RequestRewrite>,
     model: &Model,
     request: ProviderRequest,
     cancel: &CancellationToken,
+    reply: &mut Reply,
 ) -> Result<Prepared, String> {
     let request = match rewrite {
         None => request,
         Some(rewrite) => tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
-            result = rewrite.rewrite(model, request) => result.map_err(|error| error.to_string())?,
+            result = rewrite.rewrite(model, request) => result.map_err(|error| {
+                if let Some(failure) = error.provider_failure() {
+                    reply.message.failure = Some(failure);
+                }
+                error.to_string()
+            })?,
         },
     };
     Ok(Prepared {
