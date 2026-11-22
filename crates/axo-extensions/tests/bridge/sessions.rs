@@ -23,6 +23,12 @@ use crate::{Case, Host, enabled, lines, phase, wait_for, wait_ready_after};
 
 pub const CASES: &[Case] = &[
     case!(tools_policy_state_command_and_events),
+    case!(command_reentry_is_refused),
+    case!(command_reentry_through_a_turn_is_refused),
+    case!(compact_during_held_turn_is_refused),
+    case!(filtered_session_subscription),
+    case!(detach_closes_subscriptions),
+    case!(subscription_ends_with_its_generation),
     case!(unavailable_policy_fails_closed),
     case!(removed_policy_allows),
     case!(before_only_policy_skips_after),
@@ -156,11 +162,11 @@ async fn tools_policy_state_command_and_events() {
     );
     let mut updates = Vec::new();
     loop {
-        match events.try_recv().expect("read execution end not received") {
+        match &*events.try_recv().expect("read execution end not received") {
             SessionEvent::Agent(AgentEvent::ToolExecutionUpdate { call_id, update })
                 if call_id == "read" =>
             {
-                updates.extend(update.content)
+                updates.extend_from_slice(&update.content)
             }
             SessionEvent::Agent(AgentEvent::ToolExecutionEnd { call_id, .. })
                 if call_id == "read" =>
@@ -250,6 +256,202 @@ async fn tools_policy_state_command_and_events() {
     assert!(!reopened.commands().iter().any(|info| info.name == "hello"));
     reopened.shutdown().await;
     fork.shutdown().await;
+}
+
+async fn command_reentry_is_refused() {
+    let host = Host::new().await;
+    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
+    package(&host, false);
+    host.script(LAB, "command", "reenter");
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(&host, &extensions).await;
+    let command = session.parse_command("/hello").unwrap().unwrap();
+    session.run_command(command).await.unwrap();
+    assert_eq!(
+        host.calls(LAB).iter().filter(|m| *m == "command").count(),
+        1
+    );
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+/// `/hello` prompts a turn whose extension tool runs `/hello` again: the guard holds even
+/// though the turn runs on its own task.
+async fn command_reentry_through_a_turn_is_refused() {
+    let host = Host::scripted(read("r1").into()).await;
+    package(&host, false);
+    host.script(LAB, "command", "prompt");
+    host.script(LAB, "tool", "reenter");
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(&host, &extensions).await;
+    let command = session.parse_command("/hello").unwrap().unwrap();
+    session.run_command(command).await.unwrap();
+    assert_eq!(result(&session, &["r1"]).await, (false, "refused".into()));
+    assert_eq!(
+        host.calls(LAB).iter().filter(|m| *m == "command").count(),
+        1
+    );
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+async fn compact_during_held_turn_is_refused() {
+    let host = Host::scripted(vec![ScriptedTurn::HangUntilCancel]).await;
+    package(&host, false);
+    host.script(LAB, "command", "compact");
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(&host, &extensions).await;
+    let command = session.parse_command("/hello").unwrap().unwrap();
+    let (run, refusal_check) = tokio::join!(session.prompt("hold"), async {
+        wait_for("held turn", || session.is_running()).await;
+        let result = session.run_command(command).await;
+        session.abort();
+        result
+    });
+    run.unwrap();
+    refusal_check.unwrap();
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+async fn filtered_session_subscription() {
+    let host = Host::scripted(vec![ScriptedTurn::Reply(reply_text("done"))]).await;
+    package(&host, false);
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(&host, &extensions).await;
+    let command = |text: &str| session.parse_command(text).unwrap().unwrap();
+    let subs = host.path("ctl/lab/subs");
+    let streams = host.path("ctl/lab/streams");
+
+    host.script(LAB, "command", "subscribe");
+    session.run_command(command("/hello")).await.unwrap();
+    let first = &lines(&subs)[0];
+    assert!(first.starts_with("s:"));
+    let start = session.attach(None).await.missed.len();
+    session
+        .prompt("produce agent and entry events")
+        .await
+        .unwrap();
+    session.append_custom("barrier", None).await.unwrap();
+    let journal = session.attach(None).await.missed;
+    let mut expected: Vec<_> = journal[start..]
+        .iter()
+        .map(|entry| json!({ "sub": first, "event": { "type": "entry", "value": entry } }))
+        .collect();
+    wait_for("filtered entries", || {
+        lines(&streams).len() >= expected.len()
+    })
+    .await;
+
+    host.script(LAB, "command", "unsubscribe");
+    session
+        .run_command(command(&format!("/hello {first}")))
+        .await
+        .unwrap();
+    // The live control subscription proves the post-unsubscribe append traversed the bridge.
+    host.script(LAB, "command", "subscribe");
+    session.run_command(command("/hello")).await.unwrap();
+    let second = &lines(&subs)[1];
+    assert_ne!(first, second);
+    let entry = session.append_custom("after", None).await.unwrap();
+    expected.push(json!({ "sub": second, "event": { "type": "entry", "value": entry } }));
+    wait_for("control subscription", || {
+        lines(&streams).len() >= expected.len()
+    })
+    .await;
+    let received: Vec<Value> = lines(&streams)
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(received, expected);
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+/// A configured `lab` whose `/hello` subscribes to entries, with one subscription made; returns
+/// its id.
+async fn subscribed(host: &Host) -> (Extensions, Arc<Session>, String) {
+    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
+    package(host, false);
+    host.script(LAB, "command", "subscribe");
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(host, &extensions).await;
+    let command = session.parse_command("/hello").unwrap().unwrap();
+    session.run_command(command).await.unwrap();
+    let sub = lines(&host.path("ctl/lab/subs"))[0].clone();
+    (extensions, session, sub)
+}
+
+fn streamed(host: &Host) -> Vec<Value> {
+    lines(&host.path("ctl/lab/streams"))
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Detaching a session tells each of its subscriptions' listeners that it closed.
+async fn detach_closes_subscriptions() {
+    let host = Host::new().await;
+    let (extensions, session, sub) = subscribed(&host).await;
+    extensions.detach(session.id());
+    let closed = json!({ "sub": sub, "closed": true });
+    wait_for("closed frame", || streamed(&host).contains(&closed)).await;
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+/// A subscription belongs to the runner generation that made it: after a reload it never
+/// reaches the replacement, which gets only its own subscriptions.
+async fn subscription_ends_with_its_generation() {
+    let host = Host::new().await;
+    let (extensions, session, first) = subscribed(&host).await;
+    let before = host.calls(LAB).len();
+    extensions.reload(LAB).await.unwrap();
+    // A control subscription on the replacement proves later entries traversed the bridge.
+    let command = session.parse_command("/hello").unwrap().unwrap();
+    session.run_command(command).await.unwrap();
+    let second = lines(&host.path("ctl/lab/subs"))[1].clone();
+    let after = session.append_custom("after", None).await.unwrap();
+    let barrier = session.append_custom("barrier", None).await.unwrap();
+    let line = |sub: &str, entry: &Value| json!({ "sub": sub, "event": { "type": "entry", "value": entry } });
+    let (after, barrier) = (json!(after), json!(barrier));
+    wait_for("control subscription", || {
+        streamed(&host).contains(&line(&second, &barrier))
+    })
+    .await;
+    let received = streamed(&host);
+    assert!(!received.contains(&line(&first, &after)), "{received:?}");
+    assert!(!received.contains(&line(&first, &barrier)), "{received:?}");
+    let activations = host.calls(LAB)[before..]
+        .iter()
+        .filter(|m| *m == "activate")
+        .count();
+    assert_eq!(
+        activations, 1,
+        "only the control command starts the replacement"
+    );
+    session.shutdown().await;
+    extensions.shutdown().await;
 }
 
 async fn unavailable_policy_fails_closed() {

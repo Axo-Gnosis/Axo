@@ -15,6 +15,7 @@ use crate::tools::send::SEND;
 use crate::tools::{self, HostTool, Hosted};
 use axo_agent::{AgentMessage, QueuedMessage, Tool};
 use axo_ai::{Message, SystemMessage, ToolSpec, now_ms};
+use axo_macros::expose;
 use tokio_util::sync::CancellationToken;
 
 use super::spawn::SPAWN;
@@ -532,7 +533,8 @@ impl SessionHooks {
 }
 
 /// Builder state and transcript state are intentionally separate; neither is a wire receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptInspection {
     /// Most recent local build, possibly awaiting recording.
     pub latest_built: Option<indexmap::IndexMap<String, String>>,
@@ -540,7 +542,8 @@ pub struct PromptInspection {
     pub recorded: Option<indexmap::IndexMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextFilesInspection {
     /// Startup loader inventory. Overrides may omit these from `project_context`.
     pub startup: Vec<ContextFile>,
@@ -549,8 +552,27 @@ pub struct ContextFilesInspection {
     pub projected_nested: Vec<ContextFile>,
 }
 
+#[expose(block = SESSION_PROMPT, object = "session")]
 impl Session {
+    /// Renders a discovered skill with command arguments, including skills hidden from the model.
+    #[ext]
+    pub async fn render_skill(&self, name: &str, args: &str) -> Result<String, Error> {
+        let skill = self
+            .skills()
+            .iter()
+            .find(|skill| skill.name == name)
+            .ok_or_else(|| Error::SkillNotFound(name.to_owned()))?;
+        let raw = tokio::fs::read_to_string(&skill.path)
+            .await
+            .map_err(|source| Error::Io {
+                path: skill.path.clone(),
+                source,
+            })?;
+        Ok(crate::context::skills::render_block(skill, &raw, args))
+    }
+
     /// Inspects local builder and recorded prompt state without rebuilding or I/O.
+    #[ext]
     pub fn inspect_prompt(&self) -> PromptInspection {
         let view = self.hooks.journal.view();
         let recorded =
@@ -576,6 +598,7 @@ impl Session {
 
     /// Inspects loaded startup files and recorded nested blocks, never rereading disk.
     /// This is not the set of files guaranteed to appear in a provider request.
+    #[ext]
     pub fn context_files(&self) -> ContextFilesInspection {
         let startup = self
             .hooks
@@ -613,16 +636,19 @@ impl Session {
     }
 
     /// Read-only copy of recorded full-file hashes, keyed by canonical file path.
+    #[ext]
     pub fn file_ledger(&self) -> std::collections::HashMap<PathBuf, String> {
         self.hooks.tools.ledger.snapshot()
     }
 
     /// The snapshot blob `sha256` of this session, digest verified.
+    #[ext(skip = "bytes cross as base64")]
     pub async fn read_snapshot(&self, sha256: &str) -> Result<Vec<u8>, Error> {
         self.hooks.tools.snapshots.read(sha256).await
     }
 
     /// The net change per file across `changes`, re-diffed from this session's blobs.
+    #[ext]
     pub async fn squash_changes(
         &self,
         changes: &[tools::FileChange],
@@ -632,6 +658,7 @@ impl Session {
 
     /// Drops the cached project environment and resolves it again now. When its prompt
     /// note or the date changed, the prompt diff reaches the model before its next request.
+    #[ext]
     pub async fn reload_exec_env(&self) {
         self.inherited.exec.invalidate();
         let resolved = self

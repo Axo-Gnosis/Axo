@@ -260,7 +260,7 @@ impl Extensions {
     ) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
-            inner: Arc::new(Inner {
+            inner: Arc::new_cyclic(|inner| Inner {
                 layer: models.provider_layer(),
                 supervisor,
                 options,
@@ -269,7 +269,7 @@ impl Extensions {
                 closed: CancellationToken::new(),
                 events,
                 serials: AtomicU64::new(1),
-                sessions: Arc::default(),
+                sessions: Arc::new(session::Registry::new(inner.clone())),
             }),
         }
     }

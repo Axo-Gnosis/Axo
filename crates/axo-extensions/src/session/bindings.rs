@@ -127,12 +127,12 @@ impl Callbacks for Updates<'_> {
     async fn call(&self, method: &str, args: Value) -> Result<Value, Refusal> {
         if method != "update" {
             return Err(Refusal {
-                code: "unsupported",
+                code: "unsupported".into(),
                 message: "unknown host method".into(),
             });
         }
         let Update { content, details } = serde_json::from_value(args).map_err(|_| Refusal {
-            code: "invalid",
+            code: "invalid".into(),
             message: "invalid arguments".into(),
         })?;
         self.0.updates.send(ToolUpdate { content, details });
@@ -476,9 +476,14 @@ pub(super) struct RemoteCommand {
 impl CommandHandler for RemoteCommand {
     async fn run(&self, session: &Session, args: &str) -> Result<(), Error> {
         let name = &self.decl.name;
+        let _running = self
+            .remote
+            .enter(session.id(), name)
+            .map_err(|failure| Error::Host(Box::new(failure)))?;
         let wire = json!({ "command": name, "session": session.id(), "args": args });
+        let label = format!("command /{name}");
         self.remote
-            .call(&format!("command /{name}"), "command", wire, None, None)
+            .call(&label, "command", wire, None, None)
             .await
             .map(drop)
             .map_err(|failure| Error::Host(Box::new(failure)))

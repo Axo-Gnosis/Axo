@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{Located, SessionTools, file_key};
 
 /// One place a scope layer permits writes under.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum WriteRoot {
     /// An absolute directory.
@@ -31,7 +31,7 @@ impl fmt::Display for WriteRoot {
 
 /// A write scope: a target must be permitted by every layer (persona or child spec,
 /// mode, and each inherited ceiling layer). An empty layer permits nothing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(transparent)]
 pub struct WriteScope {
     pub layers: Vec<Vec<WriteRoot>>,

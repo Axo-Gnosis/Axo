@@ -21,7 +21,7 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(1);
 const SQUASH_CONCURRENCY: usize = 8;
 
 /// One file mutation by a file tool: `details.change` on its result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChange {
     /// The absolute target path (the same value as `details.ledger.path`).
@@ -44,7 +44,7 @@ pub struct FileChange {
 
 /// One side of a change, stored under `sha256` in the session's `SnapshotStore` unless
 /// `omitted`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotBlob {
     /// `FileLedger::hash` of the bytes; present even when omitted.
@@ -57,7 +57,7 @@ pub struct SnapshotBlob {
 }
 
 /// Why a blob was not stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum Omitted {
     /// Larger than `MAX_SNAPSHOT_BYTES`.
@@ -67,7 +67,7 @@ pub enum Omitted {
 }
 
 /// Line counts and patch over BOM-stripped, LF-normalized text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LineDiff {
     pub additions: usize,
@@ -85,7 +85,7 @@ pub struct LineDiff {
 }
 
 /// The net change to one file over a range of `FileChange`s.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SquashedChange {
     /// From the last mutation.
@@ -235,7 +235,9 @@ impl SnapshotStore {
     pub async fn squash(&self, changes: &[FileChange]) -> Vec<SquashedChange> {
         let mut squashed = squash(changes);
         let stored = |blob: &SnapshotBlob| !blob.binary && blob.omitted.is_none();
-        let diffs = squashed
+        // Collected so no borrowing iterator adapter lives across the await (rustc#100013 would
+        // otherwise make `Session::squash_changes`'s future fail the higher-ranked `Send` check).
+        let diffs: Vec<_> = squashed
             .iter()
             .enumerate()
             .filter(|(_, file)| {
@@ -258,7 +260,8 @@ impl SnapshotStore {
                 let label =
                     (!file.created).then(|| file.url.as_ref().unwrap_or(&file.path).clone());
                 (index, line_diff(before, after, label).await)
-            });
+            })
+            .collect();
         let diffs = stream::iter(diffs)
             .buffer_unordered(SQUASH_CONCURRENCY)
             .collect::<Vec<_>>()

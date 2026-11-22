@@ -66,7 +66,7 @@ async fn stop_latch_defers_delivery_to_the_next_prompt() {
     let stop = async {
         loop {
             if let SessionEvent::Agent(AgentEvent::ToolExecutionStart { name, .. }) =
-                events.recv().await.unwrap()
+                &*events.recv().await.unwrap()
                 && name == "hang"
             {
                 session.abort();
@@ -86,7 +86,7 @@ async fn stop_latch_defers_delivery_to_the_next_prompt() {
     if job_ends(&attached.missed).is_empty() {
         within(async {
             loop {
-                if let SessionEvent::Entry(seq) = events.recv().await.unwrap()
+                if let SessionEvent::Entry(seq) = &*events.recv().await.unwrap()
                     && matches!(seq.entry, Entry::JobEnd { .. })
                 {
                     return;

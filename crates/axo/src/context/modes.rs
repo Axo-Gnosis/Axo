@@ -12,7 +12,7 @@ use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// A session mode. Built from a definition file or passed in code; never persisted
 /// (sessions record the mode by name).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ModeSpec {
     pub name: String,
@@ -38,7 +38,7 @@ pub struct ModeSpec {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(default)]
 pub struct ToolLimits {
     pub allow: Option<Vec<String>>,
@@ -61,7 +61,7 @@ impl ToolLimits {
 
 /// What `bash` commands may write. Effective access is `ReadOnly` when the agent, the mode,
 /// or a spawning ancestor's ceiling says so.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum BashAccess {
     #[default]
@@ -76,7 +76,7 @@ impl BashAccess {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(default)]
 pub struct ModeResult {
     /// JSON Schema of the result; defaults to `{"type":"string"}`.

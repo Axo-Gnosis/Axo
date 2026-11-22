@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_ai::{JsonMap, ToolCall, UserBlock};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -42,7 +43,8 @@ pub trait Tool: Send + Sync {
 }
 
 /// Identifies one execution of a tool within an agent; unique per [`crate::Agent`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, specta::Type)]
+#[serde(transparent)]
 pub struct ToolInvocationId(pub u64);
 
 /// True while steering input is queued and not yet drained into the transcript.
@@ -120,7 +122,8 @@ pub enum Replay {
     Safe,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolOutput {
     /// Model-facing result.
     pub content: Vec<UserBlock>,
@@ -132,7 +135,8 @@ pub struct ToolOutput {
 }
 
 /// A partial result streamed while a tool runs.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolUpdate {
     pub content: Vec<UserBlock>,
     pub details: Option<Value>,

@@ -32,7 +32,17 @@
     }
   ],
   "schemes": [{ "name": "lab", "promptDoc": "lab:// URLs read lab fixtures." }],
-  "commands": [{ "name": "hello", "description": "Posts its arguments as a lab message.", "argumentHint": "<text>" }],
+  "commands": [
+    { "name": "hello", "description": "Posts its arguments as a lab message.", "argumentHint": "<text>" },
+    { "name": "plan-task", "description": "Enters plan mode with the supplied task." },
+    { "name": "skill-input", "description": "Submits the rendered review skill as a follow-up." },
+    { "name": "skill-focus", "description": "Compacts with the rendered review skill as focus." },
+    { "name": "again", "description": "Posts the error from calling itself." },
+    { "name": "hold", "description": "Waits for cancellation." },
+    { "name": "flood", "description": "Fills the runner's host-call slots and posts the queued call's error code." },
+    { "name": "watch", "description": "Records new journal entry sequence numbers." },
+    { "name": "compact-light", "description": "Compacts with a focus, or posts busy during a turn." }
+  ],
   "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
   "toolPolicy": ["before"],
   "events": true

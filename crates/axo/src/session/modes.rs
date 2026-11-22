@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock, PoisonError, Weak};
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock, thinking::clamp_level};
+use axo_macros::expose;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
@@ -106,9 +107,9 @@ impl SessionHooks {
             != target.as_ref().map(|spec| &spec.name);
         state.selected = target;
         if changed {
-            let _ = self.events.send(SessionEvent::Mode {
+            let _ = self.events.send(Arc::new(SessionEvent::Mode {
                 mode: state.selected.as_ref().map(|spec| spec.name.clone()),
-            });
+            }));
         }
         Ok(())
     }
@@ -173,7 +174,9 @@ impl SessionHooks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .selected = spec;
-        let _ = self.events.send(SessionEvent::Mode { mode: name });
+        let _ = self
+            .events
+            .send(Arc::new(SessionEvent::Mode { mode: name }));
         self.results.supersede();
         Ok(())
     }
@@ -314,8 +317,10 @@ impl SessionHooks {
     }
 }
 
+#[expose(block = SESSION_MODES, object = "session")]
 impl Session {
     /// Selects a root-session mode; instructions and limits take effect at the next request boundary.
+    #[ext]
     pub async fn set_mode(&self, name: Option<&str>) -> Result<(), Error> {
         if self.hooks.child.is_some() {
             return Err(Error::InvalidInput("Modes belong to root sessions".into()));
@@ -334,17 +339,20 @@ impl Session {
     }
 
     /// The selected mode, including a selection waiting for the next request boundary.
+    #[ext]
     pub fn mode(&self) -> Option<Arc<ModeSpec>> {
         self.hooks.selected_mode()
     }
 
     /// The mode applied at the latest request boundary, not a pending selection.
+    #[ext]
     pub fn effective_mode(&self) -> Option<Arc<ModeSpec>> {
         self.hooks.effective_mode()
     }
 
     /// Accepts a review, optionally replacing its value and continuation.
     /// Invalid replacements leave the review pending.
+    #[ext]
     pub fn accept_result(&self, call_id: &str, options: AcceptResultOptions) -> Result<(), Error> {
         if let Some(value) = &options.replacement {
             let pending = self
@@ -366,6 +374,7 @@ impl Session {
     }
 
     /// Keeps the mode active and asks the model to revise its result.
+    #[ext]
     pub fn revise_result(&self, call_id: &str, feedback: String) -> Result<(), Error> {
         if feedback.trim().is_empty() {
             return Err(Error::InvalidInput("feedback must not be blank".into()));
@@ -377,14 +386,16 @@ impl Session {
 }
 
 /// Host review edits; `None` preserves the model's original value or mode continuation.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct AcceptResultOptions {
     pub replacement: Option<Value>,
     pub message: Option<String>,
 }
 
 /// A mode result waiting for the host's review.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingResult {
     pub call_id: String,
     pub mode: String,
@@ -402,12 +413,12 @@ pub(super) enum ResultOutcome {
 }
 
 pub(super) struct PendingResults {
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<Arc<SessionEvent>>,
     pending: Pending<PendingResult, ResultOutcome>,
 }
 
 impl PendingResults {
-    pub(super) fn new(events: broadcast::Sender<SessionEvent>) -> Self {
+    pub(super) fn new(events: broadcast::Sender<Arc<SessionEvent>>) -> Self {
         Self {
             events,
             pending: Pending::default(),
@@ -416,12 +427,12 @@ impl PendingResults {
 
     fn register(&self, result: PendingResult) -> oneshot::Receiver<ResultOutcome> {
         let rx = self.pending.register(&result.call_id, result.clone());
-        let _ = self.events.send(SessionEvent::ModeResult {
+        let _ = self.events.send(Arc::new(SessionEvent::ModeResult {
             call_id: result.call_id,
             mode: result.mode,
             result: result.result,
             awaiting_review: true,
-        });
+        }));
         rx
     }
 
@@ -449,10 +460,10 @@ impl PendingResults {
     }
 
     fn resolved(&self, call_id: &str, outcome: ResultResolution) {
-        let _ = self.events.send(SessionEvent::ModeResultResolved {
+        let _ = self.events.send(Arc::new(SessionEvent::ModeResultResolved {
             call_id: call_id.to_owned(),
             outcome,
-        });
+        }));
     }
 
     fn withdraw(&self, call_id: &str) {
@@ -631,12 +642,12 @@ impl Tool for ModeYield {
                 }
             }
         } else {
-            let _ = hooks.events.send(SessionEvent::ModeResult {
+            let _ = hooks.events.send(Arc::new(SessionEvent::ModeResult {
                 call_id: cx.call.id.clone(),
                 mode: self.mode.name.clone(),
                 result: result.clone(),
                 awaiting_review: false,
-            });
+            }));
             drop(order);
             None
         };

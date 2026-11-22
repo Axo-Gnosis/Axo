@@ -18,7 +18,8 @@
 // Rust -> runner methods:
 //   activate {entry,dataDir,providers:[{id,login,rewrite}],
 //             session:{tools:[{name,..}],schemes:[{name,..}],commands:[{name,..}],
-//                      toolPolicy:["before"|"after"],spawnHook,events}} -> null
+//                      toolPolicy:["before"|"after"],spawnHook,events},
+//             sessionMethods:[<invokable session method>]} -> null
 //   login {provider} -> Credential; refresh {provider,credential} -> Credential;
 //   rewrite {provider,model,request} -> ProviderRequest
 //   tool {tool,session,call:{id,name,arguments}} -> {content,details?,isError?,terminate?}
@@ -29,6 +30,7 @@
 //   schemeResolve {scheme,path,session:{id,dir,cwd}} -> "virtual" | {file,writable}
 //   schemeRead {scheme,path,session} -> string; schemeWrite {scheme,path,session,content} -> string
 //   command {command,session,args} -> null; event {session,entry} -> null
+//   stream {sub,event} | {sub,lagged} | {sub,closed:true} -> null
 // Runner -> Rust methods with `parent` = a live call of the same `ext`:
 //   under login: openUrl {url,instructions?} -> null; deviceCode {userCode,verificationUrl,
 //   expiresInSeconds?} -> null; prompt {message,placeholder?,secret} -> string;
@@ -38,8 +40,9 @@
 // error reply to one fails the login. A tool replies only after every update it sent was
 // answered; an error reply to an update is ignored.
 // Runner -> Rust session actions, without `parent`, valid while the session is attached:
-//   post {session,customType,text,display,delivery:"steer"|"followUp"|"quiet"} -> null;
-//   appendCustom {session,customType,data?} -> null; custom {session,customType} -> value|null.
+//   invoke {object:"session",target:<session id>,method,args:[...]} -> method result; a
+//   session handle forwards only `sessionMethods` names.
+//   subscribe {session,kinds} -> {sub}; unsubscribe {sub} -> null.
 // Error codes the runner sends: "activation" (import/activation of that member failed; the
 // bridge disables only that member), "failed" (the author's method threw), "invalid" (bad
 // arguments, an invalid author return value, or a reply that is not JSON-serializable),
@@ -57,15 +60,17 @@ import type {
   Credential,
   Extension,
   Handlers,
-  JsonValue,
   LoginInteraction,
   Model,
   ProviderRequest,
   SchemeContext,
   SchemeHandlers,
+  SeqEntry,
+  SessionEvent,
   SessionHandle,
+  SessionStreamEvent,
+  SpawnContext,
   SpawnHook,
-  SpawnRequest,
   ToolCall,
   ToolHandler,
   ToolPolicy,
@@ -290,6 +295,7 @@ const HOST_METHODS: Record<string, true> = {
   schemeWrite: true,
   command: true,
   event: true,
+  stream: true,
 };
 const RUNNER_METHODS: Record<string, true> = {
   openUrl: true,
@@ -298,9 +304,9 @@ const RUNNER_METHODS: Record<string, true> = {
   select: true,
   progress: true,
   update: true,
-  post: true,
-  appendCustom: true,
-  custom: true,
+  invoke: true,
+  subscribe: true,
+  unsubscribe: true,
 };
 
 interface Call {
@@ -317,7 +323,19 @@ let nextId = 0n;
 /** Live runner calls Rust has not answered: half of peer.rs `MAX_CALLBACKS`, whose overflow ends the generation. */
 const MAX_HOST_CALLS = 128;
 /** Calls waiting for a slot under `MAX_HOST_CALLS`, started in order. */
-const queuedHostCalls: (() => void)[] = [];
+const queuedHostCalls: { start(): void; reject(error: Error): void }[] = [];
+// ponytail: a stall is detected, not prevented; exempt re-entrant calls from the slot cap if real workloads hit it
+const STALL_MS = 30_000;
+let stallTimer: NodeJS.Timeout | undefined;
+
+function resetStallTimer(): void {
+  clearTimeout(stallTimer);
+  stallTimer = queuedHostCalls.length ? setTimeout(() => {
+    stallTimer = undefined;
+    for (const call of queuedHostCalls) call.reject(new HostError("stalled", "too many nested host calls"));
+    queuedHostCalls.length = 0;
+  }, STALL_MS) : undefined;
+}
 
 function onFrame(frame: Frame): void {
   if (frame.generation !== generation) violation("wrong generation");
@@ -465,8 +483,8 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
     }
     case "spawn": {
       if (!active?.spawnHook) throw new Fail("unsupported", "no spawn hook");
-      const request = record(args.spawn, "spawn request") as unknown as SpawnRequest;
-      const value = await active.spawnHook(request, handle(ext, text(args.session, "spawn session")), signal);
+      const request = record(args.spawn, "spawn request") as unknown as SpawnContext;
+      const value = await active.spawnHook(request, text(args.session, "spawn session"), signal);
       if (isRecord(value) && Object.hasOwn(value, "replace")) return decision(value, method, { replace: "object" });
       return decision(value, method, { block: "string" });
     }
@@ -505,11 +523,39 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
       await handler(text(args.args, "command args"), handle(ext, text(args.session, "command session")), signal);
       return null;
     }
+    case "stream": {
+      const sub = text(args.sub, "stream subscription");
+      // A live session can emit before Rust's subscribe reply reaches the socket.
+      while (!subscriptions.has(sub)) {
+        const replies = [];
+        for (const [reply, owner] of registering) if (owner === ext) replies.push(reply);
+        if (!replies.length) break;
+        await Promise.race(replies).catch(() => {});
+      }
+      const subscription = subscriptions.get(sub);
+      if (subscription?.ext !== ext) throw new Fail("unsupported", "no stream listener");
+      let event: SessionStreamEvent;
+      if (args.closed === true) {
+        subscriptions.delete(sub);
+        event = { type: "closed", value: null };
+      } else if (typeof args.lagged === "number") {
+        event = { type: "lagged", value: { skipped: args.lagged } };
+      } else {
+        event = record(args.event, "stream event") as unknown as SessionEvent;
+      }
+      const { listener } = subscription;
+      try {
+        await listener(event);
+      } catch {
+        // One listener error must not end the subscription.
+      }
+      return null;
+    }
     default: {
       // event
       if (!active?.onEntry) throw new Fail("unsupported", "no entry handler");
       const session = handle(ext, text(args.session, "event session"));
-      await active.onEntry(freeze(record(args.entry, "event entry")) as unknown as JsonValue, session);
+      await active.onEntry(freeze(record(args.entry, "event entry")) as unknown as SeqEntry, session);
       return null;
     }
   }
@@ -556,7 +602,7 @@ async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): 
   const updates = new Set<Promise<unknown>>();
   const run: ToolRun = {
     call: toolCall(args.call, "tool call"),
-    session: handle(ext, text(args.session, "tool session")),
+    sessionId: text(args.session, "tool session"),
     signal,
     update(update) {
       const u = local(isRecord(update), "update", update);
@@ -637,6 +683,11 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
     return { id: text(p.id, `activate provider ${i} id`), login: p.login, rewrite: p.rewrite };
   });
   const session = record(args.session, "activate session");
+  const methods = args.sessionMethods;
+  if (!Array.isArray(methods) || !methods.every((m) => typeof m === "string")) {
+    throw new Fail("invalid", "activate sessionMethods is not a string list");
+  }
+  sessionMethods = new Set(methods);
   const names = (key: string): string[] => {
     const list = session[key];
     if (!Array.isArray(list)) throw new Fail("invalid", `activate session ${key} is not an array`);
@@ -791,35 +842,51 @@ function providers(value: unknown, declared: { id: string; login: boolean; rewri
 
 // ---- Runner -> Rust session actions ----
 
-const DELIVERIES = ["steer", "followUp", "quiet"];
+type StreamListener = Parameters<SessionHandle["subscribe"]>[0];
+const subscriptions = new Map<string, { ext: string; listener: StreamListener }>();
+const registering = new Map<Promise<unknown>, string>();
+/** The session methods a handle forwards; sent with every activation. */
+let sessionMethods = new Set<string>();
 
 /** Session actions for one session; unparented, so they work whenever Rust has it attached. */
 function handle(ext: string, id: string): SessionHandle {
-  const act = (method: string, args: Frame) => callHost(ext, method, { session: id, ...args });
-  return {
-    id,
-    async post(message) {
-      const m = local(isRecord(message), "post message", message);
-      await act("post", {
-        customType: local(typeof m.customType === "string", "post customType", m.customType),
-        text: local(typeof m.text === "string", "post text", m.text),
-        display: local(typeof m.display === "boolean", "post display", m.display),
-        delivery: local(DELIVERIES.includes(m.delivery), "post delivery", m.delivery),
-      });
-    },
-    async appendCustom(customType, data) {
-      await act("appendCustom", {
-        customType: local(typeof customType === "string", "appendCustom customType", customType),
-        data,
-      });
-    },
-    async custom(customType) {
-      const value = await act("custom", {
-        customType: local(typeof customType === "string", "custom customType", customType),
-      });
-      return (value ?? null) as JsonValue | null;
-    },
+  const subscribe: SessionHandle["subscribe"] = async (listener, kinds) => {
+    const reply = callHost(ext, "subscribe", { session: id, kinds: kinds ?? null });
+    registering.set(reply, ext);
+    try {
+      const sub = text(record(await reply, "subscribe reply").sub, "subscription id");
+      subscriptions.set(sub, { ext, listener });
+      // Memoized; the listener stays registered until Rust confirms, so a failed close retries.
+      let closing: Promise<void> | undefined;
+      return {
+        close() {
+          closing ??= (async () => {
+            if (!subscriptions.has(sub)) return;
+            try {
+              await callHost(ext, "unsubscribe", { sub });
+            } catch (error) {
+              // The host already ended the stream: closed either way.
+              if (!(error instanceof HostError && error.code === "no_subscription")) {
+                closing = undefined;
+                throw error;
+              }
+            }
+            subscriptions.delete(sub);
+          })();
+          return closing;
+        },
+      };
+    } finally {
+      registering.delete(reply);
+    }
   };
+  return new Proxy({ id, subscribe }, {
+    get(target, key) {
+      if (key === "id" || key === "subscribe") return target[key];
+      if (typeof key !== "string" || !sessionMethods.has(key)) return undefined;
+      return (...args: unknown[]) => callHost(ext, "invoke", { object: "session", target: id, method: key, args });
+    },
+  }) as SessionHandle;
 }
 
 // ---- Runner -> Rust login callbacks ----
@@ -942,7 +1009,8 @@ function callHost(ext: string, method: string, args: Frame, parent?: Parent, own
       own?.removeEventListener("abort", onOwn);
       finish();
       // A queued start that rejects early takes no slot, so the loop moves on.
-      while (pending.size < MAX_HOST_CALLS && queuedHostCalls.length) queuedHostCalls.shift()!();
+      while (pending.size < MAX_HOST_CALLS && queuedHostCalls.length) queuedHostCalls.shift()!.start();
+      resetStallTimer();
     };
     // The parent ended: Rust has already dropped its callbacks, so no cancel frame.
     const onOuter = () => settle(() => reject(outer!.reason));
@@ -963,7 +1031,10 @@ function callHost(ext: string, method: string, args: Frame, parent?: Parent, own
     });
   };
   if (pending.size < MAX_HOST_CALLS) start();
-  else queuedHostCalls.push(start);
+  else {
+    queuedHostCalls.push({ start, reject });
+    if (queuedHostCalls.length === 1) resetStallTimer();
+  }
   return promise;
 }
 

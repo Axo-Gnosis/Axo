@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use axo_agent::{Agent, AgentMessage};
 use axo_ai::{Message, Model, Usage};
+use axo_macros::expose;
 use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
@@ -78,7 +79,9 @@ impl SessionHooks {
             true
         });
         reserved?;
-        let _ = self.events.send(SessionEvent::MaintenanceStart { kind });
+        let _ = self
+            .events
+            .send(Arc::new(SessionEvent::MaintenanceStart { kind }));
         Ok(())
     }
 
@@ -94,11 +97,11 @@ impl SessionHooks {
             ended.is_some()
         });
         if let Some(kind) = ended {
-            let _ = self.events.send(SessionEvent::MaintenanceEnd {
+            let _ = self.events.send(Arc::new(SessionEvent::MaintenanceEnd {
                 kind,
                 error,
                 aborted,
-            });
+            }));
             if standalone {
                 self.release_or_deliver();
             }
@@ -582,6 +585,7 @@ impl SessionHooks {
     }
 }
 
+#[expose(block = SESSION_MAINTENANCE, object = "session")]
 impl Session {
     async fn start_maintenance(
         &self,
@@ -600,6 +604,7 @@ impl Session {
 
     /// Summarizes eligible history without submitting an ordinary user turn; `focus` tells
     /// the summary what to prioritize (blank focus counts as none).
+    #[ext]
     pub async fn compact(&self, focus: Option<String>) -> Result<(), Error> {
         self.start_maintenance(
             MaintenanceKind::Compact,
@@ -611,6 +616,7 @@ impl Session {
     }
 
     /// Removes eligible blocks into recoverable session artifacts, without model calls.
+    #[ext]
     pub async fn shake(&self, mode: ShakeMode) -> Result<(), Error> {
         self.start_maintenance(MaintenanceKind::Shake, MaintenanceOperation::Shake(mode))
             .await
@@ -621,6 +627,7 @@ impl Session {
     /// summarized first (steered by `options.focus`) and a `branch_summary` entry at `target`
     /// replaces the leaf. The next prompt continues from there with the live model and
     /// thinking level, recorded on the branch when it implies others.
+    #[ext]
     pub async fn navigate(
         &self,
         target: Option<EntryId>,

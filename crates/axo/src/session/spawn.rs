@@ -10,6 +10,7 @@ use axo_agent::{
 };
 use axo_ai::thinking::clamp_level;
 use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock};
+use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -35,7 +36,8 @@ use crate::tools::output::YIELD;
 
 pub(crate) const SPAWN: &str = "spawn";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SpawnRequest {
     /// A catalog agent. With `spec` also `None`, the child is a plain delegate of this session.
     pub agent: Option<String>,
@@ -49,7 +51,8 @@ pub struct SpawnRequest {
     pub output: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct TeamRequest {
     /// A catalog team; exclusive with `members`.
     pub team: Option<String>,
@@ -61,7 +64,7 @@ pub struct TeamRequest {
     pub tasks: IndexMap<String, PromptInput>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, specta::Type)]
 pub struct TeamMemberRequest {
     pub name: String,
     /// A catalog agent; with `spec` also `None`, a plain delegate.
@@ -78,7 +81,7 @@ pub struct TeamHandle {
     pub members: Vec<(String, ChildHandle)>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, specta::Type)]
 pub struct InlineSpec {
     /// The agent body (after axo's fixed delegation framing).
     pub prompt: String,
@@ -224,11 +227,14 @@ pub(super) fn child_inherited(
     })
 }
 
+#[expose(block = SESSION_SPAWN, object = "session")]
 impl Session {
+    #[ext(skip = "returns live child sessions; the wire method returns the receipt")]
     pub async fn spawn(&self, request: SpawnRequest) -> Result<ChildHandle, Error> {
         self.hooks.spawn(request, None).await
     }
 
+    #[ext(skip = "returns live child sessions; the wire method returns the receipt")]
     pub async fn spawn_team(&self, request: TeamRequest) -> Result<TeamHandle, Error> {
         self.hooks.spawn_team(request, None).await
     }

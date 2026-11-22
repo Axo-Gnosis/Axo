@@ -94,7 +94,8 @@ pub struct SessionTools {
 pub type ToolFactory = Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>;
 
 /// Whether a host tool is declared directly or discovered through `tool://`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum Exposure {
     Direct,
     Deferred,

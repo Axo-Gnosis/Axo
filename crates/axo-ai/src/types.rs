@@ -27,7 +27,7 @@ pub fn now_ms() -> i64 {
 }
 
 #[allow(clippy::large_enum_variant)] // Keep public variants inline; boxing adds an allocation per assistant message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum Message {
     System(SystemMessage),
@@ -42,10 +42,11 @@ pub enum Message {
 /// `content` adds instructions from that point on, `sections` replace or remove named
 /// prompt sections (`None` removes one), and `tools_added`/`tools_removed` change the
 /// tool set. Replaying every system message in order yields the current prompt and tools.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemMessage {
     #[serde(deserialize_with = "content_vec")]
+    #[specta(type = specta_serde::Phased<Vec<TextBlock>, Option<MessageContent<TextBlock>>>)]
     pub content: Vec<TextBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sections: Option<IndexMap<String, Option<String>>>,
@@ -56,15 +57,16 @@ pub struct SystemMessage {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     #[serde(deserialize_with = "content_vec")]
+    #[specta(type = specta_serde::Phased<Vec<UserBlock>, Option<MessageContent<UserBlock>>>)]
     pub content: Vec<UserBlock>,
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderFailure {
     pub status: Option<u16>,
@@ -73,10 +75,11 @@ pub struct ProviderFailure {
     pub should_retry: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
     #[serde(deserialize_with = "content_vec")]
+    #[specta(type = specta_serde::Phased<Vec<AssistantBlock>, Option<MessageContent<AssistantBlock>>>)]
     pub content: Vec<AssistantBlock>,
     pub api: ApiKind,
     pub provider: String,
@@ -140,12 +143,13 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: String,
     #[serde(deserialize_with = "content_vec")]
+    #[specta(type = specta_serde::Phased<Vec<UserBlock>, Option<MessageContent<UserBlock>>>)]
     pub content: Vec<UserBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
@@ -157,14 +161,14 @@ pub struct ToolResultMessage {
 }
 
 /// A text block of a system message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename = "text")]
 pub struct TextBlock {
     pub text: String,
 }
 
 /// Content of user messages and tool results.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -191,7 +195,7 @@ impl UserBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -216,7 +220,7 @@ pub enum AssistantBlock {
     ToolCall(ToolCall),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: String,
@@ -230,7 +234,7 @@ pub struct ToolCall {
 
 /// Opaque provider data needed to replay reasoning, tagged with its kind so data from
 /// one API can never be mistaken for another's.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 pub enum ReasoningReplay {
     /// Anthropic `signature` of a thinking block.
@@ -246,7 +250,7 @@ pub enum ReasoningReplay {
     ReasoningDetails(Value),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub input: u64,
@@ -285,7 +289,7 @@ impl std::ops::AddAssign<&Usage> for Usage {
 }
 
 /// Cost of one response in USD.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCost {
     pub input: f64,
@@ -295,7 +299,7 @@ pub struct UsageCost {
     pub total: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
     Stop,
@@ -306,7 +310,18 @@ pub enum StopReason {
 }
 
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    specta::Type,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -358,7 +373,7 @@ impl std::str::FromStr for ThinkingLevel {
 }
 
 /// A tool declaration as the model sees it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -392,6 +407,13 @@ impl FromText for AssistantBlock {
     }
 }
 
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum MessageContent<T> {
+    Text(String),
+    Blocks(Vec<T>),
+}
+
 /// Accept `content` as a block array, a plain string (one text block, none when empty)
 /// or null (no blocks).
 fn content_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -399,16 +421,12 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de> + FromText,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Content<T> {
-        Text(String),
-        Blocks(Vec<T>),
-    }
-    Ok(match Option::<Content<T>>::deserialize(deserializer)? {
-        None => Vec::new(),
-        Some(Content::Text(text)) if text.is_empty() => Vec::new(),
-        Some(Content::Text(text)) => vec![T::from_text(text)],
-        Some(Content::Blocks(blocks)) => blocks,
-    })
+    Ok(
+        match Option::<MessageContent<T>>::deserialize(deserializer)? {
+            None => Vec::new(),
+            Some(MessageContent::Text(text)) if text.is_empty() => Vec::new(),
+            Some(MessageContent::Text(text)) => vec![T::from_text(text)],
+            Some(MessageContent::Blocks(blocks)) => blocks,
+        },
+    )
 }

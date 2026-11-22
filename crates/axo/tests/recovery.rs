@@ -431,8 +431,8 @@ async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
         assert!(attach.live.running, "recovery did not requeue the prompt");
         within(async {
             loop {
-                if let SessionEvent::Entry(seq) = attach.events.recv().await.unwrap()
-                    && ended(&seq)
+                if let SessionEvent::Entry(seq) = &*attach.events.recv().await.unwrap()
+                    && ended(seq)
                 {
                     break;
                 }
@@ -534,13 +534,13 @@ fn once_only_task() -> String {
     )
 }
 
-async fn retry(events: &mut broadcast::Receiver<SessionEvent>) -> (u32, u64) {
+async fn retry(events: &mut broadcast::Receiver<Arc<SessionEvent>>) -> (u32, u64) {
     loop {
         if let SessionEvent::Retry {
             attempt, delay_ms, ..
-        } = events.recv().await.unwrap()
+        } = &*events.recv().await.unwrap()
         {
-            return (attempt, delay_ms);
+            return (*attempt, *delay_ms);
         }
     }
 }
@@ -571,7 +571,7 @@ async fn wait_end(session: &Session) {
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if matches!(
-                attach.events.recv().await.unwrap(),
+                &*attach.events.recv().await.unwrap(),
                 SessionEvent::Entry(SeqEntry {
                     entry: Entry::RunEnd { .. },
                     ..
@@ -830,7 +830,7 @@ async fn aborting_hanging_summary_has_no_checkpoint_and_no_stuck_busy_state() {
     let mut events = session.attach(None).await.events;
     let compact = session.compact(None);
     tokio::pin!(compact);
-    tokio::select! { result = &mut compact => panic!("summary unexpectedly settled: {result:?}"), _ = async { loop { if matches!(events.recv().await.unwrap(), SessionEvent::MaintenanceStart { .. }) { break; } } } => {} }
+    tokio::select! { result = &mut compact => panic!("summary unexpectedly settled: {result:?}"), _ = async { loop { if matches!(&*events.recv().await.unwrap(), SessionEvent::MaintenanceStart { .. }) { break; } } } => {} }
     // MaintenanceStart precedes the actual provider call; wait until the hanging stream exists.
     within(async {
         while api.requests().len() < 2 {
@@ -926,7 +926,7 @@ async fn retry_success_has_one_agent_start_and_end_and_consumes_followup_once() 
     });
     let mut starts = 0;
     loop {
-        match events.recv().await.unwrap() {
+        match &*events.recv().await.unwrap() {
             SessionEvent::Agent(AgentEvent::AgentStart) => starts += 1,
             SessionEvent::Retry { .. } => break,
             _ => {}
@@ -936,7 +936,7 @@ async fn retry_success_has_one_agent_start_and_end_and_consumes_followup_once() 
     assert_eq!(task.await.unwrap(), RunOutcome::Done);
     let mut ends = 0;
     while let Ok(event) = events.try_recv() {
-        match event {
+        match &*event {
             SessionEvent::Agent(AgentEvent::AgentStart) => starts += 1,
             SessionEvent::Agent(AgentEvent::AgentEnd { .. }) => ends += 1,
             _ => {}

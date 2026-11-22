@@ -12,7 +12,8 @@ use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
 use crate::tools::{FileLedger, file_key};
 
 /// One loaded context file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextFile {
     pub path: PathBuf,
     /// The file's text, BOM stripped.

@@ -365,7 +365,7 @@ async fn input_after_stop_starts_the_next_run() {
     within(async {
         loop {
             if let SessionEvent::Agent(axo_agent::AgentEvent::ToolExecutionStart { .. }) =
-                events.recv().await.unwrap()
+                &*events.recv().await.unwrap()
             {
                 break;
             }
@@ -576,7 +576,7 @@ async fn dropping_a_prompt_future_still_settles_its_run() {
                         ..
                     },
                 ..
-            }) = events.recv().await.unwrap()
+            }) = &*events.recv().await.unwrap()
             {
                 break;
             }
@@ -714,8 +714,8 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
         let mut events = attach.events;
         within(async {
             loop {
-                if let SessionEvent::Entry(seq) = events.recv().await.unwrap()
-                    && is_done(&seq)
+                if let SessionEvent::Entry(seq) = &*events.recv().await.unwrap()
+                    && is_done(seq)
                 {
                     break;
                 }

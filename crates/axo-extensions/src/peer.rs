@@ -8,12 +8,13 @@
 //! future owns its pending entry: dropping it queues a cancel frame behind the call frame.
 //! A runner call naming a `parent` belongs to that host call and runs inside its future
 //! through the [`Callbacks`] it was given; one without a parent is a session action, run
-//! on its own task through the connection's [`Actions`]. The peer knows no method names.
+//! on its own task through the connection's [`Actions`] with the [`Origin`] it arrived on.
+//! The peer knows no method names.
 //! Any protocol violation, EOF, write failure or missed heartbeat closes the peer and fails
 //! every pending call with [`CallError::Unavailable`].
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -47,7 +48,7 @@ pub const PONG_DEADLINE: Duration = Duration::from_secs(10);
 /// Why Rust refuses a runner call; `code` and `message` go to the runner as-is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-    pub code: &'static str,
+    pub code: std::borrow::Cow<'static, str>,
     pub message: String,
 }
 
@@ -61,10 +62,33 @@ pub trait Callbacks: Send + Sync {
 pub trait Actions: Send + Sync {
     fn call(
         &self,
+        origin: Origin,
         ext: String,
         method: String,
         args: Value,
     ) -> BoxFuture<'static, Result<Value, Refusal>>;
+}
+
+/// The connection a session action arrived on. Calls reach that generation only, never a
+/// replacement.
+#[derive(Clone)]
+pub struct Origin {
+    inner: Weak<Inner>,
+    closed: CancellationToken,
+}
+
+impl Origin {
+    /// Calls a runner method for `ext` on this connection; `CallError::Unavailable` once it
+    /// is gone. Dropping the future withdraws the call.
+    pub async fn call(&self, ext: &str, method: &str, args: Value) -> Result<Value, CallError> {
+        let inner = self.inner.upgrade().ok_or(CallError::Unavailable)?;
+        inner.call(ext, method, args, None).await
+    }
+
+    /// Resolves once the connection is closed.
+    pub async fn closed(&self) {
+        self.closed.cancelled().await;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -243,55 +267,7 @@ impl Peer {
         args: Value,
         callbacks: Option<&dyn Callbacks>,
     ) -> Result<Value, CallError> {
-        let inner = &*self.inner;
-        let (reply, mut result) = oneshot::channel();
-        let (route, mut routed) = mpsc::unbounded_channel();
-        let id = {
-            let mut state = inner.lock();
-            if inner.closed.is_cancelled() {
-                return Err(CallError::Unavailable);
-            }
-            let id = state.next;
-            state.next += 1;
-            state.calls.insert(
-                id,
-                Pending {
-                    ext: ext.to_owned(),
-                    method: method.to_owned(),
-                    reply,
-                    callbacks: callbacks.is_some().then_some(route),
-                },
-            );
-            id
-        };
-        let mut outstanding = Outstanding {
-            inner,
-            id,
-            sent: false,
-        };
-        let mut call = Map::new();
-        call.insert("type".into(), "call".into());
-        call.insert("id".into(), format!("h:{id}").into());
-        call.insert("ext".into(), ext.into());
-        call.insert("method".into(), method.into());
-        call.insert("args".into(), args);
-        let frame = inner.frame(Value::Object(call)).ok_or(CallError::Invalid)?;
-        inner.enqueue(frame).await?;
-        outstanding.sent = true;
-
-        let mut served = FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                biased;
-                done = &mut result => return done.unwrap_or(Err(CallError::Unavailable)),
-                Some(callback) = routed.recv() => {
-                    if let Some(callbacks) = callbacks {
-                        served.push(inner.interact(callbacks, callback));
-                    }
-                }
-                Some(()) = served.next(), if !served.is_empty() => {}
-            }
-        }
+        self.inner.call(ext, method, args, callbacks).await
     }
 
     /// Resolves once the connection is closed.
@@ -351,18 +327,72 @@ impl State {
 
     /// The number of an issued `h:` ID.
     fn issued(&self, id: &str) -> Option<u64> {
-        let n = id
-            .strip_prefix("h:")
-            .filter(|n| is_counter(n))?
-            .parse()
-            .ok()?;
-        (n < self.next).then_some(n)
+        host_id(id).filter(|&n| n < self.next)
     }
 }
 
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// See [`Peer::call`].
+    async fn call(
+        &self,
+        ext: &str,
+        method: &str,
+        args: Value,
+        callbacks: Option<&dyn Callbacks>,
+    ) -> Result<Value, CallError> {
+        let inner = self;
+        let (reply, mut result) = oneshot::channel();
+        let (route, mut routed) = mpsc::unbounded_channel();
+        let id = {
+            let mut state = inner.lock();
+            if inner.closed.is_cancelled() {
+                return Err(CallError::Unavailable);
+            }
+            let id = state.next;
+            state.next += 1;
+            state.calls.insert(
+                id,
+                Pending {
+                    ext: ext.to_owned(),
+                    method: method.to_owned(),
+                    reply,
+                    callbacks: callbacks.is_some().then_some(route),
+                },
+            );
+            id
+        };
+        let mut outstanding = Outstanding {
+            inner,
+            id,
+            sent: false,
+        };
+        let mut call = Map::new();
+        call.insert("type".into(), "call".into());
+        call.insert("id".into(), format!("h:{id}").into());
+        call.insert("ext".into(), ext.into());
+        call.insert("method".into(), method.into());
+        call.insert("args".into(), args);
+        let frame = inner.frame(Value::Object(call)).ok_or(CallError::Invalid)?;
+        inner.enqueue(frame).await?;
+        outstanding.sent = true;
+
+        let mut served = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                biased;
+                done = &mut result => return done.unwrap_or(Err(CallError::Unavailable)),
+                Some(callback) = routed.recv() => {
+                    if let Some(callbacks) = callbacks {
+                        served.push(inner.interact(callbacks, callback));
+                    }
+                }
+                Some(()) = served.next(), if !served.is_empty() => {}
+            }
+        }
     }
 
     /// Closes once: fails every pending call and drops every live callback.
@@ -554,10 +584,14 @@ impl Inner {
             }
             None => {
                 let inner = Arc::clone(self);
+                let origin = Origin {
+                    inner: Arc::downgrade(self),
+                    closed: self.closed.clone(),
+                };
                 tokio::spawn(async move {
                     let answer = tokio::select! {
                         _ = cancel.cancelled() => return,
-                        answer = async { inner.actions.call(ext, method, args).await } => answer,
+                        answer = async { inner.actions.call(origin, ext, method, args).await } => answer,
                     };
                     inner.answer(id, answer).await;
                 });
@@ -669,6 +703,13 @@ fn is_counter(n: &str) -> bool {
     !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
 }
 
+fn host_id(id: &str) -> Option<u64> {
+    id.strip_prefix("h:")
+        .filter(|n| is_counter(n))?
+        .parse()
+        .ok()
+}
+
 fn is_runner_id(id: &str) -> bool {
     id.strip_prefix("r:").is_some_and(is_counter)
 }
@@ -715,6 +756,7 @@ mod tests {
     impl Actions for TestActions {
         fn call(
             &self,
+            _origin: Origin,
             ext: String,
             method: String,
             args: Value,
@@ -732,7 +774,7 @@ mod tests {
                         std::future::pending().await
                     }
                     _ => Err(Refusal {
-                        code: "no_session",
+                        code: "no_session".into(),
                         message: "session s is not attached".into(),
                     }),
                 }

@@ -10,7 +10,7 @@ use crate::transcript::TranscriptToolSupport;
 use crate::types::ThinkingLevel;
 
 /// The wire API a model is served through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 pub enum ApiKind {
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
@@ -20,7 +20,7 @@ pub enum ApiKind {
     OpenAiCodexResponses,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum InputKind {
     Text,
@@ -32,7 +32,7 @@ pub enum InputKind {
 pub type ThinkingLevelMap = BTreeMap<ThinkingLevel, Option<String>>;
 
 /// Prices in USD per million tokens.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Cost {
     pub input: f64,
@@ -45,7 +45,7 @@ pub struct Cost {
     pub tiers: Vec<CostTier>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CostTier {
     /// Use this tier when total request input exceeds this token count.
@@ -56,7 +56,7 @@ pub struct CostTier {
     pub cache_write: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     pub id: String,
@@ -110,7 +110,7 @@ impl Model {
 /// Compatibility quirks: the union of the compat fields pi's Anthropic Messages, OpenAI
 /// Completions and OpenAI (Codex) Responses adapters read (`providers/compat-schema.ts`).
 /// `None` means "auto-detect / API default".
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Compat {
     // Shared.
@@ -194,7 +194,7 @@ pub struct Compat {
     pub supports_mid_convo_tool_changes: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionAffinityFormat {
     Openai,
@@ -202,7 +202,7 @@ pub enum SessionAffinityFormat {
     Openrouter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum MaxTokensField {
     MaxCompletionTokens,
@@ -210,7 +210,7 @@ pub enum MaxTokensField {
 }
 
 /// Format of reasoning/thinking request parameters on OpenAI-compatible servers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThinkingFormat {
     Openai,
@@ -227,7 +227,7 @@ pub enum ThinkingFormat {
 }
 
 /// Top-level request field used to cap reasoning tokens on OpenAI-compatible servers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingTokenBudgetField {
     ThinkingTokenBudget,
@@ -235,7 +235,7 @@ pub enum ThinkingTokenBudgetField {
     ThinkingBudgetTokens,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheControlFormat {
     Anthropic,
@@ -243,7 +243,7 @@ pub enum CacheControlFormat {
 
 /// A `chat_template_kwargs`/`chat_template_args` value: a literal, or a variable the
 /// adapter fills from the requested thinking level.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(untagged)]
 pub enum ChatTemplateValue {
     Var {
@@ -259,7 +259,7 @@ pub enum ChatTemplateValue {
     Literal(Value),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 pub enum ThinkingVar {
     #[serde(rename = "thinking.enabled")]
     Enabled,

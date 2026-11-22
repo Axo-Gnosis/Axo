@@ -25,7 +25,9 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
 /// An entry id: pi's 8 random hex characters, or a full UUID after 100 collisions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, specta::Type,
+)]
 #[serde(transparent)]
 pub struct EntryId(pub String);
 
@@ -65,7 +67,7 @@ impl From<String> for EntryId {
 }
 
 /// Line 1 of a session file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename = "session", rename_all = "camelCase")]
 pub struct Header {
     #[serde(default)]
@@ -86,7 +88,7 @@ pub struct Header {
 }
 
 /// How a child session was spawned; stored in its header.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnLink {
     /// The parent's header id.
@@ -117,10 +119,20 @@ pub struct SpawnLink {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_write_ceiling"
     )]
+    #[specta(type = specta_serde::Phased<Option<WriteScope>, WriteCeilingInput>)]
     pub writes: Option<WriteScope>,
     /// The member's team; `None` outside teams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<TeamLink>,
+}
+
+/// A present scope must contain at least one layer.
+#[allow(dead_code)]
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum WriteCeilingInput {
+    Null(()),
+    Scope(WriteScope),
 }
 
 fn deserialize_write_ceiling<'de, D: Deserializer<'de>>(
@@ -136,8 +148,17 @@ fn deserialize_write_ceiling<'de, D: Deserializer<'de>>(
     Ok(scope)
 }
 
+/// Type-only shape of [`Entry::Unknown`]: a line whose tag or fields this build cannot decode.
+#[allow(dead_code)]
+#[derive(Deserialize, specta::Type)]
+pub(crate) struct RawEntry {
+    r#type: String,
+    #[serde(flatten)]
+    fields: std::collections::BTreeMap<String, Value>,
+}
+
 /// A team member's identity in its parent's registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamRef {
     /// `team_N`, numbered per parent session.
@@ -150,7 +171,7 @@ pub struct TeamRef {
 }
 
 /// A team member's place in its team; stored in its spawn link.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamLink {
     pub id: String,
@@ -176,7 +197,7 @@ impl TeamLink {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct RosterEntry {
     pub name: String,
@@ -207,7 +228,7 @@ impl Header {
 }
 
 /// Fields every entry shares.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryBase {
     pub id: EntryId,
@@ -244,7 +265,7 @@ fn is_zero(value: &i64) -> bool {
 }
 
 /// Model and thinking selection to restore when leaving a mode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ModeRestore {
     pub provider: String,
@@ -256,7 +277,7 @@ pub struct ModeRestore {
 ///
 /// A line whose `type` is unknown, or a known type whose fields do not parse,
 /// is kept as [`Entry::Unknown`] and serializes back unchanged.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
@@ -370,6 +391,7 @@ pub enum Entry {
         base: EntryBase,
         custom_type: String,
         #[serde(deserialize_with = "user_content")]
+        #[specta(type = specta_serde::Phased<Vec<UserBlock>, CustomMessageContent>)]
         content: Vec<UserBlock>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
@@ -523,7 +545,7 @@ pub enum Entry {
         value: Option<Value>,
     },
     #[serde(untagged)]
-    Unknown(Value),
+    Unknown(#[specta(type = RawEntry)] Value),
 }
 
 impl Entry {
@@ -649,12 +671,12 @@ impl Entry {
 
 /// `context_edit` replacement: user, assistant, tool-result or custom
 /// content, a string or a block array, kept raw.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 pub struct ContextReplacement {
     pub content: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
     Done,
@@ -664,7 +686,7 @@ pub enum RunOutcome {
 }
 
 /// What started a compaction checkpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
     /// `Session::compact` or `/compact`.
@@ -675,14 +697,14 @@ pub enum CompactionReason {
     Overflow,
 }
 /// The host-defined presentation of a submitted custom message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmittedCustom {
     pub custom_type: String,
     pub display: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionKind {
     Prompt,
@@ -696,14 +718,15 @@ pub enum SubmissionKind {
 }
 
 /// An entry with its position: the 0-based line index after the header.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 pub struct SeqEntry {
     pub seq: u64,
     pub entry: Entry,
 }
 
 /// One listed session, built from its header line and file metadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub path: PathBuf,
     pub id: String,
@@ -715,17 +738,18 @@ pub struct SessionInfo {
     pub modified: SystemTime,
 }
 
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum CustomMessageContent {
+    Text(String),
+    Blocks(Vec<UserBlock>),
+}
+
 /// pi stores `custom_message` content as a string or a block array.
 fn user_content<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<UserBlock>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Content {
-        Text(String),
-        Blocks(Vec<UserBlock>),
-    }
-    Ok(match Content::deserialize(deserializer)? {
-        Content::Text(text) => vec![UserBlock::Text { text }],
-        Content::Blocks(blocks) => blocks,
+    Ok(match CustomMessageContent::deserialize(deserializer)? {
+        CustomMessageContent::Text(text) => vec![UserBlock::Text { text }],
+        CustomMessageContent::Blocks(blocks) => blocks,
     })
 }
 

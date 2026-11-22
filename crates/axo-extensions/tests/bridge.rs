@@ -509,7 +509,7 @@ mod fake {
 
     use super::{CONTROL, read_frame, write_frame};
 
-    type Reply = Result<Value, String>;
+    type Reply = Result<Value, (String, String)>;
 
     struct Runner {
         control: PathBuf,
@@ -530,10 +530,14 @@ mod fake {
     /// - `ctl/<ext>/rewrite`: `ok` (path `/rewritten`, header `x-rewritten: yes`, body
     ///   `rewritten: true`) | `hang` | `exit` | `fail` (code "failed").
     /// - `ctl/<ext>/tool`: `ok` (parented partial update, then echo) | `state` (unparented
-    ///   appendCustom and custom, then report the stored value) | `hang` | `exit` | `fail`.
+    ///   appendCustom and custom, then report the stored value) | `reenter` (runs `/hello`,
+    ///   returns `refused` once the host refuses it) | `hang` | `exit` | `fail`.
     /// - `ctl/<ext>/policyBefore` and `ctl/<ext>/spawn`: `ok` | `block` (reason "no").
-    /// - `command` posts a quiet `lab` message, `event` records the journal type,
-    ///   and `schemeResolve` and `schemeRead` serve a virtual resource.
+    /// - `ctl/<ext>/command`: `ok` (posts a quiet `lab` message) | `subscribe` (records the
+    ///   id in `subs`) | `unsubscribe` | `reenter` (runs itself, expects a refusal) | `prompt`
+    ///   (prompts `go`) | `compact` (expects `busy`). `stream` records each frame in `streams`,
+    ///   `event` records the journal type, and `schemeResolve` and `schemeRead` serve a
+    ///   virtual resource.
     /// - Any method: `late` waits for `ctl/<ext>/release`, then replies as `ok` even if the
     ///   host canceled the call meanwhile.
     ///
@@ -621,7 +625,10 @@ mod fake {
                     let reply = if frame["type"] == "ok" {
                         Ok(frame["value"].clone())
                     } else {
-                        Err(frame["code"].as_str().unwrap_or_default().to_owned())
+                        Err((
+                            frame["code"].as_str().unwrap().to_owned(),
+                            frame["message"].as_str().unwrap().to_owned(),
+                        ))
                     };
                     if let Some(waiter) = runner.pending.lock().unwrap().remove(&id) {
                         let _ = waiter.send(reply);
@@ -672,8 +679,14 @@ mod fake {
             let _ = self.out.send(frame);
         }
 
-        /// A runner -> host callback, with a parent for login and tool updates only.
-        async fn ask(&self, ext: &str, parent: Option<&str>, method: &str, args: Value) -> Reply {
+        /// Callbacks belong to their parent `host_call`; session actions name none.
+        async fn ask(
+            &self,
+            ext: &str,
+            host_call: Option<&str>,
+            method: &str,
+            args: Value,
+        ) -> Reply {
             let id = {
                 let mut next = self.next.lock().unwrap();
                 *next += 1;
@@ -683,20 +696,27 @@ mod fake {
             self.pending.lock().unwrap().insert(id.clone(), tx);
             let mut frame =
                 json!({"type": "call", "id": id, "ext": ext, "method": method, "args": args});
-            if let Some(parent) = parent {
-                frame["parent"] = parent.into();
+            if let Some(host_call) = host_call {
+                frame["parent"] = host_call.into();
             }
             self.send(frame);
-            rx.await.unwrap_or_else(|_| Err("dropped".into()))
+            rx.await
+                .unwrap_or_else(|_| Err(("failed".into(), "dropped".into())))
         }
 
-        async fn handle(
-            &self,
-            id: &str,
-            ext: &str,
-            method: &str,
-            args: &Value,
-        ) -> Result<Value, (String, String)> {
+        async fn invoke(&self, ext: &str, target: &Value, method: &str, args: Value) -> Reply {
+            self.ask(
+                ext,
+                None,
+                "invoke",
+                json!({
+                    "object": "session", "target": target, "method": method, "args": args,
+                }),
+            )
+            .await
+        }
+
+        async fn handle(&self, id: &str, ext: &str, method: &str, args: &Value) -> Reply {
             let script = behavior(&self.control.join(ext).join(method));
             match script.as_str() {
                 "hang" => std::future::pending().await,
@@ -732,11 +752,9 @@ mod fake {
                         "openUrl",
                         json!({"url": "https://login.test/authorize"}),
                     )
-                    .await
-                    .map_err(fail)?;
+                    .await?;
                     self.ask(ext, Some(id), "progress", json!({"message": "waiting"}))
-                        .await
-                        .map_err(fail)?;
+                        .await?;
                     let answer = self
                         .ask(
                             ext,
@@ -744,8 +762,7 @@ mod fake {
                             "prompt",
                             json!({"message": "code", "secret": false}),
                         )
-                        .await
-                        .map_err(fail)?;
+                        .await?;
                     Ok(json!({
                         "type": "oauth",
                         "access": format!("access-{}", answer.as_str().unwrap()),
@@ -773,23 +790,22 @@ mod fake {
                     request["body"]["rewritten"] = true.into();
                     Ok(request)
                 }
+                "tool" if script == "reenter" => {
+                    let command = json!({"type": "registered", "name": "hello", "args": ""});
+                    match self.invoke(ext, &args["session"], "runCommand", json!([command])).await {
+                        Err((code, message)) if code == "host" && message.contains("already running in this session") => {
+                            Ok(json!({"content": [{"type": "text", "text": "refused"}]}))
+                        }
+                        other => Err(fail(format!("expected command re-entry refusal, got {other:?}"))),
+                    }
+                }
                 "tool" => {
                     let text =
                         if script == "state" {
-                            self.ask(ext, None, "appendCustom", json!({
-                            "session": args["session"], "customType": "lab", "data": {"n": 1},
-                        })).await.map_err(fail)?;
-                            self.ask(
-                                ext,
-                                None,
-                                "custom",
-                                json!({
-                                    "session": args["session"], "customType": "lab",
-                                }),
-                            )
-                            .await
-                            .map_err(fail)?
-                            .to_string()
+                            self.invoke(ext, &args["session"], "appendCustom", json!(["lab", {"n": 1}]))
+                                .await?;
+                            self.invoke(ext, &args["session"], "custom", json!(["lab"]))
+                                .await?.to_string()
                         } else {
                             self.ask(
                                 ext,
@@ -799,8 +815,7 @@ mod fake {
                                     "content": [{"type": "text", "text": "partial"}],
                                 }),
                             )
-                            .await
-                            .map_err(fail)?;
+                            .await?;
                             format!(
                                 "ext:{}:{}",
                                 args["tool"].as_str().unwrap(),
@@ -812,18 +827,46 @@ mod fake {
                 "policyBefore" if script == "block" => Ok(json!({"block": true, "reason": "no"})),
                 "spawn" if script == "block" => Ok(json!({"block": "no"})),
                 "policyBefore" | "policyAfter" | "spawn" => Ok(Value::Null),
-                "command" => self
-                    .ask(
-                        ext,
-                        None,
-                        "post",
-                        json!({
-                            "session": args["session"], "customType": "lab", "text": args["args"],
-                            "display": true, "delivery": "quiet",
-                        }),
-                    )
-                    .await
-                    .map_err(fail),
+                "command" if script == "subscribe" => {
+                    let reply = self.ask(ext, None, "subscribe", json!({
+                        "session": args["session"], "kinds": ["entry"]
+                    })).await?;
+                    append(&self.control.join(ext).join("subs"), reply["sub"].as_str().unwrap());
+                    Ok(Value::Null)
+                }
+                "command" if script == "unsubscribe" => {
+                    let request = json!({ "sub": args["args"] });
+                    let reply = self.ask(ext, None, "unsubscribe", request.clone()).await?;
+                    assert_eq!(reply, Value::Null);
+                    match self.ask(ext, None, "unsubscribe", request).await {
+                        Err((code, _)) if code == "no_subscription" => Ok(Value::Null),
+                        other => Err(fail(format!("expected no_subscription, got {other:?}"))),
+                    }
+                }
+                "stream" => {
+                    append(&self.control.join(ext).join("streams"), &args.to_string());
+                    Ok(Value::Null)
+                }
+                "command" if script == "reenter" => {
+                    let command = json!({"type": "registered", "name": args["command"], "args": ""});
+                    match self.invoke(ext, &args["session"], "runCommand", json!([command])).await {
+                        Err((code, message)) if code == "host" && message.contains("already running in this session") => Ok(Value::Null),
+                        other => Err(fail(format!("expected command re-entry refusal, got {other:?}"))),
+                    }
+                }
+                "command" if script == "prompt" => {
+                    self.invoke(ext, &args["session"], "prompt", json!(["go"])).await?;
+                    Ok(Value::Null)
+                }
+                "command" if script == "compact" => {
+                    match self.invoke(ext, &args["session"], "compact", json!([null])).await {
+                        Err((code, _)) if code == "busy" => Ok(Value::Null),
+                        other => Err(fail(format!("expected busy refusal, got {other:?}"))),
+                    }
+                }
+                "command" => self.invoke(ext, &args["session"], "post", json!([{
+                    "customType": "lab", "text": args["args"], "display": true, "delivery": "quiet",
+                }])).await,
                 "event" => {
                     append(
                         &self.control.join(ext).join("entries"),

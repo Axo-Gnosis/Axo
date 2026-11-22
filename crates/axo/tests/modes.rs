@@ -737,7 +737,7 @@ fn result_options(dir: &Path, review: bool, then: Option<&str>) -> SessionOption
 }
 
 async fn next_mode_result(
-    events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<SessionEvent>>,
 ) -> (String, String, Value, bool) {
     within(async {
         loop {
@@ -746,9 +746,14 @@ async fn next_mode_result(
                 mode,
                 result,
                 awaiting_review,
-            } = events.recv().await.unwrap()
+            } = &*events.recv().await.unwrap()
             {
-                return (call_id, mode, result, awaiting_review);
+                return (
+                    call_id.clone(),
+                    mode.clone(),
+                    result.clone(),
+                    *awaiting_review,
+                );
             }
         }
     })
@@ -756,17 +761,17 @@ async fn next_mode_result(
 }
 
 async fn result_resolved(
-    events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<SessionEvent>>,
     expected: &str,
     expected_outcome: ResultResolution,
 ) {
     within(async {
         loop {
             if let SessionEvent::ModeResultResolved { call_id, outcome } =
-                events.recv().await.unwrap()
+                &*events.recv().await.unwrap()
             {
                 assert_eq!(call_id, expected);
-                assert_eq!(outcome, expected_outcome);
+                assert_eq!(*outcome, expected_outcome);
                 return;
             }
         }
@@ -1310,7 +1315,7 @@ async fn invalid_yield_arguments_leave_the_mode_active() {
         .join("\n");
     assert!(text.contains("Validation failed for tool \"yield\""));
     while let Ok(event) = events.try_recv() {
-        assert!(!matches!(event, SessionEvent::ModeResult { .. }));
+        assert!(!matches!(&*event, SessionEvent::ModeResult { .. }));
     }
     session.shutdown().await;
 }

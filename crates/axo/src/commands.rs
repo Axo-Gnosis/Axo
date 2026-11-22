@@ -19,7 +19,12 @@ use crate::session::{Session, ShakeMode, normalize_focus};
 use crate::store::EntryId;
 
 /// A built-in session operation, mode or registered command, decoded and validated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Command {
     Compact {
         focus: Option<String>,
@@ -69,7 +74,7 @@ pub struct RegisteredCommand {
 }
 
 /// How a command behaves while a turn is running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandPolicy {
     /// Runs during a turn or maintenance and takes effect from the next request.
@@ -80,7 +85,7 @@ pub enum CommandPolicy {
     Queued,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -99,7 +104,7 @@ pub enum CommandKind {
 }
 
 /// One entry of the command catalog; hosts expose whichever entries they want, in any form.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandInfo {
     pub name: String,

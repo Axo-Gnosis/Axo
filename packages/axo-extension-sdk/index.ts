@@ -28,118 +28,8 @@
 //   exactly when the manifest sets `"spawnHook"` and `"events"`.
 // Unknown keys, undeclared names and missing handlers fail activation.
 
-/** Any JSON value. */
-export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | JsonValue[]
-  | { [key: string]: JsonValue };
-
-// ---- Model (the Rust `axo_ai::Model` serde shape) ----
-
-export type ApiKind = "anthropic-messages" | "openai-completions" | "openai-codex-responses";
-
-export type InputKind = "text" | "image";
-
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-/** Provider value per thinking level: a missing key uses the provider default; `null` marks the level unsupported. */
-export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
-
-/** Prices in USD per million tokens. */
-export interface Cost {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** Request-wide tiers; the highest matching input threshold applies to the whole request. */
-  tiers?: CostTier[];
-}
-
-export interface CostTier {
-  inputTokensAbove: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-}
-
-export type ChatTemplateValue =
-  | { $var: "thinking.enabled" | "thinking.effort" | "thinking.budget"; omitWhenOff?: boolean }
-  | JsonValue;
-
-/** Compatibility quirks; an absent field means "auto-detect / API default". */
-export interface Compat {
-  // Shared.
-  supportsDeveloperRole?: boolean;
-  supportsMidConvoSystemMessages?: boolean;
-  supportsMidConvoEffort?: boolean;
-  sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
-  sendSessionAffinityHeaders?: boolean;
-  supportsStrictMode?: boolean;
-
-  // OpenAI Completions.
-  supportsStore?: boolean;
-  supportsReasoningEffort?: boolean;
-  supportsUsageInStreaming?: boolean;
-  supportsFinishReason?: boolean;
-  maxTokensField?: "max_completion_tokens" | "max_tokens";
-  requiresToolResultName?: boolean;
-  requiresAssistantAfterToolResult?: boolean;
-  requiresThinkingAsText?: boolean;
-  requiresReasoningContentOnAssistantMessages?: boolean;
-  thinkingFormat?:
-    | "openai"
-    | "openrouter"
-    | "deepseek"
-    | "together"
-    | "baseten"
-    | "zai"
-    | "qwen"
-    | "chat-template"
-    | "qwen-chat-template"
-    | "string-thinking"
-    | "ant-ling";
-  chatTemplateKwargs?: Record<string, ChatTemplateValue>;
-  chatTemplateArgs?: Record<string, ChatTemplateValue>;
-  openRouterRouting?: JsonValue;
-  vercelGatewayRouting?: JsonValue;
-  zaiToolStream?: boolean;
-  thinkingTokenBudgetField?: "thinking_token_budget" | "thinking_budget" | "thinking_budget_tokens";
-  supportsThinkingTokenBudget?: boolean;
-  supportsMidConvoToolAdditions?: boolean;
-  cacheControlFormat?: "anthropic";
-  vllmPriority?: number;
-
-  // OpenAI Responses.
-  supportsAdditionalTools?: boolean;
-  supportsToolSearch?: boolean;
-
-  // Anthropic Messages.
-  supportsEagerToolInputStreaming?: boolean;
-  supportsCacheControlOnTools?: boolean;
-  supportsTemperature?: boolean;
-  forceAdaptiveThinking?: boolean;
-  allowEmptySignature?: boolean;
-  supportsMidConvoToolChanges?: boolean;
-}
-
-export interface Model {
-  id: string;
-  name: string;
-  api: ApiKind;
-  provider: string;
-  baseUrl: string;
-  reasoning: boolean;
-  thinkingLevelMap?: ThinkingLevelMap;
-  input: InputKind[];
-  cost: Cost;
-  contextWindow: number;
-  maxTokens: number;
-  compat: Compat;
-}
+import type { AgentSpec, ErrorCode, Model, SeqEntry, Session, SessionEvent, SessionEventKind, ThinkingLevel, ToolCall, UserBlock, Value } from "./bindings.ts";
+export type * from "./bindings.ts";
 
 // ---- Credentials (the Rust `axo_ai::auth::Credential` serde shape) ----
 
@@ -175,7 +65,7 @@ export interface ProviderRequest {
   url: string;
   /** Ordered `[name, value]` pairs; duplicate names are separate values. */
   headers: [name: string, value: HeaderValue][];
-  body: JsonValue;
+  body: Value;
 }
 
 // ---- Login interaction (the host UI) ----
@@ -238,50 +128,42 @@ export type ProviderHandlers = LoginHandlers & RewriteHandler;
 
 // ---- Sessions ----
 
-/** A user-visible content block (the Rust `UserBlock` serde shape). */
-export type UserBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+export type SessionStreamEvent =
+  | SessionEvent
+  | { type: "lagged"; value: { skipped: number } }
+  | { type: "closed"; value: null };
 
 /**
  * Acts on one session while the host has it attached; calls on a session the host no longer
  * tracks reject.
  */
-export interface SessionHandle {
-  id: string;
-  /**
-   * Adds a custom message to the session's context. `steer` lands at the next turn boundary,
-   * `followUp` when the active run would end (both start a run when idle); `quiet` waits for
-   * the next turn boundary or run start and never starts a run. The host stores the type as
-   * `<extension id>:<customType>`.
-   */
-  post(message: {
-    customType: string;
-    text: string;
-    display: boolean;
-    delivery: "steer" | "followUp" | "quiet";
-  }): Promise<void>;
-  /**
-   * Appends branch-scoped state without adding a context message; forks and reopens keep it.
-   * The host stores the type as `<extension id>:<customType>`.
-   */
-  appendCustom(customType: string, data?: JsonValue): Promise<void>;
-  /**
-   * The latest `appendCustom` data of `customType` on the current root-to-leaf path, or `null`.
-   * Reads this extension's own `<extension id>:<customType>` entries.
-   */
-  custom(customType: string): Promise<JsonValue | null>;
-}
+export type SessionHandle = Session & {
+  readonly id: string;
+  subscribe(
+    listener: (event: SessionStreamEvent) => void | Promise<void>,
+    kinds?: SessionEventKind[],
+  ): Promise<{ close(): Promise<void> }>;
+};
 
-export interface ToolCall {
-  id: string;
-  name: string;
-  arguments: Record<string, JsonValue>;
-}
+export type HostErrorCode =
+  | ErrorCode
+  | "unknown_method"
+  | "invalid_arguments"
+  | "encode"
+  | "no_session"
+  | "no_subscription"
+  | "unsupported"
+  | "stalled"
+  /** The bridge could not decode the action's arguments. */
+  | "invalid"
+  /** The host's reply would exceed the 64 MiB frame bound. */
+  | "too_large";
 
 export interface ToolResult {
   /** Model-facing result. */
   content: UserBlock[];
   /** Host/log data; never reaches the model. */
-  details?: JsonValue;
+  details?: Value;
   isError?: boolean;
   /** Hint to stop after this batch; only honored when every result in the batch sets it. */
   terminate?: boolean;
@@ -289,14 +171,14 @@ export interface ToolResult {
 
 export interface ToolRun {
   call: ToolCall;
-  session: SessionHandle;
+  sessionId: string;
   /** Aborts when the host cancels the call. */
   signal: AbortSignal;
   /**
    * A partial result the host shows while the tool runs. The result is sent only after the host
    * has answered every update; one the host refuses is dropped.
    */
-  update(update: { content: UserBlock[]; details?: JsonValue }): void;
+  update(update: { content: UserBlock[]; details?: Value }): void;
 }
 
 export type ToolHandler = (run: ToolRun) => Promise<ToolResult>;
@@ -323,15 +205,14 @@ export interface ToolPolicy {
   after?(
     scope: ToolScope,
     call: ToolCall,
-    result: { content: UserBlock[]; details?: JsonValue; isError: boolean },
+    result: { content: UserBlock[]; details?: Value; isError: boolean },
     signal: AbortSignal,
-  ): Promise<null | { content?: UserBlock[]; details?: JsonValue; isError?: boolean; terminate?: boolean }>;
+  ): Promise<null | { content?: UserBlock[]; details?: Value; isError?: boolean; terminate?: boolean }>;
 }
 
-/** A child agent about to be spawned. */
-export interface SpawnRequest {
-  /** The agent spec (the Rust `AgentSpec` serde shape). */
-  spec: JsonValue;
+/** A child agent about to be spawned: the bridge's summary of the Rust `SpawnContext` (see `RemoteSpawnHook`), not its full shape. */
+export interface SpawnContext {
+  spec: AgentSpec;
   agent: string | null;
   mode: string | null;
   /** `provider/id`. */
@@ -344,10 +225,10 @@ export interface SpawnRequest {
 
 /** `null` allows the spawn; `block` refuses it with a reason; `replace` spawns another `AgentSpec`. */
 export type SpawnHook = (
-  spawn: SpawnRequest,
-  session: SessionHandle,
+  spawn: SpawnContext,
+  sessionId: string,
   signal: AbortSignal,
-) => Promise<null | { block: string } | { replace: JsonValue }>;
+) => Promise<null | { block: string } | { replace: AgentSpec }>;
 
 export interface SchemeContext {
   /** The scheme name, without `://`. */
@@ -387,11 +268,12 @@ export interface Handlers {
   toolPolicy?: ToolPolicy;
   spawnHook?: SpawnHook;
   /**
-   * New journal entries of attached sessions, in stored JSON shape and append order. Best effort
-   * with no replay: entries are skipped when the stream lags, the runner is unavailable or this
-   * handler throws.
+   * New journal entries of attached sessions with their sequence numbers, in stored JSON shape
+   * and append order. Best effort with no replay: entries are skipped when the stream lags, the
+   * runner is unavailable or this handler throws. An entry these bindings do not know arrives
+   * with a `RawEntry` payload.
    */
-  onEntry?: (entry: JsonValue, session: SessionHandle) => void | Promise<void>;
+  onEntry?: (entry: SeqEntry, session: SessionHandle) => void | Promise<void>;
 }
 
 /** The type of an extension's default export. */

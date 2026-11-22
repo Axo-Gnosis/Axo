@@ -443,6 +443,7 @@ impl Shared {
             "dataDir": data_dir,
             "providers": providers,
             "session": member.session,
+            "sessionMethods": crate::session::session_methods(),
         });
         match tokio::time::timeout(
             ACTIVATE_DEADLINE,

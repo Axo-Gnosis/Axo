@@ -26,9 +26,27 @@ use tokio::sync::broadcast::error::TryRecvError;
 use crate::host::{Host, SESSION, WAIT_LIMIT, wait_for};
 
 const ORIGIN: &str = "extension lab-session";
+const FOCUS: &str = "keep the plan and open questions";
 
 pub async fn run(bun: &Path, mode: Supervision) {
     let (host, api) = Host::sessions(bun, mode).await;
+    let sdk = std::process::Command::new(bun)
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args([
+            "build",
+            "--no-bundle",
+            "packages/axo-extension-sdk/index.ts",
+            "packages/axo-extension-sdk/bindings.ts",
+            "--outdir",
+        ])
+        .arg(host.path("sdk"))
+        .output()
+        .unwrap();
+    assert!(
+        sdk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sdk.stderr)
+    );
     let data = host.data_dir(SESSION);
     let options = host
         .extensions
@@ -56,7 +74,7 @@ pub async fn run(bun: &Path, mode: Supervision) {
     assert_eq!(text(&r1), r#"ext:read:{"path":"a"}"#);
     let mut updated = false;
     loop {
-        match events.try_recv() {
+        match events.try_recv().as_deref() {
             Ok(SessionEvent::Agent(AgentEvent::ToolExecutionUpdate { call_id, update }))
                 if call_id == "r1" =>
             {
@@ -150,15 +168,16 @@ pub async fn run(bun: &Path, mode: Supervision) {
         }
     );
     bounded(session.run_command(command)).await.unwrap();
-    let posted = session.attach(None).await.missed.iter().any(|seq| {
-        matches!(
-            &seq.entry,
-            Entry::Submission { custom: Some(SubmittedCustom { custom_type, .. }), parts, .. }
-                if custom_type == "lab-session:lab"
-                    && matches!(parts.as_slice(), [PromptPart::Text { text }] if text == "hi")
-        )
-    });
-    assert!(posted, "no lab submission with text hi was journaled");
+    assert_posted(&session, "hi").await;
+
+    let again = session.parse_command("/again").unwrap().unwrap();
+    tokio::time::timeout(WAIT_LIMIT, session.run_command(again))
+        .await
+        .expect("recursive command hung")
+        .unwrap();
+    assert_posted(&session, "command /again: already running in this session").await;
+
+    let compact = session.parse_command("/compact-light").unwrap().unwrap();
 
     // Every entry appended since attach reached `onEntry` with its stored `type`.
     let entries = data.join("entries");
@@ -183,6 +202,8 @@ pub async fn run(bun: &Path, mode: Supervision) {
     );
     let (outcome, ()) = tokio::join!(bounded(session.prompt("hang")), async {
         host.wait_file(SESSION, "probe-started").await;
+        bounded(session.run_command(compact.clone())).await.unwrap();
+        assert_posted(&session, "busy").await;
         session.abort();
     });
     assert!(
@@ -209,6 +230,56 @@ pub async fn run(bun: &Path, mode: Supervision) {
         (ExtensionPhase::Ready, generation)
     );
 
+    // An idle compact summarizes history, and can also issue a separate split-turn
+    // request for the last tool call. Both must carry the extension's focus.
+    let before = api.requests().len();
+    api.lane(
+        "m",
+        vec![ScriptedTurn::Reply(reply_text("Lab summary.")); 2],
+    );
+    bounded(session.run_command(compact)).await.unwrap();
+    assert!(session.attach(None).await.missed.iter().any(|seq| matches!(
+        &seq.entry,
+        Entry::Compaction { focus: Some(focus), .. } if focus == FOCUS
+    )));
+    assert_summary_focus(&api, before, FOCUS);
+
+    let watch = session.parse_command("/watch").unwrap().unwrap();
+    bounded(session.run_command(watch)).await.unwrap();
+    let cursor = session.attach(None).await.missed.last().unwrap().seq;
+    api.lane("m", vec![ScriptedTurn::Reply(reply_text("watched"))]);
+    assert_eq!(
+        bounded(session.prompt("watch this turn")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let expected: Vec<_> = session
+        .attach(Some(cursor))
+        .await
+        .missed
+        .into_iter()
+        .map(|entry| entry.seq)
+        .collect();
+    assert!(expected.len() >= 2 && expected.windows(2).all(|pair| pair[0] < pair[1]));
+    let log = data.join("watch.log");
+    wait_for("the watched journal entries", || {
+        std::fs::read_to_string(&log).is_ok_and(|seen| seen.lines().count() >= expected.len())
+    })
+    .await;
+    let seen: Vec<u64> = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    assert_eq!(seen, expected);
+
+    let flood = session.parse_command("/flood").unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(40), async {
+        session.run_command(flood).await.unwrap();
+        assert_posted(&session, "stalled").await;
+    })
+    .await
+    .expect("the queued command did not report a stall");
+
     // The state survives a reopen.
     let path = session.path().to_path_buf();
     host.extensions.detach(session.id());
@@ -219,7 +290,116 @@ pub async fn run(bun: &Path, mode: Supervision) {
     assert_eq!(reopened.custom("lab-session:lab"), Some(json!({"n": 1})));
     reopened.shutdown().await;
     drop(reopened);
+
+    let mut options = host.session_options(Some("test/m"));
+    options.modes.push(axo::ModeSpec {
+        name: "plan".into(),
+        description: "Plan".into(),
+        body: "Plan first.".into(),
+        ..Default::default()
+    });
+    let session = Arc::new(
+        host.axo
+            .create_session(host.extensions.compose(options))
+            .await
+            .unwrap(),
+    );
+    host.extensions.attach(&session).await;
+    bounded(plan_task(&session, &api)).await;
+    bounded(skill_input(&session, &api)).await;
+    bounded(skill_focus(&session, &api)).await;
+    host.extensions.detach(session.id());
+    session.shutdown().await;
+    drop(session);
     host.close().await;
+}
+
+async fn plan_task(session: &Session, api: &ScriptedApi) {
+    assert_command_submits(session, api, "/plan-task do X", "do X").await;
+    assert_eq!(session.mode().unwrap().name, "plan");
+}
+
+async fn skill_input(session: &Session, api: &ScriptedApi) {
+    let rendered = review_block(session).await;
+    assert_command_submits(session, api, "/skill-input a b", &rendered).await;
+}
+
+async fn skill_focus(session: &Session, api: &ScriptedApi) {
+    let before = api.requests().len();
+    api.lane(
+        "m",
+        vec![ScriptedTurn::Reply(reply_text("Review summary.")); 2],
+    );
+    let command = session.parse_command("/skill-focus a b").unwrap().unwrap();
+    session.run_command(command).await.unwrap();
+    assert_summary_focus(api, before, &review_block(session).await);
+}
+
+async fn review_block(session: &Session) -> String {
+    session.render_skill("review", "a b").await.unwrap()
+}
+
+async fn assert_command_submits(session: &Session, api: &ScriptedApi, input: &str, expected: &str) {
+    let before = api.requests().len();
+    api.lane("m", vec![ScriptedTurn::Reply(reply_text("done"))]);
+    let command = session.parse_command(input).unwrap().unwrap();
+    session.run_command(command).await.unwrap();
+    wait_for(input, || {
+        !session.is_running() && api.requests().len() > before
+    })
+    .await;
+    // Context notices (mode entry, deferred-tool changes) may follow the submission in the same
+    // request, so look for it among every user message rather than only the last one.
+    let submitted = api.requests()[before].transcript.iter().any(|message| {
+        matches!(message, Message::User(user)
+            if user.content.iter().filter_map(UserBlock::as_text).any(|text| text == expected))
+    });
+    assert!(
+        submitted,
+        "{input}: next request did not submit {expected:?}"
+    );
+}
+
+fn assert_summary_focus(api: &ScriptedApi, before: usize, focus: &str) {
+    let requests = api.requests();
+    assert!(requests.len() > before, "no summary request");
+    let instruction = format!("Focus from the user: {focus}\n");
+    for request in &requests[before..] {
+        assert!(
+            last_user_text(request).any(|text| text.contains(&instruction)),
+            "summary request omitted the focus"
+        );
+    }
+}
+
+fn last_user_text(request: &axo_ai::testing::RecordedRequest) -> impl Iterator<Item = &str> {
+    request
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .expect("request has a user message")
+        .content
+        .iter()
+        .filter_map(UserBlock::as_text)
+}
+
+async fn assert_posted(session: &Session, expected: &str) {
+    let posted = session.attach(None).await.missed.iter().any(|seq| {
+        matches!(
+            &seq.entry,
+            Entry::Submission { custom: Some(SubmittedCustom { custom_type, .. }), parts, .. }
+                if custom_type == "lab-session:lab"
+                    && matches!(parts.as_slice(), [PromptPart::Text { text }] if text == expected)
+        )
+    });
+    assert!(
+        posted,
+        "no lab submission with text {expected:?} was journaled"
+    );
 }
 
 /// Runs one prompt whose model calls `calls` once, then answers `done`.

@@ -19,7 +19,7 @@ use super::pending::Pending;
 
 pub(crate) const ASK: &str = "ask";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Question {
     pub id: String,
@@ -35,7 +35,7 @@ pub struct Question {
     pub recommended: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionOption {
     pub label: String,
@@ -46,7 +46,7 @@ pub struct QuestionOption {
 }
 
 /// The client's answer to one question.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Answer {
     /// The question's `id`.
@@ -70,13 +70,13 @@ pub(crate) enum AskOutcome {
 /// broadcasts `SessionEvent::QuestionPending`; the session's `answer`/`dismiss` settle it
 /// and broadcast `SessionEvent::QuestionResolved`.
 pub(crate) struct PendingQuestions {
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<Arc<SessionEvent>>,
     pending: Pending<Vec<Question>, AskOutcome>,
 }
 
 impl PendingQuestions {
     /// `events` is the session's event channel.
-    pub fn new(events: broadcast::Sender<SessionEvent>) -> Self {
+    pub fn new(events: broadcast::Sender<Arc<SessionEvent>>) -> Self {
         Self {
             events,
             pending: Pending::default(),
@@ -87,10 +87,10 @@ impl PendingQuestions {
     /// registration under the same id replaces the first, whose receiver then closes.
     pub fn ask(&self, call_id: &str, questions: Vec<Question>) -> oneshot::Receiver<AskOutcome> {
         let rx = self.pending.register(call_id, questions.clone());
-        let _ = self.events.send(SessionEvent::QuestionPending {
+        let _ = self.events.send(Arc::new(SessionEvent::QuestionPending {
             call_id: call_id.to_owned(),
             questions,
-        });
+        }));
         rx
     }
 
@@ -113,9 +113,9 @@ impl PendingQuestions {
         if !self.pending.settle(call_id, outcome) {
             return Err(Error::NoPendingQuestion(call_id.to_owned()));
         }
-        let _ = self.events.send(SessionEvent::QuestionResolved {
+        let _ = self.events.send(Arc::new(SessionEvent::QuestionResolved {
             call_id: call_id.to_owned(),
-        });
+        }));
         Ok(())
     }
 
@@ -124,9 +124,9 @@ impl PendingQuestions {
     /// registration under the same id still has its receiver and is kept.
     fn withdraw(&self, call_id: &str) {
         if self.pending.withdraw(call_id) {
-            let _ = self.events.send(SessionEvent::QuestionResolved {
+            let _ = self.events.send(Arc::new(SessionEvent::QuestionResolved {
                 call_id: call_id.to_owned(),
-            });
+            }));
         }
     }
 }

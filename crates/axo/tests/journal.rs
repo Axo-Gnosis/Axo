@@ -265,10 +265,13 @@ async fn await_file(path: &Path) {
 }
 
 /// Waits for an appended entry matching `pred`.
-async fn await_entry(events: &mut broadcast::Receiver<SessionEvent>, pred: fn(&Entry) -> bool) {
+async fn await_entry(
+    events: &mut broadcast::Receiver<Arc<SessionEvent>>,
+    pred: fn(&Entry) -> bool,
+) {
     within(async {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Entry(seq)) if pred(&seq.entry) => return,
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("session closed"),

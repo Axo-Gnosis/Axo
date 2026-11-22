@@ -161,7 +161,8 @@ pub(super) struct OutputState {
 }
 
 /// The flushed output prefix and whether the command and its helpers have finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct OutputProgress {
     /// Raw bytes available to read.
     pub bytes: u64,
@@ -175,6 +176,7 @@ pub struct OutputProgress {
 pub struct CommandOutput {
     job: String,
     artifact: u64,
+    path: PathBuf,
     file: Arc<std::fs::File>,
     index: Option<Arc<std::fs::File>>,
     progress: watch::Receiver<OutputProgress>,
@@ -194,6 +196,7 @@ impl CommandOutput {
     pub(super) fn new(
         job: String,
         artifact: u64,
+        path: PathBuf,
         file: std::fs::File,
         index: Option<std::fs::File>,
         progress: watch::Receiver<OutputProgress>,
@@ -201,10 +204,16 @@ impl CommandOutput {
         Self {
             job,
             artifact,
+            path,
             file: Arc::new(file),
             index: index.map(Arc::new),
             progress,
         }
+    }
+
+    /// The raw log file being read.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Opens a retained log, including copied fork logs and historical unlabelled logs.
@@ -234,7 +243,14 @@ impl CommandOutput {
             done: true,
             capture_failed,
         });
-        Ok(Self::new(job, artifact, file, index, progress))
+        Ok(Self::new(
+            job,
+            artifact,
+            path.to_owned(),
+            file,
+            index,
+            progress,
+        ))
     }
 
     /// Reads labeled raw chunks over a byte range clamped once to the flushed prefix. Missing metadata is `Merged`.
@@ -1332,6 +1348,7 @@ mod tests {
         let output = CommandOutput::new(
             "bg_0".into(),
             0,
+            path.clone(),
             std::fs::File::open(&path).unwrap(),
             Some(std::fs::File::open(stream_index_path(&path)).unwrap()),
             rx,

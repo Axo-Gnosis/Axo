@@ -4,26 +4,40 @@
 
 mod bindings;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use axo::{
-    AgentSpec, Exposure, HostDelivery, HostMessage, HostTool, KeywordSpec, ModeSpec,
-    RegisteredCommand, Registrations, Scheme, Session, SessionEvent, SessionOptions, SessionTools,
+    AgentSpec, Exposure, HostTool, KeywordSpec, ModeSpec, RegisteredCommand, Registrations, Scheme,
+    Session, SessionEvent, SessionEventKind, SessionOptions, SessionTools,
 };
 use futures::future::{BoxFuture, join_all};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 
 use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook, RemoteTool};
 use crate::manifest::{self, PolicyHook, SessionDecl};
-use crate::peer::{Actions, Callbacks, Refusal};
+use crate::peer::{Actions, CallError, Callbacks, Origin, Refusal};
 use crate::remote::{self, CALL_DEADLINE, Failure};
 use crate::{ExtensionDiagnostic, ExtensionEvent, Extensions, Inner, gate};
+
+/// The session methods an extension may `invoke`, as the runner's handles name them.
+pub(crate) fn session_methods() -> &'static [&'static str] {
+    static METHODS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        axo::ext::session_blocks()
+            .iter()
+            .flat_map(|block| block.entries)
+            .filter(|entry| entry.call.is_some())
+            .map(|entry| entry.meta.name)
+            .collect()
+    });
+    &METHODS
+}
 
 /// What one admitted extension contributes to sessions, runnable or not.
 pub(crate) struct Contribution {
@@ -106,7 +120,12 @@ impl Extensions {
         let id = session.id().to_owned();
         let events = session.subscribe();
         let epoch = inner.sessions.epochs.fetch_add(1, Ordering::Relaxed);
-        let pump = tokio::spawn(pump(Arc::downgrade(inner), id.clone(), epoch, events));
+        let pump = tokio::spawn(pump(
+            inner.sessions.inner.clone(),
+            id.clone(),
+            epoch,
+            events,
+        ));
         {
             let mut sessions = inner.sessions.lock();
             let attached = sessions.entry(id.clone()).or_default();
@@ -124,7 +143,7 @@ impl Extensions {
 
     /// Stops tracking; the session keeps what it has.
     pub fn detach(&self, session_id: &str) {
-        self.inner.sessions.remove(session_id, None);
+        self.inner.sessions.detach(session_id);
     }
 
     /// Composition diagnostics of the last apply to this session.
@@ -283,11 +302,14 @@ async fn pump(
     inner: Weak<Inner>,
     id: String,
     epoch: u64,
-    mut events: broadcast::Receiver<SessionEvent>,
+    mut events: broadcast::Receiver<Arc<SessionEvent>>,
 ) {
     loop {
         match events.recv().await {
-            Ok(SessionEvent::Entry(entry)) => {
+            Ok(event) => {
+                let SessionEvent::Entry(entry) = &*event else {
+                    continue;
+                };
                 let Some(strong) = inner.upgrade() else {
                     return;
                 };
@@ -313,7 +335,6 @@ async fn pump(
                         .await;
                 }
             }
-            Ok(_) => {}
             Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(session = %id, skipped, "extension entry events lagged");
             }
@@ -327,12 +348,85 @@ async fn pump(
     }
 }
 
+/// One subscription, bound to the runner generation that made it: it ends when that
+/// connection closes, on `unsubscribe`, on detach (after a `closed` frame), or when the
+/// session's channel closes (likewise after `closed`). It has at most one unacknowledged
+/// event and no delivery deadline; slow listeners learn of any resulting broadcast lag
+/// before they see the next available event.
+async fn stream(
+    inner: Weak<Inner>,
+    origin: Origin,
+    ext: String,
+    id: String,
+    mut events: broadcast::Receiver<Arc<SessionEvent>>,
+    kinds: Option<Vec<SessionEventKind>>,
+    stop: CancellationToken,
+) {
+    let closed = || json!({ "sub": id, "closed": true });
+    let lagged = |n: u64| json!({ "sub": id, "lagged": n });
+    loop {
+        let args = tokio::select! {
+            biased;
+            () = origin.closed() => break,
+            () = stop.cancelled() => {
+                let _ = origin.call(&ext, "stream", closed()).await;
+                break;
+            }
+            received = events.recv() => match received {
+                Ok(event) => {
+                    if kinds.as_ref().is_some_and(|k| !k.contains(&event.kind())) {
+                        continue;
+                    }
+                    match serde_json::to_value(&*event) {
+                        Ok(event) => json!({ "sub": id, "event": event }),
+                        Err(error) => {
+                            tracing::warn!(sub = %id, %error, "session event is not serializable; reported as lag");
+                            lagged(1)
+                        }
+                    }
+                }
+                Err(RecvError::Lagged(n)) => lagged(n),
+                Err(RecvError::Closed) => closed(),
+            }
+        };
+        let last = args.get("closed").is_some();
+        let delivered = tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                let _ = origin.call(&ext, "stream", closed()).await;
+                break;
+            }
+            delivered = origin.call(&ext, "stream", args) => delivered,
+        };
+        match delivered {
+            Ok(_) if !last => {}
+            // Too large to frame: the listener learns it missed one.
+            Err(CallError::Invalid) if !last => {
+                if origin.call(&ext, "stream", lagged(1)).await.is_err() {
+                    break;
+                }
+            }
+            // Done, the generation is gone, or the runner has no listener for it.
+            _ => break,
+        }
+    }
+    if let Some(inner) = inner.upgrade() {
+        inner.sessions.subs().remove(&id);
+    }
+}
+
 /// One extension's runner, resolved per call so handlers installed in children and
 /// unattached forks follow a `reload`.
 #[derive(Clone)]
 pub(crate) struct Remote {
     inner: Weak<Inner>,
     ext: String,
+}
+
+fn shut(ext: &str) -> Failure {
+    Failure::Removed(format!(
+        "extension {ext}: the extension manager is shut down"
+    ))
 }
 
 impl Remote {
@@ -346,14 +440,9 @@ impl Remote {
     ) -> Result<Value, Failure> {
         let ext = &self.ext;
         let placement = {
-            let shut = || {
-                Failure::Removed(format!(
-                    "extension {ext}: the extension manager is shut down"
-                ))
-            };
-            let inner = self.inner.upgrade().ok_or_else(shut)?;
+            let inner = self.inner.upgrade().ok_or_else(|| shut(ext))?;
             if inner.closed.is_cancelled() {
-                return Err(shut());
+                return Err(shut(ext));
             }
             let state = inner.lock();
             match state.member_of.get(ext) {
@@ -369,13 +458,56 @@ impl Remote {
         let label = format!("extension {ext} {what}");
         remote::call(&placement, ext, &label, method, args, callbacks, deadline).await
     }
+
+    /// Claims `command` on `session` for this extension. `Failure::Invalid` while it is
+    /// already running there, however the second call was reached.
+    pub(super) fn enter(&self, session: &str, command: &str) -> Result<Running, Failure> {
+        let ext = &self.ext;
+        let inner = self.inner.upgrade().ok_or_else(|| shut(ext))?;
+        let key = format!("{session}\0{ext}\0{command}");
+        if !inner.sessions.running().insert(key.clone()) {
+            return Err(Failure::Invalid(format!(
+                "command /{command}: already running in this session"
+            )));
+        }
+        Ok(Running {
+            inner: self.inner.clone(),
+            key,
+        })
+    }
+}
+
+/// One running `/command` on one session; dropping it frees the slot.
+pub(super) struct Running {
+    inner: Weak<Inner>,
+    key: String,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.sessions.running().remove(&self.key);
+        }
+    }
+}
+
+struct Sub {
+    ext: String,
+    session: String,
+    /// Ends the stream after a `closed` frame.
+    stop: CancellationToken,
+    task: AbortHandle,
 }
 
 /// Attached sessions, by id; serves the runner's session actions.
-#[derive(Default)]
 pub(crate) struct Registry {
     sessions: Mutex<HashMap<String, Attached>>,
+    inner: Weak<Inner>,
+    subs: Mutex<HashMap<String, Sub>>,
+    next_sub: AtomicU64,
     epochs: AtomicU64,
+    /// Running `/command`s by session, extension and name; see [`Remote::enter`].
+    running: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -388,6 +520,39 @@ struct Attached {
 }
 
 impl Registry {
+    pub(crate) fn new(inner: Weak<Inner>) -> Self {
+        Self {
+            inner,
+            sessions: Mutex::default(),
+            epochs: AtomicU64::default(),
+            subs: Mutex::default(),
+            next_sub: AtomicU64::default(),
+            running: Mutex::default(),
+        }
+    }
+
+    fn subs(&self) -> MutexGuard<'_, HashMap<String, Sub>> {
+        self.subs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn running(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets `id`; each of its subscriptions sends `closed` and ends.
+    fn detach(&self, id: &str) {
+        let mut subs = self.subs();
+        self.remove(id, None);
+        subs.retain(|_, sub| {
+            if sub.session == id {
+                sub.stop.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Attached>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -408,6 +573,10 @@ impl Registry {
 
     /// Forgets every session and stops its pump.
     pub(crate) fn clear(&self) {
+        let mut subs = self.subs();
+        for (_, sub) in subs.drain() {
+            sub.task.abort();
+        }
         for (_, attached) in self.lock().drain() {
             if let Some(pump) = attached.pump {
                 pump.abort();
@@ -426,9 +595,52 @@ impl Registry {
             pump.abort();
         }
         session.ok_or_else(|| Refusal {
-            code: "no_session",
+            code: "no_session".into(),
             message: format!("session {id} is not attached"),
         })
+    }
+
+    fn subscribe(&self, origin: Origin, ext: String, request: Subscribe) -> Result<Value, Refusal> {
+        // Lock before lookup so detach/clear cannot miss a subscription being installed.
+        let mut subs = self.subs();
+        let events = self.session(&request.session)?.subscribe();
+        let id = format!("s:{}", self.next_sub.fetch_add(1, Ordering::Relaxed));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(stream(
+            self.inner.clone(),
+            origin,
+            ext.clone(),
+            id.clone(),
+            events,
+            request.kinds,
+            stop.clone(),
+        ))
+        .abort_handle();
+        subs.insert(
+            id.clone(),
+            Sub {
+                ext,
+                session: request.session,
+                stop,
+                task,
+            },
+        );
+        Ok(json!({ "sub": id }))
+    }
+
+    fn unsubscribe(&self, ext: &str, request: Unsubscribe) -> Result<Value, Refusal> {
+        let mut subs = self.subs();
+        if let std::collections::hash_map::Entry::Occupied(entry) = subs.entry(request.sub)
+            && entry.get().ext == ext
+        {
+            entry.remove().task.abort();
+            Ok(Value::Null)
+        } else {
+            Err(Refusal {
+                code: "no_subscription".into(),
+                message: "unknown subscription".into(),
+            })
+        }
     }
 }
 
@@ -439,115 +651,84 @@ impl Drop for Registry {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Post {
-    session: String,
-    custom_type: String,
-    text: String,
-    display: bool,
-    delivery: Delivery,
+#[serde(deny_unknown_fields)]
+struct Invoke {
+    object: String,
+    target: String,
+    method: String,
+    args: Vec<Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum Delivery {
-    Steer,
-    FollowUp,
-    Quiet,
+#[serde(deny_unknown_fields)]
+struct Subscribe {
+    session: String,
+    kinds: Option<Vec<SessionEventKind>>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AppendCustom {
-    session: String,
-    custom_type: String,
-    #[serde(default)]
-    data: Option<Value>,
+#[serde(deny_unknown_fields)]
+struct Unsubscribe {
+    sub: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Custom {
-    session: String,
-    custom_type: String,
-}
-
-fn parse<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, Refusal> {
+fn decode<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refusal> {
     serde_json::from_value(args).map_err(|_| Refusal {
-        code: "invalid",
+        code: "invalid".into(),
         message: "invalid arguments".into(),
     })
-}
-
-/// The session-side custom type for an extension's `customType`: `<ext-id>:<customType>`.
-/// Extension IDs hold no `:`, so the first one always ends the ID.
-fn scoped(ext: &str, custom_type: &str) -> Result<String, Refusal> {
-    if custom_type.is_empty() {
-        return Err(Refusal {
-            code: "invalid",
-            message: "invalid arguments".into(),
-        });
-    }
-    Ok(format!("{ext}:{custom_type}"))
-}
-
-fn failed(error: axo::Error) -> Refusal {
-    Refusal {
-        code: "failed",
-        message: error.to_string(),
-    }
 }
 
 impl Actions for Registry {
     fn call(
         &self,
+        origin: Origin,
         ext: String,
         method: String,
         args: Value,
     ) -> BoxFuture<'static, Result<Value, Refusal>> {
-        // Resolved before the future, so no registry lock is held across an await.
-        let action = match method.as_str() {
-            "post" => parse::<Post>(args).and_then(|post| {
-                let custom_type = scoped(&ext, &post.custom_type)?;
-                let session = self.session(&post.session)?;
-                Ok(Box::pin(async move {
-                    let message = HostMessage {
-                        custom_type,
-                        text: post.text,
-                        display: post.display,
-                        delivery: match post.delivery {
-                            Delivery::Steer => HostDelivery::Steer,
-                            Delivery::FollowUp => HostDelivery::FollowUp,
-                            Delivery::Quiet => HostDelivery::Quiet,
-                        },
-                    };
-                    session.post(message).await.map_err(failed)?;
-                    Ok(Value::Null)
-                }) as BoxFuture<'static, _>)
-            }),
-            "appendCustom" => parse::<AppendCustom>(args).and_then(|append| {
-                let custom_type = scoped(&ext, &append.custom_type)?;
-                let session = self.session(&append.session)?;
-                Ok(Box::pin(async move {
-                    let data = append.data.filter(|data| !data.is_null());
-                    session
-                        .append_custom(&custom_type, data)
-                        .await
-                        .map_err(failed)?;
-                    Ok(Value::Null)
-                }) as BoxFuture<'static, _>)
-            }),
-            "custom" => parse::<Custom>(args).and_then(|custom| {
-                let custom_type = scoped(&ext, &custom.custom_type)?;
-                let session = self.session(&custom.session)?;
-                let value = session.custom(&custom_type).unwrap_or(Value::Null);
-                Ok(Box::pin(std::future::ready(Ok(value))) as BoxFuture<'static, _>)
-            }),
-            _ => Err(Refusal {
-                code: "unsupported",
-                message: "unknown host method".into(),
-            }),
+        match method.as_str() {
+            "subscribe" => {
+                return Box::pin(std::future::ready(
+                    decode(args).and_then(|request| self.subscribe(origin, ext, request)),
+                ));
+            }
+            "unsubscribe" => {
+                return Box::pin(std::future::ready(
+                    decode(args).and_then(|request| self.unsubscribe(&ext, request)),
+                ));
+            }
+            _ => {}
+        }
+        let resolve = || {
+            if method != "invoke" {
+                return Err(Refusal {
+                    code: "unsupported".into(),
+                    message: "unknown host method".into(),
+                });
+            }
+            let invoke: Invoke = decode(args)?;
+            if invoke.object != "session" {
+                return Err(Refusal {
+                    code: "unsupported".into(),
+                    message: format!("unknown object: {}", invoke.object),
+                });
+            }
+            Ok((self.session(&invoke.target)?, invoke))
         };
-        action.unwrap_or_else(|refusal| Box::pin(std::future::ready(Err(refusal))))
+        let resolved = resolve();
+        Box::pin(async move {
+            let (session, invoke) = resolved?;
+            let caller = axo::ext::Caller {
+                namespace: Some(ext),
+            };
+            session
+                .invoke(&invoke.method, invoke.args, &caller)
+                .await
+                .map_err(|error| Refusal {
+                    code: error.code().into(),
+                    message: error.to_string(),
+                })
+        })
     }
 }

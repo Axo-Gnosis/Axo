@@ -3,13 +3,13 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct KillReceipt {
     pub id: String,
     pub stopping: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum SendKind {
     Note,
@@ -19,7 +19,7 @@ pub enum SendKind {
 }
 
 /// The originating session and actual delivery route, independent of roster names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionProvenance {
     pub session_id: String,
@@ -28,14 +28,14 @@ pub struct SubmissionProvenance {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", content = "id", rename_all = "camelCase")]
 pub enum SendIdentity {
     Submission(String),
     Message(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SendReceipt {
     pub to: String,
@@ -60,7 +60,7 @@ impl SendReceipt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum WaitReason {
     Results,
@@ -69,7 +69,7 @@ pub enum WaitReason {
     Idle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct WaitReceipt {
     pub reason: WaitReason,
     /// Result message references, e.g. `agent_1/2`.
@@ -77,7 +77,7 @@ pub struct WaitReceipt {
     pub jobs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(untagged)]
 pub enum SpawnReceipt {
     Child {

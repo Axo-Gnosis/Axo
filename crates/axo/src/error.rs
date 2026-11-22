@@ -30,6 +30,8 @@ pub enum Error {
     ModelNotFound(String),
     #[error("Mode not found: {0}")]
     ModeNotFound(String),
+    #[error("Skill not found: {0}")]
+    SkillNotFound(String),
     /// `SessionOptions::agent` names no agent definition, or names a team.
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
@@ -91,4 +93,79 @@ pub enum Error {
     /// `navigate`/`fork` named an entry id the session does not have.
     #[error("Entry not found: {0}")]
     EntryNotFound(String),
+}
+
+/// Machine-readable category of an [`Error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    Ai,
+    Agent,
+    Io,
+    Config,
+    Host,
+    InvalidSessionHeader,
+    Scheme,
+    NoModel,
+    ModelNotFound,
+    ModeNotFound,
+    SkillNotFound,
+    AgentNotFound,
+    AgentNotRoot,
+    AgentNotSubagent,
+    SpawnBlocked,
+    SessionNotFound,
+    ChildSession,
+    UnknownModelRole,
+    InvalidModelSelector,
+    InvalidCommand,
+    InvalidInput,
+    Busy,
+    Compaction,
+    MaintenanceAborted,
+    ContextChanged,
+    InvalidHistory,
+    NoPendingQuestion,
+    NoPendingResult,
+    NotQueued,
+    SessionBusy,
+    EntryNotFound,
+}
+
+impl Error {
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Ai(_) => ErrorCode::Ai,
+            Self::Agent(_) => ErrorCode::Agent,
+            Self::Io { .. } => ErrorCode::Io,
+            Self::Config { .. } => ErrorCode::Config,
+            Self::Host(_) => ErrorCode::Host,
+            Self::InvalidSessionHeader { .. } => ErrorCode::InvalidSessionHeader,
+            Self::Scheme(_) => ErrorCode::Scheme,
+            Self::NoModel => ErrorCode::NoModel,
+            Self::ModelNotFound(_) => ErrorCode::ModelNotFound,
+            Self::ModeNotFound(_) => ErrorCode::ModeNotFound,
+            Self::SkillNotFound(_) => ErrorCode::SkillNotFound,
+            Self::AgentNotFound(_) => ErrorCode::AgentNotFound,
+            Self::AgentNotRoot(_) => ErrorCode::AgentNotRoot,
+            Self::AgentNotSubagent(_) => ErrorCode::AgentNotSubagent,
+            Self::SpawnBlocked(_) => ErrorCode::SpawnBlocked,
+            Self::SessionNotFound(_) => ErrorCode::SessionNotFound,
+            Self::ChildSession { .. } => ErrorCode::ChildSession,
+            Self::UnknownModelRole(_) => ErrorCode::UnknownModelRole,
+            Self::InvalidModelSelector { .. } => ErrorCode::InvalidModelSelector,
+            Self::InvalidCommand { .. } => ErrorCode::InvalidCommand,
+            Self::InvalidInput(_) => ErrorCode::InvalidInput,
+            Self::Busy => ErrorCode::Busy,
+            Self::Compaction(_) => ErrorCode::Compaction,
+            Self::MaintenanceAborted => ErrorCode::MaintenanceAborted,
+            Self::ContextChanged => ErrorCode::ContextChanged,
+            Self::InvalidHistory(_) => ErrorCode::InvalidHistory,
+            Self::NoPendingQuestion(_) => ErrorCode::NoPendingQuestion,
+            Self::NoPendingResult(_) => ErrorCode::NoPendingResult,
+            Self::NotQueued(_) => ErrorCode::NotQueued,
+            Self::SessionBusy { .. } => ErrorCode::SessionBusy,
+            Self::EntryNotFound(_) => ErrorCode::EntryNotFound,
+        }
+    }
 }

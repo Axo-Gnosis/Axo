@@ -16,7 +16,7 @@ use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, process_image};
 use crate::tools::{Located, SessionTools};
 
 /// One piece of a user message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -34,6 +34,7 @@ pub enum PromptPart {
     Content {
         name: String,
         #[serde(with = "base64_bytes")]
+        #[specta(type = String)]
         bytes: Vec<u8>,
     },
     /// A file axo saved from `Content`; `image` files also reach the model as pixels.
@@ -41,9 +42,32 @@ pub enum PromptPart {
 }
 
 /// A user message as parts; plain strings (`&str`, `String`, `&String`) convert to one `Text` part.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(from = "PromptInputWire", into = "Vec<PromptPart>")]
 pub struct PromptInput {
     pub parts: Vec<PromptPart>,
+}
+
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum PromptInputWire {
+    Text(String),
+    Parts(Vec<PromptPart>),
+}
+
+impl From<PromptInputWire> for PromptInput {
+    fn from(input: PromptInputWire) -> Self {
+        match input {
+            PromptInputWire::Text(text) => text.into(),
+            PromptInputWire::Parts(parts) => parts.into(),
+        }
+    }
+}
+
+impl From<PromptInput> for Vec<PromptPart> {
+    fn from(input: PromptInput) -> Self {
+        input.parts
+    }
 }
 
 impl From<&str> for PromptInput {
@@ -72,7 +96,7 @@ impl From<Vec<PromptPart>> for PromptInput {
     }
 }
 
-mod base64_bytes {
+pub(crate) mod base64_bytes {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};

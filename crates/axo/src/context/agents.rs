@@ -13,7 +13,7 @@ use crate::context::prompt::valid_section_name;
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// Where an agent definition may run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum RunAs {
     Root,
@@ -29,7 +29,7 @@ impl RunAs {
 }
 
 /// An agent's prompt and context switches.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentSpec {
     /// The agent's unique catalog name.
@@ -46,8 +46,14 @@ pub struct AgentSpec {
     /// Tool allowlist over built-in and host tools; `None` keeps every tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// `None` keeps `settings.contextFiles`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `None`, or `true` on input, keeps `settings.contextFiles`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "context_files_switch"
+    )]
+    // `Option` outside `Phased`: specta-serde 0.0.15 drops a non-nullable field type when it
+    // strips `skip_serializing_if = "Option::is_none"`.
+    #[specta(type = Option<specta_serde::Phased<ContextFiles, RawContextFiles>>)]
     pub context_files: Option<ContextFiles>,
     /// `false` removes the section; `true` changes nothing.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
@@ -75,7 +81,8 @@ pub struct AgentSpec {
 }
 
 /// An agent's override of context-file discovery.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, specta::Type)]
+#[specta(type = RawContextFiles)]
 pub enum ContextFiles {
     /// Disable all context files.
     Off,
@@ -115,7 +122,8 @@ pub(crate) fn context_files_switch<'de, D: Deserializer<'de>>(
 }
 
 /// A named roster of agents and its shared charter.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct TeamSpec {
     /// The team's unique catalog name.
     pub name: String,
@@ -130,7 +138,8 @@ pub struct TeamSpec {
 }
 
 /// One agent's role in a team.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct TeamMember {
     /// The agent's catalog name.
     pub agent: String,
@@ -149,7 +158,13 @@ impl TeamMember {
 
 /// An agent or team in the shared definition namespace.
 #[allow(clippy::large_enum_variant)] // A small catalog loaded once; boxing adds an allocation per definition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AgentDef {
     /// A runnable agent definition.
     Agent(AgentSpec),
@@ -197,9 +212,9 @@ enum ToolList {
     Csv(String),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, specta::Type)]
 #[serde(untagged)]
-enum RawContextFiles {
+pub(crate) enum RawContextFiles {
     Bool(bool),
     Map(IndexMap<String, bool>),
 }

@@ -54,7 +54,9 @@ impl AgentConfig {
 }
 
 /// How many queued messages one drain point takes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum QueueMode {
     All,
@@ -62,7 +64,14 @@ pub enum QueueMode {
     OneAtATime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(
+    rename = "AgentRunOutcome",
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum RunOutcome {
     Done,
     Aborted(CancelReason),

@@ -12,7 +12,7 @@ use crate::context::markdown::{self, name_problems, split_frontmatter};
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// A keyword. Built from a definition file or passed in code.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct KeywordSpec {
     /// The exact (case-sensitive) word that triggers it.
@@ -30,7 +30,7 @@ pub struct KeywordSpec {
 }
 
 /// The `keywords` settings object.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct KeywordSettings {
     /// `false` turns every keyword off.
@@ -49,7 +49,8 @@ impl Default for KeywordSettings {
 }
 
 /// One keyword occurrence a submission would fire; `range` is a byte range into the text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct KeywordMatch {
     pub name: String,
     pub range: Range<usize>,

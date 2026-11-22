@@ -9,6 +9,7 @@ pub mod context;
 mod coordination;
 mod error;
 pub mod exec;
+pub mod ext;
 mod input;
 mod jobs;
 mod recovery;
@@ -37,7 +38,7 @@ pub use coordination::{
     KillReceipt, SendIdentity, SendKind, SendReceipt, SpawnReceipt, SubmissionProvenance,
     WaitReason, WaitReceipt,
 };
-pub use error::Error;
+pub use error::{Error, ErrorCode};
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{
     OutputChunk, OutputError, OutputStream, Pipe, PipeChunk, ProcessSupervisor, Sandbox,
@@ -50,13 +51,14 @@ pub use jobs::{
     MessageDelivery, OutputProgress, Promotion, jobs_from_entries,
 };
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target, valid_scheme_name};
+pub use session::wire::{EntryPage, OutputPage};
 pub use session::{
     AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
     HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
     PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput, RecoveryPolicy,
-    Registrations, ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo,
-    ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam,
-    TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
+    Registrations, ResultResolution, Session, SessionEvent, SessionEventKind, SessionOptions,
+    SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
+    SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,

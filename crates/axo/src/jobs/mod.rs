@@ -136,7 +136,8 @@ enum DeliveryKey {
 }
 
 /// A job's state, as `proc://` shows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum JobStatus {
     Queued,
     Running,
@@ -161,7 +162,8 @@ impl JobStatus {
 }
 
 /// One job, for hosts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct JobInfo {
     /// The row name, `bg_N` or `agent_N`.
     pub id: String,
@@ -174,7 +176,12 @@ pub struct JobInfo {
     pub messages: Vec<JobMessageInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum JobKind {
     Command {
         /// The display label supplied by the tool.
@@ -207,7 +214,8 @@ pub enum JobKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ChildProgress {
     pub turns: u32,
     pub max_turns: u32,
@@ -218,7 +226,8 @@ pub struct ChildProgress {
     pub tools: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct JobMessageInfo {
     /// The `job_end` message id, including its sequence suffix when present.
     pub id: String,
@@ -229,7 +238,8 @@ pub struct JobMessageInfo {
     pub delivery: MessageDelivery,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum MessageDelivery {
     Held,
     Writing,
@@ -238,7 +248,7 @@ pub enum MessageDelivery {
     Delivered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum Promotion {
     Async,
@@ -247,7 +257,7 @@ pub enum Promotion {
     Host,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -262,7 +272,7 @@ pub enum CommandExit {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum Killer {
     Model,
@@ -456,7 +466,7 @@ pub struct JobRegistry {
     session_id: String,
     state: Mutex<State>,
     changed: watch::Sender<u64>,
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<Arc<SessionEvent>>,
     host: OnceLock<Weak<dyn JobHost>>,
     /// Serializes `JobHost::mail_changed` calls; never held with `state`.
     mail_notify: Mutex<()>,
@@ -879,7 +889,7 @@ impl JobRegistry {
         child_depth: u32,
         entries: &[SeqEntry],
         sessions: Arc<SessionTable>,
-        events: broadcast::Sender<SessionEvent>,
+        events: broadcast::Sender<Arc<SessionEvent>>,
     ) -> (Arc<Self>, Vec<JobId>) {
         let Replayed {
             jobs,
@@ -942,7 +952,7 @@ impl JobRegistry {
             let info = job.view(*id);
             if announced.get(id) != Some(&info) {
                 announced.insert(*id, info.clone());
-                let _ = self.events.send(SessionEvent::Job(info));
+                let _ = self.events.send(Arc::new(SessionEvent::Job(info)));
             }
         }
         announced.retain(|id, _| {
@@ -950,7 +960,7 @@ impl JobRegistry {
             if !keep {
                 let _ = self
                     .events
-                    .send(SessionEvent::JobGone { id: id.to_string() });
+                    .send(Arc::new(SessionEvent::JobGone { id: id.to_string() }));
             }
             keep
         });
@@ -1580,6 +1590,7 @@ impl JobRegistry {
             Some(CommandOutput::new(
                 id.to_string(),
                 run.artifact,
+                run.output.path.clone(),
                 file,
                 std::fs::File::open(crate::schemes::artifact::stream_index_path(
                     &run.output.path,

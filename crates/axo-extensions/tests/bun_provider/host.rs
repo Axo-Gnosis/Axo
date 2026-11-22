@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axo::{
-    Axo, EnabledExtension, EnvMap, JsonlStore, ProjectAccess, SessionOptions, StaticEnv,
-    Supervision,
+    Axo, ConfigLayer, ConfigSource, EnabledExtension, EnvMap, JsonlStore, ProjectAccess,
+    SessionOptions, StaticEnv, Supervision, UserConfig,
 };
 use axo_ai::{
     AssistantEvent, FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi,
@@ -41,6 +41,29 @@ pub struct Host {
     pub temp: tempfile::TempDir,
 }
 
+/// Keep the retained tail small enough for scripted turns to exercise manual compaction.
+struct SessionConfig {
+    skill_root: PathBuf,
+}
+
+impl ConfigSource for SessionConfig {
+    fn user(&self) -> Result<UserConfig, axo::Error> {
+        Ok(UserConfig {
+            layer: ConfigLayer {
+                origin: "session fixture".into(),
+                settings: Some(serde_json::json!({ "compaction": { "keepRecentTokens": 0 } })),
+                skill_roots: vec![self.skill_root.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn project(&self, _: &Path) -> Result<ConfigLayer, axo::Error> {
+        Ok(ConfigLayer::default())
+    }
+}
+
 impl Host {
     /// A host whose `Axo` uses `mode`, with `lab-provider` installed and enabled (cold).
     pub async fn new(bun: &Path, mode: Supervision) -> Self {
@@ -68,6 +91,16 @@ impl Host {
         let api = Arc::new(ScriptedApi::new(Vec::new()));
         let host = Self::build(bun, mode, config, Some(api.clone())).await;
         host.install(SESSION, SESSION);
+        // `/flood` occupies each runner host-call slot with its own `/hold-<i>`: a command
+        // runs once per session at a time.
+        let manifest_path = host.path("root").join(SESSION).join("extension.json");
+        let mut manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let commands = manifest["commands"].as_array_mut().unwrap();
+        commands.extend((0..128).map(|i| {
+            serde_json::json!({ "name": format!("hold-{i}"), "description": "Holds a host-call slot." })
+        }));
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
         host.extensions
             .configure(&[enabled(SESSION, None)])
             .await
@@ -109,7 +142,17 @@ impl Host {
         )
         .supervision(mode);
         if let Some(streamer) = streamer {
-            builder = builder.streamer(streamer);
+            let skill_root = temp.path().join("skills");
+            let review = skill_root.join("review");
+            std::fs::create_dir_all(&review).unwrap();
+            std::fs::write(
+                review.join("SKILL.md"),
+                "---\ndescription: Review changes\ndisable-model-invocation: true\n---\nReview $1 with $2.",
+            )
+            .unwrap();
+            builder = builder
+                .config(Arc::new(SessionConfig { skill_root }))
+                .streamer(streamer);
         }
         let axo = builder.build();
         let extensions = Extensions::new(

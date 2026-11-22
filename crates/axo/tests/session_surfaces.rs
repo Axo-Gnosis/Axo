@@ -35,7 +35,7 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
     });
     within(async {
         loop {
-            if matches!(events.recv().await.unwrap(), SessionEvent::Activity(state) if state.running) { break; }
+            if matches!(&*events.recv().await.unwrap(), SessionEvent::Activity(state) if state.running) { break; }
         }
         until(|| !host.api.requests().is_empty()).await;
     }).await;
@@ -51,7 +51,7 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
     assert!(!session.is_running());
     within(async {
         loop {
-            if matches!(events.recv().await.unwrap(), SessionEvent::Activity(state) if !state.running) { break; }
+            if matches!(&*events.recv().await.unwrap(), SessionEvent::Activity(state) if !state.running) { break; }
         }
     }).await;
     session.prompt("continue").await.unwrap();
@@ -62,15 +62,15 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
     );
     within(async {
         loop {
-            if matches!(events.recv().await.unwrap(), SessionEvent::EffectiveMode { mode } if mode.as_deref() == Some("plan")) { break; }
+            if matches!(&*events.recv().await.unwrap(), SessionEvent::EffectiveMode { mode } if mode.as_deref() == Some("plan")) { break; }
         }
     }).await;
     let mut maintenance_events = session.attach(None).await.events;
     session.shake(axo::ShakeMode::Elide).await.unwrap();
     let mut maintenance_states = Vec::new();
     while let Ok(event) = maintenance_events.try_recv() {
-        if let SessionEvent::Activity(state) = event {
-            maintenance_states.push(state);
+        if let SessionEvent::Activity(state) = &*event {
+            maintenance_states.push(*state);
         }
     }
     assert!(
@@ -86,7 +86,7 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
         .unwrap();
     let mut navigation_states = Vec::new();
     while let Ok(event) = navigation_events.try_recv() {
-        if let SessionEvent::Activity(state) = event {
+        if let SessionEvent::Activity(state) = &*event {
             navigation_states.push(state.running);
         }
     }
@@ -198,7 +198,7 @@ async fn chained_follow_up_has_no_intermediate_idle_event() {
     let mut states = Vec::new();
     within(async {
         loop {
-            match events.recv().await.unwrap() {
+            match &*events.recv().await.unwrap() {
                 SessionEvent::Activity(state) => states.push(state.running),
                 SessionEvent::ModeResult { .. } => break,
                 _ => {}
@@ -213,7 +213,7 @@ async fn chained_follow_up_has_no_intermediate_idle_event() {
     within(run).await.unwrap().unwrap();
     within(async {
         loop {
-            if let SessionEvent::Activity(state) = events.recv().await.unwrap() {
+            if let SessionEvent::Activity(state) = &*events.recv().await.unwrap() {
                 states.push(state.running);
                 if !state.running {
                     break;
@@ -252,12 +252,12 @@ async fn retry_reports_the_provider_failure_and_configured_limit() {
                 error,
                 failure,
                 ..
-            } = events.recv().await.unwrap()
+            } = &*events.recv().await.unwrap()
             {
-                assert_eq!(attempt, 1);
-                assert_eq!(max_retries, 1);
+                assert_eq!(*attempt, 1);
+                assert_eq!(*max_retries, 1);
                 assert_eq!(error.as_deref(), Some("503 service unavailable"));
-                assert_eq!(failure.unwrap().status, Some(503));
+                assert_eq!(failure.as_ref().unwrap().status, Some(503));
                 break;
             }
         }
@@ -304,7 +304,7 @@ async fn summary_retry_reports_the_provider_failure() {
         .iter()
         .position(|event| {
             matches!(
-                event,
+                event.as_ref(),
                 SessionEvent::MaintenanceStart {
                     kind: MaintenanceKind::Compact
                 }
@@ -315,7 +315,7 @@ async fn summary_retry_reports_the_provider_failure() {
         .iter()
         .position(|event| {
             matches!(
-                event,
+                event.as_ref(),
                 SessionEvent::MaintenanceEnd {
                     kind: MaintenanceKind::Compact,
                     error: None,
@@ -327,7 +327,7 @@ async fn summary_retry_reports_the_provider_failure() {
     let retries: Vec<_> = seen
         .iter()
         .enumerate()
-        .filter(|(_, event)| matches!(event, SessionEvent::Retry { .. }))
+        .filter(|(_, event)| matches!(event.as_ref(), SessionEvent::Retry { .. }))
         .collect();
     assert_eq!(retries.len(), 1, "{seen:?}");
     let (at, retry) = retries[0];
@@ -338,7 +338,7 @@ async fn summary_retry_reports_the_provider_failure() {
         error,
         failure,
         ..
-    } = retry
+    } = retry.as_ref()
     else {
         unreachable!()
     };

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use axo_agent::QueueMode;
 use axo_ai::{Model, Models, ThinkingLevel};
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::context::agents::ContextFiles;
@@ -20,7 +20,7 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 }
 
 /// The settings object. Unknown keys are ignored; every field has a default.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// `provider/model-id`.
@@ -44,6 +44,7 @@ pub struct Settings {
     /// Extensions to load, in priority order: the last one declaring a provider ID wins it.
     /// User settings only.
     #[serde(deserialize_with = "enabled_extensions")]
+    #[specta(type = specta_serde::Phased<Vec<EnabledExtension>, EnabledExtensionsInput>)]
     pub extensions: Vec<EnabledExtension>,
 }
 
@@ -71,7 +72,7 @@ impl Default for Settings {
 }
 
 /// One extension the user enabled. Members sharing a `group` share one runner process.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EnabledExtension {
     pub id: String,
@@ -130,6 +131,13 @@ fn valid_extension_name(name: &str) -> bool {
         })
 }
 
+#[allow(dead_code)]
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum EnabledExtensionsInput {
+    List(Vec<EnabledExtension>),
+}
+
 fn enabled_extensions<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<EnabledExtension>, D::Error> {
@@ -139,7 +147,7 @@ fn enabled_extensions<'de, D: Deserializer<'de>>(
 }
 
 /// Child-session budgets and defaults. User settings only.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SubagentSettings {
     /// Deepest spawn: a root session is depth 0, its children 1.
@@ -154,6 +162,7 @@ pub struct SubagentSettings {
     pub models: IndexMap<String, String>,
     /// Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`.
     #[serde(deserialize_with = "crate::context::agents::context_files_switch")]
+    #[specta(type = specta_serde::Phased<Option<ContextFiles>, Option<crate::context::agents::RawContextFiles>>)]
     pub context_files: Option<ContextFiles>,
 }
 
@@ -276,7 +285,7 @@ fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
     Err(Error::ModelNotFound(selector.to_owned()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RetrySettings {
     pub max_retries: u32,
@@ -294,7 +303,7 @@ impl Default for RetrySettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {
     pub enabled: bool,
@@ -316,7 +325,7 @@ impl Default for CompactionSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum SummaryRequest {
     #[default]
@@ -338,7 +347,7 @@ fn default_context_files() -> IndexMap<String, bool> {
 }
 
 /// What projects may contribute. Read from user settings only.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectSettings {
     pub files: ProjectFiles,
@@ -375,7 +384,7 @@ impl ProjectSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectFiles {
     /// Project `.agents/skills` discovery and explicit project skill roots.
@@ -393,7 +402,9 @@ impl Default for ProjectFiles {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize, specta::Type,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectAccess {
     /// Nothing from the project is read.
@@ -405,7 +416,7 @@ pub enum ProjectAccess {
     Trust,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BashSettings {
     pub dev_shell: DevShellMode,
@@ -434,7 +445,9 @@ impl Default for BashSettings {
 }
 
 /// How bash commands pick up a project environment.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize, specta::Type,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DevShellMode {
     /// Host environment only.
@@ -446,7 +459,7 @@ pub enum DevShellMode {
     Nix,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AskSettings {
     /// Auto-select the recommended option after this long; `None` waits forever.
@@ -466,7 +479,8 @@ pub const PROMPT_NAMES: [&str; 8] = [
 ];
 
 /// One prompt override as the host holds it. `text` is untrimmed; axo trims.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptOverride {
     pub origin: String,
     pub text: String,
@@ -516,7 +530,8 @@ pub trait ConfigSource: Send + Sync {
 }
 
 /// What one session runs with.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct EffectiveConfig {
     pub access: ProjectAccess,
     pub settings: Settings,

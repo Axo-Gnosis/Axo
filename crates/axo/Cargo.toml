@@ -11,6 +11,7 @@ repository.workspace = true
 async-trait.workspace = true
 axo-agent = { path = "../axo-agent" }
 axo-ai = { path = "../axo-ai" }
+axo-macros = { path = "../axo-macros" }
 base64.workspace = true
 futures.workspace = true
 globset.workspace = true
@@ -31,6 +32,8 @@ serde_json.workspace = true
 serde_norway.workspace = true
 sha2.workspace = true
 similar.workspace = true
+specta.workspace = true
+specta-serde.workspace = true
 strip-ansi-escapes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -44,6 +47,10 @@ uuid.workspace = true
 axo-agent = { path = "../axo-agent" }
 axo-ai = { path = "../axo-ai", features = ["testing"] }
 jsonc-parser.workspace = true
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+specta-typescript.workspace = true
+specta-util.workspace = true
+syn.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

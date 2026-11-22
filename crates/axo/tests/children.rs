@@ -65,7 +65,7 @@ async fn spawned_child_delivers_once_and_parks() {
     let child_id = handle.session.id().to_owned();
     within(async {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Job(JobInfo { id, kind, .. })) if id == "agent_1" => {
                     let JobKind::Child {
                         session_id,
@@ -82,14 +82,14 @@ async fn spawned_child_delivers_once_and_parks() {
                     else {
                         panic!("expected a child job");
                     };
-                    assert_eq!(session_id, child_id);
+                    assert_eq!(session_id, &child_id);
                     assert_eq!(path, handle.session.path());
-                    assert_eq!(depth, 1);
-                    assert_eq!(agent, None);
+                    assert_eq!(*depth, 1);
+                    assert_eq!(*agent, None);
                     assert_eq!(model, "test/child");
-                    assert_eq!(team, None);
+                    assert_eq!(*team, None);
                     assert!(resident);
-                    assert_eq!(unread_mail, 0);
+                    assert_eq!(*unread_mail, 0);
                     if let Some(progress) = progress {
                         assert!(progress.turns <= progress.max_turns + 1);
                     }
@@ -713,13 +713,13 @@ async fn queued_children_publish_running_and_per_run_usage() {
     let mut running = false;
     within(async {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Job(job)) if job.id == second.job => {
                     running |= job.status == JobStatus::Running;
                     let JobKind::Child {
                         progress: Some(progress),
                         ..
-                    } = job.kind
+                    } = &job.kind
                     else {
                         continue;
                     };
@@ -967,17 +967,17 @@ async fn tree_usage_counts_descendants_and_child_compaction_once() {
     within(async {
         let mut last: Option<Usage> = None;
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::TreeUsage { usage }) => {
                     assert!(usage.total_tokens <= expected.total_tokens, "{usage:?}");
                     if let Some(last) = &last {
-                        assert_ne!(last, &usage, "unchanged totals are not re-emitted");
+                        assert_ne!(last, usage, "unchanged totals are not re-emitted");
                         assert!(usage.total_tokens >= last.total_tokens);
                     }
-                    if usage == expected {
+                    if usage == &expected {
                         break;
                     }
-                    last = Some(usage);
+                    last = Some(usage.clone());
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("session closed"),

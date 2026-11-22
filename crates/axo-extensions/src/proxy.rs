@@ -154,7 +154,7 @@ enum Interaction {
 impl Callbacks for LoginCallbacks<'_> {
     async fn call(&self, method: &str, args: Value) -> Result<Value, Refusal> {
         let refuse = |code: &'static str, message: &str| Refusal {
-            code,
+            code: code.into(),
             message: message.to_owned(),
         };
         match Interaction::parse(method, args) {

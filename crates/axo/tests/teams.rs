@@ -84,7 +84,7 @@ async fn team_members_message_each_other_and_the_parent() {
     let b_mail = tokio::spawn(async move {
         let mut counts: Vec<u32> = Vec::new();
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Job(job)) if job.id == "agent_2" => {
                     let JobKind::Child { unread_mail, .. } = job.kind else {
                         continue;
@@ -367,7 +367,7 @@ async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
     b.session.resume_wakes();
     within(async {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::AutoPaused { paused: false }) => return,
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("closed before unpause"),
