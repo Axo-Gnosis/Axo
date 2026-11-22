@@ -7,8 +7,10 @@ pub mod config;
 pub mod discover;
 pub mod rules;
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -30,7 +32,7 @@ use crate::event::{AssistantEvent, timed};
 use crate::model::{ApiKind, Compat, Cost, InputKind, Model};
 use crate::transcript::Transcript;
 use crate::transform::transform_messages;
-use crate::types::{AssistantMessage, StopReason};
+use crate::types::{AssistantMessage, ProviderFailure, StopReason};
 
 use self::codex::CodexModel;
 use self::config::{ModelsConfig, merge_compat};
@@ -39,7 +41,8 @@ use self::config::{ModelsConfig, merge_compat};
 const DEFAULT_REFRESH_INTERVAL: u64 = 2 * 60 * 60;
 
 /// Public provider metadata without credential values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderInfo {
     pub id: String,
     pub env: Vec<String>,
@@ -49,7 +52,8 @@ pub struct ProviderInfo {
 }
 
 /// Where a provider's credential comes from, without resolving or validating it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
 pub enum CredentialSource {
     Config,
     ApiKey,
@@ -73,9 +77,9 @@ pub struct ModelsOptions {
 /// The model registry. One instance serves the host's lifetime: `reload` rebuilds the loaded
 /// catalog in place from new configuration, `refresh` (also run on a timer, see
 /// `ModelsConfig::refresh_interval`) from fresh catalog and Codex model data, and
-/// `register`/`unregister` add and remove runtime providers. Each request resolves the
-/// current model and provider by provider/id; a missing model fails with
-/// `Error::UnknownModel`.
+/// `register`/`unregister` add and remove runtime providers. Owned `ProviderLayer`s
+/// (`provider_layer`) sit above runtime registrations. Each request resolves the current
+/// model and provider by provider/id; a missing model fails with `Error::UnknownModel`.
 pub struct Models {
     shared: Arc<Shared>,
     anthropic: Arc<AnthropicApi>,
@@ -83,6 +87,27 @@ pub struct Models {
     codex: Arc<CodexApi>,
     /// The refresh timer; replaced by `reload`, aborted on drop.
     timer: Mutex<Option<AbortHandle>>,
+}
+
+/// An owned set of providers above the runtime registrations, created by
+/// `Models::provider_layer`. For each provider id the newest layer containing it wins, then
+/// the `Models::register` registration, then the loaded catalog. Dropping the layer removes
+/// only its providers and reveals whatever they hid.
+pub struct ProviderLayer {
+    shared: Arc<Shared>,
+    /// Creation order within its registry; newer wins.
+    ordinal: u64,
+}
+
+/// What a layer's provider hides (or would hide): see `ProviderLayer::hidden`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderOrigin {
+    /// An older `ProviderLayer`.
+    Layer,
+    /// A `Models::register` registration.
+    Registered,
+    /// The loaded catalog (models.dev, Codex, `models.jsonc`).
+    Loaded,
 }
 
 /// What the refresh timer shares with `Models`.
@@ -93,6 +118,8 @@ struct Shared {
     cache_dir: Option<PathBuf>,
     credentials: Arc<dyn CredentialStore>,
     http: reqwest::Client,
+    /// The next `ProviderLayer` ordinal.
+    next_layer: AtomicU64,
 }
 
 struct Inputs {
@@ -110,8 +137,10 @@ struct State {
     loaded: Loaded,
     /// One slot per provider id; a registration fully replaces a loaded provider of that id.
     registered: BTreeMap<String, Registered>,
-    /// Loaded models of providers that are not replaced, in loaded order, then each
-    /// registered provider's models in provider-id order.
+    /// Non-empty provider layers by ordinal; the newest containing an id beats `registered`.
+    layers: BTreeMap<u64, BTreeMap<String, Layered>>,
+    /// Loaded models of providers that are not replaced, in loaded order, then each winning
+    /// registered or layered provider's models in provider-id order.
     snapshot: Arc<[Model]>,
 }
 
@@ -120,6 +149,7 @@ impl State {
         let mut state = State {
             loaded,
             registered: BTreeMap::new(),
+            layers: BTreeMap::new(),
             snapshot: Arc::new([]),
         };
         state.rebuild();
@@ -127,18 +157,45 @@ impl State {
     }
 
     fn rebuild(&mut self) {
-        self.snapshot = self
+        let winners = self.winners();
+        let snapshot = self
             .loaded
             .models
             .iter()
-            .filter(|model| !self.registered.contains_key(&model.provider))
-            .chain(
-                self.registered
-                    .values()
-                    .flat_map(|registered| &registered.models),
-            )
+            .filter(|model| !winners.contains_key(model.provider.as_str()))
+            .chain(winners.values().flat_map(|registered| &registered.models))
             .cloned()
             .collect();
+        self.snapshot = snapshot;
+    }
+
+    /// Each replaced provider id's winning registration: the newest layer containing it,
+    /// else the runtime registration.
+    fn winners(&self) -> BTreeMap<&str, &Registered> {
+        let mut winners: BTreeMap<&str, &Registered> = self
+            .registered
+            .iter()
+            .map(|(id, registered)| (id.as_str(), registered))
+            .collect();
+        for layer in self.layers.values() {
+            winners.extend(
+                layer
+                    .iter()
+                    .map(|(id, layered)| (id.as_str(), &layered.provider)),
+            );
+        }
+        winners
+    }
+
+    /// The winning registration of `id` that replaces the loaded provider, with its
+    /// unavailability reason.
+    fn runtime(&self, id: &str) -> Option<(&Registered, Option<&str>)> {
+        self.layers
+            .values()
+            .rev()
+            .find_map(|layer| layer.get(id))
+            .map(|layered| (&layered.provider, layered.unavailable.as_deref()))
+            .or_else(|| self.registered.get(id).map(|registered| (registered, None)))
     }
 }
 
@@ -156,6 +213,75 @@ struct Registered {
     auth: Arc<ProviderAuth>,
     models: Vec<Model>,
     rewrite: Option<Arc<dyn RequestRewrite>>,
+}
+
+impl Registered {
+    fn new(provider: Provider) -> Result<(String, Registered), Error> {
+        provider.validate()?;
+        let Provider {
+            id,
+            models,
+            env,
+            requires_key,
+            login,
+            rewrite,
+        } = provider;
+        let auth = Arc::new(ProviderAuth {
+            id: id.clone(),
+            config_api_key: None,
+            env,
+            requires_key,
+            login,
+        });
+        Ok((
+            id,
+            Registered {
+                auth,
+                models,
+                rewrite,
+            },
+        ))
+    }
+}
+
+struct Layered {
+    provider: Registered,
+    /// `Some` reserves the id but fails its requests and login with this reason.
+    unavailable: Option<String>,
+}
+
+impl Provider {
+    /// Checks what `Models::register` and `ProviderLayer::replace` require: a non-empty id
+    /// without `/`, and models that all belong to it with distinct ids.
+    pub fn validate(&self) -> Result<(), Error> {
+        let id = &self.id;
+        if id.is_empty() || id.contains('/') {
+            return Err(Error::Config(format!("invalid provider id: {id:?}")));
+        }
+        let mut seen = HashSet::new();
+        for model in &self.models {
+            if &model.provider != id {
+                return Err(Error::Config(format!(
+                    "provider {id}: model {} belongs to provider {}",
+                    model.id, model.provider
+                )));
+            }
+            if !seen.insert(model.id.as_str()) {
+                return Err(Error::Config(format!(
+                    "provider {id}: duplicate model {}",
+                    model.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unavailable(provider: &str, reason: &str) -> Error {
+    Error::ProviderUnavailable {
+        provider: provider.to_owned(),
+        reason: reason.to_owned(),
+    }
 }
 
 struct Request {
@@ -206,6 +332,7 @@ impl Models {
                 cache_dir: opts.cache_dir,
                 credentials: opts.credentials,
                 http: http.clone(),
+                next_layer: AtomicU64::new(0),
             }),
             anthropic: Arc::new(AnthropicApi::new(http.clone())),
             completions: Arc::new(CompletionsApi::new(http.clone())),
@@ -278,50 +405,11 @@ impl Models {
     /// Adds `provider` and its models, replacing an earlier registration of the same id. While
     /// registered it fully replaces a loaded provider of that id: the loaded models, env vars,
     /// `models.jsonc` key, headers and overrides, and built-in login are unused until
-    /// `unregister`.
+    /// `unregister`. A `ProviderLayer` provider of the same id hides it.
     pub fn register(&self, provider: Provider) -> Result<(), Error> {
-        let Provider {
-            id,
-            models,
-            env,
-            requires_key,
-            login,
-            rewrite,
-        } = provider;
-        if id.is_empty() || id.contains('/') {
-            return Err(Error::Config(format!("invalid provider id: {id:?}")));
-        }
-        let mut seen = HashSet::new();
-        for model in &models {
-            if model.provider != id {
-                return Err(Error::Config(format!(
-                    "provider {id}: model {} belongs to provider {}",
-                    model.id, model.provider
-                )));
-            }
-            if !seen.insert(model.id.as_str()) {
-                return Err(Error::Config(format!(
-                    "provider {id}: duplicate model {}",
-                    model.id
-                )));
-            }
-        }
-        let auth = Arc::new(ProviderAuth {
-            id: id.clone(),
-            config_api_key: None,
-            env,
-            requires_key,
-            login,
-        });
+        let (id, registered) = Registered::new(provider)?;
         let mut state = self.shared.write();
-        state.registered.insert(
-            id,
-            Registered {
-                auth,
-                models,
-                rewrite,
-            },
-        );
+        state.registered.insert(id, registered);
         state.rebuild();
         Ok(())
     }
@@ -339,6 +427,15 @@ impl Models {
         removed
     }
 
+    /// A new, empty provider layer, newer than every existing one. The registry does not own
+    /// it: the caller fills it with `ProviderLayer::replace` and drops it to remove it.
+    pub fn provider_layer(self: &Arc<Self>) -> ProviderLayer {
+        ProviderLayer {
+            shared: Arc::clone(&self.shared),
+            ordinal: self.shared.next_layer.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
     /// Look up `provider/model-id` (the model id may itself contain `/`).
     pub fn find(&self, selector: &str) -> Option<Model> {
         let (provider, id) = selector.split_once('/')?;
@@ -348,12 +445,13 @@ impl Models {
             .cloned()
     }
 
-    /// Every model: loaded models of providers that are not replaced, then registered ones.
+    /// Every model: loaded models of providers that are not replaced, then the winning
+    /// registered and layered ones (unavailable providers included).
     pub fn all(&self) -> Arc<[Model]> {
         Arc::clone(&self.shared.read().snapshot)
     }
 
-    /// Every known provider, loaded and registered, sorted by id.
+    /// Every known provider, loaded and winning registered or layered, sorted by id.
     pub fn providers(&self) -> Vec<ProviderInfo> {
         let state = self.shared.read();
         let mut providers: BTreeMap<&str, &ProviderAuth> = state
@@ -364,9 +462,9 @@ impl Models {
             .collect();
         providers.extend(
             state
-                .registered
-                .iter()
-                .map(|(id, registered)| (id.as_str(), registered.auth.as_ref())),
+                .winners()
+                .into_iter()
+                .map(|(id, registered)| (id, registered.auth.as_ref())),
         );
         providers
             .into_values()
@@ -382,7 +480,7 @@ impl Models {
     /// Where the provider's credential would come from now, in auth order.
     /// Never resolves config values, refreshes OAuth tokens, or validates credentials.
     pub async fn credential_source(&self, provider: &str) -> Result<CredentialSource, Error> {
-        let info = self.provider(provider)?;
+        let info = self.provider(provider, false)?;
         credential_source(&info, self.shared.credentials.as_ref(), |name| {
             std::env::var(name).ok()
         })
@@ -390,21 +488,22 @@ impl Models {
     }
 
     /// Runs `provider`'s login through `interaction` and stores the credential. Drop the
-    /// future to cancel.
+    /// future to cancel. An unavailable provider fails with `Error::ProviderUnavailable`
+    /// before its login starts.
     pub async fn login(
         &self,
         provider: &str,
         interaction: &dyn LoginInteraction,
     ) -> Result<(), Error> {
-        let login =
-            self.provider(provider)?.login.clone().ok_or_else(|| {
-                Error::Auth(format!("provider {provider} does not support login"))
-            })?;
+        let login = self
+            .provider(provider, true)?
+            .login
+            .clone()
+            .ok_or_else(|| Error::Auth(format!("provider {provider} does not support login")))?;
         let credential = login.login(interaction).await?;
         self.shared.credentials.set(provider, credential).await?;
         // A new ChatGPT login may unlock a different Codex model list.
-        if provider == codex_auth::PROVIDER && !self.shared.read().registered.contains_key(provider)
-        {
+        if provider == codex_auth::PROVIDER && self.shared.read().runtime(provider).is_none() {
             let shared = Arc::clone(&self.shared);
             tokio::spawn(async move {
                 if let Err(error) = shared.refresh().await {
@@ -427,19 +526,25 @@ impl Models {
         .await
     }
 
-    /// The provider registered under `id`, else the loaded one.
-    fn provider(&self, id: &str) -> Result<Arc<ProviderAuth>, Error> {
+    /// The winning registered or layered provider of `id`, else the loaded one. With `run`,
+    /// an unavailable provider is `Error::ProviderUnavailable`.
+    fn provider(&self, id: &str, run: bool) -> Result<Arc<ProviderAuth>, Error> {
         let state = self.shared.read();
-        state
-            .registered
-            .get(id)
-            .map(|registered| Arc::clone(&registered.auth))
-            .or_else(|| state.loaded.providers.get(id).cloned())
-            .ok_or_else(|| Error::Config(format!("unknown provider: {id}")))
+        match state.runtime(id) {
+            Some((_, Some(reason))) if run => Err(unavailable(id, reason)),
+            Some((registered, _)) => Ok(Arc::clone(&registered.auth)),
+            None => state
+                .loaded
+                .providers
+                .get(id)
+                .cloned()
+                .ok_or_else(|| Error::Config(format!("unknown provider: {id}"))),
+        }
     }
 
     /// What a request to `model` runs with now: the registry's current definition of that
-    /// provider/id and its provider. `UnknownModel` when the registry no longer has it.
+    /// provider/id and its provider. `UnknownModel` when the registry no longer has it,
+    /// `ProviderUnavailable` when its provider is reserved but cannot run.
     fn request(&self, model: &Model) -> Result<Request, Error> {
         let state = self.shared.read();
         let model = state
@@ -450,7 +555,10 @@ impl Models {
                 provider: model.provider.clone(),
                 model: model.id.clone(),
             })?;
-        if let Some(registered) = state.registered.get(&model.provider) {
+        if let Some((registered, unavailability)) = state.runtime(&model.provider) {
+            if let Some(reason) = unavailability {
+                return Err(unavailable(&model.provider, reason));
+            }
             return Ok(Request {
                 model: model.clone(),
                 auth: Arc::clone(&registered.auth),
@@ -518,7 +626,7 @@ impl Shared {
 
     async fn refresh(&self) -> Result<(), Error> {
         let mut inputs = self.inputs.lock().await;
-        let codex_replaced = self.read().registered.contains_key(codex_auth::PROVIDER);
+        let codex_replaced = self.read().runtime(codex_auth::PROVIDER).is_some();
         let result = gather(
             &self.http,
             self.cache_dir.as_deref(),
@@ -534,6 +642,87 @@ impl Shared {
         .await?;
         self.replace(loaded);
         result
+    }
+}
+
+impl ProviderLayer {
+    /// Replaces this layer's providers with `entries`; `Some(reason)` reserves a provider as
+    /// unavailable (see `set_unavailable`). Every entry is validated (`Provider::validate`,
+    /// no repeated id) before anything changes; on `Err` the previous contents stay. An
+    /// empty list removes this layer's providers.
+    pub fn replace(&self, entries: Vec<(Provider, Option<String>)>) -> Result<(), Error> {
+        let mut layer = BTreeMap::new();
+        for (provider, unavailable) in entries {
+            let (id, provider) = Registered::new(provider)?;
+            match layer.entry(id) {
+                Entry::Occupied(entry) => {
+                    return Err(Error::Config(format!(
+                        "duplicate provider id: {}",
+                        entry.key()
+                    )));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(Layered {
+                        provider,
+                        unavailable,
+                    });
+                }
+            }
+        }
+        let mut state = self.shared.write();
+        if layer.is_empty() {
+            state.layers.remove(&self.ordinal);
+        } else {
+            state.layers.insert(self.ordinal, layer);
+        }
+        state.rebuild();
+        Ok(())
+    }
+
+    /// Marks this layer's provider `id` unavailable with `reason`, or available again with
+    /// `None`. Its models stay listed; requests (including `Models::auth`) and logins fail
+    /// with `Error::ProviderUnavailable` before any credential lookup. Returns whether this
+    /// layer has `id`.
+    pub fn set_unavailable(&self, id: &str, reason: Option<String>) -> bool {
+        let mut state = self.shared.write();
+        let Some(layered) = state
+            .layers
+            .get_mut(&self.ordinal)
+            .and_then(|layer| layer.get_mut(id))
+        else {
+            return false;
+        };
+        layered.unavailable = reason;
+        true
+    }
+
+    /// What this layer's provider `provider` hides, or would hide if it had one: the
+    /// next-older layer with that id, else a `Models::register` registration, else a loaded
+    /// provider. `None` when nothing beneath has that id. Newer layers are not considered.
+    pub fn hidden(&self, provider: &str) -> Option<ProviderOrigin> {
+        let state = self.shared.read();
+        if state
+            .layers
+            .range(..self.ordinal)
+            .any(|(_, layer)| layer.contains_key(provider))
+        {
+            Some(ProviderOrigin::Layer)
+        } else if state.registered.contains_key(provider) {
+            Some(ProviderOrigin::Registered)
+        } else if state.loaded.providers.contains_key(provider) {
+            Some(ProviderOrigin::Loaded)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ProviderLayer {
+    fn drop(&mut self) {
+        let mut state = self.shared.write();
+        if state.layers.remove(&self.ordinal).is_some() {
+            state.rebuild();
+        }
     }
 }
 
@@ -778,6 +967,7 @@ async fn build(
                 thinking_level_map: None,
                 input: vec![InputKind::Text],
                 cost: Cost::default(),
+                service_tiers: Default::default(),
                 context_window: 128_000,
                 max_tokens: 16_384,
                 compat: Compat::default(),
@@ -864,7 +1054,7 @@ impl Streamer for Models {
     ) -> BoxStream<'static, AssistantEvent> {
         let request = match self.request(model) {
             Ok(request) => request,
-            Err(error) => return failed(model, StopReason::Error, error.to_string()),
+            Err(error) => return setup_failed(model, &error),
         };
         let transcript = transform_messages(transcript, &request.model);
         let api: Arc<dyn Api> = match request.model.api {
@@ -896,8 +1086,13 @@ impl Streamer for Models {
                     },
                     cancel,
                 )),
-                Some(Err(error)) => failed(&request.model, StopReason::Error, error.to_string()),
-                None => failed(&request.model, StopReason::Aborted, ABORTED.to_owned()),
+                Some(Err(error)) => setup_failed(&request.model, &error),
+                None => failed(
+                    &request.model,
+                    StopReason::Aborted,
+                    ABORTED.to_owned(),
+                    None,
+                ),
             }
         })
         .flatten()
@@ -905,9 +1100,26 @@ impl Streamer for Models {
     }
 }
 
-fn failed(model: &Model, reason: StopReason, error: String) -> BoxStream<'static, AssistantEvent> {
+/// A setup error as the terminal event, with `Error::provider_failure` so an unavailable
+/// provider is never retried.
+fn setup_failed(model: &Model, error: &Error) -> BoxStream<'static, AssistantEvent> {
+    failed(
+        model,
+        StopReason::Error,
+        error.to_string(),
+        error.provider_failure(),
+    )
+}
+
+fn failed(
+    model: &Model,
+    reason: StopReason,
+    error: String,
+    failure: Option<ProviderFailure>,
+) -> BoxStream<'static, AssistantEvent> {
     let mut message = AssistantMessage::empty(model);
     message.stop_reason = reason;
     message.error_message = Some(error);
+    message.failure = failure;
     stream::iter([AssistantEvent::Error { reason, message }]).boxed()
 }

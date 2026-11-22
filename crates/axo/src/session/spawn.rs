@@ -9,7 +9,8 @@ use axo_agent::{
     QueuedMessage, Replay, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
 };
 use axo_ai::thinking::clamp_level;
-use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock};
+use axo_ai::{Model, ServiceTier, ThinkingLevel, ToolCall, UserBlock};
+use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,9 +19,10 @@ use tracing::warn;
 
 use super::children::ChildSeed;
 use super::modes::ENTER_MODE;
-use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
-use crate::config::SubagentSettings;
+use super::{Inherited, Registrations, Session, SessionHooks, SessionSetup};
+use crate::config::{SubagentSettings, SubagentTier};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
+use crate::context::definitions::{Definitions, FileDefinitions};
 use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
 use crate::coordination::SpawnReceipt;
 use crate::error::Error;
@@ -35,7 +37,8 @@ use crate::tools::output::YIELD;
 
 pub(crate) const SPAWN: &str = "spawn";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SpawnRequest {
     /// A catalog agent. With `spec` also `None`, the child is a plain delegate of this session.
     pub agent: Option<String>,
@@ -49,7 +52,8 @@ pub struct SpawnRequest {
     pub output: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct TeamRequest {
     /// A catalog team; exclusive with `members`.
     pub team: Option<String>,
@@ -61,7 +65,7 @@ pub struct TeamRequest {
     pub tasks: IndexMap<String, PromptInput>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, specta::Type)]
 pub struct TeamMemberRequest {
     pub name: String,
     /// A catalog agent; with `spec` also `None`, a plain delegate.
@@ -78,7 +82,7 @@ pub struct TeamHandle {
     pub members: Vec<(String, ChildHandle)>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, specta::Type)]
 pub struct InlineSpec {
     /// The agent body (after axo's fixed delegation framing).
     pub prompt: String,
@@ -95,7 +99,9 @@ pub struct ChildHandle {
     pub session: Arc<Session>,
 }
 
+#[expose(block = CHILD_HANDLE_BLOCK, object = "types")]
 impl ChildHandle {
+    #[ext(skip = "live child handle; session.spawn returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
         SpawnReceipt::Child {
             job: self.job.clone(),
@@ -103,7 +109,9 @@ impl ChildHandle {
     }
 }
 
+#[expose(block = TEAM_HANDLE_BLOCK, object = "types")]
 impl TeamHandle {
+    #[ext(skip = "live child handle; session.spawn returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
         SpawnReceipt::Team {
             team: self.team.clone(),
@@ -123,7 +131,12 @@ pub trait SpawnHook: Send + Sync {
 }
 
 /// Who asked for a spawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum SpawnOrigin {
     /// `Session::spawn` or `Session::spawn_team`.
     Host,
@@ -132,7 +145,8 @@ pub enum SpawnOrigin {
 }
 
 /// A team member being spawned, for spawn hooks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SpawnTeam<'a> {
     /// The catalog team; `None` for ad-hoc teams.
     pub name: Option<&'a str>,
@@ -140,6 +154,8 @@ pub struct SpawnTeam<'a> {
     pub member: &'a str,
 }
 
+#[derive(serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SpawnContext<'a> {
     /// The resolved spec, subagent defaults applied.
     pub spec: &'a AgentSpec,
@@ -155,6 +171,8 @@ pub struct SpawnContext<'a> {
     pub writes: Option<&'a WriteScope>,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
+    /// The child's chosen service tier; it applies only on models that support it.
+    pub service_tier: ServiceTier,
     pub task: &'a PromptInput,
     /// The child's depth (1 for a root session's child).
     pub depth: u32,
@@ -185,12 +203,9 @@ fn validate_output(output: Option<&Value>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn child_inherited(
-    hooks: &SessionHooks,
-    spec: &AgentSpec,
-    loaded: Loaded,
-) -> Arc<Inherited> {
+pub(super) fn child_inherited(hooks: &SessionHooks, spec: &AgentSpec) -> Arc<Inherited> {
     let parent = &hooks.inherited;
+    let defs = hooks.definitions.get();
     let base = hooks
         .shape_base
         .lock()
@@ -200,10 +215,13 @@ pub(super) fn child_inherited(
         config: parent.config.clone(),
         docs_dir: parent.docs_dir.clone(),
         harness_name: parent.harness_name.clone(),
-        agents: parent.agents.clone(),
-        modes: Vec::new(),
-        keywords: Vec::new(),
-        agent_diagnostics: Vec::new(),
+        files: Arc::new(FileDefinitions {
+            agents: defs.agents.clone(),
+            skills: defs.skills.clone(),
+            ..Default::default()
+        }),
+        definitions: Definitions::default(),
+        definition_diagnostics: Vec::new(),
         agent: Some(spec.clone()),
         streamer: parent.streamer.clone(),
         models: parent.models.clone(),
@@ -212,21 +230,26 @@ pub(super) fn child_inherited(
         ask_enabled: false,
         host_sections: base.host_sections.clone(),
         host_tools: base.host_tool_factories.clone(),
-        host_schemes: parent.host_schemes.clone(),
-        tool_policies: parent.tool_policies.clone(),
+        host_schemes: hooks.host_schemes(),
+        tool_policies: hooks.policies(),
         store: parent.store.clone(),
         sessions: parent.sessions.clone(),
-        spawn_hooks: parent.spawn_hooks.clone(),
+        spawn_hooks: hooks.spawn_hooks(),
+        commands: Vec::new(),
+        layer: Registrations::default(),
         run_slots: parent.run_slots.clone(),
-        loaded: Some(loaded),
+        docs: Some(hooks.prompt.sources.docs),
     })
 }
 
+#[expose(block = SESSION_SPAWN, object = "session")]
 impl Session {
+    #[ext(skip = "returns live child sessions; the wire method returns the receipt")]
     pub async fn spawn(&self, request: SpawnRequest) -> Result<ChildHandle, Error> {
         self.hooks.spawn(request, None).await
     }
 
+    #[ext(skip = "returns live child sessions; the wire method returns the receipt")]
     pub async fn spawn_team(&self, request: TeamRequest) -> Result<TeamHandle, Error> {
         self.hooks.spawn_team(request, None).await
     }
@@ -242,6 +265,7 @@ struct Resolved {
     agent: Option<String>,
     model: Model,
     thinking: ThinkingLevel,
+    tier: ServiceTier,
     selector: Option<String>,
     limits: ToolLimits,
     bash: BashAccess,
@@ -301,7 +325,8 @@ impl SessionHooks {
             }
             (Some(name), None) => {
                 let spec = self
-                    .inherited
+                    .definitions
+                    .get()
                     .agents
                     .iter()
                     .find_map(|definition| match definition {
@@ -387,10 +412,16 @@ impl SessionHooks {
                 .map(str::to_owned);
             let model = cascade.model.unwrap_or(parent.model);
             let thinking = clamp_level(&model, cascade.thinking.unwrap_or(parent.thinking));
-            Ok((model, thinking, selector))
+            let tier = cascade
+                .tier
+                .unwrap_or(match settings.subagents.service_tier {
+                    SubagentTier::Inherit => parent.tier,
+                    SubagentTier::Standard => ServiceTier::Standard,
+                });
+            Ok((model, thinking, tier, selector))
         };
-        let (mut model, mut thinking, mut selector) = select(&spec)?;
-        for hook in &self.inherited.spawn_hooks {
+        let (mut model, mut thinking, mut tier, mut selector) = select(&spec)?;
+        for hook in self.spawn_hooks() {
             match hook
                 .before_spawn(&SpawnContext {
                     spec: &spec,
@@ -401,6 +432,7 @@ impl SessionHooks {
                     writes: writes.as_ref(),
                     model: &model,
                     thinking,
+                    service_tier: tier,
                     task,
                     depth,
                     parent_session_id: &self.session_id,
@@ -415,7 +447,7 @@ impl SessionHooks {
                     spec = replacement;
                     normalize(&mut spec, &settings.subagents);
                     validate_output(spec.output.as_ref())?;
-                    (model, thinking, selector) = select(&spec)?;
+                    (model, thinking, tier, selector) = select(&spec)?;
                 }
             }
         }
@@ -424,6 +456,7 @@ impl SessionHooks {
             agent,
             model,
             thinking,
+            tier,
             selector,
             limits,
             bash,
@@ -450,6 +483,7 @@ impl SessionHooks {
                 agent,
                 model,
                 thinking,
+                tier,
                 selector,
                 limits,
                 bash,
@@ -470,13 +504,14 @@ impl SessionHooks {
             header.spawn = Some(link.clone());
             let child_id = header.id.clone();
             let writer = self.inherited.store.create(header).await?;
-            let inherited = child_inherited(self, &link.spec, self.loaded());
+            let inherited = child_inherited(self, &link.spec);
             let expanded_model = format!("{}/{}", model.provider, model.id);
             let child = Arc::new(
                 Session::start(SessionSetup {
                     inherited: inherited.clone(),
                     model,
                     thinking,
+                    tier,
                     session_id: child_id,
                     writer,
                     entries: Vec::new(),
@@ -645,8 +680,8 @@ impl SessionHooks {
         } = request;
         let (members, charter, team_name) = match (team, members.is_empty()) {
             (Some(name), true) => {
-                let definition = self
-                    .inherited
+                let defs = self.definitions.get();
+                let definition = defs
                     .agents
                     .iter()
                     .find(|definition| definition.name() == name)
@@ -1110,15 +1145,12 @@ impl Tool for SpawnTool {
                 None => single_output(first.id.to_string()),
             });
         }
+        let defs = hooks.definitions.get();
         let named_team = agent.as_deref().and_then(|name| {
-            hooks
-                .inherited
-                .agents
-                .iter()
-                .find_map(|definition| match definition {
-                    AgentDef::Team(team) if team.name == name => Some(team),
-                    _ => None,
-                })
+            defs.agents.iter().find_map(|definition| match definition {
+                AgentDef::Team(team) if team.name == name => Some(team),
+                _ => None,
+            })
         });
         let is_team = if members.is_some() {
             if agent.is_some() || spec.is_some() {

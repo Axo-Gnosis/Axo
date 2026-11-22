@@ -2,12 +2,18 @@
 
 use async_trait::async_trait;
 use axo_ai::{AssistantEvent, JsonMap, ToolResultMessage};
+use serde::Serialize;
 
 use crate::message::AgentMessage;
 use crate::tool::{ToolInvocationId, ToolOutput, ToolUpdate};
 
 /// One event of a run, delivered to the ordered, awaited [`Persist`] sink.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AgentEvent {
     AgentStart,
     /// Last event of a run; `messages` are the messages this run added.
@@ -52,7 +58,13 @@ pub enum AgentEvent {
 }
 
 /// Where a finished message came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum MessageOrigin {
     /// Produced by the run: assistant replies, declarations, hook messages, synthetic tool results.
     Run,

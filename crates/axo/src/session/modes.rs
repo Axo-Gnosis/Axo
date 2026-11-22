@@ -2,7 +2,8 @@ use std::sync::{Arc, OnceLock, PoisonError, Weak};
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
-use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock, thinking::clamp_level};
+use axo_ai::{Model, ServiceTier, ThinkingLevel, ToolCall, UserBlock, thinking::clamp_level};
+use axo_macros::expose;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
@@ -54,7 +55,8 @@ impl SessionHooks {
     }
 
     fn catalog_mode(&self, name: Option<&String>) -> Option<Arc<ModeSpec>> {
-        self.inherited
+        self.definitions
+            .get()
             .modes
             .iter()
             .find(|spec| Some(&spec.name) == name)
@@ -72,25 +74,26 @@ impl SessionHooks {
             let _order = self.selection_order.lock().await;
             let current = self.selection();
             let base = self.restore_base(origin.restore.filter(|_| left.is_some()), &current);
-            let (model, level, restore) = self
+            let (model, level, tier, restore) = self
                 .mode_target(target.as_deref(), &base)
                 .unwrap_or_else(|error| {
                     // The leaf is already written; navigation must not fail half-moved.
                     warn!(%error, "mode model unavailable after navigation");
-                    (base.model.clone(), base.thinking, None)
+                    (base.model.clone(), base.thinking, base.tier, None)
                 });
-            self.switch_live(&current, model.clone(), level);
-            Some((model, level, restore))
+            self.switch_live(&current, model.clone(), level, tier);
+            Some((model, level, tier, restore))
         } else {
             None
         };
         self.record_current_selection().await?;
-        if let (Some(spec), Some((model, level, restore))) = (&target, switched) {
+        if let (Some(spec), Some((model, level, tier, restore))) = (&target, switched) {
             let _order = self.selection_order.lock().await;
             let live = self.selection();
             if live.model.provider == model.provider
                 && live.model.id == model.id
                 && live.thinking == level
+                && live.tier == tier
                 && self.journal.view().projection.mode_restore != restore
             {
                 self.append(vec![Entry::ModeChange {
@@ -106,9 +109,9 @@ impl SessionHooks {
             != target.as_ref().map(|spec| &spec.name);
         state.selected = target;
         if changed {
-            let _ = self.events.send(SessionEvent::Mode {
+            let _ = self.events.send(Arc::new(SessionEvent::Mode {
                 mode: state.selected.as_ref().map(|spec| spec.name.clone()),
-            });
+            }));
         }
         Ok(())
     }
@@ -149,18 +152,27 @@ impl SessionHooks {
         };
         let current = self.selection();
         let base = self.restore_base(restore, &current);
-        let (model, level, restore) = self.mode_target(spec.as_deref(), &base)?;
+        let (model, level, tier, restore) = self.mode_target(spec.as_deref(), &base)?;
         let model_changed =
             current.model.provider != model.provider || current.model.id != model.id;
         let mut entries = if model_changed {
-            self.model_entries(&current, &model, Some(level)).0
-        } else if current.thinking != level {
-            vec![Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: level,
-            }]
+            self.model_entries(&current, &model, Some(level), Some(tier))
+                .0
         } else {
-            Vec::new()
+            let mut entries = Vec::new();
+            if current.thinking != level {
+                entries.push(Entry::ThinkingLevelChange {
+                    base: journal::base(),
+                    thinking_level: level,
+                });
+            }
+            if current.tier != tier {
+                entries.push(Entry::ServiceTierChange {
+                    base: journal::base(),
+                    service_tier: tier,
+                });
+            }
+            entries
         };
         entries.push(Entry::ModeChange {
             base: journal::base(),
@@ -168,12 +180,14 @@ impl SessionHooks {
             restore,
         });
         self.append(entries).await?;
-        self.switch_live(&current, model, level);
+        self.switch_live(&current, model, level, tier);
         self.mode
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .selected = spec;
-        let _ = self.events.send(SessionEvent::Mode { mode: name });
+        let _ = self
+            .events
+            .send(Arc::new(SessionEvent::Mode { mode: name }));
         self.results.supersede();
         Ok(())
     }
@@ -189,18 +203,19 @@ impl SessionHooks {
                     .map(|model| Selection {
                         model: model.clone(),
                         thinking: restore.thinking_level,
+                        tier: restore.service_tier,
                     })
             })
             .unwrap_or_else(|| current.clone())
     }
 
-    /// The model and level `spec` runs with from `base`, plus the selection to restore on
+    /// The model, level and tier `spec` runs with from `base`, plus the selection to restore on
     /// leaving it when they differ.
     fn mode_target(
         &self,
         spec: Option<&ModeSpec>,
         base: &Selection,
-    ) -> Result<(Model, ThinkingLevel, Option<ModeRestore>), Error> {
+    ) -> Result<(Model, ThinkingLevel, ServiceTier, Option<ModeRestore>), Error> {
         let choice = spec
             .and_then(|spec| spec.model.as_deref())
             .map(|selector| {
@@ -210,6 +225,7 @@ impl SessionHooks {
                     .resolve_model(&self.inherited.models, selector)
             })
             .transpose()?;
+        let tier_suffix = choice.as_ref().and_then(|choice| choice.tier);
         let (model, thinking) = match choice {
             Some(choice) => (
                 choice.model.unwrap_or_else(|| base.model.clone()),
@@ -218,29 +234,45 @@ impl SessionHooks {
             None => (base.model.clone(), base.thinking),
         };
         let level = clamp_level(&model, thinking);
+        let tier = self.next_tier(base, &model, tier_suffix);
         let restore = (spec.is_some()
             && (base.model.provider != model.provider
                 || base.model.id != model.id
-                || base.thinking != level))
+                || base.thinking != level
+                || base.tier != tier))
             .then(|| ModeRestore {
                 provider: base.model.provider.clone(),
                 model_id: base.model.id.clone(),
                 thinking_level: base.thinking,
+                service_tier: base.tier,
             });
-        Ok((model, level, restore))
+        Ok((model, level, tier, restore))
     }
 
-    /// Applies `model` and `level` to the attached agent; a no-op before one attaches.
-    fn switch_live(&self, current: &Selection, model: Model, level: ThinkingLevel) {
+    /// Applies the selection to the attached agent; a no-op before one attaches.
+    fn switch_live(
+        &self,
+        current: &Selection,
+        model: Model,
+        level: ThinkingLevel,
+        tier: ServiceTier,
+    ) {
         let Some(agent) = self.agent.get().and_then(Weak::upgrade) else {
             return;
         };
         if current.model.provider != model.provider || current.model.id != model.id {
-            self.apply_selection(&agent, model, level);
-        } else if current.thinking != level {
-            agent.set_thinking(level);
-            self.selection
-                .send_modify(|selection| selection.thinking = level);
+            self.apply_selection(&agent, model, level, tier);
+        } else {
+            if current.thinking != level {
+                agent.set_thinking(level);
+                self.selection
+                    .send_modify(|selection| selection.thinking = level);
+            }
+            if current.tier != tier {
+                agent.set_service_tier(tier);
+                self.selection
+                    .send_modify(|selection| selection.tier = tier);
+            }
         }
     }
 
@@ -314,15 +346,20 @@ impl SessionHooks {
     }
 }
 
+#[expose(block = SESSION_MODES, object = "session")]
 impl Session {
     /// Selects a root-session mode; instructions and limits take effect at the next request boundary.
+    #[ext]
     pub async fn set_mode(&self, name: Option<&str>) -> Result<(), Error> {
         if self.hooks.child.is_some() {
             return Err(Error::InvalidInput("Modes belong to root sessions".into()));
         }
         let spec = name
             .map(|name| {
-                self.modes()
+                self.hooks
+                    .definitions
+                    .get()
+                    .modes
                     .iter()
                     .find(|spec| spec.name == name)
                     .cloned()
@@ -334,17 +371,20 @@ impl Session {
     }
 
     /// The selected mode, including a selection waiting for the next request boundary.
+    #[ext]
     pub fn mode(&self) -> Option<Arc<ModeSpec>> {
         self.hooks.selected_mode()
     }
 
     /// The mode applied at the latest request boundary, not a pending selection.
+    #[ext]
     pub fn effective_mode(&self) -> Option<Arc<ModeSpec>> {
         self.hooks.effective_mode()
     }
 
     /// Accepts a review, optionally replacing its value and continuation.
     /// Invalid replacements leave the review pending.
+    #[ext]
     pub fn accept_result(&self, call_id: &str, options: AcceptResultOptions) -> Result<(), Error> {
         if let Some(value) = &options.replacement {
             let pending = self
@@ -366,6 +406,7 @@ impl Session {
     }
 
     /// Keeps the mode active and asks the model to revise its result.
+    #[ext]
     pub fn revise_result(&self, call_id: &str, feedback: String) -> Result<(), Error> {
         if feedback.trim().is_empty() {
             return Err(Error::InvalidInput("feedback must not be blank".into()));
@@ -377,14 +418,16 @@ impl Session {
 }
 
 /// Host review edits; `None` preserves the model's original value or mode continuation.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct AcceptResultOptions {
     pub replacement: Option<Value>,
     pub message: Option<String>,
 }
 
 /// A mode result waiting for the host's review.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingResult {
     pub call_id: String,
     pub mode: String,
@@ -402,12 +445,12 @@ pub(super) enum ResultOutcome {
 }
 
 pub(super) struct PendingResults {
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<Arc<SessionEvent>>,
     pending: Pending<PendingResult, ResultOutcome>,
 }
 
 impl PendingResults {
-    pub(super) fn new(events: broadcast::Sender<SessionEvent>) -> Self {
+    pub(super) fn new(events: broadcast::Sender<Arc<SessionEvent>>) -> Self {
         Self {
             events,
             pending: Pending::default(),
@@ -416,12 +459,12 @@ impl PendingResults {
 
     fn register(&self, result: PendingResult) -> oneshot::Receiver<ResultOutcome> {
         let rx = self.pending.register(&result.call_id, result.clone());
-        let _ = self.events.send(SessionEvent::ModeResult {
+        let _ = self.events.send(Arc::new(SessionEvent::ModeResult {
             call_id: result.call_id,
             mode: result.mode,
             result: result.result,
             awaiting_review: true,
-        });
+        }));
         rx
     }
 
@@ -449,10 +492,10 @@ impl PendingResults {
     }
 
     fn resolved(&self, call_id: &str, outcome: ResultResolution) {
-        let _ = self.events.send(SessionEvent::ModeResultResolved {
+        let _ = self.events.send(Arc::new(SessionEvent::ModeResultResolved {
             call_id: call_id.to_owned(),
             outcome,
-        });
+        }));
     }
 
     fn withdraw(&self, call_id: &str) {
@@ -631,12 +674,12 @@ impl Tool for ModeYield {
                 }
             }
         } else {
-            let _ = hooks.events.send(SessionEvent::ModeResult {
+            let _ = hooks.events.send(Arc::new(SessionEvent::ModeResult {
                 call_id: cx.call.id.clone(),
                 mode: self.mode.name.clone(),
                 result: result.clone(),
                 awaiting_review: false,
-            });
+            }));
             drop(order);
             None
         };

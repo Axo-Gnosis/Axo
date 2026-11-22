@@ -1,6 +1,6 @@
 //! Every backticked Rust-looking identifier in the docs must exist as a word somewhere in
-//! workspace source. Catches renamed or invented names in prose; `cargo test --doc`
-//! already covers fenced `rust` blocks.
+//! workspace source (crates/*/src or packages/axo-extension-sdk). Catches renamed or
+//! invented names in prose; `cargo test --doc` already covers fenced `rust` blocks.
 
 use std::collections::HashSet;
 use std::fs;
@@ -26,7 +26,7 @@ fn doc_files(root: &Path) -> Vec<PathBuf> {
     docs
 }
 
-// every `[A-Za-z0-9_]+` word in any file under crates/*/src
+// every `[A-Za-z0-9_]+` word in any file under crates/*/src or packages/axo-extension-sdk
 fn source_words(root: &Path) -> HashSet<String> {
     fn walk(dir: &Path, words: &mut HashSet<String>) {
         for entry in fs::read_dir(dir).expect("source dir") {
@@ -51,6 +51,7 @@ fn source_words(root: &Path) -> HashSet<String> {
             walk(&src, &mut words);
         }
     }
+    walk(&root.join("packages/axo-extension-sdk"), &mut words);
     words
 }
 
@@ -132,7 +133,7 @@ fn doc_identifiers_exist_in_source() {
     }
     assert!(
         missing.is_empty(),
-        "doc identifiers with no match in crates/*/src:\n{}",
+        "doc identifiers with no match in crates/*/src or packages/axo-extension-sdk:\n{}",
         missing.join("\n")
     );
 }

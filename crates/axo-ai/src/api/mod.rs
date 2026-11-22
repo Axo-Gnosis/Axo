@@ -22,7 +22,7 @@ use crate::error::Error;
 use crate::event::{AssistantEvent, parse_tool_args};
 use crate::model::Model;
 use crate::transcript::Transcript;
-use crate::types::{AssistantMessage, StopReason, ThinkingLevel};
+use crate::types::{AssistantMessage, ServiceTier, StopReason, ThinkingLevel};
 
 /// The error message of a request the caller cancelled.
 pub(crate) const ABORTED: &str = "Request was aborted";
@@ -53,7 +53,8 @@ pub trait Streamer: Send + Sync {
     ) -> BoxStream<'static, AssistantEvent>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum ToolChoice {
     Auto,
     None,
@@ -72,6 +73,8 @@ impl ToolChoice {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SimpleStreamOptions {
     pub thinking: ThinkingLevel,
+    /// The chosen tier; adapters send `Model::effective_tier` of it.
+    pub service_tier: ServiceTier,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     pub tool_choice: Option<ToolChoice>,
@@ -79,6 +82,26 @@ pub struct SimpleStreamOptions {
     pub session_id: Option<String>,
     /// Extra request headers; `None` deletes a default header.
     pub headers: BTreeMap<String, Option<String>>,
+}
+
+/// The OpenAI-family `service_tier` wire word for `tier`; `None` sends no tier.
+pub(crate) fn openai_service_tier(tier: ServiceTier) -> Option<&'static str> {
+    match tier {
+        ServiceTier::Standard => None,
+        ServiceTier::Flex => Some("flex"),
+        ServiceTier::Fast => Some("priority"),
+        ServiceTier::Ultrafast => Some("ultrafast"),
+    }
+}
+
+/// The tier a provider's echoed tier or speed word means.
+pub(crate) fn served_tier(echo: &str) -> ServiceTier {
+    match echo {
+        "priority" | "fast" => ServiceTier::Fast,
+        "flex" => ServiceTier::Flex,
+        "ultrafast" => ServiceTier::Ultrafast,
+        _ => ServiceTier::Standard,
+    }
 }
 
 #[derive(Clone, Default)]

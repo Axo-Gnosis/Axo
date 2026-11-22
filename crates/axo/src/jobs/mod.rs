@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use async_trait::async_trait;
 use axo_agent::{AgentMessage, CustomMessage, MessageOrigin, QueuedMessage, ToolInvocationId};
 use axo_ai::{Usage, UserBlock};
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
@@ -136,7 +137,8 @@ enum DeliveryKey {
 }
 
 /// A job's state, as `proc://` shows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum JobStatus {
     Queued,
     Running,
@@ -147,8 +149,10 @@ pub enum JobStatus {
     Failed,
 }
 
+#[expose(block = JOB_STATUS_BLOCK, object = "types")]
 impl JobStatus {
     /// The `proc://` label: `"queued"`, `"running"`, `"helpers running"`, `"finished"` or `"failed"`.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -161,7 +165,8 @@ impl JobStatus {
 }
 
 /// One job, for hosts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct JobInfo {
     /// The row name, `bg_N` or `agent_N`.
     pub id: String,
@@ -174,7 +179,12 @@ pub struct JobInfo {
     pub messages: Vec<JobMessageInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum JobKind {
     Command {
         /// The display label supplied by the tool.
@@ -207,7 +217,8 @@ pub enum JobKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ChildProgress {
     pub turns: u32,
     pub max_turns: u32,
@@ -218,7 +229,8 @@ pub struct ChildProgress {
     pub tools: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct JobMessageInfo {
     /// The `job_end` message id, including its sequence suffix when present.
     pub id: String,
@@ -229,7 +241,8 @@ pub struct JobMessageInfo {
     pub delivery: MessageDelivery,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum MessageDelivery {
     Held,
     Writing,
@@ -238,7 +251,7 @@ pub enum MessageDelivery {
     Delivered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum Promotion {
     Async,
@@ -247,7 +260,7 @@ pub enum Promotion {
     Host,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -262,7 +275,7 @@ pub enum CommandExit {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum Killer {
     Model,
@@ -456,7 +469,7 @@ pub struct JobRegistry {
     session_id: String,
     state: Mutex<State>,
     changed: watch::Sender<u64>,
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<Arc<SessionEvent>>,
     host: OnceLock<Weak<dyn JobHost>>,
     /// Serializes `JobHost::mail_changed` calls; never held with `state`.
     mail_notify: Mutex<()>,
@@ -879,7 +892,7 @@ impl JobRegistry {
         child_depth: u32,
         entries: &[SeqEntry],
         sessions: Arc<SessionTable>,
-        events: broadcast::Sender<SessionEvent>,
+        events: broadcast::Sender<Arc<SessionEvent>>,
     ) -> (Arc<Self>, Vec<JobId>) {
         let Replayed {
             jobs,
@@ -942,7 +955,7 @@ impl JobRegistry {
             let info = job.view(*id);
             if announced.get(id) != Some(&info) {
                 announced.insert(*id, info.clone());
-                let _ = self.events.send(SessionEvent::Job(info));
+                let _ = self.events.send(Arc::new(SessionEvent::Job(info)));
             }
         }
         announced.retain(|id, _| {
@@ -950,7 +963,7 @@ impl JobRegistry {
             if !keep {
                 let _ = self
                     .events
-                    .send(SessionEvent::JobGone { id: id.to_string() });
+                    .send(Arc::new(SessionEvent::JobGone { id: id.to_string() }));
             }
             keep
         });
@@ -1560,12 +1573,35 @@ impl JobRegistry {
         call_id: &str,
         artifacts_dir: &Path,
     ) -> Option<CommandOutput> {
+        self.find_output(artifacts_dir, |_, run| run.call_id == call_id)
+    }
+
+    pub(crate) fn job_output(&self, job_id: &str, artifacts_dir: &Path) -> Option<CommandOutput> {
+        self.find_output(artifacts_dir, |id, _| id.to_string() == job_id)
+    }
+
+    pub(crate) fn command_jobs(&self, call_id: &str) -> Vec<String> {
+        self.lock()
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| match &job.kind {
+                Kind::Command(run) if run.call_id == call_id => Some(id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_output(
+        &self,
+        artifacts_dir: &Path,
+        wanted: impl Fn(&JobId, &CommandRun) -> bool,
+    ) -> Option<CommandOutput> {
         let state = self.lock();
-        state.jobs.iter().find_map(|(id, job)| {
+        state.jobs.iter().rev().find_map(|(id, job)| {
             let Kind::Command(run) = &job.kind else {
                 return None;
             };
-            if run.call_id != call_id {
+            if !wanted(id, run) {
                 return None;
             }
             if run.output.path.as_os_str().is_empty() {
@@ -1580,6 +1616,7 @@ impl JobRegistry {
             Some(CommandOutput::new(
                 id.to_string(),
                 run.artifact,
+                run.output.path.clone(),
                 file,
                 std::fs::File::open(crate::schemes::artifact::stream_index_path(
                     &run.output.path,
@@ -1592,20 +1629,20 @@ impl JobRegistry {
 
     pub(crate) fn background(&self, call_id: &str) -> bool {
         let state = self.lock();
-        state.jobs.values().any(|job| {
+        let mut matched = false;
+        for job in state.jobs.values() {
             let Kind::Command(run) = &job.kind else {
-                return false;
+                continue;
             };
             if run.call_id == call_id
                 && run.mode == Mode::Foreground
                 && let Some(control) = &run.control
             {
                 control.promote.notify_one();
-                true
-            } else {
-                false
+                matched = true;
             }
-        })
+        }
+        matched
     }
 
     /// A listed row and its highest-sequence undelivered text.

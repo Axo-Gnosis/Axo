@@ -2,14 +2,16 @@
 //! Command execution and background delivery are shared with host tools through
 //! [`SessionTools::run_command`].
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
+use axo_macros::expose;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -21,6 +23,13 @@ use crate::tools::{CommandRequest, SessionTools};
 /// pi `MAX_TIMEOUT_MS / 1000`.
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
 
+const GUIDELINES: &[Cow<'static, str>] = &[
+    Cow::Borrowed(
+        "A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes.",
+    ),
+    Cow::Borrowed("List jobs with read proc:// and stop one with kill."),
+];
+
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
@@ -29,16 +38,24 @@ struct BashArgs {
     run_async: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BashRequest {
+    pub command: String,
+    #[serde(default)]
+    pub timeout: Option<f64>,
+    #[serde(default)]
+    pub background: bool,
+}
+
 pub struct BashTool {
     tools: Arc<SessionTools>,
     parameters: Value,
     description: String,
-    /// A `Resolved.notice` reaches the model once per session.
-    notice_shown: AtomicBool,
 }
 
 impl BashTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>) -> Self {
         let timed_promotion = if tools.runner.promote_after.is_zero() {
             String::new()
         } else {
@@ -71,7 +88,6 @@ impl BashTool {
                 },
                 "required": ["command"]
             }),
-            notice_shown: AtomicBool::new(false),
         }
     }
 }
@@ -86,11 +102,8 @@ impl Tool for BashTool {
         &self.description
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
-        &[
-            "A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes.",
-            "List jobs with read proc:// and stop one with kill.",
-        ]
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
+        GUIDELINES
     }
 
     fn parameters(&self) -> &Value {
@@ -102,14 +115,56 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ToolContext {
-            call,
-            cancel,
-            updates,
-            ..
-        } = &cx;
-        let args: BashArgs = serde_json::from_value(Value::Object(call.arguments.clone()))
+        let args: BashArgs = serde_json::from_value(Value::Object(cx.call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
+        self.tools
+            .run_bash(
+                cx,
+                BashRequest {
+                    command: args.command,
+                    timeout: args.timeout,
+                    background: args.run_async == Some(true),
+                },
+            )
+            .await
+    }
+}
+
+#[expose(block = SESSION_TOOLS_BASH, object = "tools")]
+impl SessionTools {
+    /// Runs a command as the built-in bash tool does. The environment's notice, if any,
+    /// leads the session's first result that has one.
+    #[ext(skip = "needs the call's cancellation; see the wire method")]
+    pub async fn run_bash(
+        &self,
+        cx: ToolContext,
+        request: BashRequest,
+    ) -> Result<ToolOutput, ToolError> {
+        let (request, notice) = self.prepare_bash(&cx, request).await?;
+        let result = self.run_command(cx, request).await;
+        let notice = match notice {
+            Some(notice) if !self.notice_shown.swap(true, Ordering::Relaxed) => notice,
+            _ => return result,
+        };
+        match result {
+            Ok(mut output) => {
+                if let Some(UserBlock::Text { text }) = output.content.first_mut() {
+                    *text = format!("{notice}\n\n{text}");
+                }
+                Ok(output)
+            }
+            Err(ToolError(text)) => Err(ToolError(format!("{notice}\n\n{text}"))),
+        }
+    }
+
+    async fn prepare_bash(
+        &self,
+        cx: &ToolContext,
+        args: BashRequest,
+    ) -> Result<(CommandRequest, Option<String>), ToolError> {
+        let ToolContext {
+            cancel, updates, ..
+        } = cx;
         let timeout = match args.timeout {
             Some(secs) if !secs.is_finite() || secs <= 0.0 => {
                 return Err(ToolError(
@@ -126,15 +181,14 @@ impl Tool for BashTool {
         if cancel.is_cancelled() {
             return Err(ToolError("Command aborted".into()));
         }
-        let tools = &self.tools;
-        if !tools.cwd.exists() {
+        if !self.cwd.exists() {
             return Err(ToolError(format!(
                 "Working directory does not exist: {}\nCannot execute bash commands.",
-                tools.cwd.display()
+                self.cwd.display()
             )));
         }
         // The transcript keeps the model's command; only the spawned one sees host paths.
-        let script = tools.rewrite_urls(&args.command).await?;
+        let script = self.rewrite_urls(&args.command).await?;
 
         let progress = |line: &str| {
             updates.send(ToolUpdate {
@@ -144,18 +198,18 @@ impl Tool for BashTool {
                 details: None,
             })
         };
-        let resolved = tools.exec.resolve(&tools.cwd, cancel, &progress).await;
+        let resolved = self.exec.resolve(&self.cwd, cancel, &progress).await;
         if cancel.is_cancelled() {
             return Err(ToolError("Command aborted".into()));
         }
-        let bash = find_on_path("bash", &resolved.env, &tools.cwd)
+        let bash = find_on_path("bash", &resolved.env, &self.cwd)
             .ok_or_else(|| ToolError("bash not found on PATH".into()))?;
 
         let mut env = (*resolved.env).clone();
-        let sandbox = if !tools.bash_access().is_full() {
+        let sandbox = if !self.bash_access().is_full() {
             // Writes stay possible only in scratch space: /tmp, the session's `local://`
             // dir and an absolute `TMPDIR`.
-            let local = tools.schemes.context().session_dir.join("local");
+            let local = self.schemes.context().session_dir.join("local");
             tokio::fs::create_dir_all(&local)
                 .await
                 .map_err(|err| ToolError(format!("Cannot create {}: {err}", local.display())))?;
@@ -175,33 +229,18 @@ impl Tool for BashTool {
         let spec = ExecSpec {
             program: bash,
             args: vec!["-c".into(), script.into_owned().into()],
-            cwd: tools.cwd.clone(),
+            cwd: self.cwd.clone(),
             env,
             sandbox,
         };
-        let result = tools
-            .run_command(
-                cx,
-                CommandRequest {
-                    spec,
-                    label: args.command,
-                    timeout,
-                    run_async: args.run_async == Some(true),
-                },
-            )
-            .await;
-        let notice = match resolved.notice {
-            Some(notice) if !self.notice_shown.swap(true, Ordering::Relaxed) => notice,
-            _ => return result,
-        };
-        match result {
-            Ok(mut output) => {
-                if let Some(UserBlock::Text { text }) = output.content.first_mut() {
-                    *text = format!("{notice}\n\n{text}");
-                }
-                Ok(output)
-            }
-            Err(ToolError(text)) => Err(ToolError(format!("{notice}\n\n{text}"))),
-        }
+        Ok((
+            CommandRequest {
+                spec,
+                label: args.command,
+                timeout,
+                run_async: args.background,
+            },
+            resolved.notice,
+        ))
     }
 }

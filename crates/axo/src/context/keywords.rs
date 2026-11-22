@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -12,7 +13,7 @@ use crate::context::markdown::{self, name_problems, split_frontmatter};
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// A keyword. Built from a definition file or passed in code.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct KeywordSpec {
     /// The exact (case-sensitive) word that triggers it.
@@ -30,7 +31,7 @@ pub struct KeywordSpec {
 }
 
 /// The `keywords` settings object.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct KeywordSettings {
     /// `false` turns every keyword off.
@@ -49,7 +50,8 @@ impl Default for KeywordSettings {
 }
 
 /// One keyword occurrence a submission would fire; `range` is a byte range into the text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct KeywordMatch {
     pub name: String,
     pub range: Range<usize>,
@@ -67,12 +69,9 @@ struct Frontmatter {
     extra: Map<String, Value>,
 }
 
-/// Blocking filesystem I/O; never fails (problems become diagnostics). Roots load before
-/// `programmatic`, and the first definition of a name wins.
-pub fn load_keywords(
-    roots: &[PathBuf],
-    programmatic: &[KeywordSpec],
-) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
+/// Blocking filesystem I/O; never fails (problems become diagnostics). The first
+/// definition of a name wins.
+pub fn load_keywords(roots: &[PathBuf]) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
     let mut definitions = Vec::new();
     let mut diagnostics = Vec::new();
     let mut names = HashSet::new();
@@ -105,10 +104,21 @@ pub fn load_keywords(
             }
         }
     }
-    for spec in programmatic {
+    (definitions, diagnostics)
+}
+
+pub(crate) fn merge_keywords(
+    files: &[KeywordSpec],
+    code: &[KeywordSpec],
+) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(|spec| spec.name.as_str()).collect();
+    for spec in code {
+        let name = spec.name.as_str();
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
-                origin: None,
+                origin: spec.path.clone().map(DiagnosticOrigin::Path),
                 message: format!("keyword \"{}\": {message}", spec.name),
             });
         };
@@ -117,7 +127,7 @@ pub fn load_keywords(
         if !validate(&spec, &mut warn) {
             continue;
         }
-        if names.insert(spec.name.clone()) {
+        if names.insert(name) {
             definitions.push(spec);
         } else {
             warn(format!("name \"{}\" collision", spec.name));
@@ -126,12 +136,14 @@ pub fn load_keywords(
     (definitions, diagnostics)
 }
 
+#[expose(block = KEYWORD_SPEC_BLOCK, object = "types")]
 impl KeywordSpec {
     /// Parses a keyword definition (YAML frontmatter plus body), e.g. one a host bundles
     /// with `include_str!` and passes in `SessionOptions::keywords`. `default_name` applies
     /// only when the frontmatter has no `name` key; an explicit empty `name` is invalid.
     /// Problems become diagnostics without an origin; an invalid definition yields `None`.
     /// The spec has no `path`.
+    #[ext(skip = "no receiver; served by host.parseKeyword")]
     pub fn parse(default_name: &str, markdown: &str) -> (Option<KeywordSpec>, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let spec = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {

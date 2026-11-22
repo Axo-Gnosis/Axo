@@ -9,8 +9,11 @@ pub mod context;
 mod coordination;
 mod error;
 pub mod exec;
+pub mod ext;
+mod host;
 mod input;
 mod jobs;
+mod models;
 mod recovery;
 pub mod schemes;
 mod session;
@@ -18,40 +21,50 @@ pub mod store;
 pub mod tools;
 
 pub use axo::{Axo, AxoBuilder, Catalog};
-pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
+pub use commands::{
+    Command, CommandHandler, CommandInfo, CommandKind, CommandPolicy, RegisteredCommand,
+    valid_command_name,
+};
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
-    EffectiveConfig, ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings,
-    PromptOverride, RetrySettings, Settings, SubagentSettings, SummaryRequest, UserConfig,
+    EffectiveConfig, EnabledExtension, ExtensionListError, ModelChoice, PROMPT_NAMES,
+    ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride, RetrySettings,
+    ServiceTierSettings, Settings, SubagentSettings, SubagentTier, SummaryRequest,
+    TierOnModelChange, UserConfig,
 };
 pub use context::agents::{AgentSpec, RunAs};
+pub use context::definitions::Definitions;
 pub use context::keywords::{KeywordMatch, KeywordSettings, KeywordSpec};
 pub use context::modes::{BashAccess, ModeResult, ModeSpec, ToolLimits};
+pub use context::prompt::valid_section_name;
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use coordination::{
     KillReceipt, SendIdentity, SendKind, SendReceipt, SpawnReceipt, SubmissionProvenance,
     WaitReason, WaitReceipt,
 };
-pub use error::Error;
+pub use error::{Error, ErrorCode};
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{
     OutputChunk, OutputError, OutputStream, Pipe, PipeChunk, ProcessSupervisor, Sandbox,
     Supervision,
 };
 pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
+pub use host::SessionPage;
 pub use input::{PromptInput, PromptPart};
 pub use jobs::{
     ChildProgress, CommandExit, CommandOutput, JobInfo, JobKind, JobMessageInfo, JobStatus, Killer,
     MessageDelivery, OutputProgress, Promotion, jobs_from_entries,
 };
-pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
+pub use models::CompletionRequest;
+pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target, valid_scheme_name};
+pub use session::wire::{EntryPage, OutputPage};
 pub use session::{
     AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
     HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
     PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput, RecoveryPolicy,
-    ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode,
-    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle,
-    TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
+    Registrations, ResultResolution, Session, SessionEvent, SessionEventKind, SessionOptions,
+    SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
+    SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
@@ -60,9 +73,10 @@ pub use store::{
     TIMESTAMP_FORMAT, TeamLink, TeamRef, project,
 };
 pub use tools::{
-    Answer, CommandRequest, Exposure, FileChange, HostTool, LineDiff, MAX_SNAPSHOT_BYTES, Omitted,
-    Question, QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange,
-    ToolFactory, WriteRoot, WriteScope, file_change, squash,
+    Answer, ArtifactSlot, BashRequest, CommandRequest, Exposure, FileAccess, FileChange, FileRead,
+    FileRecord, FileWrite, HostTool, LedgerRecord, LineDiff, MAX_SNAPSHOT_BYTES, Omitted, Question,
+    QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange, ToolAccess,
+    ToolFactory, WriteRoot, WriteScope, Written, file_changes, file_details, file_records, squash,
 };
 
 #[cfg(doctest)]
@@ -84,4 +98,7 @@ mod markdown_doctests {
 
     #[doc = include_str!("../docs/extending.md")]
     mod extending {}
+
+    #[doc = include_str!("../docs/extension-api.md")]
+    mod extension_api {}
 }

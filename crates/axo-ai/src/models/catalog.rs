@@ -116,6 +116,7 @@ pub(crate) struct DevToolUpdates {
 #[serde(default)]
 pub(crate) struct DevCost {
     pub text: DevTextCost,
+    pub multipliers: Vec<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]

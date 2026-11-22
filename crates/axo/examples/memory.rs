@@ -141,10 +141,10 @@ async fn main() -> Result<(), Error> {
     measurement
 }
 
-async fn wait_for_first_deltas(receivers: &mut [Receiver<SessionEvent>]) -> Result<(), Error> {
+async fn wait_for_first_deltas(receivers: &mut [Receiver<Arc<SessionEvent>>]) -> Result<(), Error> {
     for events in receivers {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Agent(AgentEvent::MessageUpdate {
                     event: AssistantEvent::TextDelta { .. } | AssistantEvent::ThinkingDelta { .. },
                 })) => break,

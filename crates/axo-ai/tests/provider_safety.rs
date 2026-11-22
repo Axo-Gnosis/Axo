@@ -6,8 +6,8 @@ use std::thread::JoinHandle;
 use axo_ai::testing::read_http_request_parts;
 use axo_ai::{
     AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, Compat, CompletionsApi,
-    Cost, InputKind, Message, Model, ModelAuth, SimpleStreamOptions, StreamOptions, SystemMessage,
-    TextBlock, ToolChoice, ToolSpec, Transcript,
+    Cost, InputKind, Message, Model, ModelAuth, ServiceTier, SimpleStreamOptions, StreamOptions,
+    SystemMessage, TextBlock, ToolChoice, ToolSpec, Transcript,
 };
 use base64::Engine;
 use futures::StreamExt;
@@ -42,6 +42,7 @@ fn model(api: ApiKind, base_url: String) -> Model {
         thinking_level_map: None,
         input: vec![InputKind::Text],
         cost: Cost::default(),
+        service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 4096,
         compat: Compat::default(),
@@ -49,17 +50,24 @@ fn model(api: ApiKind, base_url: String) -> Model {
 }
 
 async fn request(api: ApiKind, url: String, choice: Option<ToolChoice>) -> AssistantMessage {
-    request_with(api, url, choice, BTreeMap::new()).await
+    request_with(
+        model(api, url),
+        SimpleStreamOptions {
+            tool_choice: choice,
+            ..Default::default()
+        },
+        BTreeMap::new(),
+    )
+    .await
 }
 
 async fn request_with(
-    api: ApiKind,
-    url: String,
-    choice: Option<ToolChoice>,
+    model: Model,
+    simple: SimpleStreamOptions,
     headers: BTreeMap<String, String>,
 ) -> AssistantMessage {
     let client = reqwest::Client::new();
-    let adapter: Box<dyn Api> = match api {
+    let adapter: Box<dyn Api> = match model.api {
         ApiKind::AnthropicMessages => Box::new(AnthropicApi::new(client)),
         ApiKind::OpenAiCompletions => Box::new(CompletionsApi::new(client)),
         ApiKind::OpenAiCodexResponses => Box::new(CodexApi::new(client)),
@@ -68,7 +76,7 @@ async fn request_with(
         .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test"}}"#);
     let events: Vec<_> = adapter
         .stream(
-            &model(api, url),
+            &model,
             Transcript::new(vec![Message::System(SystemMessage {
                 content: vec![TextBlock {
                     text: "test".into(),
@@ -82,9 +90,8 @@ async fn request_with(
             })]),
             StreamOptions {
                 simple: SimpleStreamOptions {
-                    tool_choice: choice,
                     max_tokens: Some(42),
-                    ..Default::default()
+                    ..simple
                 },
                 auth: ModelAuth {
                     api_key: Some(format!("header.{payload}.signature")),
@@ -231,7 +238,12 @@ async fn codex_account_id_header_comes_from_the_credential_else_the_token() {
         (BTreeMap::new(), "test"),
     ] {
         let (url, server) = server(400, "", r#"{"error":{"message":"stop"}}"#);
-        request_with(ApiKind::OpenAiCodexResponses, url, None, headers).await;
+        request_with(
+            model(ApiKind::OpenAiCodexResponses, url),
+            SimpleStreamOptions::default(),
+            headers,
+        )
+        .await;
         let (head, _) = server.join().unwrap();
         let values: Vec<_> = head
             .lines()
@@ -240,5 +252,101 @@ async fn codex_account_id_header_comes_from_the_credential_else_the_token() {
             .map(|(_, value)| value.trim())
             .collect();
         assert_eq!(values, [expected]);
+    }
+}
+
+#[tokio::test]
+async fn service_tiers_reach_the_wire_and_the_bill() {
+    use ServiceTier::{Fast, Standard};
+
+    for api in [
+        ApiKind::OpenAiCodexResponses,
+        ApiKind::OpenAiCompletions,
+        ApiKind::AnthropicMessages,
+    ] {
+        let anthropic = api == ApiKind::AnthropicMessages;
+        // Anthropic need not report a speed on standard requests. OpenAI explicitly
+        // reports "default", even when asked for priority.
+        let baseline_choice = if anthropic { Standard } else { Fast };
+        for (chosen, supported, served) in [
+            (baseline_choice, true, Standard),
+            (Fast, true, Fast),
+            (Standard, true, Fast),
+            (Fast, false, Standard),
+        ] {
+            let echo = if served == Fast {
+                "priority"
+            } else {
+                "default"
+            };
+            let response = match api {
+                ApiKind::OpenAiCodexResponses => {
+                    let event = json!({"type": "response.completed", "response": {
+                        "status": "completed", "service_tier": echo, "usage": {"input_tokens": 4}
+                    }});
+                    format!("data: {event}\n\n")
+                }
+                ApiKind::OpenAiCompletions => {
+                    let chunk = json!({
+                        "service_tier": echo, "usage": {"prompt_tokens": 4},
+                        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]
+                    });
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                }
+                ApiKind::AnthropicMessages => {
+                    let mut usage = json!({"input_tokens": 4});
+                    if served == Fast {
+                        usage["speed"] = json!("fast");
+                    }
+                    let start = json!({"type": "message_start", "message": {"usage": usage}});
+                    let delta =
+                        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}});
+                    format!(
+                        "event: message_start\ndata: {start}\n\nevent: message_delta\ndata: {delta}\n\n\
+                         event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                    )
+                }
+            };
+            let (url, server) = server(200, "Content-Type: text/event-stream\r\n", &response);
+            let mut model = model(api, url);
+            model.cost.input = 1_000_000.0; // One dollar per input token.
+            if supported {
+                model.service_tiers.insert(Fast, 2.0);
+            }
+            let options = SimpleStreamOptions {
+                service_tier: chosen,
+                ..Default::default()
+            };
+            let message = request_with(model, options, BTreeMap::new()).await;
+            let (head, body) = server.join().unwrap();
+            let fast = chosen == Fast && supported;
+            let (field, value) = if anthropic {
+                let beta =
+                    head.lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .any(|(name, values)| {
+                            name.eq_ignore_ascii_case("anthropic-beta")
+                                && values
+                                    .split(',')
+                                    .any(|v| v.trim() == "fast-mode-2026-02-01")
+                        });
+                assert_eq!(beta, fast);
+                ("speed", "fast")
+            } else {
+                ("service_tier", "priority")
+            };
+            assert_eq!(
+                body.get(field),
+                fast.then(|| json!(value)).as_ref(),
+                "{api:?}"
+            );
+            assert_eq!(message.stop_reason, axo_ai::StopReason::Stop, "{message:?}");
+            assert_eq!(message.service_tier, served, "{api:?}");
+            assert_eq!(
+                message.usage.cost.total,
+                if served == Fast { 8.0 } else { 4.0 },
+                "{api:?}"
+            );
+        }
     }
 }

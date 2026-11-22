@@ -299,6 +299,7 @@ pub(super) async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
         inherited: seed.inherited.clone(),
         model,
         thinking,
+        tier: projection.tier.unwrap_or_default(),
         session_id: header.id,
         writer,
         entries,
@@ -468,7 +469,7 @@ impl SessionHooks {
         };
         let seed = Arc::new(ChildSeed {
             path: child.path.clone(),
-            inherited: child_inherited(self, &link.spec, self.loaded()),
+            inherited: child_inherited(self, &link.spec),
             link,
         });
         if recover {

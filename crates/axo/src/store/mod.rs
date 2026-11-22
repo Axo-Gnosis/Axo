@@ -16,8 +16,10 @@ pub use entry::{
     ModeRestore, RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind,
     SubmittedCustom, TIMESTAMP_FORMAT, TeamLink, TeamRef,
 };
+pub(crate) use entry::{ENTRY_BASE_BLOCK, ENTRY_BLOCK, ENTRY_ID_BLOCK, HEADER_BLOCK};
+pub(crate) use jsonl::JSONL_STORE_BLOCK;
 pub use jsonl::JsonlStore;
-pub(crate) use project::{BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, path_to};
+pub(crate) use project::{BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, PROJECTION_BLOCK, path_to};
 pub use project::{ProjectedSource, Projection, project};
 
 use crate::error::Error;
@@ -62,6 +64,23 @@ pub trait SessionStore: Send + Sync {
 
     /// Reads a session without locking it.
     async fn open_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error>;
+
+    /// Reads the header and up to `limit` entries with `seq > after`, and whether more
+    /// follow. The default reads the whole session; a store overrides it to bound the work.
+    async fn read_page(
+        &self,
+        path: &Path,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<(Header, Vec<SeqEntry>, bool), Error> {
+        let (header, mut entries) = self.open_read(path).await?;
+        let start = after.map_or(0, |seq| entries.partition_point(|entry| entry.seq <= seq));
+        let end = start.saturating_add(limit).min(entries.len());
+        let more = end < entries.len();
+        entries.truncate(end);
+        entries.drain(..start);
+        Ok((header, entries, more))
+    }
 
     /// Reads only a session's header, without locking it or reading its entries.
     async fn read_header(&self, path: &Path) -> Result<Header, Error>;

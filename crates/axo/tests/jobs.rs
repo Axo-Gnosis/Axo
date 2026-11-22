@@ -165,8 +165,8 @@ async fn await_run_end(session: &Session, after: u64) {
     }
     within(async {
         loop {
-            match attach.events.recv().await {
-                Ok(SessionEvent::Entry(seq)) if is_end(&seq) => break,
+            match attach.events.recv().await.as_deref() {
+                Ok(SessionEvent::Entry(seq)) if is_end(seq) => break,
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
             }
@@ -177,18 +177,18 @@ async fn await_run_end(session: &Session, after: u64) {
 
 /// Folds `Job`/`JobGone` events into `rows` until they equal `want`.
 async fn await_jobs(
-    events: &mut broadcast::Receiver<SessionEvent>,
+    events: &mut broadcast::Receiver<Arc<SessionEvent>>,
     rows: &mut BTreeMap<String, JobInfo>,
     want: &[JobInfo],
 ) {
     within(async {
         while !rows.values().eq(want) {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Job(info)) => {
-                    rows.insert(info.id.clone(), info);
+                    rows.insert(info.id.clone(), info.clone());
                 }
                 Ok(SessionEvent::JobGone { id }) => {
-                    rows.remove(&id);
+                    rows.remove(id);
                 }
                 Ok(_) => {}
                 Err(e) => panic!("job events: {e}"),
@@ -228,7 +228,7 @@ async fn command_events_are_ordered_across_attach() {
     });
     let running = within(async {
         loop {
-            match events.recv().await.unwrap() {
+            match &*events.recv().await.unwrap() {
                 SessionEvent::Job(info) if info.id == "bg_1" => {
                     assert_eq!(info.status, JobStatus::Running);
                     assert_eq!(info.call_id.as_deref(), Some("c1"));
@@ -240,7 +240,7 @@ async fn command_events_are_ordered_across_attach() {
                             ..
                         }
                     ));
-                    break info;
+                    break info.clone();
                 }
                 SessionEvent::Entry(seq) if matches!(seq.entry, Entry::JobEnd { .. }) => {
                     panic!("job_end preceded the running row")
@@ -255,11 +255,11 @@ async fn command_events_are_ordered_across_attach() {
     within(async {
         let mut ended = false;
         loop {
-            match events.recv().await.unwrap() {
+            match &*events.recv().await.unwrap() {
                 SessionEvent::Entry(seq) => {
-                    if let Entry::JobEnd { job_id, exit, .. } = seq.entry {
+                    if let Entry::JobEnd { job_id, exit, .. } = &seq.entry {
                         assert_eq!(job_id, "bg_1");
-                        assert_eq!(exit, Some(CommandExit::Exited { code: 0 }));
+                        assert_eq!(*exit, Some(CommandExit::Exited { code: 0 }));
                         ended = true;
                     }
                 }
@@ -286,7 +286,7 @@ async fn command_events_are_ordered_across_attach() {
     within(async {
         let mut finished = false;
         loop {
-            if let SessionEvent::Job(info) = attached.events.recv().await.unwrap() {
+            if let SessionEvent::Job(info) = &*attached.events.recv().await.unwrap() {
                 assert_eq!(info.id, "bg_1");
                 if finished {
                     assert_eq!(
@@ -710,7 +710,7 @@ async fn steer_promotes_a_foreground_command() {
 
     within(async {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Agent(AgentEvent::ToolExecutionStart { name, .. }))
                     if name == "bash" =>
                 {
@@ -1060,7 +1060,7 @@ async fn resume_wakes_delivers_results_an_abort_paused() {
     let stop = async {
         loop {
             if let SessionEvent::Agent(AgentEvent::ToolExecutionStart { name, .. }) =
-                events.recv().await.unwrap()
+                &*events.recv().await.unwrap()
                 && name == "hang"
             {
                 session.abort();
@@ -1088,7 +1088,7 @@ async fn resume_wakes_delivers_results_an_abort_paused() {
     session.resume_wakes();
     within(async {
         loop {
-            if let SessionEvent::AutoPaused { paused } = events.recv().await.unwrap() {
+            if let SessionEvent::AutoPaused { paused } = &*events.recv().await.unwrap() {
                 assert!(!paused);
                 return;
             }

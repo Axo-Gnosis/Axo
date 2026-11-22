@@ -1,9 +1,12 @@
-//! User commands: the built-in session operations and skills a host may offer, their
-//! typed arguments, and the one parser for the `/name args` text form.
+//! User commands: the built-in session operations, modes, host-registered commands and
+//! skills a host may offer, their typed arguments, and the one parser for the
+//! `/name args` text form.
 
 use std::sync::{Arc, LazyLock};
 
-use axo_ai::ThinkingLevel;
+use async_trait::async_trait;
+use axo_ai::{ServiceTier, ThinkingLevel};
+use axo_macros::expose;
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
@@ -13,11 +16,16 @@ use crate::context::modes::ModeSpec;
 use crate::context::skills::{Skill, next_command_arg};
 use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::error::Error;
-use crate::session::{ShakeMode, normalize_focus};
+use crate::session::{Session, ShakeMode, normalize_focus};
 use crate::store::EntryId;
 
-/// A built-in session operation or mode command, decoded and validated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A built-in session operation, mode or registered command, decoded and validated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Command {
     Compact {
         focus: Option<String>,
@@ -35,15 +43,42 @@ pub enum Command {
     Thinking {
         level: ThinkingLevel,
     },
+    Tier {
+        tier: ServiceTier,
+    },
     Navigate {
         entry: EntryId,
         summarize: bool,
         focus: Option<String>,
     },
+    /// A host-registered command; `args` is the rest of the line, trimmed.
+    Registered {
+        name: String,
+        args: String,
+    },
+}
+
+/// The code behind a registered command.
+#[async_trait]
+pub trait CommandHandler: Send + Sync {
+    /// Runs `/name args`; `args` is the rest of the line, trimmed.
+    async fn run(&self, session: &Session, args: &str) -> Result<(), Error>;
+}
+
+/// A command a host registers through `SessionOptions::commands` or
+/// `Session::set_commands`.
+#[derive(Clone)]
+pub struct RegisteredCommand {
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    /// Who registered it, for diagnostics.
+    pub origin: Option<String>,
+    pub handler: Arc<dyn CommandHandler>,
 }
 
 /// How a command behaves while a turn is running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandPolicy {
     /// Runs during a turn or maintenance and takes effect from the next request.
@@ -54,7 +89,7 @@ pub enum CommandPolicy {
     Queued,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -68,10 +103,12 @@ pub enum CommandKind {
     Mode { argument_hint: Option<String> },
     /// One free-text argument.
     Skill { argument_hint: Option<String> },
+    /// A host-registered command with one free-text argument.
+    Registered { argument_hint: Option<String> },
 }
 
 /// One entry of the command catalog; hosts expose whichever entries they want, in any form.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandInfo {
     pub name: String,
@@ -102,7 +139,7 @@ struct ShakeArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelArgs {
-    /// A model selector: `provider/id` or `@role`, optionally with `:thinking`, or `:thinking` alone.
+    /// A model selector: `provider/id` or `@role`, optionally with `:thinking` and `:tier` in either order, or suffixes alone.
     #[schemars(extend("format" = "model"))]
     model: String,
 }
@@ -112,6 +149,13 @@ struct ModelArgs {
 struct ThinkingArgs {
     #[schemars(schema_with = "thinking_schema")]
     level: ThinkingLevel,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TierArgs {
+    #[schemars(schema_with = "tier_schema")]
+    tier: ServiceTier,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -137,6 +181,14 @@ fn thinking_schema(_: &mut SchemaGenerator) -> Schema {
         .map(|level| serde_json::to_value(level).expect("unit variants serialize"))
         .collect();
     json_schema!({ "type": "string", "enum": levels })
+}
+
+fn tier_schema(_: &mut SchemaGenerator) -> Schema {
+    let tiers: Vec<Value> = ServiceTier::ALL
+        .iter()
+        .map(|tier| serde_json::to_value(tier).expect("unit variants serialize"))
+        .collect();
+    json_schema!({ "type": "string", "enum": tiers })
 }
 
 /// `T`'s JSON Schema with every subschema inlined (no `$ref`/`$defs`), minus `$schema`
@@ -176,6 +228,11 @@ fn decode_thinking(args: Value) -> Result<Command, serde_json::Error> {
     Ok(Command::Thinking { level })
 }
 
+fn decode_tier(args: Value) -> Result<Command, serde_json::Error> {
+    let TierArgs { tier } = serde_json::from_value(args)?;
+    Ok(Command::Tier { tier })
+}
+
 fn decode_navigate(args: Value) -> Result<Command, serde_json::Error> {
     let NavigateArgs {
         entry,
@@ -202,7 +259,7 @@ struct Builtin {
 }
 
 /// The built-in commands, in catalog order.
-static BUILTINS: [Builtin; 5] = [
+static BUILTINS: [Builtin; 6] = [
     Builtin {
         name: "compact",
         description: "Summarize older history to free context",
@@ -230,6 +287,13 @@ static BUILTINS: [Builtin; 5] = [
         policy: CommandPolicy::Alongside,
         parameters: LazyLock::new(parameters::<ThinkingArgs>),
         decode: decode_thinking,
+    },
+    Builtin {
+        name: "tier",
+        description: "Set the service tier from the next request",
+        policy: CommandPolicy::Alongside,
+        parameters: LazyLock::new(parameters::<TierArgs>),
+        decode: decode_tier,
     },
     Builtin {
         name: "navigate",
@@ -309,8 +373,10 @@ impl Builtin {
     }
 }
 
+#[expose(block = COMMAND_BLOCK, object = "types")]
 impl Command {
     /// Decodes a built-in command from JSON arguments; `null` counts as `{}`.
+    #[ext(skip = "no receiver; served by host.decodeCommand")]
     pub fn decode(name: &str, args: Value) -> Result<Command, Error> {
         builtin(name)
             .ok_or_else(|| Error::InvalidCommand {
@@ -322,6 +388,7 @@ impl Command {
 
     /// Parses `/name args` naming a built-in command, for hosts that accept typed
     /// commands. `None` for any other text, including unknown `/word`s and skills.
+    #[ext(skip = "no receiver; served by host.parseCommand")]
     pub fn parse(text: &str) -> Option<Result<Command, Error>> {
         let rest = text.strip_prefix('/')?;
         let (name, args) = match rest.find(char::is_whitespace) {
@@ -332,8 +399,14 @@ impl Command {
     }
 }
 
-/// Built-ins in table order, then modes, then skills not hidden by either.
-pub fn catalog(skills: &[Skill], modes: &[Arc<ModeSpec>]) -> Vec<CommandInfo> {
+/// Built-ins in table order, then modes, then effective registered commands, then skills
+/// not hidden by any of them.
+pub fn catalog(
+    skills: &[Skill],
+    modes: &[Arc<ModeSpec>],
+    registered: &[RegisteredCommand],
+) -> Vec<CommandInfo> {
+    let registered = effective(registered, modes);
     let builtins = BUILTINS.iter().map(|builtin| CommandInfo {
         name: builtin.name.to_owned(),
         description: builtin.description.to_owned(),
@@ -345,7 +418,9 @@ pub fn catalog(skills: &[Skill], modes: &[Arc<ModeSpec>]) -> Vec<CommandInfo> {
     let skills = skills
         .iter()
         .filter(|skill| {
-            !is_builtin(&skill.name) && !modes.iter().any(|mode| mode.name == skill.name)
+            !is_builtin(&skill.name)
+                && !modes.iter().any(|mode| mode.name == skill.name)
+                && !registered.iter().any(|command| command.name == skill.name)
         })
         .map(|skill| CommandInfo {
             name: skill.name.clone(),
@@ -363,7 +438,104 @@ pub fn catalog(skills: &[Skill], modes: &[Arc<ModeSpec>]) -> Vec<CommandInfo> {
             argument_hint: mode.argument_hint.clone(),
         },
     });
-    builtins.chain(modes).chain(skills).collect()
+    let registered = registered.iter().map(|command| CommandInfo {
+        name: command.name.clone(),
+        description: command.description.clone(),
+        policy: CommandPolicy::Alongside,
+        kind: CommandKind::Registered {
+            argument_hint: command.argument_hint.clone(),
+        },
+    });
+    builtins
+        .chain(modes)
+        .chain(registered)
+        .chain(skills)
+        .collect()
+}
+
+/// Whether a registered command name is non-empty with no whitespace or `/`.
+pub fn valid_command_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(|c: char| c.is_whitespace() || c == '/')
+}
+
+/// The registered commands that take effect: valid names not taken by a built-in or a
+/// mode, the last registration of each name, at the position its name was first seen.
+pub(crate) fn effective<'a>(
+    registered: &'a [RegisteredCommand],
+    modes: &[Arc<ModeSpec>],
+) -> Vec<&'a RegisteredCommand> {
+    let mut winners: Vec<&RegisteredCommand> = Vec::new();
+    for command in registered {
+        let name = command.name.as_str();
+        if !valid_command_name(name)
+            || is_builtin(name)
+            || modes.iter().any(|mode| mode.name == name)
+        {
+            continue;
+        }
+        match winners.iter_mut().find(|winner| winner.name == name) {
+            Some(winner) => *winner = command,
+            None => winners.push(command),
+        }
+    }
+    winners
+}
+
+/// One warning per registered command that does not take effect as registered, and per
+/// skill a registered command hides.
+pub(crate) fn registered_diagnostics(
+    registered: &[RegisteredCommand],
+    modes: &[Arc<ModeSpec>],
+    skills: &[Skill],
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut seen: Vec<&RegisteredCommand> = Vec::new();
+    for command in registered {
+        let name = command.name.as_str();
+        let who = crate::tools::who(command.origin.as_deref());
+        let message = if !valid_command_name(name) {
+            Some(format!("command name \"{name}\" is invalid; ignored"))
+        } else if is_builtin(name) {
+            Some(format!(
+                "command \"/{name}\" from {who} is hidden by the built-in /{name} command"
+            ))
+        } else if modes.iter().any(|mode| mode.name == name) {
+            Some(format!(
+                "command \"/{name}\" from {who} is hidden by the mode /{name}"
+            ))
+        } else {
+            let message = seen
+                .iter()
+                .rev()
+                .find(|earlier| earlier.name == name)
+                .map(|loser| {
+                    format!(
+                        "command \"/{name}\" from {who} replaces the one from {}",
+                        crate::tools::who(loser.origin.as_deref())
+                    )
+                });
+            seen.push(command);
+            message
+        };
+        diagnostics.extend(message.map(|message| Diagnostic {
+            origin: command.origin.clone().map(DiagnosticOrigin::Host),
+            message,
+        }));
+    }
+    let registered = effective(registered, modes);
+    diagnostics.extend(
+        skills
+            .iter()
+            .filter(|skill| registered.iter().any(|command| command.name == skill.name))
+            .map(|skill| Diagnostic {
+                origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
+                message: format!(
+                    "skill name \"{name}\" is hidden by the command /{name}; the command catalog lists the command",
+                    name = skill.name
+                ),
+            }),
+    );
+    diagnostics
 }
 
 /// One warning per skill whose name a built-in command reserves.
@@ -623,24 +795,24 @@ mod tests {
             skill("review", Some("<file>")),
             skill("deploy", None),
         ];
-        let catalog = catalog(&skills, &[]);
+        let catalog = catalog(&skills, &[], &[]);
         let names: Vec<&str> = catalog.iter().map(|info| info.name.as_str()).collect();
         assert_eq!(
             names,
             [
-                "compact", "shake", "model", "thinking", "navigate", "review", "deploy"
+                "compact", "shake", "model", "thinking", "tier", "navigate", "review", "deploy"
             ]
         );
         assert!(matches!(catalog[0].kind, CommandKind::Builtin { .. }));
-        assert_eq!(catalog[5].policy, CommandPolicy::Queued);
+        assert_eq!(catalog[6].policy, CommandPolicy::Queued);
         assert_eq!(
-            catalog[5].kind,
+            catalog[6].kind,
             CommandKind::Skill {
                 argument_hint: Some("<file>".into())
             }
         );
         assert_eq!(
-            serde_json::to_value(&catalog[5]).unwrap(),
+            serde_json::to_value(&catalog[6]).unwrap(),
             json!({
                 "name": "review",
                 "description": "review skill",
@@ -662,17 +834,17 @@ mod tests {
             argument_hint: Some("task".into()),
             ..Default::default()
         })];
-        let catalog = super::catalog(&skills, &modes);
-        assert_eq!(catalog[5].name, "review");
-        assert_eq!(catalog[5].policy, CommandPolicy::Alongside);
+        let catalog = super::catalog(&skills, &modes, &[]);
+        assert_eq!(catalog[6].name, "review");
+        assert_eq!(catalog[6].policy, CommandPolicy::Alongside);
         assert_eq!(
-            catalog[5].kind,
+            catalog[6].kind,
             CommandKind::Mode {
                 argument_hint: Some("task".into())
             }
         );
-        assert_eq!(catalog[6].name, "deploy");
-        assert_eq!(catalog.len(), 7);
+        assert_eq!(catalog[7].name, "deploy");
+        assert_eq!(catalog.len(), 8);
         let diagnostics = hidden_skill_diagnostics(&skills, &modes);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(

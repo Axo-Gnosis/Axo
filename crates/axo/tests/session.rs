@@ -365,7 +365,7 @@ async fn input_after_stop_starts_the_next_run() {
     within(async {
         loop {
             if let SessionEvent::Agent(axo_agent::AgentEvent::ToolExecutionStart { .. }) =
-                events.recv().await.unwrap()
+                &*events.recv().await.unwrap()
             {
                 break;
             }
@@ -576,7 +576,7 @@ async fn dropping_a_prompt_future_still_settles_its_run() {
                         ..
                     },
                 ..
-            }) = events.recv().await.unwrap()
+            }) = &*events.recv().await.unwrap()
             {
                 break;
             }
@@ -714,8 +714,8 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
         let mut events = attach.events;
         within(async {
             loop {
-                if let SessionEvent::Entry(seq) = events.recv().await.unwrap()
-                    && is_done(&seq)
+                if let SessionEvent::Entry(seq) = &*events.recv().await.unwrap()
+                    && is_done(seq)
                 {
                     break;
                 }
@@ -1213,7 +1213,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
     };
     let mut initial = options(dir.path());
     initial.agent = Some("a".into());
-    initial.agents = vec![a.clone(), b.clone()];
+    initial.definitions.agents = vec![a.clone(), b.clone()];
     let session = host.axo.create_session(initial).await.unwrap();
     assert_eq!(session.agent().unwrap().name, "a");
     assert!(session.spawn_link().is_none());
@@ -1224,7 +1224,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
 
     // Reopening without `agent` re-resolves the recorded persona by name.
     let mut reopen_options = options(dir.path());
-    reopen_options.agents = vec![a.clone(), b];
+    reopen_options.definitions.agents = vec![a.clone(), b];
     let reopened = host.axo.open_session(&path, reopen_options).await.unwrap();
     assert_eq!(reopened.agent().unwrap().name, "a");
     reopened
@@ -1307,7 +1307,7 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
         ..Default::default()
     };
     let mut settings = options(dir.path());
-    settings.agents = vec![root, child.clone()];
+    settings.definitions.agents = vec![root, child.clone()];
     let session = host.create_session(settings).await.unwrap();
     assert!(matches!(
         session.set_agent(Some("child-only")).await,
@@ -1333,7 +1333,7 @@ mod keywords {
     use std::time::Duration;
 
     use axo::context::keywords::{KeywordMatch, KeywordSpec};
-    use axo::{Command, Entry, PromptPart, SessionOptions};
+    use axo::{Command, Definitions, Entry, PromptPart, SessionOptions};
     use axo_agent::RunOutcome;
     use axo_ai::testing::{RecordedRequest, reply_text};
     use axo_ai::{Message, ScriptedTurn, UserBlock};
@@ -1355,7 +1355,10 @@ mod keywords {
 
     fn keyword_options(dir: &Path, keyword: KeywordSpec) -> SessionOptions {
         SessionOptions {
-            keywords: vec![keyword],
+            definitions: Definitions {
+                keywords: vec![keyword],
+                ..Default::default()
+            },
             ..options(dir)
         }
     }
@@ -1424,11 +1427,24 @@ mod keywords {
             vec![ScriptedTurn::Reply(reply_text("ok"))],
         )
         .await;
+        std::fs::write(dir.path().join("fileword.md"), "---\n---\nFile word.\n").unwrap();
+        host.config.user.lock().unwrap().layer.keyword_roots = vec![dir.path().to_owned()];
         let session = host
             .axo
             .create_session(SessionOptions {
                 keywords_enabled: false,
                 ..keyword_options(dir.path(), orchestrate())
+            })
+            .await
+            .unwrap();
+        assert!(session.keywords().is_empty());
+        session
+            .set_layer(axo::Registrations {
+                definitions: Definitions {
+                    keywords: vec![orchestrate()],
+                    ..Default::default()
+                },
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1442,6 +1458,21 @@ mod keywords {
         );
         assert_eq!(keyword_blocks(&requests[0]), 0);
         assert!(conduct_changes(&common::journal(&session)).is_empty());
+        let entries = session.attach(None).await.missed;
+        let last = axo::EntryId(entries.last().unwrap().entry.id().unwrap().to_owned());
+        let fork = within(session.fork(&last)).await.unwrap().session;
+        assert!(fork.keywords().is_empty());
+        fork.set_definitions(Definitions {
+            keywords: vec![KeywordSpec {
+                name: "forkword".into(),
+                ..orchestrate()
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(fork.keywords().is_empty());
+        fork.shutdown().await;
         session.shutdown().await;
     }
 

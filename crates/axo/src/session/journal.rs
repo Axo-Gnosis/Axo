@@ -18,8 +18,8 @@ pub(crate) struct View {
     pub(crate) entries: Vec<SeqEntry>,
     pub(crate) projection: Projection,
     /// Bumped by every entry except `submission`, `usage`, `model_change`,
-    /// `thinking_level_change`, `agent_change` and `mode_change`, so work prepared
-    /// from one view commits only while the transcript it read is unchanged.
+    /// `thinking_level_change`, `service_tier_change`, `agent_change` and `mode_change`,
+    /// so work prepared from one view commits only while the transcript it read is unchanged.
     pub(crate) revision: u64,
     pub(crate) ids: HashSet<String>,
 }
@@ -111,7 +111,7 @@ impl Journal {
         writer: Box<dyn SessionWriter>,
         entries: Vec<SeqEntry>,
         projection: Projection,
-        events: broadcast::Sender<SessionEvent>,
+        events: broadcast::Sender<Arc<SessionEvent>>,
     ) -> Self {
         let path = writer.path().to_path_buf();
         let ids = entries
@@ -181,7 +181,7 @@ async fn run(
     mut queue: mpsc::UnboundedReceiver<Append>,
     slot: Arc<Mutex<Slot>>,
     publish: watch::Sender<Arc<View>>,
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<Arc<SessionEvent>>,
     path: PathBuf,
 ) {
     let lock = || slot.lock().unwrap_or_else(PoisonError::into_inner);
@@ -214,7 +214,7 @@ async fn run(
 async fn commit(
     writer: &mut dyn SessionWriter,
     publish: &watch::Sender<Arc<View>>,
-    events: &broadcast::Sender<SessionEvent>,
+    events: &broadcast::Sender<Arc<SessionEvent>>,
     revision: Option<u64>,
     mut entries: Vec<Entry>,
 ) -> Result<Vec<SeqEntry>, Error> {
@@ -276,12 +276,13 @@ async fn commit(
                         | Entry::AgentChange { .. }
                         | Entry::ModeChange { .. }
                         | Entry::ThinkingLevelChange { .. }
+                        | Entry::ServiceTierChange { .. }
                 ) {
                     view.revision = view.revision.wrapping_add(1);
                 }
                 view.entries.push(seq.clone());
                 // Under the publication lock: see `Journal::read`.
-                let _ = events.send(SessionEvent::Entry(seq.clone()));
+                let _ = events.send(Arc::new(SessionEvent::Entry(seq.clone())));
             }
             view.projection.apply(&view.entries);
         });

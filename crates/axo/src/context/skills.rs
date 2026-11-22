@@ -14,7 +14,8 @@ use crate::context::markdown::{
 use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
 
 /// One discovered skill.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct Skill {
     pub name: String,
     pub description: String,
@@ -77,6 +78,23 @@ pub fn load_skills(
         }
     }
     diagnostics.extend(collisions);
+    (skills, diagnostics)
+}
+
+pub(crate) fn merge_skills(files: &[Skill], code: &[Skill]) -> (Vec<Skill>, Vec<Diagnostic>) {
+    let mut skills = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(|skill| skill.name.as_str()).collect();
+    for skill in code {
+        if names.insert(skill.name.as_str()) {
+            skills.push(skill.clone());
+        } else {
+            diagnostics.push(Diagnostic {
+                message: format!("name \"{}\" collision", skill.name),
+                origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
+            });
+        }
+    }
     (skills, diagnostics)
 }
 
@@ -197,14 +215,21 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     else {
         return text.to_owned();
     };
-    let raw = match std::fs::read_to_string(&skill.path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            tracing::warn!(path = %skill.path.display(), %error, "skill expansion failed");
-            return text.to_owned();
-        }
-    };
-    let (_, body) = split_frontmatter(&raw);
+    render_skill(skill, args).unwrap_or_else(|error| {
+        tracing::warn!(path = %skill.path.display(), %error, "skill expansion failed");
+        text.to_owned()
+    })
+}
+
+/// Reads a skill and renders its body with the supplied command arguments.
+pub fn render_skill(skill: &Skill, args: &str) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(&skill.path)?;
+    Ok(render_block(skill, &raw, args))
+}
+
+/// Renders a skill file's contents `raw` with the supplied command arguments.
+pub(crate) fn render_block(skill: &Skill, raw: &str, args: &str) -> String {
+    let (_, body) = split_frontmatter(raw);
     let body = body.trim();
     let placeholders = ARG_PATTERN.is_match(body);
     let body = if placeholders {
@@ -212,15 +237,15 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     } else {
         Cow::Borrowed(body)
     };
-    let block = format!(
+    let mut block = format!(
         "<skill name=\"{name}\" location=\"skill://{name}\">\nReferences are relative to skill://{name}/.\n\n{body}\n</skill>",
         name = skill.name
     );
-    if args.is_empty() || placeholders {
-        block
-    } else {
-        format!("{block}\n\n{args}")
+    if !args.is_empty() && !placeholders {
+        block.push_str("\n\n");
+        block.push_str(args);
     }
+    block
 }
 
 /// Splits command arguments bash-style, honoring single and double quotes (pi

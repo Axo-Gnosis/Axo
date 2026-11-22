@@ -1,5 +1,7 @@
 //! One routing operation for host and model sends.
 
+use axo_macros::expose;
+
 use super::children::SessionTable;
 use super::{AgentRoutes, Session};
 use crate::coordination::{SendIdentity, SendKind, SendReceipt, SubmissionProvenance};
@@ -8,9 +10,11 @@ use crate::jobs::child::ChildMessage;
 use crate::jobs::{JobId, JobKind, JobRegistry, Namespace};
 use crate::store::SubmissionKind;
 
+#[expose(block = SESSION_COORDINATION, object = "session")]
 impl Session {
     /// Routes exactly like the model's `send`: owned child id, teammate name, or `parent`.
     /// The receipt identifies the saved submission or parent result message.
+    #[ext]
     pub async fn send(&self, to: &str, message: &str, steer: bool) -> Result<SendReceipt, Error> {
         let link = self.spawn_link();
         let routes = AgentRoutes {

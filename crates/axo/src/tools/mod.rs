@@ -19,23 +19,27 @@ pub(crate) mod send;
 pub(crate) mod snapshots;
 pub(crate) mod truncate;
 pub(crate) mod wait;
+mod wire;
 pub(crate) mod write;
 pub(crate) mod writes;
 
 use ignore::WalkBuilder;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
+use axo_macros::expose;
 use regex::Regex;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
 use crate::context::modes::BashAccess;
+use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::jobs::command::CommandRunner;
@@ -54,19 +58,28 @@ use wait::WaitTool;
 use write::WriteTool;
 
 pub use crate::jobs::command::CommandRequest;
+pub use bash::BashRequest;
+pub(crate) use changes::SNAPSHOT_STORE_CHANGES;
 pub use changes::{
-    FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_change, squash,
+    FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_changes, squash,
 };
-pub use ledger::{FileAccess, FileLedger, lock_file};
-pub(crate) use ledger::{file_key, ledger_access};
+pub(crate) use ledger::FILE_LEDGER_BLOCK;
+pub use ledger::{
+    FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
+};
+pub(crate) use ledger::{file_key, ledger_records};
 pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
-pub use writes::{WriteRoot, WriteScope};
+pub use wire::{ArtifactSlot, ToolAccess};
+pub(crate) use wire::{TOOLS_BASE_BLOCKS, TOOLS_BLOCKS};
+pub use writes::{FileRead, FileWrite, WriteRoot, WriteScope, Written};
 
 /// State shared by one session's tools; each tool holds an `Arc` of it.
 pub struct SessionTools {
     /// Relative paths and commands resolve against it.
     pub cwd: PathBuf,
     pub exec: Arc<dyn ExecEnv>,
+    /// A `Resolved.notice` reaches the model once per session.
+    notice_shown: AtomicBool,
     /// Content hashes of files this session has read or written (the stale-file guard).
     pub ledger: FileLedger,
     /// Nested project instructions attached once to successful file tool results.
@@ -92,7 +105,8 @@ pub struct SessionTools {
 pub type ToolFactory = Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>;
 
 /// Whether a host tool is declared directly or discovered through `tool://`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum Exposure {
     Direct,
     Deferred,
@@ -103,25 +117,70 @@ pub enum Exposure {
 pub struct HostTool {
     pub factory: ToolFactory,
     pub exposure: Exposure,
+    /// Who registered it, for diagnostics and `SessionToolInfo::origin`.
+    pub origin: Option<String>,
 }
 
+#[expose(block = HOST_TOOL_BLOCK, object = "types")]
 impl HostTool {
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn direct(factory: ToolFactory) -> Self {
         Self {
             factory,
             exposure: Exposure::Direct,
+            origin: None,
         }
     }
 
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn deferred(factory: ToolFactory) -> Self {
         Self {
             factory,
             exposure: Exposure::Deferred,
+            origin: None,
         }
+    }
+
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
     }
 }
 
+/// A host tool built for one session, with who registered it.
+#[derive(Clone)]
+pub(crate) struct Hosted {
+    pub tool: Arc<dyn Tool>,
+    pub origin: Option<String>,
+}
+
+/// Builds `tools` for `session`, split into (direct, deferred) in registration order.
+pub(crate) fn instantiate(
+    tools: &[HostTool],
+    session: &Arc<SessionTools>,
+) -> (Vec<Hosted>, Vec<Hosted>) {
+    let (mut direct, mut deferred) = (Vec::new(), Vec::new());
+    for tool in tools {
+        let hosted = Hosted {
+            tool: (tool.factory)(session),
+            origin: tool.origin.clone(),
+        };
+        match tool.exposure {
+            Exposure::Direct => direct.push(hosted),
+            Exposure::Deferred => deferred.push(hosted),
+        }
+    }
+    (direct, deferred)
+}
+
 /// A tool path located without applying plain-filesystem fallback rules.
+#[derive(serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Located {
     /// A filesystem target; plain paths have no URL and are writable.
     File {
@@ -133,6 +192,7 @@ pub enum Located {
     Virtual { url: SchemeUrl },
 }
 
+#[expose(block = SESSION_TOOLS, object = "tools")]
 impl SessionTools {
     pub(crate) fn new(
         cwd: PathBuf,
@@ -146,6 +206,7 @@ impl SessionTools {
         Self {
             cwd,
             exec,
+            notice_shown: AtomicBool::new(false),
             ledger: FileLedger::default(),
             context,
             schemes,
@@ -158,23 +219,31 @@ impl SessionTools {
         }
     }
 
-    /// Records a completed write of `after` to `path`: updates the ledger, stores the
-    /// before and after bytes, and returns the tool result `details` (`ledger`, plus
-    /// `change` when the bytes differ). `before` is the content read under the same
-    /// `lock_file` guard, `None` for a new file; call it while still holding that guard.
-    pub async fn record_change(
+    /// The id of the session these tools belong to.
+    #[ext]
+    pub fn session_id(&self) -> &str {
+        &self.schemes.context().session_id
+    }
+
+    /// Records a completed write under the caller's `lock_file` guard. `before` is
+    /// the content read under that guard, or `None` for a new file. Changed bytes
+    /// produce a snapshot-backed change alongside the updated ledger record.
+    async fn record_change(
         &self,
         path: &Path,
         url: Option<&str>,
         before: Option<Vec<u8>>,
         after: Vec<u8>,
-    ) -> Value {
+    ) -> FileRecord {
         let after_sha = FileLedger::hash(&after);
         let ledger = self
             .ledger
             .record_hash(path, after_sha.clone(), FileAccess::Modify);
         if before.as_deref() == Some(after.as_slice()) {
-            return json!({ "ledger": ledger });
+            return FileRecord {
+                ledger,
+                change: None,
+            };
         }
         let before_blob = match &before {
             Some(bytes) => {
@@ -196,7 +265,10 @@ impl SessionTools {
             after: after_blob,
             diff,
         };
-        json!({ "ledger": ledger, "change": change })
+        FileRecord {
+            ledger,
+            change: Some(change),
+        }
     }
 
     async fn blob(&self, sha256: String, bytes: &[u8]) -> SnapshotBlob {
@@ -209,6 +281,7 @@ impl SessionTools {
     }
 
     /// The bash access of the session's current scope (agent, mode and child ceiling).
+    #[ext]
     pub fn bash_access(&self) -> BashAccess {
         if self.read_only_bash.load(Ordering::Acquire) {
             BashAccess::ReadOnly
@@ -218,6 +291,7 @@ impl SessionTools {
     }
 
     /// Runs a command with output capture, automatic background promotion and job delivery.
+    #[ext(skip = "needs the live tool call; tools.runCommand")]
     pub async fn run_command(
         &self,
         cx: ToolContext,
@@ -227,6 +301,7 @@ impl SessionTools {
     }
 
     /// Cleans and resolves a scheme URL or ordinary filesystem path.
+    #[ext]
     pub async fn locate(&self, path: &str) -> Result<Located, ToolError> {
         let Some(url) = self.parse_url(path)? else {
             return Ok(Located::File {
@@ -250,6 +325,7 @@ impl SessionTools {
     }
 
     /// Rewrites whole-word scheme URLs in a bash command to file paths; the transcript keeps the original.
+    #[ext(skip = "borrowed result; tools.rewriteUrls")]
     pub async fn rewrite_urls<'a>(&self, command: &'a str) -> Result<Cow<'a, str>, ToolError> {
         bash_urls::rewrite(command, &self.schemes).await
     }
@@ -270,6 +346,7 @@ impl SessionTools {
     /// A tool's path argument as an absolute path (pi `resolveToCwd`): unicode spaces
     /// become plain spaces, a leading `@` is dropped, `~`/`~/` expand to `$HOME`,
     /// `file://` URLs become paths, relative paths join `cwd`, and `.`/`..` are folded.
+    #[ext]
     pub fn resolve_path(&self, path: &str) -> PathBuf {
         let cleaned = clean_path(path);
         let path = cleaned.as_ref();
@@ -455,15 +532,42 @@ pub(crate) fn replace_or_push<T: ?Sized>(
     }
 }
 
-/// Applies host tools in order, replacing matching built-ins without changing their position.
+/// Applies direct host tools in order, replacing matching built-ins without changing their
+/// position; a later host tool replaces an earlier one. Returns the tools and a diagnostic
+/// per replacement that involves a labeled registration.
 pub(crate) fn merge_tools(
-    mut builtin: Vec<Arc<dyn Tool>>,
-    host: &[Arc<dyn Tool>],
-) -> Vec<Arc<dyn Tool>> {
-    for tool in host {
-        replace_or_push(&mut builtin, tool.clone(), |tool| tool.name());
+    mut tools: Vec<Arc<dyn Tool>>,
+    host: &[Hosted],
+) -> (Vec<Arc<dyn Tool>>, Vec<Diagnostic>) {
+    let mut owners: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for hosted in host {
+        let name = hosted.tool.name();
+        let winner = hosted.origin.as_deref();
+        let message = match owners.get(name) {
+            Some(loser) if winner.is_some() || loser.is_some() => Some(format!(
+                "tool \"{name}\" from {} replaces the one from {}",
+                who(winner),
+                who(*loser)
+            )),
+            None if winner.is_some() && tools.iter().any(|tool| tool.name() == name) => Some(
+                format!("tool \"{name}\" from {} replaces the built-in", who(winner)),
+            ),
+            _ => None,
+        };
+        diagnostics.extend(message.map(|message| Diagnostic {
+            origin: winner.map(|origin| DiagnosticOrigin::Host(origin.to_owned())),
+            message,
+        }));
+        owners.insert(name, winner);
+        replace_or_push(&mut tools, hosted.tool.clone(), |tool| tool.name());
     }
-    builtin
+    (tools, diagnostics)
+}
+
+/// How diagnostics name a registration's origin.
+pub(crate) fn who(origin: Option<&str>) -> &str {
+    origin.unwrap_or("the host")
 }
 
 #[cfg(test)]

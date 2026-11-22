@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::json::parse_streaming;
 use crate::types::{AssistantBlock, AssistantMessage, JsonMap, StopReason, ToolCall, now_ms};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",

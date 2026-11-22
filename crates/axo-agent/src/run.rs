@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use axo_ai::transcript::{replay_tools, tool_state_changes};
 use axo_ai::{
-    Accumulator, AssistantEvent, AssistantMessage, Message, Model, SimpleStreamOptions, StopReason,
-    SystemMessage, ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec, Transcript, UserBlock,
-    now_ms,
+    Accumulator, AssistantEvent, AssistantMessage, Message, Model, ServiceTier,
+    SimpleStreamOptions, StopReason, SystemMessage, ThinkingLevel, ToolCall, ToolResultMessage,
+    ToolSpec, Transcript, UserBlock, now_ms,
 };
 use futures::StreamExt;
 use jsonschema::error::ValidationErrorKind;
@@ -485,9 +485,10 @@ impl Run<'_> {
             return Ok(None);
         }
         let transcript = Transcript::new(messages);
-        let (model, thinking) = self.model();
+        let (model, thinking, service_tier) = self.model();
         let options = SimpleStreamOptions {
             thinking,
+            service_tier,
             session_id: agent.session_id.clone(),
             ..SimpleStreamOptions::default()
         };
@@ -644,7 +645,8 @@ impl Run<'_> {
         if let Err(text) = validate_arguments(&**tool, call) {
             return Prepared::Immediate(error_output(text));
         }
-        for hook in &self.agent.tool_hooks {
+        let hooks = self.agent.tool_hooks();
+        for hook in hooks.iter() {
             let decision = hook
                 .before_tool_call(
                     BeforeToolCallContext {
@@ -821,7 +823,8 @@ impl Run<'_> {
         call: &ToolCall,
         output: &mut ToolOutput,
     ) {
-        for hook in &self.agent.tool_hooks {
+        let hooks = self.agent.tool_hooks();
+        for hook in hooks.iter() {
             let overrides = hook
                 .after_tool_call(
                     AfterToolCallContext {
@@ -934,9 +937,9 @@ impl Run<'_> {
         messages
     }
 
-    fn model(&self) -> (Model, ThinkingLevel) {
+    fn model(&self) -> (Model, ThinkingLevel, ServiceTier) {
         let state = self.agent.lock();
-        (state.model.clone(), state.thinking)
+        (state.model.clone(), state.thinking, state.service_tier)
     }
 
     /// Replaces the transcript in both the agent state and the run's working context.

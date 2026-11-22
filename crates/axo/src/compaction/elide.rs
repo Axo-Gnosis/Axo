@@ -18,7 +18,7 @@ use crate::store::{
     BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, ContextReplacement, Entry, EntryId, Projection,
     SeqEntry,
 };
-use crate::tools::{FileAccess, file_key, ledger_access};
+use crate::tools::{FileAccess, file_key, ledger_records};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ElisionMode {
@@ -76,12 +76,13 @@ pub(crate) fn prepare(
     let mut protected = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         if let AgentMessage::Llm(Message::ToolResult(result)) = message
-            && let Some((path, FileAccess::Read)) = ledger_access(result)
+            && ledger_records(result).iter().any(|record| {
+                let path = Path::new(&record.path);
+                record.access == FileAccess::Read
+                    && (path.ends_with("SKILL.md") || skill_keys.contains(&file_key(path)))
+            })
         {
-            let path = Path::new(&path);
-            if path.ends_with("SKILL.md") || skill_keys.contains(&file_key(path)) {
-                protected.insert(index);
-            }
+            protected.insert(index);
         }
     }
     let mut recent = 0u64;

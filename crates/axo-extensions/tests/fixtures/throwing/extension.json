@@ -1,0 +1,25 @@
+{
+  "id": "throwing",
+  "entry": "index.ts",
+  "providers": [
+    {
+      "id": "throwing",
+      "models": [
+        {
+          "id": "m",
+          "name": "m",
+          "api": "openai-completions",
+          "provider": "throwing",
+          "baseUrl": "http://127.0.0.1:9/v1",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 200000,
+          "maxTokens": 4096
+        }
+      ],
+      "requiresKey": false,
+      "rewrite": true
+    }
+  ]
+}

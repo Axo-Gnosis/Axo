@@ -44,7 +44,7 @@ pub struct GrepTool {
 }
 
 impl GrepTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>) -> Self {
         let parameters = json!({
             "type": "object",
             "properties": {

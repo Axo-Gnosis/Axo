@@ -23,6 +23,10 @@ const BUNDLED_DOCS: &[(&str, &str)] = &[
         include_str!("../../docs/sessions-and-compaction.md"),
     ),
     ("extending.md", include_str!("../../docs/extending.md")),
+    (
+        "extension-api.md",
+        include_str!("../../docs/extension-api.md"),
+    ),
 ];
 
 /// Materializes bundled documentation before registering its directory scheme.
@@ -53,7 +57,7 @@ pub struct DirScheme {
 
 impl DirScheme {
     /// Writable scratch files belonging to one session.
-    pub fn local(root: PathBuf) -> Self {
+    pub(crate) fn local(root: PathBuf) -> Self {
         Self {
             name: "local".into(),
             root,
@@ -63,7 +67,7 @@ impl DirScheme {
     }
 
     /// Read-only bundled documentation.
-    pub fn docs(name: &str, root: PathBuf) -> Self {
+    pub(crate) fn docs(name: &str, root: PathBuf) -> Self {
         Self {
             name: name.into(),
             root,

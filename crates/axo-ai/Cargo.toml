@@ -1,6 +1,6 @@
 [package]
 name = "axo-ai"
-version = "0.1.0"
+version = "0.0.0"
 description = "axo's LLM layer: message model, streaming provider adapters, model catalog and auth"
 edition.workspace = true
 license.workspace = true
@@ -24,6 +24,8 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+specta.workspace = true
+specta-serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

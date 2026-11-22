@@ -199,11 +199,11 @@ async fn commands_during_a_run_follow_their_policy() {
     assert_eq!(
         names,
         [
-            "compact", "shake", "model", "thinking", "navigate", "review"
+            "compact", "shake", "model", "thinking", "tier", "navigate", "review"
         ],
         "a skill named like a builtin is left out"
     );
-    let review = &catalog[5];
+    let review = &catalog[6];
     assert_eq!(review["kind"], "skill");
     assert_eq!(review["policy"], "queued");
     assert_eq!(review["argumentHint"], "<file>");
@@ -215,7 +215,7 @@ async fn commands_during_a_run_follow_their_policy() {
         let session = session.clone();
         async move { session.prompt("original").await.unwrap() }
     });
-    while !matches!(events.recv().await.unwrap(), SessionEvent::Retry { .. }) {}
+    while !matches!(&*events.recv().await.unwrap(), SessionEvent::Retry { .. }) {}
     let before = model_changes(&entries(&session).await);
 
     // Alongside: runs mid-turn.

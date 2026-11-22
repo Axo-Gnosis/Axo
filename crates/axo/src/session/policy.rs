@@ -3,19 +3,22 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use axo_agent::{
-    AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, ToolCallDecision, ToolError,
-    ToolHooks,
+    AfterToolCallContext, AfterToolCallResult, Agent, BeforeToolCallContext, ToolCallDecision,
+    ToolError, ToolHooks,
 };
 use tokio_util::sync::CancellationToken;
 
-use super::SessionHooks;
+use super::{SessionHooks, SpawnHook};
+use crate::commands::RegisteredCommand;
 use crate::context::agents::AgentSpec;
 use crate::context::modes::{BashAccess, ModeSpec};
+use crate::schemes::Scheme;
 use crate::tools::output::YIELD;
 use crate::tools::{SessionTools, WriteScope, writes};
 
 /// The session a tool call runs in, as host policies see it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolScope {
     pub session_id: String,
     /// 0 for a root session.
@@ -98,9 +101,19 @@ pub trait ToolPolicy: Send + Sync {
 
 pub(super) type ScopeCell = Mutex<Arc<ToolScope>>;
 
+/// One host policy as an agent hook, with the session's live scope.
 pub(super) struct PolicyHook {
     pub scope: Arc<ScopeCell>,
     pub policy: Arc<dyn ToolPolicy>,
+}
+
+impl PolicyHook {
+    fn scope(&self) -> Arc<ToolScope> {
+        self.scope
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -110,12 +123,9 @@ impl ToolHooks for PolicyHook {
         call: BeforeToolCallContext<'_>,
         cancel: &CancellationToken,
     ) -> Result<ToolCallDecision, ToolError> {
-        let scope = self
-            .scope
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        self.policy.before_tool_call(&scope, call, cancel).await
+        self.policy
+            .before_tool_call(&self.scope(), call, cancel)
+            .await
     }
 
     async fn after_tool_call(
@@ -123,13 +133,26 @@ impl ToolHooks for PolicyHook {
         call: AfterToolCallContext<'_>,
         cancel: &CancellationToken,
     ) -> Result<Option<AfterToolCallResult>, ToolError> {
-        let scope = self
-            .scope
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        self.policy.after_tool_call(&scope, call, cancel).await
+        self.policy
+            .after_tool_call(&self.scope(), call, cancel)
+            .await
     }
+}
+
+/// The session's fixed hooks followed by one `PolicyHook` per policy, in agent order.
+pub(super) fn tool_hooks(
+    fixed: &[Arc<dyn ToolHooks>],
+    scope: &Arc<ScopeCell>,
+    policies: &[Arc<dyn ToolPolicy>],
+) -> Vec<Arc<dyn ToolHooks>> {
+    let mut hooks = fixed.to_vec();
+    hooks.extend(policies.iter().map(|policy| {
+        Arc::new(PolicyHook {
+            scope: scope.clone(),
+            policy: policy.clone(),
+        }) as Arc<dyn ToolHooks>
+    }));
+    hooks
 }
 
 pub(super) struct ModeGate {
@@ -220,5 +243,45 @@ impl SessionHooks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = writes;
         *current = Arc::new(scope);
+    }
+
+    /// The live host tool policies; children and forks start with these.
+    pub(super) fn policies(&self) -> Vec<Arc<dyn ToolPolicy>> {
+        self.policies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stores `policies` and gives the agent the fixed hooks followed by them, under the
+    /// policies lock so concurrent installs land in the order they store.
+    pub(super) fn install_policies(&self, agent: &Agent, policies: Vec<Arc<dyn ToolPolicy>>) {
+        let mut live = self.policies.lock().unwrap_or_else(PoisonError::into_inner);
+        agent.set_tool_hooks(tool_hooks(&self.fixed_hooks, &self.scope, &policies));
+        *live = policies;
+    }
+
+    /// The live host spawn hooks; children and forks start with these.
+    pub(super) fn spawn_hooks(&self) -> Vec<Arc<dyn SpawnHook>> {
+        self.spawn_hooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The live host schemes; children and forks start with these.
+    pub(super) fn host_schemes(&self) -> Vec<Arc<dyn Scheme>> {
+        self.host_schemes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The live registered commands; forks start with these.
+    pub(super) fn commands(&self) -> Vec<RegisteredCommand> {
+        self.commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }

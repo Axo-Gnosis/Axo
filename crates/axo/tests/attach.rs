@@ -27,7 +27,7 @@ async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
         loop {
             if let SessionEvent::Agent(AgentEvent::MessageUpdate {
                 event: AssistantEvent::TextDelta { .. },
-            }) = probe.recv().await.unwrap()
+            }) = &*probe.recv().await.unwrap()
             {
                 break;
             }
@@ -55,22 +55,22 @@ async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
 
     session.abort();
     let mut events = attach.events;
-    let next = within(async {
+    within(async {
         loop {
-            if let SessionEvent::Entry(entry) = events.recv().await.unwrap() {
-                break entry;
+            if let SessionEvent::Entry(entry) = &*events.recv().await.unwrap() {
+                assert_eq!(entry.seq, all.last().unwrap().seq + 1);
+                assert!(matches!(
+                    entry.entry,
+                    Entry::Message {
+                        message: AgentMessage::Llm(Message::Assistant(_)),
+                        ..
+                    }
+                ));
+                break;
             }
         }
     })
     .await;
-    assert_eq!(next.seq, all.last().unwrap().seq + 1);
-    assert!(matches!(
-        next.entry,
-        Entry::Message {
-            message: AgentMessage::Llm(Message::Assistant(_)),
-            ..
-        }
-    ));
     assert_eq!(
         within(run).await.unwrap().unwrap(),
         RunOutcome::Aborted(CancelReason::User)

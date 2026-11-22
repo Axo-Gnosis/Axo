@@ -1,22 +1,20 @@
 //! The `edit` tool (pi `core/tools/edit.ts`, `edit-diff.ts`), plus the stale-file guard.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
-use axo_ai::UserBlock;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::tools::files::{
-    detect_line_ending, error_code, fs_error, normalize_to_lf, restore_line_endings, split_bom,
-};
-use crate::tools::{Located, SessionTools, lock_file};
+use crate::tools::files::{detect_line_ending, normalize_to_lf, restore_line_endings, split_bom};
+use crate::tools::{FileWrite, SessionTools};
 
-const GUIDELINES: &[&str] = &[
+const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
     "When changing several places in one file, use one edit call with several entries in edits[].",
-];
+)];
 
 #[derive(Deserialize)]
 struct EditArgs {
@@ -45,7 +43,7 @@ pub struct EditTool {
 }
 
 impl EditTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>) -> Self {
         Self {
             tools,
             parameters: json!({
@@ -88,7 +86,7 @@ impl Tool for EditTool {
         &self.parameters
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
         GUIDELINES
     }
 
@@ -102,106 +100,26 @@ impl Tool for EditTool {
                 "Edit tool input is invalid. edits must contain at least one replacement.".into(),
             ));
         }
-        let located = self.tools.locate(&path).await?;
-        self.tools.check_write(&located).await?;
-        let (absolute, label) = match located {
-            Located::File {
-                url,
-                path,
-                writable: false,
-                ..
-            } => {
-                return Err(ToolError(format!(
-                    "{} is read-only",
-                    super::shown(&path, url.as_ref().map(|url| url.to_string()).as_deref())
-                        .display()
-                )));
-            }
-            Located::File { url, path, .. } => (path, url.map(|url| url.to_string())),
-            Located::Virtual { url, .. } => {
-                return Err(ToolError(format!("{url} is not a file; use read or write")));
-            }
-        };
-        let shown = super::shown(&absolute, label.as_deref());
-        let path = label.as_deref().unwrap_or(&path);
-        let _guard = lock_file(&absolute).await;
-        // Checked after each step rather than racing the step, so the lock is held until
-        // an in-flight filesystem operation has settled.
-        let aborted = || {
-            cancel
-                .is_cancelled()
-                .then(|| ToolError("Operation aborted".into()))
-        };
-        if let Some(error) = aborted() {
-            return Err(error);
-        }
-
-        // pi's `access(R_OK | W_OK)`.
-        if let Err(error) = tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&absolute)
-            .await
-        {
-            if let Some(error) = aborted() {
-                return Err(error);
-            }
-            let detail = match error_code(&error) {
-                Some((code, _)) => format!("Error code: {code}"),
-                None => error.to_string(),
-            };
-            return Err(ToolError(format!("Could not edit file: {path}. {detail}.")));
-        }
-        let bytes = tokio::fs::read(&absolute)
-            .await
-            .map_err(|error| ToolError(fs_error(&error, "read", shown)))?;
-        if let Some(error) = aborted() {
-            return Err(error);
-        }
-        self.tools.ledger.check_fresh(&absolute, path, &bytes)?;
-
-        // The BOM is stripped before matching (the model never includes it in oldText) and
-        // the file's line ending restored after.
-        let raw = std::str::from_utf8(&bytes).map_err(|_| {
-            ToolError(format!(
-                "Could not edit file: {path}. File is not valid UTF-8."
-            ))
-        })?;
-        let (bom, content) = split_bom(raw);
-        let ending = detect_line_ending(content);
-        let base = normalize_to_lf(content);
         let block_count = edits.len();
-        let new_content = apply_edits(&base, edits, path).map_err(ToolError)?;
-        if let Some(error) = aborted() {
-            return Err(error);
-        }
-
-        let final_content = format!("{bom}{}", restore_line_endings(&new_content, ending));
-        tokio::fs::write(&absolute, &final_content)
+        let edit = FileWrite::Edit(Box::new(move |bytes, path| {
+            // The model doesn't include the BOM in oldText; restore it and the file's
+            // line ending after matching against LF-normalized text.
+            let raw = std::str::from_utf8(bytes).map_err(|_| {
+                ToolError(format!(
+                    "Could not edit file: {path}. File is not valid UTF-8."
+                ))
+            })?;
+            let (bom, content) = split_bom(raw);
+            let ending = detect_line_ending(content);
+            let base = normalize_to_lf(content);
+            let new_content = apply_edits(&base, edits, path).map_err(ToolError)?;
+            Ok(format!("{bom}{}", restore_line_endings(&new_content, ending)).into_bytes())
+        }));
+        self.tools
+            .file_tool_output(&cancel, &path, edit, |shown| {
+                format!("Successfully replaced {block_count} block(s) in {shown}.")
+            })
             .await
-            .map_err(|error| ToolError(fs_error(&error, "open", shown)))?;
-        let details = self
-            .tools
-            .record_change(
-                &absolute,
-                label.as_deref(),
-                Some(bytes),
-                final_content.into_bytes(),
-            )
-            .await;
-        if let Some(error) = aborted() {
-            return Err(error);
-        }
-
-        let mut content = vec![UserBlock::Text {
-            text: format!("Successfully replaced {block_count} block(s) in {path}."),
-        }];
-        content.extend(self.tools.context.attach(&absolute).await);
-        Ok(ToolOutput {
-            content,
-            details: Some(details),
-            ..ToolOutput::default()
-        })
     }
 }
 
@@ -585,7 +503,7 @@ mod tests {
     }
 
     fn change(output: &ToolOutput) -> Value {
-        output.details.as_ref().expect("details")["change"].clone()
+        output.details.as_ref().expect("details")["files"][0]["change"].clone()
     }
 
     #[tokio::test]
@@ -608,7 +526,7 @@ mod tests {
         );
 
         let edited = fx.edit("a.txt", &[("two", "2")]).await;
-        let ledger = &edited.details.as_ref().unwrap()["ledger"];
+        let ledger = &edited.details.as_ref().unwrap()["files"][0]["ledger"];
         let edited = change(&edited);
         assert_eq!(edited["before"]["sha256"], written);
         assert_eq!(edited["diff"]["additions"], 1);
@@ -622,8 +540,8 @@ mod tests {
             .call("write", json!({ "path": "a.txt", "content": "one\n2\n" }))
             .await;
         let details = unchanged.details.unwrap();
-        assert!(details.get("ledger").is_some());
-        assert!(details.get("change").is_none());
+        assert!(details["files"][0].get("ledger").is_some());
+        assert!(details["files"][0].get("change").is_none());
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::auth::codex;
 use crate::auth::resolve::resolve_config_value;
 use crate::model::{ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap};
-use crate::types::ThinkingLevel;
+use crate::types::{ServiceTier, ThinkingLevel};
 
 use super::catalog::{Catalog, DevApi, DevCost, DevModel, DevOverride};
 use super::codex::CodexModel;
@@ -82,9 +82,9 @@ pub(crate) struct CatalogModels {
     pub models: Vec<Model>,
     /// API-key environment variables of each provider that contributed a model.
     pub envs: HashMap<String, Vec<String>>,
-    /// Prices and Off support (effort `"none"` listed) of the `openai` rows by model id,
-    /// which Codex models of the same id take.
-    pub openai: HashMap<String, (Cost, bool)>,
+    /// Prices, Off support (effort `"none"` listed), and service-tier multipliers of the
+    /// `openai` rows, which Codex models of the same id take.
+    pub openai: HashMap<String, (Cost, bool, BTreeMap<ServiceTier, f64>)>,
 }
 
 /// Maps every catalog row axo can serve, plus the `openai` prices Codex models take.
@@ -92,6 +92,7 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
     let mut models = Vec::new();
     let mut envs = HashMap::new();
     let mut openai = HashMap::new();
+    let today = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
 
     for (provider_id, provider) in catalog {
         let before = models.len();
@@ -99,7 +100,7 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
             provider
                 .models
                 .iter()
-                .filter_map(|(model_id, raw)| catalog_model(provider_id, model_id, raw)),
+                .filter_map(|(model_id, raw)| catalog_model(provider_id, model_id, raw, &today)),
         );
         if models.len() > before {
             envs.insert(provider_id.clone(), provider.env.clone());
@@ -113,7 +114,8 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
                     .effort
                     .iter()
                     .any(|effort| effort == "none");
-                Some((model_id.clone(), (catalog_cost(&dev.cost), off)))
+                let tiers = catalog_tiers(&dev.cost, ApiKind::OpenAiCodexResponses, &today);
+                Some((model_id.clone(), (catalog_cost(&dev.cost), off, tiers)))
             }));
         }
     }
@@ -143,13 +145,14 @@ pub(crate) fn build(
                 model.context_window,
                 model.image,
                 &model.efforts,
+                &model.tiers,
                 catalog,
             )
         })),
         None => {
             let efforts = CODEX_FLOOR_EFFORTS.map(str::to_owned);
             models.extend(CODEX_FLOOR.iter().map(|&(id, name, context_window, ..)| {
-                codex_model(id, name, context_window, true, &efforts, catalog)
+                codex_model(id, name, context_window, true, &efforts, &[], catalog)
             }));
         }
     }
@@ -171,7 +174,7 @@ pub(crate) fn cap_at_price_tier(model: &mut Model) {
 
 /// The model one catalog row describes, or `None` when it is not a tool-calling chat model
 /// served through a wire API axo implements at a resolvable URL.
-fn catalog_model(provider_id: &str, model_id: &str, raw: &Value) -> Option<Model> {
+fn catalog_model(provider_id: &str, model_id: &str, raw: &Value, today: &str) -> Option<Model> {
     let dev = match DevModel::deserialize(raw) {
         Ok(dev) => dev,
         Err(error) => {
@@ -258,6 +261,7 @@ fn catalog_model(provider_id: &str, model_id: &str, raw: &Value) -> Option<Model
             vec![InputKind::Text]
         },
         cost: catalog_cost(&dev.cost),
+        service_tiers: catalog_tiers(&dev.cost, api, today),
         context_window: limit
             .context
             .filter(|&context| context > 0)
@@ -315,8 +319,8 @@ fn thinking_map(efforts: &[String], off: bool) -> ThinkingLevelMap {
     map
 }
 
-/// Base prices plus context-size tiers. Tier rates the feed omits keep the base price;
-/// overrides keyed on anything but input size (service tier, time of day) are ignored.
+/// Base prices plus context-size tiers. Tier rates the feed omits keep the base price.
+/// Service-tier overrides are ignored here and read by [`catalog_tiers`].
 fn catalog_cost(cost: &DevCost) -> Cost {
     let (input, output) = (&cost.text.input, &cost.text.output);
     let base = CostTier {
@@ -357,6 +361,75 @@ fn catalog_cost(cost: &DevCost) -> Cost {
     }
 }
 
+/// The tier a catalog `service_tier` name means on `api`, when axo knows its wire form.
+fn tier_named(api: ApiKind, name: &str) -> Option<ServiceTier> {
+    match api {
+        ApiKind::AnthropicMessages => (name == "fast").then_some(ServiceTier::Fast),
+        ApiKind::OpenAiCompletions | ApiKind::OpenAiCodexResponses => match name {
+            "priority" => Some(ServiceTier::Fast),
+            "flex" => Some(ServiceTier::Flex),
+            "ultrafast" => Some(ServiceTier::Ultrafast),
+            _ => None,
+        },
+    }
+}
+
+/// Tier multipliers from `cost.multipliers`, else derived from per-tier input prices.
+fn catalog_tiers(cost: &DevCost, api: ApiKind, today: &str) -> BTreeMap<ServiceTier, f64> {
+    let tier_for = |when: &Value, allow_date: bool| {
+        let when = when.as_object()?;
+        let tier = when.get("service_tier")?.as_object()?;
+        if tier.len() != 1 {
+            return None;
+        }
+        let tier = tier_named(api, tier.get("equals")?.as_str()?)?;
+        match when.len() {
+            1 => Some(tier),
+            2 if allow_date => {
+                let date = when
+                    .get("date")?
+                    .as_object()
+                    .filter(|date| date.len() == 1)?;
+                let (op, value) = date.iter().next()?;
+                let value = value.as_str()?;
+                if value.len() != 10 || value.parse::<jiff::civil::Date>().is_err() {
+                    return None;
+                }
+                match op.as_str() {
+                    "lt" if today < value => Some(tier),
+                    "gte" if today >= value => Some(tier),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    let mut tiers = BTreeMap::new();
+    for entry in &cost.multipliers {
+        if let Some(tier) = tier_for(&entry["when"], true)
+            && let Some(factor) = entry["factor"]
+                .as_f64()
+                .or_else(|| entry["factor"]["text"].as_f64())
+            && factor.is_finite()
+            && factor > 0.0
+        {
+            tiers.entry(tier).or_insert(factor);
+        }
+    }
+    let input = &cost.text.input;
+    if let Some(base) = input.price.filter(|&price| price > 0.0) {
+        for entry in &input.overrides {
+            if let Some(tier) = tier_for(&entry["when"], false)
+                && let Some(price) = entry["price"].as_f64()
+            {
+                // ponytail: input-price ratio stands in for the whole table; store per-tier rates if cost display for these gateways matters
+                tiers.entry(tier).or_insert_with(|| price / base);
+            }
+        }
+    }
+    tiers
+}
+
 /// A cache-write price: a number, or an object keyed by TTL where the 5-minute price wins
 /// and otherwise the first listed one.
 fn cache_write(write: Option<&Value>) -> Option<f64> {
@@ -392,17 +465,18 @@ fn codex_model(
     context_window: u64,
     image: bool,
     efforts: &[String],
+    tiers: &[String],
     catalog: Option<&CatalogModels>,
 ) -> Model {
     let openai = catalog.and_then(|catalog| catalog.openai.get(id));
     let floor = CODEX_FLOOR.iter().find(|row| row.0 == id);
     let cost = match (openai, floor) {
-        (Some((cost, _)), _) => cost.clone(),
+        (Some((cost, ..)), _) => cost.clone(),
         (None, Some(&(.., prices, _))) => floor_cost(prices),
         (None, None) => Cost::default(),
     };
     let off = match openai {
-        Some(&(_, off)) => off,
+        Some(&(_, off, _)) => off,
         None => floor.is_some_and(|row| row.4),
     };
     let mut map = thinking_map(efforts, false);
@@ -424,6 +498,14 @@ fn codex_model(
             vec![InputKind::Text]
         },
         cost,
+        service_tiers: tiers
+            .iter()
+            .filter_map(|id| tier_named(ApiKind::OpenAiCodexResponses, id))
+            .map(|tier| {
+                let factor = openai.and_then(|(_, _, rates)| rates.get(&tier)).copied();
+                (tier, factor.unwrap_or(1.0))
+            })
+            .collect(),
         context_window,
         max_tokens: CODEX_MAX_TOKENS,
         compat: Compat::default(),
@@ -452,6 +534,52 @@ fn floor_cost([input, output, cache_read, cache_write]: [f64; 4]) -> Cost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_tiers_read_multipliers_and_price_lists() {
+        use serde_json::json;
+
+        let today = "2026-11-22";
+        let chat = ApiKind::OpenAiCompletions;
+        let messages = ApiKind::AnthropicMessages;
+        let cost = |value| serde_json::from_value::<DevCost>(value).unwrap();
+        let priority = cost(json!({"multipliers": [
+            {"when": {"service_tier": {"equals": "priority"}}, "factor": {"text": 2}},
+            {"when": {"service_tier": {"equals": "flex"}, "region": {"equals": "us"}}, "factor": 4}
+        ]}));
+        assert_eq!(
+            catalog_tiers(&priority, chat, today),
+            BTreeMap::from([(ServiceTier::Fast, 2.0)])
+        );
+
+        let dated = cost(json!({"multipliers": [
+            {"when": {"service_tier": {"equals": "ultrafast"}, "date": {"lt": "2027-03-01"}}, "factor": 3},
+            {"when": {"service_tier": {"equals": "ultrafast"}, "date": {"gte": "2027-03-01"}}, "factor": 6}
+        ]}));
+        for (day, factor) in [(today, 3.0), ("2027-03-01", 6.0)] {
+            assert_eq!(
+                catalog_tiers(&dated, chat, day),
+                BTreeMap::from([(ServiceTier::Ultrafast, factor)])
+            );
+        }
+
+        let fast = cost(json!({"multipliers": [
+            {"when": {"service_tier": {"equals": "fast"}}, "factor": 2}
+        ]}));
+        assert_eq!(
+            catalog_tiers(&fast, messages, today),
+            BTreeMap::from([(ServiceTier::Fast, 2.0)])
+        );
+        assert!(catalog_tiers(&fast, chat, today).is_empty());
+
+        let prices = cost(json!({"text": {"input": {"price": 4, "overrides": [
+            {"when": {"service_tier": {"equals": "priority"}}, "price": 10}
+        ]}}}));
+        assert_eq!(
+            catalog_tiers(&prices, chat, today),
+            BTreeMap::from([(ServiceTier::Fast, 2.5)])
+        );
+    }
 
     #[test]
     fn catalog_command_endpoints_are_skipped() {

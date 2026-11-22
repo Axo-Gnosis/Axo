@@ -3,7 +3,7 @@ mod common;
 use std::path::Path;
 
 use axo::{
-    AgentSpec, Entry, JobKind, SessionEvent, SessionOptions, SpawnRequest, TeamHandle,
+    AgentSpec, Definitions, Entry, JobKind, SessionEvent, SessionOptions, SpawnRequest, TeamHandle,
     TeamMemberRequest, TeamRef, TeamRequest,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
@@ -14,20 +14,23 @@ use tokio::sync::broadcast;
 
 fn team_options(dir: &Path) -> SessionOptions {
     SessionOptions {
-        agents: vec![
-            AgentSpec {
-                name: "alpha".into(),
-                description: "Alpha does A".into(),
-                model: Some("test/a".into()),
-                ..Default::default()
-            },
-            AgentSpec {
-                name: "beta".into(),
-                description: "Beta does B".into(),
-                model: Some("test/b".into()),
-                ..Default::default()
-            },
-        ],
+        definitions: Definitions {
+            agents: vec![
+                AgentSpec {
+                    name: "alpha".into(),
+                    description: "Alpha does A".into(),
+                    model: Some("test/a".into()),
+                    ..Default::default()
+                },
+                AgentSpec {
+                    name: "beta".into(),
+                    description: "Beta does B".into(),
+                    model: Some("test/b".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
         ..options(dir)
     }
 }
@@ -84,7 +87,7 @@ async fn team_members_message_each_other_and_the_parent() {
     let b_mail = tokio::spawn(async move {
         let mut counts: Vec<u32> = Vec::new();
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::Job(job)) if job.id == "agent_2" => {
                     let JobKind::Child { unread_mail, .. } = job.kind else {
                         continue;
@@ -367,7 +370,7 @@ async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
     b.session.resume_wakes();
     within(async {
         loop {
-            match events.recv().await {
+            match events.recv().await.as_deref() {
                 Ok(SessionEvent::AutoPaused { paused: false }) => return,
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("closed before unpause"),

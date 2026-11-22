@@ -18,6 +18,7 @@ fn model(api: ApiKind, provider: &str, id: &str, input: Vec<InputKind>) -> Model
         thinking_level_map: None,
         input,
         cost: Cost::default(),
+        service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 32_000,
         compat: Compat::default(),

@@ -15,7 +15,9 @@ use crate::api::{ABORTED, SimpleStreamOptions, Streamer};
 use crate::event::AssistantEvent;
 use crate::model::{ApiKind, Compat, Cost, InputKind, Model};
 use crate::transcript::Transcript;
-use crate::types::{AssistantBlock, AssistantMessage, StopReason, ToolCall, Usage, now_ms};
+use crate::types::{
+    AssistantBlock, AssistantMessage, ServiceTier, StopReason, ToolCall, Usage, now_ms,
+};
 
 /// A keyless model with stable limits for deterministic scripted sessions.
 pub fn scripted_model() -> Model {
@@ -29,6 +31,7 @@ pub fn scripted_model() -> Model {
         thinking_level_map: None,
         input: vec![InputKind::Text],
         cost: Cost::default(),
+        service_tiers: Default::default(),
         context_window: 100_000,
         max_tokens: 4096,
         compat: Compat::default(),
@@ -320,6 +323,7 @@ fn scripted_message(content: Vec<AssistantBlock>, stop_reason: StopReason) -> As
         response_id: None,
         provider_thinking_level: None,
         thinking_level: None,
+        service_tier: ServiceTier::Standard,
         usage: Usage::default(),
         stop_reason,
         error_message: None,

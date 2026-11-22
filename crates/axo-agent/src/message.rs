@@ -8,7 +8,7 @@ use serde_json::Value;
 /// A transcript entry. `Custom` messages never reach a provider directly:
 /// [`LoopHooks::convert_to_llm`](crate::LoopHooks::convert_to_llm) lowers or drops them.
 #[allow(clippy::large_enum_variant)] // Keep transcript messages inline; boxing adds an allocation per LLM message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(untagged)]
 pub enum AgentMessage {
     Llm(Message),
@@ -16,7 +16,7 @@ pub enum AgentMessage {
 }
 
 /// A host message (`role: "custom"`), e.g. an extension notice.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "role", rename = "custom", rename_all = "camelCase")]
 pub struct CustomMessage {
     pub custom_type: String,

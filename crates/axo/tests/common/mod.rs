@@ -273,7 +273,7 @@ pub async fn entry(session: &Session, matches: impl Fn(&Entry) -> bool) {
     }
     within(async {
         loop {
-            match attached.events.recv().await {
+            match attached.events.recv().await.as_deref() {
                 Ok(SessionEvent::Entry(seq)) if matches(&seq.entry) => break,
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => panic!("session closed"),

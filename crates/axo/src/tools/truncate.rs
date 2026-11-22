@@ -49,7 +49,7 @@ pub struct Truncation<'a> {
 }
 
 impl Truncation<'_> {
-    pub fn truncated(&self) -> bool {
+    pub(crate) fn truncated(&self) -> bool {
         self.truncated_by.is_some()
     }
 }

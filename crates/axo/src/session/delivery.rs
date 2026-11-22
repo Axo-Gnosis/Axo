@@ -5,6 +5,7 @@ use std::sync::{Arc, PoisonError, Weak};
 use async_trait::async_trait;
 use axo_agent::{Agent, AgentMessage, CustomMessage, QueuedMessage, RunOutcome};
 use axo_ai::{Message, UserBlock, UserMessage, now_ms};
+use axo_macros::expose;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -47,7 +48,8 @@ pub(super) struct FirstPrompt {
 /// Who owns the session. A run, standalone maintenance or a navigation sets `running`;
 /// maintenance also names itself. Only compare-and-set transitions claim it, so two
 /// owners never both win.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct Activity {
     pub running: bool,
     pub maintenance: Option<MaintenanceKind>,
@@ -56,11 +58,11 @@ pub struct Activity {
 /// Publishes under the watch write lock, so attach cannot miss a transition.
 pub(super) struct ActivityState {
     state: tokio::sync::watch::Sender<Activity>,
-    events: tokio::sync::broadcast::Sender<SessionEvent>,
+    events: tokio::sync::broadcast::Sender<Arc<SessionEvent>>,
 }
 
 impl ActivityState {
-    pub(super) fn new(events: tokio::sync::broadcast::Sender<SessionEvent>) -> Self {
+    pub(super) fn new(events: tokio::sync::broadcast::Sender<Arc<SessionEvent>>) -> Self {
         Self {
             state: tokio::sync::watch::Sender::new(Activity::default()),
             events,
@@ -80,7 +82,7 @@ impl ActivityState {
             let before = *state;
             let changed = update(state);
             if *state != before {
-                let _ = self.events.send(SessionEvent::Activity(*state));
+                let _ = self.events.send(Arc::new(SessionEvent::Activity(*state)));
             }
             changed
         })
@@ -274,11 +276,11 @@ impl SessionHooks {
     /// and allowed in the current mode.
     pub(super) fn active_keywords(&self) -> Vec<Arc<KeywordSpec>> {
         let settings = &self.inherited.config.settings.keywords;
-        if self.child.is_some() || !settings.enabled || self.inherited.keywords.is_empty() {
+        let defs = self.definitions.get();
+        if self.child.is_some() || !settings.enabled || defs.keywords.is_empty() {
             return Vec::new();
         }
-        self.inherited
-            .keywords
+        defs.keywords
             .iter()
             .filter(|keyword| {
                 !settings.disabled.contains(&keyword.name)
@@ -334,11 +336,13 @@ impl SessionHooks {
     }
 }
 
+#[expose(block = SESSION_DELIVERY, object = "session")]
 impl Session {
     /// Expands a `/skill args` invocation, saves the submission and runs the prompt;
     /// returns when the run settles. `Error::Busy` while a run is active (use
     /// `steer`/`follow_up`). Prompt text never runs a built-in command: hosts that offer
     /// typed commands parse them with `Command::parse` and call `run_command`.
+    #[ext]
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunOutcome, Error> {
         match self
             .prompt_with(PromptRequest {
@@ -354,6 +358,7 @@ impl Session {
 
     /// `prompt`, deduplicated by `request_id`: a request id that was already submitted
     /// returns its earlier submission and starts nothing, even while that run is active.
+    #[ext]
     pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
         let request_id = request.request_id.as_deref();
         // Fast path: a duplicate or busy prompt does no file or image work.
@@ -469,7 +474,7 @@ impl Session {
         let prepared = prepare(parts, &self.hooks.tools).await?;
         let content = render(
             &prepared.parts,
-            &self.hooks.prompt.sources.skills,
+            &self.hooks.definitions.get().skills,
             keywords,
             &self.hooks.tools,
         )
@@ -478,6 +483,7 @@ impl Session {
     }
 
     /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
+    #[ext]
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::Steer, input.into(), None, None)
             .await
@@ -486,6 +492,7 @@ impl Session {
 
     /// Saves and queues a user message delivered when the active run would otherwise end;
     /// on an idle session it starts a run.
+    #[ext]
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::FollowUp, input.into(), None, None)
             .await
@@ -494,6 +501,7 @@ impl Session {
 
     /// Takes a queued steer or follow-up back before it is delivered and returns it for
     /// the host to edit and resubmit. `Error::NotQueued` once it was delivered or withdrawn.
+    #[ext]
     pub async fn withdraw(&self, submission_id: &str) -> Result<QueuedInput, Error> {
         let (hooks, agent, id) = (
             self.hooks.clone(),
@@ -530,6 +538,7 @@ impl Session {
     /// Posts a durable custom message without expanding skills. This is the cache-safe
     /// channel for host instructions: it changes neither the system prompt nor tools.
     /// Quiet messages wait for a turn boundary or the next run and never start a run.
+    #[ext(skip = "namespaced per caller; see the wire method")]
     pub async fn post(&self, message: HostMessage) -> Result<(), Error> {
         if message.custom_type.is_empty() || message.text.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -579,6 +588,7 @@ impl Session {
 
     /// Lifts the pause a Stop or a failed run left and, on an idle session, starts a run
     /// with the held steers or follow-ups, else with pending job results and mail.
+    #[ext]
     pub fn resume_wakes(&self) {
         self.hooks.set_auto_paused(false);
         if self.hooks.claim_idle() {
@@ -748,9 +758,9 @@ impl JobHost for SessionHooks {
             return;
         }
         *last = usage.clone();
-        let _ = self.events.send(SessionEvent::TreeUsage {
+        let _ = self.events.send(Arc::new(SessionEvent::TreeUsage {
             usage: usage.clone(),
-        });
+        }));
         if let Some(parent) = self.parent_registry() {
             parent.child_tree_usage(&self.session_id, usage);
         }

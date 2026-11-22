@@ -10,13 +10,14 @@ It ports [pi](https://github.com/earendil-works/pi) v1.3.0's core architecture�
 
 ## Crates & Capabilities
 
-The workspace is split into three layered crates so hosts only recompile what changes and non-coding agents can use the loop and provider layers independently:
+The workspace is split into three layered core crates so hosts only recompile what changes and non-coding agents can use the loop and provider layers independently, plus an optional bridge crate above them:
 
 | Crate | Purpose | Highlights |
 | :--- | :--- | :--- |
 | **[`axo-ai`](crates/axo-ai)** | LLM message model, streaming adapters, model catalog, and auth | Anthropic Messages, OpenAI Chat Completions, and OpenAI Codex Responses (`auth.json` OAuth + refresh locking); runtime provider registration with typed login (`ProviderLogin`, `LoginInteraction`) and request rewrite (`RequestRewrite`); `models.dev` catalog and account-discovered Codex models, refreshed in place (`Models::refresh`), with price-tier caps (lifted by `ModelsOptions::extended_context`) and cache-preserving tool-change capability (`Model::tool_support`); delta `Accumulator`; transient retry and context-overflow classification |
 | **[`axo-agent`](crates/axo-agent)** | Generic tool-calling agent loop | Parallel and sequential `Tool` execution with a per-call `ToolContext` (cancellation, updates, pending-steer signal, invocation id), deferred tools and dispatcher routing (`Tool::target`, `route`), `Replay` crash-safety contracts (`Safe` vs `Never`), host policy via `ToolHooks`, the `LoopHooks` driver contract, steering and follow-up queues of identified `QueuedMessage`s, `MessageOrigin` provenance on persisted messages, `CancelReason` (`User` vs `Shutdown`), and one ordered, immutable event sink (`Persist`) |
-| **[`axo`](crates/axo)** | Sessions, compaction, context assembly, config, and built-in tools | Durable `JsonlStore` with incremental `Projection` and `context_edit`s, single-writer OS locks, crash recovery, `attach` catch-up snapshots, recoverable `/shake` and live/separate compaction summaries, `DevShellEnv` Nix/direnv capture, host-selected command supervision (`Supervision`: process groups by default, opt-in cgroup v2 through an embedded supervisor entry point), per-session URL schemes (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`, `agent://`, `tool://`, host `Scheme`s), background commands and subagents with `wait`, `kill`, and `send`, asynchronous `spawn` and schema-validated child `yield`, deferred tools through `call`, scoped `ToolPolicy`, and mode definition catalogs |
+| **[`axo`](crates/axo)** | Sessions, compaction, context assembly, config, and built-in tools | Durable `JsonlStore` with incremental `Projection` and `context_edit`s, single-writer OS locks, crash recovery, `attach` catch-up snapshots, recoverable `/shake` and live/separate compaction summaries, `DevShellEnv` Nix/direnv capture, host-selected command supervision (`Supervision`: process groups by default, opt-in cgroup v2 through an embedded supervisor entry point), per-session URL schemes (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`, `agent://`, `tool://`, host `Scheme`s), background commands and subagents with `wait`, `kill`, and `send`, asynchronous `spawn` and schema-validated child `yield`, deferred tools through `call`, scoped `ToolPolicy`, and [live definitions](crates/axo/docs/extending.md#live-definitions) for agents, teams, modes, keywords and skills |
+| **[`axo-extensions`](crates/axo-extensions)** | Optional Bun bridge for providers and session capabilities | Static `extension.json` declarations for providers, tools, policies, spawn hooks, schemes, sections, definitions and commands. `Extensions` composes host and user-enabled contributions, exposes diagnostics, and starts supervised runners on demand. Type-only SDK in [`packages/axo-extension-sdk`](packages/axo-extension-sdk) |
 
 ### Built-in tools (`crates/axo/src/tools`)
 
@@ -53,7 +54,7 @@ Hosts spawn asynchronous children with `Session::spawn` and teams with `Session:
 
 ### Commands & prompt parts
 
-`axo` owns the built-in commands (`/compact`, `/shake`, `/model`, `/thinking`, `/navigate`) and the prompt-part input shape; hosts expose the catalog via `session.commands()`. `Session::parse_command` parses built-ins first, then `/name [prompt]` for a loaded mode; `Session::run_command` enters that mode and delivers any prompt as a steer (starting a run when idle). The catalog also lists non-shadowed skills. See [Commands](crates/axo/docs/extending.md#commands) and [Prompt parts](crates/axo/docs/prompts-and-context.md#prompt-parts-cratesaxosrcinputrs).
+`axo` owns the built-in commands (`/compact`, `/shake`, `/model`, `/thinking`, `/tier`, `/navigate`) and the prompt-part input shape; hosts expose the catalog via `session.commands()`. `Session::parse_command` parses built-ins first, then `/name [prompt]` for a loaded mode, then `/name [args]` for a host-registered command (`SessionOptions::commands`, `Session::set_commands`); `Session::run_command` enters that mode and delivers any prompt as a steer (starting a run when idle), or awaits the registered `CommandHandler`. The catalog also lists non-shadowed skills. See [Commands](crates/axo/docs/extending.md#commands) and [Prompt parts](crates/axo/docs/prompts-and-context.md#prompt-parts-cratesaxosrcinputrs).
 
 ### Supervised commands & background jobs
 
@@ -120,6 +121,8 @@ Hosts keep one `Models` for their lifetime: `Models::reload` applies configurati
 
 Durable server hosts can opt into cgroup supervision (`Supervision::Cgroup`), where commands run in cgroup v2 jobs and the host routes arguments in `main` to `axo::exec::supervisor::run`. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) for the synchronous routing `main` example and failure details.
 
+For TypeScript/JavaScript extensions, pass the host's `Arc<Axo>` and `ExtensionOptions` to `Extensions::new`, then call `configure(&settings.extensions)`. Compose session options before create/open and attach the resulting session (and any host-created forks) for live reconfiguration and journal events. Extensions can also use guarded tool operations and the host's model registry; session creation, open, fork and close require a host-provided `Lifecycle` hook. Shut the manager down on exit. The host supplies the Bun binary and package, store, data and runtime locations; project settings cannot enable extensions. axo installs authored extensions' npm dependencies itself, and `Extensions::install` places host-acquired packages in the managed store with update, rollback and uninstall. See [Bun extensions](crates/axo/docs/extending.md#4-bun-extensions-axo-extensions) and the [extension API reference](crates/axo/docs/extension-api.md).
+
 ---
 
 ## Layout
@@ -129,16 +132,21 @@ axo/
 ├── crates/
 │   ├── axo-ai/                     # Message model, streaming adapters, model catalog, OAuth & credentials
 │   ├── axo-agent/                  # Tool-calling loop, hooks, queues, cancellation, split event delivery
-│   └── axo/                        # Axo & Session APIs, JsonlStore, compaction, context, DevShellEnv, supervision, jobs, tools
-│       ├── src/exec/supervisor.rs  # Embedded guard/enter entry point hosts route to for cgroup supervision
-│       ├── prompts/                # Bundled SYSTEM.md, PROSE.md, DELEGATION.md, and summarizer markdown prompts
-│       ├── examples/               # `drive` (CLI session driver) and `memory` (PSS benchmark); their own config layout under `--dir`
-│       └── docs/                   # Bundled implementation reference for the `<docs>` system-prompt section
-│           ├── README.md           # Documentation index
-│           ├── configuration.md    # ConfigSource and EffectiveConfig, settings, models, project access, dev shells, supervision
-│           ├── prompts-and-context.md     # Prompt sections, overrides, context files, skills, agents/teams, background jobs, prompt parts
-│           ├── sessions-and-compaction.md # JsonlStore, projection, recovery, attach, /shake, and compaction
-│           └── extending.md        # Declarative files, Rust embedding (Session, commands), and extension traits
+│   ├── axo/                        # Axo & Session APIs, JsonlStore, compaction, context, DevShellEnv, supervision, jobs, tools
+│   │   ├── src/exec/supervisor.rs  # Embedded guard/enter entry point hosts route to for cgroup supervision
+│   │   ├── prompts/                # Bundled SYSTEM.md, PROSE.md, DELEGATION.md, and summarizer markdown prompts
+│   │   ├── examples/               # `drive` (CLI session driver) and `memory` (PSS benchmark); their own config layout under `--dir`
+│   │   └── docs/                   # Bundled implementation reference for the `<docs>` system-prompt section
+│   │       ├── README.md           # Documentation index
+│   │       ├── configuration.md    # ConfigSource and EffectiveConfig, settings, extensions list, models, provider layers, project access, dev shells, supervision
+│   │       ├── prompts-and-context.md     # Prompt sections, overrides, context files, skills, agents/teams, background jobs, prompt parts
+│   │       ├── sessions-and-compaction.md # JsonlStore, projection, recovery, attach, /shake, and compaction
+│   │       └── extending.md        # Declarative files, Rust embedding, and Bun extensions
+│   └── axo-extensions/             # Manifests, provider layers, session bindings, supervised Bun runners
+│       ├── src/runner.ts           # Bun-side runner, embedded and materialized per generation
+│       └── tests/                  # `bridge` (scripted runner) and `bun_provider` (real Bun, opt-in)
+├── packages/
+│   └── axo-extension-sdk/          # Type-only `@axo/extension-sdk` author contract
 └── plan/                           # Architecture design, pi port studies, and background research
     ├── design.md                   # Goals, non-goals, architecture, and settled core decisions
     ├── plan.md                     # Active planning, next tracks, and open design discussions
@@ -157,6 +165,9 @@ nix develop
 cargo check --workspace --all-targets
 cargo test --workspace  # process-group mode: no cgroup delegation or helper binary needed
 systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 cargo test -p axo --test supervisor  # opt-in cgroup cases
+cargo test -p axo-extensions --test bridge  # manager, lifecycle and layer checks against an in-process runner; no Bun needed
+env AXO_TEST_BUN=/absolute/path/to/bun cargo test -p axo-extensions --test bun_provider  # real Bun runner; skips when unset, fails when set but unusable
+systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 AXO_TEST_BUN=/absolute/path/to/bun cargo test -p axo-extensions --test bun_provider  # same, under cgroup supervision
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```

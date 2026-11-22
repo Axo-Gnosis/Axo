@@ -3,9 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
-use axo_ai::{Model, Models, ThinkingLevel};
+use axo_ai::{Model, Models, ServiceTier, ThinkingLevel};
+use axo_macros::expose;
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::context::agents::ContextFiles;
@@ -20,14 +21,16 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 }
 
 /// The settings object. Unknown keys are ignored; every field has a default.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// `provider/model-id`.
     pub default_model: Option<String>,
-    /// Role name → selector (`provider/model[:thinking]` or `:thinking`); `@role` selectors expand through it. User settings only.
+    /// Role name → selector (`provider/model[:thinking][:tier]` or suffixes alone); `@role` selectors expand through it. User settings only.
     pub model_roles: IndexMap<String, String>,
     pub default_thinking_level: ThinkingLevel,
+    /// What happens to the chosen service tier when the model changes. User settings only.
+    pub service_tier: ServiceTierSettings,
     /// User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`.
     pub home_agents_dir: bool,
     pub steering_mode: QueueMode,
@@ -41,6 +44,11 @@ pub struct Settings {
     pub retry: RetrySettings,
     pub subagents: SubagentSettings,
     pub keywords: KeywordSettings,
+    /// Extensions to load, in priority order: the last one declaring a provider ID wins it.
+    /// User settings only.
+    #[serde(deserialize_with = "enabled_extensions")]
+    #[specta(type = specta_serde::Phased<Vec<EnabledExtension>, EnabledExtensionsInput>)]
+    pub extensions: Vec<EnabledExtension>,
 }
 
 impl Default for Settings {
@@ -49,6 +57,7 @@ impl Default for Settings {
             default_model: None,
             model_roles: IndexMap::new(),
             default_thinking_level: ThinkingLevel::Medium,
+            service_tier: ServiceTierSettings::default(),
             home_agents_dir: false,
             steering_mode: QueueMode::All,
             follow_up_mode: QueueMode::OneAtATime,
@@ -61,12 +70,98 @@ impl Default for Settings {
             retry: RetrySettings::default(),
             subagents: SubagentSettings::default(),
             keywords: KeywordSettings::default(),
+            extensions: Vec::new(),
         }
     }
 }
 
+/// One extension the user enabled. Members sharing a `group` share one runner process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EnabledExtension {
+    pub id: String,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// Why a list of enabled extensions is not a valid configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExtensionListError {
+    #[error(
+        "invalid extension id {0:?}: expected a name, or publisher/name for an installed extension; each part is a lower-case ASCII letter or digit followed by letters, digits, '-', '_' or '.'"
+    )]
+    InvalidId(String),
+    #[error(
+        "extension {id:?} has invalid group {group:?}: expected a lower-case ASCII letter or digit followed by letters, digits, '-', '_' or '.'"
+    )]
+    InvalidGroup { id: String, group: String },
+    #[error("extension {0:?} is enabled more than once")]
+    Duplicate(String),
+}
+
+#[expose(block = ENABLED_EXTENSION_BLOCK, object = "types")]
+impl EnabledExtension {
+    /// Checks every ID and group name and rejects a repeated ID. Settings run this while
+    /// deserializing; hosts passing a typed list run it themselves.
+    #[ext(skip = "no receiver; validates the host's own extension list")]
+    pub fn validate_all(extensions: &[EnabledExtension]) -> Result<(), ExtensionListError> {
+        let mut seen = std::collections::HashSet::with_capacity(extensions.len());
+        for extension in extensions {
+            if !valid_extension_id(&extension.id) {
+                return Err(ExtensionListError::InvalidId(extension.id.clone()));
+            }
+            if let Some(group) = &extension.group
+                && !valid_extension_name(group)
+            {
+                return Err(ExtensionListError::InvalidGroup {
+                    id: extension.id.clone(),
+                    group: group.clone(),
+                });
+            }
+            if !seen.insert(extension.id.as_str()) {
+                return Err(ExtensionListError::Duplicate(extension.id.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A plain name for an authored extension, or `publisher/name` for an installed one.
+fn valid_extension_id(id: &str) -> bool {
+    valid_extension_name(id)
+        || id.split_once('/').is_some_and(|(publisher, name)| {
+            valid_extension_name(publisher) && valid_extension_name(name)
+        })
+}
+
+/// `[a-z0-9][a-z0-9._-]*`: never empty, `.`/`..` or a path separator.
+fn valid_extension_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum EnabledExtensionsInput {
+    List(Vec<EnabledExtension>),
+}
+
+fn enabled_extensions<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<EnabledExtension>, D::Error> {
+    let extensions = Vec::<EnabledExtension>::deserialize(deserializer)?;
+    EnabledExtension::validate_all(&extensions).map_err(serde::de::Error::custom)?;
+    Ok(extensions)
+}
+
 /// Child-session budgets and defaults. User settings only.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SubagentSettings {
     /// Deepest spawn: a root session is depth 0, its children 1.
@@ -81,7 +176,10 @@ pub struct SubagentSettings {
     pub models: IndexMap<String, String>,
     /// Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`.
     #[serde(deserialize_with = "crate::context::agents::context_files_switch")]
+    #[specta(type = specta_serde::Phased<Option<ContextFiles>, Option<crate::context::agents::RawContextFiles>>)]
     pub context_files: Option<ContextFiles>,
+    /// Children's service tier when their cascade names none: `standard` (default) or the parent's (`inherit`).
+    pub service_tier: SubagentTier,
 }
 
 impl Default for SubagentSettings {
@@ -93,8 +191,33 @@ impl Default for SubagentSettings {
             default_model: None,
             models: IndexMap::new(),
             context_files: Some(ContextFiles::Off),
+            service_tier: SubagentTier::Standard,
         }
     }
+}
+
+/// Service-tier spreading rules. User settings only: a wider spread raises spending.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ServiceTierSettings {
+    /// `reset` (default) returns to `standard` when the model changes; `keep` carries the tier over.
+    pub on_model_change: TierOnModelChange,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum TierOnModelChange {
+    #[default]
+    Reset,
+    Keep,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentTier {
+    #[default]
+    Standard,
+    Inherit,
 }
 
 /// What a model selector picks: a model, a thinking level, or both (never neither).
@@ -104,15 +227,19 @@ pub struct ModelChoice {
     pub model: Option<Model>,
     /// The selected thinking level, if the selector names one.
     pub thinking: Option<ThinkingLevel>,
+    /// The service tier, if the selector names one; `Standard` when it says `:standard`.
+    pub tier: Option<ServiceTier>,
 }
 
 /// What a list of selectors picks: the first one naming a model wins; the first thinking suffix seen up to it is kept.
 pub(crate) struct Cascade<'a> {
     pub model: Option<Model>,
     pub thinking: Option<ThinkingLevel>,
+    pub tier: Option<ServiceTier>,
     pub selector: Option<&'a str>,
 }
 
+#[expose(block = SETTINGS_BLOCK, object = "types")]
 impl Settings {
     pub(crate) fn first_model<'a>(
         &self,
@@ -122,11 +249,13 @@ impl Settings {
         let mut cascade = Cascade {
             model: None,
             thinking: None,
+            tier: None,
             selector: None,
         };
         for selector in selectors.into_iter().flatten() {
             let choice = self.resolve_model(models, selector)?;
             cascade.thinking = cascade.thinking.or(choice.thinking);
+            cascade.tier = cascade.tier.or(choice.tier);
             if choice.model.is_some() {
                 cascade.model = choice.model;
                 cascade.selector = Some(selector);
@@ -137,24 +266,14 @@ impl Settings {
     }
 
     /// Resolves a model selector, expanding a user-defined `@role` if present.
+    #[ext(skip = "takes the live registry; session.setModel and models.complete resolve selectors")]
     pub fn resolve_model(&self, models: &Models, selector: &str) -> Result<ModelChoice, Error> {
         let Some(rest) = selector.strip_prefix('@') else {
             return plain(models, selector);
         };
-        let (name, level) = match rest.split_once(':') {
-            Some((name, level)) => (name, Some(level)),
-            None => (rest, None),
-        };
-        let thinking = level
-            .map(|level| {
-                level
-                    .parse::<ThinkingLevel>()
-                    .map_err(|message| Error::InvalidModelSelector {
-                        selector: selector.to_owned(),
-                        message,
-                    })
-            })
-            .transpose()?;
+        let mut parts = rest.split(':');
+        let name = parts.next().expect("split always yields a first part");
+        let suffixes = Suffixes::parse(selector, parts)?;
         let value = self
             .model_roles
             .get(name)
@@ -166,44 +285,88 @@ impl Settings {
             });
         }
         let mut choice = plain(models, value)?;
-        choice.thinking = thinking.or(choice.thinking);
+        choice.thinking = suffixes.thinking.or(choice.thinking);
+        choice.tier = suffixes.tier.or(choice.tier);
         Ok(choice)
     }
 }
 
-fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
-    if let Some(level) = selector.strip_prefix(':') {
-        let thinking =
-            level
-                .parse::<ThinkingLevel>()
+#[derive(Default)]
+struct Suffixes {
+    thinking: Option<ThinkingLevel>,
+    tier: Option<ServiceTier>,
+}
+
+impl Suffixes {
+    fn push(&mut self, segment: &str) -> Result<(), String> {
+        if let Ok(level) = segment.parse::<ThinkingLevel>() {
+            if self.thinking.is_some() {
+                return Err("more than one thinking level".into());
+            }
+            self.thinking = Some(level);
+        } else if let Ok(tier) = segment.parse::<ServiceTier>() {
+            if self.tier.is_some() {
+                return Err("more than one service tier".into());
+            }
+            self.tier = Some(tier);
+        } else {
+            return Err(format!("unknown thinking level or service tier: {segment}"));
+        }
+        Ok(())
+    }
+
+    fn parse<'a>(selector: &str, parts: impl Iterator<Item = &'a str>) -> Result<Self, Error> {
+        let mut suffixes = Self::default();
+        for segment in parts {
+            suffixes
+                .push(segment)
                 .map_err(|message| Error::InvalidModelSelector {
                     selector: selector.to_owned(),
                     message,
                 })?;
+        }
+        Ok(suffixes)
+    }
+}
+
+fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
+    if let Some(rest) = selector.strip_prefix(':') {
+        let suffixes = Suffixes::parse(selector, rest.split(':'))?;
         return Ok(ModelChoice {
             model: None,
-            thinking: Some(thinking),
+            thinking: suffixes.thinking,
+            tier: suffixes.tier,
         });
     }
     if let Some(model) = models.find(selector) {
         return Ok(ModelChoice {
             model: Some(model),
             thinking: None,
+            tier: None,
         });
     }
-    if let Some((prefix, level)) = selector.rsplit_once(':')
-        && let Ok(thinking) = level.parse::<ThinkingLevel>()
-        && let Some(model) = models.find(prefix)
-    {
-        return Ok(ModelChoice {
-            model: Some(model),
-            thinking: Some(thinking),
-        });
+    let mut remaining = selector;
+    let mut suffixes = Suffixes::default();
+    for _ in 0..2 {
+        let Some((prefix, segment)) = remaining.rsplit_once(':') else {
+            break;
+        };
+        if suffixes.push(segment).is_err() {
+            break;
+        }
+        if let Some(model) = models.find(prefix) {
+            return Ok(ModelChoice {
+                model: Some(model),
+                thinking: suffixes.thinking,
+                tier: suffixes.tier,
+            });
+        }
+        remaining = prefix;
     }
     Err(Error::ModelNotFound(selector.to_owned()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RetrySettings {
     pub max_retries: u32,
@@ -221,7 +384,7 @@ impl Default for RetrySettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {
     pub enabled: bool,
@@ -243,7 +406,7 @@ impl Default for CompactionSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum SummaryRequest {
     #[default]
@@ -265,7 +428,7 @@ fn default_context_files() -> IndexMap<String, bool> {
 }
 
 /// What projects may contribute. Read from user settings only.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectSettings {
     pub files: ProjectFiles,
@@ -275,7 +438,9 @@ pub struct ProjectSettings {
     pub paths: IndexMap<String, ProjectAccess>,
 }
 
+#[expose(block = PROJECT_SETTINGS_BLOCK, object = "types")]
 impl ProjectSettings {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn access_for(&self, root: &Path) -> ProjectAccess {
         let mut access = self.access;
         for (pattern, &value) in &self.paths {
@@ -302,7 +467,7 @@ impl ProjectSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectFiles {
     /// Project `.agents/skills` discovery and explicit project skill roots.
@@ -320,7 +485,9 @@ impl Default for ProjectFiles {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize, specta::Type,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectAccess {
     /// Nothing from the project is read.
@@ -332,7 +499,7 @@ pub enum ProjectAccess {
     Trust,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BashSettings {
     pub dev_shell: DevShellMode,
@@ -361,7 +528,9 @@ impl Default for BashSettings {
 }
 
 /// How bash commands pick up a project environment.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize, specta::Type,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DevShellMode {
     /// Host environment only.
@@ -373,7 +542,7 @@ pub enum DevShellMode {
     Nix,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AskSettings {
     /// Auto-select the recommended option after this long; `None` waits forever.
@@ -393,7 +562,8 @@ pub const PROMPT_NAMES: [&str; 8] = [
 ];
 
 /// One prompt override as the host holds it. `text` is untrimmed; axo trims.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptOverride {
     pub origin: String,
     pub text: String,
@@ -434,7 +604,8 @@ pub struct UserConfig {
 /// any other acquisition failure as `Error::Host(Box::new(err))`.
 // ponytail: blocking calls; make async if a host needs network-backed config
 pub trait ConfigSource: Send + Sync {
-    /// Called once per `create_session`, `open_session`, `Axo::schemes`, and `Axo::catalog`, before anything else.
+    /// Called once per `create_session`, `open_session`, `Axo::schemes`, `Axo::catalog`, and `Axo::stream`
+    /// (which `Axo::complete` uses), before anything else.
     fn user(&self) -> Result<UserConfig, Error>;
     /// The project contribution for a session in `cwd`. The project root is `axo::context::project_root(cwd)`.
     /// Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust`
@@ -443,7 +614,8 @@ pub trait ConfigSource: Send + Sync {
 }
 
 /// What one session runs with.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct EffectiveConfig {
     pub access: ProjectAccess,
     pub settings: Settings,
@@ -460,18 +632,27 @@ pub struct EffectiveConfig {
     pub context_files: Vec<PathBuf>,
 }
 
+#[expose(block = EFFECTIVE_CONFIG_BLOCK, object = "types")]
 impl EffectiveConfig {
     /// Samples `source.user()`, derives access (`access` overrides the user policy), then,
     /// unless access is `Ignore` or `project.files.config` is false, applies
     /// `source.project(cwd)`. Objects merge key by key with the project winning; arrays
     /// replace. The project never sets user-only keys, and below `Trust` the effective
     /// dev shell is always off, regardless of its source.
+    #[ext(skip = "takes the host's config source; host.catalog returns the resolved config")]
     pub fn resolve(
         source: &dyn ConfigSource,
         cwd: &Path,
         access: Option<ProjectAccess>,
     ) -> Result<Self, Error> {
-        const USER_ONLY_KEYS: &[&str] = &["project", "homeAgentsDir", "modelRoles", "subagents"];
+        const USER_ONLY_KEYS: &[&str] = &[
+            "project",
+            "homeAgentsDir",
+            "modelRoles",
+            "subagents",
+            "serviceTier",
+            "extensions",
+        ];
 
         let UserConfig {
             layer: user,
@@ -554,6 +735,7 @@ impl EffectiveConfig {
     /// `settings.default_model` with `$VAR` expanded and `!command` values rejected.
     /// Sessions call this only when neither `SessionOptions::model`, the session's recorded model,
     /// nor the root agent's model selects one, so an unresolvable value fails only that selection.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn default_model(&self) -> Result<Option<String>, Error> {
         let Some(model) = &self.settings.default_model else {
             return Ok(None);

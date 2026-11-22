@@ -3,6 +3,7 @@
 //! Loaders never fail: problems become [`Diagnostic`]s that the session logs.
 
 pub mod agents;
+pub(crate) mod definitions;
 pub mod files;
 pub mod keywords;
 pub(crate) mod markdown;
@@ -17,7 +18,8 @@ use axo_agent::AgentMessage;
 use axo_ai::{Message, UserMessage};
 
 /// A non-fatal problem found while loading context resources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
     /// Where the problem is, if anywhere.
     pub origin: Option<DiagnosticOrigin>,
@@ -25,7 +27,13 @@ pub struct Diagnostic {
 }
 
 /// Where a diagnostic points.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum DiagnosticOrigin {
     /// A file axo read.
     Path(PathBuf),

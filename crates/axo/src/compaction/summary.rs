@@ -1,5 +1,6 @@
 //! Transient summary requests; persistence and operation ownership stay in SessionHooks.
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use axo_agent::AgentMessage;
 use axo_ai::estimate::{estimate_message_tokens, estimate_text_tokens};
@@ -112,7 +113,7 @@ pub(crate) struct SummaryContext<'a> {
     pub reply: u64,
     pub prompts: &'a SummaryPrompts,
     pub retry: RetrySettings,
-    pub events: &'a tokio::sync::broadcast::Sender<SessionEvent>,
+    pub events: &'a tokio::sync::broadcast::Sender<Arc<SessionEvent>>,
 }
 
 #[derive(Debug)]
@@ -435,13 +436,13 @@ async fn request(
             }
             if message.stop_reason == StopReason::Error {
                 if let Some(delay) = retry_delay(&context.retry, &message, retry) {
-                    let _ = context.events.send(SessionEvent::Retry {
+                    let _ = context.events.send(Arc::new(SessionEvent::Retry {
                         attempt: retry + 1,
                         delay_ms: delay.as_millis() as u64,
                         max_retries: context.retry.max_retries,
                         error: message.error_message.clone(),
                         failure: message.failure.clone(),
-                    });
+                    }));
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(SummaryFailure::aborted()),
                         _ = tokio::time::sleep(delay) => {}

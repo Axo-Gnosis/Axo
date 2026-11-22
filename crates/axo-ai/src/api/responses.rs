@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use indexmap::IndexSet;
 use serde_json::{Value, json};
 
-use crate::api::Reply;
+use crate::api::{Reply, served_tier};
 use crate::cost::calculate_cost;
 use crate::event::AssistantEvent;
 use crate::json::parse_tool_arguments;
@@ -714,7 +714,11 @@ impl<'a> ResponsesStream<'a> {
                 cost: Default::default(),
             };
         }
-        calculate_cost(self.model, &mut reply.message.usage);
+        if let Some(echo) = response.get("service_tier").and_then(Value::as_str) {
+            reply.message.service_tier = served_tier(echo);
+        }
+        let tier = reply.message.service_tier;
+        calculate_cost(self.model, &mut reply.message.usage, tier);
 
         // Incomplete responses keep the provider's reason so max-output truncation and
         // content filtering stay distinct.

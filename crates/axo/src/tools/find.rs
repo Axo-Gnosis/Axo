@@ -31,7 +31,7 @@ pub struct FindTool {
 }
 
 impl FindTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>) -> Self {
         let parameters = json!({
             "type": "object",
             "properties": {

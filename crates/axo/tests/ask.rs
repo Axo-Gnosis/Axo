@@ -39,7 +39,7 @@ async fn steer_settles_a_pending_question() {
     });
     within(async {
         loop {
-            if let SessionEvent::QuestionPending { call_id, .. } = events.recv().await.unwrap() {
+            if let SessionEvent::QuestionPending { call_id, .. } = &*events.recv().await.unwrap() {
                 assert_eq!(call_id, "question");
                 break;
             }
@@ -49,7 +49,7 @@ async fn steer_settles_a_pending_question() {
     session.steer("do x instead").await.unwrap();
     within(async {
         loop {
-            if let SessionEvent::QuestionResolved { call_id } = events.recv().await.unwrap() {
+            if let SessionEvent::QuestionResolved { call_id } = &*events.recv().await.unwrap() {
                 assert_eq!(call_id, "question");
                 break;
             }

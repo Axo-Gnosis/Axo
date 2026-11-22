@@ -34,7 +34,6 @@ use axo::{
 use axo::{Entry, EntryId, SeqEntry};
 use axo_agent::AgentEvent;
 use axo_ai::{AssistantBlock, AssistantEvent, ThinkingLevel, UserBlock};
-use serde_json::Value;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, oneshot};
 use tracing_subscriber::EnvFilter;
@@ -328,7 +327,7 @@ fn prompt_parts(text: &str) -> Vec<PromptPart> {
 /// are printed).
 async fn print_events(
     session: Arc<Session>,
-    mut events: broadcast::Receiver<SessionEvent>,
+    mut events: broadcast::Receiver<Arc<SessionEvent>>,
     first: bool,
     stop: impl Future<Output = ()>,
 ) -> Option<axo::RunOutcome> {
@@ -357,11 +356,11 @@ async fn print_events(
             }
         };
         print_maintenance(&event);
-        match event {
+        match &*event {
             SessionEvent::Entry(SeqEntry {
                 entry: Entry::RunEnd { outcome, .. },
                 ..
-            }) => return Some(outcome),
+            }) => return Some(*outcome),
             SessionEvent::Agent(AgentEvent::TurnStart) => println!("[turn]"),
             SessionEvent::Agent(AgentEvent::MessageUpdate { event }) => match event {
                 AssistantEvent::TextStart { .. } => print!("[text] "),
@@ -370,7 +369,11 @@ async fn print_events(
                 AssistantEvent::ToolCallEnd {
                     block: AssistantBlock::ToolCall(call),
                     ..
-                } => println!("[tool] {} {}", call.name, Value::Object(call.arguments)),
+                } => println!(
+                    "[tool] {} {}",
+                    call.name,
+                    serde_json::to_string(&call.arguments).unwrap()
+                ),
                 _ => {}
             },
             SessionEvent::Agent(AgentEvent::ToolExecutionEnd { name, result, .. }) => {
@@ -388,7 +391,7 @@ async fn print_events(
             }
             SessionEvent::QuestionPending { call_id, questions } => {
                 let mut answers = Vec::new();
-                for question in &questions {
+                for question in questions {
                     let labels: Vec<&str> = question
                         .options
                         .iter()
@@ -422,7 +425,7 @@ async fn print_events(
                         format!("[answered] {}: {}", answer.id, answer.selected.join(", "))
                     })
                     .collect();
-                match session.answer(&call_id, answers) {
+                match session.answer(call_id, answers) {
                     Ok(()) => {
                         for line in printed {
                             println!("{line}");

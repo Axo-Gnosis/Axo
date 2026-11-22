@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -13,7 +14,7 @@ use crate::context::prompt::valid_section_name;
 use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// Where an agent definition may run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum RunAs {
     Root,
@@ -22,14 +23,16 @@ pub enum RunAs {
     Any,
 }
 
+#[expose(block = RUN_AS_BLOCK, object = "types")]
 impl RunAs {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_any(&self) -> bool {
         *self == Self::Any
     }
 }
 
 /// An agent's prompt and context switches.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentSpec {
     /// The agent's unique catalog name.
@@ -46,8 +49,14 @@ pub struct AgentSpec {
     /// Tool allowlist over built-in and host tools; `None` keeps every tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// `None` keeps `settings.contextFiles`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `None`, or `true` on input, keeps `settings.contextFiles`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "context_files_switch"
+    )]
+    // `Option` outside `Phased`: specta-serde 0.0.15 drops a non-nullable field type when it
+    // strips `skip_serializing_if = "Option::is_none"`.
+    #[specta(type = Option<specta_serde::Phased<ContextFiles, RawContextFiles>>)]
     pub context_files: Option<ContextFiles>,
     /// `false` removes the section; `true` changes nothing.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
@@ -75,7 +84,8 @@ pub struct AgentSpec {
 }
 
 /// An agent's override of context-file discovery.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, specta::Type)]
+#[specta(type = RawContextFiles)]
 pub enum ContextFiles {
     /// Disable all context files.
     Off,
@@ -115,7 +125,8 @@ pub(crate) fn context_files_switch<'de, D: Deserializer<'de>>(
 }
 
 /// A named roster of agents and its shared charter.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct TeamSpec {
     /// The team's unique catalog name.
     pub name: String,
@@ -130,7 +141,8 @@ pub struct TeamSpec {
 }
 
 /// One agent's role in a team.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct TeamMember {
     /// The agent's catalog name.
     pub agent: String,
@@ -140,8 +152,10 @@ pub struct TeamMember {
     pub brief: Option<String>,
 }
 
+#[expose(block = TEAM_MEMBER_BLOCK, object = "types")]
 impl TeamMember {
     /// The member's alias, or its agent name when no alias was supplied.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn roster_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.agent)
     }
@@ -149,7 +163,13 @@ impl TeamMember {
 
 /// An agent or team in the shared definition namespace.
 #[allow(clippy::large_enum_variant)] // A small catalog loaded once; boxing adds an allocation per definition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AgentDef {
     /// A runnable agent definition.
     Agent(AgentSpec),
@@ -157,8 +177,10 @@ pub enum AgentDef {
     Team(TeamSpec),
 }
 
+#[expose(block = AGENT_DEF_BLOCK, object = "types")]
 impl AgentDef {
     /// The definition's unique catalog name.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn name(&self) -> &str {
         match self {
             Self::Agent(spec) => &spec.name,
@@ -197,9 +219,9 @@ enum ToolList {
     Csv(String),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, specta::Type)]
 #[serde(untagged)]
-enum RawContextFiles {
+pub(crate) enum RawContextFiles {
     Bool(bool),
     Map(IndexMap<String, bool>),
 }
@@ -213,11 +235,9 @@ struct RawMember {
     brief: Option<String>,
 }
 
+/// Reads agent and team files. Team members are checked after merging registrations.
 /// Blocking filesystem I/O; never fails (problems become diagnostics).
-pub fn load_agents(
-    roots: &[PathBuf],
-    programmatic: &[AgentSpec],
-) -> (Vec<AgentDef>, Vec<Diagnostic>) {
+pub fn load_agents(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<Diagnostic>) {
     let mut definitions = Vec::new();
     let mut diagnostics = Vec::new();
     let mut names = HashSet::new();
@@ -250,22 +270,46 @@ pub fn load_agents(
             }
         }
     }
-    for spec in programmatic {
+    (definitions, diagnostics)
+}
+
+pub(crate) fn merge_agents(
+    files: &[AgentDef],
+    code: &[AgentDef],
+) -> (Vec<AgentDef>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(AgentDef::name).collect();
+    for definition in code {
+        let name = definition.name();
+        let (kind, path) = match definition {
+            AgentDef::Agent(spec) => ("agent", &spec.path),
+            AgentDef::Team(team) => ("team", &team.path),
+        };
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
-                origin: None,
-                message: format!("agent \"{}\": {message}", spec.name),
+                origin: path.clone().map(DiagnosticOrigin::Path),
+                message: format!("{kind} \"{name}\": {message}"),
             });
         };
-        let mut spec = spec.clone();
-        spec.body = spec.body.trim().to_owned();
-        if !valid_name(&spec.name, &mut warn) || !validate_agent(&mut spec, &mut warn) {
+        if !valid_name(name, &mut warn) {
             continue;
         }
-        if names.insert(spec.name.clone()) {
-            definitions.push(AgentDef::Agent(spec));
+        let definition = match definition {
+            AgentDef::Agent(spec) => {
+                let mut spec = spec.clone();
+                spec.body = spec.body.trim().to_owned();
+                if !validate_agent(&mut spec, &mut warn) {
+                    continue;
+                }
+                AgentDef::Agent(spec)
+            }
+            AgentDef::Team(team) => AgentDef::Team(team.clone()),
+        };
+        if names.insert(name) {
+            definitions.push(definition);
         } else {
-            warn(format!("name \"{}\" collision", spec.name));
+            warn(format!("name \"{name}\" collision"));
         }
     }
     let agent_names: IndexMap<String, RunAs> = definitions
@@ -292,11 +336,13 @@ pub fn load_agents(
     (definitions, diagnostics)
 }
 
+#[expose(block = AGENT_SPEC_BLOCK, object = "types")]
 impl AgentSpec {
     /// Parses a markdown agent definition supplied by the host (for example a bundled `include_str!`).
     /// `default_name` applies only when the frontmatter has no `name` key; an explicit empty `name` is
     /// invalid. Team definitions (frontmatter `members`) load only from agent roots and yield `None`
     /// before any other validation. Diagnostics carry no origin and `path` stays `None`.
+    #[ext(skip = "no receiver; served by host.parseAgent")]
     pub fn parse(default_name: &str, markdown: &str) -> (Option<AgentSpec>, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let def = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {

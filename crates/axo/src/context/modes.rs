@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -12,7 +13,7 @@ use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// A session mode. Built from a definition file or passed in code; never persisted
 /// (sessions record the mode by name).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ModeSpec {
     pub name: String,
@@ -38,15 +39,17 @@ pub struct ModeSpec {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(default)]
 pub struct ToolLimits {
     pub allow: Option<Vec<String>>,
     pub deny: Vec<String>,
 }
 
+#[expose(block = TOOL_LIMITS_BLOCK, object = "types")]
 impl ToolLimits {
     /// `allow` (when set) must contain `tool`, and `deny` must not.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn permits(&self, tool: &str) -> bool {
         self.allow
             .as_ref()
@@ -54,6 +57,7 @@ impl ToolLimits {
             && !self.deny.iter().any(|name| name == tool)
     }
 
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_empty(&self) -> bool {
         self.allow.is_none() && self.deny.is_empty()
     }
@@ -61,7 +65,7 @@ impl ToolLimits {
 
 /// What `bash` commands may write. Effective access is `ReadOnly` when the agent, the mode,
 /// or a spawning ancestor's ceiling says so.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum BashAccess {
     #[default]
@@ -70,13 +74,15 @@ pub enum BashAccess {
     ReadOnly,
 }
 
+#[expose(block = BASH_ACCESS_BLOCK, object = "types")]
 impl BashAccess {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_full(&self) -> bool {
         *self == Self::Full
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(default)]
 pub struct ModeResult {
     /// JSON Schema of the result; defaults to `{"type":"string"}`.
@@ -117,10 +123,7 @@ struct Frontmatter {
 }
 
 /// Blocking filesystem I/O; never fails (problems become diagnostics).
-pub fn load_modes(
-    roots: &[PathBuf],
-    programmatic: &[ModeSpec],
-) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
+pub fn load_modes(roots: &[PathBuf]) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
     let mut definitions = Vec::new();
     let mut diagnostics = Vec::new();
     let mut names = HashSet::new();
@@ -153,10 +156,21 @@ pub fn load_modes(
             }
         }
     }
-    for spec in programmatic {
+    (definitions, diagnostics)
+}
+
+pub(crate) fn merge_modes(
+    files: &[ModeSpec],
+    code: &[ModeSpec],
+) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(|spec| spec.name.as_str()).collect();
+    for spec in code {
+        let name = spec.name.as_str();
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
-                origin: None,
+                origin: spec.path.clone().map(DiagnosticOrigin::Path),
                 message: format!("mode \"{}\": {message}", spec.name),
             });
         };
@@ -165,7 +179,7 @@ pub fn load_modes(
         if !validate(&spec, &mut warn) {
             continue;
         }
-        if names.insert(spec.name.clone()) {
+        if names.insert(name) {
             definitions.push(spec);
         } else {
             warn(format!("name \"{}\" collision", spec.name));
@@ -174,12 +188,14 @@ pub fn load_modes(
     (definitions, diagnostics)
 }
 
+#[expose(block = MODE_SPEC_BLOCK, object = "types")]
 impl ModeSpec {
     /// Parses a mode definition (YAML frontmatter plus body), e.g. one a host bundles
     /// with `include_str!` and passes in `SessionOptions::modes`. `default_name` applies only
     /// when the frontmatter has no `name` key; an explicit empty `name` is invalid. Problems
     /// become diagnostics without an origin;
     /// an invalid definition yields `None`. The spec has no `path`.
+    #[ext(skip = "no receiver; served by host.parseMode")]
     pub fn parse(default_name: &str, markdown: &str) -> (Option<ModeSpec>, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let spec = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {
@@ -296,7 +312,7 @@ mod tests {
             "---\nresult:\n  schema: {type: invalid}\n---\nBroken",
         )
         .unwrap();
-        let (modes, diagnostics) = load_modes(&[dir.path().to_path_buf()], &[]);
+        let (modes, diagnostics) = load_modes(&[dir.path().to_path_buf()]);
         assert_eq!(
             modes,
             vec![ModeSpec {
@@ -349,7 +365,7 @@ mod tests {
         let nested = dir.path().join("plan");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("roadmap.md"), BUNDLED).unwrap();
-        let (mut files, diagnostics) = load_modes(&[dir.path().to_path_buf()], &[]);
+        let (mut files, diagnostics) = load_modes(&[dir.path().to_path_buf()]);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let (parsed, diagnostics) = ModeSpec::parse("plan:roadmap", BUNDLED);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");

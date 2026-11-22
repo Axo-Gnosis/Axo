@@ -1,7 +1,7 @@
 //! OpenAI Codex (ChatGPT subscription) Responses API over SSE. Port of pi
 //! `api/openai-codex-responses.ts`: `buildRequestBody`, `mapCodexEvents`,
 //! `parseErrorResponse` and the SSE headers. Not ported: the WebSocket transport, zstd
-//! request compression, service-tier requests and `previous_response_id` continuation.
+//! request compression and `previous_response_id` continuation.
 
 use std::ops::ControlFlow;
 
@@ -11,13 +11,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::http::{Prepared, prepare, read_sse, send};
 use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
-use crate::api::{Api, ProviderRequest, Reply, StreamOptions, header_map, respond};
+use crate::api::{
+    Api, ProviderRequest, Reply, StreamOptions, header_map, openai_service_tier, respond,
+};
 use crate::auth::codex::{BASE_URL, account_id};
 use crate::event::AssistantEvent;
 use crate::model::Model;
 use crate::thinking::clamp_level;
 use crate::transcript::{Transcript, resolve_transcript_tools, system_message_text};
-use crate::types::{StopReason, ThinkingLevel, Usage, now_ms};
+use crate::types::{StopReason, ThinkingLevel, now_ms};
 
 /// pi `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH`.
 const PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
@@ -51,12 +53,21 @@ impl Api for CodexApi {
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         let request = build_request(model, &transcript, &opts);
+        let tier = model.effective_tier(opts.simple.service_tier);
         let rewrite = opts.rewrite.clone();
         let http = self.http.clone();
         let owned_model = model.clone();
         respond(model, cancel, move |mut reply, cancel| async move {
+            reply.message.service_tier = tier;
             let result = async {
-                let prepared = prepare(rewrite.as_deref(), &owned_model, request?, &cancel).await?;
+                let prepared = prepare(
+                    rewrite.as_deref(),
+                    &owned_model,
+                    request?,
+                    &cancel,
+                    &mut reply,
+                )
+                .await?;
                 drive(&http, &owned_model, prepared, &cancel, &mut reply).await
             }
             .await;
@@ -173,6 +184,9 @@ fn build_request_body(
     if let Some(temperature) = opts.simple.temperature {
         body["temperature"] = json!(temperature);
     }
+    if let Some(name) = openai_service_tier(model.effective_tier(opts.simple.service_tier)) {
+        body["service_tier"] = json!(name);
+    }
     if !request_tools.is_empty() {
         body["tools"] = json!(convert_tools(
             &request_tools,
@@ -227,7 +241,7 @@ async fn drive(
     reply.start();
     let mut stream = ResponsesStream::new(model);
     read_sse(response, cancel, |sse| {
-        map_codex_event(&mut stream, model, &sse.data, reply)
+        map_codex_event(&mut stream, &sse.data, reply)
     })
     .await?;
     stream.finish(reply)?;
@@ -239,7 +253,6 @@ async fn drive(
 /// `response.completed` with a normalized status. Returns whether the event was terminal.
 fn map_codex_event(
     stream: &mut ResponsesStream<'_>,
-    model: &Model,
     data: &str,
     reply: &mut Reply,
 ) -> Result<ControlFlow<()>, String> {
@@ -287,13 +300,6 @@ fn map_codex_event(
             }
             event["type"] = json!("response.completed");
             stream.handle(&event, reply)?;
-            apply_service_tier_pricing(
-                model,
-                event
-                    .pointer("/response/service_tier")
-                    .and_then(Value::as_str),
-                &mut reply.message.usage,
-            );
             Ok(ControlFlow::Break(()))
         }
         _ => stream
@@ -366,20 +372,4 @@ fn parse_error_response(status: u16, raw: &str, body: Option<&Value>) -> String 
         Some(friendly) => format!("{friendly}\n{raw}"),
         None => message,
     }
-}
-
-/// pi `applyServiceTierPricing` for the tier the response reports.
-fn apply_service_tier_pricing(model: &Model, service_tier: Option<&str>, usage: &mut Usage) {
-    let multiplier = match service_tier {
-        Some("flex") => 0.5,
-        Some("priority") if model.id == "gpt-5.5" => 2.5,
-        Some("priority") => 2.0,
-        _ => return,
-    };
-    let cost = &mut usage.cost;
-    cost.input *= multiplier;
-    cost.output *= multiplier;
-    cost.cache_read *= multiplier;
-    cost.cache_write *= multiplier;
-    cost.total = cost.input + cost.output + cost.cache_read + cost.cache_write;
 }

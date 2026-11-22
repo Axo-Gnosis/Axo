@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use axo_agent::{ToolContext, ToolError, ToolInvocationId, ToolOutput, ToolUpdate};
 use axo_ai::UserBlock;
+use axo_macros::expose;
 use serde_json::{Value, json};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -161,7 +162,8 @@ pub(super) struct OutputState {
 }
 
 /// The flushed output prefix and whether the command and its helpers have finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct OutputProgress {
     /// Raw bytes available to read.
     pub bytes: u64,
@@ -175,6 +177,7 @@ pub struct OutputProgress {
 pub struct CommandOutput {
     job: String,
     artifact: u64,
+    path: PathBuf,
     file: Arc<std::fs::File>,
     index: Option<Arc<std::fs::File>>,
     progress: watch::Receiver<OutputProgress>,
@@ -190,10 +193,12 @@ const TAG_FAILED: u8 = 4;
 /// Records per batched index read while scanning for chunks.
 const INDEX_BATCH: u64 = 512;
 
+#[expose(block = COMMAND_OUTPUT_BLOCK, object = "types")]
 impl CommandOutput {
     pub(super) fn new(
         job: String,
         artifact: u64,
+        path: PathBuf,
         file: std::fs::File,
         index: Option<std::fs::File>,
         progress: watch::Receiver<OutputProgress>,
@@ -201,14 +206,22 @@ impl CommandOutput {
         Self {
             job,
             artifact,
+            path,
             file: Arc::new(file),
             index: index.map(Arc::new),
             progress,
         }
     }
 
+    /// The raw log file being read.
+    #[ext(skip = "live reader; session.commandOutput returns them in one page")]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Opens a retained log, including copied fork logs and historical unlabelled logs.
     /// An absent terminal index record means capture may be partial.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn open(job: String, artifact: u64, path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
@@ -234,11 +247,19 @@ impl CommandOutput {
             done: true,
             capture_failed,
         });
-        Ok(Self::new(job, artifact, file, index, progress))
+        Ok(Self::new(
+            job,
+            artifact,
+            path.to_owned(),
+            file,
+            index,
+            progress,
+        ))
     }
 
     /// Reads labeled raw chunks over a byte range clamped once to the flushed prefix. Missing metadata is `Merged`.
     /// The index is binary-searched, then scanned in fixed batches; each span is read straight into its chunk.
+    #[ext(skip = "live reader; session.commandChunks")]
     pub async fn read_chunks(
         &self,
         range: std::ops::Range<u64>,
@@ -338,21 +359,25 @@ impl CommandOutput {
     }
 
     /// The command's job id, including before it is listed.
+    #[ext(skip = "live reader; session.commandOutput returns them in one page")]
     pub fn job(&self) -> &str {
         &self.job
     }
 
     /// The artifact id backing the command's raw output.
+    #[ext(skip = "live reader; session.commandOutput returns them in one page")]
     pub fn artifact(&self) -> u64 {
         self.artifact
     }
 
     /// Subscribes to flushed output progress.
+    #[ext(skip = "live reader; session.commandOutput returns them in one page")]
     pub fn progress(&self) -> watch::Receiver<OutputProgress> {
         self.progress.clone()
     }
 
     /// Reads raw bytes, clamping the range to the flushed output prefix.
+    #[ext(skip = "live reader; session.commandOutput returns them in one page")]
     pub async fn read(&self, range: std::ops::Range<u64>) -> std::io::Result<Vec<u8>> {
         let range = self.clamp(range);
         let file = self.file.clone();
@@ -1332,6 +1357,7 @@ mod tests {
         let output = CommandOutput::new(
             "bg_0".into(),
             0,
+            path.clone(),
             std::fs::File::open(&path).unwrap(),
             Some(std::fs::File::open(stream_index_path(&path)).unwrap()),
             rx,

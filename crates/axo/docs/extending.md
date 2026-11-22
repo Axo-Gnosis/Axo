@@ -1,6 +1,6 @@
 # Embedding & Extending axo
 
-`axo` is a library with no configuration directory of its own. Hosts customize it by supplying configuration through `ConfigSource` and resources through `Axo::builder`, and extend it in Rust by embedding `axo`, `axo-agent`, and `axo-ai`. Repositories and users customize sessions through the ecosystem `.agents/` and `AGENTS.md` conventions and whatever the host exposes.
+`axo` is a library with no configuration directory of its own. Hosts customize it by supplying configuration through `ConfigSource` and resources through `Axo::builder`, and extend it in Rust by embedding `axo`, `axo-agent`, and `axo-ai`. Hosts that load trusted TypeScript/JavaScript packages add `axo-extensions` (see [Bun extensions](#4-bun-extensions-axo-extensions)). Repositories and users customize sessions through the ecosystem `.agents/` and `AGENTS.md` conventions and whatever the host exposes.
 
 ## 1. Configuration and Declarative Files
 
@@ -9,12 +9,12 @@ axo reads the ecosystem files itself; everything else arrives from the host, in 
 - **Context files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.agents/AGENTS.md`, plus any path enabled in `settings.contextFiles`):** Add persona, architecture notes, and coding rules at the repository root or in subdirectories (loaded on demand when `read`, `write`, or `edit` touches that subtree). User-wide files come from the host as `UserConfig::context_files`, and `~/.agents/AGENTS.md` with `homeAgentsDir: true`. See [`prompts-and-context.md`](prompts-and-context.md#context-files-cratesaxosrccontextfilesrs).
 - **Prompt overrides (`ConfigLayer::prompts`):** The user and project layers may override `SYSTEM`, `WORK`, `PROSE`, or the summarizer prompts (`SUMMARY`, `COMPACTION`, `COMPACTION_UPDATE`, `COMPACTION_SPLIT_TURN`, `BRANCH_SUMMARY`); the project's override wins per name. An empty `SYSTEM`, `WORK`, or `PROSE` override disables that prompt section, an empty summarizer override keeps the bundled prompt with a `Diagnostic`, and a name outside `PROMPT_NAMES` is an `Error::Config`.
 - **Skills (`.agents/skills/<name>/SKILL.md`, host skill roots, and `~/.agents/skills/<name>/SKILL.md`):** Package task instructions and reference files that the model reads on demand from `<available_skills>` or the user invokes inline with `/<name> [args]`. Roots are searched in order: project `.agents/skills`, allowed project `ConfigLayer::skill_roots`, user `ConfigLayer::skill_roots`, then `~/.agents/skills` (only with `homeAgentsDir: true`). Project skills require `Read` or `Trust` and the user's `project.files.skills`; explicit project roots also require acquisition through `project.files.config`. Optional `argument-hint` frontmatter is the placeholder apps show after `/<name>`; a skill named like a built-in command gets a warning diagnostic and is left out of the command catalog. See [`prompts-and-context.md`](prompts-and-context.md#skills-cratesaxosrccontextskillsrs).
-- **Custom providers and model patches (`axo_ai::ModelsConfig`):** The host's `ModelsConfig` registers OpenAI- or Anthropic-compatible endpoints, custom headers, literal or `$ENV` API keys, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `cost`, `compat`). Config values starting with `!` are rejected; hosts resolve command-based secrets before passing configuration. See [`configuration.md`](configuration.md#models-axo_aimodelsconfig--credentials).
-- **Agent definitions:** Supply `*.md` files with YAML frontmatter in `ConfigLayer::agent_roots` (project roots require `Trust`), or `AgentSpec` values through `SessionOptions::agents`. Select a root persona with `SessionOptions::agent`; its body, tool allowlist, context-file switches, and section removals configure the session. See [Agent definitions](prompts-and-context.md#agent-definitions).
-- **Mode definitions:** Supply markdown files through `ConfigLayer::mode_roots` (project roots require `Trust`), or `ModeSpec` values through `SessionOptions::modes`. Root sessions select them with `Session::set_mode` or session-parsed commands; see [Root-session modes](#root-session-modes) and [Mode definitions](prompts-and-context.md#mode-definitions).
-- **Keyword definitions:** Supply markdown files through `ConfigLayer::keyword_roots` (project roots require `Trust`), or `KeywordSpec` values through `SessionOptions::keywords`. A root session fires an active keyword when its name appears as a prose word in user-typed text: its body joins that user message and its optional `model` applies like `/model`. Settings `keywords.enabled` and `keywords.disabled` switch them off; see [Keyword definitions](prompts-and-context.md#keyword-definitions).
-- **Bundled definitions:** `ModeSpec::parse(default_name, markdown)`, `AgentSpec::parse(default_name, markdown)`, and `KeywordSpec::parse(default_name, markdown)` turn host-bundled markdown (for example `include_str!("modes/plan.md")`) into programmatic specs. They run the definition-file parser, so frontmatter, field types, names and schemas are validated immediately, during the `parse` call; only name collisions wait until the specs are loaded. They return `(Option<ModeSpec>, Vec<Diagnostic>)`, `(Option<AgentSpec>, Vec<Diagnostic>)`, and `(Option<KeywordSpec>, Vec<Diagnostic>)`: `None` plus diagnostics for an invalid definition (markdown without frontmatter reports `missing YAML frontmatter`), diagnostics without an origin, and a spec without a `path`. `default_name` applies only when frontmatter has no `name` key; an explicit empty `name` is invalid. Pass the specs through `SessionOptions::modes` / `SessionOptions::agents` / `SessionOptions::keywords` or `Axo::catalog`. File roots load before programmatic specs and the first name wins, so user and project files override bundled defaults by name. `AgentSpec::parse` rejects team definitions (frontmatter `members`) with `None` and only the diagnostic `team definitions load only from agent roots`, before any other validation; teams load only from agent roots.
-- **Model roles:** User-only `modelRoles` maps role names to model selectors. `SessionOptions::model`, agent, mode, and keyword models, `defaultModel`, and `/model` accept `provider/model`, `@role`, optional `:thinking` suffixes, or `:thinking` alone. See [Model selectors](configuration.md#model-selectors).
+- **Custom providers and model patches (`axo_ai::ModelsConfig`):** The host's `ModelsConfig` registers OpenAI- or Anthropic-compatible endpoints, custom headers, literal or `$ENV` API keys, and per-model overrides (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `serviceTiers`, `cost`, `compat`). Config values starting with `!` are rejected; hosts resolve command-based secrets before passing configuration. See [`configuration.md`](configuration.md#models-axo_aimodelsconfig--credentials).
+- **Agent definitions:** Supply `*.md` files with YAML frontmatter in `ConfigLayer::agent_roots` (project roots require `Trust`), or `AgentSpec` values through `Definitions::agents`. Select a root persona with `SessionOptions::agent`; its body, tool allowlist, context-file switches, and section removals configure the session. See [Agent definitions](prompts-and-context.md#agent-definitions).
+- **Mode definitions:** Supply markdown files through `ConfigLayer::mode_roots` (project roots require `Trust`), or `ModeSpec` values through `Definitions::modes`. Root sessions select them with `Session::set_mode` or session-parsed commands; see [Root-session modes](#root-session-modes) and [Mode definitions](prompts-and-context.md#mode-definitions).
+- **Keyword definitions:** Supply markdown files through `ConfigLayer::keyword_roots` (project roots require `Trust`), or `KeywordSpec` values through `Definitions::keywords`. A root session fires an active keyword when its name appears as a prose word in user-typed text: its body joins that user message and its optional `model` applies like `/model`. Settings `keywords.enabled` and `keywords.disabled` switch them off; see [Keyword definitions](prompts-and-context.md#keyword-definitions).
+- **Bundled definitions:** `ModeSpec::parse(default_name, markdown)`, `AgentSpec::parse(default_name, markdown)`, and `KeywordSpec::parse(default_name, markdown)` turn host-bundled markdown (for example `include_str!("modes/plan.md")`) into programmatic specs. They run the definition-file parser, so frontmatter, field types, names and schemas are validated immediately, during the `parse` call; only name collisions wait until the specs are loaded. They return `(Option<ModeSpec>, Vec<Diagnostic>)`, `(Option<AgentSpec>, Vec<Diagnostic>)`, and `(Option<KeywordSpec>, Vec<Diagnostic>)`: `None` plus diagnostics for an invalid definition (markdown without frontmatter reports `missing YAML frontmatter`), diagnostics without an origin, and a spec without a `path`. `default_name` applies only when frontmatter has no `name` key; an explicit empty `name` is invalid. Pass the specs through `Definitions` or `Axo::catalog`. File roots load before programmatic specs and the first name wins, so user and project files override bundled defaults by name. `AgentSpec::parse` rejects team definitions (frontmatter `members`) with `None` and only the diagnostic `team definitions load only from agent roots`, before any other validation. To supply a team in code, construct a `TeamSpec`.
+- **Model roles:** User-only `modelRoles` maps role names to model selectors. `SessionOptions::model`, agent, mode, and keyword models, `defaultModel`, and `/model` accept `provider/model`, `@role`, and thinking or service tier suffixes, together or alone. See [Model selectors](configuration.md#model-selectors).
 
 Start-time diagnostics for context files, skills, agent, mode, and keyword definitions, tool allowlists, schemes and bundled docs, prompt overrides, host sections, and reserved or hidden command names are available through `session.diagnostics()` and logged as warnings (see [`prompts-and-context.md`](prompts-and-context.md)); runtime `NestedContext` read errors are only logged.
 
@@ -22,7 +22,15 @@ Start-time diagnostics for context files, skills, agent, mode, and keyword defin
 
 Hosts link the `axo` crate to manage `Models`, a `SessionStore`, a `ConfigSource`, and `Session` instances in a single process. `Axo::builder(models, store)` takes the two required inputs; `AxoBuilder::config` and `AxoBuilder::cache_dir` are optional (see [Absent inputs](configuration.md#absent-inputs)), and `AxoBuilder::build` is synchronous, infallible, and performs no configuration I/O. The user layer is sampled at every `create_session`, `open_session`, `Axo::schemes`, and `Axo::catalog` call; a fork inherits its parent's resolved configuration.
 
-`Axo::catalog(cwd: &Path, project_access: Option<ProjectAccess>, agents: &[AgentSpec], modes: &[ModeSpec], keywords: &[KeywordSpec]) -> Result<Catalog, Error>` previews what a session in `cwd` would load without creating one: `Catalog { config, agents, modes, keywords, diagnostics }` holds the resolved `Arc<EffectiveConfig>`, the agent and team catalog, shared `Arc<ModeSpec>` and `Arc<KeywordSpec>` definitions (file roots first, then the supplied specs), and every loader's diagnostics. It performs blocking file I/O. See [Root selection and catalog](prompts-and-context.md#root-selection-and-catalog).
+### Live definitions
+
+Use one `Definitions` value for agents, teams, modes, keywords and skills. Pass the host’s value in `SessionOptions::definitions` and the layer’s in `Registrations::definitions`. A code-supplied `Skill` points to a `SKILL.md` on disk; its body and sibling reference files are read on demand.
+
+A session reads its configured definition roots once at start. `Session::set_definitions` replaces the host’s value; `Session::set_layer` replaces the layer’s. Each change merges the registrations with the original file snapshot, without rescanning. Files come first, then the layer, then the host. Within each kind the first name wins; later collisions are diagnostics. Agents and teams share a namespace, and teams are checked against agents from all sources.
+
+The definition accessors return owned snapshots of what is in force now. A selected persona or mode keeps its copy even if its definition changes or disappears; select again to use the new definition. Supply registrations again on reopen.
+
+`Axo::catalog(cwd, project_access, definitions)` previews a session without creating one. It performs blocking file I/O and merges the discovered files with the supplied `&Definitions`. The returned `Catalog` contains the resolved config, agents (including teams), modes, keywords, skills and diagnostics.
 
 ### Building `Axo` and running a `Session`
 
@@ -33,8 +41,8 @@ use std::sync::Arc;
 use axo::JsonlStore;
 use axo::{
     Answer, Axo, Command, CommandInfo, ConfigLayer, ConfigSource, NavigateOptions, PromptPart,
-    PromptRequest, PromptResult, RecoveryPolicy, SessionEvent, SessionOptions, ShakeMode,
-    UserConfig,
+    PromptRequest, PromptResult, RecoveryPolicy, Registrations, SessionEvent, SessionOptions,
+    ShakeMode, UserConfig,
 };
 use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 use serde_json::json;
@@ -83,9 +91,7 @@ let session = axo
         cwd: PathBuf::from("/repo/my-project"),
         model: Some("anthropic/claude-sonnet-4-5".into()),
         agent: None,
-        agents: Vec::new(),
-        modes: Vec::new(),
-        keywords: Vec::new(),
+        definitions: Default::default(),
         keywords_enabled: true,
         thinking: None,
         ask_enabled: true,
@@ -98,7 +104,9 @@ let session = axo
         tools: Vec::new(),
         tool_policies: Vec::new(),
         spawn_hooks: Vec::new(),
+        commands: Vec::new(),
         schemes: Vec::new(),
+        layer: Registrations::default(),
         recovery: RecoveryPolicy::Resume,
     })
     .await?;
@@ -106,7 +114,7 @@ let session = axo
 let mut attach = session.attach(None).await;
 tokio::spawn(async move {
     while let Ok(event) = attach.events.recv().await {
-        if let SessionEvent::QuestionPending { call_id, questions } = event {
+        if let SessionEvent::QuestionPending { call_id, questions } = &*event {
             // Answer or dismiss pending `ask` questions from the client UI.
             let _ = (call_id, questions);
         }
@@ -166,14 +174,16 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `abort` | `fn abort(&self)` | Stop (`session.abort()`, without awaiting): cancels active maintenance and stops the current run with `CancelReason::User` (persisting an `Aborted` outcome), including foreground tool calls and `bash`. Background jobs keep running. A Stop during an active run latches automatic continuation off when pressed: queued steers and follow-ups, row messages, and teammate mail are held until user input, a host `Steer` / `FollowUp`, or `resume_wakes`; incoming teammate mail and a host `Quiet` message do not clear the latch. Input sent after the Stop clears it and is delivered, with everything held, once the stopped run settles. A Stop while idle changes nothing (see [Queued input for hosts](#queued-input-for-hosts)) |
 | `resume_wakes` | `fn resume_wakes(&self)` | Clears the automatic-continuation latch without submitting input. Emits `AutoPaused { paused: false }` only if the session was paused; then, on an idle session, starts a run with the held steers (else follow-ups) per `steeringMode` / `followUpMode`, or else delivers pending row messages and queued teammate mail. While a run or maintenance is active, everything waits for its next boundary as usual |
 | `shutdown` | `async fn shutdown(&self)` | Cancels with `CancelReason::Shutdown`, waits for the active run without recording it as user-aborted, recursively shuts down live children, then stops command jobs and awaits their tasks. Child runs resume when the parent reopens; commands are marked interrupted. Dropping a `Session` cancels its run, kills command containers, and releases table-owned child handles; independently held children can remain live |
-| `set_model` | `async fn set_model(&self, model: Model) -> Result<(), Error>` | Appends `Entry::ModelChange` (and `ThinkingLevelChange` if clamped) and, once written, switches the model for the next request; allowed during maintenance, which it never invalidates |
+| `set_model` | `async fn set_model(&self, model: Model) -> Result<(), Error>` | On a model change, appends `Entry::ModelChange`, plus `ThinkingLevelChange` if thinking is clamped and `ServiceTierChange` if the tier resets. Once written, the selection applies to the next request; allowed during maintenance, which it never invalidates |
 | `set_thinking` | `async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error>` | Clamps `level` to the current model, appends `Entry::ThinkingLevelChange` when changed (applied once written), and returns the applied level |
+| `set_service_tier` | `async fn set_service_tier(&self, tier: ServiceTier) -> Result<ServiceTier, Error>` | Appends `Entry::ServiceTierChange` when the choice changes, then applies it from the next request. Returns the tier the current model applies |
 | `set_name` | `async fn set_name(&self, name: Option<String>) -> Result<SeqEntry, Error>` | Appends `Entry::SessionInfo` at the current position; replaces newlines with spaces, trims, and treats an empty name as `None`. May run at any time; adds no model-context messages |
 | `name` | `fn name(&self) -> Option<String>` | Returns the latest session name in file order, globally rather than scoped to the current branch |
 | `append_custom` | `async fn append_custom(&self, custom_type: &str, data: Option<Value>) -> Result<SeqEntry, Error>` | Appends `Entry::Custom` at the current position. May run at any time; adds no model-context messages. Rejects an empty `custom_type` with `Error::InvalidInput` |
 | `custom` | `fn custom(&self, custom_type: &str) -> Option<Value>` | Returns the latest data of that type on the current root-to-leaf path (branch-scoped), or `None` if absent or the latest entry has no data |
 | `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles a pending question. `dismiss` settles a pending question or mode result and stops the run like `abort` (`CancelReason::User`), leaving the selected mode active. Both return `Error::NoPendingQuestion` for an id absent from their supported pending registries, including a question a steer already settled |
-| `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot` (including `jobs`, the same list as `Session::jobs`), and a live `broadcast::Receiver<SessionEvent>` |
+| `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot` (including `jobs`, the same list as `Session::jobs`), and a live `broadcast::Receiver<Arc<SessionEvent>>` |
+| `subscribe` | `fn subscribe(&self) -> broadcast::Receiver<Arc<SessionEvent>>` | Events from now on, without the journal and live snapshot `attach` takes; for consumers that need no catch-up |
 | `compact` | `async fn compact(&self, focus: Option<String>) -> Result<(), Error>` | Runs a standalone compaction summary checkpoint in a session-owned task; `focus` tells the summary what to prioritize and is recorded on the `Entry::Compaction`; blank focus counts as none |
 | `shake` | `async fn shake(&self, mode: ShakeMode) -> Result<(), Error>` | Runs recoverable artifact elision (`Elide`, `Images`, or `Thinking`) without model calls |
 | `navigate` | `async fn navigate(&self, target: Option<EntryId>, options: NavigateOptions) -> Result<(), Error>` | Moves the leaf to `target` (`None` = root), optionally summarizing the abandoned branch into an `Entry::BranchSummary` (`NavigateOptions { summarize, focus }`; `focus` without `summarize` is `Error::InvalidInput` (blank counts as none)). Running jobs keep running; their results are delivered on whichever branch is selected when they finish, naming the originating command or child agent |
@@ -183,24 +193,35 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `agent` | `fn agent(&self) -> Option<AgentSpec>` | The current root persona, or for a child the spec it was spawned with; distinct from the catalog returned by `agents`. `spawn_link` returns a child's full persisted link |
 | `spawn_link` | `fn spawn_link(&self) -> Option<&SpawnLink>` | The persisted spawn link for a child; `None` for roots and forks |
 | `set_agent` | `async fn set_agent(&self, name: Option<&str>) -> Result<(), Error>` | Resolves a root-capable catalog persona, persists `Entry::AgentChange`, and rebuilds the next request's prompt and tools from the unfiltered base; `None` clears the persona. When the persona declares a `model` selector, it is resolved first (errors before any write) and applied with the `agent_change` in one batch, clamping thinking; otherwise model and thinking are unchanged. A missing/team name returns `Error::AgentNotFound`; a subagent-only persona returns `Error::AgentNotRoot` |
-| `set_section` | `async fn set_section(&self, name: &str, body: Option<String>) -> Result<(), Error>` | Replaces or removes a host prompt section in the live base and rebuilds the effective shape. Host section overrides apply after persona section switches. An invalid section name returns `Error::InvalidInput` |
-| `set_tools` | `async fn set_tools(&self, tools: Vec<HostTool>) -> Result<(), Error>` | Replaces host tool registrations and updates only the direct/deferred tool lists under the current persona allowlist. It does not re-apply context files, persona instructions, or section overrides; the prompt is rebuilt from the retained inputs and updated tools. Future children and forks use the current factories and exposure choices |
+| `set_section` | `async fn set_section(&self, name: &str, body: Option<String>) -> Result<(), Error>` | Replaces or removes one host prompt section in the live base and rebuilds the effective shape. Host section overrides apply after persona section switches. An invalid section name returns `Error::InvalidInput`. Withheld from extensions |
+| `set_sections` | `async fn set_sections(&self, sections: Vec<(String, Option<String>)>) -> Result<(), Error>` | Replaces every host section from the next request; a section set before and omitted now disappears. An invalid name rejects the whole set with `Error::InvalidInput` and keeps the previous one. Children return `Error::InvalidInput` |
+| `set_tools` | `async fn set_tools(&self, tools: Vec<HostTool>) -> Result<Vec<Diagnostic>, Error>` | Replaces host tool registrations and updates only the direct/deferred tool lists under the current persona allowlist; returns the new tool shape's diagnostics (labeled replacements, reserved names, deferred collisions). It does not re-apply context files, persona instructions, or section overrides; the prompt is rebuilt from the retained inputs and updated tools. Future children and forks use the current factories and exposure choices |
+| `set_tool_policies` | `fn set_tool_policies(&self, policies: Vec<Arc<dyn ToolPolicy>>) -> Result<(), Error>` | Replaces the host tool policies for hook invocations that start after it returns; a hook pass already under way finishes with the list it started with. Future forks and children start with the new list, live children keep theirs. Children return `Error::InvalidInput` |
+| `set_spawn_hooks` | `fn set_spawn_hooks(&self, hooks: Vec<Arc<dyn SpawnHook>>) -> Result<(), Error>` | Replaces the host spawn hooks for spawns resolved after it returns; future forks and children start with the new list. Children return `Error::InvalidInput` |
+| `set_schemes` | `async fn set_schemes(&self, schemes: Vec<Arc<dyn Scheme>>) -> Result<(), Error>` | Replaces the host schemes over the built-ins: URLs resolve through the new set at once (`Session::schemes()` included), and the prompt's `schemes` section changes from the next request. An invalid or reserved name rejects the whole set with `Error::Scheme` and keeps the previous one. Future forks and children start with the new set. Children return `Error::InvalidInput` |
+| `set_commands` | `fn set_commands(&self, commands: Vec<RegisteredCommand>) -> Result<Vec<Diagnostic>, Error>` | Replaces the host's [registered commands](#commands) and returns the diagnostics of every registered command, layer included; future forks start with the new list. Children return `Error::InvalidInput` (`Child sessions have no commands`) |
+| `set_definitions` | `async fn set_definitions(&self, definitions: Definitions) -> Result<Vec<Diagnostic>, Error>` | Replaces the host’s [live definitions](#live-definitions) from the next request. Returns merge, skill and command diagnostics, then tool-shape diagnostics |
+| `set_layer` | `async fn set_layer(&self, layer: Registrations) -> Result<Vec<Diagnostic>, Error>` | Replaces the layer’s tools, policies, spawn hooks, schemes, sections, commands and definitions together without changing host registrations. An invalid section or scheme name rejects the whole layer. Returns tool-shape, definition and command diagnostics. Children reject both setters |
 | `model` / `thinking` / `config` | `fn model(&self) -> Model`<br>`fn thinking(&self) -> ThinkingLevel`<br>`fn config(&self) -> &EffectiveConfig` | The live model and thinking selection, and the session's resolved configuration |
+| `service_tier` | `fn service_tier(&self) -> ServiceTier` | The chosen tier, even when unsupported by the current model |
+| `effective_service_tier` | `fn effective_service_tier(&self) -> ServiceTier` | The tier requests use on the current model: the chosen tier if supported, otherwise standard |
 | `context_usage` | `fn context_usage(&self) -> Option<ContextUsage>` | Current context estimate and model limits, also available in `LiveSnapshot::context`; distinct from cumulative token spend. See [Context usage](#context-usage) |
 | `tree_usage` | `fn tree_usage(&self) -> Usage` | Cumulative token spend of this session and every descendant child, including maintenance; also `LiveSnapshot::tree_usage` and `SessionEvent::TreeUsage`. See [Background jobs for hosts](#background-jobs-for-hosts) |
 | `reload_exec_env` | `async fn reload_exec_env(&self)` | Invalidates and re-resolves the `ExecEnv` (such as a Nix flake dev shell), queuing a `dev_shell` system-prompt diff if the note changed |
-| `commands` | `fn commands(&self) -> Vec<CommandInfo>` | The command catalog a host may offer: the five built-ins, then modes, then skills not hidden by either. See [Commands](#commands) |
-| `parse_command` | `fn parse_command(&self, text: &str) -> Option<Result<Command, Error>>` | Parses built-ins first, then `/<mode> [prompt…]` against this session's mode catalog; other input remains prompt text |
-| `run_command` | `async fn run_command(&self, command: Command) -> Result<(), Error>` | Runs a command under its policy. `Command::Model` accepts [model selectors](configuration.md#model-selectors); `Command::Mode { name, prompt }` selects the mode and passes an optional prompt to `steer` |
-| `id` / `path` / `skills` | `fn id(&self) -> &str`<br>`fn path(&self) -> &Path`<br>`fn skills(&self) -> &[Skill]` | The header UUIDv7 (known before the file exists); the session file (roots and children create it on their first submission, non-system message, or child admission, so a child's file exists once `spawn` returns; forks create it immediately); the skills loaded at start, which feed the prompt catalog and `/name` commands (a child reuses its parent's skills and `axo://` docs instead of loading them again) |
-| `agents` | `fn agents(&self) -> &[AgentDef]` | Agent and team catalog loaded at start; forks share it. `SessionOptions::agent` selects a root at creation. Reopening re-resolves the last recorded persona by name, including an explicit clear, unless options explicitly select another root; a recorded persona that is now missing or subagent-only yields a diagnostic and no persona |
-| `modes` | `fn modes(&self) -> &[Arc<ModeSpec>]` | Loaded mode definitions for a root session; empty for children |
-| `keywords` | `fn keywords(&self) -> &[Arc<KeywordSpec>]` | Every loaded keyword definition for a root session, including ones disabled in settings or inactive for lack of tools, so settings UIs can list toggles; empty for children |
+| `commands` | `fn commands(&self) -> Vec<CommandInfo>` | The command catalog a host may offer: built-ins, then modes, then registered commands, then skills not hidden by any of them. See [Commands](#commands) |
+| `parse_command` | `fn parse_command(&self, text: &str) -> Option<Result<Command, Error>>` | Parses built-ins first, then `/<mode> [prompt…]` against this session's mode catalog, then `/<registered> [args…]` as `Command::Registered { name, args }`; other input remains prompt text |
+| `run_command` | `async fn run_command(&self, command: Command) -> Result<(), Error>` | Runs a command under its policy. `Command::Model` accepts [model selectors](configuration.md#model-selectors); `Command::Mode { name, prompt }` selects the mode and passes an optional prompt to `steer`; `Command::Registered { name, args }` awaits the registered `CommandHandler::run(session, args)` (an unknown name is `Error::InvalidCommand`) |
+| `id` / `path` / `skills` | `fn id(&self) -> &str`<br>`fn path(&self) -> &Path`<br>`fn skills(&self) -> Vec<Skill>` | The header UUIDv7 (known before the file exists); the session file (roots and children create it on their first submission, non-system message, or child admission, so a child's file exists once `spawn` returns; forks create it immediately); the skills in force now, which feed the prompt catalog and `/name` commands |
+| `render_skill` | `async fn render_skill(&self, name: &str, args: &str) -> Result<String, Error>` | Renders a loaded skill's instruction block with arguments, including skills hidden from model invocation. Does not submit it: pass the result to `follow_up` as input or to `compact` as focus. An unknown name returns `Error::SkillNotFound`; a read failure returns `Error::Io` |
+| `invoke` | `async fn invoke(&self, method: &str, args: Vec<Value>, caller: &Caller) -> Result<Value, InvokeError>` | Calls a method by its camelCase wire name with positional JSON arguments. `axo::ext::Caller` supplies an optional namespace for custom types; the Bun bridge supplies the extension ID. `axo::ext::objects()` describes the callable and withheld methods; see [Extension session handles](#extension-session-handles) for wire shapes and errors |
+| `agents` | `fn agents(&self) -> Vec<AgentDef>` | Agents and teams in force now. `SessionOptions::agent` selects a root at creation. Reopening re-resolves the last recorded persona by name, including an explicit clear, unless options explicitly select another root; a recorded persona that is now missing or subagent-only yields a diagnostic and no persona |
+| `modes` | `fn modes(&self) -> Vec<Arc<ModeSpec>>` | Mode definitions in force now for a root session; empty for children |
+| `keywords` | `fn keywords(&self) -> Vec<Arc<KeywordSpec>>` | Every current keyword definition for a root session, including ones disabled in settings or inactive for lack of tools, so settings UIs can list toggles; empty for children |
 | `keyword_matches` | `fn keyword_matches(&self, text: &str) -> Vec<KeywordMatch>` | Runs the keyword matcher over `text`, treated as a message's first typed text part (a leading `/` token is skipped), against the currently active keywords. Returns `KeywordMatch { name, range }` in text order, `range` being a byte range into `text`, so a composer highlights exactly what a submission would fire; empty for children or with `keywords.enabled: false` |
 | `set_mode` | `async fn set_mode(&self, name: Option<&str>) -> Result<(), Error>` | Persists a root mode selection; `None` clears it. Unknown names return `Error::ModeNotFound`; children return `Error::InvalidInput`. Instructions and limits take effect at the next request boundary |
 | `mode` | `fn mode(&self) -> Option<Arc<ModeSpec>>` | Selected mode, including a selection waiting for the next request boundary; not necessarily the mode still governing an in-flight tool batch |
 | `effective_mode` | `fn effective_mode(&self) -> Option<Arc<ModeSpec>>` | Mode applied at the latest request boundary, distinct from the selected `mode`; also `LiveSnapshot::effective_mode` and `SessionEvent::EffectiveMode` |
-| `tools` | `fn tools(&self) -> Vec<SessionToolInfo>` | Read-only listing of the session's tools: every tool in the current prompt shape as `Exposure::Direct` (built-ins, host direct tools, and `call` when present), then every deferred catalog tool not already listed, as `Exposure::Deferred`. `SessionToolInfo` has `name`, `summary` (the deferred-catalog summary: first non-blank description line), full `description`, JSON Schema `parameters`, `exposure`, `promoted` (a deferred tool already promoted to native declarations), and `allowed_in_mode` (`true` for `yield` and when no mode is effective, otherwise the effective mode's `ToolLimits::permits`, matching the call-time mode gate; host `ToolPolicy` decisions are not reflected). Calling it never requests promotion |
+| `tools` | `fn tools(&self) -> Vec<SessionToolInfo>` | Read-only listing of the session's tools: every tool in the current prompt shape as `Exposure::Direct` (built-ins, host direct tools, and `call` when present), then every deferred catalog tool not already listed, as `Exposure::Deferred`. `SessionToolInfo` has `name`, `summary` (the deferred-catalog summary: first non-blank description line), full `description`, JSON Schema `parameters`, `exposure`, `promoted` (a deferred tool already promoted to native declarations), `allowed_in_mode` (`true` for `yield` and when no mode is effective, otherwise the effective mode's `ToolLimits::permits`, matching the call-time mode gate; host `ToolPolicy` decisions are not reflected), and `origin` (the `HostTool::origin` of the registration supplying it; `None` for built-ins and unlabeled host tools). Calling it never requests promotion |
 | `accept_result` | `fn accept_result(&self, call_id: &str, options: AcceptResultOptions) -> Result<(), Error>` | Accepts a pending mode review with optional schema-validated `replacement: Option<Value>` and continuation `message: Option<String>`. Invalid replacements leave review pending. Unknown or settled ids return `Error::NoPendingResult` |
 | `revise_result` | `fn revise_result(&self, call_id: &str, feedback: String) -> Result<(), Error>` | Settles the review with feedback while keeping the mode active. Blank feedback returns `Error::InvalidInput`; otherwise unknown or settled ids return `Error::NoPendingResult` |
 | `diagnostics` | `fn diagnostics(&self) -> &[Diagnostic]` | Start-time diagnostics retained for the host and still logged as warnings; excludes runtime `NestedContext` read errors, which are only logged |
@@ -221,13 +242,13 @@ The persona follows the live selection across navigation: `navigate` re-records 
 
 ### Root-session modes
 
-Modes are a journal-derived, branch-scoped selection independent of the root persona. `Session::set_mode(Some(name))` records `Entry::ModeChange`; selecting the same name is a no-op, and `set_mode(None)` exits. Neither call starts a run. Navigation and forks derive the selection from their selected journal path rather than carrying the current mode onto another branch. Reopening resolves the recorded name against the available definitions.
+Modes are a journal-derived, branch-scoped selection independent of the root persona. `Session::set_mode(Some(name))` records `Entry::ModeChange`; `set_mode(None)` exits. Neither call starts a run. Navigation and forks derive the selection from their selected journal path rather than carrying the current mode onto another branch. Reopening resolves the recorded name against the available definitions.
 
 The selected mode is exposed by `Session::mode`, `LiveSnapshot::mode: Option<String>`, and `SessionEvent::Mode { mode: Option<String> }`. Instructions and tool limits become effective at the next request boundary, so changing selection during a tool batch does not change that batch's permissions. `ToolScope::mode` and a tool-originated `SpawnContext::mode` expose the effective mode rather than a queued selection; a host spawn (`SpawnOrigin::Host`) applies the selected mode, so `set_mode` followed by `Session::spawn` on an idle session already restricts the child.
 
 Entry, switching, and exit are announced to the model through hidden, engine-owned `mode_notice` custom messages. Mode instructions do not replace the persona or rewrite the stable system prompt. Tool limits are execution gates for direct and routed calls, not merely catalog hints; they do not grant ordinary tools excluded by the persona. Mode `yield` remains available independently of the persona allowlist and is exempt from mode limits. Internal mode checks run before host tool policies, which still apply to `yield`.
 
-A mode's optional model selector uses the [model selector grammar](configuration.md#model-selectors), commits together with the mode change, and restores the pre-mode selection on exit unless an explicit model or thinking change intervened; see [Model restoration](sessions-and-compaction.md#model-restoration).
+A mode's optional model selector uses the [model selector grammar](configuration.md#model-selectors), commits together with the mode change, and restores the pre-mode selection on exit unless an explicit model, thinking, or tier change intervened; see [Model restoration](sessions-and-compaction.md#model-restoration).
 
 Children do not inherit mode identity or instructions and cannot select modes. A child spawned under a mode with tool limits records them in `SpawnLink::limits`; its descendants inherit that same ceiling regardless of depth. The ceiling filters the child's shaped tool list after its persona allowlist, also removing `kill` and `send` when not permitted, and is exposed to spawn hooks as `SpawnContext::limits`. Ending the parent's mode therefore does not relax an already-created child's limits.
 
@@ -278,7 +299,7 @@ Roots with loaded modes install the stable `call` dispatcher even when the defer
 | `TeamMemberRequest` | `name: String`, `agent: Option<String>`, `spec: Option<InlineSpec>`, `brief: Option<String>` | Ordered ad-hoc roster entry. Agent and spec are exclusive; neither means a plain delegate. The brief is standing instruction text, not the member's task |
 | `TeamHandle` | `team: String`, `members: Vec<(String, ChildHandle)>`; `fn receipt(&self) -> SpawnReceipt` | Per-parent team id (team_N) and member names with child handles in roster order. `receipt()` returns `SpawnReceipt::Team { team, jobs }`, matching tool details while retaining live handles |
 | `SpawnHook` | `async fn before_spawn(&self, spawn: &SpawnContext<'_>) -> SpawnDecision` | Ordered host policy, supplied as `SessionOptions::spawn_hooks: Vec<Arc<dyn SpawnHook>>` (empty by default), inherited by children |
-| `SpawnContext` | `spec`, `agent`, `mode: Option<&ModeSpec>`, `limits: &ToolLimits`, `bash: BashAccess`, `writes: Option<&WriteScope>`, `model`, `thinking`, `task`, `depth`, `parent_session_id`, `origin: &SpawnOrigin`, `team: Option<SpawnTeam<'_>>` | Borrowed normalized spec, optional catalog agent name, the parent's mode applied to this spawn (selected for host spawns, effective for tool spawns), the inherited tool ceiling the child will run under (the mode's limits at a root, the parent's own ceiling in a child), the bash ceiling recorded as `SpawnLink::bash` (the parent's effective access), the write-scope ceiling recorded as `SpawnLink::writes` (the parent's effective layers, using the mode applied to this spawn), resolved model/thinking, first prompt, child depth, parent id, requester and optional team identity |
+| `SpawnContext` | `spec`, `agent`, `mode: Option<&ModeSpec>`, `limits: &ToolLimits`, `bash: BashAccess`, `writes: Option<&WriteScope>`, `model`, `thinking`, `service_tier`, `task`, `depth`, `parent_session_id`, `origin: &SpawnOrigin`, `team: Option<SpawnTeam<'_>>` | Borrowed normalized spec, optional catalog agent name, the parent's mode applied to this spawn (selected for host spawns, effective for tool spawns), the inherited tool ceiling the child will run under (the mode's limits at a root, the parent's own ceiling in a child), the bash ceiling recorded as `SpawnLink::bash` (the parent's effective access), the write-scope ceiling recorded as `SpawnLink::writes` (the parent's effective layers, using the mode applied to this spawn), resolved model, thinking, and chosen tier, first prompt, child depth, parent id, requester and optional team identity |
 | `SpawnTeam` | `name: Option<&str>`, `member: &str` | Catalog team name (`None` for ad-hoc teams) and roster member name, supplied to hooks for each member |
 | `SpawnOrigin` | `Host`, `Tool { call_id: String }` | Distinguishes `Session::spawn` / `Session::spawn_team` from the model's `spawn` call, letting the same hook apply origin-specific policy |
 | `SpawnDecision` | `Allow`, `Block(String)`, `Replace(AgentSpec)` | The first block rejects the spawn. A replacement keeps its own output schema rather than reapplying the request's override; it is normalized, its schema checked, and its model cascade resolved again before the next hook. The catalog name stays unchanged |
@@ -346,7 +367,7 @@ A steer already queued when `ask` or a reviewed `yield` starts returns the same 
 
 ### `SessionEvent`
 
-Emitted by `attach().events` (`broadcast::Receiver<SessionEvent>`):
+Emitted by `attach().events` (`broadcast::Receiver<Arc<SessionEvent>>`; every receiver shares one allocation per event, so match through the `Arc`):
 
 | Variant | Fields | Meaning |
 | :--- | :--- | :--- |
@@ -377,12 +398,12 @@ For a promoted command, the stream reports the running row, then the finished/fa
 `bash` commands that move to the background become jobs `bg_N` (see [Background Jobs](prompts-and-context.md#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs)); spawned children have persistent rows `agent_N`. The model reaches both through `proc://`; hosts get the same state as data without parsing that text:
 
 - **State:** `Session::jobs()` returns `Vec<JobInfo>`, and `attach().live` carries the same list as `LiveSnapshot::jobs`.
-- **Spend and selection:** `LiveSnapshot::usage` is the session's own spend: `Entry::usage()` summed over its whole journal, across branches, including maintenance and failed responses, without counting `run_end` or `job_end` rollups again. `LiveSnapshot::tree_usage` (also `Session::tree_usage()`, kept current by `SessionEvent::TreeUsage { usage }`) adds every descendant's own spend, computed the same way from each child's journal, so it includes child compaction and branch summaries and grandchildren. Each child row's `JobKind::Child::tree_usage` is that child's subtree share. Do not total `Entry::JobEnd` usage for cost: it covers one child run's assistant messages only, excluding the child's maintenance and its descendants. The snapshot also carries the live `model`, `thinking`, and selected persona name in `agent`; getters expose the same current selection.
+- **Spend and selection:** `LiveSnapshot::usage` is the session's own spend: `Entry::usage()` summed over its whole journal, across branches, including maintenance and failed responses, without counting `run_end` or `job_end` rollups again. `LiveSnapshot::tree_usage` (also `Session::tree_usage()`, kept current by `SessionEvent::TreeUsage { usage }`) adds every descendant's own spend, computed the same way from each child's journal, so it includes child compaction and branch summaries and grandchildren. Each child row's `JobKind::Child::tree_usage` is that child's subtree share. Do not total `Entry::JobEnd` usage for cost: it covers one child run's assistant messages only, excluding the child's maintenance and its descendants. The snapshot also carries the live `model`, `thinking`, chosen `service_tier`, and selected persona name in `agent`; getters expose the same current selection.
 - **Changes:** each listed row that appears or changes emits `SessionEvent::Job(info)`, and a row leaving the list emits `SessionEvent::JobGone { id }`; upsert rows by `id` over the snapshot. Foreground commands that are never listed emit nothing.
 - **Stop:** `Session::kill_job(id)` returns `KillReceipt { id, stopping }`; the job outcome is then journaled and delivered normally. Commands record `CommandExit::Killed { by: Killer::Host }` and read `Command was stopped by the user`; model calls to `kill` record `Killer::Model` instead. Model `kill` and `send` serialize typed [coordination receipts](#coordination-receipts) into result details. `proc://` is read-only.
 - **Scheme text:** `session.schemes().read(&url).await` resolves file targets and reads them as UTF-8, while virtual targets use their handler. A missing file reports `{url} not found`; binary data reports `{url} is not UTF-8 text; resolve it and read the file`. Use `CommandOutput::read` for live command byte ranges, or resolve a file target and perform host file I/O.
 - **Replay:** `jobs_from_entries(&header, &entries)` reconstructs listed rows without opening a live session. Supply all raw entries, as returned by `Axo::open_session_read`, not just a projected branch. An unfinished command remains `Running`; replay does not reconcile it or invent live-only facts.
-- **Output:** `command_output(call_id)` returns a `CommandOutput` with `job()` (`bg_N`), `artifact()` (numeric artifact id), `progress()` (a watch receiver of `OutputProgress { bytes, done, capture_failed }`), and async `read(range: Range<u64>)` / `read_chunks(range: Range<u64>)`. Both ranges use byte offsets into the raw merged spool and clamp to its flushed prefix. `read_chunks` returns `Vec<OutputChunk>`, each with `stream: OutputStream` (`Stdout`, `Stderr`, or historical `Merged`) and `bytes: Vec<u8>`. Cross-pipe order is capture order, not guaranteed process-write chronology. `done` means capture ended, including retained helpers; `capture_failed` distinguishes incomplete capture. A held handle stays readable after foreground files are unlinked on Unix. No stdin or detach API is exposed; background commands die with their session.
+- **Output:** `command_output(call_id)` returns a `CommandOutput` with `job()` (`bg_N`), `artifact()` (numeric artifact id), `path()` (the raw log file), `progress()` (a watch receiver of `OutputProgress { bytes, done, capture_failed }`), and async `read(range: Range<u64>)` / `read_chunks(range: Range<u64>)`. Both ranges use byte offsets into the raw merged spool and clamp to its flushed prefix. `read_chunks` returns `Vec<OutputChunk>`, each with `stream: OutputStream` (`Stdout`, `Stderr`, or historical `Merged`) and `bytes: Vec<u8>`. Cross-pipe order is capture order, not guaranteed process-write chronology. `done` means capture ended, including retained helpers; `capture_failed` distinguishes incomplete capture. A held handle stays readable after foreground files are unlinked on Unix. No stdin or detach API is exposed; background commands die with their session.
 - **Retained output:** `CommandOutput::open(job: String, artifact: u64, path: impl AsRef<Path>) -> io::Result<Self>` opens a retained, closed, or copied raw log with its `<raw-log>.streams` sidecar. Raw `read` and model-facing artifacts remain merged bytes; the sidecar retains stream labels. Missing sidecars on older logs produce `Merged` chunks rather than invented labels. An indexed log without a terminal record reports incomplete capture. Forks snapshot both files for running commands instead of hard-linking mutable output.
 
 `JobInfo` (`axo::JobInfo`) has `id: String`, `status: JobStatus`, `call_id: Option<String>` (`None` for host-spawned children), `started_at: i64` (epoch milliseconds: command spawn or child admission time), `kind: JobKind`, and `messages: Vec<JobMessageInfo>`. Messages appear in sequence order with `id`, `note`, `is_error`, `partial`, `run_id`, and `delivery`. `MessageDelivery` is `Held`, `Writing` (journal write in flight), `Pending`, `Reserved`, or `Delivered`. Text, typed child result value, and per-run child usage remain in the corresponding `job_end` entry rather than the row; the row carries only the cumulative subtree total in `JobKind::Child::tree_usage`.
@@ -402,9 +423,9 @@ For a promoted command, the stream reports the running row, then the finished/fa
 
 ### File changes for hosts
 
-Every successful `write` or `edit` of a file target (plain path or file-backed scheme URL) records what it changed: its result `details` carry `ledger` (path, hash, access; see `FileLedger::restore`) and, unless the file already held the written bytes, `change: FileChange`. Both sides' raw bytes are stored as content-addressed blobs under `<session>/snapshots/<sha256>`, named by `FileLedger::hash` (43-character base64url SHA-256) and written read-only. `bash` writes and virtual scheme writes record nothing. Blobs are never pruned: compaction and `/shake` leave `snapshots/` alone, so changes stay reviewable for every turn of the file.
+A tool result can report multiple file accesses in `details.files`, even if the call failed. Each record has a `ledger` (absolute path, SHA-256 hash, and `read` or `modify` access; see `FileLedger::restore`). A write or edit that changes a file also includes a `change: FileChange` in that record. Both sides' raw bytes are stored as content-addressed blobs under `<session>/snapshots/<sha256>`, named by `FileLedger::hash` (43-character base64url SHA-256) and written read-only. `bash` writes and virtual scheme writes record nothing. Blobs are never pruned: compaction and `/shake` leave `snapshots/` alone, so changes stay reviewable for every turn of the file.
 
-`axo::file_change(&ToolResultMessage) -> Option<FileChange>` reads the record off a successful result. All types serialize in camelCase; `Option` fields are omitted when `None`.
+`axo::file_changes(&ToolResultMessage) -> Vec<FileChange>` returns the mutations in record order. `axo::file_records` includes reads and unchanged writes too. Both return an empty list for missing or invalid file records. All types serialize in camelCase; `Option` fields are omitted when `None`.
 
 | Type | Fields |
 | :--- | :--- |
@@ -442,15 +463,18 @@ Model `kill`, `send`, `wait`, and `spawn` results serialize the same public serd
 | :--- | :--- | :--- | :--- |
 | `compact` | `/compact [focus…]` | `WhenIdle` | `compact(focus)` |
 | `shake` | `/shake <elide\|images\|thinking>` | `WhenIdle` | `shake(mode)` |
-| `model` | `/model <selector>` | `Alongside` | Select a model and/or thinking level using the [model selector grammar](configuration.md#model-selectors) |
+| `model` | `/model <selector>` | `Alongside` | Select a model, thinking level, or service tier using the [model selector grammar](configuration.md#model-selectors) |
 | `thinking` | `/thinking <level>` | `Alongside` | `set_thinking(level)` |
+| `Command::Tier` | `/tier` followed by the tier name | `Alongside` | `set_service_tier` |
 | `navigate` | `/navigate <entry> [true\|false] [focus…]` | `WhenIdle` | `navigate(Some(entry), NavigateOptions { summarize, focus })`; focus requires `true` |
 | each skill | `/<name> <free text>` | `Queued` | Prompt text: expanded, then sent through whichever of `prompt`, `steer`, or `follow_up` the app used |
 | each mode | `/<name> [prompt…]` | `Alongside` | `Command::Mode { name, prompt }` selects the mode, then sends a nonblank optional prompt through `steer`; without a prompt it does not start a run |
+| each registered command | `/<name> [args…]` | `Alongside` | `Command::Registered { name, args }` awaits the host's `CommandHandler::run(session, args)` |
 
 - **Policies:** `Alongside` commands run during a turn or maintenance and take effect from the next request; `WhenIdle` commands return `Error::Busy` during a turn or maintenance.
-- **Typed commands:** use `Session::parse_command(text)` before prompting to recognize built-ins and this session's modes. `Command::parse(text)` remains a built-in-only parser. Both return `None` for unrecognized input; skills and unknown `/word`s stay prompt text. Built-in positional words map to schema properties in order, honoring single and double quotes; a final property with `"format": "text"` (the `focus` of `compact` and `navigate`) takes the remaining text verbatim and trimmed. Invalid arguments return `Error::InvalidCommand { command, message }`. Mode parsing takes the text after the mode name verbatim and trimmed, without quote decoding; blank text becomes `None`. `run_command` selects the mode before steering that text, which is persisted as a normal steering submission. A built-in command itself is never saved as a submission (though `compact` and summarizing `navigate` may request a model summary).
-- **Catalog JSON:** `CommandInfo` serializes as `{ "name", "description", "policy": "alongside" | "when_idle" | "queued", "kind": "builtin", "parameters" }`, `{ …, "kind": "mode", "argumentHint" }`, or `{ …, "kind": "skill", "argumentHint" }`. The Rust representation is `CommandInfo { name, description, policy: CommandPolicy, kind: CommandKind }`, with `CommandKind::Builtin { parameters: Value }`, `CommandKind::Mode { argument_hint: Option<String> }`, or `CommandKind::Skill { argument_hint: Option<String> }` (flattened into JSON as `kind`). Modes precede skills and hide same-name skills with a diagnostic. Hosts can construct `Command::Mode { name, prompt }` directly for a picker; `Command::decode(name, args)` validates built-in JSON arguments only (`null` counts as `{}`). Built-in `parameters` is an inlined JSON Schema object (draft 2020-12, no `$ref`, `$defs`, `$schema`, or `title`); `"format": "model"` and `"format": "entry"` suggest model and session-tree pickers, while `"format": "text"` marks free-form guidance.
+- **Typed commands:** use `Session::parse_command(text)` before prompting to recognize built-ins, this session's modes and its registered commands. `Command::parse(text)` remains a built-in-only parser. Both return `None` for unrecognized input; skills and unknown `/word`s stay prompt text. Built-in positional words map to schema properties in order, honoring single and double quotes; a final property with `"format": "text"` (the `focus` of `compact` and `navigate`) takes the remaining text verbatim and trimmed. Invalid arguments return `Error::InvalidCommand { command, message }`. Mode and registered-command parsing take the text after the name verbatim and trimmed, without quote decoding; blank mode text becomes `None`, blank registered-command text an empty `args`. `run_command` selects the mode before steering that text, which is persisted as a normal steering submission. A built-in or registered command itself is never saved as a submission (though `compact` and summarizing `navigate` may request a model summary).
+- **Registered commands:** hosts add `/name` commands through `SessionOptions::commands` or `Session::set_commands` as `RegisteredCommand { name, description, argument_hint, origin, handler: Arc<dyn CommandHandler> }`; `CommandHandler` has one method, `async fn run(&self, session: &Session, args: &str) -> Result<(), Error>`. Forks inherit the live list; children have none. A name that is empty or contains whitespace or `/` is ignored (`command name "<name>" is invalid; ignored`); `axo::valid_command_name` applies this rule. A built-in's or mode's name hides the command (`command "/<name>" from <origin> is hidden by the built-in /<name> command`, `… is hidden by the mode /<name>`); among duplicates the last registration wins at the first one's position (`command "/<name>" from <winner> replaces the one from <loser>`), where an unlabeled origin reads `the host`. A command hides a same-name skill with the skill's path diagnostic `skill name "<name>" is hidden by the command /<name>; the command catalog lists the command`. These diagnostics join `Session::diagnostics` at start and are returned by `set_commands` and `set_layer`, covering host and layer commands together.
+- **Catalog JSON:** `CommandInfo` serializes as `{ "name", "description", "policy": "alongside" | "when_idle" | "queued", "kind": "builtin", "parameters" }`, `{ …, "kind": "mode", "argumentHint" }`, `{ …, "kind": "registered", "argumentHint" }`, or `{ …, "kind": "skill", "argumentHint" }`. The Rust representation is `CommandInfo { name, description, policy: CommandPolicy, kind: CommandKind }`, with `CommandKind::Builtin { parameters: Value }`, `CommandKind::Mode { argument_hint: Option<String> }`, `CommandKind::Registered { argument_hint: Option<String> }`, or `CommandKind::Skill { argument_hint: Option<String> }` (flattened into JSON as `kind`). Modes precede registered commands, which precede skills; each hides same-name skills with a diagnostic. Hosts can construct `Command::Mode { name, prompt }` directly for a picker; `Command::decode(name, args)` validates built-in JSON arguments only (`null` counts as `{}`). Built-in `parameters` is an inlined JSON Schema object (draft 2020-12, no `$ref`, `$defs`, `$schema`, or `title`); `"format": "model"` and `"format": "entry"` suggest model and session-tree pickers, while `"format": "text"` marks free-form guidance.
 
 ## 3. Rust Extension Traits
 
@@ -458,11 +482,11 @@ Model `kill`, `send`, `wait`, and `spawn` results serialize the same public serd
 | :--- | :--- | :--- |
 | `ConfigSource` | `axo::ConfigSource` | Supplies configuration: `user()` returns the trusted `UserConfig` (sampled at every `create_session`, `open_session`, `Axo::schemes`, and `Axo::catalog`), `project(cwd)` the untrusted project `ConfigLayer` (called only at `Read` or `Trust`, and only when the user's `project.files.config` is `true`). axo validates, merges, and filters both through `EffectiveConfig::resolve`. Passed via `AxoBuilder::config`; without one, sessions use default settings and no project layer. See [Configuration source](configuration.md#configuration-source-axoconfigsource) |
 | `ExecEnv` | `axo::exec::ExecEnv` | Resolves the environment (`EnvMap`, optional `prompt_note`, optional one-time `notice`) for `bash` tool calls. Built-in implementations: `DevShellEnv` and `StaticEnv`; `StaticEnv::host()` snapshots the host environment. An `Arc<EnvMap>` converts to `Resolved` with no notice or prompt note. Passed via `SessionOptions::exec_env`. `DevShellEnv::new(base, settings, cache_dir: Option<PathBuf>, supervisor: Arc<ProcessSupervisor>)` runs its direnv, git, nix and capture subprocesses through that supervisor (a `None` `cache_dir` makes Nix mode resolve to `base`); `ExecEnv` only resolves the environment, and every command still runs supervised |
-| `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `fn name(&self) -> &str`, `async fn resolve(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<Target, ToolError>`, `async fn read(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<String, ToolError>`, `async fn write(&self, url: &SchemeUrl, content: &str, cx: &SchemeContext) -> Result<String, ToolError>`. Virtual writes store content so a later read returns it; the returned text is the tool result. Actions belong in tools, not scheme writes. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites whole-word, `--flag=`/`NAME=`, and redirect-target URLs to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it; defaults return `{url} cannot be read` / `{url} is read-only`). `edit`/`write` refuse non-writable files; bash refuses virtual URLs and output redirects onto read-only files. `SchemeUrl { scheme, path }` carries lowercase scheme and verbatim path; `SchemeContext { session_id, session_dir, cwd }` carries per-session facts. `prompt_doc` (default empty) is the one-line bullet in the model's `schemes` prompt section. Host names must match `^[a-z][a-z0-9+.-]+$`; `artifact`, `file`, and `tool` are reserved (`Error::Scheme`). `write_replay` defaults to `Replay::Never`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://` (with `AxoBuilder::cache_dir`), and in open sessions the read-only `proc://`, `agent://`, and `tool://`. Use `kill` and `send` for job control and agent messaging, and `call` for deferred tools. Passed via `SessionOptions::schemes`; a non-reserved matching host scheme replaces the built-in. Hosts resolve displayed URLs through `Session::schemes()` or `Axo::schemes(path, project_access, host_schemes)` |
+| `Scheme` | `axo::Scheme` | A URL scheme (`name://path`) the file tools accept as a path. `fn name(&self) -> &str`, `async fn resolve(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<Target, ToolError>`, `async fn read(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<String, ToolError>`, `async fn write(&self, url: &SchemeUrl, content: &str, cx: &SchemeContext) -> Result<String, ToolError>`. Virtual writes store content so a later read returns it; the returned text is the tool result. Actions belong in tools, not scheme writes. `resolve` maps a URL to `Target::File { path, writable }` (the normal file pipeline runs on it; bash rewrites whole-word, `--flag=`/`NAME=`, and redirect-target URLs to that path) or `Target::Virtual` (the scheme's own `read`/`write` handle it; defaults return `{url} cannot be read` / `{url} is read-only`). `edit`/`write` refuse non-writable files; bash refuses virtual URLs and output redirects onto read-only files. `SchemeUrl { scheme, path }` carries lowercase scheme and verbatim path; `SchemeContext { session_id, session_dir, cwd }` carries per-session facts. `prompt_doc` (default empty) is the one-line bullet in the model's `schemes` prompt section. Host names must match `^[a-z][a-z0-9+.-]+$`; `artifact`, `file`, and `tool` are reserved (`Error::Scheme`); `axo::valid_scheme_name` applies both rules. `write_replay` defaults to `Replay::Never`. Built-ins: `artifact://`, `skill://`, `local://`, `axo://` (with `AxoBuilder::cache_dir`), and in open sessions the read-only `proc://`, `agent://`, and `tool://`. Use `kill` and `send` for job control and agent messaging, and `call` for deferred tools. Passed via `SessionOptions::schemes` and replaced live by `Session::set_schemes`; a non-reserved matching host scheme replaces the built-in. Hosts resolve displayed URLs through `Session::schemes()` or `Axo::schemes(path, project_access, host_schemes)` |
 | `SessionStore` / `SessionWriter` | `axo::{SessionStore, SessionWriter}` | Pluggable persistence backend for creating, locking, reading (whole sessions or just the header), listing, and appending session entries. `SessionWriter::path` is known before the file exists; `append` must complete durable storage for `Entry::requires_sync` entries before returning, and `list(cwd)` must include child sessions with their `SessionInfo::spawn`, most recently modified first (`Axo::open_session` follows these to name a child's root). Bundled implementation: `JsonlStore`. Passed as the required `store` argument of `Axo::builder` |
 | `Tool` | `axo_agent::Tool` | Defines a tool (`name`, `description`, JSON Schema `parameters`, `execution_mode`, `replay`, `prompt_guidelines`, optional dispatcher `target`, and `execute(cx: ToolContext)`). `execution_mode` defaults to `Parallel`, `replay` to `Never`, `prompt_guidelines` to empty. Tools hold their own session handles; `cx` carries per-call state. Supply `HostTool` registrations through `SessionOptions::tools`; each wraps a `ToolFactory` and an `Exposure`. axo calls each factory with the session's `Arc<SessionTools>` again for each fork or child. A direct tool named like a built-in replaces it in place |
-| `ToolPolicy` | `axo::ToolPolicy` | Ordered host policy via `SessionOptions::tool_policies: Vec<Arc<dyn ToolPolicy>>` (empty by default, inherited by forks and children). Both callbacks receive `&ToolScope`, the call context, and a cancellation token. `ToolScope { session_id, depth, agent, mode, bash, writes }` identifies the session (root depth is zero), root persona or child spec, effective mode as `Option<Arc<ModeSpec>>`, not a selection awaiting the next request boundary, the effective `BashAccess` (`ReadOnly` when the agent, the effective mode, or the child ceiling declares it), and the effective write scope as `Option<WriteScope>` (`None` when unrestricted). Internal budget and mode checks precede host policies. `before_tool_call` receives `BeforeToolCallContext` and returns `ToolCallDecision`; the first `Block { reason, terminate }` or error blocks the call and skips later policies. `after_tool_call` receives `AfterToolCallContext` and returns optional `AfterToolCallResult` overrides; each policy sees prior overrides, and errors are logged and skipped |
-| `SpawnHook` | `axo::SpawnHook` | Child-creation policy via `SessionOptions::spawn_hooks`; returns `SpawnDecision` from the resolved `SpawnContext`. See [Spawning child sessions](#spawning-child-sessions) |
+| `ToolPolicy` | `axo::ToolPolicy` | Ordered host policy via `SessionOptions::tool_policies: Vec<Arc<dyn ToolPolicy>>` (empty by default; `Session::set_tool_policies` replaces the list for invocations that start afterwards; forks and children start with the session's current list). Both callbacks receive `&ToolScope`, the call context, and a cancellation token. `ToolScope { session_id, depth, agent, mode, bash, writes }` identifies the session (root depth is zero), root persona or child spec, effective mode as `Option<Arc<ModeSpec>>`, not a selection awaiting the next request boundary, the effective `BashAccess` (`ReadOnly` when the agent, the effective mode, or the child ceiling declares it), and the effective write scope as `Option<WriteScope>` (`None` when unrestricted). Internal budget and mode checks precede host policies. `before_tool_call` receives `BeforeToolCallContext` and returns `ToolCallDecision`; the first `Block { reason, terminate }` or error blocks the call and skips later policies. `after_tool_call` receives `AfterToolCallContext` and returns optional `AfterToolCallResult` overrides; each policy sees prior overrides, and errors are logged and skipped |
+| `SpawnHook` | `axo::SpawnHook` | Child-creation policy via `SessionOptions::spawn_hooks`, replaced live by `Session::set_spawn_hooks`; returns `SpawnDecision` from the resolved `SpawnContext`. See [Spawning child sessions](#spawning-child-sessions) |
 | `LoopHooks` | `axo_agent::LoopHooks` | The loop driver's contract, implemented internally by each `Session` (a private hooks object), not supplied through session options. `prepare_request(&AgentContext, cancel)` returns `Result<Option<Vec<AgentMessage>>, HookError>` to optionally replace messages (`AgentContext { messages, tools, deferred }` exposes both declared and deferred tool lists); `convert_to_llm` lowers `Custom` messages (default drops them); `should_skip_tools` intercepts unusable responses; `finish_turn` returns `TurnFinish { continue_turn: bool, messages: Option<Vec<AgentMessage>> }`; `prepare_next_turn` returns `Vec<AgentMessage>` appended with normal events and `MessageOrigin::Run`; `steering` supplies queued host input (see [Queued inputs and message origins](#queued-inputs-and-message-origins)). Model, thinking, and tools remain controlled through `Agent::set_model`, `Agent::set_thinking`, `Agent::set_tools`, and `Agent::set_deferred` |
 | `Persist` | `axo_agent::Persist` | The agent's only event sink: ordered, awaited `async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError>`; an error stops the run. `Session` uses it to persist `Entry::Message` on `MessageEnd { message, origin }` before the next request, maintain live run state, and relay session events. The agent has no broadcast or snapshot API; clients attach to `Session` |
 | `Streamer` | `axo_ai::Streamer` | Host streaming extension, injected via `AxoBuilder::streamer` for tests and custom transports. `Models` implements it with provider dispatch; `ScriptedApi` implements it behind the `testing` feature |
@@ -476,6 +500,8 @@ For deterministic streaming tests, `axo_ai::testing::ScriptedApi` records reques
 When driving `axo_agent::Agent` directly (or adding tools to a custom loop): build an `AgentConfig::new(streamer, model)` (defaults to `NoHooks`, no persist, one-at-a-time queues, thinking off), construct with `Agent::new(config)`, and interact via `prompt`, `steer`, `follow_up`, `continue_run`, `cancel(CancelReason)`, and `shutdown`. `Agent::set_tools` supplies directly declared tools; `Agent::set_deferred` supplies executable tools not initially declared to the model. Both apply from the next turn. Implement `axo_agent::Tool`:
 
 ```rust
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use axo_agent::{ExecutionMode, Replay, Tool, ToolContext, ToolError, ToolOutput, ToolUpdate};
 use axo_ai::{ToolCall, UserBlock};
@@ -519,8 +545,10 @@ impl Tool for PingTool {
         Replay::Safe
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use ping to check target reachability before opening a connection."]
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
+        const GUIDELINES: &[Cow<'static, str>] =
+            &[Cow::Borrowed("Use ping to check target reachability before opening a connection.")];
+        GUIDELINES
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -559,7 +587,7 @@ impl Tool for PingTool {
 
 ### Session tools and supervised subprocesses
 
-`SessionOptions::tools` and `Session::set_tools` accept `Vec<HostTool>`. Each `HostTool { factory, exposure }` wraps a `ToolFactory` (`Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>`) with `Exposure::Direct` or `Exposure::Deferred`; `HostTool::direct(factory)` and `HostTool::deferred(factory)` are convenience constructors. The factory receives the session's `SessionTools`:
+`SessionOptions::tools` and `Session::set_tools` accept `Vec<HostTool>`. Each `HostTool { factory, exposure, origin }` wraps a `ToolFactory` (`Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>`) with `Exposure::Direct` or `Exposure::Deferred`; `HostTool::direct(factory)` and `HostTool::deferred(factory)` are convenience constructors, and `HostTool::with_origin(label)` labels the registration for diagnostics and `SessionToolInfo::origin`. Direct host tools apply in order, a later one replacing an earlier one or a built-in of the same name; among deferred host tools of one name the later wins too. A replacement involving a labeled registration yields a diagnostic with the winner's origin: `tool "<name>" from <winner> replaces the built-in`, `tool "<name>" from <winner> replaces the one from <loser>`, and always for deferred duplicates `deferred tool "<name>" from <winner> replaces the one from <loser>` (an unlabeled origin reads `the host`). The factory receives the session's `SessionTools`, whose `session_id()` names the session it builds for:
 
 | Field or method | Type | Meaning |
 | :--- | :--- | :--- |
@@ -568,7 +596,7 @@ impl Tool for PingTool {
 | `ledger` | `FileLedger` | Content hashes of files this session has read or written (the stale-file guard) |
 | `snapshots` | `SnapshotStore` | Before/after bytes of this session's file mutations (`SnapshotStore::read`, `SnapshotStore::squash`) |
 | `context` | `NestedContext` | Nested project instructions attached once to file tool results |
-| `schemes` | `Schemes` | The session's scheme registry |
+| `schemes` | `Schemes` | The session's scheme registry; its host schemes follow `Session::set_schemes` |
 | `supervisor` | `Arc<ProcessSupervisor>` | Runs local commands in supervised containers, process groups or cgroup jobs per the host's `Supervision` (shared by every session of one `Axo`) |
 | `run_command` | `async fn run_command(&self, cx: ToolContext, request: CommandRequest) -> Result<ToolOutput, ToolError>` | Runs a supervised command with output capture, background promotion, retained helpers, and exactly-once result delivery; background jobs are listed by `Session::jobs` and `proc://` |
 | `locate` | `async fn locate(&self, path: &str) -> Result<Located, ToolError>` | Cleans and resolves a scheme URL or plain filesystem path into `Located::File { url, path, writable }` or `Located::Virtual { url }` |
@@ -576,12 +604,14 @@ impl Tool for PingTool {
 | `rewrite_urls` | `async fn rewrite_urls<'a>(&self, command: &'a str) -> Result<Cow<'a, str>, ToolError>` | Rewrites whole-word, `--flag=`/`NAME=`, and redirect-target scheme URLs in a shell command to file paths, matching `bash` |
 | `bash_access` | `fn bash_access(&self) -> BashAccess` | The session's current effective bash access, updated whenever its scope changes (persona, effective mode). Host tools that run commands can honor it by setting `ExecSpec::sandbox` the way `bash` does |
 | `write_scope` | `fn write_scope(&self) -> Option<WriteScope>` | The session's current effective [write scope](prompts-and-context.md#write-scope), updated whenever its scope changes; `None`: unrestricted |
-| `check_write` | `async fn check_write(&self, target: &Located) -> Result<(), ToolError>` | Refuses a located target not permitted by every write-scope layer; `write` and `edit` call it before accessing the target's contents, and host file-mutating tools must too |
-| `record_change` | `async fn record_change(&self, path: &Path, url: Option<&str>, before: Option<Vec<u8>>, after: Vec<u8>) -> Value` | Records a completed write of `after` to `path`: updates the ledger, stores both sides as snapshot blobs, and returns the tool result `details` (`ledger`, plus `change` when the bytes differ). `before` is the content read under the same `lock_file` guard, `None` for a new file |
+| `check_write` | `async fn check_write(&self, target: &Located) -> Result<(), ToolError>` | Refuses a located target not permitted by every write-scope layer; `write_file` checks this before accessing the target's contents |
+| `read_file` | `async fn read_file(&self, cancel: &CancellationToken, path: &str) -> Result<FileRead, ToolError>` | Returns a file's bytes and record, or the text of a virtual URL |
+| `write_file` | `async fn write_file(&self, cancel: &CancellationToken, path: &str, write: FileWrite<'_>) -> Result<(Written, String), ToolError>` | Replaces bytes or applies an edit under the file lock; returns the file record or virtual scheme's response, and the path shown to the caller |
 
 `axo::tools::CommandRequest` has `spec: ExecSpec`, `label: String` (the command shown in job listings), `timeout: Option<Duration>` (no default deadline), and `run_async: bool` (promote immediately). The runner applies the non-interactive environment overlay and, when `bash.ci` is enabled, `CI=true` after the environment supplied in `spec`. Output is spooled as `<n>.<tool>.<escaped call id>.log`, using `ToolContext::call` for the tool name and call id.
 
-File-mutating host tools must follow the same invariants as built-ins: resolve targets with `SessionTools::locate` (`Located::File { url, path, writable }` or `Located::Virtual { url }`; plain filesystem paths have no URL and are writable), refuse targets outside the write scope with `SessionTools::check_write`, verify `writable`, hold `axo::tools::lock_file(path)` throughout the read-modify-write cycle, check existing bytes with `FileLedger::check_fresh` on `SessionTools::ledger`, and, still holding the lock after a successful write, call `SessionTools::record_change(path, url, before, after)` and return its value as `ToolOutput::details`, so `FileLedger::restore` can rebuild the ledger on reopen and navigation and hosts see the [file change](#file-changes-for-hosts). Read-only tools record with `ledger.record(path, bytes, FileAccess::Read)` and return `{"ledger": record}`.
+Host tools should use `SessionTools::read_file` and `SessionTools::write_file` for file access. The write helper resolves the target, checks the write scope and freshness, and records the result while holding the mutation lock. Collect the returned file records in access order and use `axo::file_details(&records)` for `ToolOutput::details`, so `FileLedger::restore` can rebuild the ledger on reopen and navigation and hosts can review the [file changes](#file-changes-for-hosts). Virtual targets do not produce file records.
+
 Host tools that run commands should use `SessionTools::run_command` to share `bash`'s job lifecycle. All subprocesses must go through the session's `ProcessSupervisor`, directly or via this runner, never `std::process::Command`/`tokio::process::Command` directly, so descendants stay contained to the extent the selected supervision mode tracks them:
 
 ```rust
@@ -666,3 +696,371 @@ Commands run through `SessionTools::run_command` have the same background behavi
 | `Run` | Everything else: assistant replies, tool-change declarations, messages returned by `prepare_next_turn`, and synthetic tool results (blocked, failed-preparation, unanswered, or aborted before they started) |
 
 An executed result keeps its `Tool` origin exactly when it is the result persisted. `Session`'s `Persist` maps `Input(Some(id))` to the submission id (or, for a job delivery message, to the jobs it delivers) and `Tool(invocation)` to the jobs that call delivered or started, so receipts never depend on comparing message text (see [Background Job Durability](sessions-and-compaction.md#background-job-durability)).
+
+## 4. Bun extensions (`axo-extensions`)
+
+Trusted TypeScript/JavaScript packages can contribute providers, tools, policies, spawn hooks, URL schemes, prompt sections, definitions, and commands through supervised Bun runners. Declarations come from `extension.json`; the default export binds handlers. The bridge uses the same Rust session and provider APIs a host can call. Inference HTTP and SSE still belong to the Rust adapters, even when an extension rewrites the request. axo installs a package's npm dependencies with the host's Bun and manages a store of installed packages, but never downloads a package itself (see [Packaging and install](#packaging-and-install)).
+
+### Host setup and lifecycle
+
+`Extensions::new(axo, options)` takes the host's `Arc<Axo>` and `ExtensionOptions`. Runners use that host's model registry and process supervisor. Construction does no I/O. The example uses `rust,ignore` because `axo`'s own doctests cannot link `axo-extensions`:
+
+```rust,ignore
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axo::{Axo, EffectiveConfig, EnvMap, JsonlStore, ProjectAccess, SessionOptions};
+use axo_ai::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
+use axo_extensions::{ExtensionEvent, ExtensionOptions, Extensions};
+use tokio::sync::broadcast::error::RecvError;
+
+let state = PathBuf::from("/var/lib/my-host");
+let models = Arc::new(
+    Models::load(ModelsOptions {
+        http_client: None,
+        cache_dir: Some(state.join("cache")),
+        extended_context: false,
+        config: ModelsConfig::default(),
+        credentials: Arc::new(FileCredentialStore::new(state.join("credentials.json"))),
+    })
+    .await?,
+);
+let axo = Arc::new(Axo::builder(models, Arc::new(JsonlStore::new(state.join("sessions"))))
+    .config(Arc::new(HostConfig))
+    .build());
+
+let extensions = Extensions::new(
+    Arc::clone(&axo),
+    ExtensionOptions {
+        // Absolute paths only; `None` leaves every extension `Unavailable`.
+        bun: Some(PathBuf::from("/opt/bun/bin/bun")),
+        roots: vec![state.join("extensions")],
+        // Installed (`publisher/name`) extensions live here; `None` disables installs.
+        store: Some(state.join("extension-store")),
+        // Authored packages run `bun install` on their own when their dependencies are stale.
+        auto_install: true,
+        data_root: state.join("extension-data"),
+        // Keep it short: `<runtime_dir>/<private dir>/rpc` must fit a Unix socket path.
+        runtime_dir: PathBuf::from("/run/my-host"),
+        // The runner's whole environment; nothing is inherited.
+        env: Arc::new(EnvMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), state.join("extension-home").into_os_string()),
+        ])),
+    },
+);
+
+// Subscribe first so the initial reconciliation's events are seen.
+let mut events = extensions.subscribe();
+// `extensions` is user-only, so resolving at `Ignore` reads no project.
+let settings = EffectiveConfig::resolve(&HostConfig, &state, Some(ProjectAccess::Ignore))?.settings;
+extensions.configure(&settings.extensions).await?;
+// Use the composed options on create or reopen, then attach the resulting session.
+let options = extensions.compose(SessionOptions {
+    cwd: state.clone(),
+    ..SessionOptions::default()
+});
+let session = Arc::new(axo.create_session(options).await?);
+extensions.attach(&session).await;
+// The host's own registrations stay the host's to change while attached.
+session.set_sections(vec![("host_context".into(), Some("Running inside my-host.".into()))]).await?;
+
+let snapshot = (extensions.status(), extensions.collisions(), extensions.diagnostics());
+tokio::spawn(async move {
+    loop {
+        match events.recv().await {
+            Ok(ExtensionEvent::StateChanged(status)) => { /* id, group, generation, phase, reason */ }
+            Ok(ExtensionEvent::Shadowed { provider, winner, hidden }) => {}
+            Ok(ExtensionEvent::Diagnostic(diagnostic)) => {}
+            Ok(ExtensionEvent::SessionDiagnostic { session, message }) => {}
+            // Missed events: reread the snapshots, including session_diagnostics(id).
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => break,
+        }
+    }
+});
+
+// A fork keeps the host registrations and the extension layer apart: attach it too.
+// let fork = Arc::new(session.fork(&entry_id).await?.session); extensions.attach(&fork).await;
+// Reopen uses open_session with freshly composed options; attach it again afterward.
+
+extensions.shutdown().await;
+```
+
+| Item | Signature | Behavior |
+| :--- | :--- | :--- |
+| `ExtensionOptions` | `bun: Option<PathBuf>`, `roots: Vec<PathBuf>`, `data_root: PathBuf`, `runtime_dir: PathBuf`, `env: Arc<EnvMap>`, `store: Option<PathBuf>`, `auto_install: bool` | Host choices, all absolute paths. Package roots are searched in order for authored extensions; `store` holds installed ones (`None` leaves every `publisher/name` extension `Unavailable` and fails every install call); `ExtensionOptions::data_dir(id)` names each extension's data directory: `<data_root>/<id>` for an authored extension, `<data_root>/@installed/<publisher>/<name>` for an installed one (`@` cannot start an ID, so neither nests inside the other); each runner generation gets a private directory under `runtime_dir`; `env` is the runner's complete environment (plus the bridge's own variables), and also the environment of every `bun install`. `auto_install` lets axo install authored dependencies on its own. Nothing is discovered from the working directory, `PATH`, project layers, or home directories. To change options, build a new manager and `shutdown` the old one |
+| `Extensions::configure` | `async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError>` | Validates options and the enabled list, rescans packages, replaces the provider layer, and reapplies the session layer to attached root sessions when the declared contributions changed. Does not eagerly start runners. Package failures go to `status`; invalid host inputs return `Err` without changing the configuration. Call it after list or manifest changes; use `reload` for code-only changes. Serialized with `retry`, `reload` and `shutdown`, and completed even if the caller's future is dropped |
+| `Extensions::status` | `fn status(&self) -> Vec<ExtensionStatus>` | One `ExtensionStatus { id, group, generation, phase, reason }` per enabled extension, in enabled order, including shadowed ones. `reason` is a safe, human-readable string |
+| `Extensions::collisions` | `fn collisions(&self) -> Vec<ProviderCollision>` | Every `ProviderCollision { provider, winner, hidden }`: `winner` is an extension ID; `hidden` is `Hidden::Extension(id)` for a shadowed extension or `Hidden::Host(ProviderOrigin)` for a host contributor: `Layer` (an older provider layer), `Registered` (a `Models::register` provider), or `Loaded` (the loaded catalog). A snapshot from the last `configure`, `retry` or `reload`; later registry changes and newer provider layers are not reflected until the next one |
+| `Extensions::diagnostics` | `fn diagnostics(&self) -> Vec<ExtensionDiagnostic>` | Non-fatal discovery findings and scheme or section collisions between extensions, each with the extension ID and message |
+| `Extensions::subscribe` | `fn subscribe(&self) -> broadcast::Receiver<ExtensionEvent>` | Committed state changes, provider collisions, discovery and session diagnostics. After `RecvError::Lagged`, reread `status`, `collisions`, `diagnostics`, and any affected session's `session_diagnostics` |
+| `Extensions::retry` | `async fn retry(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then re-arms `id` if it is load-disabled or its placement is `Disabled` or `Unavailable`: a load-disabled member is reloaded alone (its group peers keep their own load failures, and the shared process is recycled), and a placement disabled by its crash budget restarts cold with a fresh budget. A failed dependency install is attempted again. `BridgeError::UnknownExtension` for an ID that is not enabled; `ShutDown` after shutdown |
+| `Extensions::reload` | `async fn reload(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the next callback imports the package's current code, whatever its phase. Group peers share the runner and are recycled with it; their own load failures are kept, `id`'s is cleared, and a failed dependency install is attempted again. Same errors as `retry` |
+| `Extensions::install_dependencies` | `async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError>` | Runs `bun install` for enabled authored extension `id` now, even after a failed install of the same files, then reloads it. The path when `auto_install` is off. `UnknownExtension` for an ID that is not an enabled authored extension; `BridgeError::DependencyInstall` with Bun's output when the install fails |
+| `Extensions::install` | `async fn install(&self, source: &Path, origin: &str, replace_origin: bool) -> Result<InstalledExtension, InstallError>` | Installs or updates the package folder `source` into the store; see [Installed extensions](#installed-extensions). Does not enable it |
+| `Extensions::rollback` | `async fn rollback(&self, id: &str) -> Result<InstalledExtension, InstallError>` | Swaps installed `id`'s current and previous versions (a second rollback goes forward again) and reloads it if enabled. `NotInstalled`, `NoPrevious` |
+| `Extensions::uninstall` | `async fn uninstall(&self, id: &str, delete_data: bool) -> Result<(), InstallError>` | Deletes installed `id`'s package and previous version; refuses while it is enabled (`Enabled`). `delete_data` also deletes its data directory `<data_root>/@installed/<publisher>/<name>`; files the extension wrote anywhere else are untouched, since that directory is a convention, not a sandbox |
+| `Extensions::installed` | `async fn installed(&self) -> Result<Vec<InstalledExtension>, InstallError>` | Every `InstalledExtension { id, origin, has_previous }` in the store, sorted by ID; unreadable records are skipped |
+| `Extensions::memory` | `async fn memory(&self) -> Vec<RunnerMemory>` | One `RunnerMemory { members, group, pss_bytes }` per live runner, in the enabled order of its first member: the proportional set size summed over the runner's process group or cgroup. Never split among the members of a shared runner; a runner whose memory cannot be read is omitted. Read on demand; there is no memory cap |
+| `Extensions::shutdown` | `async fn shutdown(&self)` | Closes admission, empties the extension layer of attached root sessions (their host registrations are untouched), removes the manager's providers, and kills and reaps the runners. Idempotent. Dropping the manager tears down runners without waiting; use explicit shutdown to clear the layers and wait for reaping |
+
+Await the first `configure` before composing session options or selecting extension models. Listing providers, composing options, and creating or reopening a session do not require a running Bun process. The first callback starts it, including the first subscribed journal entry after attachment.
+
+Extensions can use `ctx.host` to list or read saved sessions, read snapshots, resolve a catalog, and run parsing and projection helpers. Creating, opening, forking and closing sessions go through the host instead: install a `Lifecycle` with `Extensions::set_lifecycle` to serve those four calls. The hook composes options on create/open, keeps returned sessions alive, updates the host UI, and shuts down and releases closed sessions. The bridge attaches each returned session before replying and detaches it after a successful close. Without a hook, these four calls reject with `no_lifecycle`; the other host methods still work.
+
+Use `ctx.models` to find models, inspect credential sources without retrieving secrets, estimate tokens, or request a completion outside a session. A `CompletionRequest` names a model by `provider/id` or `@role` and supplies its messages. Optional thinking and service tier suffixes follow the [model selector grammar](configuration.md#model-selectors); explicit `thinking` and `serviceTier` fields override their respective suffixes. Without a tier from either source the request uses standard. `await ctx.models.complete(request)` returns the final assistant message; `await ctx.models.stream(request, listener)` delivers assistant events followed by a `closed` event on normal completion. Call `await subscription.close()` on the returned subscription to stop early. See the [extension API reference](extension-api.md) for the full method list and withheld methods.
+
+### Session composition
+
+- `Extensions::compose(options) -> SessionOptions` replaces `SessionOptions::layer` with the enabled extensions’ registrations, including definitions. It leaves the host’s own registrations unchanged, does no I/O and starts no runner.
+- `Extensions::attach(&session)` tracks a live `Arc<Session>` weakly for actions and events. For a root it applies the current contributions once through `Session::set_layer`, even if unchanged, since a `configure` may have run since `compose`; later reconciliation (`configure`, `retry`, `reload`) reapplies only when the declared contributions differ, and `shutdown` always does. The bridge never touches the host lists, so the host's own setters (`set_tools`, `set_sections`, `set_tool_policies`, …) stay usable while attached, and the layer keeps following whatever the host sets. A fork starts with the parent's host lists and layer kept apart; attach it to keep its layer current. An attached spawned child gets actions and events only: it starts with its parent's host and layer entries joined as its own, keeps them for life, and has no command catalog. `Extensions::detach` stops tracking by ID and leaves the registrations as they are.
+- Host tools, schemes, sections, and registered commands are followed by extension entries in enabled order. Later entries win within the applicable registration class; direct tools take precedence over deferred tools of the same name. Built-in commands and modes still outrank registered commands, which outrank skills. Policies and spawn hooks run in order, host entries first, rather than replacing each other. Diagnostics produced by a live application, including `cannot apply extensions: <error>` when `set_layer` rejects the layer and the session keeps its previous one, are available through `Extensions::session_diagnostics` and `ExtensionEvent::SessionDiagnostic`.
+- Enabling, disabling or changing an extension’s definitions updates attached roots on reconciliation. The last-enabled extension is first within the layer (see [Live definitions](#live-definitions)). At startup, definition collisions and invalid teams appear in `Session::diagnostics`; live findings are delivered through `ExtensionEvent::SessionDiagnostic`. Running children keep their snapshots, but extension handlers resolve the current runner on each invocation.
+
+### Packages and manifests
+
+For each enabled ID, and only those, the manager reads the package's `extension.json`. An authored (plain) ID is read from `<root>/<id>/extension.json` in the first root in `roots` order where that path exists; a later copy is ignored with an `ExtensionDiagnostic`, and a first copy that exists but cannot be read still claims the slot rather than falling through to a later root. An installed (`publisher/name`) ID is read from the store's current version folder; without a `store` or an install record it is `Unavailable`. The manifest is UTF-8 JSON, unknown fields are rejected, and nothing is executed to read it:
+
+```json
+{
+  "id": "lab-provider",
+  "entry": "index.ts",
+  "providers": [
+    {
+      "id": "lab",
+      "models": [
+        {
+          "id": "m",
+          "name": "Lab model",
+          "api": "openai-completions",
+          "provider": "lab",
+          "baseUrl": "http://127.0.0.1:8080/v1",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 128000,
+          "maxTokens": 8192
+        }
+      ],
+      "env": [],
+      "requiresKey": true,
+      "login": true,
+      "rewrite": true
+    }
+  ]
+}
+```
+
+- **`id`** must equal the extension ID it is enabled under: the directory name for an authored package, `publisher/name` for an installed one. **`entry`** is a package-relative regular file that must resolve inside the package; the package directory itself may be a host-made symlink, but the entry may not escape it. This is discovery hygiene, not a sandbox.
+- **`sdk`** names the extension SDK version the package was built against (`SDK_VERSION`, currently `0.0.0`, the version of `@axo/extension-sdk`). It must be caret-compatible: the same major above 0, else the same minor above 0, else the same version. A mismatch is not admitted, naming both versions. Optional for authored packages (absent means no check), required for installed ones.
+- **Providers:** `models` use the `axo_ai::Model` JSON shape (`thinkingLevelMap` and `compat` optional), each naming its enclosing provider, and are checked by the same validation as `Models::register`. `env` defaults to `[]`, `requiresKey` to `true`, and `login` and `rewrite` to `false`. Provider IDs follow the registry rules and may not repeat within a manifest. `login: true` makes `Models::login` available and routes OAuth refreshes to the extension; `rewrite: true` routes every inference request's `ProviderRequest` through it. Credentials are stored and selected by `Models` exactly as for Rust providers.
+- **Session declarations** are optional, as is `providers`. See the session manifest example below.
+- **Not admitted:** a missing, unreadable, or invalid manifest on first sight leaves the extension `Unavailable`; it claims no provider or session surface.
+- **Admitted but not runnable:** an unusable Bun or entry leaves the static declarations composed. Providers and remote tools, schemes, and commands fail naming the extension; its tool policy blocks every tool call and its spawn hook blocks every spawn instead of silently bypassing either. Bun is checked each time the manager reconciles.
+- **Removed on purpose:** policies and spawn hooks outlive their extension wherever the bridge does not reapply: spawned children, detached or never-attached sessions, and every session after `shutdown` or after the manager is dropped. Once the extension is no longer enabled or its manager is shut down, nothing can answer, so a retained tool policy allows every call and leaves results unchanged, and a retained spawn hook allows every spawn. Retained remote tools, schemes and commands still fail naming the extension (`Failure::Removed` for commands). Removal is not unavailability: a crashed, disabled, unrunnable or unadmitted extension that is still enabled keeps failing closed.
+- **Failed rescans:** a previously admitted package retains its last accepted declarations in memory, unavailable. A broken refresh does not reveal what the package hid; a fresh host has no cached declarations.
+
+```json
+{
+  "id": "lab-session",
+  "entry": "index.ts",
+  "tools": [
+    {
+      "name": "echo",
+      "description": "Echo arguments",
+      "parameters": { "type": "object" },
+      "exposure": "direct",
+      "replay": "never",
+      "executionMode": "parallel",
+      "guidelines": []
+    }
+  ],
+  "schemes": [{ "name": "lab", "promptDoc": "Lab resources", "writeReplay": "never" }],
+  "commands": [{ "name": "hello", "description": "Queue a greeting", "argumentHint": "text" }],
+  "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
+  "definitions": { "agents": "agents", "modes": "modes", "keywords": "keywords", "skills": "skills" },
+  "toolPolicy": [],
+  "spawnHook": false,
+  "events": false
+}
+```
+
+- Tool names are 1–64 ASCII letters, digits, underscores, or hyphens; `call` and `yield` are reserved. Tool `parameters` must be a JSON object with type `"object"`. The defaults shown above also allow `deferred`, `safe`, and `sequential`, respectively. Replay is a static promise read during crash recovery; it does not retry a lost runner call automatically.
+- Scheme and section names follow `valid_scheme_name` and `valid_section_name`. Scheme docs default to empty and `writeReplay` can also be `safe`. Command names must be nonempty and contain neither whitespace nor `/`. A manifest cannot repeat a tool, scheme, command, or section name.
+- `toolPolicy` lists the policy hooks the extension implements, a subset of `["before", "after"]` without repeats; empty (the default) registers no policy. Only declared hooks are called: a `["before"]` policy never sees results.
+- Section files are read as UTF-8; definition directories use the Rust loaders. These paths must be readable and resolve inside the package. The agents directory supplies both agents and teams; the skills directory contains skill folders with a `SKILL.md` and any reference files.
+
+### Packaging and install
+
+Location decides the kind of extension. An **authored** extension, written by the user or a repo, lives under a host root and has a plain ID (`[a-z0-9][a-z0-9._-]*`). An **installed** extension is placed by `Extensions::install` in the managed `store` and has a `publisher/name` ID, each part following the plain-ID rule. An ID with a `/` is looked up only in the store, one without only in the roots, so the two never collide. Settings enable both kinds the same way.
+
+#### Authored extensions
+
+An enabled authored package whose `package.json` declares `dependencies`, `devDependencies` or `optionalDependencies` installs them itself. The stamp `node_modules/.axo-install` records a SHA-256 of `package.json` and `bun.lock`; when it is missing or differs, `configure` (or `retry`/`reload`) starts `bun install` in the package folder in the background, under the host's `ProcessSupervisor` with `ExtensionOptions::env`, and returns without waiting. A package without dependencies never installs, and only enabled packages are looked at.
+
+- **Calls wait.** A callback arriving during the install waits for it before the runner starts; status shows `Installing`. A runner that was already live is reloaded when the install finishes, so a call in flight on it fails once.
+- **No lockfile required.** It is a plain `bun install`, exactly as run by hand: it creates `bun.lock` when absent (which the stamp then covers) and runs lifecycle scripts.
+- **Failure.** The extension shows `Disabled` with `bun install failed (<exit status>): <the end of Bun's stderr>`, and its callbacks fail with that reason. The same files are not reinstalled on later rescans or calls; `retry`, `reload`, or a change to `package.json`/`bun.lock` tries again. Installs time out after 10 minutes.
+- **Manual mode.** With `auto_install: false`, a stale package is `Unavailable` ("dependencies are not installed") until the host calls `Extensions::install_dependencies`.
+
+#### Installed extensions
+
+The host acquires a package into any local folder (axo never downloads one) and passes it with an origin string to `Extensions::install(source, origin, replace_origin)`, which covers first install and update:
+
+1. Reads `id` and `sdk` from `<source>/extension.json`: the ID must be `publisher/name` and the SDK declared and compatible.
+2. Refuses an update whose origin differs from the recorded one unless `replace_origin` is set; the record then takes the new origin.
+3. Copies `source` into a fresh version folder, skipping a top-level `node_modules` and `.git`, recreating symlinks as symlinks and refusing other special files, then validates the manifest and entry as discovery would.
+4. When `package.json` declares dependencies, requires `bun.lock` and runs `bun install --frozen-lockfile` there. Lifecycle scripts run.
+5. Only then rewrites the record, keeps the replaced version as the one previous copy (deleting the older one), and reloads the extension if it is enabled: its in-flight calls, and those of group peers sharing its runner, fail and are not replayed.
+
+Any failure leaves the record and the running version untouched and deletes the new folder. One install, rollback or uninstall runs per extension at a time. The store layout is:
+
+```text
+<store>/<publisher>/<name>/install.json   { "origin", "current", "previous" }
+<store>/<publisher>/<name>/v-XXXXXX/      one folder per version
+```
+
+Renaming a new `install.json` into place is the only switch, so it is atomic, and a running runner keeps reading its own version folder until it is reloaded.
+
+| `InstallError` | When |
+| :--- | :--- |
+| `NoStore` | `ExtensionOptions::store` is `None` |
+| `Bun` | Bun is missing or not executable |
+| `Busy` | Another install, rollback or uninstall of that extension is running |
+| `InvalidPackage` | Unreadable or invalid manifest, an ID that is not `publisher/name`, no `sdk`, an invalid entry, or an unsupported file type |
+| `SdkMismatch` | `sdk` is incompatible with `SDK_VERSION`; names both versions |
+| `MissingLockfile` | Dependencies declared but no `bun.lock` |
+| `OriginChanged` | An update from another origin without `replace_origin` |
+| `InstallFailed` | `bun install --frozen-lockfile` failed; carries its exit status and the end of its stderr |
+| `Enabled`, `NotInstalled`, `NoPrevious` | `uninstall` of an enabled extension; no record; `rollback` with no previous version |
+| `Io`, `ShutDown` | A filesystem error; the manager is shut down |
+
+#### Pre-bundled packages
+
+A single file built with `bun build --target=bun --outfile=<package>/index.js <source entry>` has no external imports left and loads as an `entry` with no `package.json`, `node_modules` or install. Native `.node` and `.wasm` assets must ship beside the bundle.
+
+### Winners, collisions and unavailability
+
+For each provider ID the **last enabled extension declaring it wins**. The manager owns one `ProviderLayer`, newer than any created before it, so a winning extension provider hides a `Models::register` provider and the loaded catalog provider of the same ID (and older layers). Hidden providers are untouched and reappear exactly when the winner goes away: removing the extension from the list, a changed valid declaration, a reorder, or `shutdown`. A failing or crashed winner stays the winner; the hidden provider is never used as a fallback.
+
+While an extension is `Disabled` or `Unavailable`, its providers stay in `Models::find`, `Models::all`, and `Models::providers` (with their declared login capability), but `Models::login`, `Models::auth`, and requests fail with `Error::ProviderUnavailable` before credential lookup, naming the extension and group; see [Unavailable providers](configuration.md#runtime-providers-login-and-reload). Callbacks also fail during restart or shutdown; during first startup they wait for activation.
+
+`configure` keeps a placement, its live runner, and its crash budget when its members and declarations are unchanged; a priority-only reorder changes only the activation order for later generations. A placement whose setup failed (`Unavailable`) is rebuilt cold instead, so corrected host inputs are re-checked; its members' load failures carry over. Changing a placement's members, an entry, or a declaration replaces it: the old runner's pending callbacks fail before the new providers are published, and an old provider handle that a request still holds fails at once instead of reaching the new winner. A provider that loses its winner is retired the same way even when its runner keeps serving other providers.
+
+### Trust boundary
+
+- **Who enables code:** only the user-only `extensions` setting (or a typed list from the host) enables an extension, and only packages under host-supplied `roots` or in the host-supplied `store` can load. Dependencies install only for enabled extensions, so a repo's extension runs `bun install` only once the user enables it. Project layers cannot enable, reorder, or group extensions at any access level (see [Extensions](configuration.md#extensions-extensions--axoenabledextension)). A host that wants project-provided extensions must authorize those roots itself; a session's discovered project files are never published as global providers.
+- **What runs:** extensions are trusted code. The runner is an ordinary OS process with the host user's rights and the `ExtensionOptions::env` environment, started without a sandbox (`ExecSpec::sandbox` is `None`); it may read files and use the network like any program. The data directory (`ExtensionOptions::data_dir`) is created (mode `0700` when new) before activation and passed to the extension as `dataDir`; it is a convenience, not isolation.
+- **No acquisition:** axo never downloads Bun, the SDK, or packages: the host hands `Extensions::install` a local folder. Dependency installs run the host's Bun with `ExtensionOptions::env`, so they reach whatever registry that environment configures, and run lifecycle scripts. Each runner directory carries a `bunfig.toml` with `install.auto = "disable"`, so importing a package that is not already installed fails activation instead of fetching it. An extension may still make its own network calls.
+- **Secrets:** the bridge writes its socket path, a random per-generation nonce, and the generation number into the runner environment (`AXO_EXTENSION_SOCKET`, `AXO_EXTENSION_NONCE`, `AXO_EXTENSION_GENERATION`); the runner deletes them from its environment before importing extension code. Credentials never appear on a command line. Runner stdout and stderr are drained and discarded. Error messages name the extension, provider, and method; they never include tokens, headers, request bodies, prompt answers, or author exception text. The one exception is a failed dependency install, whose reason carries the end of Bun's stderr, including any output of the package's lifecycle scripts.
+
+### Runners and supervision
+
+Extensions are placed per **placement**: an ungrouped extension gets its own runner; all members of a `group` share one. One lifecycle owner per placement starts, watches, restarts, and disables its runner.
+
+| `ExtensionPhase` | Meaning |
+| :--- | :--- |
+| `Cold` | Declarations published; no runner yet, or none needed since every member of the placement failed to load (those members show `Disabled`) |
+| `Installing` | An authored package's dependencies are being installed; callbacks wait for the install |
+| `Starting` | The first callback is starting a runner; callers arriving meanwhile share the same startup outcome |
+| `Ready` | The runner answered its handshake and the member activated |
+| `Restarting` | The runner failed and a new generation is starting immediately; callbacks arriving meanwhile fail |
+| `Disabled` | The member's own import or activation failed, its dependency install failed, or the placement spent its crash budget. Stays so until `retry` or `reload`, or until the member is removed and re-enabled (a failed install also retries when `package.json` or `bun.lock` changes) |
+| `Unavailable` | Cannot run: not admitted, no or unusable Bun, an entry that failed discovery, or a host/filesystem setup failure such as an overlong socket path. No automatic retry; the next `configure`, `retry` or `reload` re-checks |
+
+- **Start:** each generation gets a fresh private directory below `runtime_dir` (mode `0700`) holding the runner source embedded in the crate, `bunfig.toml`, and the listening socket `rpc`, bound before spawn. The supervisor runs `<bun> run <dir>/runner.ts` with that directory as working directory and no shell. The runner must connect and present the nonce within 15 s; the listener is then closed and the socket path removed. The directory is removed when the generation ends. The socket path is limited to 107 bytes.
+- **Activation:** members activate one at a time in enabled order, each with its own 15 s deadline. The runner imports the entry by file URL and calls its default export with `{ id, dataDir, session, host, models }`; the returned handlers must match the manifest exactly. A clean import or activation failure disables **that member only**. A runner that dies or hangs during activation counts as a placement failure.
+- **Heartbeat:** the bridge pings every 2 s and answers come from the JS event loop, so a synchronous loop that blocks it is detected: 10 s without a pong kills the runner.
+- **Crash budget:** runner exit, socket EOF, protocol violation, failed handshake, or a missed heartbeat is one failure for the whole placement, counted once per generation. Failures 1 and 2 within a rolling 300 s window restart immediately with a new generation; the 3rd disables every member not already load-disabled, with a reason naming the group and its members. Older failures age out. Shutdown, reconfiguration, a caller cancelling, a callback deadline, and an author's method error do not count.
+- **Teardown:** a failed generation fails all its pending callbacks with their own extension's name, kills the runner's container, and waits for it to close before starting a replacement. No callback is replayed on the new generation.
+- **Supervision mode:** runners are `ProcessSupervisor` containers of the host's `Supervision`. With `Supervision::ProcessGroup` killing the runner kills its process group, including children it spawned normally, but a descendant that leaves the group (`setsid`, double fork) survives the runner, shutdown, and the host, as with any process-group command. With `Supervision::Cgroup` every descendant, detached or not, stays in the runner's job cgroup and dies with it, and the job directory is removed. Runners are not session jobs: they are never listed under `proc://` and survive session shutdown; they belong to the `Extensions` manager.
+- **Limits:** one runner per placement serves every session; there are no per-session processes, Workers, memory or CPU limits. A group shares fate: one member's crash or hang restarts, and eventually disables, the whole group.
+
+### Callbacks and failure contracts
+
+| Callback | Deadline | Interrupted (runner death, restart, retirement, deadline, no live runner) | Author error or invalid result |
+| :--- | :--- | :--- | :--- |
+| `login` | None: waits on the human. Dropping the `Models::login` future cancels it, aborting the author's signal and withdrawing outstanding questions | `Error::ProviderUnavailable`; nothing stored | `Error::Auth` naming extension, provider, and method; nothing stored |
+| `refresh` | 60 s, including a cold start. It runs inside the credential store's locked update and continues when only a waiting stream is cancelled, so its rotated credential is still saved | `Error::ProviderUnavailable`; the lock is released and nothing is saved | `Error::Auth`; nothing saved |
+| `rewrite` | 60 s, including a cold start | The stream ends with one `AssistantEvent::Error` carrying the `provider_unavailable`, `should_retry: false` failure; no HTTP request is sent and neither axo nor the session retries it | The stream ends with an `AssistantEvent::Error` naming the extension; nothing is sent |
+
+**Interruption versus an accepted request.** The boundary is the rewrite's reply. If Bun dies, hangs, or is replaced **before** the reply is accepted, the request fails as above and is never resent; the next independent request uses the restarted runner once it is `Ready`. **After** the reply is accepted, the request belongs to Rust: transport retries, the HTTP response, and the whole SSE stream continue normally even if Bun is killed mid-stream, and nothing is re-sent or aborted on its account. A reply that arrives after its provider was retired is discarded. A callback whose deadline passes is failed and cancelled without restarting a runner that still answers heartbeats.
+
+Replies are validated before use. A credential must have the `Credential` JSON shape; a request must have an `http:` or `https:` URL, valid header names and values, and stay within the frame limit. Request headers travel as ordered `[name, value]` pairs, so duplicate headers keep their order, and non-UTF-8 values travel as `{ "base64": "..." }`.
+
+### Author SDK
+
+The type-only author SDK lives in `packages/axo-extension-sdk` (package `@axo/extension-sdk`); an extension never needs it at runtime and may be plain JS. Its default export returns a `Handlers` record, possibly asynchronously. Each of `providers`, `tools`, `schemes`, and `commands` maps declarations to handlers. Provider login requires both login and refresh, rewrite requires the rewrite handler, and a declared tool policy defines exactly the hooks its `toolPolicy` lists. Missing or undeclared handlers fail activation, including the spawn hook and journal entry handler.
+
+For a manifest that declares only an echo tool and a hello command:
+
+```ts
+import type { Extension } from "@axo/extension-sdk";
+
+export default (() => ({
+  tools: {
+    echo: async ({ call, update }) => {
+      update({ content: [{ type: "text", text: "Working" }] });
+      return { content: [{ type: "text", text: JSON.stringify(call.arguments) }] };
+    },
+  },
+  commands: {
+    hello: (args, session) =>
+      session.post({ customType: "greeting", text: args, display: true, delivery: "quiet" }),
+  },
+})) satisfies Extension;
+```
+
+- **Login interaction:** `ui.openUrl(url, instructions?)`, `ui.deviceCode({ userCode, verificationUrl, expiresInSeconds? })`, and `ui.progress(message)` resolve once the host's `LoginInteraction` has shown them; `ui.prompt({ message, placeholder?, secret }, signal?)` and `ui.select({ message, options: [{ id, label }] }, signal?)` resolve with the answer. A per-question signal withdraws just that question (for example when a browser callback wins); the login's own signal withdraws all of them. A login replies only after its display calls were delivered.
+- **Credentials:** `{ type: "api_key", key }` or `{ type: "oauth", access, refresh, expires, headers?, baseUrl?, ...providerFields }` with `expires` in milliseconds since the epoch. axo stores what `login` returns, refreshes it within 5 minutes of expiry, and sends its access token, headers, and base URL as for any OAuth provider.
+- **Rewrite:** receives the read-only model and the `ProviderRequest` axo's adapter built (`url`, ordered `headers`, JSON `body`) and returns the complete replacement. It runs once per inference request, before transport retries; model discovery is never rewritten.
+- **Signals:** each callback's signal aborts when the caller cancels, the call's deadline passes, or the runner's generation is retired.
+- **Commands and tools:** A command gets `(args, session, signal)` with the trimmed arguments and a session handle. A tool gets a `ToolRun`: `run.call` is the validated call, `run.invocation` its execution ID, and `run.tools` the tools available during that call. Use `run.tools` for guarded file access (the bridge adds the records to `details.files`) and supervised commands such as `run.tools.runCommand({ command: "echo hi" })`, which runs bash in the session's execution environment. Call `ctx.session(run.sessionId)` if the tool needs a session handle. The tool also receives `run.signal` and `run.update`; acknowledged updates precede its final result.
+- **Tool policies:** `before(scope, cx, signal)` can block a call; `after(scope, cx, signal)` can override result fields. Both receive the session's tool scope, including write restrictions, and the assistant message and tool call in `cx`. The after hook also receives the full result in `cx.result`. Return `null` to leave the call or result unchanged.
+- **Spawn hooks:** `spawnHook(spawn, signal)` receives the parent session ID, task parts, spec and origin. A tool-originated spawn includes the originating call ID. Return `null` to allow, `{ block: reason }` to refuse, or `{ replace: spec }` to substitute an `AgentSpec`. A spawn context that cannot be serialized blocks the spawn.
+- **Deadlines:** Tool and command calls have no bridge deadline. Policy, spawn, scheme and event calls have a 60 s deadline. A scheme can resolve to a virtual resource or an absolute file path, with optional handlers for virtual reads and writes. Scheme calls send the session directory and working directory as UTF-8 strings; if either is not valid UTF-8 the call fails naming the extension and scheme, without reaching the runner.
+- **Command failures:** a failed extension command returns `Error::Host` boxing the axo-extensions crate's `Failure`; hosts that need the cause match `Error::Host` and downcast its boxed source to `Failure`. `Failure::Removed` means the extension is no longer enabled or its manager is shut down.
+- **Manifest entry handler:** With `"events": true`, `onEntry(entry, session)` gets a sequence-numbered journal entry and a session handle. The first argument has the SDK type `SeqEntry`: read the cursor from `entry.seq` and the payload from `entry.entry`; an entry tag these bindings do not know arrives as a `RawEntry` payload. The bridge offers new entries after attach in append order per session, calling extensions in enabled order. A slow handler delays later ones; lag, runner unavailability or callback failure can skip entries. This is independent of explicit session subscriptions.
+
+### Extension session handles
+
+`ctx.session(id)` returns a `SessionHandle` for an attached session or a known child, even outside a callback. Addressing a child can revive it; it does not attach the child or send its entries to the manifest entry handler. Use an explicit subscription for those events. Read the ID as `session.id`. Ordinary methods return promises: the runner forwards the camelCase method name and positional arguments to `Session::invoke`; Rust decodes, executes and returns the result. The [generated reference](extension-api.md#session) lists the methods; the SDK's `bindings.ts` gives their wire types. The handle forwards only the invokable names the bridge sends at activation; any other property, such as `toJSON` or `then`, is `undefined`, so `JSON.stringify(session)` gives `{"id": ...}`. There is no per-call authority check.
+
+For example, a command can enter a host-loaded mode with a task, or use the same rendered skill as a follow-up or a compaction focus:
+
+```ts
+await session.runCommand({ type: "mode", name: "plan", prompt: args });
+// Or, in a separate command:
+const focus = await session.renderSkill("review", args);
+await session.compact(focus); // use session.followUp(focus) to submit it instead
+```
+
+The handle can answer pending questions, accept or revise mode results, and navigate. Fork and shutdown belong to the host. Extensions register through their manifest; they cannot change the host's registrations, sections or layer. The live schemes registry is not a session method on the handle.
+
+| Wire method | Difference from the Rust host API |
+| :--- | :--- |
+| `post`, `appendCustom`, `custom` | Pass a bare, non-empty `customType`. Rust prefixes it with `<extension id>:` for message delivery and branch-scoped state; Rust hosts reading it directly use the prefixed key. An empty type rejects with `invalid_input`. This is namespacing, not journal access control. |
+| `spawn`, `spawnTeam` | Return a `SpawnReceipt`, not a live child or team handle. |
+| `parseCommand(text)` | Resolves to a parsed command, `null` for ordinary text, or rejects for invalid command arguments. |
+| `readSnapshot(sha256)` | Snapshot bytes are base64. |
+| `commandOutput(callId, offset, limit)`, `commandChunks(callId, offset, limit)` | Read the call's newest command. Output is `null` when unavailable or an `OutputPage` with job, artifact, progress and up to 1 MiB of raw bytes encoded as base64, starting at the byte offset. Chunks label the bytes by stream. |
+| `commandJobs(callId)`, `jobOutput(jobId, offset, limit)`, `jobChunks(jobId, offset, limit)` | List every command the call started, oldest first, including foreground commands. Read a specific job's output or chunks by id. |
+| `entries(after?, limit?)`, `live()` | Instead of attaching a live Rust receiver, page the journal after an exclusive sequence number (omit it to start at the beginning) and read the current `LiveSnapshot` separately. An `EntryPage` contains ordered `entries` and `more`; use the last `seq` as the next cursor. The limit defaults to 256 and is clamped to 1..=1024, so every page advances; lower it if the reply exceeds the frame limit. |
+
+**Subscribe to live events:** `await session.subscribe(listener, kinds?)` returns a subscription; call `await subscription.close()` when finished. Omit `kinds` for all session events, or pass `SessionEventKind` values such as `["entry", "questionPending"]`. Each subscription is best effort, with no replay. Its `SessionStreamEvent` listener receives a `SessionEvent`, `{ type: "lagged", value: { skipped } }` when the receiver fell behind (an event too large to frame or not serializable also counts as one skipped), or `{ type: "closed", value: null }` when the stream closes. Use the journal cursor and live snapshot to catch up after lag. Each event waits for the listener's previous one, with no delivery deadline.
+
+A subscription belongs to the runner generation that made it. Detaching the session sends `closed` and ends it; `closed` can arrive while the listener is still handling the previous event. A retired or crashed generation ends its subscriptions without notice, and they never reach or start a replacement runner. `close()` is idempotent: the listener stays registered until the host confirms, and a failed close rejects and can be retried. Closing a subscription the host already ended resolves.
+
+**Handle errors by code.** The SDK's `HostErrorCode` includes snake_case Rust `ErrorCode` values such as `busy` and `skill_not_found`. Dispatch adds `unknown_object`, `unknown_method`, `invalid_arguments` (positional arguments did not decode) and `encode` (the result could not be encoded). The bridge rejects arguments it cannot decode with `invalid`, a reply that would exceed the frame bound with `too_large`, an unsupported object or operation with `unsupported`, a session ID it cannot resolve with `no_session`, and an unknown or foreign subscription with `no_subscription`. A child session that cannot be revived rejects with the underlying code (for example `session_busy` or `model_not_found`) rather than `no_session`. A tools call that fails with a tool error rejects with `tool`; a lifecycle call without a host hook rejects with `no_lifecycle`; a shut-down manager rejects with `unavailable`. A completion stream whose event cannot be framed ends with `closed`.
+
+A registered command runs at most once per session at a time: while `/<name>` runs, another `runCommand` of it in that session, whether nested in its own call or reached through a turn it started, is refused with `command /<name>: already running in this session`. Different extensions' commands never block each other. If nested host calls fill the runner's slots and its queue makes no progress for 30 seconds, every **queued** call rejects with `stalled` (`too many nested host calls`). This detects a stall; it is not a deadline on calls already in flight.
+
+### Wire protocol
+
+`runner.ts` and the Rust peer use one Unix socket per generation. A frame is a 4-byte big-endian length followed by UTF-8 JSON, bounded by `MAX_FRAME` (64 MiB). After `hello` (protocol 2, nonce, generation), frames carry the generation as a decimal string. The embedded runner and host ship together; there is no independent wire compatibility promise. A `call` carries `id`, `ext`, `method` and `args`; its terminal reply is `ok` or `error`. There are also `cancel`, `ping`, and `pong` frames.
+
+Login UI calls, tool updates and invocations on the `tools` object carry their live host call's `parent`. Other `invoke` calls are unparented: all specify `object`, `method` and positional `args`; only the session object takes a `target` session ID. `activate` carries `methods`, the map of names each object forwards.
+
+`subscribe` takes `{ session, kinds }` or `{ completion }` and returns `{ sub }`; `unsubscribe` takes `{ sub }`. The host delivers events with `stream` on the subscribing connection, reporting closure with `{ sub, closed: true }` and session lag with `{ sub, lagged }`. Manifest entry handlers use the same `stream` method with `{ sub: "entry", session, event }` for host-attached sessions. Calls run concurrently so interaction does not block heartbeats. Malformed framing, wrong generation, duplicate live IDs or invalid parentage end the generation; an ordinary method refusal does not.

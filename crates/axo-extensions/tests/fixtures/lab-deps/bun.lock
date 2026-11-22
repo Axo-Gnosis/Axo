@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "lab-deps",
+      "dependencies": {
+        "lab-dep": "file:./vendor/lab-dep",
+      },
+    },
+  },
+  "packages": {
+    "lab-dep": ["lab-dep@file:vendor/lab-dep", {}],
+  }
+}

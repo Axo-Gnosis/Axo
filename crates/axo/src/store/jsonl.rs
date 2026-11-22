@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axo_agent::AgentMessage;
 use axo_ai::Message;
+use axo_macros::expose;
 use serde_json::Value;
 
 use super::{Entry, Header, SeqEntry, SessionInfo, SessionStore, SessionWriter};
@@ -18,8 +19,10 @@ pub struct JsonlStore {
     root: PathBuf,
 }
 
+#[expose(block = JSONL_STORE_BLOCK, object = "types")]
 impl JsonlStore {
     /// A store rooted at the host-chosen directory `root`.
+    #[ext(skip = "host construction")]
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
@@ -82,17 +85,24 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<(Header, Vec<SeqEntry>, u64), Erro
     let mut count = 0;
     for (seq, line) in (0u64..).zip(lines) {
         count = seq + 1;
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        match serde_json::from_slice::<Entry>(line) {
-            Ok(entry) => entries.push(SeqEntry { seq, entry }),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), seq, %err, "skipping malformed session line")
-            }
+        if let Some(entry) = parse_entry(path, seq, line) {
+            entries.push(entry);
         }
     }
     Ok((header, entries, count))
+}
+
+fn parse_entry(path: &Path, seq: u64, line: &[u8]) -> Option<SeqEntry> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    match serde_json::from_slice::<Entry>(line) {
+        Ok(entry) => Some(SeqEntry { seq, entry }),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), seq, %err, "skipping malformed session line");
+            None
+        }
+    }
 }
 
 /// Parses a session header line (without its newline); every read path goes
@@ -199,6 +209,43 @@ impl SessionStore for JsonlStore {
             let bytes = fs::read(&path).map_err(|err| io_error(&path, err))?;
             let (header, entries, _) = parse(&path, &bytes)?;
             Ok((header, entries))
+        })
+        .await
+    }
+
+    async fn read_page(
+        &self,
+        path: &Path,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<(Header, Vec<SeqEntry>, bool), Error> {
+        let target = path.to_path_buf();
+        blocking(path, move || {
+            let path = target.as_path();
+            let io = |err| io_error(path, err);
+            let mut reader = BufReader::new(File::open(path).map_err(io)?);
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).map_err(io)?;
+            let header = parse_header(path, line.strip_suffix(b"\n").unwrap_or(&line))?;
+            let mut entries = Vec::new();
+            for seq in 0u64.. {
+                line.clear();
+                if reader.read_until(b'\n', &mut line).map_err(io)? == 0 {
+                    break;
+                }
+                if after.is_some_and(|after| seq <= after) {
+                    continue;
+                }
+                if let Some(entry) =
+                    parse_entry(path, seq, line.strip_suffix(b"\n").unwrap_or(&line))
+                {
+                    if entries.len() == limit {
+                        return Ok((header, entries, true));
+                    }
+                    entries.push(entry);
+                }
+            }
+            Ok((header, entries, false))
         })
         .await
     }

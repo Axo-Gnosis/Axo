@@ -1,7 +1,7 @@
 //! The sectioned system prompt (pi `core/system-prompt.ts`, `plan/pi/context.md` §1).
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::config::PromptOverride;
+use crate::context::definitions::LiveDefinitions;
 use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
@@ -35,7 +36,7 @@ pub(crate) fn escape_wrappers(text: &str) -> Cow<'_, str> {
 }
 
 /// Whether a system prompt section name is lowercase ASCII with digits, `_` or `-`.
-pub(crate) fn valid_section_name(name: &str) -> bool {
+pub fn valid_section_name(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
         && name
             .chars()
@@ -52,10 +53,8 @@ pub(crate) struct PromptSources {
     pub team: Option<String>,
     /// Whether the bundled documentation scheme is available.
     pub docs: bool,
-    /// Scheme prompt docs: the schemes section.
-    pub scheme_docs: Vec<String>,
     /// Skills with `disable_model_invocation` are left out of the listing.
-    pub skills: Vec<Skill>,
+    pub definitions: Arc<LiveDefinitions>,
 }
 
 /// Inputs which change when the host switches a session's persona, sections or tools.
@@ -74,6 +73,10 @@ pub(crate) struct PromptShape {
     /// Prevalidated host sections, applied last: `Some(body)` sets or replaces a
     /// section, `None` removes it.
     pub host_sections: Vec<(String, Option<String>)>,
+    /// Scheme prompt docs: the schemes section. Replaced when the host's schemes change.
+    pub scheme_docs: Vec<String>,
+    /// Tool name → origin of the labeled host registration that supplies it.
+    pub origins: HashMap<String, String>,
 }
 
 const BUNDLED_DELEGATION: &str = include_str!("../../prompts/DELEGATION.md");
@@ -119,9 +122,9 @@ pub(crate) fn build_sections(
     }
 
     bodies.insert("tools".into(), render_guidelines(&shape.tools));
-    if !sources.scheme_docs.is_empty() {
+    if !shape.scheme_docs.is_empty() {
         let mut body = "Tools accept these URLs as paths. In bash, a URL that is a whole argument, a `--flag=`/`NAME=` value or a redirect target becomes its file path.".to_owned();
-        for doc in &sources.scheme_docs {
+        for doc in &shape.scheme_docs {
             body.push_str("\n- ");
             body.push_str(doc);
         }
@@ -140,7 +143,8 @@ pub(crate) fn build_sections(
     }
 
     let has_tool = |name: &str| shape.tools.iter().any(|tool| tool.name() == name);
-    let visible: Vec<&Skill> = sources
+    let defs = sources.definitions.get();
+    let visible: Vec<&Skill> = defs
         .skills
         .iter()
         .filter(|skill| !skill.disable_model_invocation)
@@ -210,10 +214,7 @@ pub(crate) fn build_sections(
 fn render_guidelines(tools: &[Arc<dyn Tool>]) -> String {
     let mut seen = HashSet::new();
     let mut rules = Vec::new();
-    for rule in tools
-        .iter()
-        .flat_map(|tool| tool.prompt_guidelines().iter().copied())
-    {
+    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines()) {
         let rule = rule.trim();
         if !rule.is_empty() && seen.insert(rule) {
             rules.push(format!("- {rule}"));
@@ -279,8 +280,7 @@ mod tests {
             delegation: false,
             team: None,
             docs: false,
-            scheme_docs: Vec::new(),
-            skills: Vec::new(),
+            definitions: Arc::default(),
         };
         let mut shape = PromptShape {
             prompts,
@@ -290,6 +290,8 @@ mod tests {
             context_files: Vec::new(),
             agent_sections: Vec::new(),
             host_sections: Vec::new(),
+            scheme_docs: Vec::new(),
+            origins: HashMap::new(),
         };
         let sections = build_sections(&sources, &shape, None, "2026-10-22");
         assert_eq!(sections["system"], "<system>\nHost system.\n</system>");

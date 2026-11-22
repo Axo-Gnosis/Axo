@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
@@ -124,6 +125,7 @@ struct Layer {
     path: Vec<String>,
 }
 
+#[expose(block = DEV_SHELL_ENV_BLOCK, object = "types")]
 impl DevShellEnv {
     /// `base`: the host snapshot every resolution starts from and falls back to.
     /// `settings`: the effective bash settings after project access filtering;
@@ -133,6 +135,7 @@ impl DevShellEnv {
     /// `Direnv` never uses it.
     /// `supervisor`: runs every subprocess in its own container; when it is unavailable,
     /// resolution falls back to `base` (with the capture failure notice in `Nix` mode).
+    #[ext(skip = "host construction")]
     pub fn new(
         base: Arc<EnvMap>,
         settings: BashSettings,

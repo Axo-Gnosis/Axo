@@ -1,5 +1,6 @@
 /// Why a run was cancelled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum CancelReason {
     /// The user stopped the run: the aborted assistant message is kept and every tool call
     /// left without a result gets an `"Operation aborted"` error result.

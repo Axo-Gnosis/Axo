@@ -1,13 +1,14 @@
 //! Response cost from usage and model prices. Port of pi `models.ts` `calculateCost`.
 
 use crate::model::Model;
-use crate::types::{Usage, UsageCost};
+use crate::types::{ServiceTier, Usage, UsageCost};
 
 /// Compute `usage.cost` from the model's prices, store it, and return it.
 ///
 /// The highest pricing tier whose input threshold the request exceeds applies to the
-/// whole request. 1h cache writes cost twice the base input price (Anthropic).
-pub(crate) fn calculate_cost(model: &Model, usage: &mut Usage) -> UsageCost {
+/// whole request. 1h cache writes cost twice the base input price (Anthropic). `tier` is
+/// the service tier that served the response; its multiplier scales every component.
+pub(crate) fn calculate_cost(model: &Model, usage: &mut Usage, tier: ServiceTier) -> UsageCost {
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
     let cost = &model.cost;
     let (mut input, mut output, mut cache_read, mut cache_write) =
@@ -25,11 +26,13 @@ pub(crate) fn calculate_cost(model: &Model, usage: &mut Usage) -> UsageCost {
 
     let long_write = usage.cache_write_1h.unwrap_or(0) as f64;
     let short_write = usage.cache_write as f64 - long_write;
+    let multiplier = model.service_tiers.get(&tier).copied().unwrap_or(1.0);
     let mut result = UsageCost {
-        input: input / 1_000_000.0 * usage.input as f64,
-        output: output / 1_000_000.0 * usage.output as f64,
-        cache_read: cache_read / 1_000_000.0 * usage.cache_read as f64,
-        cache_write: (cache_write * short_write + input * 2.0 * long_write) / 1_000_000.0,
+        input: input / 1_000_000.0 * usage.input as f64 * multiplier,
+        output: output / 1_000_000.0 * usage.output as f64 * multiplier,
+        cache_read: cache_read / 1_000_000.0 * usage.cache_read as f64 * multiplier,
+        cache_write: (cache_write * short_write + input * 2.0 * long_write) / 1_000_000.0
+            * multiplier,
         total: 0.0,
     };
     result.total = result.input + result.output + result.cache_read + result.cache_write;

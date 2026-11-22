@@ -12,6 +12,7 @@ use std::process::{ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axo_macros::expose;
 use rustix::io::Errno;
 use rustix::process::{
     Pid, PidfdFlags, Signal, WaitOptions, kill_process_group, pidfd_open, pidfd_send_signal,
@@ -45,7 +46,8 @@ pub fn find_on_path(name: &str, env: &EnvMap, cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Origin of replayed bytes; logs without a stream index are `Merged`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum OutputStream {
     Stdout,
     Stderr,
@@ -53,9 +55,12 @@ pub enum OutputStream {
 }
 
 /// Labeled bytes read back from a command log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct OutputChunk {
     pub stream: OutputStream,
+    #[serde(with = "crate::input::base64_bytes")]
+    #[specta(type = String)]
     pub bytes: Vec<u8>,
 }
 
@@ -164,9 +169,11 @@ pub struct ProcessSupervisor {
     ready: OnceCell<Result<PathBuf, String>>,
 }
 
+#[expose(block = PROCESS_SUPERVISOR_BLOCK, object = "types")]
 impl ProcessSupervisor {
     /// Checks nothing yet: hosts that never run commands keep working without a
     /// delegated cgroup.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub fn new(supervision: Supervision) -> Arc<Self> {
         Arc::new(Self {
             supervision,
@@ -176,6 +183,7 @@ impl ProcessSupervisor {
 
     /// Starts `spec` in a fresh container. Cancelling the returned future at any point
     /// leaves nothing behind.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub async fn spawn(&self, spec: ExecSpec) -> Result<Process, String> {
         match &self.supervision {
             Supervision::ProcessGroup => spawn_group(spec),
@@ -198,6 +206,7 @@ impl ProcessSupervisor {
     /// Runs to completion like `Command::output`, then kills anything left in the
     /// container and closes it. Reaching `deadline` kills the job and returns
     /// [`OutputError::TimedOut`].
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub async fn output(
         &self,
         spec: ExecSpec,
@@ -539,15 +548,18 @@ impl Watch {
     }
 }
 
+#[expose(block = PROCESS_BLOCK, object = "types")]
 impl Process {
     /// Takes both pipes and forwards labeled raw chunks in capture order.
     /// Read errors are delivered explicitly; dropping the `JoinSet` stops the readers.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub fn capture_output(&mut self) -> (mpsc::Receiver<io::Result<PipeChunk>>, JoinSet<()>) {
         capture(self.stdout.take(), self.stderr.take())
     }
 
     /// Waits for the root process. In cgroup mode a guardian that dies first takes the
     /// job with it. Cancel-safe.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         tokio::select! {
             status = self.root.wait() => status,
@@ -561,10 +573,12 @@ impl Process {
     /// watcher the job must not keep running unsupervised. Never resolves while the
     /// guardian lives, nor again once its death was handled, and never in process-group
     /// mode, whose guard is best effort. Cancel-safe.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub async fn guardian_lost(&mut self) {
         guardian_lost(&mut self.watch, &self.container).await;
     }
 
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub fn container(&self) -> Container {
         self.container.clone()
     }
@@ -595,6 +609,7 @@ impl Process {
     /// Waits for the root and every leftover to exit, removes the job directory (cgroup
     /// mode) and stands the watcher down. Callers that want leftovers dead call
     /// `container().kill()` first. Cancelling it falls back to the drop path.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub async fn close(mut self) {
         self.wait_empty().await;
         if let Scope::Cgroup(dir) = &*self.container.0 {
@@ -658,9 +673,11 @@ enum Scope {
     Group(Pid),
 }
 
+#[expose(block = CONTAINER_BLOCK, object = "types")]
 impl Container {
     /// SIGKILLs everything in the container (`cgroup.kill` or a group kill); errors are
     /// ignored.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub fn kill(&self) {
         match &*self.0 {
             Scope::Cgroup(dir) => {
@@ -674,6 +691,7 @@ impl Container {
 
     /// Whether any process is left in the container; false when unreadable. Group
     /// members that refuse a signal (EPERM) still count as present.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub fn populated(&self) -> bool {
         match &*self.0 {
             Scope::Cgroup(dir) => supervisor::populated(dir),
@@ -686,6 +704,7 @@ impl Container {
     /// `cgroup.procs` was read makes the send fail with ESRCH instead of hitting another
     /// process. In group mode the caller must keep reaping the leader meanwhile: an
     /// unreaped zombie still counts as a member.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub async fn terminate(&self) {
         match &*self.0 {
             Scope::Cgroup(dir) => {
@@ -714,6 +733,44 @@ impl Container {
             sleep(Duration::from_millis(20)).await;
         }
         self.kill();
+    }
+
+    /// PSS in bytes summed over every process in the container, or `None` when none can be
+    /// read. Blocking `/proc` reads; async callers use `spawn_blocking`.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    pub fn memory(&self) -> Option<u64> {
+        let pids: Vec<String> = match &*self.0 {
+            Scope::Cgroup(dir) => std::fs::read_to_string(dir.join("cgroup.procs"))
+                .ok()?
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            Scope::Group(pgid) => {
+                let pgid = pgid.as_raw_nonzero().to_string();
+                std::fs::read_dir("/proc")
+                    .ok()?
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+                    .filter(|pid| {
+                        // After the command's closing `)`: `state ppid pgrp …`.
+                        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                            stat.rsplit_once(')')
+                                .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                                == Some(pgid.as_str())
+                        })
+                    })
+                    .collect()
+            }
+        };
+        pids.iter()
+            .filter_map(|pid| {
+                let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+                let line = rollup.lines().find(|line| line.starts_with("Pss:"))?;
+                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                Some(kb * 1024)
+            })
+            .reduce(|a, b| a + b)
     }
 
     /// Whether `pid` is in this job cgroup; cgroup mode only.

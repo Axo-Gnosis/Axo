@@ -1,27 +1,22 @@
 //! Read-only URLs for discovered skills and their supporting files.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_agent::ToolError;
 
 use super::{Scheme, SchemeContext, SchemeUrl, Target, join_contained};
-use crate::context::skills::Skill;
+use crate::context::definitions::LiveDefinitions;
 
 /// Resolves every loaded skill, including skills hidden from model invocation.
 pub struct SkillScheme {
-    skills: Vec<(String, PathBuf)>,
+    definitions: Arc<LiveDefinitions>,
 }
 
 impl SkillScheme {
-    /// Keeps each skill's name and `SKILL.md` location in discovery order.
-    pub fn new(skills: &[Skill]) -> Self {
-        Self {
-            skills: skills
-                .iter()
-                .map(|skill| (skill.name.clone(), skill.path.clone()))
-                .collect(),
-        }
+    pub(crate) fn new(definitions: Arc<LiveDefinitions>) -> Self {
+        Self { definitions }
     }
 }
 
@@ -36,8 +31,14 @@ impl Scheme for SkillScheme {
     }
 
     async fn resolve(&self, url: &SchemeUrl, _cx: &SchemeContext) -> Result<Target, ToolError> {
-        let (name, skill_md) = self
+        let skills: Vec<_> = self
+            .definitions
+            .get()
             .skills
+            .iter()
+            .map(|skill| (skill.name.clone(), skill.path.clone()))
+            .collect();
+        let (name, skill_md) = skills
             .iter()
             .filter(|(name, _)| {
                 url.path == *name
@@ -54,7 +55,7 @@ impl Scheme for SkillScheme {
                     .map_or(url.path.as_str(), |(name, _)| name);
                 ToolError(format!(
                     "Unknown skill: {name}. Available: {}",
-                    super::available(self.skills.iter().map(|(name, _)| name.clone()).collect())
+                    super::available(skills.iter().map(|(name, _)| name.clone()).collect())
                 ))
             })?;
         let path = if url.path.len() == name.len() {
@@ -74,15 +75,29 @@ impl Scheme for SkillScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::definitions::ResolvedDefinitions;
+    use crate::context::skills::Skill;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn nested_skill_names_resolve_to_the_longest_match() {
-        let scheme = SkillScheme {
-            skills: vec![
-                ("team".into(), PathBuf::from("/s/team/SKILL.md")),
-                ("team/deploy".into(), PathBuf::from("/s/deploy/SKILL.md")),
-            ],
-        };
+        let skills = [
+            ("team", "/s/team/SKILL.md"),
+            ("team/deploy", "/s/deploy/SKILL.md"),
+        ]
+        .into_iter()
+        .map(|(name, path)| Skill {
+            name: name.into(),
+            description: String::new(),
+            path: path.into(),
+            disable_model_invocation: false,
+            argument_hint: None,
+        })
+        .collect();
+        let scheme = SkillScheme::new(Arc::new(LiveDefinitions::new(ResolvedDefinitions {
+            skills,
+            ..Default::default()
+        })));
         let context = SchemeContext {
             session_id: "t".into(),
             session_dir: "/x".into(),

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use axo_agent::ToolError;
+use axo_macros::expose;
 use tokio::fs::File;
 
 use super::{Scheme, SchemeContext, SchemeUrl, Target};
@@ -42,8 +43,10 @@ impl Drop for LiveArtifact {
     }
 }
 
+#[expose(block = ARTIFACTS_BLOCK, object = "types")]
 impl Artifacts {
     /// Uses `dir` without creating it; numbering is discovered on first allocation.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
@@ -53,11 +56,13 @@ impl Artifacts {
     }
 
     /// The directory containing this session's artifacts.
+    #[ext(skip = "served by tools.artifactDir")]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
     /// Reserves the next numeric ID and its path without creating either directory or file.
+    #[ext(skip = "served by tools.allocateArtifact")]
     pub fn allocate(&self, tail: &str) -> (u64, PathBuf) {
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
         let next = next.get_or_insert_with(|| {
@@ -72,6 +77,7 @@ impl Artifacts {
     }
 
     /// Creates a numbered file, registering it as live before any filesystem mutation.
+    #[ext(skip = "live handle; tools.allocateArtifact")]
     pub async fn create(&self, tail: &str) -> io::Result<(u64, PathBuf, LiveArtifact)> {
         let (id, path) = self.allocate(tail);
         self.live
@@ -99,6 +105,7 @@ impl Artifacts {
     }
 
     /// Paths still owned by writers, which forks must copy instead of hard-linking.
+    #[ext(skip = "served by tools.liveArtifacts")]
     pub fn live(&self) -> HashSet<PathBuf> {
         let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         live.iter()
@@ -107,6 +114,7 @@ impl Artifacts {
     }
 
     /// Finds the first artifact with exactly this numeric prefix.
+    #[ext(skip = "served by tools.findArtifact")]
     pub fn find(&self, n: u64) -> Option<PathBuf> {
         let prefix = format!("{n}.");
         std::fs::read_dir(&self.dir)

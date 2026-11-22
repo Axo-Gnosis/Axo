@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use axo_agent::AgentMessage;
-use axo_ai::{Message, SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_ai::{Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_macros::expose;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -25,12 +26,16 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
 /// An entry id: pi's 8 random hex characters, or a full UUID after 100 collisions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, specta::Type,
+)]
 #[serde(transparent)]
 pub struct EntryId(pub String);
 
+#[expose(block = ENTRY_ID_BLOCK, object = "types")]
 impl EntryId {
     /// A fresh id for which `taken` returns false (pi `SM:277-284`).
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn generate(taken: impl Fn(&str) -> bool) -> Self {
         for _ in 0..100 {
             let id = format!("{:08x}", rand::random::<u32>());
@@ -41,6 +46,7 @@ impl EntryId {
         Self(uuid::Uuid::now_v7().to_string())
     }
 
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -65,7 +71,7 @@ impl From<String> for EntryId {
 }
 
 /// Line 1 of a session file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename = "session", rename_all = "camelCase")]
 pub struct Header {
     #[serde(default)]
@@ -86,7 +92,7 @@ pub struct Header {
 }
 
 /// How a child session was spawned; stored in its header.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnLink {
     /// The parent's header id.
@@ -117,10 +123,20 @@ pub struct SpawnLink {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_write_ceiling"
     )]
+    #[specta(type = specta_serde::Phased<Option<WriteScope>, WriteCeilingInput>)]
     pub writes: Option<WriteScope>,
     /// The member's team; `None` outside teams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<TeamLink>,
+}
+
+/// A present scope must contain at least one layer.
+#[allow(dead_code)]
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum WriteCeilingInput {
+    Null(()),
+    Scope(WriteScope),
 }
 
 fn deserialize_write_ceiling<'de, D: Deserializer<'de>>(
@@ -136,8 +152,17 @@ fn deserialize_write_ceiling<'de, D: Deserializer<'de>>(
     Ok(scope)
 }
 
+/// Type-only shape of [`Entry::Unknown`]: a line whose tag or fields this build cannot decode.
+#[allow(dead_code)]
+#[derive(Deserialize, specta::Type)]
+pub(crate) struct RawEntry {
+    r#type: String,
+    #[serde(flatten)]
+    fields: std::collections::BTreeMap<String, Value>,
+}
+
 /// A team member's identity in its parent's registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamRef {
     /// `team_N`, numbered per parent session.
@@ -150,7 +175,7 @@ pub struct TeamRef {
 }
 
 /// A team member's place in its team; stored in its spawn link.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamLink {
     pub id: String,
@@ -176,7 +201,7 @@ impl TeamLink {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct RosterEntry {
     pub name: String,
@@ -185,8 +210,10 @@ pub struct RosterEntry {
     pub session_id: String,
 }
 
+#[expose(block = HEADER_BLOCK, object = "types")]
 impl Header {
     /// A header for a new session with a fresh UUIDv7 id, timestamped now.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(
         cwd: PathBuf,
         parent_session: Option<PathBuf>,
@@ -207,7 +234,7 @@ impl Header {
 }
 
 /// Fields every entry shares.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryBase {
     pub id: EntryId,
@@ -218,8 +245,10 @@ pub struct EntryBase {
     pub timestamp: String,
 }
 
+#[expose(block = ENTRY_BASE_BLOCK, object = "types")]
 impl EntryBase {
     /// A base timestamped now.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(id: EntryId, parent_id: Option<EntryId>) -> Self {
         Self {
             id,
@@ -231,6 +260,7 @@ impl EntryBase {
     }
 
     /// The entry's timestamp as Unix milliseconds, if it is valid.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn timestamp_ms(&self) -> Option<i64> {
         self.timestamp
             .parse::<jiff::Timestamp>()
@@ -243,20 +273,22 @@ fn is_zero(value: &i64) -> bool {
     *value == 0
 }
 
-/// Model and thinking selection to restore when leaving a mode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Model, thinking level and service tier to restore when leaving a mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ModeRestore {
     pub provider: String,
     pub model_id: String,
     pub thinking_level: ThinkingLevel,
+    #[serde(default)]
+    pub service_tier: ServiceTier,
 }
 
 /// One line after the header.
 ///
 /// A line whose `type` is unknown, or a known type whose fields do not parse,
 /// is kept as [`Entry::Unknown`] and serializes back unchanged.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
@@ -282,6 +314,11 @@ pub enum Entry {
         #[serde(flatten)]
         base: EntryBase,
         thinking_level: ThinkingLevel,
+    },
+    ServiceTierChange {
+        #[serde(flatten)]
+        base: EntryBase,
+        service_tier: ServiceTier,
     },
     ModelChange {
         #[serde(flatten)]
@@ -370,6 +407,7 @@ pub enum Entry {
         base: EntryBase,
         custom_type: String,
         #[serde(deserialize_with = "user_content")]
+        #[specta(type = specta_serde::Phased<Vec<UserBlock>, CustomMessageContent>)]
         content: Vec<UserBlock>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
@@ -523,13 +561,15 @@ pub enum Entry {
         value: Option<Value>,
     },
     #[serde(untagged)]
-    Unknown(Value),
+    Unknown(#[specta(type = RawEntry)] Value),
 }
 
+#[expose(block = ENTRY_BLOCK, object = "types")]
 impl Entry {
     /// Usage incurred by this entry, including failed assistant responses.
     ///
     /// Run and job totals are derived summaries, not additional usage.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn usage(&self) -> Option<&Usage> {
         match self {
             Self::Message {
@@ -543,6 +583,7 @@ impl Entry {
     }
 
     /// Whether appending this entry must complete durable storage before returning.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn requires_sync(&self) -> bool {
         match self {
             Entry::RunStart { .. }
@@ -570,10 +611,12 @@ impl Entry {
     }
 
     /// The shared fields; `None` for [`Entry::Unknown`].
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn base(&self) -> Option<&EntryBase> {
         match self {
             Entry::Message { base, .. }
             | Entry::ThinkingLevelChange { base, .. }
+            | Entry::ServiceTierChange { base, .. }
             | Entry::ModelChange { base, .. }
             | Entry::AgentChange { base, .. }
             | Entry::ModeChange { base, .. }
@@ -603,6 +646,7 @@ impl Entry {
         match self {
             Entry::Message { base, .. }
             | Entry::ThinkingLevelChange { base, .. }
+            | Entry::ServiceTierChange { base, .. }
             | Entry::ModelChange { base, .. }
             | Entry::AgentChange { base, .. }
             | Entry::ModeChange { base, .. }
@@ -628,6 +672,7 @@ impl Entry {
     }
 
     /// The entry's id, read from the raw object for [`Entry::Unknown`].
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn id(&self) -> Option<&str> {
         match self {
             Entry::Unknown(value) => value.get("id").and_then(Value::as_str),
@@ -636,6 +681,7 @@ impl Entry {
     }
 
     /// The entry's parent id, read from the raw object for [`Entry::Unknown`].
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn parent_id(&self) -> Option<&str> {
         match self {
             Entry::Unknown(value) => value.get("parentId").and_then(Value::as_str),
@@ -649,12 +695,12 @@ impl Entry {
 
 /// `context_edit` replacement: user, assistant, tool-result or custom
 /// content, a string or a block array, kept raw.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 pub struct ContextReplacement {
     pub content: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
     Done,
@@ -664,7 +710,7 @@ pub enum RunOutcome {
 }
 
 /// What started a compaction checkpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
     /// `Session::compact` or `/compact`.
@@ -675,14 +721,14 @@ pub enum CompactionReason {
     Overflow,
 }
 /// The host-defined presentation of a submitted custom message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmittedCustom {
     pub custom_type: String,
     pub display: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionKind {
     Prompt,
@@ -696,14 +742,15 @@ pub enum SubmissionKind {
 }
 
 /// An entry with its position: the 0-based line index after the header.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 pub struct SeqEntry {
     pub seq: u64,
     pub entry: Entry,
 }
 
 /// One listed session, built from its header line and file metadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub path: PathBuf,
     pub id: String,
@@ -715,17 +762,18 @@ pub struct SessionInfo {
     pub modified: SystemTime,
 }
 
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+enum CustomMessageContent {
+    Text(String),
+    Blocks(Vec<UserBlock>),
+}
+
 /// pi stores `custom_message` content as a string or a block array.
 fn user_content<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<UserBlock>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Content {
-        Text(String),
-        Blocks(Vec<UserBlock>),
-    }
-    Ok(match Content::deserialize(deserializer)? {
-        Content::Text(text) => vec![UserBlock::Text { text }],
-        Content::Blocks(blocks) => blocks,
+    Ok(match CustomMessageContent::deserialize(deserializer)? {
+        CustomMessageContent::Text(text) => vec![UserBlock::Text { text }],
+        CustomMessageContent::Blocks(blocks) => blocks,
     })
 }
 

@@ -21,6 +21,7 @@ async fn accumulator_reproduces_done_message() {
         thinking_level_map: None,
         input: vec![InputKind::Text],
         cost: Cost::default(),
+        service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 32_000,
         compat: Compat::default(),

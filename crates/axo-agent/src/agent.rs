@@ -5,7 +5,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use axo_ai::{AssistantMessage, Message, Model, Streamer, ThinkingLevel, ToolResultMessage};
+use axo_ai::{
+    AssistantMessage, Message, Model, ServiceTier, Streamer, ThinkingLevel, ToolResultMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +24,7 @@ pub struct AgentConfig {
     pub streamer: Arc<dyn Streamer>,
     pub model: Model,
     pub thinking: ThinkingLevel,
+    pub service_tier: ServiceTier,
     pub tools: Vec<Arc<dyn Tool>>,
     pub deferred: Vec<Arc<dyn Tool>>,
     pub hooks: Arc<dyn LoopHooks>,
@@ -41,6 +44,7 @@ impl AgentConfig {
             streamer,
             model,
             thinking: ThinkingLevel::Off,
+            service_tier: ServiceTier::Standard,
             tools: Vec::new(),
             deferred: Vec::new(),
             hooks: Arc::new(NoHooks),
@@ -54,7 +58,9 @@ impl AgentConfig {
 }
 
 /// How many queued messages one drain point takes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum QueueMode {
     All,
@@ -62,7 +68,14 @@ pub enum QueueMode {
     OneAtATime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(
+    rename = "AgentRunOutcome",
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum RunOutcome {
     Done,
     Aborted(CancelReason),
@@ -73,7 +86,7 @@ pub enum RunOutcome {
 pub struct Agent {
     pub(crate) streamer: Arc<dyn Streamer>,
     pub(crate) hooks: Arc<dyn LoopHooks>,
-    pub(crate) tool_hooks: Vec<Arc<dyn ToolHooks>>,
+    pub(crate) tool_hooks: Mutex<Arc<[Arc<dyn ToolHooks>]>>,
     pub(crate) persist: Option<Arc<dyn Persist>>,
     pub(crate) steering_mode: QueueMode,
     pub(crate) follow_up_mode: QueueMode,
@@ -90,6 +103,7 @@ pub(crate) struct State {
     pub(crate) messages: Vec<AgentMessage>,
     pub(crate) model: Model,
     pub(crate) thinking: ThinkingLevel,
+    pub(crate) service_tier: ServiceTier,
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     pub(crate) deferred: Vec<Arc<dyn Tool>>,
     pub(crate) steering: VecDeque<QueuedMessage>,
@@ -121,7 +135,7 @@ impl Agent {
         Self {
             streamer: cfg.streamer,
             hooks: cfg.hooks,
-            tool_hooks: cfg.tool_hooks,
+            tool_hooks: Mutex::new(cfg.tool_hooks.into()),
             persist: cfg.persist,
             steering_mode: cfg.steering_mode,
             follow_up_mode: cfg.follow_up_mode,
@@ -130,6 +144,7 @@ impl Agent {
                 messages: Vec::new(),
                 model: cfg.model,
                 thinking: cfg.thinking,
+                service_tier: cfg.service_tier,
                 tools: cfg.tools,
                 deferred: cfg.deferred,
                 steering: VecDeque::new(),
@@ -147,6 +162,22 @@ impl Agent {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Replaces the tool hooks for hook passes that start after this returns.
+    pub fn set_tool_hooks(&self, hooks: Vec<Arc<dyn ToolHooks>>) {
+        *self
+            .tool_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hooks.into();
+    }
+
+    /// The current tool hooks; a pass iterates this snapshot without holding the lock.
+    pub(crate) fn tool_hooks(&self) -> Arc<[Arc<dyn ToolHooks>]> {
+        self.tool_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Registers a new run; `Error::Busy` if one is active. After `shutdown` the run
@@ -333,6 +364,11 @@ impl Agent {
     /// Takes effect from the next provider request.
     pub fn set_thinking(&self, t: ThinkingLevel) {
         self.lock().thinking = t;
+    }
+
+    /// Takes effect from the next provider request.
+    pub fn set_service_tier(&self, t: ServiceTier) {
+        self.lock().service_tier = t;
     }
 
     /// Takes effect from the next turn; the change is declared to the model with a
