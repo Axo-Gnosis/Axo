@@ -118,7 +118,7 @@ async fn invalid_input_changes_nothing() {
         enabled(&[("beta", None), ("beta", None)]),
         enabled(&[("Beta", None)]),
         enabled(&[("..", None)]),
-        enabled(&[("a/b", None)]),
+        enabled(&[("a/b/c", None)]),
         enabled(&[("", None)]),
         enabled(&[("beta", Some("Group"))]),
         enabled(&[("beta", Some(""))]),

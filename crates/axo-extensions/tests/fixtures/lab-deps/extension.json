@@ -1,0 +1,13 @@
+{
+  "id": "lab-deps",
+  "sdk": "0.0.0",
+  "entry": "index.ts",
+  "providers": [],
+  "tools": [
+    {
+      "name": "dep",
+      "description": "Returns the value exported by the lab-dep dependency.",
+      "parameters": { "type": "object" }
+    }
+  ]
+}

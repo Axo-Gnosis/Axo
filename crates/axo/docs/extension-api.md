@@ -299,6 +299,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | CONTAINER_BLOCK::kill | live process handles; commands go through tools.runCommand |
 | CONTAINER_BLOCK::populated | live process handles; commands go through tools.runCommand |
 | CONTAINER_BLOCK::terminate | live process handles; commands go through tools.runCommand |
+| CONTAINER_BLOCK::memory | live process handles; commands go through tools.runCommand |
 | INVOKE_ERROR_BLOCK::code | errors cross as { code, message } |
 | HOST_TOOL_BLOCK::direct | construction or internal state rebuilding with no meaning across the wire |
 | HOST_TOOL_BLOCK::deferred | construction or internal state rebuilding with no meaning across the wire |

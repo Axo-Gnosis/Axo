@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 
-use axo::ProcessSupervisor;
+use axo::{ProcessSupervisor, exec::host::Container};
+use futures::future::BoxFuture;
 use serde_json::json;
 use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,9 @@ use budget::{Budget, LIMIT, WINDOW};
 const ACTIVATE_DEADLINE: Duration = Duration::from_secs(15);
 
 type Report = Arc<dyn Fn(ExtensionStatus) + Send + Sync>;
+/// Readies one member before a generation starts (installs its dependencies); `Err` disables
+/// that member with the reason.
+pub type Prepare = Arc<dyn Fn(Member) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 pub struct Placement {
     shared: Arc<Shared>,
@@ -46,6 +50,7 @@ struct Shared {
     ids: Arc<[String]>,
     group: Option<String>,
     report: Report,
+    prepare: Prepare,
     /// Serves the runner's session actions on every generation.
     actions: Arc<dyn Actions>,
     state: Mutex<State>,
@@ -63,6 +68,8 @@ struct State {
     waiters: Vec<oneshot::Sender<Result<(), String>>>,
     driver: Option<JoinHandle<()>>,
     closed: bool,
+    /// The live generation's container, for memory reads.
+    container: Option<Container>,
 }
 
 #[derive(Default)]
@@ -109,6 +116,7 @@ impl Placement {
         options: ExtensionOptions,
         supervisor: Arc<ProcessSupervisor>,
         report: Report,
+        prepare: Prepare,
         actions: Arc<dyn Actions>,
     ) -> Arc<Self> {
         let state = State {
@@ -121,6 +129,7 @@ impl Placement {
                 members,
                 group,
                 report,
+                prepare,
                 actions,
                 state: Mutex::new(state),
             }),
@@ -181,6 +190,11 @@ impl Placement {
     pub fn status(&self) -> Vec<ExtensionStatus> {
         let state = self.shared.lock();
         self.shared.statuses(&state)
+    }
+
+    /// The live runner's container, while one runs.
+    pub fn container(&self) -> Option<Container> {
+        self.shared.lock().container.clone()
     }
 
     /// The live peer serving `ext`. A cold placement starts here; this call and any arriving
@@ -355,6 +369,29 @@ impl Shared {
         generation: u64,
         stop: &CancellationToken,
     ) -> Exit {
+        // A member whose dependencies cannot be installed is disabled alone; calls wait here.
+        let pending: Vec<Member> = {
+            let state = self.lock();
+            let ready = |member: &&Member| !state.load.contains_key(&member.id);
+            self.members.iter().filter(ready).cloned().collect()
+        };
+        for member in pending {
+            let id = member.id.clone();
+            let prepared = tokio::select! {
+                prepared = (self.prepare)(member) => prepared,
+                () = stop.cancelled() => return Exit::Stopped,
+            };
+            if let Err(reason) = prepared {
+                self.lock().load.insert(id, reason);
+            }
+        }
+        if self
+            .members
+            .iter()
+            .all(|member| self.lock().load.contains_key(&member.id))
+        {
+            return Exit::Idle;
+        }
         let start = Generation::start(
             options,
             supervisor,
@@ -374,6 +411,7 @@ impl Shared {
             }
         };
         let peer = process.peer.clone();
+        self.lock().container = process.container();
         // One `wait` spans activation and service, so a death mid-activation is seen at once.
         let exit = tokio::select! {
             biased;
@@ -381,6 +419,7 @@ impl Shared {
             () = process.wait() => Exit::Crash(format!("{} runner stopped unexpectedly", self.who())),
             exit = self.serve(&peer, options, generation) => exit,
         };
+        self.lock().container = None;
         process.shutdown().await;
         exit
     }
@@ -419,7 +458,7 @@ impl Shared {
         check_entry(&member.entry)
             .await
             .map_err(|err| Activation::Member(format!("{label} entry {err}")))?;
-        let data = options.data_root.join(&member.id);
+        let data = options.data_dir(&member.id);
         tokio::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

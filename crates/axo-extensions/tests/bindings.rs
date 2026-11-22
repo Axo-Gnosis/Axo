@@ -112,3 +112,15 @@ fn bindings_are_current() {
         );
     }
 }
+
+/// Extensions declare the SDK version they were built for; the bridge checks it against this.
+#[test]
+fn sdk_version_matches_the_package() {
+    let manifest = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/axo-extension-sdk/package.json"
+    );
+    let package: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest).unwrap()).unwrap();
+    assert_eq!(package["version"], axo_extensions::SDK_VERSION);
+}

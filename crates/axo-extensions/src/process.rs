@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axo::{
     ProcessSupervisor,
-    exec::host::{ExecSpec, Process},
+    exec::host::{Container, ExecSpec, Process},
 };
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -171,6 +171,11 @@ impl Generation {
             () = self.peer.closed() => {}
             _ = process.wait() => {}
         }
+    }
+
+    /// The runner's container; `None` once `shutdown` took the process.
+    pub fn container(&self) -> Option<Container> {
+        self.process.as_ref().map(Process::container)
     }
 
     /// Closes the connection (failing its pending calls), kills the container,

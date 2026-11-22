@@ -589,7 +589,8 @@ fn invalid_extension_lists_are_rejected_against_their_layer_before_filtering() {
         r#"[{ "id": "" }]"#,
         r#"[{ "id": "." }]"#,
         r#"[{ "id": ".." }]"#,
-        r#"[{ "id": "a/b" }]"#,
+        r#"[{ "id": "a/b/c" }]"#,
+        r#"[{ "id": "a/" }]"#,
         r#"[{ "id": "a\\b" }]"#,
         r#"[{ "id": "Upper" }]"#,
         r#"[{ "id": "-lead" }]"#,
@@ -622,6 +623,7 @@ fn typed_extension_lists_use_the_settings_validator() {
             enabled("lab-provider", None),
             enabled("a1.b_c-d", Some("personal")),
             enabled("0", Some("personal")),
+            enabled("lab/pkg", None),
         ]),
         Ok(())
     );
@@ -629,6 +631,13 @@ fn typed_extension_lists_use_the_settings_validator() {
         EnabledExtension::validate_all(&[enabled("..", None)]),
         Err(ExtensionListError::InvalidId("..".into()))
     );
+    for invalid in ["a/", "/b", "a/b/c", "A/b", "a/.."] {
+        assert_eq!(
+            EnabledExtension::validate_all(&[enabled(invalid, None)]),
+            Err(ExtensionListError::InvalidId(invalid.into())),
+            "{invalid}"
+        );
+    }
     assert_eq!(
         EnabledExtension::validate_all(&[enabled("ok", Some("a/b"))]),
         Err(ExtensionListError::InvalidGroup {

@@ -687,7 +687,7 @@ An executed result keeps its `Tool` origin exactly when it is the result persist
 
 ## 4. Bun extensions (`axo-extensions`)
 
-Trusted TypeScript/JavaScript packages can contribute providers, tools, policies, spawn hooks, URL schemes, prompt sections, definitions, and commands through supervised Bun runners. Declarations come from `extension.json`; the default export binds handlers. The bridge uses the same Rust session and provider APIs a host can call. Inference HTTP and SSE still belong to the Rust adapters, even when an extension rewrites the request. Package installation is not provided.
+Trusted TypeScript/JavaScript packages can contribute providers, tools, policies, spawn hooks, URL schemes, prompt sections, definitions, and commands through supervised Bun runners. Declarations come from `extension.json`; the default export binds handlers. The bridge uses the same Rust session and provider APIs a host can call. Inference HTTP and SSE still belong to the Rust adapters, even when an extension rewrites the request. axo installs a package's npm dependencies with the host's Bun and manages a store of installed packages, but never downloads a package itself (see [Packaging and install](#packaging-and-install)).
 
 ### Host setup and lifecycle
 
@@ -724,6 +724,10 @@ let extensions = Extensions::new(
         // Absolute paths only; `None` leaves every extension `Unavailable`.
         bun: Some(PathBuf::from("/opt/bun/bin/bun")),
         roots: vec![state.join("extensions")],
+        // Installed (`publisher/name`) extensions live here; `None` disables installs.
+        store: Some(state.join("extension-store")),
+        // Authored packages run `bun install` on their own when their dependencies are stale.
+        auto_install: true,
         data_root: state.join("extension-data"),
         // Keep it short: `<runtime_dir>/<private dir>/rpc` must fit a Unix socket path.
         runtime_dir: PathBuf::from("/run/my-host"),
@@ -774,14 +778,20 @@ extensions.shutdown().await;
 
 | Item | Signature | Behavior |
 | :--- | :--- | :--- |
-| `ExtensionOptions` | `bun: Option<PathBuf>`, `roots: Vec<PathBuf>`, `data_root: PathBuf`, `runtime_dir: PathBuf`, `env: Arc<EnvMap>` | Host choices, all absolute paths. Package roots are searched in order; each extension's data directory is `<data_root>/<id>`; each runner generation gets a private directory under `runtime_dir`; `env` is the runner's complete environment (plus the bridge's own variables). Nothing is discovered from the working directory, `PATH`, project layers, or home directories. To change options, build a new manager and `shutdown` the old one |
+| `ExtensionOptions` | `bun: Option<PathBuf>`, `roots: Vec<PathBuf>`, `data_root: PathBuf`, `runtime_dir: PathBuf`, `env: Arc<EnvMap>`, `store: Option<PathBuf>`, `auto_install: bool` | Host choices, all absolute paths. Package roots are searched in order for authored extensions; `store` holds installed ones (`None` leaves every `publisher/name` extension `Unavailable` and fails every install call); `ExtensionOptions::data_dir(id)` names each extension's data directory: `<data_root>/<id>` for an authored extension, `<data_root>/@installed/<publisher>/<name>` for an installed one (`@` cannot start an ID, so neither nests inside the other); each runner generation gets a private directory under `runtime_dir`; `env` is the runner's complete environment (plus the bridge's own variables), and also the environment of every `bun install`. `auto_install` lets axo install authored dependencies on its own. Nothing is discovered from the working directory, `PATH`, project layers, or home directories. To change options, build a new manager and `shutdown` the old one |
 | `Extensions::configure` | `async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError>` | Validates options and the enabled list, rescans packages, replaces the provider layer, and reapplies the session layer to attached root sessions when the declared contributions changed. Does not eagerly start runners. Package failures go to `status`; invalid host inputs return `Err` without changing the configuration. Call it after list or manifest changes; use `reload` for code-only changes. Serialized with `retry`, `reload` and `shutdown`, and completed even if the caller's future is dropped |
 | `Extensions::status` | `fn status(&self) -> Vec<ExtensionStatus>` | One `ExtensionStatus { id, group, generation, phase, reason }` per enabled extension, in enabled order, including shadowed ones. `reason` is a safe, human-readable string |
 | `Extensions::collisions` | `fn collisions(&self) -> Vec<ProviderCollision>` | Every `ProviderCollision { provider, winner, hidden }`: `winner` is an extension ID; `hidden` is `Hidden::Extension(id)` for a shadowed extension or `Hidden::Host(ProviderOrigin)` for a host contributor: `Layer` (an older provider layer), `Registered` (a `Models::register` provider), or `Loaded` (the loaded catalog). A snapshot from the last `configure`, `retry` or `reload`; later registry changes and newer provider layers are not reflected until the next one |
 | `Extensions::diagnostics` | `fn diagnostics(&self) -> Vec<ExtensionDiagnostic>` | Non-fatal discovery findings and scheme or section collisions between extensions, each with the extension ID and message |
 | `Extensions::subscribe` | `fn subscribe(&self) -> broadcast::Receiver<ExtensionEvent>` | Committed state changes, provider collisions, discovery and session diagnostics. After `RecvError::Lagged`, reread `status`, `collisions`, `diagnostics`, and any affected session's `session_diagnostics` |
-| `Extensions::retry` | `async fn retry(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then re-arms `id` if it is load-disabled or its placement is `Disabled` or `Unavailable`: a load-disabled member is reloaded alone (its group peers keep their own load failures, and the shared process is recycled), and a placement disabled by its crash budget restarts cold with a fresh budget. `BridgeError::UnknownExtension` for an ID that is not enabled; `ShutDown` after shutdown |
-| `Extensions::reload` | `async fn reload(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the next callback imports the package's current code, whatever its phase. Group peers share the runner and are recycled with it; their own load failures are kept, `id`'s is cleared. Same errors as `retry` |
+| `Extensions::retry` | `async fn retry(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then re-arms `id` if it is load-disabled or its placement is `Disabled` or `Unavailable`: a load-disabled member is reloaded alone (its group peers keep their own load failures, and the shared process is recycled), and a placement disabled by its crash budget restarts cold with a fresh budget. A failed dependency install is attempted again. `BridgeError::UnknownExtension` for an ID that is not enabled; `ShutDown` after shutdown |
+| `Extensions::reload` | `async fn reload(&self, id: &str) -> Result<(), BridgeError>` | Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the next callback imports the package's current code, whatever its phase. Group peers share the runner and are recycled with it; their own load failures are kept, `id`'s is cleared, and a failed dependency install is attempted again. Same errors as `retry` |
+| `Extensions::install_dependencies` | `async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError>` | Runs `bun install` for enabled authored extension `id` now, even after a failed install of the same files, then reloads it. The path when `auto_install` is off. `UnknownExtension` for an ID that is not an enabled authored extension; `BridgeError::DependencyInstall` with Bun's output when the install fails |
+| `Extensions::install` | `async fn install(&self, source: &Path, origin: &str, replace_origin: bool) -> Result<InstalledExtension, InstallError>` | Installs or updates the package folder `source` into the store; see [Installed extensions](#installed-extensions). Does not enable it |
+| `Extensions::rollback` | `async fn rollback(&self, id: &str) -> Result<InstalledExtension, InstallError>` | Swaps installed `id`'s current and previous versions (a second rollback goes forward again) and reloads it if enabled. `NotInstalled`, `NoPrevious` |
+| `Extensions::uninstall` | `async fn uninstall(&self, id: &str, delete_data: bool) -> Result<(), InstallError>` | Deletes installed `id`'s package and previous version; refuses while it is enabled (`Enabled`). `delete_data` also deletes its data directory `<data_root>/@installed/<publisher>/<name>`; files the extension wrote anywhere else are untouched, since that directory is a convention, not a sandbox |
+| `Extensions::installed` | `async fn installed(&self) -> Result<Vec<InstalledExtension>, InstallError>` | Every `InstalledExtension { id, origin, has_previous }` in the store, sorted by ID; unreadable records are skipped |
+| `Extensions::memory` | `async fn memory(&self) -> Vec<RunnerMemory>` | One `RunnerMemory { members, group, pss_bytes }` per live runner, in the enabled order of its first member: the proportional set size summed over the runner's process group or cgroup. Never split among the members of a shared runner; a runner whose memory cannot be read is omitted. Read on demand; there is no memory cap |
 | `Extensions::shutdown` | `async fn shutdown(&self)` | Closes admission, empties the extension layer of attached root sessions (their host registrations are untouched), removes the manager's providers, and kills and reaps the runners. Idempotent. Dropping the manager tears down runners without waiting; use explicit shutdown to clear the layers and wait for reaping |
 
 Await the first `configure` before composing session options or selecting extension models. Listing providers, composing options, and creating or reopening a session do not require a running Bun process. The first callback starts it, including the first subscribed journal entry after attachment.
@@ -799,7 +809,7 @@ Use `ctx.models` to find models, inspect credential sources without retrieving s
 
 ### Packages and manifests
 
-For each enabled ID, and only those, the manager reads `<root>/<id>/extension.json` from the first root in `roots` order where that path exists. A later copy is ignored with an `ExtensionDiagnostic`; a first copy that exists but cannot be read still claims the slot rather than falling through to a later root. The manifest is UTF-8 JSON, unknown fields are rejected, and nothing is executed to read it:
+For each enabled ID, and only those, the manager reads the package's `extension.json`. An authored (plain) ID is read from `<root>/<id>/extension.json` in the first root in `roots` order where that path exists; a later copy is ignored with an `ExtensionDiagnostic`, and a first copy that exists but cannot be read still claims the slot rather than falling through to a later root. An installed (`publisher/name`) ID is read from the store's current version folder; without a `store` or an install record it is `Unavailable`. The manifest is UTF-8 JSON, unknown fields are rejected, and nothing is executed to read it:
 
 ```json
 {
@@ -831,7 +841,8 @@ For each enabled ID, and only those, the manager reads `<root>/<id>/extension.js
 }
 ```
 
-- **`id`** must equal the directory name. **`entry`** is a package-relative regular file that must resolve inside the package; the package directory itself may be a host-made symlink, but the entry may not escape it. This is discovery hygiene, not a sandbox.
+- **`id`** must equal the extension ID it is enabled under: the directory name for an authored package, `publisher/name` for an installed one. **`entry`** is a package-relative regular file that must resolve inside the package; the package directory itself may be a host-made symlink, but the entry may not escape it. This is discovery hygiene, not a sandbox.
+- **`sdk`** names the extension SDK version the package was built against (`SDK_VERSION`, currently `0.0.0`, the version of `@axo/extension-sdk`). It must be caret-compatible: the same major above 0, else the same minor above 0, else the same version. A mismatch is not admitted, naming both versions. Optional for authored packages (absent means no check), required for installed ones.
 - **Providers:** `models` use the `axo_ai::Model` JSON shape (`thinkingLevelMap` and `compat` optional), each naming its enclosing provider, and are checked by the same validation as `Models::register`. `env` defaults to `[]`, `requiresKey` to `true`, and `login` and `rewrite` to `false`. Provider IDs follow the registry rules and may not repeat within a manifest. `login: true` makes `Models::login` available and routes OAuth refreshes to the extension; `rewrite: true` routes every inference request's `ProviderRequest` through it. Credentials are stored and selected by `Models` exactly as for Rust providers.
 - **Session declarations** are optional, as is `providers`. See the session manifest example below.
 - **Not admitted:** a missing, unreadable, or invalid manifest on first sight leaves the extension `Unavailable`; it claims no provider or session surface.
@@ -869,6 +880,55 @@ For each enabled ID, and only those, the manager reads `<root>/<id>/extension.js
 - `toolPolicy` lists the policy hooks the extension implements, a subset of `["before", "after"]` without repeats; empty (the default) registers no policy. Only declared hooks are called: a `["before"]` policy never sees results.
 - Section files are read as UTF-8; definition directories use the Rust loaders. These paths must be readable and resolve inside the package. Definition files can declare agents, modes and keywords; teams are ignored with a diagnostic.
 
+### Packaging and install
+
+Location decides the kind of extension. An **authored** extension, written by the user or a repo, lives under a host root and has a plain ID (`[a-z0-9][a-z0-9._-]*`). An **installed** extension is placed by `Extensions::install` in the managed `store` and has a `publisher/name` ID, each part following the plain-ID rule. An ID with a `/` is looked up only in the store, one without only in the roots, so the two never collide. Settings enable both kinds the same way.
+
+#### Authored extensions
+
+An enabled authored package whose `package.json` declares `dependencies`, `devDependencies` or `optionalDependencies` installs them itself. The stamp `node_modules/.axo-install` records a SHA-256 of `package.json` and `bun.lock`; when it is missing or differs, `configure` (or `retry`/`reload`) starts `bun install` in the package folder in the background, under the host's `ProcessSupervisor` with `ExtensionOptions::env`, and returns without waiting. A package without dependencies never installs, and only enabled packages are looked at.
+
+- **Calls wait.** A callback arriving during the install waits for it before the runner starts; status shows `Installing`. A runner that was already live is reloaded when the install finishes, so a call in flight on it fails once.
+- **No lockfile required.** It is a plain `bun install`, exactly as run by hand: it creates `bun.lock` when absent (which the stamp then covers) and runs lifecycle scripts.
+- **Failure.** The extension shows `Disabled` with `bun install failed (<exit status>): <the end of Bun's stderr>`, and its callbacks fail with that reason. The same files are not reinstalled on later rescans or calls; `retry`, `reload`, or a change to `package.json`/`bun.lock` tries again. Installs time out after 10 minutes.
+- **Manual mode.** With `auto_install: false`, a stale package is `Unavailable` ("dependencies are not installed") until the host calls `Extensions::install_dependencies`.
+
+#### Installed extensions
+
+The host acquires a package into any local folder (axo never downloads one) and passes it with an origin string to `Extensions::install(source, origin, replace_origin)`, which covers first install and update:
+
+1. Reads `id` and `sdk` from `<source>/extension.json`: the ID must be `publisher/name` and the SDK declared and compatible.
+2. Refuses an update whose origin differs from the recorded one unless `replace_origin` is set; the record then takes the new origin.
+3. Copies `source` into a fresh version folder, skipping a top-level `node_modules` and `.git`, recreating symlinks as symlinks and refusing other special files, then validates the manifest and entry as discovery would.
+4. When `package.json` declares dependencies, requires `bun.lock` and runs `bun install --frozen-lockfile` there. Lifecycle scripts run.
+5. Only then rewrites the record, keeps the replaced version as the one previous copy (deleting the older one), and reloads the extension if it is enabled: its in-flight calls, and those of group peers sharing its runner, fail and are not replayed.
+
+Any failure leaves the record and the running version untouched and deletes the new folder. One install, rollback or uninstall runs per extension at a time. The store layout is:
+
+```text
+<store>/<publisher>/<name>/install.json   { "origin", "current", "previous" }
+<store>/<publisher>/<name>/v-XXXXXX/      one folder per version
+```
+
+Renaming a new `install.json` into place is the only switch, so it is atomic, and a running runner keeps reading its own version folder until it is reloaded.
+
+| `InstallError` | When |
+| :--- | :--- |
+| `NoStore` | `ExtensionOptions::store` is `None` |
+| `Bun` | Bun is missing or not executable |
+| `Busy` | Another install, rollback or uninstall of that extension is running |
+| `InvalidPackage` | Unreadable or invalid manifest, an ID that is not `publisher/name`, no `sdk`, an invalid entry, or an unsupported file type |
+| `SdkMismatch` | `sdk` is incompatible with `SDK_VERSION`; names both versions |
+| `MissingLockfile` | Dependencies declared but no `bun.lock` |
+| `OriginChanged` | An update from another origin without `replace_origin` |
+| `InstallFailed` | `bun install --frozen-lockfile` failed; carries its exit status and the end of its stderr |
+| `Enabled`, `NotInstalled`, `NoPrevious` | `uninstall` of an enabled extension; no record; `rollback` with no previous version |
+| `Io`, `ShutDown` | A filesystem error; the manager is shut down |
+
+#### Pre-bundled packages
+
+A single file built with `bun build --target=bun --outfile=<package>/index.js <source entry>` has no external imports left and loads as an `entry` with no `package.json`, `node_modules` or install. Native `.node` and `.wasm` assets must ship beside the bundle.
+
 ### Winners, collisions and unavailability
 
 For each provider ID the **last enabled extension declaring it wins**. The manager owns one `ProviderLayer`, newer than any created before it, so a winning extension provider hides a `Models::register` provider and the loaded catalog provider of the same ID (and older layers). Hidden providers are untouched and reappear exactly when the winner goes away: removing the extension from the list, a changed valid declaration, a reorder, or `shutdown`. A failing or crashed winner stays the winner; the hidden provider is never used as a fallback.
@@ -879,10 +939,10 @@ While an extension is `Disabled` or `Unavailable`, its providers stay in `Models
 
 ### Trust boundary
 
-- **Who enables code:** only the user-only `extensions` setting (or a typed list from the host) enables an extension, and only packages under host-supplied `roots` can load. Project layers cannot enable, reorder, or group extensions at any access level (see [Extensions](configuration.md#extensions-extensions--axoenabledextension)). A host that wants project-provided extensions must authorize those roots itself; a session's discovered project files are never published as global providers.
-- **What runs:** extensions are trusted code. The runner is an ordinary OS process with the host user's rights and the `ExtensionOptions::env` environment, started without a sandbox (`ExecSpec::sandbox` is `None`); it may read files and use the network like any program. The data directory `<data_root>/<id>` is created (mode `0700` when new) before activation and passed to the extension as `dataDir`; it is a convenience, not isolation.
-- **No acquisition:** axo never downloads Bun, the SDK, or dependencies. Each runner directory carries a `bunfig.toml` with `install.auto = "disable"`, so importing a package that is not already present fails activation instead of fetching it. An extension may still make its own network calls.
-- **Secrets:** the bridge writes its socket path, a random per-generation nonce, and the generation number into the runner environment (`AXO_EXTENSION_SOCKET`, `AXO_EXTENSION_NONCE`, `AXO_EXTENSION_GENERATION`); the runner deletes them from its environment before importing extension code. Credentials never appear on a command line. Runner stdout and stderr are drained and discarded. Error messages name the extension, provider, and method; they never include tokens, headers, request bodies, prompt answers, or author exception text.
+- **Who enables code:** only the user-only `extensions` setting (or a typed list from the host) enables an extension, and only packages under host-supplied `roots` or in the host-supplied `store` can load. Dependencies install only for enabled extensions, so a repo's extension runs `bun install` only once the user enables it. Project layers cannot enable, reorder, or group extensions at any access level (see [Extensions](configuration.md#extensions-extensions--axoenabledextension)). A host that wants project-provided extensions must authorize those roots itself; a session's discovered project files are never published as global providers.
+- **What runs:** extensions are trusted code. The runner is an ordinary OS process with the host user's rights and the `ExtensionOptions::env` environment, started without a sandbox (`ExecSpec::sandbox` is `None`); it may read files and use the network like any program. The data directory (`ExtensionOptions::data_dir`) is created (mode `0700` when new) before activation and passed to the extension as `dataDir`; it is a convenience, not isolation.
+- **No acquisition:** axo never downloads Bun, the SDK, or packages: the host hands `Extensions::install` a local folder. Dependency installs run the host's Bun with `ExtensionOptions::env`, so they reach whatever registry that environment configures, and run lifecycle scripts. Each runner directory carries a `bunfig.toml` with `install.auto = "disable"`, so importing a package that is not already installed fails activation instead of fetching it. An extension may still make its own network calls.
+- **Secrets:** the bridge writes its socket path, a random per-generation nonce, and the generation number into the runner environment (`AXO_EXTENSION_SOCKET`, `AXO_EXTENSION_NONCE`, `AXO_EXTENSION_GENERATION`); the runner deletes them from its environment before importing extension code. Credentials never appear on a command line. Runner stdout and stderr are drained and discarded. Error messages name the extension, provider, and method; they never include tokens, headers, request bodies, prompt answers, or author exception text. The one exception is a failed dependency install, whose reason carries the end of Bun's stderr, including any output of the package's lifecycle scripts.
 
 ### Runners and supervision
 
@@ -891,10 +951,11 @@ Extensions are placed per **placement**: an ungrouped extension gets its own run
 | `ExtensionPhase` | Meaning |
 | :--- | :--- |
 | `Cold` | Declarations published; no runner yet, or none needed since every member of the placement failed to load (those members show `Disabled`) |
+| `Installing` | An authored package's dependencies are being installed; callbacks wait for the install |
 | `Starting` | The first callback is starting a runner; callers arriving meanwhile share the same startup outcome |
 | `Ready` | The runner answered its handshake and the member activated |
 | `Restarting` | The runner failed and a new generation is starting immediately; callbacks arriving meanwhile fail |
-| `Disabled` | The member's own import or activation failed, or the placement spent its crash budget. Stays so until `retry` or `reload`, or until the member is removed and re-enabled |
+| `Disabled` | The member's own import or activation failed, its dependency install failed, or the placement spent its crash budget. Stays so until `retry` or `reload`, or until the member is removed and re-enabled (a failed install also retries when `package.json` or `bun.lock` changes) |
 | `Unavailable` | Cannot run: not admitted, no or unusable Bun, an entry that failed discovery, or a host/filesystem setup failure such as an overlong socket path. No automatic retry; the next `configure`, `retry` or `reload` re-checks |
 
 - **Start:** each generation gets a fresh private directory below `runtime_dir` (mode `0700`) holding the runner source embedded in the crate, `bunfig.toml`, and the listening socket `rpc`, bound before spawn. The supervisor runs `<bun> run <dir>/runner.ts` with that directory as working directory and no shell. The runner must connect and present the nonce within 15 s; the listener is then closed and the socket path removed. The directory is removed when the generation ends. The socket path is limited to 107 bytes.

@@ -6,6 +6,7 @@
 //! package's `extension.json`; a runner starts only when a callback is first needed. Hosts
 //! layer extensions into sessions with [`Extensions::compose`] and [`Extensions::attach`].
 
+mod deps;
 mod lifecycle;
 mod manifest;
 mod peer;
@@ -14,15 +15,17 @@ mod process;
 mod proxy;
 mod remote;
 mod session;
+mod store;
 mod wire_value;
 
 pub use lifecycle::{
     ForkReceipt, Forked, LIFECYCLE_METHODS, Lifecycle, LifecycleMethod, SessionRequest,
 };
 pub use remote::Failure;
+pub use store::{InstallError, InstalledExtension};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -35,12 +38,17 @@ use futures::future::join_all;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::deps::Deps;
 use crate::manifest::{Descriptor, Member};
 use crate::peer::Actions;
-use crate::placement::Placement;
+use crate::placement::{Placement, Prepare};
 use crate::session::Contribution;
 
 const EVENT_CAPACITY: usize = 256;
+
+/// The extension SDK version this bridge provides. A package's `extension.json` `sdk` must be
+/// caret-compatible with it: the same major above 0, else the same minor above 0, else equal.
+pub const SDK_VERSION: &str = "0.0.0";
 
 /// Registers the bridge's own wire types.
 #[doc(hidden)]
@@ -63,20 +71,43 @@ pub fn wire_types(types: specta::Types) -> specta::Types {
 pub struct ExtensionOptions {
     /// The Bun executable. `None` leaves every extension `Unavailable`.
     pub bun: Option<PathBuf>,
-    /// Package roots searched in order for `<root>/<id>/extension.json`.
+    /// Package roots searched in order for `<root>/<id>/extension.json` (authored extensions).
     pub roots: Vec<PathBuf>,
-    /// Each extension's data directory is `<data_root>/<id>`.
+    /// Holds each extension's data directory; see [`ExtensionOptions::data_dir`].
     pub data_root: PathBuf,
     /// Private per-generation runner directories are created below this.
     pub runtime_dir: PathBuf,
     /// The runner's whole environment (plus the bridge's `AXO_EXTENSION_*` variables).
     pub env: Arc<EnvMap>,
+    /// The managed store for installed (`publisher/name`) extensions. `None` leaves every
+    /// installed extension `Unavailable` and fails every install call.
+    pub store: Option<PathBuf>,
+    /// Whether axo runs `bun install` on its own for an authored extension whose
+    /// dependencies are missing or stale. `false`: the host calls
+    /// [`Extensions::install_dependencies`].
+    pub auto_install: bool,
+}
+
+impl ExtensionOptions {
+    /// The data directory of extension `id`, created before it activates and passed to it as
+    /// `dataDir`: `<data_root>/<id>` for an authored extension and
+    /// `<data_root>/@installed/<publisher>/<name>` for an installed one. `@` cannot start an
+    /// ID, so an authored extension's directory never contains an installed one's.
+    pub fn data_dir(&self, id: &str) -> PathBuf {
+        if id.contains('/') {
+            self.data_root.join("@installed").join(id)
+        } else {
+            self.data_root.join(id)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExtensionPhase {
     /// Declarations published; no runner yet.
     Cold,
+    /// Dependencies are being installed; calls wait for the install.
+    Installing,
     Starting,
     Ready,
     Restarting,
@@ -140,6 +171,17 @@ pub enum ExtensionEvent {
     },
 }
 
+/// One live runner's memory. Reported per process container, never split among the members
+/// sharing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerMemory {
+    /// The extensions the runner serves, in enabled order.
+    pub members: Vec<String>,
+    pub group: Option<String>,
+    /// Proportional set size summed over every process in the runner's container.
+    pub pss_bytes: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error(transparent)]
@@ -150,6 +192,9 @@ pub enum BridgeError {
     ShutDown,
     #[error("unknown extension {0:?}")]
     UnknownExtension(String),
+    /// `install_dependencies` failed; the message carries Bun's output.
+    #[error("{0}")]
+    DependencyInstall(String),
     #[error(transparent)]
     Registry(#[from] axo_ai::Error),
 }
@@ -178,6 +223,8 @@ struct Inner {
     serials: AtomicU64,
     /// Attached sessions; every placement serves their session actions.
     sessions: Arc<session::Registry>,
+    /// Authored dependency installs, one at a time per extension.
+    deps: Arc<Deps>,
 }
 
 #[derive(Default)]
@@ -199,6 +246,10 @@ struct State {
     bindings: BTreeMap<String, Binding>,
     /// Every admitted extension's session contribution, runnable or not, in enabled order.
     contributions: Vec<Arc<Contribution>>,
+    /// Authored extensions whose dependencies are being installed.
+    installing: HashSet<String>,
+    /// Authored extensions whose last dependency install failed, with the reason.
+    install_failed: HashMap<String, String>,
 }
 
 impl State {
@@ -207,7 +258,8 @@ impl State {
         self.enabled
             .iter()
             .map(|ext| {
-                self.overrides
+                let mut status = self
+                    .overrides
                     .get(&ext.id)
                     .or_else(|| self.last.get(&ext.id).map(|(_, status)| status))
                     .cloned()
@@ -217,7 +269,21 @@ impl State {
                         generation: 0,
                         phase: ExtensionPhase::Cold,
                         reason: None,
-                    })
+                    });
+                // A runner not yet started is waiting on (or blocked by) its dependencies.
+                let waiting = matches!(
+                    status.phase,
+                    ExtensionPhase::Cold | ExtensionPhase::Starting
+                );
+                if waiting && self.installing.contains(&ext.id) {
+                    status.phase = ExtensionPhase::Installing;
+                } else if let Some(reason) = self.install_failed.get(&ext.id)
+                    && status.phase == ExtensionPhase::Cold
+                {
+                    status.phase = ExtensionPhase::Disabled;
+                    status.reason = Some(reason.clone());
+                }
+                status
             })
             .collect()
     }
@@ -280,6 +346,11 @@ impl Extensions {
             inner: Arc::new_cyclic(|inner| Inner {
                 layer: axo.models().provider_layer(),
                 supervisor: axo.supervisor(),
+                deps: Arc::new(Deps::new(
+                    options.bun.clone(),
+                    Arc::clone(&options.env),
+                    axo.supervisor(),
+                )),
                 axo,
                 lifecycle: Mutex::default(),
                 options,
@@ -330,8 +401,10 @@ impl Extensions {
     /// Rescans, and re-arms `id`'s placement if `id` is disabled or unavailable: a
     /// load-disabled member is reloaded alone (its peers keep their own load failures); a
     /// placement disabled by its crash budget restarts cold with a fresh budget. Like
-    /// `configure`, it also rebuilds any placement whose setup failed.
+    /// `configure`, it also rebuilds any placement whose setup failed. A failed dependency
+    /// install is attempted again.
     pub async fn retry(&self, id: &str) -> Result<(), BridgeError> {
+        self.inner.forget_install_failure(id);
         let inner = Arc::clone(&self.inner);
         run(inner.reconcile(None, Some(Rearm::Retry(id.to_owned()))))
             .await
@@ -341,12 +414,127 @@ impl Extensions {
     /// Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the
     /// next callback imports the package's current code. `configure` cannot see code-only
     /// changes: it compares declarations, not files. Group peers share the runner and are
-    /// recycled with it; their own load failures are kept, `id`'s is cleared.
+    /// recycled with it; their own load failures are kept, `id`'s is cleared, and a failed
+    /// dependency install is attempted again.
     pub async fn reload(&self, id: &str) -> Result<(), BridgeError> {
+        self.inner.forget_install_failure(id);
         let inner = Arc::clone(&self.inner);
         run(inner.reconcile(None, Some(Rearm::Reload(id.to_owned()))))
             .await
             .unwrap_or(Err(BridgeError::ShutDown))
+    }
+
+    /// Installs the dependencies of enabled authored extension `id` now (the path when
+    /// `ExtensionOptions::auto_install` is off), then reloads it. Runs Bun even after a failed
+    /// install of the same files.
+    pub async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError> {
+        let inner = Arc::clone(&self.inner);
+        let id = id.to_owned();
+        run(async move {
+            let enabled = inner.lock().enabled.iter().any(|ext| ext.id == id);
+            if !enabled || id.contains('/') {
+                return Err(BridgeError::UnknownExtension(id));
+            }
+            let (package, _) = manifest::locate(&id, &inner.options)
+                .await
+                .map_err(BridgeError::DependencyInstall)?;
+            inner.forget_install_failure(&id);
+            inner
+                .ensure_dependencies(&id, &package)
+                .await
+                .map_err(BridgeError::DependencyInstall)?;
+            inner.reconcile(None, Some(Rearm::Reload(id))).await
+        })
+        .await
+        .unwrap_or(Err(BridgeError::ShutDown))
+    }
+
+    /// Installs the package folder `source` (its `extension.json` names a `publisher/name` ID
+    /// and an `sdk`) into the store: copies it without `node_modules` or `.git`, runs
+    /// `bun install --frozen-lockfile` when it declares dependencies (a `bun.lock` is then
+    /// required), and switches to it only on success, keeping the replaced version for
+    /// `rollback`. An update must come from the recorded `origin` unless `replace_origin`.
+    /// An enabled extension is reloaded at once: its in-flight calls, and its group peers',
+    /// fail. Installing does not enable it.
+    pub async fn install(
+        &self,
+        source: &Path,
+        origin: &str,
+        replace_origin: bool,
+    ) -> Result<InstalledExtension, InstallError> {
+        let inner = Arc::clone(&self.inner);
+        run(inner.install(source.to_owned(), origin.to_owned(), replace_origin))
+            .await
+            .unwrap_or(Err(InstallError::ShutDown))
+    }
+
+    /// Swaps installed `id`'s current and previous versions (a second rollback goes forward
+    /// again) and reloads it if enabled.
+    pub async fn rollback(&self, id: &str) -> Result<InstalledExtension, InstallError> {
+        let inner = Arc::clone(&self.inner);
+        run(inner.rollback(id.to_owned()))
+            .await
+            .unwrap_or(Err(InstallError::ShutDown))
+    }
+
+    /// Deletes installed `id`'s package and its previous version; refuses while it is enabled.
+    /// `delete_data` also deletes its data directory; nothing else it wrote is touched.
+    pub async fn uninstall(&self, id: &str, delete_data: bool) -> Result<(), InstallError> {
+        let inner = Arc::clone(&self.inner);
+        run(inner.uninstall(id.to_owned(), delete_data))
+            .await
+            .unwrap_or(Err(InstallError::ShutDown))
+    }
+
+    /// Every extension in the store, sorted by ID; unreadable records are skipped.
+    pub async fn installed(&self) -> Result<Vec<InstalledExtension>, InstallError> {
+        self.inner.installed().await
+    }
+
+    /// One entry per runner that is currently alive, in the enabled order of its first
+    /// member. A runner whose memory cannot be read is omitted.
+    pub async fn memory(&self) -> Vec<RunnerMemory> {
+        let placements: Vec<Installed> = {
+            let state = self.inner.lock();
+            let mut placements: Vec<(usize, Installed)> = state
+                .placements
+                .values()
+                .map(|installed| {
+                    let first = installed.members.first().map(|m| m.id.as_str());
+                    let position = state
+                        .enabled
+                        .iter()
+                        .position(|ext| Some(ext.id.as_str()) == first);
+                    (position.unwrap_or(usize::MAX), installed.clone())
+                })
+                .collect();
+            placements.sort_by_key(|(position, _)| *position);
+            placements
+                .into_iter()
+                .map(|(_, installed)| installed)
+                .collect()
+        };
+        let live: Vec<_> = placements
+            .into_iter()
+            .filter_map(|installed| {
+                let container = installed.placement.container()?;
+                let members = installed.members.iter().map(|m| m.id.clone()).collect();
+                Some((members, installed.group, container))
+            })
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            live.into_iter()
+                .filter_map(|(members, group, container)| {
+                    Some(RunnerMemory {
+                        members,
+                        group,
+                        pss_bytes: container.memory()?,
+                    })
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Closes admission, restores every attached session to its host registrations and stops
@@ -387,6 +575,80 @@ impl Inner {
 
     fn snapshot(&self) -> Vec<ExtensionStatus> {
         self.lock().statuses()
+    }
+
+    /// Applies `change` and emits `StateChanged` if `id`'s committed status moved.
+    fn mark(&self, id: &str, change: impl FnOnce(&mut State)) {
+        let mut state = self.lock();
+        let status = |state: &State| state.statuses().into_iter().find(|s| s.id == id);
+        let before = status(&state);
+        change(&mut state);
+        if let Some(after) = status(&state)
+            && Some(&after) != before.as_ref()
+        {
+            let _ = self.events.send(ExtensionEvent::StateChanged(after));
+        }
+    }
+
+    fn forget_install_failure(&self, id: &str) {
+        self.deps.forget(id);
+        self.mark(id, |state| {
+            state.install_failed.remove(id);
+        });
+    }
+
+    /// Installs authored `id`'s dependencies unless current, publishing `Installing` while Bun
+    /// runs and `Disabled` with the reason when it fails. `Ok(true)` when an install ran.
+    async fn ensure_dependencies(&self, id: &str, package: &Path) -> Result<bool, String> {
+        let started = || {
+            self.mark(id, |state| {
+                state.installing.insert(id.to_owned());
+            })
+        };
+        let result = tokio::select! {
+            result = self.deps.ensure(id, package, started) => result,
+            () = self.closed.cancelled() => return Err(BridgeError::ShutDown.to_string()),
+        };
+        self.mark(id, |state| {
+            state.installing.remove(id);
+            match &result {
+                Ok(_) => state.install_failed.remove(id),
+                Err(reason) => state.install_failed.insert(id.to_owned(), reason.clone()),
+            };
+        });
+        result
+    }
+
+    /// What a placement runs before starting a generation: an authored member waits for its
+    /// dependencies. Holds the manager weakly, so a placement never keeps it alive.
+    fn preparer(self: &Arc<Self>) -> Prepare {
+        let inner = Arc::downgrade(self);
+        Arc::new(move |member: Member| {
+            let inner = inner.clone();
+            Box::pin(async move {
+                let Some(inner) = inner.upgrade() else {
+                    return Err(BridgeError::ShutDown.to_string());
+                };
+                if member.id.contains('/') || !inner.options.auto_install {
+                    return Ok(());
+                }
+                inner
+                    .ensure_dependencies(&member.id, &member.package)
+                    .await
+                    .map(drop)
+            })
+        })
+    }
+
+    /// Installs `id`'s stale dependencies in the background. A runner that was already live
+    /// is reloaded once they changed (its in-flight calls fail, as for any reload); a cold one
+    /// is not, since a call may be waiting on it.
+    fn spawn_install(self: Arc<Self>, id: String, package: PathBuf, was_running: bool) {
+        tokio::spawn(async move {
+            if self.ensure_dependencies(&id, &package).await == Ok(true) && was_running {
+                let _ = self.reconcile(None, Some(Rearm::Reload(id))).await;
+            }
+        });
     }
 
     /// A placement's state change. Ignored unless `serial` still runs that extension and the
@@ -462,10 +724,14 @@ impl Inner {
         });
 
         // Discovery: read-only, so nothing is lost if it fails midway.
-        let roots = &self.options.roots;
+        let options = &self.options;
         let (bun, found) = tokio::join!(
-            async { process::usable_bun(self.options.bun.as_deref()).await.err() },
-            join_all(enabled.iter().map(|ext| manifest::discover(&ext.id, roots)))
+            async { process::usable_bun(options.bun.as_deref()).await.err() },
+            join_all(
+                enabled
+                    .iter()
+                    .map(|ext| manifest::discover(&ext.id, options))
+            )
         );
         let mut accepted_next = HashMap::new();
         let mut overrides = HashMap::new();
@@ -473,6 +739,8 @@ impl Inner {
         // Admitted extensions: declarations, and why they cannot run (if they cannot).
         let mut usable: HashMap<&str, (Member, Option<String>)> = HashMap::new();
         let mut contributions = Vec::new();
+        // Admitted authored extensions whose dependencies need installing.
+        let mut stale = Vec::new();
         for (ext, result) in enabled.iter().zip(found) {
             let (member, contribution, problem) = match result {
                 Ok(found) => {
@@ -503,7 +771,20 @@ impl Inner {
                     }
                 },
             };
-            let problem = problem.or_else(|| bun.clone());
+            let mut problem = problem.or_else(|| bun.clone());
+            if problem.is_none() && !ext.id.contains('/') {
+                let id = &ext.id;
+                match deps::stale(&member.package).await {
+                    Err(error) => problem = Some(format!("extension {id}: {error}")),
+                    Ok(true) if !options.auto_install => {
+                        problem = Some(format!(
+                            "extension {id}: dependencies are not installed; call Extensions::install_dependencies"
+                        ));
+                    }
+                    Ok(true) => stale.push((id.clone(), member.package.clone())),
+                    Ok(false) => {}
+                }
+            }
             if let Some(problem) = &problem {
                 overrides.insert(ext.id.clone(), unavailable(ext, problem.clone()));
             }
@@ -564,6 +845,7 @@ impl Inner {
                 self.options.clone(),
                 Arc::clone(&self.supervisor),
                 reporter(Arc::downgrade(&self), serial),
+                self.preparer(),
                 Arc::clone(&self.sessions) as Arc<dyn Actions>,
             );
             if let Some(old) = old
@@ -697,7 +979,7 @@ impl Inner {
 
         // Commit: fence displaced winners, publish the whole set at once, and emit what
         // changed, all under the state lock reports take, then reap outside it.
-        let (retired, unchanged) = {
+        let (retired, unchanged, installs) = {
             let mut state = self.lock();
             let state = &mut *state;
             let before = state.statuses();
@@ -772,7 +1054,19 @@ impl Inner {
                         .send(ExtensionEvent::Diagnostic(diagnostic.clone()));
                 }
             }
-            (retired, unchanged)
+            let installs: Vec<(String, PathBuf, bool)> = stale
+                .into_iter()
+                .map(|(id, package)| {
+                    let running = state.last.get(&id).is_some_and(|(_, status)| {
+                        !matches!(
+                            status.phase,
+                            ExtensionPhase::Cold | ExtensionPhase::Starting
+                        )
+                    });
+                    (id, package, running)
+                })
+                .collect();
+            (retired, unchanged, installs)
         };
         for (placement, order) in reordered {
             placement.reorder(&order);
@@ -782,6 +1076,9 @@ impl Inner {
             session::reapply(&self).await;
         }
         join_all(retired.iter().map(|p| p.shutdown())).await;
+        for (id, package, was_running) in installs {
+            Arc::clone(&self).spawn_install(id, package, was_running);
+        }
         Ok(())
     }
 
@@ -846,6 +1143,7 @@ fn validate_options(options: &ExtensionOptions) -> Result<(), BridgeError> {
         .iter()
         .map(|path| ("bun", path))
         .chain(options.roots.iter().map(|path| ("root", path)))
+        .chain(options.store.iter().map(|path| ("store", path)))
         .chain([
             ("data_root", &options.data_root),
             ("runtime_dir", &options.runtime_dir),

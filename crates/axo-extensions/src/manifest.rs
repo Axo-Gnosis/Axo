@@ -1,4 +1,7 @@
 //! Static discovery: read an enabled extension's `extension.json` without running it.
+//!
+//! A plain ID names an authored package under the host's roots; a `publisher/name` ID names
+//! an installed package in the managed store, at the version its install record names.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -13,12 +16,16 @@ use axo_ai::{Model, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MANIFEST: &str = "extension.json";
+use crate::{ExtensionOptions, SDK_VERSION, store};
+
+pub const MANIFEST: &str = "extension.json";
 
 /// One admitted package: its validated declarations and absolute entry path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Member {
     pub id: String,
+    /// The package directory as located: a root's `<id>` folder or a store version folder.
+    pub package: PathBuf,
     /// Inside the package when its entry check passed; otherwise the declared path, kept
     /// only for comparison across rescans.
     pub entry: PathBuf,
@@ -163,6 +170,9 @@ struct DefinitionDirs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
     id: String,
+    /// The extension SDK version the package was built for; required when installed.
+    #[serde(default)]
+    sdk: Option<String>,
     entry: String,
     #[serde(default)]
     providers: Vec<Descriptor>,
@@ -200,15 +210,40 @@ pub struct Discovered {
     pub keywords: Vec<KeywordSpec>,
 }
 
-/// Reads `<root>/<id>/extension.json` from the first root that has one.
+/// Locates and loads `id`'s package; see [`locate`] and [`load`].
 ///
-/// `Err` means the package is not admitted (no manifest, unreadable or invalid
-/// declarations, unreadable section files or definition directories). `id` must already
-/// be a valid extension ID.
-pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String> {
+/// `Err` means the package is not admitted (not found, unreadable or invalid declarations,
+/// an incompatible SDK, unreadable section files or definition directories). `id` must
+/// already be a valid extension ID.
+pub async fn discover(id: &str, options: &ExtensionOptions) -> Result<Discovered, String> {
+    let (package, diagnostics) = locate(id, options).await?;
+    let mut found = load(id, &package).await?;
+    found.diagnostics.splice(0..0, diagnostics);
+    Ok(found)
+}
+
+/// The package directory of `id`, plus diagnostics for ignored duplicates. A plain ID is the
+/// first `<root>/<id>` holding an `extension.json`; a `publisher/name` ID is the store's
+/// current version folder.
+pub async fn locate(
+    id: &str,
+    options: &ExtensionOptions,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if id.contains('/') {
+        let store = options
+            .store
+            .as_deref()
+            .ok_or_else(|| format!("extension {id}: no extension store configured"))?;
+        let dir = store.join(id);
+        return match store::read_record(&dir).await {
+            Ok(Some(record)) => Ok((dir.join(record.current), Vec::new())),
+            Ok(None) => Err(format!("extension {id}: not installed")),
+            Err(error) => Err(format!("extension {id}: {error}")),
+        };
+    }
     let mut chosen: Option<PathBuf> = None;
     let mut diagnostics = Vec::new();
-    for root in roots {
+    for root in &options.roots {
         let path = root.join(id).join(MANIFEST);
         match tokio::fs::metadata(&path).await {
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
@@ -230,6 +265,14 @@ pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String>
             "extension {id}: no {MANIFEST} in any extension root"
         ));
     };
+    let package = path.parent().expect("manifest has a directory").to_owned();
+    Ok((package, diagnostics))
+}
+
+/// Reads and validates `<package>/extension.json` for `id`.
+pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
+    let path = package.join(MANIFEST);
+    let mut diagnostics = Vec::new();
     let fail = |what: String| format!("extension {id}: {}: {what}", path.display());
     let text = tokio::fs::read_to_string(&path)
         .await
@@ -241,6 +284,17 @@ pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String>
             "manifest id {:?} does not match the directory",
             manifest.id
         )));
+    }
+    match &manifest.sdk {
+        Some(declared) if !compatible(declared, SDK_VERSION) => {
+            return Err(fail(format!(
+                "built for extension SDK {declared}, but this axo provides {SDK_VERSION}"
+            )));
+        }
+        None if id.contains('/') => {
+            return Err(fail("an installed extension must declare \"sdk\"".into()));
+        }
+        _ => {}
     }
     let mut seen = HashSet::with_capacity(manifest.providers.len());
     for descriptor in &manifest.providers {
@@ -254,7 +308,6 @@ pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String>
     }
     validate_session(&manifest).map_err(fail)?;
 
-    let package = path.parent().expect("manifest has a directory");
     let mut sections = Vec::with_capacity(manifest.sections.len());
     for section in &manifest.sections {
         let what = |why: String| {
@@ -321,6 +374,7 @@ pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String>
     Ok(Discovered {
         member: Member {
             id: manifest.id,
+            package: package.to_owned(),
             entry,
             providers: manifest.providers,
             session: SessionDecl {
@@ -339,6 +393,25 @@ pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String>
         modes: modes.0,
         keywords: keywords.0,
     })
+}
+
+/// Whether a package built for SDK `declared` runs on `provided`, by the caret rule: the same
+/// major when it is above 0, else the same minor when that is above 0, else the same version.
+/// Both must be exactly `major.minor.patch`.
+pub fn compatible(declared: &str, provided: &str) -> bool {
+    fn parse(version: &str) -> Option<[u64; 3]> {
+        let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+        let version = [parts.next()??, parts.next()??, parts.next()??];
+        parts.next().is_none().then_some(version)
+    }
+    let (Some(d), Some(p)) = (parse(declared), parse(provided)) else {
+        return false;
+    };
+    match d {
+        [0, 0, _] => d == p,
+        [0, _, _] => d[..2] == p[..2],
+        _ => d[0] == p[0],
+    }
 }
 
 /// Names and shapes the session declarations must have to be admitted.
@@ -457,6 +530,69 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// Discovery over authored `roots` alone.
+    async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String> {
+        let options = ExtensionOptions {
+            bun: None,
+            roots: roots.to_vec(),
+            data_root: "/".into(),
+            runtime_dir: "/".into(),
+            env: Default::default(),
+            store: None,
+            auto_install: false,
+        };
+        super::discover(id, &options).await
+    }
+
+    #[test]
+    fn sdk_compatibility_follows_the_caret_rule() {
+        for (declared, provided, ok) in [
+            ("0.0.0", "0.0.0", true),
+            ("0.0.1", "0.0.0", false),
+            ("0.2.0", "0.2.9", true),
+            ("0.2.0", "0.3.0", false),
+            ("1.2.0", "1.9.0", true),
+            ("1.0.0", "2.0.0", false),
+            ("1.0", "1.0.0", false),
+            ("1.0.0.0", "1.0.0", false),
+            ("^1.0.0", "1.0.0", false),
+        ] {
+            assert_eq!(
+                compatible(declared, provided),
+                ok,
+                "{declared} on {provided}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let with_sdk = |id: &str, sdk: Option<&str>| {
+            let mut manifest = json!({ "id": id, "entry": "index.ts" });
+            if let Some(sdk) = sdk {
+                manifest["sdk"] = sdk.into();
+            }
+            package(&root, id, &manifest, Some("index.ts"))
+        };
+        with_sdk("current", Some(SDK_VERSION));
+        with_sdk("plain", None);
+        with_sdk("future", Some("9.9.9"));
+        let roots = [root.clone()];
+        assert!(discover("current", &roots).await.is_ok());
+        assert!(discover("plain", &roots).await.is_ok());
+        let error = discover("future", &roots).await.unwrap_err();
+        assert!(
+            error.contains("9.9.9") && error.contains(SDK_VERSION),
+            "{error}"
+        );
+        // An installed package must declare its SDK.
+        let package = with_sdk("lab/pkg", None);
+        let error = load("lab/pkg", &package).await.unwrap_err();
+        assert!(error.contains("must declare \"sdk\""), "{error}");
+    }
 
     fn model(provider: &str, id: &str) -> Value {
         json!({

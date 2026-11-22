@@ -8,7 +8,7 @@ This is the live planning document for unbuilt work and active design discussion
 
 ## Overview of tracks
 
-M1–M5 plus Tracks 2, 3 and 4 are complete. Track 5 has shipped providers, logins, session contributions and extension API parity through `axo-extensions`; packaging remains open. Extensions do not wait for codemode; `axo-acp` is deferred.
+M1–M5 plus Tracks 2, 3 and 4 are complete. Track 5 has shipped providers, logins, session contributions, extension API parity and packaging through `axo-extensions`. Extensions do not wait for codemode; `axo-acp` is deferred.
 
 ```mermaid
 flowchart LR
@@ -19,14 +19,14 @@ flowchart LR
   T1 -.builds on shipped spawn.-> S2["Track 2: Shipped"]
   N -.reused by.-> MCP["MCP adapter (Track 5)"]
   E["Extensions (Track 5)"] --> B["Providers and logins (implemented)"] --> P3["Session contributions (implemented)"]
-  B --> P4["Packaging (planned)"]
+  B --> P4["Packaging (implemented)"]
   P3 --> A["Extension API parity (plans A and B implemented)"]
 ```
 
 | Track | Scope | Status |
 |---|---|---|
 | **1. Codemode & script extensions** | Embedded JS sandbox (QuickJS/Boa engine evaluation), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and script hooks on spawned specs (rungs 2–5) | Rungs 0–1 scoped; rungs 2+ in discussion. Not the current implementation priority |
-| **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs | **Phases 1–3 and extension API parity plans A and B implemented.** Packaging (phase 4) remains open; MCP and `ast_edit` are deferred |
+| **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs | **Phases 1–4 and extension API parity plans A and B implemented.** MCP and `ast_edit` are deferred |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
 | **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | Designed 2026-11-21; not started |
 | **Tool surface & session modes** | Deferred tools, action tools, scoped host policy, cache-safe root mode overlays and completion | **Shipped (A–H).** See [Shipped tracks](#shipped-tracks) |
@@ -297,7 +297,7 @@ Key risks to design around when building step 3 (script hooks):
 
 ### Status and settled direction
 
-**Phases 1–3 and extension API parity plans A and B implemented; packaging remains open.** The `axo-extensions` bridge loads TS/JS providers and session contributions under supervised Bun runners. See the [runtime reference](../crates/axo/docs/extending.md#4-bun-extensions-axo-extensions) and [enablement setting](../crates/axo/docs/configuration.md#extensions-extensions--axoenabledextension). Packaging and the MCP adapter do not exist.
+**Phases 1–4 and extension API parity plans A and B implemented.** The `axo-extensions` bridge loads TS/JS providers and session contributions under supervised Bun runners, installs their npm dependencies and manages a store of installed extensions. See the [runtime reference](../crates/axo/docs/extending.md#4-bun-extensions-axo-extensions) and [enablement setting](../crates/axo/docs/configuration.md#extensions-extensions--axoenabledextension). The MCP adapter does not exist.
 
 The [parity and authority rules](design.md#extension-parity-and-authority) govern which public Rust methods are bound and why a method may be withheld. There is no codemode dependency.
 
@@ -358,9 +358,9 @@ Phase 1 precedes 2; phases 3 and 4 depend on 2 and can proceed independently. AP
 
 - **Embedding.** `axo_extensions::Extensions::new(axo, options)` uses the model registry and supervisor of the host's `Arc<Axo>`; `configure(&[EnabledExtension])` reconciles, `status`/`collisions`/`diagnostics`/`subscribe` report typed state, `retry` re-arms a disabled member, `reload` replaces a placement after a code-only package change, and `shutdown` reaps runners and removes the layer. The user-only `extensions` setting (`[{ id, group? }]`) supplies order and grouping; project layers cannot enable code. No session is created to start providers.
 - **Static catalog, lazy code.** Each enabled package's `extension.json` declares its id, entry and providers with full model metadata and `login`/`rewrite` capabilities. Discovery reads only enabled IDs from host roots and never executes code; the last enabled declaring extension wins a provider id, and hidden contributors are reported. Winners are published as one atomic `ProviderLayer` replacement. A failed rescan keeps the last accepted declarations, marked unavailable. Bun starts on the first login, refresh or rewrite that needs it.
-- **Runner and transport.** The TS runner is embedded with `include_str!`, written per generation into a private `0700` directory under `runtime_dir` with a `bunfig.toml` disabling auto-install, and run as `bun run <runner>` through the host's `ProcessSupervisor` in either process-group or cgroup mode. Length-prefixed JSON frames (64 MiB bound) travel over a Unix-domain socket bound before spawn and authenticated by a per-generation nonce; stdin/stdout carry no protocol. The bridge is therefore Unix-only. Authors write against the type-only `@axo/extension-sdk` (`packages/axo-extension-sdk`); no runtime SDK, package installation or compatibility check is involved.
+- **Runner and transport.** The TS runner is embedded with `include_str!`, written per generation into a private `0700` directory under `runtime_dir` with a `bunfig.toml` disabling auto-install, and run as `bun run <runner>` through the host's `ProcessSupervisor` in either process-group or cgroup mode. Length-prefixed JSON frames (64 MiB bound) travel over a Unix-domain socket bound before spawn and authenticated by a per-generation nonce; stdin/stdout carry no protocol. The bridge is therefore Unix-only. Authors write against the type-only `@axo/extension-sdk` (`packages/axo-extension-sdk`); there is no runtime SDK (Phase 4 added dependency installs and the manifest's `sdk` check).
 - **Contract.** The runner serves `login` (with nested URL/device-code/prompt/select/progress callbacks to the host's `LoginInteraction`), `refresh` and `rewrite` (complete URL/headers/body replacement, preserving duplicate and binary header values). Rust validates every reply, keeps credential storage and locked refresh, and sends and parses HTTP itself; inference bytes never cross the socket.
-- **Lifecycle.** One placement per extension or user group, shared across sessions. States `Cold`, `Starting`, `Ready`, `Restarting`, `Disabled`, `Unavailable`. A 2 s heartbeat with a 10 s deadline detects blocked JS; handshake and per-member activation are bounded at 15 s; refresh/rewrite calls at 60 s, while human login stays cancelable without a short deadline. Runner death, protocol corruption or a hang counts one failure for the whole placement; restarts follow failures 1 and 2, and a third within 300 s disables the placement with an event. A clean import/activation rejection disables only that member. Missing or unusable Bun leaves claims in place as `Unavailable`.
+- **Lifecycle.** One placement per extension or user group, shared across sessions. States `Cold`, `Starting`, `Ready`, `Restarting`, `Disabled`, `Unavailable` (Phase 4 added `Installing`). A 2 s heartbeat with a 10 s deadline detects blocked JS; handshake and per-member activation are bounded at 15 s; refresh/rewrite calls at 60 s, while human login stays cancelable without a short deadline. Runner death, protocol corruption or a hang counts one failure for the whole placement; restarts follow failures 1 and 2, and a third within 300 s disables the placement with an event. A clean import/activation rejection disables only that member. Missing or unusable Bun leaves claims in place as `Unavailable`.
 - **Failure boundary.** Interrupted callbacks fail with `ProviderUnavailable`, carried as a nonretryable `provider_unavailable` terminal failure, and are never replayed. Killing Bun **before** a rewrite replies fails that request without sending HTTP; killing it **after** Rust sent the rewritten request leaves that stream to finish normally. A canceled waiter does not cancel an in-flight refresh, which completes and saves its credential.
 
 **Acceptance:** deterministic checks (`cargo test -p axo-ai --test providers`, `-p axo --test settings`, `-p axo-extensions --test bridge`) need no Bun. The real-process target `cargo test -p axo-extensions --test bun_provider` runs only with `AXO_TEST_BUN` set to an absolute Bun path (an unusable value fails rather than skips) and covers login, a single locked refresh under concurrency, rewritten streaming with an unchanged tool name, both kill points, the shared 3-in-5 disable, a synchronous hang, descendant cleanup and shutdown reaping. Adding `AXO_TEST_CGROUP=1` in a delegated cgroup repeats the lifecycle under `Supervision::Cgroup`, including a detached in-cgroup child. Process groups cannot contain descendants that leave their group; only the cgroup mode claims that.
@@ -383,18 +383,44 @@ Each public `Session` method has an exposure decision: `#[expose]` generates dis
 
 Tool handlers get guarded file and command operations; the host object delegates lifecycle requests to an optional host hook, and the models object supports one-off and streamed completions. The [surface guard](../crates/axo/tests/ext_surface.rs) checks method and free-function decisions. See the [generated reference](../crates/axo/docs/extension-api.md) for callable methods and reasons for withholding others.
 
-#### Phase 4: Packaging and install
+#### Phase 4: Packaging and install (implemented)
 
-**Goal:** a host can install and update dependency-bearing extensions through axo without manual steps. Phase 4 is axo-only; host integration is outside it.
+**Goal:** extensions with npm dependencies run without manual steps, whether the user wrote them or installed them. Phase 4 is axo-only; host integration is outside it.
 
-- **Acquisition stays host-owned.** The host puts the package directory on disk; axo installs its dependencies and reports failures as typed errors carrying Bun's output.
-- **Install** runs `bun install` with the host's Bun under `ProcessSupervisor`. It requires a `bun.lock` and refuses a package without one. Lifecycle scripts run: they add no authority a trusted extension lacks, and native packages need them.
-- **Update and rollback.** Install into a staging sibling of the package directory, swap it into place with a same-filesystem rename only on success, then `reload`. A failed install leaves the running version untouched.
+**Two independent axes.** *Scope* is where an extension applies: every session of the user, or only one project's sessions. *Management* is who owns its files: an *authored* extension is written and maintained by the user or the repo (edited by hand, kept in git); an *installed* extension is fetched by axo's install call and owned by axo (updated, rolled back and removed by axo, never edited by hand). An extension the user writes in their home extensions folder is authored even though it applies everywhere.
+
+| | Authored | Installed |
+|---|---|---|
+| **User** | a host root in the user's home, e.g. `~/.axome/extensions/bun-guard/` | axo's managed store, a host-supplied directory inside the host's data dir |
+| **Project** | a host root inside the repo, e.g. `repo/.axome/extensions/lint-rules/`, committed with it | not scheduled: a project declaring that it wants an installed extension |
+
+Location decides the kind: host roots hold authored extensions, the managed store holds installed ones, and the two never mix.
+
+- **Manifests stay.** Every extension keeps declaring its contributions in `extension.json`; the runner never runs code to learn them, so lazy start, visible failures and pre-execution collision handling remain. omp/pi-style registration in code, or axo generating the manifest from code, was weighed and set aside for now; revisit if writing real extensions shows the manifest is a burden.
+- **Identity follows management.** Authored extensions keep a plain name, with no publisher, origin, rollback or uninstall; two sharing a name resolve by host root order, as today. Installed extensions are named `publisher/name` and pinned to the host-supplied origin string recorded at first install; an update from another origin is refused unless the host passes an explicit replace flag. A plain name never collides with an installed `publisher/name`.
+
+**Authored extensions: dependencies install themselves.**
+
+- When discovery finds an authored extension whose `package.json` declares dependencies and whose install stamp is missing or stale, axo starts `bun install` in its folder in the background, under `ProcessSupervisor`, without blocking `configure`. The stamp lives under `node_modules` and records a hash of `package.json` and `bun.lock`, so a fresh clone, a pull that changes dependencies, or an edit to `package.json` triggers a new install; an extension without dependencies never installs.
+- An activation that arrives while the install runs waits for it. Status reports the extension as `Installing`, then `Cold` (or its live phase), or `Disabled` with Bun's output when the install fails; an unchanged failed package is not reinstalled until `retry`, `reload` or a change to `package.json`/`bun.lock`. A runner that was already live is reloaded once the install changed its dependencies. One install runs per extension at a time.
+- No lockfile is required: a plain `bun install` creates `bun.lock` if absent, exactly as running it by hand would, including in a repo. Lifecycle scripts run.
+- Installing dependencies needs no trust beyond running the extension: a project's extensions run only when the host includes that project's folder as a root.
+- A host option (`ExtensionOptions::auto_install`) turns automatic installs off; discovery then reports the extension `Unavailable` as needing install and the host calls `Extensions::install_dependencies`.
+
+**Installed extensions: one install call does everything.**
+
+- **Acquisition stays host-owned.** The host fetches a package into any folder and hands it, with its origin string, to axo's install call; axo copies it, installs its dependencies and places it in the managed store. One call covers first install and update. Typed errors distinguish missing Bun, missing `bun.lock`, an invalid manifest, an SDK mismatch, a refused origin change, a failed `bun install` (exit status and Bun's output) and an install already running for that extension.
+- **Install** runs `bun install --frozen-lockfile` with the host's Bun under `ProcessSupervisor` and refuses a package without `bun.lock`: an installed version must be reproducible. Lifecycle scripts run: they add no authority a trusted extension lacks, and native packages need them.
+- **Update and rollback.** Each install copies the package into a fresh per-version folder beside an `install.json` record naming the current and previous versions; renaming a new record into place is the only switch, so it is atomic, and a running runner keeps its own version folder until it is reloaded. The record switches only on success, then the extension reloads immediately: in-flight calls of the extension, and of group peers sharing its runner, fail visibly and are not replayed. A failed install leaves the running version untouched. The replaced version is kept as one previous copy; a `rollback` call swaps current and previous, since a version that installs cleanly can still fail on its first lazy activation.
+- **Uninstall** is distinct from disabling (removal from the enabled list, which already withdraws every contribution). axo's uninstall refuses an enabled extension, then deletes its package folder and previous copy. Deleting its data is an explicit option, off by default, and removes only the data directory axo assigned (`<data root>/@installed/<publisher>/<name>`, kept apart from authored extensions' `<data root>/<id>` so an authored `lab` never contains an installed `lab/pkg`'s data); the docs state plainly that files an extension wrote anywhere else are untouched, because that directory is a suggestion, not a sandbox.
+
+**Both kinds.**
+
 - **Pre-bundled single file** needs no install: `bun build --target=bun` output with no external imports already loads as an `entry`. Document it and cover it with a fixture; native `.node` and `.wasm` assets must ship beside the bundle.
 - **SDK compatibility.** `extension.json` declares the SDK version it was built against; Rust checks it during discovery, before Bun starts, and refuses a mismatch naming both versions. Settled: while axo is in development the SDK version stays `0.0.0` and is not bumped for breaking changes; versioning becomes meaningful only when Toph declares axo out of development.
 - **Memory reporting** by runner (process group, or cgroup under cgroup supervision), never split per member of a shared runner. No memory cap.
 
-**Acceptance:** through axo's public install API, a test host installs a fixture extension with an npm dependency and calls one of its tools; a manifest declaring another SDK version is refused with both versions named; a failed update leaves the previous version running. Install tests that need network or a warmed cache are opt-in like the other real-Bun tests.
+**Acceptance:** an authored fixture extension with an npm dependency and no `node_modules` installs itself after `configure` and runs a tool, and a second `configure` with the stamp current does not reinstall; through axo's public install API a test host installs an installed fixture with an npm dependency and calls one of its tools; an update from another origin is refused without the replace flag; a manifest declaring another SDK version is refused with both versions named; a failed update leaves the previous version running. `cargo test -p axo-extensions --test bridge install` covers these offline with a scripted `bun install`; the opt-in `bun_provider` target runs the `lab-deps` fixture (a `file:` dependency, so still offline) authored, installed and pre-bundled, and reads runner memory.
 
 ### Evidence and remaining phase-plan work
 
@@ -402,9 +428,8 @@ The [extension-system study](research/extensions.md) records OMP, pi, Octet, Cla
 
 The [Bun study](research/bun-topology.md) preserves the original shared-loop/Worker experiment and a separate process-per-extension follow-up. The latter informed the selected process default. Whole-tree PSS, workloads, retained dependencies and measurement availability matter; the follow-up's programs/raw data were not retained, and its figures are not directly comparable to the earlier workload. Killing a Bun runner does not kill the Rust host. Process boundaries permit cleanup and attribution, not automatic quotas or OS sandboxing.
 
-Phase 4 reuses the supervised transport and lifecycle. Install, rollback, compatibility and memory reporting are settled above; its detailed plan must still settle, without widening extension authority:
+Phase 4 reuses the supervised transport and lifecycle without widening extension authority.
 
-- The public install API shape and its typed errors; how install, the staging swap and `reload` interact with a running or grouped runner; stable package identities and ownership-aware unloading.
 - Deterministic offline contract checks; real Bun scenarios opt in, and live provider proof is separate from normal test suites.
 
 General UI requests, provider level 3/custom streams, MCP and `ast_edit` remain deferred.

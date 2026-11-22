@@ -73,7 +73,7 @@ Hosts are trusted integration code; project layers are untrusted data. axo enfor
 | Agent definitions | `ConfigLayer::agent_roots` | Explicit roots recursively searched for frontmatter-bearing `*.md` files; trusted project roots precede user roots. No implicit `.agents/` discovery. See [Agent definitions](prompts-and-context.md#agent-definitions) |
 | Mode definitions | `ConfigLayer::mode_roots`, `SessionOptions::modes` | Explicit roots recursively searched for markdown definitions, followed by programmatic `ModeSpec` values; trusted project roots precede user roots. Root sessions select modes through `Session::set_mode`, `Command::Mode`, or deferred `enter_mode` when model invocation is enabled. Instructions, tool limits, and mode `yield` become effective at the next request boundary. See [Mode definitions](prompts-and-context.md#mode-definitions) for metadata and [Root-session modes](extending.md#root-session-modes) for selection, model restoration, host review, events, and child limits |
 | Keyword definitions | `ConfigLayer::keyword_roots`, `SessionOptions::keywords` | Explicit roots recursively searched for markdown definitions, followed by programmatic `KeywordSpec` values; trusted project roots precede user roots. A root session matches active keyword names in user-typed prose, adds their bodies to that user message, and applies the first matched keyword's `model` like `/model`. The [`keywords`](#keywords-keywords--keywordsettings) settings switch them off globally or by name. See [Keyword definitions](prompts-and-context.md#keyword-definitions) |
-| Bun extensions | `ExtensionOptions` passed to `Extensions::new` (crate `axo-extensions`) | The Bun executable, package roots, data and runtime directories, and runner environment are host choices; settings only list which extensions are enabled (see [Extensions](#extensions-extensions--axoenabledextension)). axo never searches the working directory, `PATH`, or home directories for packages or Bun. See [Bun extensions](extending.md#4-bun-extensions-axo-extensions) |
+| Bun extensions | `ExtensionOptions` passed to `Extensions::new` (crate `axo-extensions`) | The Bun executable, package roots, the managed extension store, data and runtime directories, runner environment and automatic dependency installs are host choices; settings only list which extensions are enabled (see [Extensions](#extensions-extensions--axoenabledextension)). axo never searches the working directory, `PATH`, or home directories for packages or Bun. See [Bun extensions](extending.md#4-bun-extensions-axo-extensions) |
 
 With `homeAgentsDir: true` in the user layer, axo also reads the ecosystem files `~/.agents/AGENTS.md` (before `UserConfig::context_files`) and `~/.agents/skills/` (after explicit skill roots).
 
@@ -359,16 +359,17 @@ These settings govern both failed turns and summary requests; they do not change
   "extensions": [
     { "id": "lab-provider" },
     { "id": "alpha", "group": "personal" },
-    { "id": "beta", "group": "personal" }
+    { "id": "beta", "group": "personal" },
+    { "id": "acme/linter" }
   ]
 }
 ```
 
-- **Validation:** IDs and group names match `[a-z0-9][a-z0-9._-]*`, so neither is empty, `.`, `..`, or contains a path separator. A malformed entry or an ID listed twice fails the layer with `Error::Config` while deserializing (`ExtensionListError`: `InvalidId`, `InvalidGroup`, `Duplicate`); entries are never silently deduplicated. Hosts passing a typed list call `EnabledExtension::validate_all` (`Extensions::configure` runs it too).
+- **Validation:** group names and the IDs of authored extensions match `[a-z0-9][a-z0-9._-]*`, so neither is empty, `.`, `..`, or contains a path separator. An installed extension's ID is `publisher/name`, each part following the same rule (see [Packaging and install](extending.md#packaging-and-install)). A malformed entry or an ID listed twice fails the layer with `Error::Config` while deserializing (`ExtensionListError`: `InvalidId`, `InvalidGroup`, `Duplicate`); entries are never silently deduplicated. Hosts passing a typed list call `EnabledExtension::validate_all` (`Extensions::configure` runs it too).
 - **Order:** list order is priority order. The last declaring extension wins for a provider ID and for same-kind named session contributions, subject to the [session composition rules](extending.md#session-composition).
 - **Groups:** members sharing a `group` share one Bun runner process (and its crash budget); an extension without a group gets its own. Group names and extension IDs are separate namespaces.
 - **User only:** a project layer's `extensions` is stripped with a warning at `Read` and `Trust`, so a repository can neither enable code nor change ordering or grouping.
-- **Not loaded by core:** `axo` parses and validates the list into `Settings::extensions`; the host passes it to an `Extensions` manager from the `axo-extensions` crate. Package roots, the Bun executable, and data locations have no settings keys. See [Bun extensions](extending.md#4-bun-extensions-axo-extensions).
+- **Not loaded by core:** `axo` parses and validates the list into `Settings::extensions`; the host passes it to an `Extensions` manager from the `axo-extensions` crate. Package roots, the extension store, the Bun executable, and data locations have no settings keys. See [Bun extensions](extending.md#4-bun-extensions-axo-extensions).
 
 
 ## Models (`axo_ai::ModelsConfig`) & Credentials

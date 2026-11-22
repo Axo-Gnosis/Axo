@@ -246,6 +246,8 @@ impl Host {
                 data_root: temp.path().join("data"),
                 runtime_dir: temp.path().join("runtime"),
                 env: Arc::new(runner_env(temp.path(), &server.url, detach)),
+                store: Some(temp.path().join("store")),
+                auto_install: true,
             },
         ));
         let lifecycle = Arc::new(TestLifecycle {
@@ -280,10 +282,14 @@ impl Host {
     /// `lab-provider` itself declares provider `id` (see [`provider`]), so renamed copies
     /// can be grouped side by side. Replaces an existing copy.
     pub fn install(&self, id: &str, fixture: &str) {
+        self.copy_fixture(fixture, &self.path("root").join(id), id);
+    }
+
+    /// [`Host::install`] into any `target` folder.
+    pub fn copy_fixture(&self, fixture: &str, target: &Path, id: &str) {
         let source = Path::new(FIXTURES).join(fixture);
-        let target = self.path("root").join(id);
-        let _ = std::fs::remove_dir_all(&target);
-        copy_dir(&source, &target);
+        let _ = std::fs::remove_dir_all(target);
+        copy_dir(&source, target);
         let manifest_path = if source.join("extension.json").exists() {
             source.join("extension.json")
         } else {

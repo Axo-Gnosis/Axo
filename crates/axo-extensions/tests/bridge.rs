@@ -15,6 +15,8 @@ macro_rules! case {
     };
 }
 
+#[path = "bridge/install.rs"]
+mod install;
 #[path = "bridge/lifecycle.rs"]
 mod lifecycle;
 #[path = "bridge/manager.rs"]
@@ -48,8 +50,13 @@ pub type CaseFuture = Pin<Box<dyn Future<Output = ()>>>;
 pub type Case = (&'static str, fn() -> CaseFuture);
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    if args.next().is_some_and(|first| first == "run")
+    let first = std::env::args_os().nth(1);
+    // `cargo test … install` passes the filter as the first argument too; only the host's
+    // runner environment carries the control directory.
+    if first.as_deref() == Some("install".as_ref()) && std::env::var_os(CONTROL).is_some() {
+        return fake::install();
+    }
+    if first.is_some_and(|first| first == "run")
         && std::env::var_os("AXO_EXTENSION_SOCKET").is_some()
     {
         return fake::runner();
@@ -71,10 +78,11 @@ fn main() -> ExitCode {
             }
         }
     }
-    let groups: [(&str, &[Case]); 3] = [
+    let groups: [(&str, &[Case]); 4] = [
         ("manager", manager::CASES),
         ("lifecycle", lifecycle::CASES),
         ("sessions", sessions::CASES),
+        ("install", install::CASES),
     ];
     let mut ran = 0;
     for (group, cases) in groups {
@@ -221,6 +229,8 @@ impl Host {
             data_root: self.path("data"),
             runtime_dir: self.path("run"),
             env: Arc::new(env),
+            store: Some(self.path("store")),
+            auto_install: true,
         }
     }
 
@@ -540,13 +550,44 @@ mod fake {
     /// - Any method: `late` waits for `ctl/<ext>/release`, then replies as `ok` even if the
     ///   host canceled the call meanwhile.
     ///
-    /// Records: `ctl/pids`, and `ctl/<ext>/{calls,canceled,entries}`, one line per event.
+    /// Records: `ctl/pids`, and `ctl/<ext>/{calls,canceled,entries}`, one line per event;
+    /// `ctl/<ext>/activated` holds each activation's entry path.
     pub fn runner() -> ExitCode {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(run());
+        ExitCode::SUCCESS
+    }
+
+    /// The scripted stand-in for `bun install [--frozen-lockfile]`: appends
+    /// `<cwd> <args>` to `ctl/installs`, then follows `ctl/install`: `fail:<text>` prints
+    /// `<text>` and exits 1; `hold` waits for `ctl/install-release`. Otherwise it creates
+    /// `node_modules/` and, unless frozen, a missing `bun.lock`.
+    pub fn install() -> ExitCode {
+        let control = PathBuf::from(std::env::var(CONTROL).expect("control directory"));
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let cwd = std::env::current_dir().unwrap();
+        append(
+            &control.join("installs"),
+            &format!("{} {}", cwd.display(), args.join(" ")),
+        );
+        let script = behavior(&control.join("install"));
+        if let Some(text) = script.strip_prefix("fail:") {
+            eprintln!("{text}");
+            return ExitCode::FAILURE;
+        }
+        if script == "hold" {
+            while !control.join("install-release").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        std::fs::create_dir_all(cwd.join("node_modules")).unwrap();
+        let lock = cwd.join("bun.lock");
+        if !args.iter().any(|arg| arg == "--frozen-lockfile") && !lock.exists() {
+            std::fs::write(lock, "{}\n").unwrap();
+        }
         ExitCode::SUCCESS
     }
 
@@ -743,7 +784,13 @@ mod fake {
                 .as_millis() as i64;
             let fail = |error: String| ("failed".to_owned(), error);
             match method {
-                "activate" => Ok(Value::Null),
+                "activate" => {
+                    append(
+                        &self.control.join(ext).join("activated"),
+                        args["entry"].as_str().unwrap(),
+                    );
+                    Ok(Value::Null)
+                }
                 "login" => {
                     self.ask(
                         ext,

@@ -735,6 +735,44 @@ impl Container {
         self.kill();
     }
 
+    /// PSS in bytes summed over every process in the container, or `None` when none can be
+    /// read. Blocking `/proc` reads; async callers use `spawn_blocking`.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    pub fn memory(&self) -> Option<u64> {
+        let pids: Vec<String> = match &*self.0 {
+            Scope::Cgroup(dir) => std::fs::read_to_string(dir.join("cgroup.procs"))
+                .ok()?
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            Scope::Group(pgid) => {
+                let pgid = pgid.as_raw_nonzero().to_string();
+                std::fs::read_dir("/proc")
+                    .ok()?
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+                    .filter(|pid| {
+                        // After the command's closing `)`: `state ppid pgrp …`.
+                        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                            stat.rsplit_once(')')
+                                .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                                == Some(pgid.as_str())
+                        })
+                    })
+                    .collect()
+            }
+        };
+        pids.iter()
+            .filter_map(|pid| {
+                let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+                let line = rollup.lines().find(|line| line.starts_with("Pss:"))?;
+                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                Some(kb * 1024)
+            })
+            .reduce(|a, b| a + b)
+    }
+
     /// Whether `pid` is in this job cgroup; cgroup mode only.
     fn contains(&self, pid: Pid) -> bool {
         let Scope::Cgroup(dir) = &*self.0 else {

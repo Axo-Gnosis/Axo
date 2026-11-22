@@ -1,0 +1,7 @@
+{
+  "name": "lab-deps",
+  "private": true,
+  "dependencies": {
+    "lab-dep": "file:./vendor/lab-dep"
+  }
+}

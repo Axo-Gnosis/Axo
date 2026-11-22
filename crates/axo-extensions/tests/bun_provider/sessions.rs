@@ -517,7 +517,12 @@ async fn assert_posted(session: &Session, expected: &str) {
 }
 
 /// Runs one prompt whose model calls `calls` once, then answers `done`.
-async fn turn(session: &Session, api: &ScriptedApi, calls: &[(&str, &str, Value)], prompt: &str) {
+pub async fn turn(
+    session: &Session,
+    api: &ScriptedApi,
+    calls: &[(&str, &str, Value)],
+    prompt: &str,
+) {
     api.lane(
         "m",
         vec![
@@ -530,7 +535,7 @@ async fn turn(session: &Session, api: &ScriptedApi, calls: &[(&str, &str, Value)
 }
 
 /// The journaled result of `call_id`.
-async fn result(session: &Session, call_id: &str) -> ToolResultMessage {
+pub async fn result(session: &Session, call_id: &str) -> ToolResultMessage {
     session
         .attach(None)
         .await
@@ -546,7 +551,7 @@ async fn result(session: &Session, call_id: &str) -> ToolResultMessage {
         .unwrap_or_else(|| panic!("no result for {call_id}"))
 }
 
-fn text(result: &ToolResultMessage) -> String {
+pub fn text(result: &ToolResultMessage) -> String {
     result
         .content
         .iter()

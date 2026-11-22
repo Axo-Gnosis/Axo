@@ -1,6 +1,7 @@
 //! Real Bun acceptance: a Rust host loads `tests/fixtures/lab-provider` (and renamed or
 //! broken copies) through the public `Axo` + `Extensions` APIs against a loopback lab server,
-//! and `tests/fixtures/lab-session` into scripted real sessions.
+//! `tests/fixtures/lab-session` into scripted real sessions, and `tests/fixtures/lab-deps`
+//! with its npm dependency installed by axo.
 //!
 //! Needs `AXO_TEST_BUN=/absolute/path/to/bun`: unset prints an explicit skip, set but
 //! unusable fails. Process-group cases always run; `AXO_TEST_CGROUP=1` (inside a delegated
@@ -9,6 +10,8 @@
 
 #[path = "bun_provider/host.rs"]
 mod host;
+#[path = "bun_provider/install.rs"]
+mod install;
 #[path = "bun_provider/lifecycle.rs"]
 mod lifecycle;
 #[path = "bun_provider/oauth.rs"]
@@ -72,6 +75,8 @@ fn main() -> ExitCode {
             println!("bun_provider: lifecycle ({name}) ... ok");
             sessions::run(&bun, mode.clone()).await;
             println!("bun_provider: sessions ({name}) ... ok");
+            install::run(&bun, mode.clone()).await;
+            println!("bun_provider: install ({name}) ... ok");
         }
     });
     drop(runtime);

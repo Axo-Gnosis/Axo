@@ -85,7 +85,7 @@ pub struct EnabledExtension {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExtensionListError {
     #[error(
-        "invalid extension id {0:?}: expected a lower-case ASCII letter or digit followed by letters, digits, '-', '_' or '.'"
+        "invalid extension id {0:?}: expected a name, or publisher/name for an installed extension; each part is a lower-case ASCII letter or digit followed by letters, digits, '-', '_' or '.'"
     )]
     InvalidId(String),
     #[error(
@@ -104,7 +104,7 @@ impl EnabledExtension {
     pub fn validate_all(extensions: &[EnabledExtension]) -> Result<(), ExtensionListError> {
         let mut seen = std::collections::HashSet::with_capacity(extensions.len());
         for extension in extensions {
-            if !valid_extension_name(&extension.id) {
+            if !valid_extension_id(&extension.id) {
                 return Err(ExtensionListError::InvalidId(extension.id.clone()));
             }
             if let Some(group) = &extension.group
@@ -121,6 +121,14 @@ impl EnabledExtension {
         }
         Ok(())
     }
+}
+
+/// A plain name for an authored extension, or `publisher/name` for an installed one.
+fn valid_extension_id(id: &str) -> bool {
+    valid_extension_name(id)
+        || id.split_once('/').is_some_and(|(publisher, name)| {
+            valid_extension_name(publisher) && valid_extension_name(name)
+        })
 }
 
 /// `[a-z0-9][a-z0-9._-]*`: never empty, `.`/`..` or a path separator.
