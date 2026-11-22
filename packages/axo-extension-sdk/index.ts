@@ -1,5 +1,6 @@
 // The author contract for axo extensions. Types only: nothing here runs, and an extension
 // never needs this package at runtime (`import type` / `satisfies` is erased).
+// Host object methods are generated in bindings.ts and accept an optional trailing AbortSignal.
 //
 //   import type { Extension } from "@axo/extension-sdk";
 //   export default (async ({ id, dataDir, session }) => ({
@@ -28,7 +29,7 @@
 //   exactly when the manifest sets `"spawnHook"` and `"events"`.
 // Unknown keys, undeclared names and missing handlers fail activation.
 
-import type { AgentSpec, ErrorCode, Model, SeqEntry, Session, SessionEvent, SessionEventKind, ThinkingLevel, ToolCall, UserBlock, Value } from "./bindings.ts";
+import type { AfterToolCall, AgentSpec, AssistantEvent, BeforeToolCall, CompletionRequest, ErrorCode, Host, HostLifecycle, Model, Models, SeqEntry, Session, SessionEvent, SessionEventKind, SpawnContext, ToolCall, ToolScope, Tools, UserBlock, Value } from "./bindings.ts";
 export type * from "./bindings.ts";
 
 // ---- Credentials (the Rust `axo_ai::auth::Credential` serde shape) ----
@@ -147,13 +148,18 @@ export type SessionHandle = Session & {
 
 export type HostErrorCode =
   | ErrorCode
+  | "unknown_object"
   | "unknown_method"
   | "invalid_arguments"
   | "encode"
+  | "tool"
+  | "no_lifecycle"
   | "no_session"
   | "no_subscription"
   | "unsupported"
   | "stalled"
+  /** The extension manager is shut down. */
+  | "unavailable"
   /** The bridge could not decode the action's arguments. */
   | "invalid"
   /** The host's reply would exceed the 64 MiB frame bound. */
@@ -172,6 +178,9 @@ export interface ToolResult {
 export interface ToolRun {
   call: ToolCall;
   sessionId: string;
+  invocation: number;
+  /** Guarded file operations, supervised commands, and helpers for this call. */
+  tools: Tools;
   /** Aborts when the host cancels the call. */
   signal: AbortSignal;
   /**
@@ -183,54 +192,30 @@ export interface ToolRun {
 
 export type ToolHandler = (run: ToolRun) => Promise<ToolResult>;
 
-/** Where a tool call runs. */
-export interface ToolScope {
-  sessionId: string;
-  depth: number;
-  agent: string | null;
-  mode: string | null;
-  readOnlyBash: boolean;
-}
-
 /**
- * Sees every tool call of attached sessions. `before` blocks with an optional reason; `after`
- * overrides fields of the result. `null` allows the call or keeps the result.
+ * Sees the assistant message and tool call. `before` blocks with an optional reason; `after`
+ * also sees the full result and may override its fields. `null` keeps the default behavior.
  */
 export interface ToolPolicy {
   before?(
     scope: ToolScope,
-    call: ToolCall,
+    cx: BeforeToolCall,
     signal: AbortSignal,
   ): Promise<null | { block: true; reason?: string; terminate?: boolean }>;
   after?(
     scope: ToolScope,
-    call: ToolCall,
-    result: { content: UserBlock[]; details?: Value; isError: boolean },
+    cx: AfterToolCall,
     signal: AbortSignal,
   ): Promise<null | { content?: UserBlock[]; details?: Value; isError?: boolean; terminate?: boolean }>;
-}
-
-/** A child agent about to be spawned: the bridge's summary of the Rust `SpawnContext` (see `RemoteSpawnHook`), not its full shape. */
-export interface SpawnContext {
-  spec: AgentSpec;
-  agent: string | null;
-  mode: string | null;
-  /** `provider/id`. */
-  model: string;
-  thinking: ThinkingLevel;
-  depth: number;
-  origin: "host" | "tool";
-  team: { name: string | null; member: string } | null;
 }
 
 /** `null` allows the spawn; `block` refuses it with a reason; `replace` spawns another `AgentSpec`. */
 export type SpawnHook = (
   spawn: SpawnContext,
-  sessionId: string,
   signal: AbortSignal,
 ) => Promise<null | { block: string } | { replace: AgentSpec }>;
 
-export interface SchemeContext {
+export interface SchemeHandlerContext {
   /** The scheme name, without `://`. */
   scheme: string;
   session: { id: string; dir: string; cwd: string };
@@ -239,10 +224,10 @@ export interface SchemeContext {
 /** Serves `<scheme>://<path>` URLs. */
 export interface SchemeHandlers {
   /** `"virtual"` serves reads and writes here; `file` maps the URL to an absolute path. */
-  resolve(path: string, cx: SchemeContext, signal: AbortSignal): Promise<"virtual" | { file: string; writable: boolean }>;
-  read?(path: string, cx: SchemeContext, signal: AbortSignal): Promise<string>;
+  resolve(path: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<"virtual" | { file: string; writable: boolean }>;
+  read?(path: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<string>;
   /** Returns a short confirmation for the model. */
-  write?(path: string, content: string, cx: SchemeContext, signal: AbortSignal): Promise<string>;
+  write?(path: string, content: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<string>;
 }
 
 /** Runs `/name args`; `args` is the rest of the line, trimmed. */
@@ -250,12 +235,25 @@ export type CommandHandler = (args: string, session: SessionHandle, signal: Abor
 
 // ---- The default export ----
 
+export type HostHandle = Host & HostLifecycle;
+
+export type CompletionStreamEvent = AssistantEvent | { type: "closed"; value: null };
+
+export type ModelsHandle = Models & {
+  stream(
+    request: CompletionRequest,
+    listener: (event: CompletionStreamEvent) => void | Promise<void>,
+  ): Promise<{ close(): Promise<void> }>;
+};
+
 export interface ExtensionContext {
   /** The extension ID from `extension.json`. */
   id: string;
   /** A private directory the host provides for this extension's own files. */
   dataDir: string;
-  /** Session actions for an attached session by ID. */
+  host: HostHandle;
+  models: ModelsHandle;
+  /** Session actions for an attached session or its child by ID. */
   session(id: string): SessionHandle;
 }
 

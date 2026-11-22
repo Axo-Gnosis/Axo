@@ -345,8 +345,10 @@ pub enum SessionEventKind {
     TreeUsage,
 }
 
+#[expose(block = SESSION_EVENT_BLOCK, object = "types")]
 impl SessionEvent {
     /// Returns this event's tag without serializing its payload.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn kind(&self) -> SessionEventKind {
         match self {
             Self::Agent(_) => SessionEventKind::Agent,
@@ -2541,7 +2543,7 @@ impl Session {
         }
     }
 
-    /// Opens a command's flushed raw output, including commands still in the foreground.
+    /// Opens the call's newest command's flushed raw output, foreground commands included.
     /// A handle remains readable after the command's spool is unlinked.
     #[ext(skip = "live reader; the wire method reads one page")]
     pub fn command_output(&self, call_id: &str) -> Option<crate::jobs::CommandOutput> {
@@ -2552,7 +2554,23 @@ impl Session {
             .command_output(call_id, self.hooks.tools.schemes.artifacts().dir())
     }
 
-    /// Requests promotion of a foreground command. A command that finishes first stays foreground.
+    /// Opens one command's flushed raw output by job id (`bg_N`), foreground commands included.
+    #[ext(skip = "live reader; the wire method reads one page")]
+    pub fn job_output(&self, job_id: &str) -> Option<crate::jobs::CommandOutput> {
+        self.hooks
+            .tools
+            .runner
+            .jobs
+            .job_output(job_id, self.hooks.tools.schemes.artifacts().dir())
+    }
+
+    /// The job ids of the commands a tool call started, oldest first, foreground commands included.
+    #[ext]
+    pub fn command_jobs(&self, call_id: &str) -> Vec<String> {
+        self.hooks.tools.runner.jobs.command_jobs(call_id)
+    }
+
+    /// Requests promotion of every foreground command the call started. A command that finishes first stays foreground.
     #[ext]
     pub fn background(&self, call_id: &str) -> bool {
         self.hooks.tools.runner.jobs.background(call_id)
@@ -3215,12 +3233,12 @@ impl Session {
         // The blobs the fork's path references: its file changes stay reviewable.
         let snapshots = path
             .iter()
-            .filter_map(|entry| match entry {
+            .flat_map(|entry| match entry {
                 Entry::Message {
                     message: AgentMessage::Llm(Message::ToolResult(result)),
                     ..
-                } => tools::file_change(result),
-                _ => None,
+                } => tools::file_changes(result),
+                _ => Vec::new(),
             })
             .flat_map(|change| change.before.into_iter().chain([change.after]))
             .filter(|blob| blob.omitted.is_none())

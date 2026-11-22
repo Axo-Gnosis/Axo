@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo_ai::ThinkingLevel;
+use axo_macros::expose;
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
@@ -342,8 +343,10 @@ impl Builtin {
     }
 }
 
+#[expose(block = COMMAND_BLOCK, object = "types")]
 impl Command {
     /// Decodes a built-in command from JSON arguments; `null` counts as `{}`.
+    #[ext(skip = "no receiver; served by host.decodeCommand")]
     pub fn decode(name: &str, args: Value) -> Result<Command, Error> {
         builtin(name)
             .ok_or_else(|| Error::InvalidCommand {
@@ -355,6 +358,7 @@ impl Command {
 
     /// Parses `/name args` naming a built-in command, for hosts that accept typed
     /// commands. `None` for any other text, including unknown `/word`s and skills.
+    #[ext(skip = "no receiver; served by host.parseCommand")]
     pub fn parse(text: &str) -> Option<Result<Command, Error>> {
         let rest = text.strip_prefix('/')?;
         let (name, args) = match rest.find(char::is_whitespace) {

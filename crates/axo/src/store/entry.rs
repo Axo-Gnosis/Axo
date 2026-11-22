@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use axo_agent::AgentMessage;
 use axo_ai::{Message, SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_macros::expose;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -31,8 +32,10 @@ pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 #[serde(transparent)]
 pub struct EntryId(pub String);
 
+#[expose(block = ENTRY_ID_BLOCK, object = "types")]
 impl EntryId {
     /// A fresh id for which `taken` returns false (pi `SM:277-284`).
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn generate(taken: impl Fn(&str) -> bool) -> Self {
         for _ in 0..100 {
             let id = format!("{:08x}", rand::random::<u32>());
@@ -43,6 +46,7 @@ impl EntryId {
         Self(uuid::Uuid::now_v7().to_string())
     }
 
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -206,8 +210,10 @@ pub struct RosterEntry {
     pub session_id: String,
 }
 
+#[expose(block = HEADER_BLOCK, object = "types")]
 impl Header {
     /// A header for a new session with a fresh UUIDv7 id, timestamped now.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(
         cwd: PathBuf,
         parent_session: Option<PathBuf>,
@@ -239,8 +245,10 @@ pub struct EntryBase {
     pub timestamp: String,
 }
 
+#[expose(block = ENTRY_BASE_BLOCK, object = "types")]
 impl EntryBase {
     /// A base timestamped now.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(id: EntryId, parent_id: Option<EntryId>) -> Self {
         Self {
             id,
@@ -252,6 +260,7 @@ impl EntryBase {
     }
 
     /// The entry's timestamp as Unix milliseconds, if it is valid.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn timestamp_ms(&self) -> Option<i64> {
         self.timestamp
             .parse::<jiff::Timestamp>()
@@ -548,10 +557,12 @@ pub enum Entry {
     Unknown(#[specta(type = RawEntry)] Value),
 }
 
+#[expose(block = ENTRY_BLOCK, object = "types")]
 impl Entry {
     /// Usage incurred by this entry, including failed assistant responses.
     ///
     /// Run and job totals are derived summaries, not additional usage.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn usage(&self) -> Option<&Usage> {
         match self {
             Self::Message {
@@ -565,6 +576,7 @@ impl Entry {
     }
 
     /// Whether appending this entry must complete durable storage before returning.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn requires_sync(&self) -> bool {
         match self {
             Entry::RunStart { .. }
@@ -592,6 +604,7 @@ impl Entry {
     }
 
     /// The shared fields; `None` for [`Entry::Unknown`].
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn base(&self) -> Option<&EntryBase> {
         match self {
             Entry::Message { base, .. }
@@ -650,6 +663,7 @@ impl Entry {
     }
 
     /// The entry's id, read from the raw object for [`Entry::Unknown`].
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn id(&self) -> Option<&str> {
         match self {
             Entry::Unknown(value) => value.get("id").and_then(Value::as_str),
@@ -658,6 +672,7 @@ impl Entry {
     }
 
     /// The entry's parent id, read from the raw object for [`Entry::Unknown`].
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn parent_id(&self) -> Option<&str> {
         match self {
             Entry::Unknown(value) => value.get("parentId").and_then(Value::as_str),

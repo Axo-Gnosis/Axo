@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "axo"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "axo-agent",
@@ -121,8 +121,6 @@ dependencies = [
  "similar",
  "specta",
  "specta-serde",
- "specta-typescript",
- "specta-util",
  "strip-ansi-escapes",
  "syn 2.0.119",
  "tempfile",
@@ -138,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "axo-agent"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "axo-ai",
@@ -157,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "axo-ai"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "axo-ai",
@@ -186,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "axo-extensions"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "axo",
@@ -199,6 +197,10 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "specta",
+ "specta-serde",
+ "specta-typescript",
+ "specta-util",
  "tempfile",
  "thiserror",
  "tokio",
@@ -209,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "axo-macros"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "quote",

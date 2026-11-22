@@ -2,18 +2,21 @@
 //! attaches the session it opened, and the manager keeps that layer current through
 //! `Session::set_layer`, serves the runner's session actions and forwards its journal entries.
 
-mod bindings;
+pub(super) mod bindings;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use axo::{
-    AgentSpec, Exposure, HostTool, KeywordSpec, ModeSpec, RegisteredCommand, Registrations, Scheme,
-    Session, SessionEvent, SessionEventKind, SessionOptions, SessionTools,
+    AgentSpec, CompletionRequest, Exposure, HostTool, KeywordSpec, ModeSpec, RegisteredCommand,
+    Registrations, Scheme, Session, SessionEvent, SessionEventKind, SessionOptions, SessionTools,
 };
+use axo_ai::AssistantEvent;
+use futures::StreamExt;
 use futures::future::{BoxFuture, join_all};
+use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -26,14 +29,25 @@ use crate::peer::{Actions, CallError, Callbacks, Origin, Refusal};
 use crate::remote::{self, CALL_DEADLINE, Failure};
 use crate::{ExtensionDiagnostic, ExtensionEvent, Extensions, Inner, gate};
 
-/// The session methods an extension may `invoke`, as the runner's handles name them.
-pub(crate) fn session_methods() -> &'static [&'static str] {
-    static METHODS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-        axo::ext::session_blocks()
+/// The callable wire names for each extension object.
+pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
+    static METHODS: LazyLock<BTreeMap<&str, Vec<&str>>> = LazyLock::new(|| {
+        axo::ext::objects()
             .iter()
-            .flat_map(|block| block.entries)
-            .filter(|entry| entry.call.is_some())
-            .map(|entry| entry.meta.name)
+            .filter(|object| object.name != "types")
+            .map(|object| {
+                let mut names: Vec<_> = object
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.entries)
+                    .filter(|meta| meta.skip.is_none())
+                    .map(|meta| meta.name)
+                    .collect();
+                if object.name == "host" {
+                    names.extend(crate::LIFECYCLE_METHODS.iter().map(|method| method.name));
+                }
+                (object.name, names)
+            })
             .collect()
     });
     &METHODS
@@ -112,9 +126,30 @@ impl Extensions {
 
     /// Tracks `session` for session actions and entry events and applies the current
     /// composition as its layer (a `configure` may have run since `compose`). Forks are
-    /// attached the same way. Child sessions (from `Axo::session`) get actions and events only.
+    /// attached the same way. Unattached children only receive explicitly subscribed events.
     pub async fn attach(&self, session: &Arc<Session>) {
-        let inner = &self.inner;
+        self.inner.attach(session).await;
+    }
+
+    /// Stops tracking; the session keeps what it has.
+    pub fn detach(&self, session_id: &str) {
+        self.inner.sessions.detach(session_id);
+    }
+
+    /// Composition diagnostics of the last apply to this session.
+    pub fn session_diagnostics(&self, session_id: &str) -> Vec<String> {
+        self.inner
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|attached| attached.diagnostics.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Inner {
+    pub(super) async fn attach(self: &Arc<Self>, session: &Arc<Session>) {
+        let inner = self;
         let _config = inner.config.lock().await;
         let closed = inner.closed.is_cancelled();
         let id = session.id().to_owned();
@@ -141,19 +176,15 @@ impl Extensions {
         }
     }
 
-    /// Stops tracking; the session keeps what it has.
-    pub fn detach(&self, session_id: &str) {
-        self.inner.sessions.detach(session_id);
-    }
-
-    /// Composition diagnostics of the last apply to this session.
-    pub fn session_diagnostics(&self, session_id: &str) -> Vec<String> {
-        self.inner
-            .sessions
-            .lock()
-            .get(session_id)
-            .map(|attached| attached.diagnostics.clone())
-            .unwrap_or_default()
+    pub(super) async fn resolve_session(&self, id: &str) -> Result<Arc<Session>, Refusal> {
+        match self.sessions.session(id) {
+            Ok(session) => Ok(session),
+            Err(missing) => self
+                .axo
+                .session(id)
+                .await
+                .map_err(|error| child_error(missing, error)),
+        }
     }
 }
 
@@ -177,6 +208,7 @@ fn layer(contributions: &[Arc<Contribution>], inner: &Weak<Inner>) -> Registrati
                     remote: remote.clone(),
                     decl: Arc::clone(&decl),
                     session: tools.session_id().to_owned(),
+                    tools: Arc::clone(tools),
                 }) as Arc<dyn axo_agent::Tool>
             });
             parts.tools.push(
@@ -307,9 +339,9 @@ async fn pump(
     loop {
         match events.recv().await {
             Ok(event) => {
-                let SessionEvent::Entry(entry) = &*event else {
+                if !matches!(&*event, SessionEvent::Entry(_)) {
                     continue;
-                };
+                }
                 let Some(strong) = inner.upgrade() else {
                     return;
                 };
@@ -324,14 +356,15 @@ async fn pump(
                 if listeners.is_empty() {
                     continue;
                 }
-                let args = json!({ "session": id, "entry": entry });
-                for ext in listeners {
+                let args = json!({ "sub": "entry", "session": id, "event": &*event });
+                let frames = std::iter::repeat_n(args, listeners.len());
+                for (ext, args) in listeners.into_iter().zip(frames) {
                     let remote = Remote {
                         inner: inner.clone(),
                         ext,
                     };
                     let _ = remote
-                        .call("event", "event", args.clone(), None, Some(CALL_DEADLINE))
+                        .call("event", "stream", args, None, Some(CALL_DEADLINE))
                         .await;
                 }
             }
@@ -354,7 +387,6 @@ async fn pump(
 /// event and no delivery deadline; slow listeners learn of any resulting broadcast lag
 /// before they see the next available event.
 async fn stream(
-    inner: Weak<Inner>,
     origin: Origin,
     ext: String,
     id: String,
@@ -410,8 +442,37 @@ async fn stream(
             _ => break,
         }
     }
-    if let Some(inner) = inner.upgrade() {
-        inner.sessions.subs().remove(&id);
+}
+
+async fn completion_stream(
+    origin: Origin,
+    ext: String,
+    id: String,
+    mut events: BoxStream<'static, AssistantEvent>,
+) {
+    let deliver = async {
+        while let Some(event) = events.next().await {
+            let terminal = event.is_terminal();
+            match origin
+                .call(&ext, "stream", json!({ "sub": id, "event": event }))
+                .await
+            {
+                Ok(_) => {}
+                Err(CallError::Invalid) => break,
+                Err(_) => return,
+            }
+            if terminal {
+                break;
+            }
+        }
+        let _ = origin
+            .call(&ext, "stream", json!({ "sub": id, "closed": true }))
+            .await;
+    };
+    tokio::select! {
+        biased;
+        () = origin.closed() => {}
+        () = deliver => {}
     }
 }
 
@@ -493,7 +554,7 @@ impl Drop for Running {
 
 struct Sub {
     ext: String,
-    session: String,
+    session: Option<String>,
     /// Ends the stream after a `closed` frame.
     stop: CancellationToken,
     task: AbortHandle,
@@ -540,11 +601,11 @@ impl Registry {
     }
 
     /// Forgets `id`; each of its subscriptions sends `closed` and ends.
-    fn detach(&self, id: &str) {
+    pub(super) fn detach(&self, id: &str) {
         let mut subs = self.subs();
         self.remove(id, None);
         subs.retain(|_, sub| {
-            if sub.session == id {
+            if sub.session.as_deref() == Some(id) {
                 sub.stop.cancel();
                 false
             } else {
@@ -600,32 +661,84 @@ impl Registry {
         })
     }
 
-    fn subscribe(&self, origin: Origin, ext: String, request: Subscribe) -> Result<Value, Refusal> {
-        // Lock before lookup so detach/clear cannot miss a subscription being installed.
-        let mut subs = self.subs();
-        let events = self.session(&request.session)?.subscribe();
+    async fn subscribe(
+        &self,
+        inner: &Inner,
+        origin: Origin,
+        ext: String,
+        request: Subscribe,
+    ) -> Result<Value, Refusal> {
+        let (name, kinds) = match request {
+            Subscribe::Session { session, kinds } => (session, kinds),
+            Subscribe::Completion { completion } => {
+                let stop = CancellationToken::new();
+                let events = inner
+                    .axo
+                    .stream(completion, stop.clone())
+                    .map_err(axo::ext::InvokeError::from)?;
+                let guard = stop.clone().drop_guard();
+                return Ok(
+                    self.install(&mut self.subs(), ext, None, stop, |ext, id| async move {
+                        let _guard = guard;
+                        completion_stream(origin, ext, id, events).await;
+                    }),
+                );
+            }
+        };
+        let install = |subs: &mut HashMap<String, Sub>, name, session: Arc<Session>, keep: bool| {
+            let events = session.subscribe();
+            let child = keep.then_some(session);
+            let stop = CancellationToken::new();
+            self.install(subs, ext, Some(name), stop.clone(), |ext, id| async move {
+                let _child = child;
+                stream(origin, ext, id, events, kinds, stop).await;
+            })
+        };
+        // Lock before lookup so detach cannot miss an attached session's subscription.
+        let missing = {
+            let mut subs = self.subs();
+            match self.session(&name) {
+                Ok(session) => return Ok(install(&mut subs, name, session, false)),
+                Err(missing) => missing,
+            }
+        };
+        let child = inner
+            .axo
+            .session(&name)
+            .await
+            .map_err(|error| child_error(missing, error))?;
+        Ok(install(&mut self.subs(), name, child, true))
+    }
+
+    fn install<F: Future<Output = ()> + Send + 'static>(
+        &self,
+        subs: &mut HashMap<String, Sub>,
+        ext: String,
+        session: Option<String>,
+        stop: CancellationToken,
+        run: impl FnOnce(String, String) -> F,
+    ) -> Value {
         let id = format!("s:{}", self.next_sub.fetch_add(1, Ordering::Relaxed));
-        let stop = CancellationToken::new();
-        let task = tokio::spawn(stream(
-            self.inner.clone(),
-            origin,
-            ext.clone(),
-            id.clone(),
-            events,
-            request.kinds,
-            stop.clone(),
-        ))
+        let stream = run(ext.clone(), id.clone());
+        let inner = self.inner.clone();
+        let task_id = id.clone();
+        let task = tokio::spawn(async move {
+            stream.await;
+            if let Some(inner) = inner.upgrade() {
+                inner.sessions.subs().remove(&task_id);
+            }
+        })
         .abort_handle();
         subs.insert(
             id.clone(),
             Sub {
                 ext,
-                session: request.session,
+                session,
                 stop,
                 task,
             },
         );
-        Ok(json!({ "sub": id }))
+        json!({ "sub": id })
     }
 
     fn unsubscribe(&self, ext: &str, request: Unsubscribe) -> Result<Value, Refusal> {
@@ -654,16 +767,22 @@ impl Drop for Registry {
 #[serde(deny_unknown_fields)]
 struct Invoke {
     object: String,
-    target: String,
+    #[serde(default)]
+    target: Option<String>,
     method: String,
     args: Vec<Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Subscribe {
-    session: String,
-    kinds: Option<Vec<SessionEventKind>>,
+#[serde(untagged, deny_unknown_fields)]
+enum Subscribe {
+    Session {
+        session: String,
+        kinds: Option<Vec<SessionEventKind>>,
+    },
+    Completion {
+        completion: CompletionRequest,
+    },
 }
 
 #[derive(Deserialize)]
@@ -679,6 +798,29 @@ fn decode<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refusal> {
     })
 }
 
+impl From<axo::ext::InvokeError> for Refusal {
+    fn from(error: axo::ext::InvokeError) -> Self {
+        Self {
+            code: error.code().into(),
+            message: error.to_string(),
+        }
+    }
+}
+
+fn unavailable() -> Refusal {
+    Refusal {
+        code: "unavailable".into(),
+        message: "the extension manager is shut down".into(),
+    }
+}
+
+fn child_error(missing: Refusal, error: axo::Error) -> Refusal {
+    match error {
+        axo::Error::SessionNotFound(_) => missing,
+        error => axo::ext::InvokeError::from(error).into(),
+    }
+}
+
 impl Actions for Registry {
     fn call(
         &self,
@@ -687,48 +829,70 @@ impl Actions for Registry {
         method: String,
         args: Value,
     ) -> BoxFuture<'static, Result<Value, Refusal>> {
-        match method.as_str() {
-            "subscribe" => {
-                return Box::pin(std::future::ready(
-                    decode(args).and_then(|request| self.subscribe(origin, ext, request)),
-                ));
-            }
-            "unsubscribe" => {
-                return Box::pin(std::future::ready(
-                    decode(args).and_then(|request| self.unsubscribe(&ext, request)),
-                ));
-            }
-            _ => {}
-        }
-        let resolve = || {
-            if method != "invoke" {
-                return Err(Refusal {
-                    code: "unsupported".into(),
-                    message: "unknown host method".into(),
-                });
+        let inner = self.inner.upgrade();
+        Box::pin(async move {
+            let inner = inner.ok_or_else(unavailable)?;
+            match method.as_str() {
+                "subscribe" => {
+                    return inner
+                        .sessions
+                        .subscribe(&inner, origin, ext, decode(args)?)
+                        .await;
+                }
+                "unsubscribe" => return inner.sessions.unsubscribe(&ext, decode(args)?),
+                "invoke" => {}
+                _ => {
+                    return Err(Refusal {
+                        code: "unsupported".into(),
+                        message: "unknown host method".into(),
+                    });
+                }
             }
             let invoke: Invoke = decode(args)?;
-            if invoke.object != "session" {
-                return Err(Refusal {
-                    code: "unsupported".into(),
-                    message: format!("unknown object: {}", invoke.object),
-                });
-            }
-            Ok((self.session(&invoke.target)?, invoke))
-        };
-        let resolved = resolve();
-        Box::pin(async move {
-            let (session, invoke) = resolved?;
             let caller = axo::ext::Caller {
                 namespace: Some(ext),
             };
-            session
-                .invoke(&invoke.method, invoke.args, &caller)
-                .await
-                .map_err(|error| Refusal {
-                    code: error.code().into(),
-                    message: error.to_string(),
-                })
+            let invalid = || Refusal {
+                code: "invalid".into(),
+                message: "invalid arguments".into(),
+            };
+            match invoke.object.as_str() {
+                "session" => {
+                    let id = invoke.target.as_deref().ok_or_else(invalid)?;
+                    inner
+                        .resolve_session(id)
+                        .await?
+                        .invoke(&invoke.method, invoke.args, &caller)
+                        .await
+                }
+                "host" | "models" => {
+                    if invoke.target.is_some() {
+                        return Err(invalid());
+                    }
+                    if invoke.object == "host"
+                        && let Some(m) = crate::LIFECYCLE_METHODS
+                            .iter()
+                            .find(|m| m.name == invoke.method)
+                    {
+                        return crate::run(
+                            async move { m.method.invoke(&inner, invoke.args).await },
+                        )
+                        .await
+                        .unwrap_or_else(|| Err(unavailable()));
+                    }
+                    inner
+                        .axo
+                        .invoke(&invoke.object, &invoke.method, invoke.args, &caller)
+                        .await
+                }
+                other => {
+                    return Err(Refusal {
+                        code: "unsupported".into(),
+                        message: format!("unknown object: {other}"),
+                    });
+                }
+            }
+            .map_err(Refusal::from)
         })
     }
 }

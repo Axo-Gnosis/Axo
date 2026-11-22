@@ -88,7 +88,7 @@ fn ledger_result(
         unreachable!("result constructs a tool result");
     };
     result.details = Some(json!({
-        "ledger": {"path": path, "sha256": "x", "access": access}
+        "files": [{"ledger": {"path": path, "sha256": "x", "access": access}}]
     }));
     Message::ToolResult(result)
 }
@@ -1402,7 +1402,7 @@ async fn eliding_a_real_read_reattaches_nested_instructions_on_the_next_touch() 
         blocks_text(&second.content).matches(&instructions).count(),
         1
     );
-    assert!(second.details.as_ref().unwrap().get("ledger").is_some());
+    assert!(second.details.as_ref().unwrap()["files"][0]["ledger"].is_object());
 }
 
 // Real runs journal run_start/submission/run_end entries with no model

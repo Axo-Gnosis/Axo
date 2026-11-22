@@ -19,30 +19,30 @@
 //   activate {entry,dataDir,providers:[{id,login,rewrite}],
 //             session:{tools:[{name,..}],schemes:[{name,..}],commands:[{name,..}],
 //                      toolPolicy:["before"|"after"],spawnHook,events},
-//             sessionMethods:[<invokable session method>]} -> null
+//             methods:{<object>:[<invokable method>]}} -> null
 //   login {provider} -> Credential; refresh {provider,credential} -> Credential;
 //   rewrite {provider,model,request} -> ProviderRequest
-//   tool {tool,session,call:{id,name,arguments}} -> {content,details?,isError?,terminate?}
-//   policyBefore {scope,call} -> null | {block:true,reason?,terminate?}
-//   policyAfter {scope,call,result:{content,details?,isError}}
+//   tool {tool,session,invocation,call:{id,name,arguments}} -> {content,details?,isError?,terminate?}
+//   policyBefore {scope,cx:{assistantMessage,toolCall}} -> null | {block:true,reason?,terminate?}
+//   policyAfter {scope,cx:{assistantMessage,toolCall,result}}
 //     -> null | {content?,details?,isError?,terminate?}
-//   spawn {session,spawn} -> null | {block} | {replace}
+//   spawn {spawn} -> null | {block} | {replace}
 //   schemeResolve {scheme,path,session:{id,dir,cwd}} -> "virtual" | {file,writable}
 //   schemeRead {scheme,path,session} -> string; schemeWrite {scheme,path,session,content} -> string
-//   command {command,session,args} -> null; event {session,entry} -> null
+//   command {command,session,args} -> null; stream {sub:"entry",session,event} -> null
 //   stream {sub,event} | {sub,lagged} | {sub,closed:true} -> null
 // Runner -> Rust methods with `parent` = a live call of the same `ext`:
 //   under login: openUrl {url,instructions?} -> null; deviceCode {userCode,verificationUrl,
 //   expiresInSeconds?} -> null; prompt {message,placeholder?,secret} -> string;
 //   select {message,options:[{id,label}]} -> string; progress {message} -> null.
-//   under tool: update {content,details?} -> null.
+//   under tool: update {content,details?} -> null; invoke {object:"tools",method,args} -> method result.
 // A login replies only after every display/progress callback it made was acknowledged; an
 // error reply to one fails the login. A tool replies only after every update it sent was
 // answered; an error reply to an update is ignored.
-// Runner -> Rust session actions, without `parent`, valid while the session is attached:
-//   invoke {object:"session",target:<session id>,method,args:[...]} -> method result; a
-//   session handle forwards only `sessionMethods` names.
-//   subscribe {session,kinds} -> {sub}; unsubscribe {sub} -> null.
+// Runner -> Rust actions without `parent`:
+//   invoke {object:"host"|"models",method,args:[...]} -> method result.
+//   invoke {object:"session",target:<session id>,method,args:[...]} -> method result.
+//   subscribe {session,kinds} | {completion} -> {sub}; unsubscribe {sub} -> null.
 // Error codes the runner sends: "activation" (import/activation of that member failed; the
 // bridge disables only that member), "failed" (the author's method threw), "invalid" (bad
 // arguments, an invalid author return value, or a reply that is not JSON-serializable),
@@ -56,17 +56,21 @@
 import { connect } from "node:net";
 import { pathToFileURL } from "node:url";
 import type {
+  AfterToolCall,
+  BeforeToolCall,
   CommandHandler,
+  CompletionStreamEvent,
   Credential,
   Extension,
   Handlers,
+  HostHandle,
   LoginInteraction,
   Model,
+  ModelsHandle,
   ProviderRequest,
-  SchemeContext,
+  SchemeHandlerContext,
   SchemeHandlers,
   SeqEntry,
-  SessionEvent,
   SessionHandle,
   SessionStreamEvent,
   SpawnContext,
@@ -294,7 +298,6 @@ const HOST_METHODS: Record<string, true> = {
   schemeRead: true,
   schemeWrite: true,
   command: true,
-  event: true,
   stream: true,
 };
 const RUNNER_METHODS: Record<string, true> = {
@@ -465,15 +468,16 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
       const before = active?.toolPolicy?.before;
       if (!before) throw new Fail("unsupported", "no tool policy handler");
       const scope = freeze(record(args.scope, "policyBefore scope")) as unknown as ToolScope;
-      const value = await before(scope, toolCall(args.call, "policyBefore call"), signal);
+      const cx = record(args.cx, "policyBefore context") as unknown as BeforeToolCall;
+      const value = await before(scope, cx, signal);
       return decision(value, method, { block: "true", reason: "string?", terminate: "boolean?" });
     }
     case "policyAfter": {
       const after = active?.toolPolicy?.after;
       if (!after) throw new Fail("unsupported", "no tool policy handler");
       const scope = freeze(record(args.scope, "policyAfter scope")) as unknown as ToolScope;
-      const result = record(args.result, "policyAfter result") as unknown as Parameters<typeof after>[2];
-      const value = await after(scope, toolCall(args.call, "policyAfter call"), result, signal);
+      const cx = record(args.cx, "policyAfter context") as unknown as AfterToolCall;
+      const value = await after(scope, cx, signal);
       return decision(value, method, {
         content: "array?",
         details: "any?",
@@ -484,7 +488,7 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
     case "spawn": {
       if (!active?.spawnHook) throw new Fail("unsupported", "no spawn hook");
       const request = record(args.spawn, "spawn request") as unknown as SpawnContext;
-      const value = await active.spawnHook(request, text(args.session, "spawn session"), signal);
+      const value = await active.spawnHook(request, signal);
       if (isRecord(value) && Object.hasOwn(value, "replace")) return decision(value, method, { replace: "object" });
       return decision(value, method, { block: "string" });
     }
@@ -496,7 +500,7 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
       if (!scheme) throw new Fail("unsupported", "no scheme handler");
       const path = text(args.path, `${method} path`);
       const session = record(args.session, `${method} session`);
-      const cx: SchemeContext = freeze({
+      const cx: SchemeHandlerContext = freeze({
         scheme: name,
         session: {
           id: text(session.id, `${method} session id`),
@@ -525,7 +529,14 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
     }
     case "stream": {
       const sub = text(args.sub, "stream subscription");
-      // A live session can emit before Rust's subscribe reply reaches the socket.
+      if (sub === "entry") {
+        if (!active?.onEntry) throw new Fail("unsupported", "no entry handler");
+        const event = record(args.event, "stream event");
+        const entry = freeze(record(event.value, "stream entry")) as unknown as SeqEntry;
+        await active.onEntry(entry, handle(ext, text(args.session, "stream session")));
+        return null;
+      }
+      // A stream can emit before Rust's subscribe reply reaches the socket.
       while (!subscriptions.has(sub)) {
         const replies = [];
         for (const [reply, owner] of registering) if (owner === ext) replies.push(reply);
@@ -534,14 +545,14 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
       }
       const subscription = subscriptions.get(sub);
       if (subscription?.ext !== ext) throw new Fail("unsupported", "no stream listener");
-      let event: SessionStreamEvent;
+      let event: StreamEvent;
       if (args.closed === true) {
         subscriptions.delete(sub);
         event = { type: "closed", value: null };
       } else if (typeof args.lagged === "number") {
         event = { type: "lagged", value: { skipped: args.lagged } };
       } else {
-        event = record(args.event, "stream event") as unknown as SessionEvent;
+        event = record(args.event, "stream event") as unknown as StreamEvent;
       }
       const { listener } = subscription;
       try {
@@ -549,13 +560,6 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
       } catch {
         // One listener error must not end the subscription.
       }
-      return null;
-    }
-    default: {
-      // event
-      if (!active?.onEntry) throw new Fail("unsupported", "no entry handler");
-      const session = handle(ext, text(args.session, "event session"));
-      await active.onEntry(freeze(record(args.entry, "event entry")) as unknown as SeqEntry, session);
       return null;
     }
   }
@@ -600,9 +604,12 @@ async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): 
   // Every update is answered before the result goes out, so none trails it; a refused
   // update is the host's business, not the tool's failure.
   const updates = new Set<Promise<unknown>>();
+  if (typeof args.invocation !== "number") throw new Fail("invalid", "tool invocation is not a number");
   const run: ToolRun = {
     call: toolCall(args.call, "tool call"),
     sessionId: text(args.session, "tool session"),
+    invocation: args.invocation,
+    tools: object(ext, "tools", {}, undefined, parent) as ToolRun["tools"],
     signal,
     update(update) {
       const u = local(isRecord(update), "update", update);
@@ -613,7 +620,14 @@ async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): 
       sent.then(done, done);
     },
   };
-  const value = await handler(run);
+  let value: ToolResult;
+  try {
+    value = await handler(run);
+  } catch (error) {
+    // An unhandled host tool refusal is a model-facing tool error, not an author exception.
+    if (!(error instanceof HostError && error.code === "tool")) throw error;
+    value = { content: [{ type: "text", text: error.message }], isError: true };
+  }
   while (updates.size) await Promise.allSettled(updates);
   const result = decision(value, "tool", {
     content: "array",
@@ -683,11 +697,13 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
     return { id: text(p.id, `activate provider ${i} id`), login: p.login, rewrite: p.rewrite };
   });
   const session = record(args.session, "activate session");
-  const methods = args.sessionMethods;
-  if (!Array.isArray(methods) || !methods.every((m) => typeof m === "string")) {
-    throw new Fail("invalid", "activate sessionMethods is not a string list");
+  const table = args.methods;
+  const entries = table && typeof table === "object" && !Array.isArray(table) ? Object.entries(table) : undefined;
+  if (!entries || !entries.every(([, list]) => Array.isArray(list) && list.every((m) => typeof m === "string"))) {
+    throw new Fail("invalid", "activate methods is not a method table");
   }
-  sessionMethods = new Set(methods);
+  methods.clear();
+  for (const [name, list] of entries) methods.set(name, new Set(list));
   const names = (key: string): string[] => {
     const list = session[key];
     if (!Array.isArray(list)) throw new Fail("invalid", `activate session ${key} is not an array`);
@@ -730,6 +746,10 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
       result = await (module.default as Extension)({
         id: ext,
         dataDir,
+        host: object(ext, "host", {}) as HostHandle,
+        models: object(ext, "models", {
+          stream: (request, listener) => openSubscription(ext, { completion: request }, listener),
+        } satisfies Pick<ModelsHandle, "stream">) as ModelsHandle,
         session: (id) => handle(ext, local(typeof id === "string", "session id", id)),
       });
     } catch {
@@ -842,51 +862,65 @@ function providers(value: unknown, declared: { id: string; login: boolean; rewri
 
 // ---- Runner -> Rust session actions ----
 
-type StreamListener = Parameters<SessionHandle["subscribe"]>[0];
+type StreamEvent = SessionStreamEvent | CompletionStreamEvent;
+type StreamListener = (event: StreamEvent) => void | Promise<void>;
 const subscriptions = new Map<string, { ext: string; listener: StreamListener }>();
 const registering = new Map<Promise<unknown>, string>();
-/** The session methods a handle forwards; sent with every activation. */
-let sessionMethods = new Set<string>();
+/** The methods each object forwards; sent with every activation. */
+const methods = new Map<string, Set<string>>();
 
-/** Session actions for one session; unparented, so they work whenever Rust has it attached. */
-function handle(ext: string, id: string): SessionHandle {
-  const subscribe: SessionHandle["subscribe"] = async (listener, kinds) => {
-    const reply = callHost(ext, "subscribe", { session: id, kinds: kinds ?? null });
-    registering.set(reply, ext);
-    try {
-      const sub = text(record(await reply, "subscribe reply").sub, "subscription id");
-      subscriptions.set(sub, { ext, listener });
-      // Memoized; the listener stays registered until Rust confirms, so a failed close retries.
-      let closing: Promise<void> | undefined;
-      return {
-        close() {
-          closing ??= (async () => {
-            if (!subscriptions.has(sub)) return;
-            try {
-              await callHost(ext, "unsubscribe", { sub });
-            } catch (error) {
-              // The host already ended the stream: closed either way.
-              if (!(error instanceof HostError && error.code === "no_subscription")) {
-                closing = undefined;
-                throw error;
-              }
-            }
-            subscriptions.delete(sub);
-          })();
-          return closing;
-        },
+function object<T extends object>(ext: string, name: string, base: T, target?: string, parent?: Parent): T {
+  return new Proxy(base, {
+    get(base, key) {
+      if (Object.hasOwn(base, key)) return Reflect.get(base, key);
+      if (typeof key !== "string" || key === "then" || !methods.get(name)?.has(key)) return undefined;
+      return (...args: unknown[]) => {
+        const last = args.at(-1);
+        const own = last instanceof AbortSignal ? last : undefined;
+        if (own) args.pop();
+        return callHost(ext, "invoke", { object: name, target, method: key, args }, parent, own);
       };
-    } finally {
-      registering.delete(reply);
-    }
-  };
-  return new Proxy({ id, subscribe }, {
-    get(target, key) {
-      if (key === "id" || key === "subscribe") return target[key];
-      if (typeof key !== "string" || !sessionMethods.has(key)) return undefined;
-      return (...args: unknown[]) => callHost(ext, "invoke", { object: "session", target: id, method: key, args });
     },
-  }) as SessionHandle;
+  });
+}
+
+/** Session actions for one session Rust can resolve by ID. */
+function handle(ext: string, id: string): SessionHandle {
+  const subscribe: SessionHandle["subscribe"] = (listener, kinds) =>
+    openSubscription(ext, { session: id, kinds }, listener);
+  return object(ext, "session", { id, subscribe }, id) as SessionHandle;
+}
+
+async function openSubscription<E extends StreamEvent>(ext: string, args: Frame, listener: (event: E) => void | Promise<void>) {
+  const reply = callHost(ext, "subscribe", args);
+  registering.set(reply, ext);
+  try {
+    const sub = text(record(await reply, "subscribe reply").sub, "subscription id");
+    // Rust sends only the event type requested for this subscription ID.
+    subscriptions.set(sub, { ext, listener: listener as StreamListener });
+    // Memoized; the listener stays registered until Rust confirms, so a failed close retries.
+    let closing: Promise<void> | undefined;
+    return {
+      close() {
+        closing ??= (async () => {
+          if (!subscriptions.has(sub)) return;
+          try {
+            await callHost(ext, "unsubscribe", { sub });
+          } catch (error) {
+            // The host already ended the stream: closed either way.
+            if (!(error instanceof HostError && error.code === "no_subscription")) {
+              closing = undefined;
+              throw error;
+            }
+          }
+          subscriptions.delete(sub);
+        })();
+        return closing;
+      },
+    };
+  } finally {
+    registering.delete(reply);
+  }
 }
 
 // ---- Runner -> Rust login callbacks ----

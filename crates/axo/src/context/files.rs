@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use axo_agent::AgentMessage;
 use axo_ai::{Message, UserBlock};
+use axo_macros::expose;
 use indexmap::IndexMap;
 
 use crate::context::{Diagnostic, DiagnosticOrigin, project_dirs, project_root};
@@ -20,7 +21,9 @@ pub struct ContextFile {
     pub content: String,
 }
 
+#[expose(block = CONTEXT_FILE_BLOCK, object = "types")]
 impl ContextFile {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn render(&self) -> String {
         format!(
             "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
@@ -178,8 +181,10 @@ struct NestedState {
     seen: Arc<Mutex<Seen>>,
 }
 
+#[expose(block = NESTED_CONTEXT_BLOCK, object = "types")]
 impl NestedContext {
     /// `root`: the project root, or `None` to disable. `startup`: system-prompt files.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) -> Self {
         let mut base = Seen::default();
         for file in startup {
@@ -195,12 +200,14 @@ impl NestedContext {
         }
     }
 
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn disabled() -> Self {
         Self::new(None, Vec::new(), &[])
     }
 
     /// Replaces discovery settings and clears deduplication to the new startup files.
     /// In-flight attachments retain their previous snapshot and cannot pollute the new one.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn reset(&self, root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) {
         let replacement = Self::new(root, names, startup);
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = replacement
@@ -210,6 +217,7 @@ impl NestedContext {
     }
 
     /// Loads context files on a blocking worker without holding the seen-files lock.
+    #[ext(skip = "served by tools.attachContext")]
     pub async fn attach(&self, file: &Path) -> Vec<UserBlock> {
         let (root, names, seen) = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -275,6 +283,7 @@ impl NestedContext {
     }
 
     /// Resets to startup files plus every context block in the current tool results.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn restore(&self, messages: &[AgentMessage]) {
         let mut restored = Vec::new();
         for message in messages {

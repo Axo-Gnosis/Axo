@@ -17,7 +17,8 @@ use crate::tools::output::YIELD;
 use crate::tools::{SessionTools, WriteScope, writes};
 
 /// The session a tool call runs in, as host policies see it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolScope {
     pub session_id: String,
     /// 0 for a root session.

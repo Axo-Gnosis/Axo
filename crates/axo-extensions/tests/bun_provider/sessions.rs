@@ -10,6 +10,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axo::{
@@ -48,9 +49,9 @@ pub async fn run(bun: &Path, mode: Supervision) {
         String::from_utf8_lossy(&sdk.stderr)
     );
     let data = host.data_dir(SESSION);
-    let options = host
-        .extensions
-        .compose(host.session_options(Some("test/m")));
+    let mut options = host.session_options(Some("test/m"));
+    options.exec_env = Some(Arc::new(axo::exec::StaticEnv::host()));
+    let options = host.extensions.compose(options);
     let session = Arc::new(host.axo.create_session(options).await.unwrap());
     host.extensions.attach(&session).await;
 
@@ -114,6 +115,25 @@ pub async fn run(bun: &Path, mode: Supervision) {
     assert!(text(&r2).contains("no"), "{:?}", r2.content);
     std::fs::remove_file(data.join("block")).unwrap();
 
+    turn(
+        &session,
+        &api,
+        &[("delegate", "spawn", json!({"task": "review the change"}))],
+        "delegate the review",
+    )
+    .await;
+    let spawn = result(&session, "delegate").await;
+    assert!(
+        spawn.is_error && text(&spawn).contains("spawn recorded"),
+        "{spawn:?}"
+    );
+    let recorded: Value =
+        serde_json::from_slice(&std::fs::read(data.join("spawn.json")).unwrap()).unwrap();
+    assert_eq!(
+        recorded,
+        json!({"task": [{"type": "text", "text": "review the change"}], "callId": "delegate"})
+    );
+
     // Branch state written by the handler through unparented session actions.
     turn(
         &session,
@@ -169,6 +189,26 @@ pub async fn run(bun: &Path, mode: Supervision) {
     );
     bounded(session.run_command(command)).await.unwrap();
     assert_posted(&session, "hi").await;
+
+    let count = host.axo.models().all().len();
+    assert!(count > 0);
+    let reply = "A one-off answer.";
+    api.lane("m", vec![ScriptedTurn::Reply(reply_text(reply))]);
+    let ask = session.parse_command("/ask-model hello").unwrap().unwrap();
+    bounded(session.run_command(ask)).await.unwrap();
+    assert_posted(&session, &format!("{count}: {reply}")).await;
+
+    let fork_here = session.parse_command("/fork-here").unwrap().unwrap();
+    bounded(session.run_command(fork_here)).await.unwrap();
+    assert_eq!(host.lifecycle.forks.load(Ordering::Relaxed), 1);
+    let fork_id = {
+        let held = host.lifecycle.sessions.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].name().as_deref(), Some("forked"));
+        held[0].id().to_owned()
+    };
+    assert_ne!(fork_id, session.id());
+    assert_posted(&session, &fork_id).await;
 
     let again = session.parse_command("/again").unwrap().unwrap();
     tokio::time::timeout(WAIT_LIMIT, session.run_command(again))
@@ -280,6 +320,8 @@ pub async fn run(bun: &Path, mode: Supervision) {
     .await
     .expect("the queued command did not report a stall");
 
+    tool_access(&session, &api, &host.path("work")).await;
+
     // The state survives a reopen.
     let path = session.path().to_path_buf();
     host.extensions.detach(session.id());
@@ -312,6 +354,78 @@ pub async fn run(bun: &Path, mode: Supervision) {
     session.shutdown().await;
     drop(session);
     host.close().await;
+}
+
+async fn tool_access(session: &Session, api: &ScriptedApi, cwd: &Path) {
+    turn(
+        session,
+        api,
+        &[("touch", "touch-two", json!({}))],
+        "write two files",
+    )
+    .await;
+    let touch = result(session, "touch").await;
+    assert!(!touch.is_error, "{:?}", touch.content);
+    let files = touch.details.as_ref().unwrap()["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    let sha = files[0]["change"]["after"]["sha256"].as_str().unwrap();
+
+    turn(
+        session,
+        api,
+        &[(
+            "edit-a",
+            "edit",
+            json!({
+                "path": "a.txt", "edits": [{"oldText": "first", "newText": "edited"}]
+            }),
+        )],
+        "edit the first file without a read",
+    )
+    .await;
+    let edit = result(session, "edit-a").await;
+    assert!(!edit.is_error, "{:?}", edit.content);
+    assert_eq!(std::fs::read(cwd.join("a.txt")).unwrap(), b"edited");
+    assert_eq!(std::fs::read(cwd.join("b.txt")).unwrap(), b"second");
+    assert_eq!(session.read_snapshot(sha).await.unwrap(), b"first");
+
+    std::fs::write(cwd.join("seen.txt"), "old").unwrap();
+    turn(
+        session,
+        api,
+        &[("stale", "stale", json!({}))],
+        "overwrite an unread file",
+    )
+    .await;
+    let stale = result(session, "stale").await;
+    assert!(stale.is_error);
+    assert!(
+        text(&stale).contains("File has not been read in this session"),
+        "{:?}",
+        stale.content
+    );
+    assert_eq!(std::fs::read(cwd.join("seen.txt")).unwrap(), b"old");
+
+    turn(session, api, &[("shell", "sh", json!({}))], "say hi").await;
+    let shell = result(session, "shell").await;
+    assert!(!shell.is_error, "{:?}", shell.content);
+    assert_eq!(text(&shell).trim(), "hi");
+
+    // Only promoted commands have a persistent job row after the foreground call returns.
+    turn(
+        session,
+        api,
+        &[("shell-bg", "sh", json!({"background": true}))],
+        "start a job",
+    )
+    .await;
+    assert!(
+        session
+            .jobs()
+            .iter()
+            .any(|job| job.call_id.as_deref() == Some("shell-bg")
+                && matches!(job.kind, axo::JobKind::Command { .. }))
+    );
 }
 
 async fn plan_task(session: &Session, api: &ScriptedApi) {

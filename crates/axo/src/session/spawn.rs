@@ -98,7 +98,9 @@ pub struct ChildHandle {
     pub session: Arc<Session>,
 }
 
+#[expose(block = CHILD_HANDLE_BLOCK, object = "types")]
 impl ChildHandle {
+    #[ext(skip = "live child handle; session.spawn returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
         SpawnReceipt::Child {
             job: self.job.clone(),
@@ -106,7 +108,9 @@ impl ChildHandle {
     }
 }
 
+#[expose(block = TEAM_HANDLE_BLOCK, object = "types")]
 impl TeamHandle {
+    #[ext(skip = "live child handle; session.spawn returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
         SpawnReceipt::Team {
             team: self.team.clone(),
@@ -126,7 +130,12 @@ pub trait SpawnHook: Send + Sync {
 }
 
 /// Who asked for a spawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum SpawnOrigin {
     /// `Session::spawn` or `Session::spawn_team`.
     Host,
@@ -135,7 +144,8 @@ pub enum SpawnOrigin {
 }
 
 /// A team member being spawned, for spawn hooks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SpawnTeam<'a> {
     /// The catalog team; `None` for ad-hoc teams.
     pub name: Option<&'a str>,
@@ -143,6 +153,8 @@ pub struct SpawnTeam<'a> {
     pub member: &'a str,
 }
 
+#[derive(serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SpawnContext<'a> {
     /// The resolved spec, subagent defaults applied.
     pub spec: &'a AgentSpec,

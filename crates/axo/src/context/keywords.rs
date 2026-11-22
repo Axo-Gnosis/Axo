@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -127,12 +128,14 @@ pub fn load_keywords(
     (definitions, diagnostics)
 }
 
+#[expose(block = KEYWORD_SPEC_BLOCK, object = "types")]
 impl KeywordSpec {
     /// Parses a keyword definition (YAML frontmatter plus body), e.g. one a host bundles
     /// with `include_str!` and passes in `SessionOptions::keywords`. `default_name` applies
     /// only when the frontmatter has no `name` key; an explicit empty `name` is invalid.
     /// Problems become diagnostics without an origin; an invalid definition yields `None`.
     /// The spec has no `path`.
+    #[ext(skip = "no receiver; served by host.parseKeyword")]
     pub fn parse(default_name: &str, markdown: &str) -> (Option<KeywordSpec>, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let spec = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {

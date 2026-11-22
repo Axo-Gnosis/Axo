@@ -7,6 +7,7 @@
 // - Tool `probe {mode:"hang"}` sends one update, writes `probe-started` in `dataDir` and waits
 //   for its signal; on abort it writes `canceled` and fails.
 // - The tool policy blocks every call with reason `no` while `dataDir/block` exists.
+// - The spawn hook records its task and originating call ID in `dataDir/spawn.json`, then blocks.
 // - Tool `burst` sends 300 updates in a plain loop, then returns `burst`.
 // - `/hello <args>` posts a quiet, displayed `lab` message with text `<args>`.
 // - `/flood` holds every runner host-call slot with `/hold-0`..`/hold-127` (one command may run
@@ -45,7 +46,7 @@ const hold: CommandHandler = async (_args, session, signal) => {
   await waitForAbort(stop);
 };
 
-const activate: Extension = ({ dataDir, session: getSession }) => ({
+const activate: Extension = ({ dataDir, host, models, session: getSession }) => ({
   tools: {
     async read({ call, update }) {
       update({ content: [{ type: "text", text: "partial" }] });
@@ -67,14 +68,53 @@ const activate: Extension = ({ dataDir, session: getSession }) => ({
       for (let i = 0; i < 300; i++) update({ content: [{ type: "text", text: `${i}` }] });
       return { content: [{ type: "text", text: "burst" }] };
     },
+    async "touch-two"(run) {
+      await run.tools.writeFile("a.txt", "first");
+      await run.tools.writeFile("b.txt", "second");
+      return { content: [] };
+    },
+    async stale(run) {
+      await run.tools.writeFile("seen.txt", "new");
+      return { content: [] };
+    },
+    async sh(run) {
+      return run.call.arguments.background
+        ? await run.tools.runCommand({ command: "sleep 0.2; echo bg", background: true })
+        : await run.tools.runCommand({ command: "echo hi" });
+    },
   },
   toolPolicy: {
-    async before() {
+    async before(_scope, _cx, _signal) {
       return existsSync(join(dataDir, "block")) ? { block: true, reason: "no" } : null;
     },
   },
+  async spawnHook(spawn) {
+    const callId = spawn.origin.type === "tool" ? spawn.origin.callId : null;
+    writeAtomic(dataDir, "spawn.json", JSON.stringify({ task: spawn.task, callId }));
+    return { block: "spawn recorded" };
+  },
   commands: {
     hello: (args, session) => session.post({ customType: "lab", text: args, display: true, delivery: "quiet" }),
+    async "ask-model"(args, session) {
+      const count = (await models.all()).length;
+      const reply = await models.complete({
+        model: "test/m",
+        messages: [{ role: "user", content: args, timestamp: Date.now() }],
+      });
+      const text = Array.isArray(reply.content)
+        ? reply.content.flatMap(block => block.type === "text" ? [block.text] : []).join("")
+        : reply.content;
+      await session.post({ customType: "lab", text: `${count}: ${text}`, display: true, delivery: "quiet" });
+    },
+    async "fork-here"(_args, session) {
+      let page = await session.entries();
+      while (page.more) page = await session.entries(page.entries.at(-1)!.seq);
+      const id = page.entries.at(-1)?.entry.id;
+      if (typeof id !== "string") throw new Error("no entry ID to fork at");
+      const receipt = await host.forkSession(session.id, id);
+      await getSession(receipt.session).setName("forked");
+      await session.post({ customType: "lab", text: receipt.session, display: true, delivery: "quiet" });
+    },
     async "plan-task"(args, session) {
       await session.runCommand({ type: "mode", name: "plan", prompt: args });
     },

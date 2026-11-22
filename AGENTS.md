@@ -58,9 +58,10 @@ cargo fmt --check
 
 - **Offline deterministic tests**: All `cargo test` suites must run offline without API keys or network access. Use `crates/*/examples/` for live model smoke runs.
 - **Doc & supervision gates**: `cargo test -p axo --test doc_identifiers` rejects backticked identifiers in README.md, AGENTS.md, and `crates/axo/docs/` that do not exist in source. Cgroup supervision tests run only with `$AXO_TEST_CGROUP=1` in a delegated cgroup. Real-Bun acceptance (`cargo test -p axo-extensions --test bun_provider`) runs only with `$AXO_TEST_BUN` set to an absolute Bun path.
-- **Extension gates:** `cargo test -p axo --test ext_surface` checks exposure decisions and block coverage; `cargo test -p axo --test bindings` rejects stale SDK bindings. To regenerate after a surface change:
+- **Extension gates:** `cargo test -p axo --test ext_surface` checks method decisions, registered blocks and a FREE decision for every reachable public free function. `cargo test -p axo-extensions --test bindings` checks the SDK bindings; `cargo test -p axo --test ext_reference` checks `crates/axo/docs/extension-api.md`. Regenerate both after a surface change:
 
   ```bash
-  UPDATE_BINDINGS=1 cargo test -p axo --test bindings
+  UPDATE_BINDINGS=1 cargo test -p axo-extensions --test bindings
+  UPDATE_BINDINGS=1 cargo test -p axo --test ext_reference
   ```
 - **Reuse test harnesses**: Use `axo_ai::testing::ScriptedApi` (under `features = ["testing"]`) for mocked model turns and `crates/axo/tests/common/mod.rs` (helpers `axo`, `axo_with`, `host`, `options`, `bash_options`, `tool_text`, `dead`, `within`, `until`, `entry`, `delivered`, `request`, `journal`, `only`, `transient`, `message_text`, and the in-memory `ConfigSource` fixture behind `Host::config`) for session tests in `tempfile::tempdir()`.

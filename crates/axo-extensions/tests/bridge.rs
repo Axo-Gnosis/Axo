@@ -28,7 +28,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axo::{Axo, EnabledExtension, EnvMap, JsonlStore, ProcessSupervisor};
+use axo::{Axo, EnabledExtension, EnvMap, JsonlStore};
 use axo_ai::{
     AssistantEvent, FileCredentialStore, Message, Model, Models, ModelsConfig, ModelsOptions,
     ScriptedApi, ScriptedTurn, SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
@@ -157,8 +157,7 @@ pub struct Host {
     pub dir: tempfile::TempDir,
     pub models: Arc<Models>,
     pub store: Arc<FileCredentialStore>,
-    pub axo: Axo,
-    pub supervisor: Arc<ProcessSupervisor>,
+    pub axo: Arc<Axo>,
 }
 
 impl Host {
@@ -196,13 +195,11 @@ impl Host {
         )
         .streamer(Arc::new(ScriptedApi::new(turns)))
         .build();
-        let supervisor = axo.supervisor();
         Host {
             dir,
             models,
             store,
-            axo,
-            supervisor,
+            axo: Arc::new(axo),
         }
     }
 
@@ -232,7 +229,7 @@ impl Host {
     }
 
     pub fn manager_with(&self, options: ExtensionOptions) -> Extensions {
-        Extensions::new(self.models.clone(), self.supervisor.clone(), options)
+        Extensions::new(self.axo.clone(), options)
     }
 
     /// Writes `<root>/<id>/extension.json` and its entry; `providers` are
@@ -531,13 +528,15 @@ mod fake {
     ///   `rewritten: true`) | `hang` | `exit` | `fail` (code "failed").
     /// - `ctl/<ext>/tool`: `ok` (parented partial update, then echo) | `state` (unparented
     ///   appendCustom and custom, then report the stored value) | `reenter` (runs `/hello`,
-    ///   returns `refused` once the host refuses it) | `hang` | `exit` | `fail`.
-    /// - `ctl/<ext>/policyBefore` and `ctl/<ext>/spawn`: `ok` | `block` (reason "no").
+    ///   returns `refused` once the host refuses it) | `resolve` (resolve a path only when
+    ///   the request has the tool call as parent) | `hang` | `exit` | `fail`.
+    /// - `ctl/<ext>/policyBefore` and `ctl/<ext>/spawn`: `ok` | `block` (reason "no";
+    ///   `spawn` also records its args in `blocked-spawn`). `policyAfter`: `record` logs `after`.
     /// - `ctl/<ext>/command`: `ok` (posts a quiet `lab` message) | `subscribe` (records the
     ///   id in `subs`) | `unsubscribe` | `reenter` (runs itself, expects a refusal) | `prompt`
-    ///   (prompts `go`) | `compact` (expects `busy`). `stream` records each frame in `streams`,
-    ///   `event` records the journal type, and `schemeResolve` and `schemeRead` serve a
-    ///   virtual resource.
+    ///   (prompts `go`) | `compact` (expects `busy`). `stream` records journal entry types in
+    ///   `entries` for `sub: "entry"` and other subscriptions' frames in `streams`.
+    ///   `schemeResolve` and `schemeRead` serve a virtual resource.
     /// - Any method: `late` waits for `ctl/<ext>/release`, then replies as `ok` even if the
     ///   host canceled the call meanwhile.
     ///
@@ -790,6 +789,16 @@ mod fake {
                     request["body"]["rewritten"] = true.into();
                     Ok(request)
                 }
+                "tool" if script == "resolve" => {
+                    let request = json!({"object": "tools", "method": "resolvePath", "args": ["x"]});
+                    let path = self.ask(ext, Some(id), "invoke", request.clone()).await?;
+                    match self.ask(ext, None, "invoke", request).await {
+                        Err((code, _)) if code == "unsupported" => {
+                            Ok(json!({"content": [{"type": "text", "text": path}]}))
+                        }
+                        other => Err(fail(format!("expected unsupported without a parent, got {other:?}"))),
+                    }
+                }
                 "tool" if script == "reenter" => {
                     let command = json!({"type": "registered", "name": "hello", "args": ""});
                     match self.invoke(ext, &args["session"], "runCommand", json!([command])).await {
@@ -825,12 +834,28 @@ mod fake {
                     Ok(json!({"content": [{"type": "text", "text": text}]}))
                 }
                 "policyBefore" if script == "block" => Ok(json!({"block": true, "reason": "no"})),
-                "spawn" if script == "block" => Ok(json!({"block": "no"})),
+                "policyAfter" if script == "record" => {
+                    append(&self.control.join(ext).join("after"), &args.to_string());
+                    Ok(Value::Null)
+                }
+                "spawn" if script == "block" => {
+                    append(&self.control.join(ext).join("blocked-spawn"), &args.to_string());
+                    Ok(json!({"block": "no"}))
+                }
                 "policyBefore" | "policyAfter" | "spawn" => Ok(Value::Null),
-                "command" if script == "subscribe" => {
-                    let reply = self.ask(ext, None, "subscribe", json!({
-                        "session": args["session"], "kinds": ["entry"]
-                    })).await?;
+                "command" if script == "invoke" => {
+                    let request = serde_json::from_str(args["args"].as_str().unwrap()).unwrap();
+                    let reply = self.ask(ext, None, "invoke", request).await;
+                    std::fs::write(self.control.join(ext).join("reply"), serde_json::to_vec(&reply).unwrap()).unwrap();
+                    Ok(Value::Null)
+                }
+                "command" if matches!(script.as_str(), "subscribe" | "completion") => {
+                    let request = if script == "completion" {
+                        json!({ "completion": { "model": "test/m", "messages": [] } })
+                    } else {
+                        json!({ "session": args["session"], "kinds": ["entry"] })
+                    };
+                    let reply = self.ask(ext, None, "subscribe", request).await?;
                     append(&self.control.join(ext).join("subs"), reply["sub"].as_str().unwrap());
                     Ok(Value::Null)
                 }
@@ -842,6 +867,14 @@ mod fake {
                         Err((code, _)) if code == "no_subscription" => Ok(Value::Null),
                         other => Err(fail(format!("expected no_subscription, got {other:?}"))),
                     }
+                }
+                "stream" if args["sub"] == "entry" => {
+                    assert_eq!(args["event"]["type"], "entry");
+                    append(
+                        &self.control.join(ext).join("entries"),
+                        args["event"]["value"]["entry"]["type"].as_str().unwrap(),
+                    );
+                    Ok(Value::Null)
                 }
                 "stream" => {
                     append(&self.control.join(ext).join("streams"), &args.to_string());
@@ -867,13 +900,6 @@ mod fake {
                 "command" => self.invoke(ext, &args["session"], "post", json!([{
                     "customType": "lab", "text": args["args"], "display": true, "delivery": "quiet",
                 }])).await,
-                "event" => {
-                    append(
-                        &self.control.join(ext).join("entries"),
-                        args["entry"]["entry"]["type"].as_str().unwrap(),
-                    );
-                    Ok(Value::Null)
-                }
                 "schemeResolve" => Ok(json!("virtual")),
                 "schemeRead" => Ok(json!(format!("read:{}", args["path"].as_str().unwrap()))),
                 other => Err(("unsupported".into(), format!("unknown method {other}"))),

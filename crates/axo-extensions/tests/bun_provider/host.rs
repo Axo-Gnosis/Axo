@@ -5,18 +5,22 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use axo::{
-    Axo, ConfigLayer, ConfigSource, EnabledExtension, EnvMap, JsonlStore, ProjectAccess,
-    SessionOptions, StaticEnv, Supervision, UserConfig,
+    Axo, ConfigLayer, ConfigSource, EnabledExtension, EntryId, EnvMap, JsonlStore, ProjectAccess,
+    Session, SessionOptions, StaticEnv, Supervision, UserConfig,
 };
 use axo_ai::{
     AssistantEvent, FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi,
     SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
 };
-use axo_extensions::{ExtensionOptions, ExtensionPhase, ExtensionStatus, Extensions};
+use axo_extensions::{
+    ExtensionOptions, ExtensionPhase, ExtensionStatus, Extensions, Forked, Lifecycle,
+    SessionRequest,
+};
 use futures::StreamExt;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -33,12 +37,91 @@ pub const SESSION: &str = "lab-session";
 pub const WAIT_LIMIT: Duration = Duration::from_secs(30);
 
 pub struct Host {
-    pub axo: Axo,
+    pub axo: Arc<Axo>,
     pub models: Arc<Models>,
     pub store: Arc<FileCredentialStore>,
-    pub extensions: Extensions,
+    pub extensions: Arc<Extensions>,
+    pub lifecycle: Arc<TestLifecycle>,
     pub server: Server,
     pub temp: tempfile::TempDir,
+}
+
+pub struct TestLifecycle {
+    axo: Arc<Axo>,
+    extensions: Weak<Extensions>,
+    pub sessions: Mutex<Vec<Arc<Session>>>,
+    pub forks: AtomicUsize,
+}
+
+impl TestLifecycle {
+    fn options(&self, cwd: PathBuf, request: SessionRequest) -> Result<SessionOptions, axo::Error> {
+        let extensions = self
+            .extensions
+            .upgrade()
+            .ok_or_else(|| axo::Error::Host("extension manager has been dropped".into()))?;
+        Ok(extensions.compose(session_options(cwd, request)))
+    }
+
+    fn hold(&self, session: Session) -> Arc<Session> {
+        let session = Arc::new(session);
+        self.sessions.lock().unwrap().push(session.clone());
+        session
+    }
+}
+
+#[async_trait::async_trait]
+impl Lifecycle for TestLifecycle {
+    async fn create(
+        &self,
+        cwd: PathBuf,
+        request: SessionRequest,
+    ) -> Result<Arc<Session>, axo::Error> {
+        Ok(self.hold(self.axo.create_session(self.options(cwd, request)?).await?))
+    }
+
+    async fn open(
+        &self,
+        path: PathBuf,
+        request: SessionRequest,
+    ) -> Result<Arc<Session>, axo::Error> {
+        let options = self.options(PathBuf::new(), request)?;
+        Ok(self.hold(self.axo.open_session(&path, options).await?))
+    }
+
+    async fn fork(&self, session: Arc<Session>, entry: EntryId) -> Result<Forked, axo::Error> {
+        self.forks.fetch_add(1, Ordering::Relaxed);
+        let fork = session.fork(&entry).await?;
+        Ok(Forked {
+            session: self.hold(fork.session),
+            editable: fork.editable,
+        })
+    }
+
+    async fn close(&self, session_id: String) -> Result<(), axo::Error> {
+        let session = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let index = sessions
+                .iter()
+                .position(|s| s.id() == session_id)
+                .ok_or(axo::Error::SessionNotFound(session_id))?;
+            sessions.swap_remove(index)
+        };
+        session.shutdown().await;
+        Ok(())
+    }
+}
+
+fn session_options(cwd: PathBuf, request: SessionRequest) -> SessionOptions {
+    SessionOptions {
+        cwd,
+        model: request.model,
+        agent: request.agent,
+        thinking: request.thinking,
+        project_access: request.project_access.or(Some(ProjectAccess::Ignore)),
+        sections: request.sections,
+        exec_env: Some(Arc::new(StaticEnv(Arc::new(BTreeMap::new())))),
+        ..SessionOptions::default()
+    }
 }
 
 /// Keep the retained tail small enough for scripted turns to exercise manual compaction.
@@ -154,10 +237,9 @@ impl Host {
                 .config(Arc::new(SessionConfig { skill_root }))
                 .streamer(streamer);
         }
-        let axo = builder.build();
-        let extensions = Extensions::new(
-            models.clone(),
-            axo.supervisor(),
+        let axo = Arc::new(builder.build());
+        let extensions = Arc::new(Extensions::new(
+            axo.clone(),
             ExtensionOptions {
                 bun: Some(bun.to_path_buf()),
                 roots: vec![temp.path().join("root")],
@@ -165,12 +247,20 @@ impl Host {
                 runtime_dir: temp.path().join("runtime"),
                 env: Arc::new(runner_env(temp.path(), &server.url, detach)),
             },
-        );
+        ));
+        let lifecycle = Arc::new(TestLifecycle {
+            axo: axo.clone(),
+            extensions: Arc::downgrade(&extensions),
+            sessions: Mutex::default(),
+            forks: AtomicUsize::default(),
+        });
+        extensions.set_lifecycle(Some(lifecycle.clone()));
         Host {
             axo,
             models,
             store,
             extensions,
+            lifecycle,
             server,
             temp,
         }
@@ -246,13 +336,13 @@ impl Host {
 
     /// Session options on `selector` in `<temp>/work`, without project files or a dev shell.
     pub fn session_options(&self, selector: Option<&str>) -> SessionOptions {
-        SessionOptions {
-            cwd: self.path("work"),
-            model: selector.map(Into::into),
-            project_access: Some(ProjectAccess::Ignore),
-            exec_env: Some(Arc::new(StaticEnv(Arc::new(BTreeMap::new())))),
-            ..SessionOptions::default()
-        }
+        session_options(
+            self.path("work"),
+            SessionRequest {
+                model: selector.map(Into::into),
+                ..Default::default()
+            },
+        )
     }
 
     /// The cold path, before any login: `find`, a real session create and prompt (which fails
@@ -337,6 +427,11 @@ impl Host {
 
     /// Shuts the manager down (reaping every runner), then the host.
     pub async fn close(self) {
+        let sessions = std::mem::take(&mut *self.lifecycle.sessions.lock().unwrap());
+        for session in sessions {
+            self.extensions.detach(session.id());
+            session.shutdown().await;
+        }
         self.extensions.shutdown().await;
     }
 }

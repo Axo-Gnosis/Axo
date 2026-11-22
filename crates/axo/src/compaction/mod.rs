@@ -12,7 +12,7 @@ use axo_ai::{Message, Model, StopReason};
 
 use crate::session::{MODE_NOTICE, TOOL_CATALOG};
 use crate::store::{Entry, EntryId, Projection, SeqEntry};
-use crate::tools::{FileAccess, ledger_access};
+use crate::tools::{FileAccess, ledger_records};
 use crate::{CompactionSettings, Error};
 
 const CLEARING_HEADROOM: u64 = 20_000;
@@ -26,11 +26,11 @@ pub(crate) struct Limits {
     pub keep_recent: u64,
 }
 impl Limits {
-    pub fn clearing_target(&self) -> Option<u64> {
+    pub(crate) fn clearing_target(&self) -> Option<u64> {
         self.trigger.checked_sub(CLEARING_HEADROOM)
     }
 
-    pub fn resolve(model: &Model, settings: &CompactionSettings) -> Result<Self, Error> {
+    pub(crate) fn resolve(model: &Model, settings: &CompactionSettings) -> Result<Self, Error> {
         let window = settings
             .max_context
             .map_or(model.context_window, |cap| cap.min(model.context_window));
@@ -173,7 +173,7 @@ pub(crate) struct FileLists {
     pub modified: Vec<String>,
 }
 impl FileLists {
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut out = String::new();
         for (tag, paths) in [
             ("read-files", &self.read),
@@ -185,7 +185,7 @@ impl FileLists {
         }
         out
     }
-    pub fn details(&self) -> serde_json::Value {
+    pub(crate) fn details(&self) -> serde_json::Value {
         serde_json::json!({"readFiles": self.read, "modifiedFiles": self.modified})
     }
 }
@@ -205,17 +205,15 @@ pub(crate) fn file_lists<'a>(
     let mut read = BTreeSet::new();
     let mut modified = BTreeSet::new();
     for message in messages {
-        if let AgentMessage::Llm(Message::ToolResult(result)) = message
-            && let Some((path, access)) = ledger_access(result)
-        {
-            match access {
-                FileAccess::Read => {
-                    read.insert(path);
-                }
-                FileAccess::Modify => {
-                    modified.insert(path);
-                }
-            }
+        let AgentMessage::Llm(Message::ToolResult(result)) = message else {
+            continue;
+        };
+        for record in ledger_records(result) {
+            let paths = match record.access {
+                FileAccess::Read => &mut read,
+                FileAccess::Modify => &mut modified,
+            };
+            paths.insert(record.path);
         }
     }
     for entry in entries {

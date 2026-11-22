@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
 use axo_ai::{Model, Models, ThinkingLevel};
+use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
@@ -95,9 +96,11 @@ pub enum ExtensionListError {
     Duplicate(String),
 }
 
+#[expose(block = ENABLED_EXTENSION_BLOCK, object = "types")]
 impl EnabledExtension {
     /// Checks every ID and group name and rejects a repeated ID. Settings run this while
     /// deserializing; hosts passing a typed list run it themselves.
+    #[ext(skip = "no receiver; validates the host's own extension list")]
     pub fn validate_all(extensions: &[EnabledExtension]) -> Result<(), ExtensionListError> {
         let mut seen = std::collections::HashSet::with_capacity(extensions.len());
         for extension in extensions {
@@ -195,6 +198,7 @@ pub(crate) struct Cascade<'a> {
     pub selector: Option<&'a str>,
 }
 
+#[expose(block = SETTINGS_BLOCK, object = "types")]
 impl Settings {
     pub(crate) fn first_model<'a>(
         &self,
@@ -219,6 +223,7 @@ impl Settings {
     }
 
     /// Resolves a model selector, expanding a user-defined `@role` if present.
+    #[ext(skip = "takes the live registry; session.setModel and models.complete resolve selectors")]
     pub fn resolve_model(&self, models: &Models, selector: &str) -> Result<ModelChoice, Error> {
         let Some(rest) = selector.strip_prefix('@') else {
             return plain(models, selector);
@@ -357,7 +362,9 @@ pub struct ProjectSettings {
     pub paths: IndexMap<String, ProjectAccess>,
 }
 
+#[expose(block = PROJECT_SETTINGS_BLOCK, object = "types")]
 impl ProjectSettings {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn access_for(&self, root: &Path) -> ProjectAccess {
         let mut access = self.access;
         for (pattern, &value) in &self.paths {
@@ -521,7 +528,8 @@ pub struct UserConfig {
 /// any other acquisition failure as `Error::Host(Box::new(err))`.
 // ponytail: blocking calls; make async if a host needs network-backed config
 pub trait ConfigSource: Send + Sync {
-    /// Called once per `create_session`, `open_session`, `Axo::schemes`, and `Axo::catalog`, before anything else.
+    /// Called once per `create_session`, `open_session`, `Axo::schemes`, `Axo::catalog`, and `Axo::stream`
+    /// (which `Axo::complete` uses), before anything else.
     fn user(&self) -> Result<UserConfig, Error>;
     /// The project contribution for a session in `cwd`. The project root is `axo::context::project_root(cwd)`.
     /// Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust`
@@ -548,12 +556,14 @@ pub struct EffectiveConfig {
     pub context_files: Vec<PathBuf>,
 }
 
+#[expose(block = EFFECTIVE_CONFIG_BLOCK, object = "types")]
 impl EffectiveConfig {
     /// Samples `source.user()`, derives access (`access` overrides the user policy), then,
     /// unless access is `Ignore` or `project.files.config` is false, applies
     /// `source.project(cwd)`. Objects merge key by key with the project winning; arrays
     /// replace. The project never sets user-only keys, and below `Trust` the effective
     /// dev shell is always off, regardless of its source.
+    #[ext(skip = "takes the host's config source; host.catalog returns the resolved config")]
     pub fn resolve(
         source: &dyn ConfigSource,
         cwd: &Path,
@@ -648,6 +658,7 @@ impl EffectiveConfig {
     /// `settings.default_model` with `$VAR` expanded and `!command` values rejected.
     /// Sessions call this only when neither `SessionOptions::model`, the session's recorded model,
     /// nor the root agent's model selects one, so an unresolvable value fails only that selection.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn default_model(&self) -> Result<Option<String>, Error> {
         let Some(model) = &self.settings.default_model else {
             return Ok(None);

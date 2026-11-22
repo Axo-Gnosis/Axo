@@ -1,7 +1,6 @@
 //! The `read` tool (pi `core/tools/read.ts`).
 
 use std::borrow::Cow;
-use std::io::ErrorKind;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,12 +9,12 @@ use axo_ai::{ToolCall, UserBlock};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, fs_error, process_image};
+use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, process_image};
 use crate::tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, TruncatedBy, format_size, truncate_head,
     truncation_details,
 };
-use crate::tools::{FileAccess, Located, SessionTools};
+use crate::tools::{FileRead, SessionTools, file_details};
 
 const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
     "Use read to examine files instead of cat or sed.",
@@ -35,7 +34,7 @@ pub struct ReadTool {
 }
 
 impl ReadTool {
-    pub fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>) -> Self {
         Self {
             tools,
             description: format!(
@@ -85,49 +84,31 @@ impl Tool for ReadTool {
             limit,
         } = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|error| ToolError(error.to_string()))?;
-        if cancel.is_cancelled() {
-            return Err(ToolError("Operation aborted".into()));
-        }
-        let (absolute, label) = match self.tools.locate(&path).await? {
-            Located::File { url, path, .. } => {
-                let path = if url.is_none() {
-                    super::existing_variant(path)
-                } else {
-                    path
-                };
-                (path, url.map(|url| url.to_string()))
-            }
-            Located::Virtual { url } => {
-                let text = self.tools.schemes.read(&url).await?;
-                if url.scheme == "tool" && !url.path.is_empty() {
-                    self.tools.deferred.request(&url.path);
+        let (absolute, label, bytes, record) =
+            match self.tools.read_file(&cancel, &path, None).await? {
+                FileRead::File {
+                    path,
+                    label,
+                    bytes,
+                    record,
+                } => (path, label, bytes, record),
+                FileRead::Virtual { url, text } => {
+                    if url.scheme == "tool" && !url.path.is_empty() {
+                        self.tools.deferred.request(&url.path);
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(ToolError("Operation aborted".into()));
+                    }
+                    let (output, truncation) = page_text(&text, None, offset, limit)?;
+                    return Ok(ToolOutput {
+                        content: vec![UserBlock::Text { text: output }],
+                        details: truncation.map(|truncation| json!({ "truncation": truncation })),
+                        ..ToolOutput::default()
+                    });
                 }
-                if cancel.is_cancelled() {
-                    return Err(ToolError("Operation aborted".into()));
-                }
-                let (output, truncation) = page_text(&text, None, offset, limit)?;
-                return Ok(ToolOutput {
-                    content: vec![UserBlock::Text { text: output }],
-                    details: truncation.map(|truncation| json!({ "truncation": truncation })),
-                    ..ToolOutput::default()
-                });
-            }
-        };
-        let shown = super::shown(&absolute, label.as_deref());
-        let path = label.as_deref().unwrap_or(&path);
-        let bytes = tokio::fs::read(&absolute).await.map_err(|error| {
-            let syscall = if error.kind() == ErrorKind::IsADirectory {
-                "read"
-            } else {
-                "access"
             };
-            ToolError(fs_error(&error, syscall, shown))
-        })?;
-        if cancel.is_cancelled() {
-            return Err(ToolError("Operation aborted".into()));
-        }
-        let mut details =
-            json!({ "ledger": self.tools.ledger.record(&absolute, &bytes, FileAccess::Read) });
+        let path = label.as_deref().unwrap_or(&path);
+        let mut details = file_details(&[record]);
 
         let mut content =
             if let Some(mime) = detect_image_mime(&bytes[..bytes.len().min(IMAGE_SNIFF_BYTES)]) {

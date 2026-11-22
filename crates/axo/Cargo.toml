@@ -1,6 +1,6 @@
 [package]
 name = "axo"
-version = "0.1.0"
+version = "0.0.0"
 description = "axo's coding-agent core: built-in tools, Nix dev-shell exec, prompt and context assembly, config and sessions"
 edition.workspace = true
 license.workspace = true
@@ -48,8 +48,6 @@ axo-agent = { path = "../axo-agent" }
 axo-ai = { path = "../axo-ai", features = ["testing"] }
 jsonc-parser.workspace = true
 proc-macro2 = { workspace = true, features = ["span-locations"] }
-specta-typescript.workspace = true
-specta-util.workspace = true
 syn.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

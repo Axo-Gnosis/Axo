@@ -76,7 +76,7 @@ pub(crate) struct PendingQuestions {
 
 impl PendingQuestions {
     /// `events` is the session's event channel.
-    pub fn new(events: broadcast::Sender<Arc<SessionEvent>>) -> Self {
+    pub(crate) fn new(events: broadcast::Sender<Arc<SessionEvent>>) -> Self {
         Self {
             events,
             pending: Pending::default(),
@@ -85,7 +85,11 @@ impl PendingQuestions {
 
     /// Registers `questions` under `call_id` and announces them to the client. A second
     /// registration under the same id replaces the first, whose receiver then closes.
-    pub fn ask(&self, call_id: &str, questions: Vec<Question>) -> oneshot::Receiver<AskOutcome> {
+    pub(crate) fn ask(
+        &self,
+        call_id: &str,
+        questions: Vec<Question>,
+    ) -> oneshot::Receiver<AskOutcome> {
         let rx = self.pending.register(call_id, questions.clone());
         let _ = self.events.send(Arc::new(SessionEvent::QuestionPending {
             call_id: call_id.to_owned(),
@@ -95,17 +99,17 @@ impl PendingQuestions {
     }
 
     /// Settles the pending call with the client's answers.
-    pub fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error> {
+    pub(crate) fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error> {
         self.settle(call_id, AskOutcome::Answered(answers))
     }
 
     /// Settles the pending call as dismissed; the tool reports a user cancellation.
-    pub fn dismiss(&self, call_id: &str) -> Result<(), Error> {
+    pub(crate) fn dismiss(&self, call_id: &str) -> Result<(), Error> {
         self.settle(call_id, AskOutcome::Dismissed)
     }
 
     /// Snapshot of every unanswered call, for clients attaching late.
-    pub fn pending(&self) -> Vec<(String, Vec<Question>)> {
+    pub(crate) fn pending(&self) -> Vec<(String, Vec<Question>)> {
         self.pending.snapshot()
     }
 

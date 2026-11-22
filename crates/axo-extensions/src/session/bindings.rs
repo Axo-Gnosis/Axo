@@ -5,19 +5,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo::{
-    AgentSpec, CommandHandler, Error, Scheme, SchemeContext, SchemeUrl, Session, SpawnContext,
-    SpawnDecision, SpawnHook, SpawnOrigin, Target, ToolPolicy, ToolScope,
+    AgentSpec, CommandHandler, Error, Scheme, SchemeContext, SchemeUrl, Session, SessionTools,
+    SpawnContext, SpawnDecision, SpawnHook, Target, ToolAccess, ToolPolicy, ToolScope,
 };
 use axo_agent::{
     AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, ExecutionMode, Replay, Tool,
-    ToolCallDecision, ToolContext, ToolError, ToolOutput, ToolUpdate,
+    ToolCallDecision, ToolContext, ToolError, ToolInvocationId, ToolOutput, ToolUpdate,
 };
-use axo_ai::{ToolCall, UserBlock};
-use serde::Deserialize;
+use axo_ai::{AssistantMessage, ToolCall, UserBlock};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::Remote;
+use super::{Remote, decode};
 use crate::manifest::{self, CommandDecl, SchemeDecl, ToolDecl};
 use crate::peer::{Callbacks, Refusal};
 use crate::remote::{CALL_DEADLINE, Failure};
@@ -29,8 +29,39 @@ fn replay(replay: manifest::Replay) -> Replay {
     }
 }
 
-fn call_json(call: &ToolCall) -> Value {
-    json!({ "id": call.id, "name": call.name, "arguments": call.arguments })
+#[derive(Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ToolRunArgs<'a> {
+    tool: &'a str,
+    session: &'a str,
+    call: &'a ToolCall,
+    invocation: ToolInvocationId,
+}
+
+#[derive(Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BeforeToolCall<'a> {
+    assistant_message: &'a AssistantMessage,
+    tool_call: &'a ToolCall,
+}
+
+#[derive(Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AfterToolCall<'a> {
+    assistant_message: &'a AssistantMessage,
+    tool_call: &'a ToolCall,
+    result: &'a ToolOutput,
+}
+
+#[derive(Serialize)]
+struct PolicyArgs<'a, C> {
+    scope: &'a ToolScope,
+    cx: C,
+}
+
+#[derive(Serialize)]
+struct SpawnArgs<'a> {
+    spawn: &'a SpawnContext<'a>,
 }
 
 /// A tool result as the runner sends it.
@@ -51,6 +82,7 @@ pub(super) struct RemoteTool {
     pub remote: Remote,
     pub decl: Arc<ToolDecl>,
     pub session: String,
+    pub tools: Arc<SessionTools>,
 }
 
 #[async_trait]
@@ -84,35 +116,60 @@ impl Tool for RemoteTool {
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let (ext, name) = (&self.remote.ext, &self.decl.name);
-        let args = json!({ "tool": name, "session": self.session, "call": call_json(&cx.call) });
-        let updates = Updates(&cx);
-        let what = format!("tool {name}");
-        let call = self.remote.call(&what, "tool", args, Some(&updates), None);
-        // Dropping the call on cancel sends the runner its cancel frame.
-        let value = tokio::select! {
-            biased;
-            _ = cx.cancel.cancelled() => {
-                return Err(ToolError(format!("extension {ext} tool {name}: canceled")));
-            }
-            value = call => value,
-        }
-        .map_err(|failure| ToolError(failure.to_string()))?;
-        let output: Output = serde_json::from_value(value).map_err(|_| {
+        let access = ToolAccess::new(self.tools.clone(), cx.clone());
+        let args = serde_json::to_value(ToolRunArgs {
+            tool: name,
+            session: &self.session,
+            call: &cx.call,
+            invocation: cx.invocation,
+        })
+        .map_err(|error| {
             ToolError(format!(
-                "extension {ext} tool {name}: returned an invalid result"
+                "extension {ext} tool {name}: call cannot be sent: {error}"
             ))
         })?;
-        Ok(ToolOutput {
-            content: output.content,
-            details: output.details,
-            is_error: output.is_error.unwrap_or(false),
-            terminate: output.terminate.unwrap_or(false),
-        })
+        let callbacks = ToolCalls {
+            access: &access,
+            ext,
+        };
+        let what = format!("tool {name}");
+        let call = self
+            .remote
+            .call(&what, "tool", args, Some(&callbacks), None);
+        // Dropping the call on cancel sends the runner its cancel frame; `finish` waits for
+        // file operations already under way.
+        let result = tokio::select! {
+            biased;
+            _ = cx.cancel.cancelled() => Err(ToolError(format!("extension {ext} tool {name}: canceled"))),
+            value = call => value.map_err(|failure| ToolError(failure.to_string())),
+        }
+        .and_then(|value| {
+            let output: Output = serde_json::from_value(value).map_err(|_| {
+                ToolError(format!("extension {ext} tool {name}: returned an invalid result"))
+            })?;
+            Ok(ToolOutput {
+                content: output.content,
+                details: output.details,
+                is_error: output.is_error.unwrap_or(false),
+                terminate: output.terminate.unwrap_or(false),
+            })
+        });
+        access.finish(result).await
     }
 }
 
-/// A tool call's only callback: streaming a partial result.
-struct Updates<'a>(&'a ToolContext);
+struct ToolCalls<'a> {
+    access: &'a ToolAccess,
+    ext: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolInvoke {
+    object: String,
+    method: String,
+    args: Vec<Value>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,31 +180,40 @@ struct Update {
 }
 
 #[async_trait]
-impl Callbacks for Updates<'_> {
+impl Callbacks for ToolCalls<'_> {
     async fn call(&self, method: &str, args: Value) -> Result<Value, Refusal> {
-        if method != "update" {
-            return Err(Refusal {
+        match method {
+            "update" => {
+                let Update { content, details } = decode(args)?;
+                self.access.cx.updates.send(ToolUpdate { content, details });
+                Ok(Value::Null)
+            }
+            "invoke" => {
+                let ToolInvoke {
+                    object,
+                    method,
+                    args,
+                } = decode(args)?;
+                if object != "tools" {
+                    return Err(Refusal {
+                        code: "unsupported".into(),
+                        message: format!("unknown object: {object}"),
+                    });
+                }
+                let caller = axo::ext::Caller {
+                    namespace: Some(self.ext.to_owned()),
+                };
+                self.access
+                    .invoke(&method, args, &caller)
+                    .await
+                    .map_err(Refusal::from)
+            }
+            _ => Err(Refusal {
                 code: "unsupported".into(),
                 message: "unknown host method".into(),
-            });
+            }),
         }
-        let Update { content, details } = serde_json::from_value(args).map_err(|_| Refusal {
-            code: "invalid".into(),
-            message: "invalid arguments".into(),
-        })?;
-        self.0.updates.send(ToolUpdate { content, details });
-        Ok(Value::Null)
     }
-}
-
-fn scope_json(scope: &ToolScope) -> Value {
-    json!({
-        "sessionId": scope.session_id,
-        "depth": scope.depth,
-        "agent": scope.agent.as_ref().map(|agent| &agent.name),
-        "mode": scope.mode.as_ref().map(|mode| &mode.name),
-        "readOnlyBash": !scope.bash.is_full(),
-    })
 }
 
 /// Runs `call` unless `cancel` fires first.
@@ -208,7 +274,18 @@ impl ToolPolicy for RemotePolicy {
             return Ok(ToolCallDecision::Allow);
         }
         let ext = &self.remote.ext;
-        let args = json!({ "scope": scope_json(scope), "call": call_json(call.tool_call) });
+        let args = serde_json::to_value(PolicyArgs {
+            scope,
+            cx: BeforeToolCall {
+                assistant_message: call.assistant_message,
+                tool_call: call.tool_call,
+            },
+        })
+        .map_err(|error| {
+            ToolError(format!(
+                "extension {ext}: tool policy: call cannot be sent: {error}"
+            ))
+        })?;
         let reply = self.remote.call(
             "tool policy",
             "policyBefore",
@@ -252,16 +329,19 @@ impl ToolPolicy for RemotePolicy {
             return Ok(None);
         }
         let ext = &self.remote.ext;
-        let result = call.result;
-        let args = json!({
-            "scope": scope_json(scope),
-            "call": call_json(call.tool_call),
-            "result": {
-                "content": result.content,
-                "details": result.details,
-                "isError": result.is_error,
+        let args = serde_json::to_value(PolicyArgs {
+            scope,
+            cx: AfterToolCall {
+                assistant_message: call.assistant_message,
+                tool_call: call.tool_call,
+                result: call.result,
             },
-        });
+        })
+        .map_err(|error| {
+            ToolError(format!(
+                "extension {ext}: tool policy: call cannot be sent: {error}"
+            ))
+        })?;
         let reply = self.remote.call(
             "tool policy",
             "policyAfter",
@@ -314,31 +394,14 @@ enum Spawned {
 impl SpawnHook for RemoteSpawnHook {
     async fn before_spawn(&self, spawn: &SpawnContext<'_>) -> SpawnDecision {
         let ext = &self.remote.ext;
-        // `task` is omitted: `PromptInput` has no wire form.
-        let spec = match serde_json::to_value(spawn.spec) {
-            Ok(spec) => spec,
+        let args = match serde_json::to_value(SpawnArgs { spawn }) {
+            Ok(args) => args,
             Err(error) => {
                 return SpawnDecision::Block(format!(
-                    "extension {ext}: spawn hook: the agent spec cannot be sent: {error}"
+                    "extension {ext}: spawn hook: context cannot be sent: {error}"
                 ));
             }
         };
-        let args = json!({
-            "session": spawn.parent_session_id,
-            "spawn": {
-                "spec": spec,
-                "agent": spawn.agent,
-                "mode": spawn.mode.map(|mode| &mode.name),
-                "model": format!("{}/{}", spawn.model.provider, spawn.model.id),
-                "thinking": spawn.thinking,
-                "depth": spawn.depth,
-                "origin": match spawn.origin {
-                    SpawnOrigin::Host => "host",
-                    SpawnOrigin::Tool { .. } => "tool",
-                },
-                "team": spawn.team.map(|team| json!({ "name": team.name, "member": team.member })),
-            },
-        });
         let reply = self
             .remote
             .call("spawn hook", "spawn", args, None, Some(CALL_DEADLINE))

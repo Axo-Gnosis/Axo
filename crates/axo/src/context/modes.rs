@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -45,8 +46,10 @@ pub struct ToolLimits {
     pub deny: Vec<String>,
 }
 
+#[expose(block = TOOL_LIMITS_BLOCK, object = "types")]
 impl ToolLimits {
     /// `allow` (when set) must contain `tool`, and `deny` must not.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn permits(&self, tool: &str) -> bool {
         self.allow
             .as_ref()
@@ -54,6 +57,7 @@ impl ToolLimits {
             && !self.deny.iter().any(|name| name == tool)
     }
 
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_empty(&self) -> bool {
         self.allow.is_none() && self.deny.is_empty()
     }
@@ -70,7 +74,9 @@ pub enum BashAccess {
     ReadOnly,
 }
 
+#[expose(block = BASH_ACCESS_BLOCK, object = "types")]
 impl BashAccess {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_full(&self) -> bool {
         *self == Self::Full
     }
@@ -174,12 +180,14 @@ pub fn load_modes(
     (definitions, diagnostics)
 }
 
+#[expose(block = MODE_SPEC_BLOCK, object = "types")]
 impl ModeSpec {
     /// Parses a mode definition (YAML frontmatter plus body), e.g. one a host bundles
     /// with `include_str!` and passes in `SessionOptions::modes`. `default_name` applies only
     /// when the frontmatter has no `name` key; an explicit empty `name` is invalid. Problems
     /// become diagnostics without an origin;
     /// an invalid definition yields `None`. The spec has no `path`.
+    #[ext(skip = "no receiver; served by host.parseMode")]
     pub fn parse(default_name: &str, markdown: &str) -> (Option<ModeSpec>, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let spec = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {

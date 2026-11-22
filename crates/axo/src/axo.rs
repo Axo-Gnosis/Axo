@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use axo_ai::thinking::clamp_level;
 use axo_ai::{Models, Streamer};
+use axo_macros::expose;
+use serde_json::Value;
 
 use crate::config::{
     ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
@@ -19,6 +21,7 @@ use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
 use crate::exec::{EnvMap, ExecEnv, StaticEnv};
+use crate::ext::{Caller, HOST, InvokeError, MODELS};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::session::children::SessionTable;
 use crate::session::{
@@ -33,10 +36,10 @@ pub struct Axo {
     name: String,
     models: Arc<Models>,
     /// What sessions stream through: `models` unless the builder overrode it.
-    streamer: Arc<dyn Streamer>,
-    store: Arc<dyn SessionStore>,
-    /// Sampled at every `create_session`, `open_session` and `schemes`.
-    config: Arc<dyn ConfigSource>,
+    pub(crate) streamer: Arc<dyn Streamer>,
+    pub(crate) store: Arc<dyn SessionStore>,
+    /// Sampled at every `create_session`, `open_session`, `schemes`, `catalog` and model completion.
+    pub(crate) config: Arc<dyn ConfigSource>,
     /// Where axo materializes its docs (`axo://`) and dev-shell captures.
     cache_dir: Option<PathBuf>,
     /// Host environment snapshot taken at `build`.
@@ -47,7 +50,32 @@ pub struct Axo {
     sessions: Arc<SessionTable>,
 }
 
+pub(crate) fn load_catalog(
+    config: &dyn ConfigSource,
+    cwd: &Path,
+    project_access: Option<ProjectAccess>,
+    agents: &[AgentSpec],
+    modes: &[ModeSpec],
+    keywords: &[KeywordSpec],
+) -> Result<Catalog, Error> {
+    let config = Arc::new(EffectiveConfig::resolve(config, cwd, project_access)?);
+    let (agents, mut diagnostics) = load_agents(&config.agent_roots, agents);
+    let (modes, mode_diagnostics) = load_modes(&config.mode_roots, modes);
+    diagnostics.extend(mode_diagnostics);
+    let (keywords, keyword_diagnostics) = load_keywords(&config.keyword_roots, keywords);
+    diagnostics.extend(keyword_diagnostics);
+    Ok(Catalog {
+        config,
+        agents,
+        modes: modes.into_iter().map(Arc::new).collect(),
+        keywords: keywords.into_iter().map(Arc::new).collect(),
+        diagnostics,
+    })
+}
+
 /// Configuration and agent, mode and keyword definitions resolved without starting a session.
+#[derive(serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct Catalog {
     pub config: Arc<EffectiveConfig>,
     pub agents: Vec<AgentDef>,
@@ -83,9 +111,11 @@ impl ConfigSource for NoConfig {
     }
 }
 
+#[expose(block = AXO_BUILDER_BLOCK, object = "types")]
 impl AxoBuilder {
     /// Names the harness in model-facing text: the docs scheme (`<name>://`), the `docs`
     /// section, and the bundled `SYSTEM`/`SUMMARY` prompts. Defaults to `axo`.
+    #[ext(skip = "host construction")]
     pub fn name(mut self, name: impl Into<String>) -> Result<Self, Error> {
         let name = name.into();
         crate::schemes::check_harness_name(&name)?;
@@ -94,6 +124,7 @@ impl AxoBuilder {
     }
 
     /// The host's configuration, sampled per session (see [`ConfigSource`]).
+    #[ext(skip = "host construction")]
     pub fn config(mut self, config: Arc<dyn ConfigSource>) -> Self {
         self.config = Some(config);
         self
@@ -101,6 +132,7 @@ impl AxoBuilder {
 
     /// A directory axo owns for caches: bundled docs under `docs/`, dev-shell captures
     /// under `devshell/`.
+    #[ext(skip = "host construction")]
     pub fn cache_dir(mut self, cache_dir: PathBuf) -> Self {
         self.cache_dir = Some(cache_dir);
         self
@@ -108,17 +140,20 @@ impl AxoBuilder {
 
     /// Streams every session's requests through `streamer` instead of `Models`; models
     /// are still looked up in `Models`. For tests (e.g. `axo_ai::ScriptedApi`).
+    #[ext(skip = "host construction")]
     pub fn streamer(mut self, streamer: Arc<dyn Streamer>) -> Self {
         self.streamer = Some(streamer);
         self
     }
 
     /// Defaults to [`Supervision::ProcessGroup`].
+    #[ext(skip = "host construction")]
     pub fn supervision(mut self, supervision: Supervision) -> Self {
         self.supervision = Some(supervision);
         self
     }
 
+    #[ext(skip = "host construction")]
     pub fn build(self) -> Axo {
         let streamer: Arc<dyn Streamer> = match self.streamer {
             Some(streamer) => streamer,
@@ -142,7 +177,9 @@ impl AxoBuilder {
     }
 }
 
+#[expose(block = AXO, object = "host")]
 impl Axo {
+    #[ext(skip = "host construction")]
     pub fn builder(models: Arc<Models>, store: Arc<dyn SessionStore>) -> AxoBuilder {
         AxoBuilder {
             name: "axo".into(),
@@ -155,8 +192,31 @@ impl Axo {
         }
     }
 
+    /// The host's shared model registry.
+    #[ext(skip = "live registry; reached through the models object")]
+    pub fn models(&self) -> &Arc<Models> {
+        &self.models
+    }
+
+    /// Calls an extension-accessible host or model method with positional JSON arguments.
+    #[ext(skip = "the dispatcher itself")]
+    pub async fn invoke(
+        &self,
+        object: &str,
+        method: &str,
+        args: Vec<Value>,
+        caller: &Caller,
+    ) -> Result<Value, InvokeError> {
+        match object {
+            "host" => HOST.invoke(self, method, args, caller).await,
+            "models" => MODELS.invoke(self, method, args, caller).await,
+            _ => Err(InvokeError::UnknownObject(object.to_owned())),
+        }
+    }
+
     /// The supervisor every local command runs under, for hosts that run other
     /// processes (such as extension runners) in the same containers.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
     pub fn supervisor(&self) -> Arc<ProcessSupervisor> {
         self.supervisor.clone()
     }
@@ -165,6 +225,9 @@ impl Axo {
     /// environment, tools and system prompt, and returns an idle session. Its file is
     /// created on the first submission. Resolving the exec environment may capture a Nix
     /// dev shell, which can take minutes on a cold cache.
+    #[ext(
+        skip = "returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook"
+    )]
     pub async fn create_session(&self, options: SessionOptions) -> Result<Session, Error> {
         let header = Header::new(options.cwd.clone(), None, None);
         let session_id = header.id.clone();
@@ -189,6 +252,9 @@ impl Axo {
     /// for its `run_end` via `Session::attach`).
     /// Child files return [`Error::ChildSession`] with the owning root's path when
     /// its ancestry is available; open that root, then use [`Axo::session`].
+    #[ext(
+        skip = "returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook"
+    )]
     pub async fn open_session(
         &self,
         path: &Path,
@@ -247,23 +313,27 @@ impl Axo {
     /// A live child session, or a parked one revived (its unfinished run resumes). Children
     /// are known once their parent is open in this process; an unknown id first waits for
     /// reopened sessions to finish registering their children.
+    #[ext(skip = "returns a live session; ctx.session(id) reaches it")]
     pub async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
         self.sessions.session(id).await
     }
 
     /// Reads a saved session without locking it.
+    #[ext(skip = "a whole journal can exceed a frame; host.readSession pages it")]
     pub async fn open_session_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error> {
         self.store.open_read(path).await
     }
 
     /// The snapshot blob `sha256` of a session file (open, closed, or child), digest
     /// verified. Takes no lock.
+    #[ext(skip = "bytes cross as base64")]
     pub async fn read_snapshot(&self, session: &Path, sha256: &str) -> Result<Vec<u8>, Error> {
         SnapshotStore::for_session(session).read(sha256).await
     }
 
     /// `SnapshotStore::squash` over a session file's blobs: the net change per file across
     /// `changes`. Takes no lock.
+    #[ext]
     pub async fn squash_changes(
         &self,
         session: &Path,
@@ -273,6 +343,7 @@ impl Axo {
     }
 
     /// Sessions started in `cwd`, most recently modified first.
+    #[ext]
     pub async fn list_sessions(&self, cwd: &Path) -> Result<Vec<SessionInfo>, Error> {
         self.store.list(cwd).await
     }
@@ -287,6 +358,7 @@ impl Axo {
     /// `project_access` is the `SessionOptions::project_access` the host
     /// opens this session with (`None` uses the user policy), so `skill://` sees the same
     /// skills as the open session.
+    #[ext(skip = "takes host scheme objects; a live session's schemes are reached through tools")]
     pub async fn schemes(
         &self,
         path: &Path,
@@ -316,6 +388,7 @@ impl Axo {
 
     /// Resolves configuration and definitions using blocking file I/O, without a session.
     /// Model roles are available in `config.settings.model_roles`.
+    #[ext(skip = "takes the host's programmatic definitions; the wire method resolves files only")]
     pub fn catalog(
         &self,
         cwd: &Path,
@@ -324,23 +397,7 @@ impl Axo {
         modes: &[ModeSpec],
         keywords: &[KeywordSpec],
     ) -> Result<Catalog, Error> {
-        let config = Arc::new(EffectiveConfig::resolve(
-            &*self.config,
-            cwd,
-            project_access,
-        )?);
-        let (agents, mut diagnostics) = load_agents(&config.agent_roots, agents);
-        let (modes, mode_diagnostics) = load_modes(&config.mode_roots, modes);
-        diagnostics.extend(mode_diagnostics);
-        let (keywords, keyword_diagnostics) = load_keywords(&config.keyword_roots, keywords);
-        diagnostics.extend(keyword_diagnostics);
-        Ok(Catalog {
-            config,
-            agents,
-            modes: modes.into_iter().map(Arc::new).collect(),
-            keywords: keywords.into_iter().map(Arc::new).collect(),
-            diagnostics,
-        })
+        load_catalog(&*self.config, cwd, project_access, agents, modes, keywords)
     }
 
     /// Where bundled docs are materialized; `None` without a cache directory.

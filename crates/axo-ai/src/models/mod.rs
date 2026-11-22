@@ -41,7 +41,8 @@ use self::config::{ModelsConfig, merge_compat};
 const DEFAULT_REFRESH_INTERVAL: u64 = 2 * 60 * 60;
 
 /// Public provider metadata without credential values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderInfo {
     pub id: String,
     pub env: Vec<String>,
@@ -51,7 +52,8 @@ pub struct ProviderInfo {
 }
 
 /// Where a provider's credential comes from, without resolving or validating it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
 pub enum CredentialSource {
     Config,
     ApiKey,

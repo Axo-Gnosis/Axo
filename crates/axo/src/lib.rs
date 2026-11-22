@@ -10,8 +10,10 @@ mod coordination;
 mod error;
 pub mod exec;
 pub mod ext;
+mod host;
 mod input;
 mod jobs;
+mod models;
 mod recovery;
 pub mod schemes;
 mod session;
@@ -45,11 +47,13 @@ pub use exec::host::{
     Supervision,
 };
 pub use exec::{EnvMap, ExecEnv, Resolved, StaticEnv};
+pub use host::SessionPage;
 pub use input::{PromptInput, PromptPart};
 pub use jobs::{
     ChildProgress, CommandExit, CommandOutput, JobInfo, JobKind, JobMessageInfo, JobStatus, Killer,
     MessageDelivery, OutputProgress, Promotion, jobs_from_entries,
 };
+pub use models::CompletionRequest;
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target, valid_scheme_name};
 pub use session::wire::{EntryPage, OutputPage};
 pub use session::{
@@ -67,9 +71,10 @@ pub use store::{
     TIMESTAMP_FORMAT, TeamLink, TeamRef, project,
 };
 pub use tools::{
-    Answer, CommandRequest, Exposure, FileChange, HostTool, LineDiff, MAX_SNAPSHOT_BYTES, Omitted,
-    Question, QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange,
-    ToolFactory, WriteRoot, WriteScope, file_change, squash,
+    Answer, ArtifactSlot, BashRequest, CommandRequest, Exposure, FileAccess, FileChange, FileRead,
+    FileRecord, FileWrite, HostTool, LedgerRecord, LineDiff, MAX_SNAPSHOT_BYTES, Omitted, Question,
+    QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange, ToolAccess,
+    ToolFactory, WriteRoot, WriteScope, Written, file_changes, file_details, file_records, squash,
 };
 
 #[cfg(doctest)]
@@ -91,4 +96,7 @@ mod markdown_doctests {
 
     #[doc = include_str!("../docs/extending.md")]
     mod extending {}
+
+    #[doc = include_str!("../docs/extension-api.md")]
+    mod extension_api {}
 }

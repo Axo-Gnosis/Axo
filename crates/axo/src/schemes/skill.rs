@@ -15,7 +15,7 @@ pub struct SkillScheme {
 
 impl SkillScheme {
     /// Keeps each skill's name and `SKILL.md` location in discovery order.
-    pub fn new(skills: &[Skill]) -> Self {
+    pub(crate) fn new(skills: &[Skill]) -> Self {
         Self {
             skills: skills
                 .iter()

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use axo_agent::{AgentMessage, CustomMessage};
 use axo_ai::{Message, ThinkingLevel, UserBlock};
+use axo_macros::expose;
 use serde_json::{Value, json};
 
 use super::entry::ModeRestore;
@@ -21,14 +22,16 @@ pub(crate) const COMPACTION_SUMMARY_TYPE: &str = "compactionSummary";
 pub(crate) const BRANCH_SUMMARY_TYPE: &str = "branchSummary";
 
 /// Provenance of one selected context entry, including entries hidden by edits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectedSource {
     pub entry_index: usize,
     pub messages: std::ops::Range<usize>,
 }
 
 /// What a session's current position contributes to the next request.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct Projection {
     pub messages: Vec<AgentMessage>,
     pub sources: Vec<ProjectedSource>,
@@ -42,6 +45,8 @@ pub struct Projection {
     pub mode: Option<String>,
     /// Selection saved by the latest mode change, cleared by model or thinking changes.
     pub mode_restore: Option<ModeRestore>,
+    #[serde(skip)]
+    #[specta(skip)]
     processed: usize,
     /// Id of the entry the path ends at.
     leaf: Option<String>,
@@ -49,13 +54,16 @@ pub struct Projection {
     omitted: HashSet<String>,
 }
 
+#[expose(block = PROJECTION_BLOCK, object = "types")]
 impl Projection {
     /// Raw root-to-leaf entry indices, including entries hidden by edits.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn path(&self) -> &[usize] {
         &self.path
     }
 
     /// Whether the latest edit on the path omits `id`.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_omitted(&self, id: &str) -> bool {
         self.omitted.contains(id)
     }
@@ -63,6 +71,7 @@ impl Projection {
     /// Updates the projection for the entries appended since it last ran. A chain of
     /// children of the current leaf with no context-rewriting entry among them
     /// extends it in place; anything else rebuilds it once.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn apply(&mut self, entries: &[SeqEntry]) {
         if entries.is_empty() {
             *self = Self::default();

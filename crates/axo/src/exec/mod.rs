@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axo_macros::expose;
 use tokio_util::sync::CancellationToken;
 
 /// A complete process environment; commands spawn with `env_clear().envs(..)`.
@@ -57,8 +58,10 @@ impl From<Arc<EnvMap>> for Resolved {
 #[derive(Debug, Clone)]
 pub struct StaticEnv(pub Arc<EnvMap>);
 
+#[expose(block = STATIC_ENV_BLOCK, object = "types")]
 impl StaticEnv {
     /// Snapshots the host environment from `std::env::vars_os()`.
+    #[ext(skip = "host construction")]
     pub fn host() -> Self {
         Self(Arc::new(std::env::vars_os().collect()))
     }

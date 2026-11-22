@@ -4,7 +4,8 @@ use serde_json::Value;
 
 use super::{HostMessage, LiveSnapshot, Session, SpawnRequest, TeamRequest};
 use crate::ext::{Base64, Caller};
-use crate::{Command, Error, OutputProgress, SeqEntry, SpawnReceipt};
+use crate::jobs::CommandOutput;
+use crate::{Command, Error, OutputChunk, OutputProgress, SeqEntry, SpawnReceipt};
 
 /// A bounded page of raw command output and its latest progress.
 #[derive(Serialize, specta::Type)]
@@ -100,7 +101,7 @@ impl SessionWire<'_> {
         self.session.read_snapshot(&sha256).await.map(Base64)
     }
 
-    /// Reads up to one MiB of a command's raw output starting at a byte offset.
+    /// Reads up to one MiB of raw output from the call's newest command at a byte offset.
     #[ext]
     pub async fn command_output(
         &self,
@@ -108,22 +109,40 @@ impl SessionWire<'_> {
         offset: u64,
         limit: u64,
     ) -> Result<Option<OutputPage>, Error> {
-        let Some(output) = self.session.command_output(&call_id) else {
-            return Ok(None);
-        };
-        let bytes = output
-            .read(offset..offset.saturating_add(limit.min(1 << 20)))
-            .await
-            .map_err(|source| Error::Io {
-                path: output.path().to_owned(),
-                source,
-            })?;
-        Ok(Some(OutputPage {
-            job: output.job().to_owned(),
-            artifact: output.artifact(),
-            progress: *output.progress().borrow(),
-            bytes: Base64(bytes),
-        }))
+        output_page(self.session.command_output(&call_id), offset, limit).await
+    }
+
+    /// Reads up to one MiB from the call's newest command, labeled by stream, at a byte offset.
+    #[ext]
+    pub async fn command_chunks(
+        &self,
+        call_id: String,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Option<Vec<OutputChunk>>, Error> {
+        output_chunks(self.session.command_output(&call_id), offset, limit).await
+    }
+
+    /// Reads up to one MiB of raw output from a job at a byte offset.
+    #[ext]
+    pub async fn job_output(
+        &self,
+        job_id: String,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Option<OutputPage>, Error> {
+        output_page(self.session.job_output(&job_id), offset, limit).await
+    }
+
+    /// Reads up to one MiB from a job, labeled by stream, at a byte offset.
+    #[ext]
+    pub async fn job_chunks(
+        &self,
+        job_id: String,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Option<Vec<OutputChunk>>, Error> {
+        output_chunks(self.session.job_output(&job_id), offset, limit).await
     }
 
     /// Reads journal entries after a sequence number (default 256, clamped to 1..=1024).
@@ -147,4 +166,45 @@ impl SessionWire<'_> {
     pub async fn live(&self) -> LiveSnapshot {
         self.session.attach(Some(u64::MAX)).await.live
     }
+}
+
+async fn output_page(
+    output: Option<CommandOutput>,
+    offset: u64,
+    limit: u64,
+) -> Result<Option<OutputPage>, Error> {
+    let Some(output) = output else {
+        return Ok(None);
+    };
+    let bytes = output
+        .read(offset..offset.saturating_add(limit.min(1 << 20)))
+        .await
+        .map_err(|source| Error::Io {
+            path: output.path().to_owned(),
+            source,
+        })?;
+    Ok(Some(OutputPage {
+        job: output.job().to_owned(),
+        artifact: output.artifact(),
+        progress: *output.progress().borrow(),
+        bytes: Base64(bytes),
+    }))
+}
+
+async fn output_chunks(
+    output: Option<CommandOutput>,
+    offset: u64,
+    limit: u64,
+) -> Result<Option<Vec<OutputChunk>>, Error> {
+    let Some(output) = output else {
+        return Ok(None);
+    };
+    output
+        .read_chunks(offset..offset.saturating_add(limit.min(1 << 20)))
+        .await
+        .map(Some)
+        .map_err(|source| Error::Io {
+            path: output.path().to_owned(),
+            source,
+        })
 }

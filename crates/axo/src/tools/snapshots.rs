@@ -5,6 +5,7 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axo_macros::expose;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tokio::io::AsyncWriteExt;
@@ -27,12 +28,14 @@ pub struct SnapshotStore {
     dir: PathBuf,
 }
 
+#[expose(block = SNAPSHOT_STORE_BLOCK, object = "types")]
 impl SnapshotStore {
     pub(crate) fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
 
     /// `<session file without .jsonl>/snapshots`.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn for_session(session_path: &Path) -> Self {
         Self::new(session_path.with_extension("").join(SNAPSHOTS_DIR))
     }
@@ -102,6 +105,7 @@ impl SnapshotStore {
     }
 
     /// The bytes stored under `sha256`, verified against it.
+    #[ext(skip = "served by tools.readSnapshot")]
     pub async fn read(&self, sha256: &str) -> Result<Vec<u8>, Error> {
         let path = self
             .blob_path(sha256)

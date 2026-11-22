@@ -6,6 +6,7 @@
 //! package's `extension.json`; a runner starts only when a callback is first needed. Hosts
 //! layer extensions into sessions with [`Extensions::compose`] and [`Extensions::attach`].
 
+mod lifecycle;
 mod manifest;
 mod peer;
 mod placement;
@@ -15,6 +16,9 @@ mod remote;
 mod session;
 mod wire_value;
 
+pub use lifecycle::{
+    ForkReceipt, Forked, LIFECYCLE_METHODS, Lifecycle, LifecycleMethod, SessionRequest,
+};
 pub use remote::Failure;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,9 +28,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
 pub use axo::EnabledExtension;
-use axo::{EnvMap, ExtensionListError, ProcessSupervisor};
+use axo::{Axo, EnvMap, ExtensionListError, ProcessSupervisor};
 pub use axo_ai::ProviderOrigin;
-use axo_ai::{Credential, LoginInteraction, Models, Provider, ProviderLayer, ProviderLogin};
+use axo_ai::{Credential, LoginInteraction, Provider, ProviderLayer, ProviderLogin};
 use futures::future::join_all;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +41,21 @@ use crate::placement::Placement;
 use crate::session::Contribution;
 
 const EVENT_CAPACITY: usize = 256;
+
+/// Registers the bridge's own wire types.
+#[doc(hidden)]
+pub fn wire_types(types: specta::Types) -> specta::Types {
+    types
+        .register::<session::bindings::ToolRunArgs<'static>>()
+        .register::<session::bindings::BeforeToolCall<'static>>()
+        .register::<session::bindings::AfterToolCall<'static>>()
+        .register::<axo::ToolScope>()
+        .register::<axo::SpawnContext<'static>>()
+        .register::<SessionRequest>()
+        .register::<ForkReceipt>()
+        .register::<axo::CompletionRequest>()
+        .register::<axo_ai::AssistantEvent>()
+}
 
 /// Host choices for an [`Extensions`] manager. Every path must be absolute; nothing is
 /// discovered from the working directory, `PATH` or home directories.
@@ -143,6 +162,8 @@ pub struct Extensions {
 }
 
 struct Inner {
+    axo: Arc<Axo>,
+    lifecycle: Mutex<Option<Arc<dyn Lifecycle>>>,
     layer: ProviderLayer,
     supervisor: Arc<ProcessSupervisor>,
     options: ExtensionOptions,
@@ -253,16 +274,14 @@ struct Binding {
 }
 
 impl Extensions {
-    pub fn new(
-        models: Arc<Models>,
-        supervisor: Arc<ProcessSupervisor>,
-        options: ExtensionOptions,
-    ) -> Self {
+    pub fn new(axo: Arc<Axo>, options: ExtensionOptions) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
             inner: Arc::new_cyclic(|inner| Inner {
-                layer: models.provider_layer(),
-                supervisor,
+                layer: axo.models().provider_layer(),
+                supervisor: axo.supervisor(),
+                axo,
+                lifecycle: Mutex::default(),
                 options,
                 config: tokio::sync::Mutex::new(()),
                 state: Mutex::new(State::default()),
@@ -284,7 +303,9 @@ impl Extensions {
         EnabledExtension::validate_all(enabled)?;
         validate_options(&self.inner.options)?;
         let inner = Arc::clone(&self.inner);
-        run(inner.reconcile(Some(enabled.to_vec()), None)).await
+        run(inner.reconcile(Some(enabled.to_vec()), None))
+            .await
+            .unwrap_or(Err(BridgeError::ShutDown))
     }
 
     /// One status per enabled extension, in enabled order.
@@ -312,7 +333,9 @@ impl Extensions {
     /// `configure`, it also rebuilds any placement whose setup failed.
     pub async fn retry(&self, id: &str) -> Result<(), BridgeError> {
         let inner = Arc::clone(&self.inner);
-        run(inner.reconcile(None, Some(Rearm::Retry(id.to_owned())))).await
+        run(inner.reconcile(None, Some(Rearm::Retry(id.to_owned()))))
+            .await
+            .unwrap_or(Err(BridgeError::ShutDown))
     }
 
     /// Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the
@@ -321,7 +344,9 @@ impl Extensions {
     /// recycled with it; their own load failures are kept, `id`'s is cleared.
     pub async fn reload(&self, id: &str) -> Result<(), BridgeError> {
         let inner = Arc::clone(&self.inner);
-        run(inner.reconcile(None, Some(Rearm::Reload(id.to_owned())))).await
+        run(inner.reconcile(None, Some(Rearm::Reload(id.to_owned()))))
+            .await
+            .unwrap_or(Err(BridgeError::ShutDown))
     }
 
     /// Closes admission, restores every attached session to its host registrations and stops
@@ -341,15 +366,16 @@ impl Drop for Extensions {
     }
 }
 
-/// Runs reconfiguration as its own task so a dropped caller cannot leave it half done.
-async fn run(
-    task: impl Future<Output = Result<(), BridgeError>> + Send + 'static,
-) -> Result<(), BridgeError> {
+/// Runs `task` to completion as its own task, so a dropped caller cannot leave it half
+/// done. `None`: the runtime is shutting down.
+pub(crate) async fn run<T: Send + 'static>(
+    task: impl Future<Output = T> + Send + 'static,
+) -> Option<T> {
     match tokio::spawn(task).await {
-        Ok(result) => result,
+        Ok(value) => Some(value),
         Err(error) => match error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
-            Err(_) => Err(BridgeError::ShutDown),
+            Err(_) => None,
         },
     }
 }
@@ -765,6 +791,12 @@ impl Inner {
         // With no contributions left, this restores every session to its host registrations.
         session::reapply(&self).await;
         self.sessions.clear();
+        let hook = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(hook);
         join_all(state.placements.values().map(|p| p.placement.shutdown())).await;
         drop(state);
         self.layer.replace(Vec::new())?;

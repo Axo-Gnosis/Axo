@@ -13,7 +13,9 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use axo_agent::{Replay, ToolError};
+use axo_macros::expose;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 static URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$").expect("valid regex"));
@@ -49,7 +51,8 @@ fn split(text: &str) -> Option<(String, &str)> {
 
 /// A recognized URL: `scheme` is lowercase and `path` is everything after `://`,
 /// verbatim, without decoding or splitting query strings and fragments.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SchemeUrl {
     pub scheme: String,
     pub path: String,
@@ -62,7 +65,8 @@ impl fmt::Display for SchemeUrl {
 }
 
 /// Per-session facts every scheme call receives, so one handler can serve many sessions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct SchemeContext {
     pub session_id: String,
     pub session_dir: PathBuf,
@@ -70,7 +74,12 @@ pub struct SchemeContext {
 }
 
 /// The resource behind a scheme URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Target {
     /// The normal file pipeline runs on `path`; `edit` and `write` refuse when not writable.
     File { path: PathBuf, writable: bool },
@@ -150,10 +159,12 @@ pub struct Schemes {
     entries: Arc<Mutex<SchemeList>>,
 }
 
+#[expose(block = SCHEMES_BLOCK, object = "types")]
 impl Schemes {
     /// Applies host handlers in order, replacing matching built-ins in place.
     /// `artifact://` is always registered first and backed by `artifacts`;
     /// `artifact`, `file` and `tool` are reserved and cannot be supplied by a host.
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn new(
         context: SchemeContext,
         artifacts: Arc<artifact::Artifacts>,
@@ -186,11 +197,13 @@ impl Schemes {
     }
 
     /// The session facts passed to every handler call.
+    #[ext(skip = "served by tools.schemeContext")]
     pub fn context(&self) -> &SchemeContext {
         &self.context
     }
 
     /// The artifact store backing `artifact://` in this session.
+    #[ext(skip = "live handle; tools.allocateArtifact")]
     pub fn artifacts(&self) -> &Arc<artifact::Artifacts> {
         &self.artifacts
     }
@@ -222,6 +235,7 @@ impl Schemes {
     }
 
     /// Non-empty scheme documentation in registration order.
+    #[ext(skip = "served by tools.promptDocs")]
     pub fn prompt_docs(&self) -> Vec<String> {
         self.snapshot()
             .iter()
@@ -233,6 +247,7 @@ impl Schemes {
 
     /// Recognizes scheme URLs, including a missing slash or a prefixed filesystem path.
     /// Explicit unknown schemes error; file URLs and drive letters remain plain paths.
+    #[ext(skip = "served by tools.parseUrl")]
     pub fn parse(&self, input: &str) -> Result<Option<SchemeUrl>, ToolError> {
         Self::parse_with(&self.snapshot(), input)
     }
@@ -274,6 +289,7 @@ impl Schemes {
 
     /// Recognizes only a whole, registered URL, without repairing model path typos.
     /// Unknown schemes, file URLs and drive letters return `None`.
+    #[ext(skip = "served by tools.exactUrl")]
     pub fn exact(&self, text: &str) -> Option<SchemeUrl> {
         let (scheme, path) = split(text)?;
         if scheme.len() == 1 || scheme == "file" || Self::find(&self.snapshot(), &scheme).is_none()
@@ -288,11 +304,13 @@ impl Schemes {
 
     /// Resolves a URL from `parse` or `exact` against this session. Hosts showing URLs
     /// (links, tool paths) use `exact` to recognize them, then this.
+    #[ext(skip = "served by tools.locate, tools.readFile and tools.writeFile")]
     pub async fn resolve(&self, url: &SchemeUrl) -> Result<Target, ToolError> {
         self.handler(url)?.resolve(url, &self.context).await
     }
 
     /// Reads a URL's virtual resource or resolved UTF-8 file.
+    #[ext(skip = "served by tools.locate, tools.readFile and tools.writeFile")]
     pub async fn read(&self, url: &SchemeUrl) -> Result<String, ToolError> {
         let handler = self.handler(url)?;
         match handler.resolve(url, &self.context).await? {
@@ -315,6 +333,7 @@ impl Schemes {
     }
 
     /// Writes a URL that resolved to [`Target::Virtual`], returning the handler's result text.
+    #[ext(skip = "served by tools.locate, tools.readFile and tools.writeFile")]
     pub async fn write(&self, url: &SchemeUrl, content: &str) -> Result<String, ToolError> {
         self.handler(url)?.write(url, content, &self.context).await
     }

@@ -19,6 +19,7 @@ pub(crate) mod send;
 pub(crate) mod snapshots;
 pub(crate) mod truncate;
 pub(crate) mod wait;
+mod wire;
 pub(crate) mod write;
 pub(crate) mod writes;
 
@@ -31,8 +32,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
+use axo_macros::expose;
 use regex::Regex;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
@@ -56,19 +58,28 @@ use wait::WaitTool;
 use write::WriteTool;
 
 pub use crate::jobs::command::CommandRequest;
+pub use bash::BashRequest;
+pub(crate) use changes::SNAPSHOT_STORE_CHANGES;
 pub use changes::{
-    FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_change, squash,
+    FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_changes, squash,
 };
-pub use ledger::{FileAccess, FileLedger, lock_file};
-pub(crate) use ledger::{file_key, ledger_access};
+pub(crate) use ledger::FILE_LEDGER_BLOCK;
+pub use ledger::{
+    FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
+};
+pub(crate) use ledger::{file_key, ledger_records};
 pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
-pub use writes::{WriteRoot, WriteScope};
+pub use wire::{ArtifactSlot, ToolAccess};
+pub(crate) use wire::{TOOLS_BASE_BLOCKS, TOOLS_BLOCKS};
+pub use writes::{FileRead, FileWrite, WriteRoot, WriteScope, Written};
 
 /// State shared by one session's tools; each tool holds an `Arc` of it.
 pub struct SessionTools {
     /// Relative paths and commands resolve against it.
     pub cwd: PathBuf,
     pub exec: Arc<dyn ExecEnv>,
+    /// A `Resolved.notice` reaches the model once per session.
+    notice_shown: AtomicBool,
     /// Content hashes of files this session has read or written (the stale-file guard).
     pub ledger: FileLedger,
     /// Nested project instructions attached once to successful file tool results.
@@ -110,7 +121,9 @@ pub struct HostTool {
     pub origin: Option<String>,
 }
 
+#[expose(block = HOST_TOOL_BLOCK, object = "types")]
 impl HostTool {
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn direct(factory: ToolFactory) -> Self {
         Self {
             factory,
@@ -119,6 +132,7 @@ impl HostTool {
         }
     }
 
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn deferred(factory: ToolFactory) -> Self {
         Self {
             factory,
@@ -127,6 +141,7 @@ impl HostTool {
         }
     }
 
+    #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
         self.origin = Some(origin.into());
         self
@@ -160,6 +175,12 @@ pub(crate) fn instantiate(
 }
 
 /// A tool path located without applying plain-filesystem fallback rules.
+#[derive(serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Located {
     /// A filesystem target; plain paths have no URL and are writable.
     File {
@@ -171,6 +192,7 @@ pub enum Located {
     Virtual { url: SchemeUrl },
 }
 
+#[expose(block = SESSION_TOOLS, object = "tools")]
 impl SessionTools {
     pub(crate) fn new(
         cwd: PathBuf,
@@ -184,6 +206,7 @@ impl SessionTools {
         Self {
             cwd,
             exec,
+            notice_shown: AtomicBool::new(false),
             ledger: FileLedger::default(),
             context,
             schemes,
@@ -197,27 +220,30 @@ impl SessionTools {
     }
 
     /// The id of the session these tools belong to.
+    #[ext]
     pub fn session_id(&self) -> &str {
         &self.schemes.context().session_id
     }
 
-    /// Records a completed write of `after` to `path`: updates the ledger, stores the
-    /// before and after bytes, and returns the tool result `details` (`ledger`, plus
-    /// `change` when the bytes differ). `before` is the content read under the same
-    /// `lock_file` guard, `None` for a new file; call it while still holding that guard.
-    pub async fn record_change(
+    /// Records a completed write under the caller's `lock_file` guard. `before` is
+    /// the content read under that guard, or `None` for a new file. Changed bytes
+    /// produce a snapshot-backed change alongside the updated ledger record.
+    async fn record_change(
         &self,
         path: &Path,
         url: Option<&str>,
         before: Option<Vec<u8>>,
         after: Vec<u8>,
-    ) -> Value {
+    ) -> FileRecord {
         let after_sha = FileLedger::hash(&after);
         let ledger = self
             .ledger
             .record_hash(path, after_sha.clone(), FileAccess::Modify);
         if before.as_deref() == Some(after.as_slice()) {
-            return json!({ "ledger": ledger });
+            return FileRecord {
+                ledger,
+                change: None,
+            };
         }
         let before_blob = match &before {
             Some(bytes) => {
@@ -239,7 +265,10 @@ impl SessionTools {
             after: after_blob,
             diff,
         };
-        json!({ "ledger": ledger, "change": change })
+        FileRecord {
+            ledger,
+            change: Some(change),
+        }
     }
 
     async fn blob(&self, sha256: String, bytes: &[u8]) -> SnapshotBlob {
@@ -252,6 +281,7 @@ impl SessionTools {
     }
 
     /// The bash access of the session's current scope (agent, mode and child ceiling).
+    #[ext]
     pub fn bash_access(&self) -> BashAccess {
         if self.read_only_bash.load(Ordering::Acquire) {
             BashAccess::ReadOnly
@@ -261,6 +291,7 @@ impl SessionTools {
     }
 
     /// Runs a command with output capture, automatic background promotion and job delivery.
+    #[ext(skip = "needs the live tool call; tools.runCommand")]
     pub async fn run_command(
         &self,
         cx: ToolContext,
@@ -270,6 +301,7 @@ impl SessionTools {
     }
 
     /// Cleans and resolves a scheme URL or ordinary filesystem path.
+    #[ext]
     pub async fn locate(&self, path: &str) -> Result<Located, ToolError> {
         let Some(url) = self.parse_url(path)? else {
             return Ok(Located::File {
@@ -293,6 +325,7 @@ impl SessionTools {
     }
 
     /// Rewrites whole-word scheme URLs in a bash command to file paths; the transcript keeps the original.
+    #[ext(skip = "borrowed result; tools.rewriteUrls")]
     pub async fn rewrite_urls<'a>(&self, command: &'a str) -> Result<Cow<'a, str>, ToolError> {
         bash_urls::rewrite(command, &self.schemes).await
     }
@@ -313,6 +346,7 @@ impl SessionTools {
     /// A tool's path argument as an absolute path (pi `resolveToCwd`): unicode spaces
     /// become plain spaces, a leading `@` is dropped, `~`/`~/` expand to `$HOME`,
     /// `file://` URLs become paths, relative paths join `cwd`, and `.`/`..` are folded.
+    #[ext]
     pub fn resolve_path(&self, path: &str) -> PathBuf {
         let cleaned = clean_path(path);
         let path = cleaned.as_ref();

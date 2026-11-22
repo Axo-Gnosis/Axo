@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use axo_macros::expose;
+
 /// Every error `axo` returns.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -28,6 +30,8 @@ pub enum Error {
     NoModel,
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    #[error("Completion failed: {0}")]
+    Completion(String),
     #[error("Mode not found: {0}")]
     ModeNotFound(String),
     #[error("Skill not found: {0}")]
@@ -108,6 +112,7 @@ pub enum ErrorCode {
     Scheme,
     NoModel,
     ModelNotFound,
+    Completion,
     ModeNotFound,
     SkillNotFound,
     AgentNotFound,
@@ -132,7 +137,9 @@ pub enum ErrorCode {
     EntryNotFound,
 }
 
+#[expose(block = ERROR_BLOCK, object = "types")]
 impl Error {
+    #[ext(skip = "errors cross as { code, message }")]
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Ai(_) => ErrorCode::Ai,
@@ -144,6 +151,7 @@ impl Error {
             Self::Scheme(_) => ErrorCode::Scheme,
             Self::NoModel => ErrorCode::NoModel,
             Self::ModelNotFound(_) => ErrorCode::ModelNotFound,
+            Self::Completion(_) => ErrorCode::Completion,
             Self::ModeNotFound(_) => ErrorCode::ModeNotFound,
             Self::SkillNotFound(_) => ErrorCode::SkillNotFound,
             Self::AgentNotFound(_) => ErrorCode::AgentNotFound,

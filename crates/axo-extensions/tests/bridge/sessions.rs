@@ -3,8 +3,8 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axo::{
@@ -15,7 +15,7 @@ use axo::{
 use axo_agent::{AgentEvent, AgentMessage, BeforeToolCallContext, ToolCallDecision, ToolError};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ThinkingLevel, UserBlock};
-use axo_extensions::{ExtensionPhase, Extensions, Failure};
+use axo_extensions::{ExtensionPhase, Extensions, Failure, Forked, Lifecycle, SessionRequest};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -23,10 +23,12 @@ use crate::{Case, Host, enabled, lines, phase, wait_for, wait_ready_after};
 
 pub const CASES: &[Case] = &[
     case!(tools_policy_state_command_and_events),
+    case!(host_lifecycle_and_child_lookup),
     case!(command_reentry_is_refused),
     case!(command_reentry_through_a_turn_is_refused),
     case!(compact_during_held_turn_is_refused),
     case!(filtered_session_subscription),
+    case!(completion_stream_and_unsubscribe),
     case!(detach_closes_subscriptions),
     case!(subscription_ends_with_its_generation),
     case!(unavailable_policy_fails_closed),
@@ -124,6 +126,7 @@ async fn tools_policy_state_command_and_events() {
     let turns = read("read")
         .into_iter()
         .chain(read("blocked"))
+        .chain(read("resolve"))
         .chain(turn("state", "call", json!({"tool": "probe", "args": {}})))
         .chain(turn(
             "spawn",
@@ -155,11 +158,17 @@ async fn tools_policy_state_command_and_events() {
             .any(|text| text.contains("replaces the built-in"))
     );
 
+    host.script(LAB, "policyAfter", "record");
     session.prompt("read it").await.unwrap();
     assert_eq!(
         result(&session, &["read"]).await,
         (false, "ext:read:{\"path\":\"a\"}".into())
     );
+    let after: Value = serde_json::from_str(&lines(&host.path("ctl/lab/after"))[0]).unwrap();
+    assert_eq!(after["cx"]["toolCall"]["id"], "read");
+    assert!(after["cx"]["assistantMessage"].is_object());
+    assert_eq!(after["cx"]["result"]["terminate"], false);
+    assert_eq!(after["scope"].get("writes"), Some(&Value::Null));
     let mut updates = Vec::new();
     loop {
         match &*events.try_recv().expect("read execution end not received") {
@@ -195,6 +204,13 @@ async fn tools_policy_state_command_and_events() {
     assert!(error && text.contains("no"), "{text}");
 
     host.script(LAB, "policyBefore", "ok");
+    host.script(LAB, "tool", "resolve");
+    session.prompt("resolve a path").await.unwrap();
+    assert_eq!(
+        result(&session, &["resolve"]).await,
+        (false, host.path("work/x").display().to_string())
+    );
+
     host.script(LAB, "tool", "state");
     session.prompt("save state").await.unwrap();
     assert_eq!(
@@ -207,7 +223,18 @@ async fn tools_policy_state_command_and_events() {
     session.prompt("block the spawn").await.unwrap();
     let (error, text) = result(&session, &["spawn"]).await;
     assert!(error && text.contains("no"), "{text}");
-    assert!(host.calls(LAB).iter().any(|call| call == "spawn"));
+    let args: Value = serde_json::from_str(&lines(&host.path("ctl/lab/blocked-spawn"))[0]).unwrap();
+    let spawn = &args["spawn"];
+    assert!(args.get("session").is_none());
+    assert_eq!(spawn["parentSessionId"], session.id());
+    assert_eq!(
+        spawn["task"],
+        json!([{ "type": "text", "text": "Review it" }])
+    );
+    assert_eq!(
+        spawn["origin"],
+        json!({ "type": "tool", "callId": "spawn" })
+    );
 
     assert!(session.commands().iter().any(|info| info.name == "hello" && matches!(info.kind, CommandKind::Registered { .. })));
     let command = session.parse_command("/hello hi").unwrap().unwrap();
@@ -256,6 +283,127 @@ async fn tools_policy_state_command_and_events() {
     assert!(!reopened.commands().iter().any(|info| info.name == "hello"));
     reopened.shutdown().await;
     fork.shutdown().await;
+}
+
+#[derive(Default)]
+struct ForkHost(Mutex<Vec<Arc<Session>>>);
+
+#[async_trait]
+impl Lifecycle for ForkHost {
+    async fn create(&self, _: PathBuf, _: SessionRequest) -> Result<Arc<Session>, Error> {
+        panic!("unexpected create")
+    }
+    async fn open(&self, _: PathBuf, _: SessionRequest) -> Result<Arc<Session>, Error> {
+        panic!("unexpected open")
+    }
+    async fn fork(&self, session: Arc<Session>, entry: axo::EntryId) -> Result<Forked, Error> {
+        let fork = session.fork(&entry).await?;
+        let session = Arc::new(fork.session);
+        self.0.lock().unwrap().push(session.clone());
+        Ok(Forked {
+            session,
+            editable: fork.editable,
+        })
+    }
+    async fn close(&self, id: String) -> Result<(), Error> {
+        let session = self.0.lock().unwrap().pop().unwrap();
+        assert_eq!(session.id(), id);
+        session.shutdown().await;
+        Ok(())
+    }
+}
+
+async fn host_lifecycle_and_child_lookup() {
+    let host = Host::scripted(vec![
+        ScriptedTurn::Reply(reply_text("parent ready")),
+        ScriptedTurn::Reply(reply_text("child done")),
+    ])
+    .await;
+    package(&host, false);
+    host.script(LAB, "command", "invoke");
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(&host, &extensions).await;
+    // Root journals are created on the first submission, not by attachment or custom entries.
+    session.prompt("start").await.unwrap();
+    let invoke = async |request: Value| -> Result<Value, (String, String)> {
+        let command = session
+            .parse_command(&format!("/hello {request}"))
+            .unwrap()
+            .unwrap();
+        session.run_command(command).await.unwrap();
+        serde_json::from_slice(&std::fs::read(host.path("ctl/lab/reply")).unwrap()).unwrap()
+    };
+    let host_call =
+        |method: &str, args: Value| json!({ "object": "host", "method": method, "args": args });
+    let name =
+        |id: &str| json!({ "object": "session", "target": id, "method": "name", "args": [] });
+    let leaf = session.append_custom("fork-point", None).await.unwrap();
+    let fork = host_call(
+        "forkSession",
+        json!([session.id(), leaf.entry.id().unwrap()]),
+    );
+    assert_eq!(
+        invoke(fork.clone()).await.unwrap_err(),
+        (
+            "no_lifecycle".into(),
+            "the host registered no session lifecycle hook".into()
+        )
+    );
+    let listed = invoke(host_call("listSessions", json!([host.path("work")])))
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|info| info["id"] == session.id())
+    );
+
+    let hook = Arc::new(ForkHost::default());
+    extensions.set_lifecycle(Some(hook.clone()));
+    assert_eq!(
+        invoke(host_call("forkSession", json!([session.id()])))
+            .await
+            .unwrap_err()
+            .0,
+        "invalid_arguments"
+    );
+    let receipt = invoke(fork).await.unwrap();
+    let id = receipt["session"].as_str().unwrap();
+    assert_ne!(id, session.id());
+    let expected = {
+        let held = hook.0.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id(), id);
+        json!(held[0].name())
+    };
+    assert_eq!(invoke(name(id)).await.unwrap(), expected);
+    assert_eq!(
+        invoke(host_call("closeSession", json!([id])))
+            .await
+            .unwrap(),
+        Value::Null
+    );
+    assert_eq!(invoke(name(id)).await.unwrap_err().0, "no_session");
+
+    let child = session
+        .spawn(axo::SpawnRequest {
+            task: "check".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        invoke(name(child.session.id())).await.unwrap(),
+        json!(child.session.name())
+    );
+    session.shutdown().await;
+    extensions.shutdown().await;
 }
 
 async fn command_reentry_is_refused() {
@@ -380,6 +528,83 @@ async fn filtered_session_subscription() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(received, expected);
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+async fn completion_stream_and_unsubscribe() {
+    let host = Host::scripted(vec![
+        ScriptedTurn::HangUntilCancel,
+        ScriptedTurn::Reply(reply_text("hello!")),
+    ])
+    .await;
+    package(&host, false);
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let session = attach(&host, &extensions).await;
+    let command = |text: &str| session.parse_command(text).unwrap().unwrap();
+    let subs = host.path("ctl/lab/subs");
+
+    // Hold the first delivery unacknowledged. Unsubscribing must withdraw that call
+    // rather than delivering the queued deltas or a closed frame.
+    host.script(LAB, "stream", "hang");
+    host.script(LAB, "command", "completion");
+    session.run_command(command("/hello")).await.unwrap();
+    let held = &lines(&subs)[0];
+    wait_for("held completion delivery", || {
+        host.calls(LAB).iter().any(|m| m == "stream")
+    })
+    .await;
+    host.script(LAB, "command", "unsubscribe");
+    session
+        .run_command(command(&format!("/hello {held}")))
+        .await
+        .unwrap();
+    wait_for("withdrawn delivery", || {
+        host.canceled(LAB).iter().any(|m| m == "stream")
+    })
+    .await;
+
+    host.script(LAB, "stream", "ok");
+    host.script(LAB, "command", "completion");
+    session.run_command(command("/hello")).await.unwrap();
+    let sub = &lines(&subs)[1];
+    let closed = json!({ "sub": sub, "closed": true });
+    wait_for("completed model stream", || {
+        streamed(&host).contains(&closed)
+    })
+    .await;
+    let frames = streamed(&host);
+    assert!(frames.iter().all(|frame| frame["sub"] == sub.as_str()));
+    assert_eq!(frames.last(), Some(&closed));
+    let events = &frames[..frames.len() - 1];
+    assert_eq!(
+        events
+            .iter()
+            .map(|f| f["event"]["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "start",
+            "text_start",
+            "text_delta",
+            "text_delta",
+            "text_end",
+            "done"
+        ]
+    );
+    assert_eq!(events[2]["event"]["delta"], "hel");
+    assert_eq!(events[3]["event"]["delta"], "lo!");
+    assert_eq!(
+        events[5]["event"]["message"]["content"][0]["text"],
+        "hello!"
+    );
+    assert_eq!(
+        host.calls(LAB).iter().filter(|m| *m == "stream").count(),
+        1 + frames.len()
+    );
     session.shutdown().await;
     extensions.shutdown().await;
 }

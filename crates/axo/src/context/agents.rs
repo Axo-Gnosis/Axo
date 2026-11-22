@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -22,7 +23,9 @@ pub enum RunAs {
     Any,
 }
 
+#[expose(block = RUN_AS_BLOCK, object = "types")]
 impl RunAs {
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_any(&self) -> bool {
         *self == Self::Any
     }
@@ -149,8 +152,10 @@ pub struct TeamMember {
     pub brief: Option<String>,
 }
 
+#[expose(block = TEAM_MEMBER_BLOCK, object = "types")]
 impl TeamMember {
     /// The member's alias, or its agent name when no alias was supplied.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn roster_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.agent)
     }
@@ -172,8 +177,10 @@ pub enum AgentDef {
     Team(TeamSpec),
 }
 
+#[expose(block = AGENT_DEF_BLOCK, object = "types")]
 impl AgentDef {
     /// The definition's unique catalog name.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn name(&self) -> &str {
         match self {
             Self::Agent(spec) => &spec.name,
@@ -307,11 +314,13 @@ pub fn load_agents(
     (definitions, diagnostics)
 }
 
+#[expose(block = AGENT_SPEC_BLOCK, object = "types")]
 impl AgentSpec {
     /// Parses a markdown agent definition supplied by the host (for example a bundled `include_str!`).
     /// `default_name` applies only when the frontmatter has no `name` key; an explicit empty `name` is
     /// invalid. Team definitions (frontmatter `members`) load only from agent roots and yield `None`
     /// before any other validation. Diagnostics carry no origin and `path` stays `None`.
+    #[ext(skip = "no receiver; served by host.parseAgent")]
     pub fn parse(default_name: &str, markdown: &str) -> (Option<AgentSpec>, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let def = parse_markdown(markdown, default_name.to_owned(), None, &mut |message| {

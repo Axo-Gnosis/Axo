@@ -8,7 +8,7 @@ This is the live planning document for unbuilt work and active design discussion
 
 ## Overview of tracks
 
-M1–M5 plus Tracks 2, 3 and 4 are complete. Track 5 has shipped providers, logins, session contributions and session API parity through `axo-extensions`; packaging and parity beyond sessions remain open. Extensions do not wait for codemode; `axo-acp` is deferred.
+M1–M5 plus Tracks 2, 3 and 4 are complete. Track 5 has shipped providers, logins, session contributions and extension API parity through `axo-extensions`; packaging remains open. Extensions do not wait for codemode; `axo-acp` is deferred.
 
 ```mermaid
 flowchart LR
@@ -20,13 +20,13 @@ flowchart LR
   N -.reused by.-> MCP["MCP adapter (Track 5)"]
   E["Extensions (Track 5)"] --> B["Providers and logins (implemented)"] --> P3["Session contributions (implemented)"]
   B --> P4["Packaging (planned)"]
-  P3 --> A["Session API parity (implemented)"] --> PB["Remaining API parity (open)"]
+  P3 --> A["Extension API parity (plans A and B implemented)"]
 ```
 
 | Track | Scope | Status |
 |---|---|---|
 | **1. Codemode & script extensions** | Embedded JS sandbox (QuickJS/Boa engine evaluation), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and script hooks on spawned specs (rungs 2–5) | Rungs 0–1 scoped; rungs 2+ in discussion. Not the current implementation priority |
-| **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs | **Phases 1–3 and extension API parity plan A implemented.** Packaging (phase 4) and parity plan B remain open; MCP and `ast_edit` are deferred |
+| **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs | **Phases 1–3 and extension API parity plans A and B implemented.** Packaging (phase 4) remains open; MCP and `ast_edit` are deferred |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
 | **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | Designed 2026-11-21; not started |
 | **Tool surface & session modes** | Deferred tools, action tools, scoped host policy, cache-safe root mode overlays and completion | **Shipped (A–H).** See [Shipped tracks](#shipped-tracks) |
@@ -168,7 +168,7 @@ Codemode plus bash covers everything eval does except state between calls and or
 
 The session the user talks to is changed only by the user. Children are disposable agents a script builds for one job; their hooks die with them.
 
-This proposed restriction concerns model-written scripts, not user-installed Bun extensions acting with the user's authority. See [extension parity and authority](design.md#extension-parity-and-authority-planned).
+This proposed restriction concerns model-written scripts, not user-installed Bun extensions acting with the user's authority. See [extension parity and authority](design.md#extension-parity-and-authority).
 
 - **The invariant.** Children inherit the parent's policy: user settings, user and project extensions, project trust, the exec environment. Script hooks run **before** that inherited policy, so the policy always sees the final arguments that will run. A script can tighten a child's rules, never loosen them past the user's.
 - **What it fixes:**
@@ -289,7 +289,7 @@ Key risks to design around when building step 3 (script hooks):
 - **Definitions, inspection and tree usage:** Landed in code: persona and child spec bodies in their own `agent` prompt section; `:`-namespaced mode and skill names derived from folders; `ModeSpec::parse`, `AgentSpec::parse` and `KeywordSpec::parse` for host-bundled markdown; keyword definitions with persistent, `/model`-equivalent model selection; side-effect-free host tool inspection (`Session::tools`, host `tool://` reads); read-only `bash` through `BashAccess` and Landlock; typed `ResultResolution` and persisted review `details`; structured `kill`/`send` details; `Session::resume_wakes`; executing child tools and unread mail on child rows; and journal-derived whole-tree usage (`Session::tree_usage`, `SessionEvent::TreeUsage`). Opening a child while its root is closed stays a documented root-first flow, not a new API. Settled contracts in [`design.md`](design.md#settled-core-decisions); runtime reference in [`crates/axo/docs/prompts-and-context.md`](../crates/axo/docs/prompts-and-context.md#keyword-definitions), [`crates/axo/docs/configuration.md`](../crates/axo/docs/configuration.md#keywords-keywords--keywordsettings), [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md#tree-usage), and [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#background-jobs-for-hosts).
 - **Host capability handoff:** Landed in code: `ConfigLayer::skill_roots` with Read/Trust project skills gates and existing discovery precedence; synchronized activity snapshots/events plus `is_running` (observation, not reservation); selected/effective mode surfaces; schema-validated edited acceptance retaining original and accepted values; built-versus-recorded prompt inspection, context-file inventories and ledger hashes; rich retry events; typed `kill`/`send`/`wait`/`spawn` receipts and routed host `send` with provenance; stdout/stderr capture with durable `.streams` sidecars and retained-log reads. Raw artifacts stay merged; stream ordering is capture order, not true chronology. No host `prepare_request` hook or event envelope was added; the provider `RequestRewrite` is the separate level-2 wire seam. Runtime contracts live in [`extending.md`](../crates/axo/docs/extending.md).
 - **Keyword replay and write scopes:** Landed in code: `Entry::Submission::keywords` records the keywords that fired, and reopen requeues from those recorded names instead of matching again; frontmatter `writes` on modes and agents scopes `write`/`edit` (`ModeSpec::writes`, `AgentSpec::writes`, `ToolScope::writes`, `SessionTools::check_write`) and persists onto children as the `SpawnLink::writes` ceiling.
-- **File-change snapshots:** Landed in code: `write` and `edit` of file targets record typed `details.change` (`FileChange` with before/after `SnapshotBlob`s and a `LineDiff`) through the shared `SessionTools::record_change`, storing raw bytes as content-addressed, never-pruned blobs under `<session>/snapshots/`; `edit`'s legacy `diff`/`patch`/`first_changed_line` keys are gone and it refuses non-UTF-8 files. Hosts read blobs (`Session::read_snapshot`, lock-free `Axo::read_snapshot`) and squash ranges (`squash`, `squash_changes`); forks link only the blobs their path references. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#file-changes-for-hosts).
+- **File-change snapshots:** File tools report accesses in `details.files`, with a `FileChange` for each mutation (before/after `SnapshotBlob`s and a `LineDiff` for diffable text). Raw snapshots are content-addressed, never-pruned blobs under `<session>/snapshots/`; `edit` refuses non-UTF-8 files. Hosts read blobs (`Session::read_snapshot`, lock-free `Axo::read_snapshot`) and squash ranges (`squash`, `squash_changes`); forks link only the blobs their path references. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#file-changes-for-hosts).
 - **Queue control:** Landed in code: input sent after a Stop is delivered when the stopped run settles (a Stop latches when pressed, a failed run when it settles); `Session::resume_wakes` also sends held steers and follow-ups; `steeringMode` defaults to `"all"`; `Session::withdraw` takes queued input back, recorded as `Entry::SubmissionWithdrawn` so reopening never requeues it; `LiveSnapshot::queued` lists `QueuedInput` with submission ids; a queued steer settles a pending `ask` question or reviewed `yield` (`ResultResolution::Steered`) instead of waiting behind it. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#queued-input-for-hosts).
 ---
 
@@ -297,7 +297,7 @@ Key risks to design around when building step 3 (script hooks):
 
 ### Status and settled direction
 
-**Phases 1–3 and extension API parity plan A implemented; packaging and parity plan B remain open.** The `axo-extensions` bridge loads TS/JS providers and session contributions under supervised Bun runners. See the [runtime reference](../crates/axo/docs/extending.md#4-bun-extensions-axo-extensions) and [enablement setting](../crates/axo/docs/configuration.md#extensions-extensions--axoenabledextension). Packaging and the MCP adapter do not exist.
+**Phases 1–3 and extension API parity plans A and B implemented; packaging remains open.** The `axo-extensions` bridge loads TS/JS providers and session contributions under supervised Bun runners. See the [runtime reference](../crates/axo/docs/extending.md#4-bun-extensions-axo-extensions) and [enablement setting](../crates/axo/docs/configuration.md#extensions-extensions--axoenabledextension). Packaging and the MCP adapter do not exist.
 
 The [parity and authority rules](design.md#extension-parity-and-authority) govern which public Rust methods are bound and why a method may be withheld. There is no codemode dependency.
 
@@ -356,7 +356,7 @@ Phase 1 precedes 2; phases 3 and 4 depend on 2 and can proceed independently. AP
 
 **Goal:** a Rust embedder loads a trusted TS/JS provider under supervision and uses it through the normal `Models` APIs.
 
-- **Embedding.** `axo_extensions::Extensions::new(models, supervisor, ExtensionOptions { bun, roots, data_root, runtime_dir, env })` takes the host's `Arc<Models>` and the supervisor from `Axo::supervisor()`; `configure(&[EnabledExtension])` reconciles, `status`/`collisions`/`diagnostics`/`subscribe` report typed state, `retry` re-arms a disabled member, `reload` replaces a placement after a code-only package change, and `shutdown` reaps runners and removes the layer. The user-only `extensions` setting (`[{ id, group? }]`) supplies order and grouping; project layers cannot enable code. No session is created to start providers.
+- **Embedding.** `axo_extensions::Extensions::new(axo, options)` uses the model registry and supervisor of the host's `Arc<Axo>`; `configure(&[EnabledExtension])` reconciles, `status`/`collisions`/`diagnostics`/`subscribe` report typed state, `retry` re-arms a disabled member, `reload` replaces a placement after a code-only package change, and `shutdown` reaps runners and removes the layer. The user-only `extensions` setting (`[{ id, group? }]`) supplies order and grouping; project layers cannot enable code. No session is created to start providers.
 - **Static catalog, lazy code.** Each enabled package's `extension.json` declares its id, entry and providers with full model metadata and `login`/`rewrite` capabilities. Discovery reads only enabled IDs from host roots and never executes code; the last enabled declaring extension wins a provider id, and hidden contributors are reported. Winners are published as one atomic `ProviderLayer` replacement. A failed rescan keeps the last accepted declarations, marked unavailable. Bun starts on the first login, refresh or rewrite that needs it.
 - **Runner and transport.** The TS runner is embedded with `include_str!`, written per generation into a private `0700` directory under `runtime_dir` with a `bunfig.toml` disabling auto-install, and run as `bun run <runner>` through the host's `ProcessSupervisor` in either process-group or cgroup mode. Length-prefixed JSON frames (64 MiB bound) travel over a Unix-domain socket bound before spawn and authenticated by a per-generation nonce; stdin/stdout carry no protocol. The bridge is therefore Unix-only. Authors write against the type-only `@axo/extension-sdk` (`packages/axo-extension-sdk`); no runtime SDK, package installation or compatibility check is involved.
 - **Contract.** The runner serves `login` (with nested URL/device-code/prompt/select/progress callbacks to the host's `LoginInteraction`), `refresh` and `rewrite` (complete URL/headers/body replacement, preserving duplicate and binary header values). Rust validates every reply, keeps credential storage and locked refresh, and sends and parses HTTP itself; inference bytes never cross the socket.
@@ -379,17 +379,22 @@ Phase 1 precedes 2; phases 3 and 4 depend on 2 and can proceed independently. AP
 
 Each public `Session` method has an exposure decision: `#[expose]` generates dispatch for `#[ext]` methods and records a reason for every skip. Explicitly registered blocks drive both `Session::invoke` and the checked-in TypeScript bindings generated with specta. The runner forwards positional arguments rather than implementing methods. Wire adapters replace live handles with receipts, pages or snapshots; typed subscriptions deliver session events. The bridge refuses recursive registered commands in the same call chain and detects stalled queues of nested host calls.
 
-**Plan B (open):** the `tools` object for tool handlers, the host API and its lifecycle hook, models, and the other exported types. The `PENDING` list in [`ext_surface.rs`](../crates/axo/tests/ext_surface.rs) tracks the remaining public types with unclassified methods in `axo`.
+#### Extension API parity, plan B (implemented)
+
+Tool handlers get guarded file and command operations; the host object delegates lifecycle requests to an optional host hook, and the models object supports one-off and streamed completions. The [surface guard](../crates/axo/tests/ext_surface.rs) checks method and free-function decisions. See the [generated reference](../crates/axo/docs/extension-api.md) for callable methods and reasons for withholding others.
 
 #### Phase 4: Packaging and install
 
-**Goal:** hosts can install/update dependency-bearing extensions without manual user steps.
+**Goal:** a host can install and update dependency-bearing extensions through axo without manual steps. Phase 4 is axo-only; host integration is outside it.
 
-- Host-triggered installation using its Bun binary, with a pre-bundled single-file path that needs no dependency installation.
-- SDK/axo compatibility checks with explicit diagnostics, host-facing memory reporting by process/group, and an optional cap only if a real need exists.
-- Package acquisition, presentation, paths and layout stay host-owned; axo provides the install operation and its diagnostics.
+- **Acquisition stays host-owned.** The host puts the package directory on disk; axo installs its dependencies and reports failures as typed errors carrying Bun's output.
+- **Install** runs `bun install` with the host's Bun under `ProcessSupervisor`. It requires a `bun.lock` and refuses a package without one. Lifecycle scripts run: they add no authority a trusted extension lacks, and native packages need them.
+- **Update and rollback.** Install into a staging sibling of the package directory, swap it into place with a same-filesystem rename only on success, then `reload`. A failed install leaves the running version untouched.
+- **Pre-bundled single file** needs no install: `bun build --target=bun` output with no external imports already loads as an `entry`. Document it and cover it with a fixture; native `.node` and `.wasm` assets must ship beside the bundle.
+- **SDK compatibility.** `extension.json` declares the SDK version it was built against; Rust checks it during discovery, before Bun starts, and refuses a mismatch naming both versions. Settled: while axo is in development the SDK version stays `0.0.0` and is not bumped for breaking changes; versioning becomes meaningful only when Toph declares axo out of development.
+- **Memory reporting** by runner (process group, or cgroup under cgroup supervision), never split per member of a shared runner. No memory cap.
 
-**Acceptance:** through axo's public install API, a test host adds an npm-dependent extension with no manual steps; an incompatible SDK is refused with both versions identified.
+**Acceptance:** through axo's public install API, a test host installs a fixture extension with an npm dependency and calls one of its tools; a manifest declaring another SDK version is refused with both versions named; a failed update leaves the previous version running. Install tests that need network or a warmed cache are opt-in like the other real-Bun tests.
 
 ### Evidence and remaining phase-plan work
 
@@ -397,12 +402,12 @@ The [extension-system study](research/extensions.md) records OMP, pi, Octet, Cla
 
 The [Bun study](research/bun-topology.md) preserves the original shared-loop/Worker experiment and a separate process-per-extension follow-up. The latter informed the selected process default. Whole-tree PSS, workloads, retained dependencies and measurement availability matter; the follow-up's programs/raw data were not retained, and its figures are not directly comparable to the earlier workload. Killing a Bun runner does not kill the Rust host. Process boundaries permit cleanup and attribution, not automatic quotas or OS sandboxing.
 
-Phase 4 reuses the supervised transport and lifecycle. Its detailed plan must settle packaging contracts without widening extension authority.
+Phase 4 reuses the supervised transport and lifecycle. Install, rollback, compatibility and memory reporting are settled above; its detailed plan must still settle, without widening extension authority:
 
-- Install/update rollback and dependency errors, stable package identities, compatibility and ownership-aware unloading.
+- The public install API shape and its typed errors; how install, the staging swap and `reload` interact with a running or grouped runner; stable package identities and ownership-aware unloading.
 - Deterministic offline contract checks; real Bun scenarios opt in, and live provider proof is separate from normal test suites.
 
-General UI requests, provider level 3/custom streams, MCP and `ast_edit` remain deferred. The host lifecycle hook belongs to parity plan B, not packaging.
+General UI requests, provider level 3/custom streams, MCP and `ast_edit` remain deferred.
 
 
 ### MCP tool adapter

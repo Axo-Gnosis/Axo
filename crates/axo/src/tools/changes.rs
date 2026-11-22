@@ -1,10 +1,11 @@
-//! The typed `details.change` record of a file mutation, its line diff, and squashing a
+//! The typed record of a file mutation, its line diff, and squashing a
 //! range of changes into the net change per file.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use axo_ai::ToolResultMessage;
+use axo_macros::expose;
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
@@ -20,11 +21,11 @@ const MAX_INLINE_PATCH_BYTES: usize = 64 * 1024;
 const DIFF_TIMEOUT: Duration = Duration::from_secs(1);
 const SQUASH_CONCURRENCY: usize = 8;
 
-/// One file mutation by a file tool: `details.change` on its result.
+/// One file mutation in a tool result's `details.files` list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChange {
-    /// The absolute target path (the same value as `details.ledger.path`).
+    /// The absolute target path (the same value as the accompanying ledger record's path).
     pub path: String,
     /// The canonical file identity; group changes by this.
     pub key: String,
@@ -110,12 +111,12 @@ pub struct SquashedChange {
     pub diff: Option<LineDiff>,
 }
 
-/// The change a successful tool result recorded, if any.
-pub fn file_change(result: &ToolResultMessage) -> Option<FileChange> {
-    if result.is_error {
-        return None;
-    }
-    FileChange::deserialize(result.details.as_ref()?.get("change")?).ok()
+/// All mutations recorded by a successful tool result, in order.
+pub fn file_changes(result: &ToolResultMessage) -> Vec<FileChange> {
+    crate::tools::file_records(result)
+        .into_iter()
+        .filter_map(|record| record.change)
+        .collect()
 }
 
 pub(crate) fn is_binary(bytes: &[u8]) -> bool {
@@ -229,9 +230,11 @@ pub fn squash<'a>(changes: impl IntoIterator<Item = &'a FileChange>) -> Vec<Squa
     squashed
 }
 
+#[expose(block = SNAPSHOT_STORE_CHANGES, object = "types")]
 impl SnapshotStore {
     /// `squash`, then for files mutated more than once whose first-before (empty when
     /// created) and last-after are stored text, reads both blobs and fills `diff`.
+    #[ext(skip = "served by session.squashChanges and host.squashChanges")]
     pub async fn squash(&self, changes: &[FileChange]) -> Vec<SquashedChange> {
         let mut squashed = squash(changes);
         let stored = |blob: &SnapshotBlob| !blob.binary && blob.omitted.is_none();

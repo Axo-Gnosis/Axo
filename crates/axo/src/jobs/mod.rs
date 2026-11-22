@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use async_trait::async_trait;
 use axo_agent::{AgentMessage, CustomMessage, MessageOrigin, QueuedMessage, ToolInvocationId};
 use axo_ai::{Usage, UserBlock};
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
@@ -148,8 +149,10 @@ pub enum JobStatus {
     Failed,
 }
 
+#[expose(block = JOB_STATUS_BLOCK, object = "types")]
 impl JobStatus {
     /// The `proc://` label: `"queued"`, `"running"`, `"helpers running"`, `"finished"` or `"failed"`.
+    #[ext(skip = "derivable from the value in TypeScript")]
     pub fn label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -1570,12 +1573,35 @@ impl JobRegistry {
         call_id: &str,
         artifacts_dir: &Path,
     ) -> Option<CommandOutput> {
+        self.find_output(artifacts_dir, |_, run| run.call_id == call_id)
+    }
+
+    pub(crate) fn job_output(&self, job_id: &str, artifacts_dir: &Path) -> Option<CommandOutput> {
+        self.find_output(artifacts_dir, |id, _| id.to_string() == job_id)
+    }
+
+    pub(crate) fn command_jobs(&self, call_id: &str) -> Vec<String> {
+        self.lock()
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| match &job.kind {
+                Kind::Command(run) if run.call_id == call_id => Some(id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_output(
+        &self,
+        artifacts_dir: &Path,
+        wanted: impl Fn(&JobId, &CommandRun) -> bool,
+    ) -> Option<CommandOutput> {
         let state = self.lock();
-        state.jobs.iter().find_map(|(id, job)| {
+        state.jobs.iter().rev().find_map(|(id, job)| {
             let Kind::Command(run) = &job.kind else {
                 return None;
             };
-            if run.call_id != call_id {
+            if !wanted(id, run) {
                 return None;
             }
             if run.output.path.as_os_str().is_empty() {
@@ -1603,20 +1629,20 @@ impl JobRegistry {
 
     pub(crate) fn background(&self, call_id: &str) -> bool {
         let state = self.lock();
-        state.jobs.values().any(|job| {
+        let mut matched = false;
+        for job in state.jobs.values() {
             let Kind::Command(run) = &job.kind else {
-                return false;
+                continue;
             };
             if run.call_id == call_id
                 && run.mode == Mode::Foreground
                 && let Some(control) = &run.control
             {
                 control.promote.notify_one();
-                true
-            } else {
-                false
+                matched = true;
             }
-        })
+        }
+        matched
     }
 
     /// A listed row and its highest-sequence undelivered text.

@@ -53,7 +53,8 @@ pub trait Streamer: Send + Sync {
     ) -> BoxStream<'static, AssistantEvent>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum ToolChoice {
     Auto,
     None,

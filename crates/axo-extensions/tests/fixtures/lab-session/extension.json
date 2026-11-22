@@ -29,11 +29,28 @@
       "description": "Lab burst: sends 300 updates, then returns `burst`.",
       "parameters": { "type": "object" },
       "exposure": "deferred"
+    },
+    {
+      "name": "touch-two",
+      "description": "Writes a.txt and b.txt.",
+      "parameters": { "type": "object" }
+    },
+    {
+      "name": "stale",
+      "description": "Overwrites seen.txt without reading it first.",
+      "parameters": { "type": "object" }
+    },
+    {
+      "name": "sh",
+      "description": "Runs a supervised shell command.",
+      "parameters": { "type": "object", "properties": { "background": { "type": "boolean" } } }
     }
   ],
   "schemes": [{ "name": "lab", "promptDoc": "lab:// URLs read lab fixtures." }],
   "commands": [
     { "name": "hello", "description": "Posts its arguments as a lab message.", "argumentHint": "<text>" },
+    { "name": "ask-model", "description": "Posts the model count and a one-off completion." },
+    { "name": "fork-here", "description": "Forks at the latest entry and posts the new session ID." },
     { "name": "plan-task", "description": "Enters plan mode with the supplied task." },
     { "name": "skill-input", "description": "Submits the rendered review skill as a follow-up." },
     { "name": "skill-focus", "description": "Compacts with the rendered review skill as focus." },
@@ -45,5 +62,6 @@
   ],
   "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
   "toolPolicy": ["before"],
+  "spawnHook": true,
   "events": true
 }

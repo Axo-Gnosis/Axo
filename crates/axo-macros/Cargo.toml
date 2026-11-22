@@ -1,6 +1,6 @@
 [package]
 name = "axo-macros"
-version = "0.1.0"
+version = "0.0.0"
 description = "axo's proc macros: the #[expose] extension surface for public Rust APIs"
 edition.workspace = true
 license.workspace = true

@@ -70,6 +70,7 @@ impl SteerSignal {
 }
 
 /// Per-call state handed to [`Tool::execute`]. Owned, so the call runs on its own task.
+#[derive(Clone)]
 pub struct ToolContext {
     pub call: Arc<ToolCall>,
     pub cancel: CancellationToken,
