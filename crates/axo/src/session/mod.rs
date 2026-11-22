@@ -103,6 +103,9 @@ pub struct SessionOptions {
     pub modes: Vec<ModeSpec>,
     /// Keyword definitions supplied in code, after every file-defined one; the first name wins.
     pub keywords: Vec<KeywordSpec>,
+    /// `false` loads no keywords, so nothing in a prompt fires one. For host-driven sessions
+    /// whose prompts are not typed by the user. Forks inherit it.
+    pub keywords_enabled: bool,
     /// Falls back to the session's last level, then `defaultThinkingLevel`; clamped to
     /// the model's supported levels.
     pub thinking: Option<ThinkingLevel>,
@@ -137,6 +140,7 @@ impl Default for SessionOptions {
             agents: Vec::new(),
             modes: Vec::new(),
             keywords: Vec::new(),
+            keywords_enabled: true,
             thinking: None,
             ask_enabled: false,
             project_access: None,

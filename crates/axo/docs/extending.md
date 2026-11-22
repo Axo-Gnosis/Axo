@@ -86,6 +86,7 @@ let session = axo
         agents: Vec::new(),
         modes: Vec::new(),
         keywords: Vec::new(),
+        keywords_enabled: true,
         thinking: None,
         ask_enabled: true,
         project_access: None,

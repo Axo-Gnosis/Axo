@@ -1416,6 +1416,36 @@ mod keywords {
     }
 
     #[tokio::test]
+    async fn sessions_with_keywords_off_never_fire_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = keyword_host(
+            dir.path(),
+            json!({}),
+            vec![ScriptedTurn::Reply(reply_text("ok"))],
+        )
+        .await;
+        let session = host
+            .axo
+            .create_session(SessionOptions {
+                keywords_enabled: false,
+                ..keyword_options(dir.path(), orchestrate())
+            })
+            .await
+            .unwrap();
+        assert!(session.keywords().is_empty());
+        assert!(session.keyword_matches("orchestrate the fix").is_empty());
+        within(session.prompt("orchestrate the fix")).await.unwrap();
+        let requests = host.api.requests();
+        assert_eq!(
+            requests[0].model.id, "m",
+            "the keyword's model is not selected"
+        );
+        assert_eq!(keyword_blocks(&requests[0]), 0);
+        assert!(conduct_changes(&common::journal(&session)).is_empty());
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn typed_keywords_select_the_model_before_the_run_and_join_the_message() {
         let dir = tempfile::tempdir().unwrap();
         let host = keyword_host(

@@ -360,6 +360,7 @@ impl Axo {
             agents,
             modes,
             keywords,
+            keywords_enabled,
             thinking,
             ask_enabled,
             project_access,
@@ -379,6 +380,11 @@ impl Axo {
             keywords,
             diagnostics: mut agent_diagnostics,
         } = self.catalog(&cwd, project_access, &agents, &modes, &keywords)?;
+        let keywords = if keywords_enabled {
+            keywords
+        } else {
+            Vec::new()
+        };
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
