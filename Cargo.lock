@@ -173,6 +173,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axo",
+ "axo-agent",
  "axo-ai",
  "base64",
  "futures",
@@ -185,6 +186,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "url",
 ]
 

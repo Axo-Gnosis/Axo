@@ -18,7 +18,7 @@ use tracing::warn;
 
 use super::children::ChildSeed;
 use super::modes::ENTER_MODE;
-use super::{Inherited, Loaded, Session, SessionHooks, SessionSetup};
+use super::{Inherited, Loaded, Registrations, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
 use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
@@ -212,11 +212,13 @@ pub(super) fn child_inherited(
         ask_enabled: false,
         host_sections: base.host_sections.clone(),
         host_tools: base.host_tool_factories.clone(),
-        host_schemes: parent.host_schemes.clone(),
-        tool_policies: parent.tool_policies.clone(),
+        host_schemes: hooks.host_schemes(),
+        tool_policies: hooks.policies(),
         store: parent.store.clone(),
         sessions: parent.sessions.clone(),
-        spawn_hooks: parent.spawn_hooks.clone(),
+        spawn_hooks: hooks.spawn_hooks(),
+        commands: Vec::new(),
+        layer: Registrations::default(),
         run_slots: parent.run_slots.clone(),
         loaded: Some(loaded),
     })
@@ -390,7 +392,7 @@ impl SessionHooks {
             Ok((model, thinking, selector))
         };
         let (mut model, mut thinking, mut selector) = select(&spec)?;
-        for hook in &self.inherited.spawn_hooks {
+        for hook in self.spawn_hooks() {
             match hook
                 .before_spawn(&SpawnContext {
                     spec: &spec,

@@ -1,6 +1,7 @@
 //! The `write` tool (pi `core/tools/write.ts`), plus the stale-file guard for existing
 //! files.
 
+use std::borrow::Cow;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +15,9 @@ use serde_json::{Value, json};
 use crate::tools::files::fs_error;
 use crate::tools::{Located, SessionTools, lock_file};
 
-const GUIDELINES: &[&str] = &["Use write only for new files or complete rewrites."];
+const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
+    "Use write only for new files or complete rewrites.",
+)];
 
 #[derive(Deserialize)]
 struct WriteArgs {
@@ -74,7 +77,7 @@ impl Tool for WriteTool {
         }
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
         GUIDELINES
     }
 

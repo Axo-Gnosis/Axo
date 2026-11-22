@@ -1,5 +1,6 @@
 //! The `edit` tool (pi `core/tools/edit.ts`, `edit-diff.ts`), plus the stale-file guard.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,9 +15,9 @@ use crate::tools::files::{
 };
 use crate::tools::{Located, SessionTools, lock_file};
 
-const GUIDELINES: &[&str] = &[
+const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
     "When changing several places in one file, use one edit call with several entries in edits[].",
-];
+)];
 
 #[derive(Deserialize)]
 struct EditArgs {
@@ -88,7 +89,7 @@ impl Tool for EditTool {
         &self.parameters
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
         GUIDELINES
     }
 

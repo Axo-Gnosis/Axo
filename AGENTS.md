@@ -30,7 +30,7 @@ Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -
 - **`crates/axo-ai`**: LLM wire layer—message/transcript model, streaming adapters, model catalog, auth, cross-model transforms, error/overflow classification.
 - **`crates/axo-agent`**: Stateful turn loop, tool execution (`Tool`), deferred-tool routing (`route`), host tool-policy hooks (`ToolHooks`), loop-driver contract (`LoopHooks`), immutable event sink (`Persist`), queues, and cancellation.
 - **`crates/axo`**: Coding-agent harness—`Axo` host, `Session`, JSONL tree store & projection, recovery, compaction, context/skills, root session modes, scoped `ToolPolicy`, deferred tools (`call`, `tool://`), `ExecEnv`, command supervision (`ProcessSupervisor`), background jobs, the command catalog, URL `schemes`, and built-in tools.
-- **`crates/axo-extensions`**: Optional extension bridge above `axo`—`Extensions` manager, static `extension.json` discovery, supervised Bun runners (`runner.ts`) and their wire protocol, contributing providers through `ProviderLayer`. Nothing below may depend on it.
+- **`crates/axo-extensions`**: Optional extension bridge above `axo`—`Extensions` manager, static `extension.json` discovery, supervised Bun runners (`runner.ts`) and their wire protocol, provider layers, and composition over public session APIs. Nothing below may depend on it.
 
 ## Code Invariants
 

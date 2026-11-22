@@ -19,6 +19,8 @@ macro_rules! case {
 mod lifecycle;
 #[path = "bridge/manager.rs"]
 mod manager;
+#[path = "bridge/sessions.rs"]
+mod sessions;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -26,10 +28,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axo::{EnabledExtension, EnvMap, ProcessSupervisor, Supervision};
+use axo::{Axo, EnabledExtension, EnvMap, JsonlStore, ProcessSupervisor};
 use axo_ai::{
     AssistantEvent, FileCredentialStore, Message, Model, Models, ModelsConfig, ModelsOptions,
-    SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
+    ScriptedApi, ScriptedTurn, SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
 };
 use axo_extensions::{ExtensionOptions, ExtensionPhase, ExtensionStatus, Extensions};
 use futures::StreamExt;
@@ -69,8 +71,11 @@ fn main() -> ExitCode {
             }
         }
     }
-    let groups: [(&str, &[Case]); 2] =
-        [("manager", manager::CASES), ("lifecycle", lifecycle::CASES)];
+    let groups: [(&str, &[Case]); 3] = [
+        ("manager", manager::CASES),
+        ("lifecycle", lifecycle::CASES),
+        ("sessions", sessions::CASES),
+    ];
     let mut ran = 0;
     for (group, cases) in groups {
         for (name, case) in cases {
@@ -152,17 +157,22 @@ pub struct Host {
     pub dir: tempfile::TempDir,
     pub models: Arc<Models>,
     pub store: Arc<FileCredentialStore>,
+    pub axo: Axo,
     pub supervisor: Arc<ProcessSupervisor>,
 }
 
 impl Host {
     pub async fn new() -> Self {
+        Self::scripted(Vec::new()).await
+    }
+
+    pub async fn scripted(turns: Vec<ScriptedTurn>) -> Self {
         // Under /tmp: the per-generation socket path must stay below the Unix limit.
         let dir = tempfile::Builder::new()
             .prefix("axb")
             .tempdir_in("/tmp")
             .unwrap();
-        for sub in ["root", "root2", "data", "run", "ctl"] {
+        for sub in ["root", "root2", "data", "run", "ctl", "work"] {
             std::fs::create_dir(dir.path().join(sub)).unwrap();
         }
         let store = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
@@ -177,11 +187,22 @@ impl Host {
             .await
             .unwrap(),
         );
+        if !turns.is_empty() {
+            register_native(&models, "test", "http://127.0.0.1:9/v1");
+        }
+        let axo = Axo::builder(
+            models.clone(),
+            Arc::new(JsonlStore::new(dir.path().join("sessions"))),
+        )
+        .streamer(Arc::new(ScriptedApi::new(turns)))
+        .build();
+        let supervisor = axo.supervisor();
         Host {
             dir,
             models,
             store,
-            supervisor: ProcessSupervisor::new(Supervision::ProcessGroup),
+            axo,
+            supervisor,
         }
     }
 
@@ -508,10 +529,15 @@ mod fake {
     /// - `ctl/<ext>/refresh`: `ok` (access `refreshed`) | `hang` | `exit`.
     /// - `ctl/<ext>/rewrite`: `ok` (path `/rewritten`, header `x-rewritten: yes`, body
     ///   `rewritten: true`) | `hang` | `exit` | `fail` (code "failed").
+    /// - `ctl/<ext>/tool`: `ok` (parented partial update, then echo) | `state` (unparented
+    ///   appendCustom and custom, then report the stored value) | `hang` | `exit` | `fail`.
+    /// - `ctl/<ext>/policyBefore` and `ctl/<ext>/spawn`: `ok` | `block` (reason "no").
+    /// - `command` posts a quiet `lab` message, `event` records the journal type,
+    ///   and `schemeResolve` and `schemeRead` serve a virtual resource.
     /// - Any method: `late` waits for `ctl/<ext>/release`, then replies as `ok` even if the
     ///   host canceled the call meanwhile.
     ///
-    /// Records: `ctl/pids` (one line per start), `ctl/<ext>/calls`, `ctl/<ext>/canceled`.
+    /// Records: `ctl/pids`, and `ctl/<ext>/{calls,canceled,entries}`, one line per event.
     pub fn runner() -> ExitCode {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -560,7 +586,7 @@ mod fake {
         let (mut reader, mut writer) = stream.into_split();
         let (out, mut queue) = mpsc::unbounded_channel::<Value>();
         let hello =
-            json!({"type": "hello", "protocol": 1, "nonce": nonce, "generation": generation});
+            json!({"type": "hello", "protocol": 2, "nonce": nonce, "generation": generation});
         write_frame(&mut writer, &hello).await;
         tokio::spawn(async move {
             while let Some(frame) = queue.recv().await {
@@ -646,8 +672,8 @@ mod fake {
             let _ = self.out.send(frame);
         }
 
-        /// A runner -> host login callback under the live login `parent`.
-        async fn ask(&self, ext: &str, parent: &str, method: &str, args: Value) -> Reply {
+        /// A runner -> host callback, with a parent for login and tool updates only.
+        async fn ask(&self, ext: &str, parent: Option<&str>, method: &str, args: Value) -> Reply {
             let id = {
                 let mut next = self.next.lock().unwrap();
                 *next += 1;
@@ -655,7 +681,12 @@ mod fake {
             };
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(id.clone(), tx);
-            self.send(json!({"type": "call", "id": id, "ext": ext, "method": method, "args": args, "parent": parent}));
+            let mut frame =
+                json!({"type": "call", "id": id, "ext": ext, "method": method, "args": args});
+            if let Some(parent) = parent {
+                frame["parent"] = parent.into();
+            }
+            self.send(frame);
             rx.await.unwrap_or_else(|_| Err("dropped".into()))
         }
 
@@ -691,25 +722,25 @@ mod fake {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64;
+            let fail = |error: String| ("failed".to_owned(), error);
             match method {
                 "activate" => Ok(Value::Null),
                 "login" => {
-                    let fail = |error: String| ("failed".to_owned(), error);
                     self.ask(
                         ext,
-                        id,
+                        Some(id),
                         "openUrl",
                         json!({"url": "https://login.test/authorize"}),
                     )
                     .await
                     .map_err(fail)?;
-                    self.ask(ext, id, "progress", json!({"message": "waiting"}))
+                    self.ask(ext, Some(id), "progress", json!({"message": "waiting"}))
                         .await
                         .map_err(fail)?;
                     let answer = self
                         .ask(
                             ext,
-                            id,
+                            Some(id),
                             "prompt",
                             json!({"message": "code", "secret": false}),
                         )
@@ -742,6 +773,66 @@ mod fake {
                     request["body"]["rewritten"] = true.into();
                     Ok(request)
                 }
+                "tool" => {
+                    let text =
+                        if script == "state" {
+                            self.ask(ext, None, "appendCustom", json!({
+                            "session": args["session"], "customType": "lab", "data": {"n": 1},
+                        })).await.map_err(fail)?;
+                            self.ask(
+                                ext,
+                                None,
+                                "custom",
+                                json!({
+                                    "session": args["session"], "customType": "lab",
+                                }),
+                            )
+                            .await
+                            .map_err(fail)?
+                            .to_string()
+                        } else {
+                            self.ask(
+                                ext,
+                                Some(id),
+                                "update",
+                                json!({
+                                    "content": [{"type": "text", "text": "partial"}],
+                                }),
+                            )
+                            .await
+                            .map_err(fail)?;
+                            format!(
+                                "ext:{}:{}",
+                                args["tool"].as_str().unwrap(),
+                                args["call"]["arguments"]
+                            )
+                        };
+                    Ok(json!({"content": [{"type": "text", "text": text}]}))
+                }
+                "policyBefore" if script == "block" => Ok(json!({"block": true, "reason": "no"})),
+                "spawn" if script == "block" => Ok(json!({"block": "no"})),
+                "policyBefore" | "policyAfter" | "spawn" => Ok(Value::Null),
+                "command" => self
+                    .ask(
+                        ext,
+                        None,
+                        "post",
+                        json!({
+                            "session": args["session"], "customType": "lab", "text": args["args"],
+                            "display": true, "delivery": "quiet",
+                        }),
+                    )
+                    .await
+                    .map_err(fail),
+                "event" => {
+                    append(
+                        &self.control.join(ext).join("entries"),
+                        args["entry"]["entry"]["type"].as_str().unwrap(),
+                    );
+                    Ok(Value::Null)
+                }
+                "schemeResolve" => Ok(json!("virtual")),
+                "schemeRead" => Ok(json!(format!("read:{}", args["path"].as_str().unwrap()))),
                 other => Err(("unsupported".into(), format!("unknown method {other}"))),
             }
         }

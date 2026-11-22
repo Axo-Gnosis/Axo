@@ -2,4 +2,4 @@
 // `bunfig.toml` disables auto-install, so this import must fail without fetching anything.
 import { missing } from "axo-lab-missing-dependency";
 
-export default () => missing;
+export default () => ({ providers: missing });

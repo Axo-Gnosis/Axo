@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::ExtensionOptions;
-use crate::peer::{HANDSHAKE, Peer};
+use crate::peer::{Actions, HANDSHAKE, Peer};
 
 const RUNNER: &str = include_str!("runner.ts");
 /// Disables Bun's implicit package installation for anything the runner imports.
@@ -60,12 +60,15 @@ pub struct Generation {
 
 impl Generation {
     /// Spawns the runner for `generation` and completes its hello within the
-    /// handshake deadline. Cancelling the future leaves nothing behind.
+    /// handshake deadline; `actions` serves the runner's session actions for the extensions
+    /// `members` names. Cancelling the future leaves nothing behind.
     pub async fn start(
         options: &ExtensionOptions,
         supervisor: &ProcessSupervisor,
         generation: u64,
         stop: &CancellationToken,
+        actions: &Arc<dyn Actions>,
+        members: &Arc<[String]>,
     ) -> Result<Generation, StartError> {
         let bun = usable_bun(options.bun.as_deref())
             .await
@@ -124,7 +127,7 @@ impl Generation {
                 .accept()
                 .await
                 .map_err(|err| format!("extension socket accept failed: {err}"))?;
-            Peer::connect(stream, generation, &nonce).await
+            Peer::connect(stream, generation, &nonce, members.clone(), actions.clone()).await
         };
         let outcome = tokio::select! {
             outcome = tokio::time::timeout(HANDSHAKE, handshake) => match outcome {

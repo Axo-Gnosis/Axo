@@ -1,16 +1,21 @@
 //! axo's extension bridge: trusted TS/JS packages contribute providers to an `axo_ai::Models`
-//! registry through supervised Bun runners.
+//! registry and capabilities to sessions through supervised Bun runners.
 //!
 //! [`Extensions`] owns one [`ProviderLayer`] and one lifecycle owner per placement (a
 //! dedicated extension or a named group). Declarations are read statically from each enabled
-//! package's `extension.json`; a runner starts only when a callback is first needed.
+//! package's `extension.json`; a runner starts only when a callback is first needed. Hosts
+//! layer extensions into sessions with [`Extensions::compose`] and [`Extensions::attach`].
 
 mod manifest;
 mod peer;
 mod placement;
 mod process;
 mod proxy;
+mod remote;
+mod session;
 mod wire_value;
+
+pub use remote::Failure;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,7 +32,9 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{Descriptor, Member};
+use crate::peer::Actions;
 use crate::placement::Placement;
+use crate::session::Contribution;
 
 const EVENT_CAPACITY: usize = 256;
 
@@ -107,6 +114,11 @@ pub enum ExtensionEvent {
         hidden: Hidden,
     },
     Diagnostic(ExtensionDiagnostic),
+    /// A composition finding for one attached session; see `Extensions::session_diagnostics`.
+    SessionDiagnostic {
+        session: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -134,7 +146,7 @@ struct Inner {
     layer: ProviderLayer,
     supervisor: Arc<ProcessSupervisor>,
     options: ExtensionOptions,
-    /// Serializes `configure`, `retry`, `reload` and `shutdown`.
+    /// Serializes configuration changes and attachment so their live applies cannot cross.
     config: tokio::sync::Mutex<()>,
     /// Never held across an await.
     state: Mutex<State>,
@@ -143,13 +155,16 @@ struct Inner {
     events: broadcast::Sender<ExtensionEvent>,
     /// The next placement serial; reports carry it so a replaced placement cannot write.
     serials: AtomicU64,
+    /// Attached sessions; every placement serves their session actions.
+    sessions: Arc<session::Registry>,
 }
 
 #[derive(Default)]
 struct State {
     enabled: Vec<EnabledExtension>,
-    /// Last accepted declarations per enabled extension, kept through failed rescans.
-    accepted: HashMap<String, Member>,
+    /// Last accepted declarations per enabled extension, kept through failed rescans so a
+    /// broken package keeps its surfaces (failing closed) instead of losing them.
+    accepted: HashMap<String, (Member, Arc<Contribution>)>,
     /// Statuses not owned by a placement (not admitted, or admitted but unable to run).
     overrides: HashMap<String, ExtensionStatus>,
     diagnostics: Vec<ExtensionDiagnostic>,
@@ -161,6 +176,8 @@ struct State {
     last: HashMap<String, (u64, ExtensionStatus)>,
     /// The published winner per provider ID.
     bindings: BTreeMap<String, Binding>,
+    /// Every admitted extension's session contribution, runnable or not, in enabled order.
+    contributions: Vec<Arc<Contribution>>,
 }
 
 impl State {
@@ -252,6 +269,7 @@ impl Extensions {
                 closed: CancellationToken::new(),
                 events,
                 serials: AtomicU64::new(1),
+                sessions: Arc::default(),
             }),
         }
     }
@@ -306,7 +324,8 @@ impl Extensions {
         run(inner.reconcile(None, Some(Rearm::Reload(id.to_owned())))).await
     }
 
-    /// Closes admission, fails pending calls, kills and reaps every runner and removes this
+    /// Closes admission, restores every attached session to its host registrations and stops
+    /// tracking it, fails pending calls, kills and reaps every runner and removes this
     /// manager's providers. Idempotent.
     pub async fn shutdown(&self) {
         self.inner.closed.cancel();
@@ -427,18 +446,31 @@ impl Inner {
         let mut diagnostics = Vec::new();
         // Admitted extensions: declarations, and why they cannot run (if they cannot).
         let mut usable: HashMap<&str, (Member, Option<String>)> = HashMap::new();
+        let mut contributions = Vec::new();
         for (ext, result) in enabled.iter().zip(found) {
-            let (member, problem) = match result {
-                Ok((member, entry, found)) => {
-                    diagnostics.extend(found.into_iter().map(|message| ExtensionDiagnostic {
-                        id: ext.id.clone(),
-                        message,
+            let (member, contribution, problem) = match result {
+                Ok(found) => {
+                    diagnostics.extend(found.diagnostics.into_iter().map(|message| {
+                        ExtensionDiagnostic {
+                            id: ext.id.clone(),
+                            message,
+                        }
                     }));
-                    (member, entry)
+                    let contribution = Arc::new(Contribution {
+                        ext: ext.id.clone(),
+                        decl: found.member.session.clone(),
+                        sections: found.sections,
+                        agents: found.agents,
+                        modes: found.modes,
+                        keywords: found.keywords,
+                    });
+                    (found.member, contribution, found.entry_error)
                 }
-                // A failed rescan keeps the last accepted claims, unavailable.
+                // A failed rescan keeps the last accepted claims and contribution, unavailable.
                 Err(error) => match accepted.get(&ext.id) {
-                    Some(member) => (member.clone(), Some(error)),
+                    Some((member, contribution)) => {
+                        (member.clone(), Arc::clone(contribution), Some(error))
+                    }
                     None => {
                         overrides.insert(ext.id.clone(), unavailable(ext, error));
                         continue;
@@ -449,9 +481,11 @@ impl Inner {
             if let Some(problem) = &problem {
                 overrides.insert(ext.id.clone(), unavailable(ext, problem.clone()));
             }
-            accepted_next.insert(ext.id.clone(), member.clone());
+            accepted_next.insert(ext.id.clone(), (member.clone(), Arc::clone(&contribution)));
+            contributions.push(contribution);
             usable.insert(&ext.id, (member, problem));
         }
+        diagnostics.extend(session::collisions(&contributions));
 
         // Placements: runnable members grouped in enabled order, shadowed ones included.
         let mut wanted: Vec<(Key, Option<String>, Vec<Member>)> = Vec::new();
@@ -504,6 +538,7 @@ impl Inner {
                 self.options.clone(),
                 Arc::clone(&self.supervisor),
                 reporter(Arc::downgrade(&self), serial),
+                Arc::clone(&self.sessions) as Arc<dyn Actions>,
             );
             if let Some(old) = old
                 && (forced_here || same)
@@ -636,7 +671,7 @@ impl Inner {
 
         // Commit: fence displaced winners, publish the whole set at once, and emit what
         // changed, all under the state lock reports take, then reap outside it.
-        let retired = {
+        let (retired, unchanged) = {
             let mut state = self.lock();
             let state = &mut *state;
             let before = state.statuses();
@@ -685,6 +720,8 @@ impl Inner {
             state.placements = placements;
             state.member_of = member_of;
             state.bindings = bindings;
+            let unchanged = session::same_layer(&state.contributions, &contributions);
+            state.contributions = contributions;
             let old_collisions = std::mem::replace(&mut state.collisions, collisions);
             let old_diagnostics = std::mem::replace(&mut state.diagnostics, diagnostics);
 
@@ -709,10 +746,14 @@ impl Inner {
                         .send(ExtensionEvent::Diagnostic(diagnostic.clone()));
                 }
             }
-            retired
+            (retired, unchanged)
         };
         for (placement, order) in reordered {
             placement.reorder(&order);
+        }
+        // Handlers resolve their runner per call: unchanged declarations need no reapply.
+        if !unchanged {
+            session::reapply(&self).await;
         }
         join_all(retired.iter().map(|p| p.shutdown())).await;
         Ok(())
@@ -721,6 +762,9 @@ impl Inner {
     async fn teardown(self: Arc<Self>) -> Result<(), BridgeError> {
         let _config = self.config.lock().await;
         let state = std::mem::take(&mut *self.lock());
+        // With no contributions left, this restores every session to its host registrations.
+        session::reapply(&self).await;
+        self.sessions.clear();
         join_all(state.placements.values().map(|p| p.placement.shutdown())).await;
         drop(state);
         self.layer.replace(Vec::new())?;

@@ -129,7 +129,7 @@ const activate: Extension = ({ id, dataDir }) => {
     };
   }
 
-  return { [key]: { login, refresh, rewrite } };
+  return { providers: { [key]: { login, refresh, rewrite } } };
 };
 
 export default activate;

@@ -1,11 +1,17 @@
 //! Static discovery: read an enabled extension's `extension.json` without running it.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
+use axo::context::agents::{AgentDef, load_agents};
+use axo::context::keywords::load_keywords;
+use axo::context::modes::load_modes;
+use axo::{AgentSpec, KeywordSpec, ModeSpec};
 use axo_ai::{Model, Provider};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const MANIFEST: &str = "extension.json";
 
@@ -17,6 +23,8 @@ pub struct Member {
     /// only for comparison across rescans.
     pub entry: PathBuf,
     pub providers: Vec<Descriptor>,
+    /// What the runner binds handlers for; sent with `activate`.
+    pub session: SessionDecl,
 }
 
 /// One provider an extension declares.
@@ -54,24 +62,150 @@ impl Descriptor {
     }
 }
 
+/// The session capabilities an extension declares; its handlers bind at activation.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDecl {
+    pub tools: Vec<ToolDecl>,
+    pub schemes: Vec<SchemeDecl>,
+    pub commands: Vec<CommandDecl>,
+    /// The policy hooks the extension's handler defines; empty means no policy.
+    pub tool_policy: Vec<PolicyHook>,
+    pub spawn_hook: bool,
+    pub events: bool,
+}
+
+/// One hook of an extension's tool policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PolicyHook {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolDecl {
+    pub name: String,
+    pub description: String,
+    /// A JSON Schema object (`"type": "object"`).
+    pub parameters: Value,
+    #[serde(default)]
+    pub exposure: Exposure,
+    #[serde(default)]
+    pub replay: Replay,
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub guidelines: Vec<Cow<'static, str>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Exposure {
+    #[default]
+    Direct,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Replay {
+    #[default]
+    Never,
+    Safe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionMode {
+    #[default]
+    Parallel,
+    Sequential,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SchemeDecl {
+    pub name: String,
+    #[serde(default)]
+    pub prompt_doc: String,
+    #[serde(default)]
+    pub write_replay: Replay,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandDecl {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+}
+
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SectionDecl {
+    name: String,
+    file: String,
+}
+
+/// Package-relative directories of agent, mode and keyword definitions.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionDirs {
+    agents: Option<String>,
+    modes: Option<String>,
+    keywords: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
     id: String,
     entry: String,
+    #[serde(default)]
     providers: Vec<Descriptor>,
+    #[serde(default)]
+    tools: Vec<ToolDecl>,
+    #[serde(default)]
+    schemes: Vec<SchemeDecl>,
+    #[serde(default)]
+    commands: Vec<CommandDecl>,
+    #[serde(default)]
+    sections: Vec<SectionDecl>,
+    #[serde(default)]
+    definitions: DefinitionDirs,
+    #[serde(default)]
+    tool_policy: Vec<PolicyHook>,
+    #[serde(default)]
+    spawn_hook: bool,
+    #[serde(default)]
+    events: bool,
+}
+
+/// An admitted package. Sections and definitions never reach the runner, so they stay
+/// outside [`Member`].
+#[derive(Debug)]
+pub struct Discovered {
+    pub member: Member,
+    /// Why the entry cannot load; the declarations stay usable.
+    pub entry_error: Option<String>,
+    /// Ignored duplicate manifests in later roots and definition-loader findings.
+    pub diagnostics: Vec<String>,
+    /// `(name, body)` in declaration order.
+    pub sections: Vec<(String, String)>,
+    pub agents: Vec<AgentSpec>,
+    pub modes: Vec<ModeSpec>,
+    pub keywords: Vec<KeywordSpec>,
 }
 
 /// Reads `<root>/<id>/extension.json` from the first root that has one.
 ///
 /// `Err` means the package is not admitted (no manifest, unreadable or invalid
-/// declarations). `Ok((member, entry_error, diagnostics))`: `entry_error` says why the
-/// entry cannot load (the catalog stays usable); `diagnostics` name ignored duplicate
-/// manifests in later roots. `id` must already be a valid extension ID.
-pub async fn discover(
-    id: &str,
-    roots: &[PathBuf],
-) -> Result<(Member, Option<String>, Vec<String>), String> {
+/// declarations, unreadable section files or definition directories). `id` must already
+/// be a valid extension ID.
+pub async fn discover(id: &str, roots: &[PathBuf]) -> Result<Discovered, String> {
     let mut chosen: Option<PathBuf> = None;
     let mut diagnostics = Vec::new();
     for root in roots {
@@ -118,7 +252,65 @@ pub async fn discover(
             .validate()
             .map_err(|error| fail(error.to_string()))?;
     }
+    validate_session(&manifest).map_err(fail)?;
+
     let package = path.parent().expect("manifest has a directory");
+    let mut sections = Vec::with_capacity(manifest.sections.len());
+    for section in &manifest.sections {
+        let what = |why: String| {
+            fail(format!(
+                "section {:?} file {:?} {why}",
+                section.name, section.file
+            ))
+        };
+        let file = resolve_inside(package, &section.file).await.map_err(what)?;
+        let body = tokio::fs::read_to_string(&file)
+            .await
+            .map_err(|error| what(format!("cannot be read: {error}")))?;
+        sections.push((section.name.clone(), body));
+    }
+    let dirs = &manifest.definitions;
+    let definition_dir = async |kind: &str, dir: &Option<String>| match dir {
+        None => Ok(Vec::new()),
+        Some(dir) => {
+            let what = |why: String| fail(format!("{kind} directory {dir:?} {why}"));
+            let resolved = resolve_inside(package, dir).await.map_err(what)?;
+            match tokio::fs::metadata(&resolved).await {
+                Ok(metadata) if metadata.is_dir() => Ok(vec![resolved]),
+                Ok(_) => Err(what("is not a directory".into())),
+                Err(error) => Err(what(format!("cannot be read: {error}"))),
+            }
+        }
+    };
+    let agent_dirs = definition_dir("agents", &dirs.agents).await?;
+    let mode_dirs = definition_dir("modes", &dirs.modes).await?;
+    let keyword_dirs = definition_dir("keywords", &dirs.keywords).await?;
+    let (agents, modes, keywords) = tokio::task::spawn_blocking(move || {
+        (
+            load_agents(&agent_dirs, &[]),
+            load_modes(&mode_dirs, &[]),
+            load_keywords(&keyword_dirs, &[]),
+        )
+    })
+    .await
+    .map_err(|error| fail(format!("cannot load definitions: {error}")))?;
+    let loaded = agents.1.iter().chain(&modes.1).chain(&keywords.1);
+    diagnostics.extend(loaded.map(|diagnostic| format!("extension {id}: {diagnostic}")));
+    let agents = agents
+        .0
+        .into_iter()
+        .filter_map(|definition| match definition {
+            AgentDef::Agent(spec) => Some(spec),
+            AgentDef::Team(team) => {
+                diagnostics.push(format!(
+                    "extension {id}: team \"{}\" ignored; extensions contribute agents, not teams",
+                    team.name
+                ));
+                None
+            }
+        })
+        .collect();
+
     let (entry, entry_error) = match resolve_entry(package, &manifest.entry).await {
         Ok(entry) => (entry, None),
         Err(why) => (
@@ -126,23 +318,99 @@ pub async fn discover(
             Some(format!("extension {id}: entry {:?} {why}", manifest.entry)),
         ),
     };
-    Ok((
-        Member {
+    Ok(Discovered {
+        member: Member {
             id: manifest.id,
             entry,
             providers: manifest.providers,
+            session: SessionDecl {
+                tools: manifest.tools,
+                schemes: manifest.schemes,
+                commands: manifest.commands,
+                tool_policy: manifest.tool_policy,
+                spawn_hook: manifest.spawn_hook,
+                events: manifest.events,
+            },
         },
         entry_error,
         diagnostics,
-    ))
+        sections,
+        agents,
+        modes: modes.0,
+        keywords: keywords.0,
+    })
 }
 
-/// A package-relative regular file that resolves inside the package. The package
-/// directory itself may be a host-made link; the entry may not escape it.
-async fn resolve_entry(package: &Path, entry: &str) -> Result<PathBuf, String> {
-    let relative = Path::new(entry);
-    if entry.is_empty()
-        || !relative
+/// Names and shapes the session declarations must have to be admitted.
+fn validate_session(manifest: &Manifest) -> Result<(), String> {
+    fn unique<'a>(kind: &str, names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for name in names {
+            if !seen.insert(name) {
+                return Err(format!("duplicate {kind} {name:?}"));
+            }
+        }
+        Ok(())
+    }
+    unique("tool", manifest.tools.iter().map(|t| t.name.as_str()))?;
+    unique("scheme", manifest.schemes.iter().map(|s| s.name.as_str()))?;
+    unique("command", manifest.commands.iter().map(|c| c.name.as_str()))?;
+    unique("section", manifest.sections.iter().map(|s| s.name.as_str()))?;
+    let hooks = &manifest.tool_policy;
+    if (1..hooks.len()).any(|i| hooks[..i].contains(&hooks[i])) {
+        return Err("duplicate toolPolicy hook".into());
+    }
+    for tool in &manifest.tools {
+        let name = &tool.name;
+        let valid = (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid {
+            return Err(format!("tool name {name:?} is invalid"));
+        }
+        if matches!(name.as_str(), "call" | "yield") {
+            return Err(format!("tool \"{name}\" is reserved"));
+        }
+        if tool.parameters.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(format!(
+                "tool \"{name}\" parameters must be an object schema with \"type\": \"object\""
+            ));
+        }
+    }
+    if let Some(scheme) = manifest
+        .schemes
+        .iter()
+        .find(|scheme| !axo::valid_scheme_name(&scheme.name))
+    {
+        return Err(format!(
+            "scheme name {:?} is invalid or reserved",
+            scheme.name
+        ));
+    }
+    if let Some(command) = manifest
+        .commands
+        .iter()
+        .find(|command| !axo::valid_command_name(&command.name))
+    {
+        return Err(format!("command name {:?} is invalid", command.name));
+    }
+    if let Some(section) = manifest
+        .sections
+        .iter()
+        .find(|section| !axo::valid_section_name(&section.name))
+    {
+        return Err(format!("section name {:?} is invalid", section.name));
+    }
+    Ok(())
+}
+
+/// A package-relative path that resolves inside the package. The package directory
+/// itself may be a host-made link; the path may not escape it.
+async fn resolve_inside(package: &Path, relative: &str) -> Result<PathBuf, String> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || !path
             .components()
             .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
     {
@@ -151,12 +419,18 @@ async fn resolve_entry(package: &Path, entry: &str) -> Result<PathBuf, String> {
     let package = tokio::fs::canonicalize(package)
         .await
         .map_err(|error| format!("cannot be resolved: {error}"))?;
-    let resolved = tokio::fs::canonicalize(package.join(relative))
+    let resolved = tokio::fs::canonicalize(package.join(path))
         .await
         .map_err(|error| format!("cannot be resolved: {error}"))?;
     if !resolved.starts_with(&package) {
         return Err("resolves outside the package".into());
     }
+    Ok(resolved)
+}
+
+/// A package-relative regular file that resolves inside the package.
+async fn resolve_entry(package: &Path, entry: &str) -> Result<PathBuf, String> {
+    let resolved = resolve_inside(package, entry).await?;
     check_entry(&resolved).await?;
     Ok(resolved)
 }
@@ -234,7 +508,12 @@ mod tests {
             &declare("lab-provider", "other.ts", json!([])),
             Some("other.ts"),
         );
-        let (member, entry_error, diagnostics) = discover("lab-provider", &roots).await.unwrap();
+        let Discovered {
+            member,
+            entry_error,
+            diagnostics,
+            ..
+        } = discover("lab-provider", &roots).await.unwrap();
         assert_eq!(member.id, "lab-provider");
         assert_eq!(member.entry, dir.join("index.ts"));
         assert_eq!(entry_error, None);
@@ -261,7 +540,12 @@ mod tests {
 
         let defaults = declare("plain", "index.ts", json!([{ "id": "plain" }]));
         package(&second, "plain", &defaults, Some("index.ts"));
-        let (member, _, diagnostics) = discover("plain", &roots).await.unwrap();
+        let Discovered {
+            member,
+            diagnostics,
+            ..
+        } = discover("plain", &roots).await.unwrap();
+        assert_eq!(member.session, SessionDecl::default());
         assert!(diagnostics.is_empty());
         assert_eq!(
             (
@@ -332,7 +616,11 @@ mod tests {
         // Admitted with an entry error: the catalog stays usable.
         let entry_error = async |id: &str, entry: &str, what: &str| {
             package(&first, id, &declare(id, entry, json!([{ "id": id }])), None);
-            let (member, error, _) = discover(id, &roots).await.unwrap();
+            let Discovered {
+                member,
+                entry_error: error,
+                ..
+            } = discover(id, &roots).await.unwrap();
             assert_eq!(member.providers.len(), 1);
             let error = error.unwrap_or_else(|| panic!("{id}: entry accepted"));
             assert!(error.contains(what), "{error} lacks {what}");
@@ -358,8 +646,140 @@ mod tests {
             Some("index.ts"),
         );
         std::os::unix::fs::symlink(&target, first.join("linked")).unwrap();
-        let (member, error, _) = discover("linked", &roots).await.unwrap();
+        let Discovered {
+            member,
+            entry_error: error,
+            ..
+        } = discover("linked", &roots).await.unwrap();
         assert_eq!(error, None);
         assert_eq!(member.entry, target.join("index.ts"));
+    }
+
+    #[tokio::test]
+    async fn session_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let roots = [root.clone()];
+        let base = |id: &str| json!({ "id": id, "entry": "index.ts" });
+
+        // Every key, with and without its defaults; `providers` may be omitted.
+        let mut manifest = base("lab");
+        manifest.as_object_mut().unwrap().extend(
+            json!({
+                "tools": [
+                    { "name": "read", "description": "Reads", "parameters": { "type": "object" } },
+                    { "name": "probe", "description": "Probes", "parameters": { "type": "object" },
+                      "exposure": "deferred", "replay": "safe", "executionMode": "sequential",
+                      "guidelines": ["Probe first"] },
+                ],
+                "schemes": [{ "name": "lab" }, { "name": "notes", "promptDoc": "Notes", "writeReplay": "safe" }],
+                "commands": [{ "name": "hello", "description": "Greets", "argumentHint": "<who>" }],
+                "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
+                "definitions": { "agents": "agents", "modes": "modes", "keywords": "keywords" },
+                "toolPolicy": ["before", "after"], "spawnHook": true, "events": true,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let dir = package(&root, "lab", &manifest, Some("index.ts"));
+        for sub in ["prompts", "agents", "modes", "keywords"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("prompts/rules.md"), "Be careful.").unwrap();
+        std::fs::write(
+            dir.join("agents/helper.md"),
+            "---\nname: helper\ndescription: Helps\n---\nHelp.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agents/crew.md"),
+            "---\nname: crew\ndescription: A crew\nmembers:\n  - agent: helper\n---\nWork.\n",
+        )
+        .unwrap();
+        let found = discover("lab", &roots).await.unwrap();
+        assert_eq!(found.entry_error, None);
+        let session = &found.member.session;
+        let [read, probe] = session.tools.as_slice() else {
+            panic!("two tools")
+        };
+        assert_eq!(
+            (read.exposure, read.replay, read.execution_mode),
+            (Exposure::Direct, Replay::Never, ExecutionMode::Parallel)
+        );
+        assert!(read.guidelines.is_empty());
+        assert_eq!(
+            (probe.exposure, probe.replay, probe.execution_mode),
+            (Exposure::Deferred, Replay::Safe, ExecutionMode::Sequential)
+        );
+        assert_eq!(
+            (
+                session.schemes[0].prompt_doc.as_str(),
+                session.schemes[0].write_replay
+            ),
+            ("", Replay::Never)
+        );
+        assert_eq!(session.schemes[1].write_replay, Replay::Safe);
+        assert_eq!(session.commands[0].argument_hint.as_deref(), Some("<who>"));
+        assert_eq!(session.tool_policy, [PolicyHook::Before, PolicyHook::After]);
+        assert!(session.spawn_hook && session.events);
+        assert_eq!(
+            found.sections,
+            [("lab_rules".to_owned(), "Be careful.".to_owned())]
+        );
+        let names: Vec<&str> = found.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["helper"]);
+        assert!(found.modes.is_empty() && found.keywords.is_empty());
+        assert!(
+            found
+                .diagnostics
+                .iter()
+                .any(|d| d.starts_with("extension lab: team \"crew\" ignored")),
+            "{:?}",
+            found.diagnostics
+        );
+        // The activation wire shape: camelCase, every declaration whole.
+        let wire = serde_json::to_value(session).unwrap();
+        assert_eq!(wire["tools"][1]["executionMode"], "sequential");
+        assert_eq!(wire["schemes"][1]["writeReplay"], "safe");
+        assert_eq!(wire["toolPolicy"], json!(["before", "after"]));
+
+        // Not admitted.
+        let not_admitted = async |id: &str, extra: Value, what: &str| {
+            let mut manifest = base(id);
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            package(&root, id, &manifest, Some("index.ts"));
+            let error = discover(id, &roots).await.unwrap_err();
+            assert!(error.contains(what), "{error} lacks {what}");
+        };
+        let tool = |name: &str| json!({ "name": name, "description": "d", "parameters": { "type": "object" } });
+        not_admitted(
+            "reserved",
+            json!({ "tools": [tool("yield")] }),
+            "tool \"yield\" is reserved",
+        )
+        .await;
+        not_admitted(
+            "dup-command",
+            json!({ "commands": [{ "name": "hi", "description": "a" }, { "name": "hi", "description": "b" }] }),
+            "duplicate command \"hi\"",
+        )
+        .await;
+        not_admitted(
+            "dup-policy",
+            json!({ "toolPolicy": ["after", "after"] }),
+            "duplicate toolPolicy hook",
+        )
+        .await;
+        std::fs::write(root.join("rules.md"), "outside").unwrap();
+        not_admitted(
+            "escape-section",
+            json!({ "sections": [{ "name": "rules", "file": "../rules.md" }] }),
+            "package-relative",
+        )
+        .await;
     }
 }

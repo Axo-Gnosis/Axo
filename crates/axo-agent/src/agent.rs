@@ -73,7 +73,7 @@ pub enum RunOutcome {
 pub struct Agent {
     pub(crate) streamer: Arc<dyn Streamer>,
     pub(crate) hooks: Arc<dyn LoopHooks>,
-    pub(crate) tool_hooks: Vec<Arc<dyn ToolHooks>>,
+    pub(crate) tool_hooks: Mutex<Arc<[Arc<dyn ToolHooks>]>>,
     pub(crate) persist: Option<Arc<dyn Persist>>,
     pub(crate) steering_mode: QueueMode,
     pub(crate) follow_up_mode: QueueMode,
@@ -121,7 +121,7 @@ impl Agent {
         Self {
             streamer: cfg.streamer,
             hooks: cfg.hooks,
-            tool_hooks: cfg.tool_hooks,
+            tool_hooks: Mutex::new(cfg.tool_hooks.into()),
             persist: cfg.persist,
             steering_mode: cfg.steering_mode,
             follow_up_mode: cfg.follow_up_mode,
@@ -147,6 +147,22 @@ impl Agent {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Replaces the tool hooks for hook passes that start after this returns.
+    pub fn set_tool_hooks(&self, hooks: Vec<Arc<dyn ToolHooks>>) {
+        *self
+            .tool_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hooks.into();
+    }
+
+    /// The current tool hooks; a pass iterates this snapshot without holding the lock.
+    pub(crate) fn tool_hooks(&self) -> Arc<[Arc<dyn ToolHooks>]> {
+        self.tool_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Registers a new run; `Error::Busy` if one is active. After `shutdown` the run

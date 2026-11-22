@@ -7,7 +7,7 @@
 //
 // Wire: each frame is a 4-byte unsigned big-endian length followed by that many bytes of
 // UTF-8 JSON, at most 64 MiB in either direction. The runner connects and sends
-//   {type:"hello",protocol:1,nonce,generation}
+//   {type:"hello",protocol:2,nonce,generation}
 // Every frame after that, both ways, carries `generation` (the same opaque string).
 //   {type:"call",id,ext,method,args,parent?}  id "h:<n>" from Rust, "r:<n>" from the runner
 //   {type:"ok",id,value} | {type:"error",id,code,message}  terminal reply to a call
@@ -15,14 +15,31 @@
 //   {type:"ping",id} -> {type:"pong",id}       Rust pings; the runner answers from its event loop.
 //                                              While the socket is blocked an unsent pong is
 //                                              replaced by the newest one; any pong proves liveness.
-// Rust -> runner methods: activate {entry,dataDir,providers:[{id,login,rewrite}]} -> null;
-// login {provider} -> Credential; refresh {provider,credential} -> Credential;
-// rewrite {provider,model,request} -> ProviderRequest.
-// Runner -> Rust methods (only with `parent` = a live login call of the same `ext`):
-// openUrl {url,instructions?} -> null; deviceCode {userCode,verificationUrl,expiresInSeconds?}
-// -> null; prompt {message,placeholder?,secret} -> string; select {message,options:[{id,label}]}
-// -> string; progress {message} -> null. A login replies only after every display/progress
-// callback it made was acknowledged; an error reply to one fails the login.
+// Rust -> runner methods:
+//   activate {entry,dataDir,providers:[{id,login,rewrite}],
+//             session:{tools:[{name,..}],schemes:[{name,..}],commands:[{name,..}],
+//                      toolPolicy:["before"|"after"],spawnHook,events}} -> null
+//   login {provider} -> Credential; refresh {provider,credential} -> Credential;
+//   rewrite {provider,model,request} -> ProviderRequest
+//   tool {tool,session,call:{id,name,arguments}} -> {content,details?,isError?,terminate?}
+//   policyBefore {scope,call} -> null | {block:true,reason?,terminate?}
+//   policyAfter {scope,call,result:{content,details?,isError}}
+//     -> null | {content?,details?,isError?,terminate?}
+//   spawn {session,spawn} -> null | {block} | {replace}
+//   schemeResolve {scheme,path,session:{id,dir,cwd}} -> "virtual" | {file,writable}
+//   schemeRead {scheme,path,session} -> string; schemeWrite {scheme,path,session,content} -> string
+//   command {command,session,args} -> null; event {session,entry} -> null
+// Runner -> Rust methods with `parent` = a live call of the same `ext`:
+//   under login: openUrl {url,instructions?} -> null; deviceCode {userCode,verificationUrl,
+//   expiresInSeconds?} -> null; prompt {message,placeholder?,secret} -> string;
+//   select {message,options:[{id,label}]} -> string; progress {message} -> null.
+//   under tool: update {content,details?} -> null.
+// A login replies only after every display/progress callback it made was acknowledged; an
+// error reply to one fails the login. A tool replies only after every update it sent was
+// answered; an error reply to an update is ignored.
+// Runner -> Rust session actions, without `parent`, valid while the session is attached:
+//   post {session,customType,text,display,delivery:"steer"|"followUp"|"quiet"} -> null;
+//   appendCustom {session,customType,data?} -> null; custom {session,customType} -> value|null.
 // Error codes the runner sends: "activation" (import/activation of that member failed; the
 // bridge disables only that member), "failed" (the author's method threw), "invalid" (bad
 // arguments, an invalid author return value, or a reply that is not JSON-serializable),
@@ -36,14 +53,28 @@
 import { connect } from "node:net";
 import { pathToFileURL } from "node:url";
 import type {
+  CommandHandler,
   Credential,
   Extension,
+  Handlers,
+  JsonValue,
   LoginInteraction,
   Model,
   ProviderRequest,
+  SchemeContext,
+  SchemeHandlers,
+  SessionHandle,
+  SpawnHook,
+  SpawnRequest,
+  ToolCall,
+  ToolHandler,
+  ToolPolicy,
+  ToolResult,
+  ToolRun,
+  ToolScope,
 } from "../../../packages/axo-extension-sdk/index.ts";
 
-const PROTOCOL = 1;
+const PROTOCOL = 2;
 const MAX_FRAME = 64 * 1024 * 1024;
 // Bytes held ahead of the socket before replies and callbacks wait for their turn.
 const QUEUE_LIMIT = MAX_FRAME;
@@ -245,13 +276,31 @@ socket.on("error", () => {
 
 // ---- Dispatch ----
 
-const HOST_METHODS: Record<string, true> = { activate: true, login: true, refresh: true, rewrite: true };
+const HOST_METHODS: Record<string, true> = {
+  activate: true,
+  login: true,
+  refresh: true,
+  rewrite: true,
+  tool: true,
+  policyBefore: true,
+  policyAfter: true,
+  spawn: true,
+  schemeResolve: true,
+  schemeRead: true,
+  schemeWrite: true,
+  command: true,
+  event: true,
+};
 const RUNNER_METHODS: Record<string, true> = {
   openUrl: true,
   deviceCode: true,
   prompt: true,
   select: true,
   progress: true,
+  update: true,
+  post: true,
+  appendCustom: true,
+  custom: true,
 };
 
 interface Call {
@@ -265,6 +314,10 @@ const calls = new Map<string, Call>();
 /** Live runner callbacks by ID. */
 const pending = new Map<string, { resolve(value: unknown): void; reject(error: Error): void }>();
 let nextId = 0n;
+/** Live runner calls Rust has not answered: half of peer.rs `MAX_CALLBACKS`, whose overflow ends the generation. */
+const MAX_HOST_CALLS = 128;
+/** Calls waiting for a slot under `MAX_HOST_CALLS`, started in order. */
+const queuedHostCalls: (() => void)[] = [];
 
 function onFrame(frame: Frame): void {
   if (frame.generation !== generation) violation("wrong generation");
@@ -335,21 +388,37 @@ function errorReply(id: string, error: unknown, method: string): Frame {
 
 // ---- Rust -> runner methods ----
 
-interface Active {
+interface Provider {
   login?: (ui: LoginInteraction, signal: AbortSignal) => Promise<Credential>;
   refresh?: (credential: Credential, signal: AbortSignal) => Promise<Credential>;
   rewrite?: (model: Readonly<Model>, request: ProviderRequest, signal: AbortSignal) => Promise<ProviderRequest>;
 }
 
-/** Activated extensions: provider ID -> bound handlers. */
-const extensions = new Map<string, Map<string, Active>>();
+/** A tool policy hook the manifest declares. */
+type PolicyHook = "before" | "after";
+
+/** One activated extension's bound handlers, exactly as its activate call declared them. */
+interface Active {
+  providers: Map<string, Provider>;
+  tools: Map<string, ToolHandler>;
+  schemes: Map<string, SchemeHandlers>;
+  commands: Map<string, CommandHandler>;
+  toolPolicy?: ToolPolicy;
+  spawnHook?: SpawnHook;
+  onEntry?: NonNullable<Handlers["onEntry"]>;
+}
+
+/** Activated extensions by ID. */
+const extensions = new Map<string, Active>();
 const activating = new Set<string>();
 
+function isRecord(value: unknown): value is Frame {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function record(value: unknown, what: string): Frame {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Fail("invalid", `${what} is not an object`);
-  }
-  return value as Frame;
+  if (!isRecord(value)) throw new Fail("invalid", `${what} is not an object`);
+  return value;
 }
 
 function text(value: unknown, what: string): string {
@@ -360,16 +429,102 @@ function text(value: unknown, what: string): string {
 async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
   // `method` is one of HOST_METHODS, so labels stay fixed strings; Rust names the owner.
   const { ext, method, controller } = call;
-  const args = record(rawArgs, `${method} args`);
-  if (method === "activate") return activate(ext, args, controller.signal);
-  if (typeof args.provider !== "string") throw new Fail("invalid", `${method} provider is not a string`);
-  const handlers = extensions.get(ext)?.get(args.provider);
   const signal = controller.signal;
+  const args = record(rawArgs, `${method} args`);
+  if (method === "activate") return activate(ext, args, signal);
+  const active = extensions.get(ext);
+  switch (method) {
+    case "login":
+    case "refresh":
+    case "rewrite":
+      return provider(id, call, active, args);
+    case "tool": {
+      const handler = active?.tools.get(text(args.tool, "tool name"));
+      if (!handler) throw new Fail("unsupported", "no tool handler");
+      return tool(id, call, handler, args);
+    }
+    case "policyBefore": {
+      const before = active?.toolPolicy?.before;
+      if (!before) throw new Fail("unsupported", "no tool policy handler");
+      const scope = freeze(record(args.scope, "policyBefore scope")) as unknown as ToolScope;
+      const value = await before(scope, toolCall(args.call, "policyBefore call"), signal);
+      return decision(value, method, { block: "true", reason: "string?", terminate: "boolean?" });
+    }
+    case "policyAfter": {
+      const after = active?.toolPolicy?.after;
+      if (!after) throw new Fail("unsupported", "no tool policy handler");
+      const scope = freeze(record(args.scope, "policyAfter scope")) as unknown as ToolScope;
+      const result = record(args.result, "policyAfter result") as unknown as Parameters<typeof after>[2];
+      const value = await after(scope, toolCall(args.call, "policyAfter call"), result, signal);
+      return decision(value, method, {
+        content: "array?",
+        details: "any?",
+        isError: "boolean?",
+        terminate: "boolean?",
+      });
+    }
+    case "spawn": {
+      if (!active?.spawnHook) throw new Fail("unsupported", "no spawn hook");
+      const request = record(args.spawn, "spawn request") as unknown as SpawnRequest;
+      const value = await active.spawnHook(request, handle(ext, text(args.session, "spawn session")), signal);
+      if (isRecord(value) && Object.hasOwn(value, "replace")) return decision(value, method, { replace: "object" });
+      return decision(value, method, { block: "string" });
+    }
+    case "schemeResolve":
+    case "schemeRead":
+    case "schemeWrite": {
+      const name = text(args.scheme, `${method} scheme`);
+      const scheme = active?.schemes.get(name);
+      if (!scheme) throw new Fail("unsupported", "no scheme handler");
+      const path = text(args.path, `${method} path`);
+      const session = record(args.session, `${method} session`);
+      const cx: SchemeContext = freeze({
+        scheme: name,
+        session: {
+          id: text(session.id, `${method} session id`),
+          dir: text(session.dir, `${method} session dir`),
+          cwd: text(session.cwd, `${method} session cwd`),
+        },
+      });
+      if (method === "schemeResolve") {
+        const target = await scheme.resolve(path, cx, signal);
+        if (target === "virtual") return target;
+        return decision(target, method, { file: "string", writable: "boolean" }) ?? invalidReply(method);
+      }
+      if (method === "schemeRead") {
+        if (!scheme.read) throw new Fail("unsupported", "no scheme read handler");
+        return text(await scheme.read(path, cx, signal), "schemeRead result");
+      }
+      if (!scheme.write) throw new Fail("unsupported", "no scheme write handler");
+      const content = text(args.content, "schemeWrite content");
+      return text(await scheme.write(path, content, cx, signal), "schemeWrite result");
+    }
+    case "command": {
+      const handler = active?.commands.get(text(args.command, "command name"));
+      if (!handler) throw new Fail("unsupported", "no command handler");
+      await handler(text(args.args, "command args"), handle(ext, text(args.session, "command session")), signal);
+      return null;
+    }
+    default: {
+      // event
+      if (!active?.onEntry) throw new Fail("unsupported", "no entry handler");
+      const session = handle(ext, text(args.session, "event session"));
+      await active.onEntry(freeze(record(args.entry, "event entry")) as unknown as JsonValue, session);
+      return null;
+    }
+  }
+}
+
+async function provider(id: string, call: Call, active: Active | undefined, args: Frame): Promise<unknown> {
+  const { ext, method, controller } = call;
+  const signal = controller.signal;
+  if (typeof args.provider !== "string") throw new Fail("invalid", `${method} provider is not a string`);
+  const handlers = active?.providers.get(args.provider);
   switch (method) {
     case "login": {
       if (!handlers?.login) throw new Fail("unsupported", "no login handler");
       const notices = new Set<Promise<void>>();
-      const value = await handlers.login(interaction(ext, id, signal, notices), signal);
+      const value = await handlers.login(interaction(ext, { id, signal }, notices), signal);
       // A credential never outruns a display or progress message the host has not acknowledged.
       try {
         while (notices.size) await Promise.all(notices);
@@ -392,6 +547,84 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
   }
 }
 
+async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): Promise<ToolResult> {
+  const { ext, controller } = call;
+  const signal = controller.signal;
+  const parent: Parent = { id, signal };
+  // Every update is answered before the result goes out, so none trails it; a refused
+  // update is the host's business, not the tool's failure.
+  const updates = new Set<Promise<unknown>>();
+  const run: ToolRun = {
+    call: toolCall(args.call, "tool call"),
+    session: handle(ext, text(args.session, "tool session")),
+    signal,
+    update(update) {
+      const u = local(isRecord(update), "update", update);
+      const content = local(Array.isArray(u.content), "update content", u.content);
+      const sent = callHost(ext, "update", { content, details: u.details }, parent);
+      updates.add(sent);
+      const done = () => updates.delete(sent);
+      sent.then(done, done);
+    },
+  };
+  const value = await handler(run);
+  while (updates.size) await Promise.allSettled(updates);
+  const result = decision(value, "tool", {
+    content: "array",
+    details: "any?",
+    isError: "boolean?",
+    terminate: "boolean?",
+  });
+  return (result ?? invalidReply("tool")) as unknown as ToolResult;
+}
+
+function toolCall(value: unknown, what: string): ToolCall {
+  const call = record(value, what);
+  text(call.id, `${what} id`);
+  text(call.name, `${what} name`);
+  record(call.arguments, `${what} arguments`);
+  return call as unknown as ToolCall;
+}
+
+type Check = "true" | "string" | "boolean" | "array" | "object" | "any";
+
+function invalidReply(label: string): never {
+  throw new Fail("invalid", `${label} returned an invalid result`);
+}
+
+/**
+ * An author's reply: `null` or `undefined` as `null`, otherwise a record with only the
+ * `shape` keys (`?` marks optional); anything else fails "{label} returned an invalid result".
+ */
+function decision(value: unknown, label: string, shape: Record<string, Check | `${Check}?`>): Frame | null {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value) || Object.keys(value).some((key) => !Object.hasOwn(shape, key))) return invalidReply(label);
+  const out: Frame = {};
+  for (const [key, spec] of Object.entries(shape)) {
+    const v = value[key];
+    const optional = spec.endsWith("?");
+    const check = (optional ? spec.slice(0, -1) : spec) as Check;
+    const ok =
+      v === undefined
+        ? optional
+        : check === "any" ||
+          (check === "true" && v === true) ||
+          (check === "array" && Array.isArray(v)) ||
+          (check === "object" && isRecord(v)) ||
+          ((check === "string" || check === "boolean") && typeof v === check);
+    if (!ok) invalidReply(label);
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}
+
+/** Activation failures carry fixed messages only: author errors and keys never reach diagnostics. */
+function fail(message: string): never {
+  throw new Fail("activation", message);
+}
+
+const HANDLER_KINDS = ["providers", "tools", "schemes", "commands", "toolPolicy", "spawnHook", "onEntry"];
+
 async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<null> {
   const entry = text(args.entry, "activate entry");
   const dataDir = text(args.dataDir, "activate dataDir");
@@ -403,11 +636,34 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
     }
     return { id: text(p.id, `activate provider ${i} id`), login: p.login, rewrite: p.rewrite };
   });
-  if (extensions.has(ext) || activating.has(ext)) throw new Fail("invalid", "already activated");
-  // Fixed messages only: author errors and author-chosen keys never reach diagnostics.
-  const fail = (message: string): never => {
-    throw new Fail("activation", message);
+  const session = record(args.session, "activate session");
+  const names = (key: string): string[] => {
+    const list = session[key];
+    if (!Array.isArray(list)) throw new Fail("invalid", `activate session ${key} is not an array`);
+    return list.map((raw, i) => text(record(raw, `activate ${key} ${i}`).name, `activate ${key} ${i} name`));
   };
+  const flag = (key: string): boolean => {
+    const value = session[key];
+    if (typeof value !== "boolean") throw new Fail("invalid", `activate session ${key} is not a boolean`);
+    return value;
+  };
+  const hooks = (): PolicyHook[] => {
+    const list = session.toolPolicy;
+    const valid =
+      Array.isArray(list) &&
+      list.every((hook, i) => (hook === "before" || hook === "after") && list.indexOf(hook) === i);
+    if (!valid) throw new Fail("invalid", "activate session toolPolicy is not a hook list");
+    return list as PolicyHook[];
+  };
+  const decl = {
+    tools: names("tools"),
+    schemes: names("schemes"),
+    commands: names("commands"),
+    toolPolicy: hooks(),
+    spawnHook: flag("spawnHook"),
+    events: flag("events"),
+  };
+  if (extensions.has(ext) || activating.has(ext)) throw new Fail("invalid", "already activated");
   activating.add(ext);
   try {
     let module: { default?: unknown };
@@ -420,41 +676,150 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
     if (typeof module.default !== "function") return fail("default export is not a function");
     let result: unknown;
     try {
-      result = await (module.default as Extension)({ id: ext, dataDir });
+      result = await (module.default as Extension)({
+        id: ext,
+        dataDir,
+        session: (id) => handle(ext, local(typeof id === "string", "session id", id)),
+      });
     } catch {
       return fail("activation threw");
     }
-    if (typeof result !== "object" || result === null || Array.isArray(result)) {
-      return fail("activation did not return a provider record");
+    const handlers: Frame = isRecord(result) ? result : fail("activation did not return a handler record");
+    for (const key of Object.keys(handlers)) {
+      if (!HANDLER_KINDS.includes(key)) fail("activation returned an unknown handler kind");
     }
-    const returned = result as Record<string, unknown>;
-    for (const key of Object.keys(returned)) {
-      if (!declared.some((p) => p.id === key)) fail("activation returned an undeclared provider");
-    }
-    const providers = new Map<string, Active>();
-    for (const [i, p] of declared.entries()) {
-      const value = returned[p.id];
-      if (value === undefined && !p.login && !p.rewrite) continue;
-      if (typeof value !== "object" || value === null) fail(`provider ${i}: handlers missing`);
-      const h = value as Record<string, unknown>;
-      const wants: Record<string, boolean> = { login: p.login, refresh: p.login, rewrite: p.rewrite };
-      for (const key of Object.keys(h)) {
-        if (!Object.hasOwn(wants, key)) fail(`provider ${i}: undeclared method`);
-      }
-      const active: Active = {};
-      for (const [key, wanted] of Object.entries(wants)) {
-        const fn = h[key];
-        if (wanted && typeof fn !== "function") fail(`provider ${i}: ${key} is not a function`);
-        if (!wanted && fn !== undefined) fail(`provider ${i}: ${key} is not declared`);
-        if (wanted) (active as Record<string, unknown>)[key] = (fn as Function).bind(h);
-      }
-      providers.set(p.id, active);
-    }
-    if (!signal.aborted) extensions.set(ext, providers);
+    const active: Active = {
+      providers: providers(handlers.providers, declared),
+      tools: named<ToolHandler>(handlers.tools, decl.tools, "tool", method),
+      schemes: named(handlers.schemes, decl.schemes, "scheme", schemeHandlers),
+      commands: named<CommandHandler>(handlers.commands, decl.commands, "command", method),
+      toolPolicy: single(handlers.toolPolicy, decl.toolPolicy.length > 0, "tool policy", (h): ToolPolicy | undefined => {
+        if (!isRecord(h)) return undefined;
+        if (Object.keys(h).some((key) => key !== "before" && key !== "after")) fail("tool policy handler malformed");
+        const bind = <T>(hook: PolicyHook): T | undefined => {
+          if (!decl.toolPolicy.includes(hook)) {
+            return h[hook] === undefined ? undefined : fail("undeclared tool policy handler");
+          }
+          return method<T>(h[hook], h) ?? fail("tool policy handler missing");
+        };
+        return { before: bind<ToolPolicy["before"]>("before"), after: bind<ToolPolicy["after"]>("after") };
+      }),
+      spawnHook: single(handlers.spawnHook, decl.spawnHook, "spawn hook", (h) => method<SpawnHook>(h, handlers)),
+      onEntry: single(handlers.onEntry, decl.events, "entry", (h) => method<Active["onEntry"]>(h, handlers)),
+    };
+    if (!signal.aborted) extensions.set(ext, active);
     return null;
   } finally {
     activating.delete(ext);
   }
+}
+
+function method<T>(value: unknown, owner: unknown): T | undefined {
+  return typeof value === "function" ? (value.bind(owner) as T) : undefined;
+}
+
+function optionalMethod<T>(owner: Frame, key: string, kind: string): T | undefined {
+  const value = owner[key];
+  if (value === undefined) return undefined;
+  return method<T>(value, owner) ?? fail(`${kind} handler malformed`);
+}
+
+function schemeHandlers(value: unknown): SchemeHandlers | undefined {
+  if (!isRecord(value)) return undefined;
+  if (Object.keys(value).some((key) => key !== "resolve" && key !== "read" && key !== "write")) {
+    fail("scheme handler malformed");
+  }
+  const resolve = method<SchemeHandlers["resolve"]>(value.resolve, value);
+  if (!resolve) return undefined;
+  return {
+    resolve,
+    read: optionalMethod(value, "read", "scheme"),
+    write: optionalMethod(value, "write", "scheme"),
+  };
+}
+
+/** Binds one handler per declared name; every returned name must be declared and vice versa. */
+function named<T>(
+  value: unknown,
+  names: string[],
+  kind: string,
+  bind: (handler: unknown, owner: Frame) => T | undefined,
+): Map<string, T> {
+  const owner: Frame = value === undefined ? {} : isRecord(value) ? value : fail(`${kind} handlers are not a record`);
+  for (const key of Object.keys(owner)) if (!names.includes(key)) fail(`undeclared ${kind} handler`);
+  const out = new Map<string, T>();
+  for (const name of names) {
+    const handler = Object.hasOwn(owner, name) ? bind(owner[name], owner) : undefined;
+    out.set(name, handler ?? fail(`${kind} handler missing`));
+  }
+  return out;
+}
+
+/** Binds a singular handler the manifest declared; an undeclared one fails activation. */
+function single<T>(value: unknown, declared: boolean, kind: string, bind: (handler: unknown) => T | undefined): T | undefined {
+  if (!declared) return value === undefined ? undefined : fail(`undeclared ${kind} handler`);
+  return (value === undefined ? undefined : bind(value)) ?? fail(`${kind} handler missing`);
+}
+
+function providers(value: unknown, declared: { id: string; login: boolean; rewrite: boolean }[]): Map<string, Provider> {
+  const returned: Frame =
+    value === undefined ? {} : isRecord(value) ? value : fail("activation did not return a provider record");
+  for (const key of Object.keys(returned)) {
+    if (!declared.some((p) => p.id === key)) fail("activation returned an undeclared provider");
+  }
+  const out = new Map<string, Provider>();
+  for (const [i, p] of declared.entries()) {
+    const value = returned[p.id];
+    if (value === undefined && !p.login && !p.rewrite) continue;
+    if (typeof value !== "object" || value === null) fail(`provider ${i}: handlers missing`);
+    const h = value as Record<string, unknown>;
+    const wants: Record<string, boolean> = { login: p.login, refresh: p.login, rewrite: p.rewrite };
+    for (const key of Object.keys(h)) {
+      if (!Object.hasOwn(wants, key)) fail(`provider ${i}: undeclared method`);
+    }
+    const bound: Provider = {};
+    for (const [key, wanted] of Object.entries(wants)) {
+      const fn = h[key];
+      if (wanted && typeof fn !== "function") fail(`provider ${i}: ${key} is not a function`);
+      if (!wanted && fn !== undefined) fail(`provider ${i}: ${key} is not declared`);
+      if (wanted) (bound as Record<string, unknown>)[key] = (fn as Function).bind(h);
+    }
+    out.set(p.id, bound);
+  }
+  return out;
+}
+
+// ---- Runner -> Rust session actions ----
+
+const DELIVERIES = ["steer", "followUp", "quiet"];
+
+/** Session actions for one session; unparented, so they work whenever Rust has it attached. */
+function handle(ext: string, id: string): SessionHandle {
+  const act = (method: string, args: Frame) => callHost(ext, method, { session: id, ...args });
+  return {
+    id,
+    async post(message) {
+      const m = local(isRecord(message), "post message", message);
+      await act("post", {
+        customType: local(typeof m.customType === "string", "post customType", m.customType),
+        text: local(typeof m.text === "string", "post text", m.text),
+        display: local(typeof m.display === "boolean", "post display", m.display),
+        delivery: local(DELIVERIES.includes(m.delivery), "post delivery", m.delivery),
+      });
+    },
+    async appendCustom(customType, data) {
+      await act("appendCustom", {
+        customType: local(typeof customType === "string", "appendCustom customType", customType),
+        data,
+      });
+    },
+    async custom(customType) {
+      const value = await act("custom", {
+        customType: local(typeof customType === "string", "custom customType", customType),
+      });
+      return (value ?? null) as JsonValue | null;
+    },
+  };
 }
 
 // ---- Runner -> Rust login callbacks ----
@@ -463,9 +828,8 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
  * The host UI for one login. Display calls (openUrl, deviceCode, progress) are tracked in
  * `notices` until Rust acknowledges them so the login cannot return past an undelivered one.
  */
-function interaction(ext: string, parent: string, outer: AbortSignal, notices: Set<Promise<void>>): LoginInteraction {
-  const ask = (method: string, args: Frame, own?: AbortSignal) =>
-    callHost(ext, parent, method, args, outer, own);
+function interaction(ext: string, parent: Parent, notices: Set<Promise<void>>): LoginInteraction {
+  const ask = (method: string, args: Frame, own?: AbortSignal) => callHost(ext, method, args, parent, own);
   const notify = (method: string, build: () => Frame): Promise<void> => {
     let delivered: Promise<void>;
     try {
@@ -548,47 +912,58 @@ function answer(value: unknown): string {
   return value;
 }
 
-function callHost(
-  ext: string,
-  parent: string,
-  method: string,
-  args: Frame,
-  outer: AbortSignal,
-  own?: AbortSignal,
-): Promise<unknown> {
+/** The live Rust call a callback runs under; its signal aborts when that call ends. */
+interface Parent {
+  id: string;
+  signal: AbortSignal;
+}
+
+/**
+ * Calls Rust. With `parent` the callback lives no longer than that call; without one it is a
+ * session action, independent of any call.
+ */
+function callHost(ext: string, method: string, args: Frame, parent?: Parent, own?: AbortSignal): Promise<unknown> {
   const { promise, resolve, reject } = Promise.withResolvers<unknown>();
-  if (outer.aborted || !calls.has(parent)) {
-    reject(outer.reason ?? new Error("login finished"));
-    return promise;
-  }
-  if (own?.aborted) {
-    reject(own.reason);
-    return promise;
-  }
-  const id = `r:${nextId++}`;
-  let sent = false;
-  const settle = (finish: () => void) => {
-    pending.delete(id);
-    outer.removeEventListener("abort", onOuter);
-    own?.removeEventListener("abort", onOwn);
-    finish();
-  };
-  // The parent ended: Rust has already dropped its callbacks, so no cancel frame.
-  const onOuter = () => settle(() => reject(outer.reason));
-  const onOwn = () =>
-    settle(() => {
-      if (sent) sendControl({ type: "cancel", id });
-      reject(own!.reason);
+  const outer = parent?.signal;
+  const start = () => {
+    if (parent && (parent.signal.aborted || !calls.has(parent.id))) {
+      reject(parent.signal.reason ?? new Error("call finished"));
+      return;
+    }
+    if (own?.aborted) {
+      reject(own.reason);
+      return;
+    }
+    const id = `r:${nextId++}`;
+    let sent = false;
+    const settle = (finish: () => void) => {
+      pending.delete(id);
+      outer?.removeEventListener("abort", onOuter);
+      own?.removeEventListener("abort", onOwn);
+      finish();
+      // A queued start that rejects early takes no slot, so the loop moves on.
+      while (pending.size < MAX_HOST_CALLS && queuedHostCalls.length) queuedHostCalls.shift()!();
+    };
+    // The parent ended: Rust has already dropped its callbacks, so no cancel frame.
+    const onOuter = () => settle(() => reject(outer!.reason));
+    const onOwn = () =>
+      settle(() => {
+        if (sent) sendControl({ type: "cancel", id });
+        reject(own!.reason);
+      });
+    pending.set(id, {
+      resolve: (value) => settle(() => resolve(value)),
+      reject: (error) => settle(() => reject(error)),
     });
-  pending.set(id, {
-    resolve: (value) => settle(() => resolve(value)),
-    reject: (error) => settle(() => reject(error)),
-  });
-  outer.addEventListener("abort", onOuter, { once: true });
-  own?.addEventListener("abort", onOwn, { once: true });
-  void send({ type: "call", id, ext, method, args, parent }, () => (sent = pending.has(id))).then((status) => {
-    if (status !== "ok") pending.get(id)?.reject(new RangeError(`axo: ${method} arguments cannot be sent (${status})`));
-  });
+    outer?.addEventListener("abort", onOuter, { once: true });
+    own?.addEventListener("abort", onOwn, { once: true });
+    const frame = { type: "call", id, ext, method, args, parent: parent?.id };
+    void send(frame, () => (sent = pending.has(id))).then((status) => {
+      if (status !== "ok") pending.get(id)?.reject(new RangeError(`axo: ${method} arguments cannot be sent (${status})`));
+    });
+  };
+  if (pending.size < MAX_HOST_CALLS) start();
+  else queuedHostCalls.push(start);
   return promise;
 }
 

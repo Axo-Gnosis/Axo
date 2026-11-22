@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ExtensionOptions, ExtensionPhase, ExtensionStatus,
     manifest::{Member, check_entry},
-    peer::{CallError, Peer},
+    peer::{Actions, CallError, Peer},
     process::{Generation, StartError},
 };
 
@@ -42,8 +42,12 @@ pub struct Placement {
 
 struct Shared {
     members: Vec<Member>,
+    /// Member IDs, built once; every generation's peer refuses session actions naming others.
+    ids: Arc<[String]>,
     group: Option<String>,
     report: Report,
+    /// Serves the runner's session actions on every generation.
+    actions: Arc<dyn Actions>,
     state: Mutex<State>,
 }
 
@@ -55,8 +59,8 @@ struct State {
     load: HashMap<String, String>,
     /// Activation order as indices into `Shared::members`; read when a generation activates.
     order: Vec<usize>,
-    /// The operation that started a cold placement; settled once on the first outcome.
-    waiter: Option<oneshot::Sender<Result<(), String>>>,
+    /// Operations waiting for a first start; all settled on its first outcome.
+    waiters: Vec<oneshot::Sender<Result<(), String>>>,
     driver: Option<JoinHandle<()>>,
     closed: bool,
 }
@@ -83,6 +87,15 @@ enum Exit {
     Crash(String),
 }
 
+/// What a caller finds when it asks for a member's peer.
+enum Check {
+    Ready(Arc<Peer>),
+    /// Not started: the caller starts it, then waits.
+    Cold,
+    /// A first start is under way: the caller waits for it.
+    Starting,
+}
+
 enum Activation {
     Member(String),
     Placement(String),
@@ -96,6 +109,7 @@ impl Placement {
         options: ExtensionOptions,
         supervisor: Arc<ProcessSupervisor>,
         report: Report,
+        actions: Arc<dyn Actions>,
     ) -> Arc<Self> {
         let state = State {
             order: (0..members.len()).collect(),
@@ -103,9 +117,11 @@ impl Placement {
         };
         Arc::new(Self {
             shared: Arc::new(Shared {
+                ids: members.iter().map(|member| member.id.clone()).collect(),
                 members,
                 group,
                 report,
+                actions,
                 state: Mutex::new(state),
             }),
             options,
@@ -167,32 +183,39 @@ impl Placement {
         self.shared.statuses(&state)
     }
 
-    /// The live peer serving `ext`. A cold placement starts here and this call waits for its
-    /// activation; calls arriving while it starts or restarts fail naming `ext`.
+    /// The live peer serving `ext`. A cold placement starts here; this call and any arriving
+    /// during that first start wait for its activation. Calls arriving while it restarts fail
+    /// naming `ext`.
     pub async fn peer(&self, ext: &str) -> Result<Arc<Peer>, String> {
         let waiter = {
             let mut state = self.shared.lock();
-            if let Some(peer) = self.shared.check(&state, ext)? {
+            let check = self.shared.check(&state, ext)?;
+            if let Check::Ready(peer) = check {
                 return Ok(peer);
             }
+            if let Check::Cold = check {
+                state.phase = Phase::Starting;
+                state.driver = Some(tokio::spawn(drive(
+                    self.shared.clone(),
+                    self.options.clone(),
+                    self.supervisor.clone(),
+                    self.stop.clone(),
+                )));
+            }
             let (tx, rx) = oneshot::channel();
-            state.waiter = Some(tx);
-            state.phase = Phase::Starting;
-            state.driver = Some(tokio::spawn(drive(
-                self.shared.clone(),
-                self.options.clone(),
-                self.supervisor.clone(),
-                self.stop.clone(),
-            )));
+            state.waiters.push(tx);
             rx
         };
         waiter
             .await
             .map_err(|_| format!("{} is shut down", self.shared.label(ext)))??;
         let state = self.shared.lock();
-        self.shared
-            .check(&state, ext)?
-            .ok_or_else(|| format!("{} is not running", self.shared.label(ext)))
+        match self.shared.check(&state, ext)? {
+            Check::Ready(peer) => Ok(peer),
+            Check::Cold | Check::Starting => {
+                Err(format!("{} is not running", self.shared.label(ext)))
+            }
+        }
     }
 
     /// Closes admission, then stops and joins the driver, which reaps the live generation and fails
@@ -201,7 +224,7 @@ impl Placement {
         let driver = {
             let mut state = self.shared.lock();
             state.closed = true;
-            state.waiter = None;
+            state.waiters.clear();
             state.driver.take()
         };
         self.stop.cancel();
@@ -244,8 +267,7 @@ impl Shared {
         }
     }
 
-    /// `Ok(None)` means cold: the caller may start it.
-    fn check(&self, state: &State, ext: &str) -> Result<Option<Arc<Peer>>, String> {
+    fn check(&self, state: &State, ext: &str) -> Result<Check, String> {
         let label = self.label(ext);
         if !self.members.iter().any(|member| member.id == ext) {
             return Err(format!("{label} is not part of this placement"));
@@ -257,9 +279,9 @@ impl Shared {
             return Err(reason.clone());
         }
         match &state.phase {
-            Phase::Cold => Ok(None),
-            Phase::Ready(peer) => Ok(Some(peer.clone())),
-            Phase::Starting => Err(format!("{label} is starting")),
+            Phase::Cold => Ok(Check::Cold),
+            Phase::Ready(peer) => Ok(Check::Ready(peer.clone())),
+            Phase::Starting => Ok(Check::Starting),
             Phase::Restarting(reason) => Err(format!("{label} is restarting after: {reason}")),
             Phase::Disabled(reason) | Phase::Unavailable(reason) => Err(reason.clone()),
         }
@@ -295,8 +317,8 @@ impl Shared {
             .collect()
     }
 
-    /// Publishes `phase` for `generation`, settles the first waiter on any outcome, then reports
-    /// outside the lock. False once shut down.
+    /// Publishes `phase` for `generation`, settles the first start's waiters on any outcome,
+    /// then reports outside the lock. False once shut down.
     fn commit(&self, generation: u64, phase: Phase) -> bool {
         let statuses = {
             let mut state = self.lock();
@@ -310,10 +332,10 @@ impl Shared {
                 | Phase::Disabled(reason)
                 | Phase::Unavailable(reason) => Some(Err(reason.clone())),
             };
-            if let Some(outcome) = outcome
-                && let Some(waiter) = state.waiter.take()
-            {
-                let _ = waiter.send(outcome);
+            if let Some(outcome) = outcome {
+                for waiter in state.waiters.drain(..) {
+                    let _ = waiter.send(outcome.clone());
+                }
             }
             state.generation = generation;
             state.phase = phase;
@@ -333,7 +355,15 @@ impl Shared {
         generation: u64,
         stop: &CancellationToken,
     ) -> Exit {
-        let mut process = match Generation::start(options, supervisor, generation, stop).await {
+        let start = Generation::start(
+            options,
+            supervisor,
+            generation,
+            stop,
+            &self.actions,
+            &self.ids,
+        );
+        let mut process = match start.await {
             Ok(process) => process,
             Err(StartError::Stopped) => return Exit::Stopped,
             Err(StartError::Setup(reason)) => {
@@ -408,7 +438,12 @@ impl Shared {
             .iter()
             .map(|d| json!({ "id": d.id, "login": d.login, "rewrite": d.rewrite }))
             .collect();
-        let args = json!({ "entry": entry, "dataDir": data_dir, "providers": providers });
+        let args = json!({
+            "entry": entry,
+            "dataDir": data_dir,
+            "providers": providers,
+            "session": member.session,
+        });
         match tokio::time::timeout(
             ACTIVATE_DEADLINE,
             peer.call(&member.id, "activate", args, None),

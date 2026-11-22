@@ -1,6 +1,7 @@
 //! The tool contract (pi `agent/src/types.ts:423-499`). Tools hold their own session
 //! handles; the per-call state arrives in a [`ToolContext`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ pub trait Tool: Send + Sync {
         Replay::Never
     }
     /// Bullets for the system prompt's `tools` section.
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
         &[]
     }
     /// For a dispatcher: the tool this call names and that tool's arguments. The loop runs

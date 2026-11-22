@@ -375,6 +375,8 @@ impl Axo {
             tool_policies,
             spawn_hooks,
             schemes: host_schemes,
+            commands,
+            layer,
             recovery: _,
         } = options;
 
@@ -482,6 +484,8 @@ impl Axo {
                 store: self.store.clone(),
                 sessions: self.sessions.clone(),
                 spawn_hooks,
+                commands,
+                layer,
                 run_slots,
                 loaded: None,
             }),

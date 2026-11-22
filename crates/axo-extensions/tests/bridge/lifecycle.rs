@@ -122,9 +122,11 @@ async fn cold_until_a_callback_is_needed_then_rewrites_reach_http() {
     assert!(host.pids().is_empty());
     assert!(!host.path("data").join("lab-provider").exists());
 
-    request(&host, "lab").await;
+    // Two requests on the cold placement: the second waits for the first start, and both
+    // reach HTTP through the one runner.
+    tokio::join!(request(&host, "lab"), request(&host, "lab"));
     let requests = http.requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     let (head, body) = &requests[0];
     assert!(head.starts_with("POST /rewritten "), "{head}");
     assert_eq!(header(head, "x-rewritten"), Some("yes"));
@@ -138,12 +140,12 @@ async fn cold_until_a_callback_is_needed_then_rewrites_reach_http() {
 
     // The live runner serves later requests.
     request(&host, "lab").await;
-    assert_eq!(http.requests().len(), 2);
+    assert_eq!(http.requests().len(), 3);
     let pids = host.pids();
     assert_eq!(pids.len(), 1);
     assert_eq!(
         host.calls("lab-provider"),
-        ["activate", "rewrite", "rewrite"]
+        ["activate", "rewrite", "rewrite", "rewrite"]
     );
 
     extensions.shutdown().await;

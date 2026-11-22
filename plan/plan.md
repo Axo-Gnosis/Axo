@@ -8,7 +8,7 @@ This is the live planning document for unbuilt work and active design discussion
 
 ## Overview of tracks
 
-M1–M5 plus Tracks 2, 3 and 4 are complete. **Extensions are the current planning priority** (decisions of 2026-11-16): Track 5 phases 1 and 2 (Rust provider seam, then TS/JS providers through `axo-extensions`) are implemented; session capabilities and packaging remain. Extensions do not wait for codemode; `axo-acp` is deferred.
+M1–M5 plus Tracks 2, 3 and 4 are complete. Track 5 phases 1–3 implement providers, logins and session capabilities through `axo-extensions`; packaging remains. Extensions do not wait for codemode; `axo-acp` is deferred.
 
 ```mermaid
 flowchart LR
@@ -18,14 +18,15 @@ flowchart LR
   end
   T1 -.builds on shipped spawn.-> S2["Track 2: Shipped"]
   N -.reused by.-> MCP["MCP adapter (Track 5)"]
-  E["Extensions (Track 5): providers and logins first"] --> B["Rust provider seam, Bun provider bridge (implemented)"] --> P3["Session capabilities, then packaging"]
+  E["Extensions (Track 5)"] --> B["Providers and logins (implemented)"] --> P3["Session capabilities (implemented)"] --> P4["Packaging (planned)"]
 ```
 
 | Track | Scope | Status |
 |---|---|---|
 | **1. Codemode & script extensions** | Embedded JS sandbox (QuickJS/Boa engine evaluation), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and script hooks on spawned specs (rungs 2–5) | Rungs 0–1 scoped; rungs 2+ in discussion. Not the current implementation priority |
-| **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs; providers/logins first, then session capabilities and packaging | **Four-phase roadmap approved; Phase 1 (Rust provider and login seam) and Phase 2 (Bun provider bridge, `axo-extensions`) implemented, phases 3–4 unimplemented.** Process per extension, user grouping and bounded restart selected. MCP and `ast_edit` remain deferred adjacent work |
+| **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs | **Provider and session capabilities implemented (phases 1–3); packaging remains (phase 4).** MCP and `ast_edit` remain deferred adjacent work |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
+| **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | Designed 2026-11-21; not started |
 | **Tool surface & session modes** | Deferred tools, action tools, scoped host policy, cache-safe root mode overlays and completion | **Shipped (A–H).** See [Shipped tracks](#shipped-tracks) |
 
 ---
@@ -294,20 +295,20 @@ Key risks to design around when building step 3 (script hooks):
 
 ### Status and settled direction
 
-**Phases 1 and 2 implemented; phases 3–4 planning only.** The Rust provider/login seam, runtime provider registration and the request-rewrite hook work today (runtime reference in [`crates/axo/docs/configuration.md`](../crates/axo/docs/configuration.md#runtime-providers-login-and-reload)), and the `axo-extensions` bridge loads TS/JS providers from enabled packages under supervised Bun runners (reference in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#4-provider-extensions-axo-extensions), user setting in [`configuration.md`](../crates/axo/docs/configuration.md#extensions-extensions--axoenabledextension)). Session capabilities, registered commands, packaging and the MCP adapter do not exist. Each remaining phase receives its own detailed plan before implementation.
+**Phases 1–3 implemented; Phase 4 is planned.** The `axo-extensions` bridge loads TS/JS providers and session contributions under supervised Bun runners. See the [runtime reference](../crates/axo/docs/extending.md#4-bun-extensions-axo-extensions) and [enablement setting](../crates/axo/docs/configuration.md#extensions-extensions--axoenabledextension). Packaging and the MCP adapter do not exist.
 
-The [settled extension scope and authority](design.md#extension-parity-and-authority-planned) distinguish contributions from host ownership. Extensions mean extending axo without Rust, not exposing every Rust host power. Providers and logins are the first useful slice; there is no codemode dependency.
+The [settled extension scope and authority](design.md#extension-parity-and-authority) distinguish contributions from host ownership. Extensions mean extending axo without Rust, not exposing every Rust host power. There is no codemode dependency.
 
 - **Runtime and ownership:** TS/JS on a host-supplied Bun binary; axo bundles none. The bridge crate sits above `axo`, uses only public APIs, and shares this repository with the SDK. Hosts choose paths, acquisition and presentation; no fixed application directories or required terminal UI.
 - **Placement:** one supervised process per extension, not per session. Users may group extensions to save memory, accepting a shared failure domain. No Workers, author isolation hints or automatic relocation. Missing Bun diagnoses unavailable extensions, leaving unrelated core functionality usable.
 - **Recovery:** restart a stuck/crashed runner; three failures in five minutes disable it with a host-visible event. Load-time failure disables only that extension. Interrupted calls fail visibly, not replayed blindly; an unavailable provider or policy cannot be silently bypassed. Grouped runners require group-aware accounting rather than guessed individual blame.
 - **Contributions:** tools (including replaceable built-ins), policies, spawn hooks, schemes, sections, definitions, providers, commands, messages, branch-scoped custom state and events. User-enabled extension order determines collisions, with provenance diagnostics and no priority syntax; reserved core names remain reserved.
-- **Host-only ownership:** no extension replacement of store/configuration/credential services, default streamer, supervisor or execution environment; no direct session lifecycle/navigation, trust grants, or resolution of the host's pending questions/reviews. The bridge composes registrations and owns wholesale setters, so removing one extension cannot wipe other contributions.
+- **Host-only ownership:** no extension replacement of store/configuration/credential services, default streamer, supervisor or execution environment; no direct session lifecycle/navigation, trust grants, or resolution of the host's pending questions/reviews. The bridge composes extension registrations into the session's layer (`Session::set_layer`) and never replaces host registrations, so removing one extension cannot wipe other contributions and the host setters stay usable.
 - **Files and configuration:** no extension-defined settings keys. Pass a host-chosen data directory as a convention, not a sandbox; authors choose file formats. Core enable/group configuration is user-only. A trusted Bun extension can still write anywhere the user's OS permissions allow.
 - **Loading and trust:** start enabled code lazily from host-supplied roots; project-discovered executable extensions require trust. Explicit user installation/authorization is distinct from discovering code in a checkout.
 - **Resource reporting:** no default memory cap. Report process/group metrics with attribution scope, not exact per-extension allocations inside a shared runner. Optional user caps wait for a concrete need.
 
-### Existing Rust contracts and composition gaps
+### Shared Rust contracts
 
 Preserve the [implemented extension contracts](../crates/axo/docs/extending.md#3-rust-extension-traits) within the scope above:
 
@@ -315,26 +316,9 @@ Preserve the [implemented extension contracts](../crates/axo/docs/extending.md#3
 - `append_custom` / `custom` provide branch-scoped metadata without adding model context. Reuse them rather than inventing extension persistence; extension-owned settings files serve a different purpose.
 - Tool, section, persona, mode, model and thinking controls already have defined during-run behavior. Subsequent requests see changes at their boundaries; routed calls keep implementation snapshots. This inventory is not permission to expose every session control in the SDK.
 - Reopen requires executable registrations and host section configuration to be supplied again; the journal does not reconstruct closures. Preserve replay/error contracts and never retry an uncertain external effect merely because a runner restarted.
-- Live policy/scheme setters are missing. Store/configuration/default streamer are builder choices, not extension registries. `LoopHooks` is the session's driver, not an arbitrary session-level request-rewrite plugin.
-- Tools lack the session identity available to policy/scheme contexts. Remote replay declarations must be available synchronously during recovery. Code-backed commands have no shared registration seam yet.
+- Live host setters replace tool policies, spawn hooks, schemes, sections and command registrations; `Session::set_layer` replaces a second registration set applied after them. Store, configuration and default streamer remain builder choices. `LoopHooks` is the session's driver, not an arbitrary request-rewrite plugin.
 
-Current behavior, **not the proposed extension precedence**:
-
-| Surface | Current Rust rule |
-|---|---|
-| Direct tool versus builtin/another direct tool | Later host registration replaces earlier in place |
-| Direct versus deferred | Direct wins; conflicting deferred entries are diagnosed and ignored |
-| Deferred duplicates | First wins; later duplicates are silently skipped |
-| Reserved tools | `call` is core-owned; the applicable mode/structured-child `yield` is core-owned |
-| Schemes | Later handler replaces earlier; `artifact`, `file`, `tool` remain reserved |
-| Agent/team, mode, keyword definitions | First valid name wins; files precede programmatic definitions, with diagnostics; agents and teams share a namespace |
-| Commands and skills | Builtins precede modes; builtin/mode names hide skills in the catalog |
-| Providers | `Models::register` keeps one slot per provider id that fully replaces a loaded provider of that id; `Models::unregister` restores the loaded one. An owned `ProviderLayer` (`Models::provider_layer`) sits above both: newest layer wins, dropping it reveals exactly what was underneath, and a layer entry can be reserved-but-unavailable. `axo-extensions` composes extension contributors into one layer in user order |
-| Store/configuration/exec/default streamer | Host-selected slots, not multi-owner contribution registries |
-
-The agreed ordered-extension override model needs shared composition changes where those rules cannot express it, especially definitions and deferred duplicates. Keep provenance, diagnose hidden registrations, and preserve core reservations. Do not introduce universal middleware or an extra TS-only arbitration mechanism.
-
-Command parsing and direct prompt submission are different paths: directly submitted slash text can expand a skill hidden in the command catalog. Registered commands must join the existing catalog/parse/run API, not force the host to merge lists or intercept text itself. Planned order: built-ins, modes, registered commands, skills.
+Directly submitted slash text can expand a skill hidden in the command catalog: prompt submission is distinct from command parsing. The catalog and parser use built-ins, modes, registered commands, then skills.
 
 Source anchors: [session API](../crates/axo/src/session/mod.rs), [tool factories](../crates/axo/src/tools/mod.rs), [shaping](../crates/axo/src/session/prompt.rs), [child inheritance](../crates/axo/src/session/spawn.rs), [schemes](../crates/axo/src/schemes/mod.rs), [commands](../crates/axo/src/commands.rs), [definitions](../crates/axo/src/context), [configuration](../crates/axo/src/config.rs).
 
@@ -381,15 +365,13 @@ Phase 1 precedes 2; phases 3 and 4 depend on 2 and can proceed independently. No
 
 **Not part of Phase 2:** live vendor smoke tests, response adaptation or level-3 transport, and Phase 3/4 scope. UI, Bun acquisition, roots and data paths are host choices.
 
-#### Phase 3: Session capabilities and commands from TypeScript
+#### Phase 3: Session capabilities and commands from TypeScript (implemented)
 
-**Goal:** bind tools (including updates/cancel), policies, spawn hooks, schemes, sections, definitions, messages, branch state, events and registered commands.
+- Static declarations compose tools (including updates and cancel), policies, spawn hooks, schemes, sections, definitions and registered commands. The host composes options (the extensions go into `SessionOptions::layer`) before opening and attaches the live session for actions, journal events and layer reapplication on reconfiguration.
+- Per-session factories and live setters preserve child/fork inheritance, request boundaries and tool provenance. Replay is declared statically; an unavailable tool policy or spawn hook fails closed.
+- The bridge uses the existing custom journal state and registered-command catalog, parser and dispatch. The SDK returns handlers by kind.
 
-- Shared Rust gaps: tool session identity, synchronous remote replay metadata, live policy/scheme updates, contribution-aware tool composition and provenance, deferred-duplicate diagnostics, and a fourth command kind.
-- Preserve request boundaries, child/fork inheritance, durable state and default `Replay::Never`; unavailable policies block rather than silently permit execution.
-- Preserve tool prompt-description/guideline customization through shared Rust seams, not a second TS-only tool pipeline.
-
-**Acceptance:** an extension replaces a built-in tool, blocks a call by policy, preserves branch state across fork/reopen, and exposes a code-backed slash command through the existing host catalog/parse/run path.
+**Acceptance:** `cargo test -p axo-extensions --test bridge sessions` exercises replacement, blocking, state across fork/reopen, commands, events and restart/disable; the opt-in `bun_provider` target also exercises real handler cancellation.
 
 #### Phase 4: Packaging and install
 
@@ -407,7 +389,7 @@ The [extension-system study](research/extensions.md) records OMP, pi, Octet, Cla
 
 The [Bun study](research/bun-topology.md) preserves the original shared-loop/Worker experiment and a separate process-per-extension follow-up. The latter informed the selected process default. Whole-tree PSS, workloads, retained dependencies and measurement availability matter; the follow-up's programs/raw data were not retained, and its figures are not directly comparable to the earlier workload. Killing a Bun runner does not kill the Rust host. Process boundaries permit cleanup and attribution, not automatic quotas or OS sandboxing.
 
-Detailed plans for phases 3 and 4 must inventory callers and settle concrete engineering contracts, not reopen the four-phase direction. Phase 2 settled the transport (Unix socket under the existing supervisor), group failure accounting, generation fencing, bounded buffering, disposal and the no-replay rule; later phases reuse them rather than redesigning them.
+Phase 4 reuses the supervised transport and lifecycle. Its detailed plan must settle packaging contracts without widening extension authority.
 
 - Install/update rollback and dependency errors, stable package identities, compatibility and ownership-aware unloading.
 - Deterministic offline contract checks; real Bun scenarios opt in, and live provider proof is separate from normal test suites.
@@ -439,12 +421,138 @@ Maps the [Agent Client Protocol](https://agentclientprotocol.com) over stdio ont
 | `session/prompt` | `Session::parse_command` + `run_command` for `/<builtin>` and `/<mode>` text (ACP clients send commands as prompt text), otherwise `prompt` (and `steer` / `follow_up` mapping) |
 | `session/cancel` | `abort` |
 | `session/update` | Streams `AgentEvent`s through `Accumulator` |
-| `availableCommands` | Publishes `Session::commands()`: built-ins with their `parameters` schema, then modes and skills with `argumentHint` (→ `input.hint`) |
+| `availableCommands` | Publishes `Session::commands()`: built-ins with their `parameters` schema, then modes, registered commands and skills with `argumentHint` (→ `input.hint`) |
 
 Decisions when resumed:
 1. Use the `agent-client-protocol` crate or handwritten serde types (<1k lines).
 2. Default to `RecoveryPolicy::MarkInterrupted` on interactive open so the user decides whether to resume an interrupted run.
 3. Optional ACP `terminal/create` backend for `bash`.
+
+---
+
+## Track 7: Ask documents
+
+Notes from the design discussion of 2026-11-21. Items marked **Decided** are settled; items marked **Proposed** came up while planning the code and still need a yes.
+
+### Why
+
+Today `ask` (`crates/axo/src/tools/ask.rs`) sends `questions[]`: each question is one sentence plus options with a short description. The user has to decide without the context the model had. omp solved this in 18.18.3 by replacing its question list with one HTML `<form>` that mixes prose, tables and controls. The result is good, but it makes the model write HTML and makes the harness or host own a form language and parser. We take the idea and drop the HTML.
+
+### Where we landed
+
+- **Decided:** `ask` takes one document: an ordered list of blocks, each either Markdown or a typed question. Order is reading order, so the model builds context first and places each question where it belongs.
+- **Decided:** axo never parses the Markdown. It is passed through to the host, which renders it with whatever it has.
+- **Decided:** questions are typed data, never syntax inside the Markdown. A question sits between blocks, not inside a table cell or sentence.
+- **Decided:** the tool keeps the name `ask` and has one schema. Clean cutover: the old `questions[]` shape, its types and its result formatting are deleted, with no translation of old calls.
+- **Decided:** three question kinds: `choice`, `text`, `number`. No disabled options, date/email/url formats, sliders, hidden values, length limits or regex patterns. A ruled-out option belongs in the prose.
+- **Decided:** every `choice` gets a host-supplied free-text "Other" answer; the model never adds its own.
+- **Decided:** one note per question ("anything else to say"), accompanying the answer rather than replacing it. No per-option notes.
+- **Decided:** timeout stays off by default (`ask.timeoutMs`). When it elapses, only the model's recommended and default values are submitted; if a required question has neither, the result says no answer was given. The first option is never guessed.
+- **Decided:** axo validates a host's submission against the document before settling. An invalid submission is rejected and the question stays pending.
+- **Decided:** the tool description says only "write Markdown", with no judgement on how rich or plain. How a host tells the model what it can render is the host's business; the docs say so and name host prompt sections (`SessionOptions::sections`, `Session::set_section`) as one way, without prescribing a section name.
+- **Proposed:** `recommended` is a flag on the option, not a value named on the question. It reads the same for single and multi-select and cannot name a missing option.
+- **Proposed:** a skipped optional question is `null` in the result, so every question `id` is always present.
+- **Proposed:** event names stay `QuestionPending` / `QuestionResolved`; only the payload changes.
+- **Proposed:** this track changes axo only. Axome and Sworm adopt it when they bump their axo revision, since each needs its own UI for the document.
+
+### Model contract
+
+```json
+{
+  "blocks": [
+    { "type": "markdown", "text": "## Session store\nSessions live in memory and die on restart.\n\n| | SQLite | Redis |\n|---|---|---|\n| New service | no | yes |" },
+    { "type": "choice", "id": "store", "question": "Which store?",
+      "options": [
+        { "value": "sqlite", "label": "SQLite", "recommended": true },
+        { "value": "redis", "label": "Redis", "description": "shared across instances" }
+      ] },
+    { "type": "markdown", "text": "Lifetime decides how often people get logged out." },
+    { "type": "number", "id": "ttl_days", "question": "Session lifetime (days)", "default": 30, "min": 1 }
+  ]
+}
+```
+
+| Block | Fields |
+|---|---|
+| `markdown` | `text` |
+| `choice` | `id`, `question`, `optional`, `options[]` (`value`, `label`, `description`, `recommended`), `multi` |
+| `text` | `id`, `question`, `optional`, `multiline`, `placeholder`, `default` |
+| `number` | `id`, `question`, `optional`, `min`, `max`, `default` |
+
+Checks axo makes on the call, each returned as a tool error the model can fix:
+
+- at least one question block;
+- question ids non-empty and unique;
+- a `choice` has at least two options with unique, non-empty values;
+- a single-select `choice` has at most one `recommended` option;
+- a `number` has `min` ≤ `max` and a `default` inside that range.
+
+Yes/no is a two-option `choice`. The description keeps today's guidance on when to ask (only when a decision the user must make blocks progress) and adds: put what the user needs to decide in Markdown blocks, place each question after its context, mark the pick with `recommended` or `default`, never add "Other".
+
+### Result
+
+The model receives `User answers:` followed by one JSON object keyed by question `id`; `details` carries the same object under `answers` (plus `timedOut` when set), so a host can rebuild a settled card from the tool call and its result alone.
+
+```json
+{
+  "store":    { "value": "sqlite", "note": "keep the schema portable to Postgres" },
+  "features": { "value": ["ci"], "other": "terraform" },
+  "ttl_days": { "value": 30 },
+  "comment":  null
+}
+```
+
+- `value`: the chosen option `value` (never a display label), an array for `multi`, the typed text, or the number.
+- `other`: the user's own answer. On a single-select it replaces the pick; on a multi-select it is one more entry beside the picks.
+- `note`: a remark alongside the answer.
+- Dismissal, cancellation and the steered result (`details.outcome == "steered"`) keep today's behavior and text.
+
+### Host contract
+
+Public types in `crates/axo/src/tools/ask.rs`, exported from `axo` (names are a sketch):
+
+```rust
+pub enum AskBlock { Markdown { text: String }, Choice(ChoiceQuestion), Text(TextQuestion), Number(NumberQuestion) }
+pub struct QuestionOption { pub value: String, pub label: String, pub description: Option<String>, pub recommended: bool }
+pub struct Answer { pub id: String, pub value: Option<AnswerValue>, pub other: Option<String>, pub note: Option<String> }
+pub enum AnswerValue { Text(String), Number(serde_json::Number), Many(Vec<String>) }
+```
+
+- `SessionEvent::QuestionPending { call_id, blocks: Vec<AskBlock> }` and `LiveSnapshot::pending_questions: Vec<(String, Vec<AskBlock>)>` replace the `Vec<Question>` payloads.
+- `Session::answer(call_id, Vec<Answer>)` keeps its signature. It returns `Error::NoPendingQuestion` as today and `Error::InvalidInput` for a submission that does not fit the document; in the second case the question stays pending and no `QuestionResolved` is sent.
+- `Session::dismiss` is unchanged.
+
+Rules for a submission:
+
+| Question | Accepted |
+|---|---|
+| any | each answer names a question id once; a required question has an answer; blank `other` and `note` count as absent |
+| single `choice` | `value` is one option value, or `other` is set; not both |
+| multi `choice` | `value` is a list of distinct option values, optionally with `other`; a required one needs at least one of them |
+| `text` | `value` is non-blank text; no `other`, no `note` |
+| `number` | `value` is a number within `min`/`max`; no `other` |
+
+### What does not change
+
+- The pending registry, late attachment, `Replay::Safe` re-execution after restart, and withdrawal on cancel.
+- A queued steer settling the question with a non-error result.
+- `SessionOptions::ask_enabled`, agent allowlists, and children never getting `ask`.
+
+### Implementation plan
+
+1. **`tools/pending.rs`:** add a settle that computes the outcome from the stored payload under the lock and leaves the entry in place on error; `settle` becomes the infallible case of it. Mode results (`modes::ResultOutcome`) keep using `settle`.
+2. **`tools/ask.rs`:** replace `Question`/`Answer`/`QuestionResult` and both text formatters with the block types, one `check` for the model's call, and one function that turns `(&[AskBlock], Vec<Answer>)` into the result object or an error. Validation and result building are the same pass, so nothing unvalidated can reach the model. `PendingQuestions::answer` runs that function through the new settle. A second function builds the timeout result from `recommended`/`default`. Add an explicit timed-out outcome instead of reusing `Dismissed` for it.
+3. **Schema:** one flat block object (`type` enum plus every field optional, `additionalProperties: false`); per-kind requirements are enforced by deserializing into `AskBlock` with unknown fields denied. No tool in the workspace uses `anyOf`/`oneOf` today, and serde's errors ("missing field `options`") read better to a model than a failed union.
+4. **`session/mod.rs`, `tools/mod.rs`, `lib.rs`:** payload type and exports. `tools/edit.rs` only constructs `PendingQuestions` in a test and needs no change.
+5. **`examples/drive.rs`:** print Markdown blocks, answer each question from its `recommended`/`default`.
+6. **Tests (`crates/axo/tests/ask.rs`):** update the steer test to the new call shape. Add two that guard the contract: an invalid submission is rejected and the question is still pending and answerable; a timeout submits recommended/default values and reports no answer when a required question has none.
+7. **Docs, same change:** `README.md` tool table; `crates/axo/docs/extending.md` (example, `answer` row, `QuestionPending` row, a new "Ask documents for hosts" section with the block types, submission rules, result shape and the rendering note); `crates/axo/docs/configuration.md` (`ask.timeoutMs` meaning); `plan/design.md` `ask` bullet.
+
+### Open
+
+- **`default` typing in the flat schema.** `text` wants a string and `number` wants a number under the same key. A two-type `type` array may not be accepted by every provider; the alternatives are an untyped `default` or separate keys. Check the adapters in `axo-ai` before choosing.
+- **A note on a skipped optional question.** Keep it as `{ "note": … }` or drop it. Keeping it loses nothing the user typed.
+- **Later, not in this track:** pasted images on notes, and re-answering a settled question on a sibling branch (both exist in omp).
 
 ---
 

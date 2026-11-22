@@ -1,14 +1,32 @@
-// The author contract for axo provider extensions. Types only: nothing here runs, and an
-// extension never needs this package at runtime (`import type` / `satisfies` is erased).
+// The author contract for axo extensions. Types only: nothing here runs, and an extension
+// never needs this package at runtime (`import type` / `satisfies` is erased).
 //
 //   import type { Extension } from "@axo/extension-sdk";
-//   export default (async ({ id, dataDir }) => ({
-//     lab: { login, refresh, rewrite },
+//   export default (async ({ id, dataDir, session }) => ({
+//     providers: { lab: { login, refresh, rewrite } },
+//     tools: {
+//       echo: async ({ call, update }) => {
+//         update({ content: [{ type: "text", text: "working" }] });
+//         return { content: [{ type: "text", text: JSON.stringify(call.arguments) }] };
+//       },
+//     },
+//     commands: {
+//       hello: (args, session) =>
+//         session.post({ customType: "hello", text: args, display: true, delivery: "quiet" }),
+//     },
 //   })) satisfies Extension;
 //
-// The returned record is keyed by the provider IDs declared in `extension.json`. A provider
-// declared with `"login": true` must supply both `login` and `refresh`; `"rewrite": true`
-// requires `rewrite`. Undeclared providers or methods fail activation.
+// Everything the model or the host sees is declared statically in `extension.json`; the
+// default export only binds handlers to those declarations, and activation fails unless they
+// match both ways:
+// - `providers` is keyed by the provider IDs declared there. A provider declared with
+//   `"login": true` must supply both `login` and `refresh`; `"rewrite": true` requires
+//   `rewrite`.
+// - `tools`, `schemes` and `commands` are keyed by the declared names, one handler each.
+// - `toolPolicy` is present exactly when the manifest's `"toolPolicy"` lists hooks, and defines
+//   exactly the listed hooks (`"before"`, `"after"`). `spawnHook` and `onEntry` are present
+//   exactly when the manifest sets `"spawnHook"` and `"events"`.
+// Unknown keys, undeclared names and missing handlers fail activation.
 
 /** Any JSON value. */
 export type JsonValue =
@@ -218,14 +236,163 @@ interface RewriteHandler {
 
 export type ProviderHandlers = LoginHandlers & RewriteHandler;
 
+// ---- Sessions ----
+
+/** A user-visible content block (the Rust `UserBlock` serde shape). */
+export type UserBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+/**
+ * Acts on one session while the host has it attached; calls on a session the host no longer
+ * tracks reject.
+ */
+export interface SessionHandle {
+  id: string;
+  /**
+   * Adds a custom message to the session's context. `steer` lands at the next turn boundary,
+   * `followUp` when the active run would end (both start a run when idle); `quiet` waits for
+   * the next turn boundary or run start and never starts a run. The host stores the type as
+   * `<extension id>:<customType>`.
+   */
+  post(message: {
+    customType: string;
+    text: string;
+    display: boolean;
+    delivery: "steer" | "followUp" | "quiet";
+  }): Promise<void>;
+  /**
+   * Appends branch-scoped state without adding a context message; forks and reopens keep it.
+   * The host stores the type as `<extension id>:<customType>`.
+   */
+  appendCustom(customType: string, data?: JsonValue): Promise<void>;
+  /**
+   * The latest `appendCustom` data of `customType` on the current root-to-leaf path, or `null`.
+   * Reads this extension's own `<extension id>:<customType>` entries.
+   */
+  custom(customType: string): Promise<JsonValue | null>;
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, JsonValue>;
+}
+
+export interface ToolResult {
+  /** Model-facing result. */
+  content: UserBlock[];
+  /** Host/log data; never reaches the model. */
+  details?: JsonValue;
+  isError?: boolean;
+  /** Hint to stop after this batch; only honored when every result in the batch sets it. */
+  terminate?: boolean;
+}
+
+export interface ToolRun {
+  call: ToolCall;
+  session: SessionHandle;
+  /** Aborts when the host cancels the call. */
+  signal: AbortSignal;
+  /**
+   * A partial result the host shows while the tool runs. The result is sent only after the host
+   * has answered every update; one the host refuses is dropped.
+   */
+  update(update: { content: UserBlock[]; details?: JsonValue }): void;
+}
+
+export type ToolHandler = (run: ToolRun) => Promise<ToolResult>;
+
+/** Where a tool call runs. */
+export interface ToolScope {
+  sessionId: string;
+  depth: number;
+  agent: string | null;
+  mode: string | null;
+  readOnlyBash: boolean;
+}
+
+/**
+ * Sees every tool call of attached sessions. `before` blocks with an optional reason; `after`
+ * overrides fields of the result. `null` allows the call or keeps the result.
+ */
+export interface ToolPolicy {
+  before?(
+    scope: ToolScope,
+    call: ToolCall,
+    signal: AbortSignal,
+  ): Promise<null | { block: true; reason?: string; terminate?: boolean }>;
+  after?(
+    scope: ToolScope,
+    call: ToolCall,
+    result: { content: UserBlock[]; details?: JsonValue; isError: boolean },
+    signal: AbortSignal,
+  ): Promise<null | { content?: UserBlock[]; details?: JsonValue; isError?: boolean; terminate?: boolean }>;
+}
+
+/** A child agent about to be spawned. */
+export interface SpawnRequest {
+  /** The agent spec (the Rust `AgentSpec` serde shape). */
+  spec: JsonValue;
+  agent: string | null;
+  mode: string | null;
+  /** `provider/id`. */
+  model: string;
+  thinking: ThinkingLevel;
+  depth: number;
+  origin: "host" | "tool";
+  team: { name: string | null; member: string } | null;
+}
+
+/** `null` allows the spawn; `block` refuses it with a reason; `replace` spawns another `AgentSpec`. */
+export type SpawnHook = (
+  spawn: SpawnRequest,
+  session: SessionHandle,
+  signal: AbortSignal,
+) => Promise<null | { block: string } | { replace: JsonValue }>;
+
+export interface SchemeContext {
+  /** The scheme name, without `://`. */
+  scheme: string;
+  session: { id: string; dir: string; cwd: string };
+}
+
+/** Serves `<scheme>://<path>` URLs. */
+export interface SchemeHandlers {
+  /** `"virtual"` serves reads and writes here; `file` maps the URL to an absolute path. */
+  resolve(path: string, cx: SchemeContext, signal: AbortSignal): Promise<"virtual" | { file: string; writable: boolean }>;
+  read?(path: string, cx: SchemeContext, signal: AbortSignal): Promise<string>;
+  /** Returns a short confirmation for the model. */
+  write?(path: string, content: string, cx: SchemeContext, signal: AbortSignal): Promise<string>;
+}
+
+/** Runs `/name args`; `args` is the rest of the line, trimmed. */
+export type CommandHandler = (args: string, session: SessionHandle, signal: AbortSignal) => Promise<void>;
+
+// ---- The default export ----
+
 export interface ExtensionContext {
   /** The extension ID from `extension.json`. */
   id: string;
   /** A private directory the host provides for this extension's own files. */
   dataDir: string;
+  /** Session actions for an attached session by ID. */
+  session(id: string): SessionHandle;
+}
+
+/** Handlers by kind, bound to the declarations in `extension.json`. */
+export interface Handlers {
+  providers?: Record<string, ProviderHandlers>;
+  tools?: Record<string, ToolHandler>;
+  schemes?: Record<string, SchemeHandlers>;
+  commands?: Record<string, CommandHandler>;
+  toolPolicy?: ToolPolicy;
+  spawnHook?: SpawnHook;
+  /**
+   * New journal entries of attached sessions, in stored JSON shape and append order. Best effort
+   * with no replay: entries are skipped when the stream lags, the runner is unavailable or this
+   * handler throws.
+   */
+  onEntry?: (entry: JsonValue, session: SessionHandle) => void | Promise<void>;
 }
 
 /** The type of an extension's default export. */
-export type Extension = (
-  ctx: ExtensionContext,
-) => Record<string, ProviderHandlers> | Promise<Record<string, ProviderHandlers>>;
+export type Extension = (ctx: ExtensionContext) => Handlers | Promise<Handlers>;

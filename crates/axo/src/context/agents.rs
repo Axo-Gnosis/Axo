@@ -253,7 +253,7 @@ pub fn load_agents(
     for spec in programmatic {
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
-                origin: None,
+                origin: spec.path.clone().map(DiagnosticOrigin::Path),
                 message: format!("agent \"{}\": {message}", spec.name),
             });
         };

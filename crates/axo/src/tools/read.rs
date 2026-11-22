@@ -1,5 +1,6 @@
 //! The `read` tool (pi `core/tools/read.ts`).
 
+use std::borrow::Cow;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
@@ -16,7 +17,9 @@ use crate::tools::truncate::{
 };
 use crate::tools::{FileAccess, Located, SessionTools};
 
-const GUIDELINES: &[&str] = &["Use read to examine files instead of cat or sed."];
+const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
+    "Use read to examine files instead of cat or sed.",
+)];
 
 #[derive(Deserialize)]
 struct ReadArgs {
@@ -70,7 +73,7 @@ impl Tool for ReadTool {
         Replay::Safe
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
         GUIDELINES
     }
 

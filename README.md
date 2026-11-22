@@ -17,7 +17,7 @@ The workspace is split into three layered core crates so hosts only recompile wh
 | **[`axo-ai`](crates/axo-ai)** | LLM message model, streaming adapters, model catalog, and auth | Anthropic Messages, OpenAI Chat Completions, and OpenAI Codex Responses (`auth.json` OAuth + refresh locking); runtime provider registration with typed login (`ProviderLogin`, `LoginInteraction`) and request rewrite (`RequestRewrite`); `models.dev` catalog and account-discovered Codex models, refreshed in place (`Models::refresh`), with price-tier caps (lifted by `ModelsOptions::extended_context`) and cache-preserving tool-change capability (`Model::tool_support`); delta `Accumulator`; transient retry and context-overflow classification |
 | **[`axo-agent`](crates/axo-agent)** | Generic tool-calling agent loop | Parallel and sequential `Tool` execution with a per-call `ToolContext` (cancellation, updates, pending-steer signal, invocation id), deferred tools and dispatcher routing (`Tool::target`, `route`), `Replay` crash-safety contracts (`Safe` vs `Never`), host policy via `ToolHooks`, the `LoopHooks` driver contract, steering and follow-up queues of identified `QueuedMessage`s, `MessageOrigin` provenance on persisted messages, `CancelReason` (`User` vs `Shutdown`), and one ordered, immutable event sink (`Persist`) |
 | **[`axo`](crates/axo)** | Sessions, compaction, context assembly, config, and built-in tools | Durable `JsonlStore` with incremental `Projection` and `context_edit`s, single-writer OS locks, crash recovery, `attach` catch-up snapshots, recoverable `/shake` and live/separate compaction summaries, `DevShellEnv` Nix/direnv capture, host-selected command supervision (`Supervision`: process groups by default, opt-in cgroup v2 through an embedded supervisor entry point), per-session URL schemes (`artifact://`, `skill://`, `local://`, `axo://`, `proc://`, `agent://`, `tool://`, host `Scheme`s), background commands and subagents with `wait`, `kill`, and `send`, asynchronous `spawn` and schema-validated child `yield`, deferred tools through `call`, scoped `ToolPolicy`, and mode definition catalogs |
-| **[`axo-extensions`](crates/axo-extensions)** | Optional Bun provider-extension bridge above `axo` and `axo-ai` | `Extensions` loads trusted TypeScript/JavaScript packages enabled by the user-only `extensions` setting from host-supplied roots; static `extension.json` provider/model declarations published as one owned `ProviderLayer` (last enabled wins; hidden native providers reappear on removal); `login`, `refresh`, and request `rewrite` callbacks over an authenticated Unix socket to lazily started runners under the host's `ProcessSupervisor`; heartbeat, per-placement crash budget, typed status/collision events, and non-retryable `Error::ProviderUnavailable` for interrupted callbacks. Type-only author SDK in [`packages/axo-extension-sdk`](packages/axo-extension-sdk) |
+| **[`axo-extensions`](crates/axo-extensions)** | Optional Bun bridge for providers and session capabilities | Static `extension.json` declarations for providers, tools, policies, spawn hooks, schemes, sections, definitions and commands. `Extensions` composes host and user-enabled contributions, exposes diagnostics, and starts supervised runners on demand. Type-only SDK in [`packages/axo-extension-sdk`](packages/axo-extension-sdk) |
 
 ### Built-in tools (`crates/axo/src/tools`)
 
@@ -54,7 +54,7 @@ Hosts spawn asynchronous children with `Session::spawn` and teams with `Session:
 
 ### Commands & prompt parts
 
-`axo` owns the built-in commands (`/compact`, `/shake`, `/model`, `/thinking`, `/navigate`) and the prompt-part input shape; hosts expose the catalog via `session.commands()`. `Session::parse_command` parses built-ins first, then `/name [prompt]` for a loaded mode; `Session::run_command` enters that mode and delivers any prompt as a steer (starting a run when idle). The catalog also lists non-shadowed skills. See [Commands](crates/axo/docs/extending.md#commands) and [Prompt parts](crates/axo/docs/prompts-and-context.md#prompt-parts-cratesaxosrcinputrs).
+`axo` owns the built-in commands (`/compact`, `/shake`, `/model`, `/thinking`, `/navigate`) and the prompt-part input shape; hosts expose the catalog via `session.commands()`. `Session::parse_command` parses built-ins first, then `/name [prompt]` for a loaded mode, then `/name [args]` for a host-registered command (`SessionOptions::commands`, `Session::set_commands`); `Session::run_command` enters that mode and delivers any prompt as a steer (starting a run when idle), or awaits the registered `CommandHandler`. The catalog also lists non-shadowed skills. See [Commands](crates/axo/docs/extending.md#commands) and [Prompt parts](crates/axo/docs/prompts-and-context.md#prompt-parts-cratesaxosrcinputrs).
 
 ### Supervised commands & background jobs
 
@@ -121,7 +121,7 @@ Hosts keep one `Models` for their lifetime: `Models::reload` applies configurati
 
 Durable server hosts can opt into cgroup supervision (`Supervision::Cgroup`), where commands run in cgroup v2 jobs and the host routes arguments in `main` to `axo::exec::supervisor::run`. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) for the synchronous routing `main` example and failure details.
 
-Hosts that want TypeScript/JavaScript providers add `axo-extensions`: `Extensions::new(models, axo.supervisor(), ExtensionOptions { .. })` with the same `Arc<Models>`, then `configure(&settings.extensions)` before opening sessions and `shutdown()` on exit. The Bun path, package roots, and data/runtime directories are host choices; settings only list enabled extensions, and project layers cannot set them. See [Provider extensions](crates/axo/docs/extending.md#4-provider-extensions-axo-extensions).
+For TypeScript/JavaScript extensions, create an `Extensions` manager with the same `Arc<Models>` and `axo.supervisor()`, then call `configure(&settings.extensions)`. Compose session options before create/open and attach the resulting session (and any forks) to enable live reconfiguration, actions and journal events. Shut the manager down on exit. The host supplies the Bun binary and package, data and runtime locations; project settings cannot enable extensions. See [Bun extensions](crates/axo/docs/extending.md#4-bun-extensions-axo-extensions).
 
 ---
 
@@ -141,10 +141,10 @@ axo/
 │   │       ├── configuration.md    # ConfigSource and EffectiveConfig, settings, extensions list, models, provider layers, project access, dev shells, supervision
 │   │       ├── prompts-and-context.md     # Prompt sections, overrides, context files, skills, agents/teams, background jobs, prompt parts
 │   │       ├── sessions-and-compaction.md # JsonlStore, projection, recovery, attach, /shake, and compaction
-│   │       └── extending.md        # Declarative files, Rust embedding (Session, commands), extension traits, and Bun provider extensions
-│   └── axo-extensions/             # Optional Bun provider-extension bridge: manifests, provider layer, supervised runners
+│   │       └── extending.md        # Declarative files, Rust embedding, and Bun extensions
+│   └── axo-extensions/             # Manifests, provider layers, session bindings, supervised Bun runners
 │       ├── src/runner.ts           # Bun-side runner, embedded and materialized per generation
-│       └── tests/                  # `bridge` (in-process peer, always runs) and `bun_provider` (real Bun, opt-in)
+│       └── tests/                  # `bridge` (scripted runner) and `bun_provider` (real Bun, opt-in)
 ├── packages/
 │   └── axo-extension-sdk/          # Type-only `@axo/extension-sdk` author contract
 └── plan/                           # Architecture design, pi port studies, and background research

@@ -4,18 +4,21 @@
 //! Frames are a 4-byte big-endian length plus UTF-8 JSON, at most [`MAX_FRAME`] bytes both
 //! ways. One reader demultiplexes without awaiting user code; one writer serializes frames,
 //! letting pings and small reader-originated replies jump ahead of the byte-budgeted data
-//! queue. Rust calls use IDs `h:<n>` (shared with pings), runner callbacks `r:<n>`. A call's
-//! future owns its pending entry: dropping it queues a cancel frame behind the call frame,
-//! and a login drives its borrowed UI interactions inside its own future. Any protocol
-//! violation, EOF, write failure or missed heartbeat closes the peer and fails every pending
-//! call with [`CallError::Unavailable`].
+//! queue. Rust calls use IDs `h:<n>` (shared with pings), runner calls `r:<n>`. A call's
+//! future owns its pending entry: dropping it queues a cancel frame behind the call frame.
+//! A runner call naming a `parent` belongs to that host call and runs inside its future
+//! through the [`Callbacks`] it was given; one without a parent is a session action, run
+//! on its own task through the connection's [`Actions`]. The peer knows no method names.
+//! Any protocol violation, EOF, write failure or missed heartbeat closes the peer and fails
+//! every pending call with [`CallError::Unavailable`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use axo_ai::{DeviceCode, LoginInteraction, LoginOption, LoginPrompt, LoginSelect};
+use async_trait::async_trait;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -26,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 use tokio_util::sync::CancellationToken;
 
-pub const PROTOCOL: u64 = 1;
+pub const PROTOCOL: u64 = 2;
 /// Largest frame body either side may send or accept.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Bytes of data frames queued ahead of the socket before senders wait for room.
@@ -35,13 +38,34 @@ const QUEUE_LIMIT: usize = 2 * MAX_FRAME;
 const CONTROL_SLOTS: usize = 64;
 /// Cancel frames queued behind their calls; none left means the writer is stuck.
 const CANCEL_SLOTS: usize = 256;
-/// Live runner callbacks across all logins on one connection.
+/// Live runner calls (parented and session actions) across one connection.
 const MAX_CALLBACKS: usize = 256;
 pub const HANDSHAKE: Duration = Duration::from_secs(15);
 pub const PING_EVERY: Duration = Duration::from_secs(2);
 pub const PONG_DEADLINE: Duration = Duration::from_secs(10);
 
-const HOST_METHODS: [&str; 4] = ["activate", "login", "refresh", "rewrite"];
+/// Why Rust refuses a runner call; `code` and `message` go to the runner as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Serves the runner's calls made under one host call (`parent`).
+#[async_trait]
+pub trait Callbacks: Send + Sync {
+    async fn call(&self, method: &str, args: Value) -> Result<Value, Refusal>;
+}
+
+/// Serves runner calls that belong to no host call.
+pub trait Actions: Send + Sync {
+    fn call(
+        &self,
+        ext: String,
+        method: String,
+        args: Value,
+    ) -> BoxFuture<'static, Result<Value, Refusal>>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CallError {
@@ -109,6 +133,9 @@ struct Inner {
     data: mpsc::UnboundedSender<(Vec<u8>, OwnedSemaphorePermit)>,
     budget: Arc<Semaphore>,
     cancels: Arc<Semaphore>,
+    /// The extension IDs this runner hosts; a session action may only name one of them.
+    members: Arc<[String]>,
+    actions: Arc<dyn Actions>,
 }
 
 struct State {
@@ -117,47 +144,41 @@ struct State {
     calls: HashMap<u64, Pending>,
     pings: BTreeSet<u64>,
     last_pong: Instant,
-    /// Live runner callbacks by `r:` ID.
+    /// Live runner calls by `r:` ID.
     callbacks: HashMap<String, Live>,
 }
 
 struct Pending {
     ext: String,
-    method: &'static str,
+    method: String,
     reply: oneshot::Sender<Result<Value, CallError>>,
-    /// Present only for a login: routes its callbacks to the login's future.
+    /// Present only for a call given callbacks: routes its runner calls to its future.
     callbacks: Option<mpsc::UnboundedSender<Callback>>,
 }
 
 struct Live {
-    parent: u64,
+    /// The host call it belongs to; `None` for a session action.
+    parent: Option<u64>,
     cancel: CancellationToken,
 }
 
 struct Callback {
     id: String,
-    request: Interaction,
+    method: String,
+    args: Value,
     cancel: CancellationToken,
-}
-
-enum Interaction {
-    OpenUrl {
-        url: String,
-        instructions: Option<String>,
-    },
-    DeviceCode(DeviceCode),
-    Prompt(LoginPrompt),
-    Select(LoginSelect),
-    Progress(String),
 }
 
 impl Peer {
     /// Authenticates the runner's hello on `stream` and starts the reader, writer and
-    /// heartbeat for `generation`.
+    /// heartbeat for `generation`; `actions` serves the session actions of `members`, the
+    /// extensions this runner hosts.
     pub async fn connect(
         stream: UnixStream,
         generation: u64,
         nonce: &str,
+        members: Arc<[String]>,
+        actions: Arc<dyn Actions>,
     ) -> Result<Arc<Peer>, String> {
         let tag = generation.to_string();
         let (read, write) = stream.into_split();
@@ -197,6 +218,8 @@ impl Peer {
             data,
             budget: Arc::new(Semaphore::new(QUEUE_LIMIT)),
             cancels: Arc::new(Semaphore::new(CANCEL_SLOTS)),
+            members,
+            actions,
         });
         let tasks = vec![
             tokio::spawn(read_loop(inner.clone(), reader)),
@@ -209,25 +232,20 @@ impl Peer {
         }))
     }
 
-    /// Calls a runner method for `ext`. `login` needs `ui` and drives its interactions
-    /// until the runner's terminal reply; other methods take none. Dropping the future
-    /// withdraws the call; deadlines belong to the caller.
+    /// Calls a runner method for `ext`. Runner calls parented to this one are served by
+    /// `callbacks` inside this future until the terminal reply; without `callbacks` they are
+    /// a protocol violation. Dropping the future withdraws the call; deadlines belong to the
+    /// caller.
     pub async fn call(
         &self,
         ext: &str,
         method: &str,
         args: Value,
-        ui: Option<&dyn LoginInteraction>,
+        callbacks: Option<&dyn Callbacks>,
     ) -> Result<Value, CallError> {
-        let Some(method) = HOST_METHODS.into_iter().find(|m| *m == method) else {
-            return Err(CallError::Invalid);
-        };
-        if (method == "login") != ui.is_some() {
-            return Err(CallError::Invalid);
-        }
         let inner = &*self.inner;
         let (reply, mut result) = oneshot::channel();
-        let (callbacks, mut routed) = mpsc::unbounded_channel();
+        let (route, mut routed) = mpsc::unbounded_channel();
         let id = {
             let mut state = inner.lock();
             if inner.closed.is_cancelled() {
@@ -235,14 +253,13 @@ impl Peer {
             }
             let id = state.next;
             state.next += 1;
-            let callbacks = ui.is_some().then_some(callbacks);
             state.calls.insert(
                 id,
                 Pending {
                     ext: ext.to_owned(),
-                    method,
+                    method: method.to_owned(),
                     reply,
-                    callbacks,
+                    callbacks: callbacks.is_some().then_some(route),
                 },
             );
             id
@@ -262,17 +279,17 @@ impl Peer {
         inner.enqueue(frame).await?;
         outstanding.sent = true;
 
-        let mut interactions = FuturesUnordered::new();
+        let mut served = FuturesUnordered::new();
         loop {
             tokio::select! {
                 biased;
                 done = &mut result => return done.unwrap_or(Err(CallError::Unavailable)),
                 Some(callback) = routed.recv() => {
-                    if let Some(ui) = ui {
-                        interactions.push(inner.interact(ui, callback));
+                    if let Some(callbacks) = callbacks {
+                        served.push(inner.interact(callbacks, callback));
                     }
                 }
-                Some(()) = interactions.next(), if !interactions.is_empty() => {}
+                Some(()) = served.next(), if !served.is_empty() => {}
             }
         }
     }
@@ -323,7 +340,7 @@ impl State {
     fn finish(&mut self, id: u64) -> Option<Pending> {
         let pending = self.calls.remove(&id)?;
         self.callbacks.retain(|_, live| {
-            let keep = live.parent != id;
+            let keep = live.parent != Some(id);
             if !keep {
                 live.cancel.cancel();
             }
@@ -403,11 +420,7 @@ impl Inner {
         }
     }
 
-    fn reply_error(&self, id: &str, code: &str, message: &str) {
-        self.control(json!({"type": "error", "id": id, "code": code, "message": message}));
-    }
-
-    fn dispatch(&self, frame: Value) -> Result<(), &'static str> {
+    fn dispatch(self: &Arc<Self>, frame: Value) -> Result<(), &'static str> {
         let Value::Object(mut frame) = frame else {
             return Err("frame is not an object");
         };
@@ -462,63 +475,65 @@ impl Inner {
         };
         if let Some(pending) = pending {
             let result = result
-                .map_err(|code| CallError::Method(label(&pending.ext, pending.method, &code)));
+                .map_err(|code| CallError::Method(label(&pending.ext, &pending.method, &code)));
             let _ = pending.reply.send(result);
         }
         Ok(())
     }
 
-    fn callback(&self, id: String, mut frame: Map<String, Value>) -> Result<(), &'static str> {
+    fn callback(
+        self: &Arc<Self>,
+        id: String,
+        mut frame: Map<String, Value>,
+    ) -> Result<(), &'static str> {
         if !is_runner_id(&id) {
             return Err("call id is not a runner id");
         }
-        let args = frame.remove("args");
-        let method = frame
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or("malformed call")?;
-        if HOST_METHODS.contains(&method) {
-            return Err("runner called a host method");
-        }
-        let ext = frame
-            .get("ext")
-            .and_then(Value::as_str)
-            .ok_or("malformed call")?;
-        let parent = frame
-            .get("parent")
-            .and_then(Value::as_str)
-            .ok_or("unparented callback")?;
-        let request = Interaction::parse(method, args);
+        let args = frame.remove("args").unwrap_or(Value::Null);
+        let Some(Value::String(method)) = frame.remove("method") else {
+            return Err("malformed call");
+        };
+        let Some(Value::String(ext)) = frame.remove("ext") else {
+            return Err("malformed call");
+        };
+        let parent = match frame.get("parent") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(parent)) => Some(parent.as_str()),
+            Some(_) => return Err("malformed call"),
+        };
         let mut state = self.lock();
-        let parent = state
-            .issued(parent)
-            .ok_or("callback parent was never issued")?;
+        let parent = match parent {
+            Some(parent) => Some(
+                state
+                    .issued(parent)
+                    .ok_or("callback parent was never issued")?,
+            ),
+            None => None,
+        };
         if state.callbacks.contains_key(&id) {
             return Err("duplicate live callback id");
         }
-        let Some(pending) = state.calls.get(&parent) else {
-            return Ok(()); // the login already ended; the runner drops its own callback
-        };
-        if pending.ext != ext {
-            return Err("callback for another extension's login");
-        }
-        let Some(route) = pending.callbacks.clone() else {
-            return Err("callback parent is not a login");
+        let route = match parent {
+            Some(parent) => {
+                let Some(pending) = state.calls.get(&parent) else {
+                    return Ok(()); // the call already ended; the runner drops its own callback
+                };
+                if pending.ext != ext {
+                    return Err("callback for another extension's call");
+                }
+                let Some(route) = pending.callbacks.clone() else {
+                    return Err("callback parent takes no callbacks");
+                };
+                Some(route)
+            }
+            None if !self.members.contains(&ext) => {
+                return Err("session action for an extension outside this runner");
+            }
+            None => None,
         };
         if state.callbacks.len() >= MAX_CALLBACKS {
             return Err("too many live callbacks");
         }
-        let request = match request {
-            Some(Ok(request)) => request,
-            failure => {
-                drop(state);
-                match failure {
-                    None => self.reply_error(&id, "unsupported", "unknown host method"),
-                    _ => self.reply_error(&id, "invalid", "invalid arguments"),
-                }
-                return Ok(());
-            }
-        };
         let cancel = CancellationToken::new();
         state.callbacks.insert(
             id.clone(),
@@ -527,33 +542,55 @@ impl Inner {
                 cancel: cancel.clone(),
             },
         );
-        let _ = route.send(Callback {
-            id,
-            request,
-            cancel,
-        });
+        drop(state);
+        match route {
+            Some(route) => {
+                let _ = route.send(Callback {
+                    id,
+                    method,
+                    args,
+                    cancel,
+                });
+            }
+            None => {
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    let answer = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        answer = async { inner.actions.call(ext, method, args).await } => answer,
+                    };
+                    inner.answer(id, answer).await;
+                });
+            }
+        }
         Ok(())
     }
 
-    /// Runs one runner callback against the borrowed host UI and answers it, unless the
-    /// runner or the login withdrew it first.
-    async fn interact(&self, ui: &dyn LoginInteraction, callback: Callback) {
+    /// Runs one parented runner call through the host call's callbacks and answers it,
+    /// unless the runner or the host call withdrew it first.
+    async fn interact(&self, callbacks: &dyn Callbacks, callback: Callback) {
         let Callback {
             id,
-            request,
+            method,
+            args,
             cancel,
         } = callback;
         let answer = tokio::select! {
             _ = cancel.cancelled() => return,
-            answer = request.run(ui) => answer,
+            answer = callbacks.call(&method, args) => answer,
         };
+        self.answer(id, answer).await;
+    }
+
+    /// Replies to a live runner call; a withdrawn one gets nothing.
+    async fn answer(&self, id: String, answer: Result<Value, Refusal>) {
         if self.lock().callbacks.remove(&id).is_none() {
             return;
         }
         let reply = match answer {
             Ok(value) => json!({"type": "ok", "id": &id, "value": value}),
-            Err(code) => {
-                json!({"type": "error", "id": &id, "code": code, "message": format!("host {code}")})
+            Err(Refusal { code, message }) => {
+                json!({"type": "error", "id": &id, "code": code, "message": message})
             }
         };
         let frame = self.frame(reply).or_else(|| {
@@ -562,105 +599,6 @@ impl Inner {
         if let Some(frame) = frame {
             let _ = self.enqueue(frame).await;
         }
-    }
-}
-
-impl Interaction {
-    /// `None` for an unknown method, `Some(Err)` for malformed arguments.
-    fn parse(method: &str, args: Option<Value>) -> Option<Result<Interaction, ()>> {
-        let args = match args {
-            Some(Value::Object(args)) => args,
-            _ => return is_runner_method(method).then_some(Err(())),
-        };
-        let text = |key: &str| {
-            args.get(key)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or(())
-        };
-        let optional = |key: &str| match args.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) => Ok(Some(value.clone())),
-            Some(_) => Err(()),
-        };
-        let parsed = (|| -> Result<Option<Interaction>, ()> {
-            Ok(Some(match method {
-                "openUrl" => Interaction::OpenUrl {
-                    url: text("url")?,
-                    instructions: optional("instructions")?,
-                },
-                "deviceCode" => Interaction::DeviceCode(DeviceCode {
-                    user_code: text("userCode")?,
-                    verification_url: text("verificationUrl")?,
-                    expires_in_seconds: match args.get("expiresInSeconds") {
-                        None | Some(Value::Null) => None,
-                        Some(value) => Some(value.as_u64().ok_or(())?),
-                    },
-                }),
-                "prompt" => Interaction::Prompt(LoginPrompt {
-                    message: text("message")?,
-                    placeholder: optional("placeholder")?,
-                    secret: args.get("secret").and_then(Value::as_bool).ok_or(())?,
-                }),
-                "select" => {
-                    let options = args.get("options").and_then(Value::as_array).ok_or(())?;
-                    let options = options
-                        .iter()
-                        .map(|option| {
-                            let field = |key: &str| {
-                                option
-                                    .get(key)
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned)
-                                    .ok_or(())
-                            };
-                            Ok(LoginOption {
-                                id: field("id")?,
-                                label: field("label")?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, ()>>()?;
-                    if options.is_empty() {
-                        return Err(());
-                    }
-                    Interaction::Select(LoginSelect {
-                        message: text("message")?,
-                        options,
-                    })
-                }
-                "progress" => Interaction::Progress(text("message")?),
-                _ => return Ok(None),
-            }))
-        })();
-        match parsed {
-            Ok(Some(request)) => Some(Ok(request)),
-            Ok(None) => None,
-            Err(()) => Some(Err(())),
-        }
-    }
-
-    /// Notices are acknowledged once shown; prompt/select resolve with a validated answer.
-    /// Host UI errors reach the runner only as the fixed code `interaction`.
-    async fn run(self, ui: &dyn LoginInteraction) -> Result<Value, &'static str> {
-        let failed = |_: axo_ai::Error| "interaction";
-        match self {
-            Interaction::OpenUrl { url, instructions } => {
-                ui.open_url(&url, instructions.as_deref()).await
-            }
-            Interaction::DeviceCode(code) => ui.device_code(&code).await,
-            Interaction::Progress(message) => ui.progress(&message).await,
-            Interaction::Prompt(prompt) => {
-                return ui.prompt(&prompt).await.map(Value::String).map_err(failed);
-            }
-            Interaction::Select(select) => {
-                let choice = ui.select(&select).await.map_err(failed)?;
-                if !select.options.iter().any(|option| option.id == choice) {
-                    return Err("invalid");
-                }
-                return Ok(Value::String(choice));
-            }
-        }
-        Ok(Value::Null)
     }
 }
 
@@ -735,13 +673,6 @@ fn is_runner_id(id: &str) -> bool {
     id.strip_prefix("r:").is_some_and(is_counter)
 }
 
-fn is_runner_method(method: &str) -> bool {
-    matches!(
-        method,
-        "openUrl" | "deviceCode" | "prompt" | "select" | "progress"
-    )
-}
-
 /// A fixed, host-owned label for a runner error code. The runner's message is never shown:
 /// author text (and anything secret in it) may follow any prefix.
 fn label(ext: &str, method: &str, code: &str) -> String {
@@ -768,10 +699,55 @@ fn same(a: &str, b: &str) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
-    use axo_ai::Error;
+    use axo_ai::{DeviceCode, Error, LoginInteraction, LoginPrompt, LoginSelect};
 
     use super::*;
+    use crate::proxy::LoginCallbacks;
+
+    /// Drops of the `never` session action's future.
+    static NEVER_DROPPED: AtomicUsize = AtomicUsize::new(0);
+    /// Starts of the `never` session action: the task has created its future.
+    static NEVER_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Echoes `echo`, refuses `refuse`, never answers `never`.
+    struct TestActions;
+
+    impl Actions for TestActions {
+        fn call(
+            &self,
+            ext: String,
+            method: String,
+            args: Value,
+        ) -> BoxFuture<'static, Result<Value, Refusal>> {
+            if method == "never" {
+                NEVER_STARTED.fetch_add(1, Ordering::SeqCst);
+            }
+            // Marked from creation: a withdrawn action may never be polled.
+            let mark = (method == "never").then(|| DropMark(&NEVER_DROPPED));
+            Box::pin(async move {
+                match method.as_str() {
+                    "echo" => Ok(json!({"ext": ext, "args": args})),
+                    "never" => {
+                        let _mark = mark;
+                        std::future::pending().await
+                    }
+                    _ => Err(Refusal {
+                        code: "no_session",
+                        message: "session s is not attached".into(),
+                    }),
+                }
+            })
+        }
+    }
+
+    fn actions() -> Arc<dyn Actions> {
+        Arc::new(TestActions)
+    }
+
+    /// The extensions the test runner hosts: every frame names one of these, except `z`.
+    fn members() -> Arc<[String]> {
+        ["a".to_owned(), "b".to_owned()].into()
+    }
 
     const NONCE: &str = "4e6f6e6365";
     const GENERATION: u64 = 7;
@@ -839,7 +815,7 @@ mod tests {
     }
 
     fn hello() -> Value {
-        json!({"type": "hello", "protocol": 1, "nonce": NONCE, "generation": GENERATION.to_string()})
+        json!({"type": "hello", "protocol": 2, "nonce": NONCE, "generation": GENERATION.to_string()})
     }
 
     /// A connected peer and the runner end.
@@ -847,9 +823,12 @@ mod tests {
         let (host, runner) = UnixStream::pair().unwrap();
         let (reader, writer) = runner.into_split();
         let mut raw = Raw { reader, writer };
-        let (peer, ()) = tokio::join!(Peer::connect(host, GENERATION, NONCE), async {
-            raw.writer.write_all(&bytes(&hello())).await.unwrap();
-        });
+        let (peer, ()) = tokio::join!(
+            Peer::connect(host, GENERATION, NONCE, members(), actions()),
+            async {
+                raw.writer.write_all(&bytes(&hello())).await.unwrap();
+            }
+        );
         (peer.unwrap(), raw)
     }
 
@@ -944,12 +923,15 @@ mod tests {
         // One byte per write: the reader must reassemble the hello.
         let (host, runner) = UnixStream::pair().unwrap();
         let (reader, mut writer) = runner.into_split();
-        let (peer, ()) = tokio::join!(Peer::connect(host, GENERATION, NONCE), async {
-            for byte in bytes(&hello()) {
-                writer.write_all(&[byte]).await.unwrap();
-                tokio::task::yield_now().await;
+        let (peer, ()) = tokio::join!(
+            Peer::connect(host, GENERATION, NONCE, members(), actions()),
+            async {
+                for byte in bytes(&hello()) {
+                    writer.write_all(&[byte]).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
             }
-        });
+        );
         let peer = peer.unwrap();
         let mut raw = Raw { reader, writer };
         // And it works: one call round-trips, its reply split across writes too.
@@ -981,17 +963,20 @@ mod tests {
 
         // Wrong nonce, wrong protocol, missing generation or a non-hello first frame fail.
         let bad = [
-            json!({"type": "hello", "protocol": 1, "nonce": "wrong", "generation": "7"}),
-            json!({"type": "hello", "protocol": 2, "nonce": NONCE, "generation": "7"}),
-            json!({"type": "hello", "protocol": 1, "nonce": NONCE, "generation": "8"}),
-            json!({"type": "hello", "protocol": 1, "nonce": NONCE}),
+            json!({"type": "hello", "protocol": 2, "nonce": "wrong", "generation": "7"}),
+            json!({"type": "hello", "protocol": 1, "nonce": NONCE, "generation": "7"}),
+            json!({"type": "hello", "protocol": 2, "nonce": NONCE, "generation": "8"}),
+            json!({"type": "hello", "protocol": 2, "nonce": NONCE}),
             json!({"type": "pong", "id": "h:0", "generation": "7"}),
         ];
         for frame in bad {
             let (host, mut runner) = UnixStream::pair().unwrap();
-            let (peer, ()) = tokio::join!(Peer::connect(host, GENERATION, NONCE), async {
-                runner.write_all(&bytes(&frame)).await.unwrap();
-            });
+            let (peer, ()) = tokio::join!(
+                Peer::connect(host, GENERATION, NONCE, members(), actions()),
+                async {
+                    runner.write_all(&bytes(&frame)).await.unwrap();
+                }
+            );
             assert!(peer.is_err(), "accepted {frame}");
         }
     }
@@ -1068,8 +1053,9 @@ mod tests {
     async fn login_interleaves_callbacks_and_cancels_one_prompt() {
         let (peer, mut raw) = pair().await;
         let ui = Ui::default();
+        let callbacks = LoginCallbacks(&ui);
         let (login, refresh, ()) = tokio::join!(
-            peer.call("a", "login", json!({"provider": "p"}), Some(&ui)),
+            peer.call("a", "login", json!({"provider": "p"}), Some(&callbacks)),
             peer.call(
                 "a",
                 "refresh",
@@ -1197,8 +1183,9 @@ mod tests {
     async fn dropped_login_drops_its_ui_and_late_callbacks() {
         let (peer, mut raw) = pair().await;
         let ui = Ui::default();
+        let callbacks = LoginCallbacks(&ui);
         {
-            let login = peer.call("a", "login", json!({"provider": "p"}), Some(&ui));
+            let login = peer.call("a", "login", json!({"provider": "p"}), Some(&callbacks));
             tokio::pin!(login);
             let id = tokio::select! {
                 _ = &mut login => panic!("finished without a reply"),
@@ -1239,8 +1226,9 @@ mod tests {
     async fn ui_errors_and_bad_selections_answer_without_closing() {
         let (peer, mut raw) = pair().await;
         let ui = Ui::default();
+        let callbacks = LoginCallbacks(&ui);
         let (login, ()) = tokio::join!(
-            peer.call("a", "login", json!({"provider": "p"}), Some(&ui)),
+            peer.call("a", "login", json!({"provider": "p"}), Some(&callbacks)),
             async {
                 let (login, ..) = called(&raw.next().await.unwrap());
                 let callback = |id: &str, method: &str, args: Value| json!({"type": "call", "id": id, "ext": "a", "method": method, "args": args, "parent": login});
@@ -1283,6 +1271,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_actions_run_outside_host_calls() {
+        let (peer, mut raw) = pair().await;
+        let action = |id: &str, method: &str| json!({"type": "call", "id": id, "ext": "a", "method": method, "args": {"session": "s"}});
+        // No host call is pending: unparented calls are answered on their own.
+        raw.send(action("r:0", "never")).await;
+        raw.send(action("r:1", "echo")).await;
+        raw.send(action("r:2", "refuse")).await;
+        let mut replies = std::collections::BTreeMap::new();
+        while replies.len() < 2 {
+            let frame = raw.next().await.unwrap();
+            replies.insert(frame["id"].as_str().unwrap().to_owned(), frame);
+        }
+        assert_eq!(
+            replies["r:1"]["value"],
+            json!({"ext": "a", "args": {"session": "s"}})
+        );
+        assert_eq!(
+            (
+                replies["r:2"]["code"].as_str(),
+                replies["r:2"]["message"].as_str()
+            ),
+            (Some("no_session"), Some("session s is not attached"))
+        );
+        // The runner withdraws the pending one once it runs: its future is dropped, nothing
+        // is sent. An action withdrawn before its task starts never creates a future.
+        wait_for("action started", || {
+            NEVER_STARTED.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        raw.send(json!({"type": "cancel", "id": "r:0"})).await;
+        wait_for("action dropped", || {
+            NEVER_DROPPED.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // A live action id cannot be reused while it runs.
+        raw.send(action("r:3", "never")).await;
+        wait_for("second action started", || {
+            NEVER_STARTED.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        raw.send(action("r:3", "never")).await;
+        raw.expect_eof().await;
+        closes(&peer).await;
+        // Closing dropped the remaining action too.
+        wait_for("action dropped on close", || {
+            NEVER_DROPPED.load(Ordering::SeqCst) == 2
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn session_action_outside_the_runner_closes_without_running() {
+        let (peer, mut raw) = pair().await;
+        raw.send(json!({"type": "call", "id": "r:0", "ext": "z", "method": "echo", "args": {"session": "s"}}))
+            .await;
+        raw.expect_eof().await;
+        closes(&peer).await;
+        peer.join().await;
+    }
+
+    #[tokio::test]
     async fn protocol_violations_close_and_fail_pending_calls() {
         let violations: Vec<(&str, Vec<u8>)> = vec![
             ("invalid json", {
@@ -1300,21 +1349,15 @@ mod tests {
                 bytes(&json!({"type": "shout", "id": "r:0", "generation": "7"})),
             ),
             (
-                "unparented callback",
-                bytes(
-                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {"message": "x"}, "generation": "7"}),
-                ),
-            ),
-            (
-                "parent is not a login",
+                "parent takes no callbacks",
                 bytes(
                     &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {"message": "x"}, "parent": "h:0", "generation": "7"}),
                 ),
             ),
             (
-                "host method from runner",
+                "parent never issued",
                 bytes(
-                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "login", "args": {}, "generation": "7"}),
+                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {}, "parent": "h:99", "generation": "7"}),
                 ),
             ),
             (
@@ -1363,8 +1406,9 @@ mod tests {
         // Duplicate live callback IDs inside one login.
         let (peer, mut raw) = pair().await;
         let ui = Ui::default();
+        let callbacks = LoginCallbacks(&ui);
         let (result, ()) = tokio::join!(
-            peer.call("a", "login", json!({"provider": "p"}), Some(&ui)),
+            peer.call("a", "login", json!({"provider": "p"}), Some(&callbacks)),
             async {
                 let (login, ..) = called(&raw.next().await.unwrap());
                 let prompt = json!({"type": "call", "id": "r:0", "ext": "a", "method": "prompt", "args": {"message": "never", "secret": false}, "parent": login});
@@ -1437,17 +1481,7 @@ mod tests {
             .call("a", "rewrite", json!({"provider": "p", "model": {}, "request": {"url": "http://x/", "headers": [], "body": {"big": huge}}}), None)
             .await;
         assert!(matches!(result, Err(CallError::Invalid)), "{result:?}");
-        // Unknown methods and login without a UI are also rejected before writing.
-        assert!(matches!(
-            peer.call("a", "teleport", json!({}), None).await,
-            Err(CallError::Invalid)
-        ));
-        assert!(matches!(
-            peer.call("a", "login", json!({"provider": "p"}), None)
-                .await,
-            Err(CallError::Invalid)
-        ));
-        // Nothing was written for them, and the connection is healthy.
+        // Nothing was written for it, and the connection is healthy.
         let (result, ()) = tokio::join!(
             peer.call(
                 "a",
@@ -1489,8 +1523,9 @@ mod tests {
         // A runner that stops answering is closed after 10 s without a pong.
         let silent = tokio::time::Instant::now();
         let ui = Ui::default();
+        let callbacks = LoginCallbacks(&ui);
         let (result, ()) = tokio::join!(
-            peer.call("a", "login", json!({"provider": "p"}), Some(&ui)),
+            peer.call("a", "login", json!({"provider": "p"}), Some(&callbacks)),
             async {
                 peer.closed().await;
             }

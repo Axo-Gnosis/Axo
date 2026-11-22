@@ -18,7 +18,10 @@ pub mod store;
 pub mod tools;
 
 pub use axo::{Axo, AxoBuilder, Catalog};
-pub use commands::{Command, CommandInfo, CommandKind, CommandPolicy};
+pub use commands::{
+    Command, CommandHandler, CommandInfo, CommandKind, CommandPolicy, RegisteredCommand,
+    valid_command_name,
+};
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
     EffectiveConfig, EnabledExtension, ExtensionListError, ModelChoice, PROMPT_NAMES,
@@ -28,6 +31,7 @@ pub use config::{
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::keywords::{KeywordMatch, KeywordSettings, KeywordSpec};
 pub use context::modes::{BashAccess, ModeResult, ModeSpec, ToolLimits};
+pub use context::prompt::valid_section_name;
 pub use context::{Diagnostic, DiagnosticOrigin};
 pub use coordination::{
     KillReceipt, SendIdentity, SendKind, SendReceipt, SpawnReceipt, SubmissionProvenance,
@@ -45,14 +49,14 @@ pub use jobs::{
     ChildProgress, CommandExit, CommandOutput, JobInfo, JobKind, JobMessageInfo, JobStatus, Killer,
     MessageDelivery, OutputProgress, Promotion, jobs_from_entries,
 };
-pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
+pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target, valid_scheme_name};
 pub use session::{
     AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
     HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
     PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput, RecoveryPolicy,
-    ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo, ShakeMode,
-    SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle,
-    TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
+    Registrations, ResultResolution, Session, SessionEvent, SessionOptions, SessionToolInfo,
+    ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest, SpawnTeam,
+    TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,

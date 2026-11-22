@@ -24,6 +24,7 @@ pub(crate) mod writes;
 
 use ignore::WalkBuilder;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,6 +37,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::context::files::NestedContext;
 use crate::context::modes::BashAccess;
+use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
 use crate::jobs::command::CommandRunner;
@@ -103,6 +105,8 @@ pub enum Exposure {
 pub struct HostTool {
     pub factory: ToolFactory,
     pub exposure: Exposure,
+    /// Who registered it, for diagnostics and `SessionToolInfo::origin`.
+    pub origin: Option<String>,
 }
 
 impl HostTool {
@@ -110,6 +114,7 @@ impl HostTool {
         Self {
             factory,
             exposure: Exposure::Direct,
+            origin: None,
         }
     }
 
@@ -117,8 +122,40 @@ impl HostTool {
         Self {
             factory,
             exposure: Exposure::Deferred,
+            origin: None,
         }
     }
+
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
+    }
+}
+
+/// A host tool built for one session, with who registered it.
+#[derive(Clone)]
+pub(crate) struct Hosted {
+    pub tool: Arc<dyn Tool>,
+    pub origin: Option<String>,
+}
+
+/// Builds `tools` for `session`, split into (direct, deferred) in registration order.
+pub(crate) fn instantiate(
+    tools: &[HostTool],
+    session: &Arc<SessionTools>,
+) -> (Vec<Hosted>, Vec<Hosted>) {
+    let (mut direct, mut deferred) = (Vec::new(), Vec::new());
+    for tool in tools {
+        let hosted = Hosted {
+            tool: (tool.factory)(session),
+            origin: tool.origin.clone(),
+        };
+        match tool.exposure {
+            Exposure::Direct => direct.push(hosted),
+            Exposure::Deferred => deferred.push(hosted),
+        }
+    }
+    (direct, deferred)
 }
 
 /// A tool path located without applying plain-filesystem fallback rules.
@@ -156,6 +193,11 @@ impl SessionTools {
             writes: Mutex::new(None),
             snapshots,
         }
+    }
+
+    /// The id of the session these tools belong to.
+    pub fn session_id(&self) -> &str {
+        &self.schemes.context().session_id
     }
 
     /// Records a completed write of `after` to `path`: updates the ledger, stores the
@@ -455,15 +497,42 @@ pub(crate) fn replace_or_push<T: ?Sized>(
     }
 }
 
-/// Applies host tools in order, replacing matching built-ins without changing their position.
+/// Applies direct host tools in order, replacing matching built-ins without changing their
+/// position; a later host tool replaces an earlier one. Returns the tools and a diagnostic
+/// per replacement that involves a labeled registration.
 pub(crate) fn merge_tools(
-    mut builtin: Vec<Arc<dyn Tool>>,
-    host: &[Arc<dyn Tool>],
-) -> Vec<Arc<dyn Tool>> {
-    for tool in host {
-        replace_or_push(&mut builtin, tool.clone(), |tool| tool.name());
+    mut tools: Vec<Arc<dyn Tool>>,
+    host: &[Hosted],
+) -> (Vec<Arc<dyn Tool>>, Vec<Diagnostic>) {
+    let mut owners: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for hosted in host {
+        let name = hosted.tool.name();
+        let winner = hosted.origin.as_deref();
+        let message = match owners.get(name) {
+            Some(loser) if winner.is_some() || loser.is_some() => Some(format!(
+                "tool \"{name}\" from {} replaces the one from {}",
+                who(winner),
+                who(*loser)
+            )),
+            None if winner.is_some() && tools.iter().any(|tool| tool.name() == name) => Some(
+                format!("tool \"{name}\" from {} replaces the built-in", who(winner)),
+            ),
+            _ => None,
+        };
+        diagnostics.extend(message.map(|message| Diagnostic {
+            origin: winner.map(|origin| DiagnosticOrigin::Host(origin.to_owned())),
+            message,
+        }));
+        owners.insert(name, winner);
+        replace_or_push(&mut tools, hosted.tool.clone(), |tool| tool.name());
     }
-    builtin
+    (tools, diagnostics)
+}
+
+/// How diagnostics name a registration's origin.
+pub(crate) fn who(origin: Option<&str>) -> &str {
+    origin.unwrap_or("the host")
 }
 
 #[cfg(test)]

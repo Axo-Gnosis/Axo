@@ -6,21 +6,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axo_ai::{
-    Credential, Error, LoginInteraction, Model, Provider, ProviderLogin, ProviderRequest,
-    RequestRewrite,
+    Credential, DeviceCode, Error, LoginInteraction, LoginOption, LoginPrompt, LoginSelect, Model,
+    Provider, ProviderLogin, ProviderRequest, RequestRewrite,
 };
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::Descriptor;
-use crate::peer::CallError;
+use crate::peer::{Callbacks, Refusal};
 use crate::placement::Placement;
+use crate::remote::{self, CALL_DEADLINE, Failure};
 use crate::wire_value::{decode_credential, decode_request, encode_request};
-
-/// Refresh holds the credential store's lock and rewrite holds a waiting request; neither
-/// may hang on a runner that answers heartbeats but not this call. Measured from the call,
-/// including a cold start. Login waits on a human and has no deadline.
-const CALL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The provider `desc` declares, owned by extension `ext` in `placement`. Once `retired`
 /// is canceled every call fails at once and a reply still in flight is discarded.
@@ -66,7 +62,7 @@ impl Bridge {
         &self,
         method: &str,
         args: Value,
-        ui: Option<&dyn LoginInteraction>,
+        callbacks: Option<&dyn Callbacks>,
         deadline: Option<Duration>,
     ) -> Result<Value, Error> {
         let label = self.label(method);
@@ -78,37 +74,22 @@ impl Bridge {
         if self.retired.is_cancelled() {
             return Err(retired());
         }
-        let call = async {
-            let peer = self.placement.peer(&self.ext).await.map_err(unavailable)?;
-            peer.call(&self.ext, method, args, ui)
-                .await
-                .map_err(|error| match error {
-                    CallError::Unavailable => {
-                        unavailable(format!("{label}: interrupted, the runner stopped"))
-                    }
-                    CallError::Method(message) => Error::Auth(format!("{label} failed: {message}")),
-                    CallError::Invalid => Error::Auth(format!(
-                        "{label}: the request is invalid or too large to send"
-                    )),
-                })
-        };
-        let call = async {
-            match deadline {
-                None => call.await,
-                Some(deadline) => tokio::time::timeout(deadline, call)
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(unavailable(format!(
-                            "{label}: no reply within {}s",
-                            deadline.as_secs()
-                        )))
-                    }),
-            }
-        };
+        let call = remote::call(
+            &self.placement,
+            &self.ext,
+            &label,
+            method,
+            args,
+            callbacks,
+            deadline,
+        );
         let value = tokio::select! {
             biased;
             _ = self.retired.cancelled() => return Err(retired()),
-            value = call => value?,
+            value = call => value.map_err(|failure| match failure {
+                Failure::Unavailable(reason) | Failure::Removed(reason) => unavailable(reason),
+                Failure::Method(message) | Failure::Invalid(message) => Error::Auth(message),
+            })?,
         };
         // A reply that raced retirement belongs to a contribution that no longer exists.
         if self.retired.is_cancelled() {
@@ -122,7 +103,8 @@ impl Bridge {
 impl ProviderLogin for Bridge {
     async fn login(&self, interaction: &dyn LoginInteraction) -> Result<Credential, Error> {
         let args = json!({ "provider": self.provider });
-        let value = self.call("login", args, Some(interaction), None).await?;
+        let ui = LoginCallbacks(interaction);
+        let value = self.call("login", args, Some(&ui), None).await?;
         decode_credential(value, &self.label("login")).map_err(Error::Auth)
     }
 
@@ -151,5 +133,139 @@ impl RequestRewrite for Bridge {
             .call("rewrite", args, None, Some(CALL_DEADLINE))
             .await?;
         decode_request(value, &self.label("rewrite")).map_err(Error::Auth)
+    }
+}
+
+/// Serves a login's runner calls from the host's login UI.
+pub struct LoginCallbacks<'a>(pub &'a dyn LoginInteraction);
+
+enum Interaction {
+    OpenUrl {
+        url: String,
+        instructions: Option<String>,
+    },
+    DeviceCode(DeviceCode),
+    Prompt(LoginPrompt),
+    Select(LoginSelect),
+    Progress(String),
+}
+
+#[async_trait]
+impl Callbacks for LoginCallbacks<'_> {
+    async fn call(&self, method: &str, args: Value) -> Result<Value, Refusal> {
+        let refuse = |code: &'static str, message: &str| Refusal {
+            code,
+            message: message.to_owned(),
+        };
+        match Interaction::parse(method, args) {
+            None => Err(refuse("unsupported", "unknown host method")),
+            Some(Err(())) => Err(refuse("invalid", "invalid arguments")),
+            Some(Ok(request)) => request.run(self.0).await.map_err(|code| match code {
+                "invalid" => refuse(code, "the selection is not one of the options"),
+                _ => refuse(code, "host interaction failed"),
+            }),
+        }
+    }
+}
+
+impl Interaction {
+    /// `None` for an unknown method, `Some(Err)` for malformed arguments.
+    fn parse(method: &str, args: Value) -> Option<Result<Interaction, ()>> {
+        let known = matches!(
+            method,
+            "openUrl" | "deviceCode" | "prompt" | "select" | "progress"
+        );
+        let Value::Object(args) = args else {
+            return known.then_some(Err(()));
+        };
+        let text = |key: &str| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(())
+        };
+        let optional = |key: &str| match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(()),
+        };
+        let parsed = (|| -> Result<Option<Interaction>, ()> {
+            Ok(Some(match method {
+                "openUrl" => Interaction::OpenUrl {
+                    url: text("url")?,
+                    instructions: optional("instructions")?,
+                },
+                "deviceCode" => Interaction::DeviceCode(DeviceCode {
+                    user_code: text("userCode")?,
+                    verification_url: text("verificationUrl")?,
+                    expires_in_seconds: match args.get("expiresInSeconds") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(value.as_u64().ok_or(())?),
+                    },
+                }),
+                "prompt" => Interaction::Prompt(LoginPrompt {
+                    message: text("message")?,
+                    placeholder: optional("placeholder")?,
+                    secret: args.get("secret").and_then(Value::as_bool).ok_or(())?,
+                }),
+                "select" => {
+                    let options = args.get("options").and_then(Value::as_array).ok_or(())?;
+                    let options = options
+                        .iter()
+                        .map(|option| {
+                            let field = |key: &str| {
+                                option
+                                    .get(key)
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                                    .ok_or(())
+                            };
+                            Ok(LoginOption {
+                                id: field("id")?,
+                                label: field("label")?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ()>>()?;
+                    if options.is_empty() {
+                        return Err(());
+                    }
+                    Interaction::Select(LoginSelect {
+                        message: text("message")?,
+                        options,
+                    })
+                }
+                "progress" => Interaction::Progress(text("message")?),
+                _ => return Ok(None),
+            }))
+        })();
+        match parsed {
+            Ok(Some(request)) => Some(Ok(request)),
+            Ok(None) => None,
+            Err(()) => Some(Err(())),
+        }
+    }
+
+    /// Notices are acknowledged once shown; prompt/select resolve with a validated answer.
+    /// Host UI errors reach the runner only as the fixed code `interaction`.
+    async fn run(self, ui: &dyn LoginInteraction) -> Result<Value, &'static str> {
+        let failed = |_: axo_ai::Error| "interaction";
+        match self {
+            Interaction::OpenUrl { url, instructions } => {
+                ui.open_url(&url, instructions.as_deref()).await
+            }
+            Interaction::DeviceCode(code) => ui.device_code(&code).await,
+            Interaction::Progress(message) => ui.progress(&message).await,
+            Interaction::Prompt(prompt) => {
+                return ui.prompt(&prompt).await.map(Value::String).map_err(failed);
+            }
+            Interaction::Select(select) => {
+                let choice = ui.select(&select).await.map_err(failed)?;
+                if !select.options.iter().any(|option| option.id == choice) {
+                    return Err("invalid");
+                }
+                return Ok(Value::String(choice));
+            }
+        }
+        Ok(Value::Null)
     }
 }

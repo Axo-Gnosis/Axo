@@ -108,7 +108,7 @@ pub fn load_keywords(
     for spec in programmatic {
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
-                origin: None,
+                origin: spec.path.clone().map(DiagnosticOrigin::Path),
                 message: format!("keyword \"{}\": {message}", spec.name),
             });
         };

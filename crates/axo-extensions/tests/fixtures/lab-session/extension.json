@@ -1,0 +1,39 @@
+{
+  "id": "lab-session",
+  "entry": "index.ts",
+  "providers": [],
+  "tools": [
+    {
+      "name": "read",
+      "description": "Lab replacement for the built-in read tool.",
+      "parameters": {
+        "type": "object",
+        "properties": { "path": { "type": "string" } },
+        "required": ["path"]
+      },
+      "guidelines": ["The lab read tool echoes its arguments."]
+    },
+    {
+      "name": "probe",
+      "description": "Lab probe: `state` round-trips branch state, `hang` waits for cancellation.",
+      "parameters": {
+        "type": "object",
+        "properties": { "mode": { "type": "string", "enum": ["state", "hang"] } },
+        "required": ["mode"]
+      },
+      "exposure": "deferred",
+      "executionMode": "sequential"
+    },
+    {
+      "name": "burst",
+      "description": "Lab burst: sends 300 updates, then returns `burst`.",
+      "parameters": { "type": "object" },
+      "exposure": "deferred"
+    }
+  ],
+  "schemes": [{ "name": "lab", "promptDoc": "lab:// URLs read lab fixtures." }],
+  "commands": [{ "name": "hello", "description": "Posts its arguments as a lab message.", "argumentHint": "<text>" }],
+  "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
+  "toolPolicy": ["before"],
+  "events": true
+}

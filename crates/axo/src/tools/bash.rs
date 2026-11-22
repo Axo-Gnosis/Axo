@@ -2,6 +2,7 @@
 //! Command execution and background delivery are shared with host tools through
 //! [`SessionTools::run_command`].
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,13 @@ use crate::tools::{CommandRequest, SessionTools};
 
 /// pi `MAX_TIMEOUT_MS / 1000`.
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
+
+const GUIDELINES: &[Cow<'static, str>] = &[
+    Cow::Borrowed(
+        "A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes.",
+    ),
+    Cow::Borrowed("List jobs with read proc:// and stop one with kill."),
+];
 
 #[derive(Deserialize)]
 struct BashArgs {
@@ -86,11 +94,8 @@ impl Tool for BashTool {
         &self.description
     }
 
-    fn prompt_guidelines(&self) -> &[&str] {
-        &[
-            "A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes.",
-            "List jobs with read proc:// and stop one with kill.",
-        ]
+    fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
+        GUIDELINES
     }
 
     fn parameters(&self) -> &Value {

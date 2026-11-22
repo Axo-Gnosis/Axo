@@ -59,13 +59,14 @@ impl SessionHooks {
 
     /// Direct tools, then catalog tools not already direct; never requests a promotion.
     pub(super) fn tool_infos(&self) -> Vec<SessionToolInfo> {
-        let direct = self
-            .prompt
-            .shape
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .tools
-            .clone();
+        let (direct, origins) = {
+            let shape = self
+                .prompt
+                .shape
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            (shape.tools.clone(), shape.origins.clone())
+        };
         let catalog = self.catalog();
         let promoted = self
             .promoted
@@ -91,6 +92,7 @@ impl SessionHooks {
                     promoted: promoted.iter().any(|entry| entry == name),
                     allowed_in_mode: name == YIELD
                         || mode.as_ref().is_none_or(|mode| mode.tools.permits(name)),
+                    origin: origins.get(name).cloned(),
                 }
             })
             .collect()

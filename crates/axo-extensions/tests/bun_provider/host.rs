@@ -13,7 +13,7 @@ use axo::{
     Supervision,
 };
 use axo_ai::{
-    AssistantEvent, FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions,
+    AssistantEvent, FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions, ScriptedApi,
     SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
 };
 use axo_extensions::{ExtensionOptions, ExtensionPhase, ExtensionStatus, Extensions};
@@ -27,6 +27,8 @@ use crate::server::Server;
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 /// The package every host starts with.
 pub const LAB: &str = "lab-provider";
+/// The session-capabilities package [`Host::sessions`] starts with.
+pub const SESSION: &str = "lab-session";
 /// Bound for every explicit barrier wait.
 pub const WAIT_LIMIT: Duration = Duration::from_secs(30);
 
@@ -42,6 +44,43 @@ pub struct Host {
 impl Host {
     /// A host whose `Axo` uses `mode`, with `lab-provider` installed and enabled (cold).
     pub async fn new(bun: &Path, mode: Supervision) -> Self {
+        let host = Self::build(bun, mode, ModelsConfig::default(), None).await;
+        host.install(LAB, LAB);
+        host.extensions
+            .configure(&[enabled(LAB, None)])
+            .await
+            .unwrap();
+        host
+    }
+
+    /// A host whose sessions stream from the returned [`ScriptedApi`] (model `test/m`, turns
+    /// queued with `lane("m", …)`), with `lab-session` installed and enabled (cold).
+    pub async fn sessions(bun: &Path, mode: Supervision) -> (Self, Arc<ScriptedApi>) {
+        let config = ModelsConfig::parse_jsonc(
+            &serde_json::json!({"providers": {"test": {
+                "api": "openai-completions",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "models": [{"id": "m"}],
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let api = Arc::new(ScriptedApi::new(Vec::new()));
+        let host = Self::build(bun, mode, config, Some(api.clone())).await;
+        host.install(SESSION, SESSION);
+        host.extensions
+            .configure(&[enabled(SESSION, None)])
+            .await
+            .unwrap();
+        (host, api)
+    }
+
+    async fn build(
+        bun: &Path,
+        mode: Supervision,
+        config: ModelsConfig,
+        streamer: Option<Arc<ScriptedApi>>,
+    ) -> Self {
         // Under /tmp: per-generation socket paths must stay below the Unix path limit.
         let temp = tempfile::Builder::new()
             .prefix("axbun")
@@ -56,7 +95,7 @@ impl Host {
             Models::load(ModelsOptions {
                 cache_dir: None,
                 extended_context: false,
-                config: ModelsConfig::default(),
+                config,
                 credentials: store.clone(),
                 http_client: None,
             })
@@ -64,12 +103,15 @@ impl Host {
             .unwrap(),
         );
         let detach = matches!(mode, Supervision::Cgroup { .. });
-        let axo = Axo::builder(
+        let mut builder = Axo::builder(
             models.clone(),
             Arc::new(JsonlStore::new(temp.path().join("sessions"))),
         )
-        .supervision(mode)
-        .build();
+        .supervision(mode);
+        if let Some(streamer) = streamer {
+            builder = builder.streamer(streamer);
+        }
+        let axo = builder.build();
         let extensions = Extensions::new(
             models.clone(),
             axo.supervisor(),
@@ -81,20 +123,14 @@ impl Host {
                 env: Arc::new(runner_env(temp.path(), &server.url, detach)),
             },
         );
-        let host = Host {
+        Host {
             axo,
             models,
             store,
             extensions,
             server,
             temp,
-        };
-        host.install(LAB, LAB);
-        host.extensions
-            .configure(&[enabled(LAB, None)])
-            .await
-            .unwrap();
-        host
+        }
     }
 
     pub fn path(&self, sub: &str) -> PathBuf {

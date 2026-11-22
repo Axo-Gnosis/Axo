@@ -644,7 +644,8 @@ impl Run<'_> {
         if let Err(text) = validate_arguments(&**tool, call) {
             return Prepared::Immediate(error_output(text));
         }
-        for hook in &self.agent.tool_hooks {
+        let hooks = self.agent.tool_hooks();
+        for hook in hooks.iter() {
             let decision = hook
                 .before_tool_call(
                     BeforeToolCallContext {
@@ -821,7 +822,8 @@ impl Run<'_> {
         call: &ToolCall,
         output: &mut ToolOutput,
     ) {
-        for hook in &self.agent.tool_hooks {
+        let hooks = self.agent.tool_hooks();
+        for hook in hooks.iter() {
             let overrides = hook
                 .after_tool_call(
                     AfterToolCallContext {
