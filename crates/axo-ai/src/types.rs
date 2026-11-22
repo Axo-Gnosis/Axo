@@ -96,6 +96,9 @@ pub struct AssistantMessage {
     /// Thinking level the agent loop requested for this response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ThinkingLevel>,
+    /// Tier that served this response: the provider's report, else the tier the request asked for.
+    #[serde(default, skip_serializing_if = "ServiceTier::is_standard")]
+    pub service_tier: ServiceTier,
     pub usage: Usage,
     pub stop_reason: StopReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +127,7 @@ impl AssistantMessage {
             response_id: None,
             provider_thinking_level: None,
             thinking_level: None,
+            service_tier: ServiceTier::Standard,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -369,6 +373,66 @@ impl std::str::FromStr for ThinkingLevel {
             .into_iter()
             .find(|level| level.as_str() == text)
             .ok_or_else(|| format!("unknown thinking level: {text}"))
+    }
+}
+
+/// Provider service tier a request asks for. `Standard` sends no tier; adapters
+/// translate the rest to each provider's wire word.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    specta::Type,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    #[default]
+    Standard,
+    Flex,
+    Fast,
+    Ultrafast,
+}
+
+impl ServiceTier {
+    /// Every tier, `Standard` first.
+    pub const ALL: [ServiceTier; 4] = [
+        ServiceTier::Standard,
+        ServiceTier::Flex,
+        ServiceTier::Fast,
+        ServiceTier::Ultrafast,
+    ];
+
+    /// The serde name (`standard`, `flex`, `fast`, `ultrafast`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceTier::Standard => "standard",
+            ServiceTier::Flex => "flex",
+            ServiceTier::Fast => "fast",
+            ServiceTier::Ultrafast => "ultrafast",
+        }
+    }
+
+    pub fn is_standard(&self) -> bool {
+        *self == ServiceTier::Standard
+    }
+}
+
+impl std::str::FromStr for ServiceTier {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        ServiceTier::ALL
+            .into_iter()
+            .find(|tier| tier.as_str() == text)
+            .ok_or_else(|| format!("unknown service tier: {text}"))
     }
 }
 

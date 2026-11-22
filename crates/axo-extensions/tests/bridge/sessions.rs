@@ -943,6 +943,7 @@ async fn failures_reach_the_host_typed() {
         writes: None,
         model: &model,
         thinking: ThinkingLevel::Off,
+        service_tier: axo_ai::ServiceTier::Standard,
         task: &task,
         depth: 1,
         parent_session_id: "s",

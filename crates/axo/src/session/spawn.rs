@@ -9,7 +9,7 @@ use axo_agent::{
     QueuedMessage, Replay, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
 };
 use axo_ai::thinking::clamp_level;
-use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock};
+use axo_ai::{Model, ServiceTier, ThinkingLevel, ToolCall, UserBlock};
 use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -20,7 +20,7 @@ use tracing::warn;
 use super::children::ChildSeed;
 use super::modes::ENTER_MODE;
 use super::{Inherited, Registrations, Session, SessionHooks, SessionSetup};
-use crate::config::SubagentSettings;
+use crate::config::{SubagentSettings, SubagentTier};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
 use crate::context::definitions::{Definitions, FileDefinitions};
 use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
@@ -171,6 +171,8 @@ pub struct SpawnContext<'a> {
     pub writes: Option<&'a WriteScope>,
     pub model: &'a Model,
     pub thinking: ThinkingLevel,
+    /// The child's chosen service tier; it applies only on models that support it.
+    pub service_tier: ServiceTier,
     pub task: &'a PromptInput,
     /// The child's depth (1 for a root session's child).
     pub depth: u32,
@@ -263,6 +265,7 @@ struct Resolved {
     agent: Option<String>,
     model: Model,
     thinking: ThinkingLevel,
+    tier: ServiceTier,
     selector: Option<String>,
     limits: ToolLimits,
     bash: BashAccess,
@@ -409,9 +412,15 @@ impl SessionHooks {
                 .map(str::to_owned);
             let model = cascade.model.unwrap_or(parent.model);
             let thinking = clamp_level(&model, cascade.thinking.unwrap_or(parent.thinking));
-            Ok((model, thinking, selector))
+            let tier = cascade
+                .tier
+                .unwrap_or(match settings.subagents.service_tier {
+                    SubagentTier::Inherit => parent.tier,
+                    SubagentTier::Standard => ServiceTier::Standard,
+                });
+            Ok((model, thinking, tier, selector))
         };
-        let (mut model, mut thinking, mut selector) = select(&spec)?;
+        let (mut model, mut thinking, mut tier, mut selector) = select(&spec)?;
         for hook in self.spawn_hooks() {
             match hook
                 .before_spawn(&SpawnContext {
@@ -423,6 +432,7 @@ impl SessionHooks {
                     writes: writes.as_ref(),
                     model: &model,
                     thinking,
+                    service_tier: tier,
                     task,
                     depth,
                     parent_session_id: &self.session_id,
@@ -437,7 +447,7 @@ impl SessionHooks {
                     spec = replacement;
                     normalize(&mut spec, &settings.subagents);
                     validate_output(spec.output.as_ref())?;
-                    (model, thinking, selector) = select(&spec)?;
+                    (model, thinking, tier, selector) = select(&spec)?;
                 }
             }
         }
@@ -446,6 +456,7 @@ impl SessionHooks {
             agent,
             model,
             thinking,
+            tier,
             selector,
             limits,
             bash,
@@ -472,6 +483,7 @@ impl SessionHooks {
                 agent,
                 model,
                 thinking,
+                tier,
                 selector,
                 limits,
                 bash,
@@ -499,6 +511,7 @@ impl SessionHooks {
                     inherited: inherited.clone(),
                     model,
                     thinking,
+                    tier,
                     session_id: child_id,
                     writer,
                     entries: Vec::new(),

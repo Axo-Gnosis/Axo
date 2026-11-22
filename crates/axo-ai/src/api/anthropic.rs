@@ -16,6 +16,7 @@ use crate::api::http::{prepare, read_sse, send};
 use crate::api::sse::SseEvent;
 use crate::api::{
     ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
+    served_tier,
 };
 use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
@@ -29,7 +30,7 @@ use crate::transcript::{
 };
 use crate::transform::replace_images;
 use crate::types::{
-    AssistantBlock, Message, ReasoningReplay, StopReason, ThinkingLevel, ToolCall,
+    AssistantBlock, Message, ReasoningReplay, ServiceTier, StopReason, ThinkingLevel, ToolCall,
     ToolResultMessage, ToolSpec, Usage, UserBlock,
 };
 
@@ -39,6 +40,7 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
 const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// The only SSE event types passed on to the block mapper.
 const ANTHROPIC_MESSAGE_EVENTS: [&str; 6] = [
@@ -115,6 +117,7 @@ impl AnthropicCompat {
 struct RequestOptions {
     max_tokens: u64,
     temperature: Option<f64>,
+    fast: bool,
     tool_choice: Option<crate::ToolChoice>,
     thinking_enabled: bool,
     thinking_budget_tokens: Option<u64>,
@@ -135,6 +138,7 @@ fn request_options(
             simple.max_tokens.unwrap_or(model.max_tokens),
         ),
         temperature: simple.temperature,
+        fast: model.effective_tier(simple.service_tier) == ServiceTier::Fast,
         tool_choice: simple.tool_choice,
         thinking_enabled: false,
         thinking_budget_tokens: None,
@@ -196,6 +200,11 @@ async fn run(
 
     let compat = AnthropicCompat::of(model);
     let options = request_options(model, transcript, &opts.simple);
+    reply.message.service_tier = if options.fast {
+        ServiceTier::Fast
+    } else {
+        ServiceTier::Standard
+    };
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
     let built = build_params(model, &resolved, &compat, &options);
     if built.provider_thinking_level.is_some() {
@@ -317,6 +326,9 @@ impl BlockMapper {
                 }
                 // Captured now so an early abort still reports the input tokens.
                 let usage = &message["usage"];
+                if let Some(speed) = usage["speed"].as_str() {
+                    output.service_tier = served_tier(speed);
+                }
                 let tokens = |key: &str| usage[key].as_u64().unwrap_or(0);
                 output.usage.input = tokens("input_tokens");
                 output.usage.output = tokens("output_tokens");
@@ -327,7 +339,8 @@ impl BlockMapper {
                         .as_u64()
                         .unwrap_or(0),
                 );
-                update_cost(model, &mut output.usage);
+                let tier = output.service_tier;
+                update_cost(model, &mut output.usage, tier);
             }
             "content_block_start" => self.start_block(&event, reply)?,
             "content_block_delta" => self.delta(&event, reply),
@@ -345,6 +358,9 @@ impl BlockMapper {
                 }
                 // Only present fields overwrite: proxies omit input tokens here.
                 let usage = &event["usage"];
+                if let Some(speed) = usage["speed"].as_str() {
+                    output.service_tier = served_tier(speed);
+                }
                 let usage_fields = [
                     ("input_tokens", &mut output.usage.input),
                     ("output_tokens", &mut output.usage.output),
@@ -363,7 +379,8 @@ impl BlockMapper {
                 if let Some(value) = usage["output_tokens_details"]["thinking_tokens"].as_u64() {
                     output.usage.reasoning = Some(value);
                 }
-                update_cost(model, &mut output.usage);
+                let tier = output.service_tier;
+                update_cost(model, &mut output.usage, tier);
             }
             "message_stop" => self.saw_stop = true,
             _ => {}
@@ -522,9 +539,9 @@ fn append_text(reply: &mut Reply, content_index: usize, delta: &str) {
 }
 
 /// Anthropic reports no total; it is the sum of the parts. Priced after every update.
-fn update_cost(model: &Model, usage: &mut Usage) {
+fn update_cost(model: &Model, usage: &mut Usage, tier: ServiceTier) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    calculate_cost(model, usage);
+    calculate_cost(model, usage, tier);
 }
 
 fn map_stop_reason(
@@ -624,6 +641,9 @@ fn build_params(
         && compat.temperature
     {
         params["temperature"] = json!(temperature);
+    }
+    if options.fast {
+        params["speed"] = json!("fast");
     }
 
     let tool_cache_control = compat.cache_control_on_tools.then_some(&cache_control);
@@ -727,6 +747,9 @@ fn beta_features(
             }
             if native_tool_changes {
                 add(INLINE_TOOLS_BETA);
+            }
+            if options.fast {
+                add(FAST_MODE_BETA);
             }
         }
     }

@@ -54,7 +54,7 @@ Hosts spawn asynchronous children with `Session::spawn` and teams with `Session:
 
 ### Commands & prompt parts
 
-`axo` owns the built-in commands (`/compact`, `/shake`, `/model`, `/thinking`, `/navigate`) and the prompt-part input shape; hosts expose the catalog via `session.commands()`. `Session::parse_command` parses built-ins first, then `/name [prompt]` for a loaded mode, then `/name [args]` for a host-registered command (`SessionOptions::commands`, `Session::set_commands`); `Session::run_command` enters that mode and delivers any prompt as a steer (starting a run when idle), or awaits the registered `CommandHandler`. The catalog also lists non-shadowed skills. See [Commands](crates/axo/docs/extending.md#commands) and [Prompt parts](crates/axo/docs/prompts-and-context.md#prompt-parts-cratesaxosrcinputrs).
+`axo` owns the built-in commands (`/compact`, `/shake`, `/model`, `/thinking`, `/tier`, `/navigate`) and the prompt-part input shape; hosts expose the catalog via `session.commands()`. `Session::parse_command` parses built-ins first, then `/name [prompt]` for a loaded mode, then `/name [args]` for a host-registered command (`SessionOptions::commands`, `Session::set_commands`); `Session::run_command` enters that mode and delivers any prompt as a steer (starting a run when idle), or awaits the registered `CommandHandler`. The catalog also lists non-shadowed skills. See [Commands](crates/axo/docs/extending.md#commands) and [Prompt parts](crates/axo/docs/prompts-and-context.md#prompt-parts-cratesaxosrcinputrs).
 
 ### Supervised commands & background jobs
 

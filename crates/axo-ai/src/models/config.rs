@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::error::Error;
 use crate::model::{ApiKind, CostTier, InputKind, Model, ThinkingLevelMap};
+use crate::types::ServiceTier;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +90,8 @@ pub struct ModelPatch {
     #[serde(default)]
     pub cost: Option<CostPatch>,
     #[serde(default)]
+    pub service_tiers: Option<BTreeMap<ServiceTier, Option<f64>>>,
+    #[serde(default)]
     pub context_window: Option<u64>,
     #[serde(default)]
     pub max_tokens: Option<u64>,
@@ -151,6 +154,25 @@ impl ModelPatch {
             target.cache_write = cost.cache_write.unwrap_or(target.cache_write);
             if let Some(tiers) = &cost.tiers {
                 target.tiers = tiers.clone();
+            }
+        }
+        if let Some(tiers) = &self.service_tiers {
+            for (&tier, &factor) in tiers {
+                if tier.is_standard() {
+                    return Err(Error::Config(
+                        "serviceTiers: \"standard\" has no multiplier".into(),
+                    ));
+                }
+                if let Some(factor) = factor {
+                    if !factor.is_finite() || factor <= 0.0 {
+                        return Err(Error::Config(
+                            "serviceTiers: multipliers must be positive numbers".into(),
+                        ));
+                    }
+                    model.service_tiers.insert(tier, factor);
+                } else {
+                    model.service_tiers.remove(&tier);
+                }
             }
         }
         if let Some(context_window) = self.context_window {

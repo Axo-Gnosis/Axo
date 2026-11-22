@@ -47,6 +47,6 @@ pub use transcript::{Transcript, TranscriptToolSupport};
 pub use transform::transform_messages;
 pub use types::{
     AssistantBlock, AssistantMessage, JsonMap, Message, ProviderFailure, ReasoningReplay,
-    StopReason, SystemMessage, TextBlock, ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec,
-    Usage, UsageCost, UserBlock, UserMessage, now_ms,
+    ServiceTier, StopReason, SystemMessage, TextBlock, ThinkingLevel, ToolCall, ToolResultMessage,
+    ToolSpec, Usage, UsageCost, UserBlock, UserMessage, now_ms,
 };

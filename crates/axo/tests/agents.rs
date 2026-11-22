@@ -9,7 +9,7 @@ use axo::{
 };
 use axo_ai::testing::reply_text;
 use axo_ai::transcript::current_system_prompt;
-use axo_ai::{Message, ScriptedTurn, ThinkingLevel};
+use axo_ai::{Message, ScriptedTurn, ServiceTier, ThinkingLevel};
 use common::{host, options, within};
 use serde_json::json;
 
@@ -82,6 +82,107 @@ async fn model_selectors_expand_roles_and_thinking() {
         .unwrap();
     assert_eq!(choice.model.unwrap().id, "qwen3:8b");
     assert_eq!(choice.thinking, None);
+}
+
+#[tokio::test]
+async fn service_tier_follows_selectors_and_settings() {
+    use ServiceTier::{Fast, Standard};
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let host = host(
+        dir,
+        json!([
+            {"id": "a", "reasoning": true, "serviceTiers": {"fast": 2}},
+            {"id": "b", "serviceTiers": {"fast": 2}},
+            {"id": "c"}
+        ]),
+        json!({}),
+        (0..5)
+            .map(|_| ScriptedTurn::Reply(reply_text("done")))
+            .collect(),
+    )
+    .await;
+    let opts = |selector: &str| SessionOptions {
+        model: Some(selector.into()),
+        ..options(dir)
+    };
+    let model = |selector: &str| Command::Model {
+        model: selector.into(),
+    };
+    let session = host
+        .axo
+        .create_session(opts("test/a:low:fast"))
+        .await
+        .unwrap();
+    within(session.prompt("hi")).await.unwrap();
+    let requests = host.api.requests();
+    assert_eq!(requests[0].options.service_tier, Fast);
+    assert_eq!(requests[0].options.thinking, ThinkingLevel::Low);
+    assert_eq!(session.effective_service_tier(), Fast);
+
+    session.run_command(model("test/a")).await.unwrap();
+    assert_eq!(session.service_tier(), Fast);
+    session.run_command(model("test/b")).await.unwrap();
+    assert_eq!(session.service_tier(), Standard);
+    session
+        .run_command(Command::Tier { tier: Fast })
+        .await
+        .unwrap();
+    assert_eq!(session.effective_service_tier(), Fast);
+    session.run_command(model(":standard")).await.unwrap();
+    assert_eq!(session.service_tier(), Standard);
+    session.run_command(model("test/c")).await.unwrap();
+    assert_eq!(session.set_service_tier(Fast).await.unwrap(), Standard);
+    assert_eq!(session.service_tier(), Fast);
+    assert_eq!(session.effective_service_tier(), Standard);
+
+    let path = session.path().to_path_buf();
+    session.shutdown().await;
+    drop(session);
+    let reopened = host
+        .axo
+        .open_session(
+            &path,
+            SessionOptions {
+                model: None,
+                ..options(dir)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.service_tier(), Fast);
+    assert_eq!(reopened.effective_service_tier(), Standard);
+    reopened.shutdown().await;
+
+    for expected_child in [Standard, Fast] {
+        if expected_child == Fast {
+            host.config.user.lock().unwrap().layer.settings = Some(json!({
+                "serviceTier": {"onModelChange": "keep"},
+                "subagents": {"serviceTier": "inherit"}
+            }));
+        }
+        let parent = host.axo.create_session(opts("test/a:fast")).await.unwrap();
+        if expected_child == Fast {
+            parent.run_command(model("test/b")).await.unwrap();
+        }
+        assert_eq!(parent.effective_service_tier(), Fast);
+        let child = parent
+            .spawn(axo::SpawnRequest {
+                task: "check".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        common::delivered(&parent, &child.job).await;
+        let requests = host.api.requests();
+        let request = requests
+            .iter()
+            .find(|r| r.options.session_id.as_deref() == Some(child.session.id()))
+            .unwrap();
+        assert_eq!(request.options.service_tier, expected_child);
+        parent.shutdown().await;
+    }
 }
 
 #[tokio::test]

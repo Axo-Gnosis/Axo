@@ -299,6 +299,7 @@ pub(super) async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
         inherited: seed.inherited.clone(),
         model,
         thinking,
+        tier: projection.tier.unwrap_or_default(),
         session_id: header.id,
         writer,
         entries,

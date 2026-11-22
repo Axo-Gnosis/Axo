@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 use crate::api::http::{prepare, read_sse, send};
 use crate::api::sse::SseEvent;
 use crate::api::{
-    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
+    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map,
+    openai_service_tier, respond, served_tier,
 };
 use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
@@ -37,8 +38,8 @@ use crate::transcript::{
     Transcript, render_system_message_update, resolve_transcript_tools, system_message_text,
 };
 use crate::types::{
-    AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, StopReason, ThinkingLevel,
-    ToolCall, ToolSpec, Usage, UserBlock,
+    AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, ServiceTier, StopReason,
+    ThinkingLevel, ToolCall, ToolSpec, Usage, UserBlock,
 };
 
 /// Delta fields that carry reasoning text, in the order they are read: llama.cpp uses
@@ -328,6 +329,9 @@ fn build_params(
     }
     if let Some(priority) = model.compat.vllm_priority {
         params.insert("priority".into(), priority.into());
+    }
+    if let Some(name) = openai_service_tier(model.effective_tier(simple.service_tier)) {
+        params.insert("service_tier".into(), name.into());
     }
 
     let budget_field = compat.thinking_token_budget_field.or(compat
@@ -1034,7 +1038,7 @@ fn http_error_message(status: u16, text: &str, body: Option<&Value>) -> String {
 
 /// Usage from a chunk's `usage` (pi `parseChunkUsage`). `cached_tokens` are cache reads;
 /// `completion_tokens` already include reasoning tokens.
-fn parse_usage(raw: &Value, model: &Model) -> Usage {
+fn parse_usage(raw: &Value, model: &Model, tier: ServiceTier) -> Usage {
     let count = |value: Option<&Value>| {
         value
             .and_then(Value::as_f64)
@@ -1067,7 +1071,7 @@ fn parse_usage(raw: &Value, model: &Model) -> Usage {
         total_tokens: input + output + cache_read + cache_write,
         cost: Default::default(),
     };
-    calculate_cost(model, &mut usage);
+    calculate_cost(model, &mut usage, tier);
     usage
 }
 
@@ -1131,6 +1135,7 @@ impl Response {
         opts: &StreamOptions,
         cancel: &CancellationToken,
     ) -> Result<StopReason, String> {
+        self.reply.message.service_tier = self.model.effective_tier(opts.simple.service_tier);
         let base_url = opts.base_url(&self.model);
         let compat = resolve_compat(&self.model, base_url);
         let mut headers = build_headers(&compat, opts)?;
@@ -1239,9 +1244,13 @@ impl Response {
         {
             self.reply.message.response_model = Some(name.to_owned());
         }
+        if let Some(echo) = chunk.get("service_tier").and_then(Value::as_str) {
+            self.reply.message.service_tier = served_tier(echo);
+        }
         let usage = chunk.get("usage").filter(|usage| truthy(Some(usage)));
         if let Some(usage) = usage {
-            self.reply.message.usage = parse_usage(usage, &self.model);
+            self.reply.message.usage =
+                parse_usage(usage, &self.model, self.reply.message.service_tier);
         }
 
         let Some(choice) = chunk
@@ -1256,7 +1265,8 @@ impl Response {
         if usage.is_none()
             && let Some(usage) = choice.get("usage").filter(|usage| truthy(Some(usage)))
         {
-            self.reply.message.usage = parse_usage(usage, &self.model);
+            self.reply.message.usage =
+                parse_usage(usage, &self.model, self.reply.message.service_tier);
         }
         if let Some(reason) = choice
             .get("finish_reason")
@@ -1474,6 +1484,7 @@ mod tests {
             thinking_level_map: None,
             input: vec![InputKind::Text],
             cost: Cost::default(),
+            service_tiers: Default::default(),
             context_window: 200_000,
             max_tokens: 4096,
             compat: Compat {

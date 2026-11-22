@@ -5,7 +5,7 @@
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use axo_ai::ThinkingLevel;
+use axo_ai::{ServiceTier, ThinkingLevel};
 use axo_macros::expose;
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -42,6 +42,9 @@ pub enum Command {
     },
     Thinking {
         level: ThinkingLevel,
+    },
+    Tier {
+        tier: ServiceTier,
     },
     Navigate {
         entry: EntryId,
@@ -136,7 +139,7 @@ struct ShakeArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelArgs {
-    /// A model selector: `provider/id` or `@role`, optionally with `:thinking`, or `:thinking` alone.
+    /// A model selector: `provider/id` or `@role`, optionally with `:thinking` and `:tier` in either order, or suffixes alone.
     #[schemars(extend("format" = "model"))]
     model: String,
 }
@@ -146,6 +149,13 @@ struct ModelArgs {
 struct ThinkingArgs {
     #[schemars(schema_with = "thinking_schema")]
     level: ThinkingLevel,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TierArgs {
+    #[schemars(schema_with = "tier_schema")]
+    tier: ServiceTier,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -171,6 +181,14 @@ fn thinking_schema(_: &mut SchemaGenerator) -> Schema {
         .map(|level| serde_json::to_value(level).expect("unit variants serialize"))
         .collect();
     json_schema!({ "type": "string", "enum": levels })
+}
+
+fn tier_schema(_: &mut SchemaGenerator) -> Schema {
+    let tiers: Vec<Value> = ServiceTier::ALL
+        .iter()
+        .map(|tier| serde_json::to_value(tier).expect("unit variants serialize"))
+        .collect();
+    json_schema!({ "type": "string", "enum": tiers })
 }
 
 /// `T`'s JSON Schema with every subschema inlined (no `$ref`/`$defs`), minus `$schema`
@@ -210,6 +228,11 @@ fn decode_thinking(args: Value) -> Result<Command, serde_json::Error> {
     Ok(Command::Thinking { level })
 }
 
+fn decode_tier(args: Value) -> Result<Command, serde_json::Error> {
+    let TierArgs { tier } = serde_json::from_value(args)?;
+    Ok(Command::Tier { tier })
+}
+
 fn decode_navigate(args: Value) -> Result<Command, serde_json::Error> {
     let NavigateArgs {
         entry,
@@ -236,7 +259,7 @@ struct Builtin {
 }
 
 /// The built-in commands, in catalog order.
-static BUILTINS: [Builtin; 5] = [
+static BUILTINS: [Builtin; 6] = [
     Builtin {
         name: "compact",
         description: "Summarize older history to free context",
@@ -264,6 +287,13 @@ static BUILTINS: [Builtin; 5] = [
         policy: CommandPolicy::Alongside,
         parameters: LazyLock::new(parameters::<ThinkingArgs>),
         decode: decode_thinking,
+    },
+    Builtin {
+        name: "tier",
+        description: "Set the service tier from the next request",
+        policy: CommandPolicy::Alongside,
+        parameters: LazyLock::new(parameters::<TierArgs>),
+        decode: decode_tier,
     },
     Builtin {
         name: "navigate",
@@ -770,19 +800,19 @@ mod tests {
         assert_eq!(
             names,
             [
-                "compact", "shake", "model", "thinking", "navigate", "review", "deploy"
+                "compact", "shake", "model", "thinking", "tier", "navigate", "review", "deploy"
             ]
         );
         assert!(matches!(catalog[0].kind, CommandKind::Builtin { .. }));
-        assert_eq!(catalog[5].policy, CommandPolicy::Queued);
+        assert_eq!(catalog[6].policy, CommandPolicy::Queued);
         assert_eq!(
-            catalog[5].kind,
+            catalog[6].kind,
             CommandKind::Skill {
                 argument_hint: Some("<file>".into())
             }
         );
         assert_eq!(
-            serde_json::to_value(&catalog[5]).unwrap(),
+            serde_json::to_value(&catalog[6]).unwrap(),
             json!({
                 "name": "review",
                 "description": "review skill",
@@ -805,16 +835,16 @@ mod tests {
             ..Default::default()
         })];
         let catalog = super::catalog(&skills, &modes, &[]);
-        assert_eq!(catalog[5].name, "review");
-        assert_eq!(catalog[5].policy, CommandPolicy::Alongside);
+        assert_eq!(catalog[6].name, "review");
+        assert_eq!(catalog[6].policy, CommandPolicy::Alongside);
         assert_eq!(
-            catalog[5].kind,
+            catalog[6].kind,
             CommandKind::Mode {
                 argument_hint: Some("task".into())
             }
         );
-        assert_eq!(catalog[6].name, "deploy");
-        assert_eq!(catalog.len(), 7);
+        assert_eq!(catalog[7].name, "deploy");
+        assert_eq!(catalog.len(), 8);
         let diagnostics = hidden_skill_diagnostics(&skills, &modes);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(

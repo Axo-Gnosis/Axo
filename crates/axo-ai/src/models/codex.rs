@@ -24,6 +24,8 @@ pub(crate) struct CodexModel {
     pub image: bool,
     /// Reasoning efforts as listed; ones axo has no thinking level for are ignored later.
     pub efforts: Vec<String>,
+    #[serde(default)]
+    pub tiers: Vec<String>,
 }
 
 const FILE: &str = "codex-models.json";
@@ -51,12 +53,21 @@ struct Row {
     #[serde(default)]
     supported_reasoning_levels: Vec<Level>,
     #[serde(default)]
+    service_tiers: Vec<RowTier>,
+    #[serde(default)]
+    additional_speed_tiers: Vec<String>,
+    #[serde(default)]
     visibility: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Level {
     effort: String,
+}
+
+#[derive(Deserialize)]
+struct RowTier {
+    id: String,
 }
 
 /// The account's listed models; hidden ones and rows without a context window are skipped.
@@ -108,8 +119,15 @@ pub(crate) async fn discover(
         })
         .filter(|row| row.visibility.as_deref() != Some("hide"))
         .filter_map(|row| {
+            let context_window = row.context_window.filter(|&window| window > 0)?;
+            let mut tiers: Vec<_> = row.service_tiers.into_iter().map(|tier| tier.id).collect();
+            if row.additional_speed_tiers.iter().any(|tier| tier == "fast")
+                && !tiers.iter().any(|tier| tier == "priority")
+            {
+                tiers.push("priority".to_owned());
+            }
             Some(CodexModel {
-                context_window: row.context_window.filter(|&window| window > 0)?,
+                context_window,
                 name: row.display_name.unwrap_or_else(|| row.slug.clone()),
                 id: row.slug,
                 image: row.input_modalities.iter().any(|kind| kind == "image"),
@@ -118,6 +136,7 @@ pub(crate) async fn discover(
                     .into_iter()
                     .map(|level| level.effort)
                     .collect(),
+                tiers,
             })
         })
         .collect();

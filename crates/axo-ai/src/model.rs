@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::transcript::TranscriptToolSupport;
-use crate::types::ThinkingLevel;
+use crate::types::{ServiceTier, ThinkingLevel};
 
 /// The wire API a model is served through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
@@ -69,6 +69,10 @@ pub struct Model {
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Vec<InputKind>,
     pub cost: Cost,
+    /// Service tiers this model can be requested with → price multiplier over `cost`.
+    /// Never contains `Standard`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_tiers: BTreeMap<ServiceTier, f64>,
     pub context_window: u64,
     pub max_tokens: u64,
     #[serde(default)]
@@ -103,6 +107,18 @@ impl Model {
                 TranscriptToolSupport::Additions
             }
             _ => TranscriptToolSupport::None,
+        }
+    }
+
+    /// `tier` when this model can be sent it, else `Standard`. Anthropic Messages has one
+    /// speed switch, so only `Fast` is sendable there.
+    pub fn effective_tier(&self, tier: ServiceTier) -> ServiceTier {
+        let sendable = self.service_tiers.contains_key(&tier)
+            && (self.api != ApiKind::AnthropicMessages || tier == ServiceTier::Fast);
+        if sendable {
+            tier
+        } else {
+            ServiceTier::Standard
         }
     }
 }

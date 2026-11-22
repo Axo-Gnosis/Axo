@@ -13,6 +13,8 @@ Extensions are trusted code; nothing here is a sandbox.
 | agent |  | The current root persona or the definition this child was spawned with. |
 | model |  | The currently selected model. |
 | thinking |  | The thinking level applied to the current model. |
+| serviceTier |  | The chosen service tier; it applies only on models that support it. |
+| effectiveServiceTier |  | The tier requests are sent with on the current model. |
 | config |  | The effective configuration for this session. |
 | setName | name? | Sets the file-wide session name; newlines become spaces and blank names clear it. May be called while a run is active; this entry contributes no context message. |
 | name |  | The latest session name in file order, independent of the selected branch. |
@@ -28,11 +30,12 @@ Extensions are trusted code; nothing here is a sandbox.
 | modes |  | The mode definitions in force now; empty for children. |
 | keywords |  | Every keyword definition in force now, disabled ones included; empty for children. |
 | keywordMatches | text | The keywords that would fire in text typed as a message right now, as byte ranges into text. A leading /command token is skipped, as on submission. |
-| runCommand | command | Runs a command under its policy: model/thinking, modes and registered commands alongside a turn, compact/shake/navigate only when idle (Error::Busy otherwise). |
+| runCommand | command | Runs a command under its policy: model/thinking/tier, modes and registered commands alongside a turn, compact/shake/navigate only when idle (Error::Busy otherwise). |
 | abort |  | Stops the active run (CancelReason::User). Stopping an active run holds queued input and job results until the user's next input or resume_wakes; input sent after the Stop starts the next run once this one settles. An idle Stop changes nothing. |
 | setModel | model | Switches the model from the next request; the thinking level is clamped to it. |
 | setAgent | name? | Switches the root persona from the next request, applying its model selector when present. Changing the system prompt and tools is cache-heavy on models without mid-conversation system-message and tool changes. |
 | setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
+| setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
 | answer | callId, answers | Settles the pending question of tool call call_id. |
 | dismiss | callId | Dismisses a pending question or mode result; the run is cancelled. |
 | contextUsage |  | The current estimated context size and effective compaction limits. |

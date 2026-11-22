@@ -192,7 +192,9 @@ impl SessionHooks {
             compaction::summary::SummaryFailure,
         >,
     ) -> Result<Result<(compaction::summary::GeneratedSummary, Model), (Error, bool)>, Error> {
-        let Selection { model, thinking } = self.selection();
+        let Selection {
+            model, thinking, ..
+        } = self.selection();
         let context = compaction::summary::SummaryContext {
             streamer: self.inherited.streamer.as_ref(),
             model: &model,

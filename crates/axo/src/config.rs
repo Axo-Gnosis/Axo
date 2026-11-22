@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
-use axo_ai::{Model, Models, ThinkingLevel};
+use axo_ai::{Model, Models, ServiceTier, ThinkingLevel};
 use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -26,9 +26,11 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 pub struct Settings {
     /// `provider/model-id`.
     pub default_model: Option<String>,
-    /// Role name → selector (`provider/model[:thinking]` or `:thinking`); `@role` selectors expand through it. User settings only.
+    /// Role name → selector (`provider/model[:thinking][:tier]` or suffixes alone); `@role` selectors expand through it. User settings only.
     pub model_roles: IndexMap<String, String>,
     pub default_thinking_level: ThinkingLevel,
+    /// What happens to the chosen service tier when the model changes. User settings only.
+    pub service_tier: ServiceTierSettings,
     /// User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`.
     pub home_agents_dir: bool,
     pub steering_mode: QueueMode,
@@ -55,6 +57,7 @@ impl Default for Settings {
             default_model: None,
             model_roles: IndexMap::new(),
             default_thinking_level: ThinkingLevel::Medium,
+            service_tier: ServiceTierSettings::default(),
             home_agents_dir: false,
             steering_mode: QueueMode::All,
             follow_up_mode: QueueMode::OneAtATime,
@@ -175,6 +178,8 @@ pub struct SubagentSettings {
     #[serde(deserialize_with = "crate::context::agents::context_files_switch")]
     #[specta(type = specta_serde::Phased<Option<ContextFiles>, Option<crate::context::agents::RawContextFiles>>)]
     pub context_files: Option<ContextFiles>,
+    /// Children's service tier when their cascade names none: `standard` (default) or the parent's (`inherit`).
+    pub service_tier: SubagentTier,
 }
 
 impl Default for SubagentSettings {
@@ -186,8 +191,33 @@ impl Default for SubagentSettings {
             default_model: None,
             models: IndexMap::new(),
             context_files: Some(ContextFiles::Off),
+            service_tier: SubagentTier::Standard,
         }
     }
+}
+
+/// Service-tier spreading rules. User settings only: a wider spread raises spending.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ServiceTierSettings {
+    /// `reset` (default) returns to `standard` when the model changes; `keep` carries the tier over.
+    pub on_model_change: TierOnModelChange,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum TierOnModelChange {
+    #[default]
+    Reset,
+    Keep,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentTier {
+    #[default]
+    Standard,
+    Inherit,
 }
 
 /// What a model selector picks: a model, a thinking level, or both (never neither).
@@ -197,12 +227,15 @@ pub struct ModelChoice {
     pub model: Option<Model>,
     /// The selected thinking level, if the selector names one.
     pub thinking: Option<ThinkingLevel>,
+    /// The service tier, if the selector names one; `Standard` when it says `:standard`.
+    pub tier: Option<ServiceTier>,
 }
 
 /// What a list of selectors picks: the first one naming a model wins; the first thinking suffix seen up to it is kept.
 pub(crate) struct Cascade<'a> {
     pub model: Option<Model>,
     pub thinking: Option<ThinkingLevel>,
+    pub tier: Option<ServiceTier>,
     pub selector: Option<&'a str>,
 }
 
@@ -216,11 +249,13 @@ impl Settings {
         let mut cascade = Cascade {
             model: None,
             thinking: None,
+            tier: None,
             selector: None,
         };
         for selector in selectors.into_iter().flatten() {
             let choice = self.resolve_model(models, selector)?;
             cascade.thinking = cascade.thinking.or(choice.thinking);
+            cascade.tier = cascade.tier.or(choice.tier);
             if choice.model.is_some() {
                 cascade.model = choice.model;
                 cascade.selector = Some(selector);
@@ -236,20 +271,9 @@ impl Settings {
         let Some(rest) = selector.strip_prefix('@') else {
             return plain(models, selector);
         };
-        let (name, level) = match rest.split_once(':') {
-            Some((name, level)) => (name, Some(level)),
-            None => (rest, None),
-        };
-        let thinking = level
-            .map(|level| {
-                level
-                    .parse::<ThinkingLevel>()
-                    .map_err(|message| Error::InvalidModelSelector {
-                        selector: selector.to_owned(),
-                        message,
-                    })
-            })
-            .transpose()?;
+        let mut parts = rest.split(':');
+        let name = parts.next().expect("split always yields a first part");
+        let suffixes = Suffixes::parse(selector, parts)?;
         let value = self
             .model_roles
             .get(name)
@@ -261,39 +285,83 @@ impl Settings {
             });
         }
         let mut choice = plain(models, value)?;
-        choice.thinking = thinking.or(choice.thinking);
+        choice.thinking = suffixes.thinking.or(choice.thinking);
+        choice.tier = suffixes.tier.or(choice.tier);
         Ok(choice)
     }
 }
 
-fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
-    if let Some(level) = selector.strip_prefix(':') {
-        let thinking =
-            level
-                .parse::<ThinkingLevel>()
+#[derive(Default)]
+struct Suffixes {
+    thinking: Option<ThinkingLevel>,
+    tier: Option<ServiceTier>,
+}
+
+impl Suffixes {
+    fn push(&mut self, segment: &str) -> Result<(), String> {
+        if let Ok(level) = segment.parse::<ThinkingLevel>() {
+            if self.thinking.is_some() {
+                return Err("more than one thinking level".into());
+            }
+            self.thinking = Some(level);
+        } else if let Ok(tier) = segment.parse::<ServiceTier>() {
+            if self.tier.is_some() {
+                return Err("more than one service tier".into());
+            }
+            self.tier = Some(tier);
+        } else {
+            return Err(format!("unknown thinking level or service tier: {segment}"));
+        }
+        Ok(())
+    }
+
+    fn parse<'a>(selector: &str, parts: impl Iterator<Item = &'a str>) -> Result<Self, Error> {
+        let mut suffixes = Self::default();
+        for segment in parts {
+            suffixes
+                .push(segment)
                 .map_err(|message| Error::InvalidModelSelector {
                     selector: selector.to_owned(),
                     message,
                 })?;
+        }
+        Ok(suffixes)
+    }
+}
+
+fn plain(models: &Models, selector: &str) -> Result<ModelChoice, Error> {
+    if let Some(rest) = selector.strip_prefix(':') {
+        let suffixes = Suffixes::parse(selector, rest.split(':'))?;
         return Ok(ModelChoice {
             model: None,
-            thinking: Some(thinking),
+            thinking: suffixes.thinking,
+            tier: suffixes.tier,
         });
     }
     if let Some(model) = models.find(selector) {
         return Ok(ModelChoice {
             model: Some(model),
             thinking: None,
+            tier: None,
         });
     }
-    if let Some((prefix, level)) = selector.rsplit_once(':')
-        && let Ok(thinking) = level.parse::<ThinkingLevel>()
-        && let Some(model) = models.find(prefix)
-    {
-        return Ok(ModelChoice {
-            model: Some(model),
-            thinking: Some(thinking),
-        });
+    let mut remaining = selector;
+    let mut suffixes = Suffixes::default();
+    for _ in 0..2 {
+        let Some((prefix, segment)) = remaining.rsplit_once(':') else {
+            break;
+        };
+        if suffixes.push(segment).is_err() {
+            break;
+        }
+        if let Some(model) = models.find(prefix) {
+            return Ok(ModelChoice {
+                model: Some(model),
+                thinking: suffixes.thinking,
+                tier: suffixes.tier,
+            });
+        }
+        remaining = prefix;
     }
     Err(Error::ModelNotFound(selector.to_owned()))
 }
@@ -582,6 +650,7 @@ impl EffectiveConfig {
             "homeAgentsDir",
             "modelRoles",
             "subagents",
+            "serviceTier",
             "extensions",
         ];
 

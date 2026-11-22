@@ -56,6 +56,7 @@ fn model(provider: &str, id: &str, api: ApiKind, base_url: &str) -> Model {
         thinking_level_map: None,
         input: vec![InputKind::Text],
         cost: Cost::default(),
+        service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 4096,
         compat: Compat::default(),

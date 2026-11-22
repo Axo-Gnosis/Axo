@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axo_agent::{AgentMessage, CustomMessage};
-use axo_ai::{Message, ThinkingLevel, UserBlock};
+use axo_ai::{Message, ServiceTier, ThinkingLevel, UserBlock};
 use axo_macros::expose;
 use serde_json::{Value, json};
 
@@ -39,11 +39,13 @@ pub struct Projection {
     pub model: Option<String>,
     /// The latest `thinking_level_change` on the path.
     pub thinking: Option<ThinkingLevel>,
+    /// The latest `service_tier_change` on the path.
+    pub tier: Option<ServiceTier>,
     /// The latest root persona selected by `agent_change` on the path.
     pub agent: Option<String>,
     /// The latest mode selected by `mode_change` on the path.
     pub mode: Option<String>,
-    /// Selection saved by the latest mode change, cleared by model or thinking changes.
+    /// Selection saved by the latest mode change, cleared by model, thinking or tier changes.
     pub mode_restore: Option<ModeRestore>,
     #[serde(skip)]
     #[specta(skip)]
@@ -122,6 +124,10 @@ impl Projection {
             }
             Entry::ThinkingLevelChange { thinking_level, .. } => {
                 self.thinking = Some(*thinking_level);
+                self.mode_restore = None;
+            }
+            Entry::ServiceTierChange { service_tier, .. } => {
+                self.tier = Some(*service_tier);
                 self.mode_restore = None;
             }
             _ => {}

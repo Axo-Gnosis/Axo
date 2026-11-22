@@ -28,8 +28,9 @@ pub use commands::{
 pub use config::{
     AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
     EffectiveConfig, EnabledExtension, ExtensionListError, ModelChoice, PROMPT_NAMES,
-    ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride, RetrySettings, Settings,
-    SubagentSettings, SummaryRequest, UserConfig,
+    ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride, RetrySettings,
+    ServiceTierSettings, Settings, SubagentSettings, SubagentTier, SummaryRequest,
+    TierOnModelChange, UserConfig,
 };
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::definitions::Definitions;

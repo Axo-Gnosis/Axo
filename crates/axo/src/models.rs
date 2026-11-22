@@ -2,7 +2,7 @@ use std::path::Path;
 
 use axo_ai::estimate::{estimate_blocks_tokens, estimate_message_tokens, estimate_text_tokens};
 use axo_ai::{
-    AssistantEvent, AssistantMessage, CredentialSource, Message, Model, ProviderInfo,
+    AssistantEvent, AssistantMessage, CredentialSource, Message, Model, ProviderInfo, ServiceTier,
     SimpleStreamOptions, ThinkingLevel, ToolChoice, Transcript, UserBlock,
 };
 use axo_macros::expose;
@@ -18,13 +18,16 @@ use crate::{Axo, EffectiveConfig, Error, ProjectAccess};
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompletionRequest {
-    /// A model selector as `/model` takes it: `provider/id` or `@role`, either with an
-    /// optional `:thinking` suffix.
+    /// A model selector as `/model` takes it: `provider/id` or `@role`, optionally with
+    /// `:thinking` and `:tier` suffixes in either order.
     pub model: String,
     pub messages: Vec<Message>,
     /// Overrides the selector's thinking suffix; `off` when neither names a level.
     #[serde(default)]
     pub thinking: Option<ThinkingLevel>,
+    /// Overrides the selector's tier suffix; standard when neither names one.
+    #[serde(default)]
+    pub service_tier: Option<ServiceTier>,
     #[serde(default)]
     pub max_tokens: Option<u64>,
     #[serde(default)]
@@ -56,6 +59,7 @@ impl Axo {
             Transcript::new(request.messages),
             SimpleStreamOptions {
                 thinking: request.thinking.or(choice.thinking).unwrap_or_default(),
+                service_tier: request.service_tier.or(choice.tier).unwrap_or_default(),
                 max_tokens: request.max_tokens,
                 temperature: request.temperature,
                 tool_choice: request.tool_choice,

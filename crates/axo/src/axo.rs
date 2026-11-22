@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo_ai::thinking::clamp_level;
-use axo_ai::{Models, Streamer};
+use axo_ai::{Models, ServiceTier, Streamer};
 use axo_macros::expose;
 use serde_json::Value;
 
 use crate::config::{
-    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
+    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, TierOnModelChange,
+    UserConfig,
 };
 use crate::context::Diagnostic;
 use crate::context::agents::{AgentDef, RunAs};
@@ -484,15 +485,26 @@ impl Axo {
         )?;
         let selected_model = cascade.model;
         let mut suffix = cascade.thinking;
+        let mut tier_suffix = cascade.tier;
         let model = match selected_model {
             Some(model) => model,
             None => {
                 let selector = config.default_model()?.ok_or(Error::NoModel)?;
                 let choice = settings.resolve_model(&self.models, &selector)?;
                 suffix = suffix.or(choice.thinking);
+                tier_suffix = tier_suffix.or(choice.tier);
                 choice.model.ok_or(Error::NoModel)?
             }
         };
+        let same = projection.model.as_deref()
+            == Some(format!("{}/{}", model.provider, model.id).as_str());
+        let tier = tier_suffix.unwrap_or(
+            if same || settings.service_tier.on_model_change == TierOnModelChange::Keep {
+                projection.tier.unwrap_or_default()
+            } else {
+                ServiceTier::Standard
+            },
+        );
         let thinking = clamp_level(
             &model,
             thinking
@@ -553,6 +565,7 @@ impl Axo {
             }),
             model,
             thinking,
+            tier,
             session_id,
             writer,
             entries,

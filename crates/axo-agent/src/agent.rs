@@ -5,7 +5,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use axo_ai::{AssistantMessage, Message, Model, Streamer, ThinkingLevel, ToolResultMessage};
+use axo_ai::{
+    AssistantMessage, Message, Model, ServiceTier, Streamer, ThinkingLevel, ToolResultMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +24,7 @@ pub struct AgentConfig {
     pub streamer: Arc<dyn Streamer>,
     pub model: Model,
     pub thinking: ThinkingLevel,
+    pub service_tier: ServiceTier,
     pub tools: Vec<Arc<dyn Tool>>,
     pub deferred: Vec<Arc<dyn Tool>>,
     pub hooks: Arc<dyn LoopHooks>,
@@ -41,6 +44,7 @@ impl AgentConfig {
             streamer,
             model,
             thinking: ThinkingLevel::Off,
+            service_tier: ServiceTier::Standard,
             tools: Vec::new(),
             deferred: Vec::new(),
             hooks: Arc::new(NoHooks),
@@ -99,6 +103,7 @@ pub(crate) struct State {
     pub(crate) messages: Vec<AgentMessage>,
     pub(crate) model: Model,
     pub(crate) thinking: ThinkingLevel,
+    pub(crate) service_tier: ServiceTier,
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     pub(crate) deferred: Vec<Arc<dyn Tool>>,
     pub(crate) steering: VecDeque<QueuedMessage>,
@@ -139,6 +144,7 @@ impl Agent {
                 messages: Vec::new(),
                 model: cfg.model,
                 thinking: cfg.thinking,
+                service_tier: cfg.service_tier,
                 tools: cfg.tools,
                 deferred: cfg.deferred,
                 steering: VecDeque::new(),
@@ -358,6 +364,11 @@ impl Agent {
     /// Takes effect from the next provider request.
     pub fn set_thinking(&self, t: ThinkingLevel) {
         self.lock().thinking = t;
+    }
+
+    /// Takes effect from the next provider request.
+    pub fn set_service_tier(&self, t: ServiceTier) {
+        self.lock().service_tier = t;
     }
 
     /// Takes effect from the next turn; the change is declared to the model with a

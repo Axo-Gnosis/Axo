@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use axo_agent::AgentMessage;
-use axo_ai::{Message, SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_ai::{Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
 use axo_macros::expose;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -273,13 +273,15 @@ fn is_zero(value: &i64) -> bool {
     *value == 0
 }
 
-/// Model and thinking selection to restore when leaving a mode.
+/// Model, thinking level and service tier to restore when leaving a mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ModeRestore {
     pub provider: String,
     pub model_id: String,
     pub thinking_level: ThinkingLevel,
+    #[serde(default)]
+    pub service_tier: ServiceTier,
 }
 
 /// One line after the header.
@@ -312,6 +314,11 @@ pub enum Entry {
         #[serde(flatten)]
         base: EntryBase,
         thinking_level: ThinkingLevel,
+    },
+    ServiceTierChange {
+        #[serde(flatten)]
+        base: EntryBase,
+        service_tier: ServiceTier,
     },
     ModelChange {
         #[serde(flatten)]
@@ -609,6 +616,7 @@ impl Entry {
         match self {
             Entry::Message { base, .. }
             | Entry::ThinkingLevelChange { base, .. }
+            | Entry::ServiceTierChange { base, .. }
             | Entry::ModelChange { base, .. }
             | Entry::AgentChange { base, .. }
             | Entry::ModeChange { base, .. }
@@ -638,6 +646,7 @@ impl Entry {
         match self {
             Entry::Message { base, .. }
             | Entry::ThinkingLevelChange { base, .. }
+            | Entry::ServiceTierChange { base, .. }
             | Entry::ModelChange { base, .. }
             | Entry::AgentChange { base, .. }
             | Entry::ModeChange { base, .. }

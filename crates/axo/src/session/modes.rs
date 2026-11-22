@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock, PoisonError, Weak};
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
-use axo_ai::{Model, ThinkingLevel, ToolCall, UserBlock, thinking::clamp_level};
+use axo_ai::{Model, ServiceTier, ThinkingLevel, ToolCall, UserBlock, thinking::clamp_level};
 use axo_macros::expose;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
@@ -74,25 +74,26 @@ impl SessionHooks {
             let _order = self.selection_order.lock().await;
             let current = self.selection();
             let base = self.restore_base(origin.restore.filter(|_| left.is_some()), &current);
-            let (model, level, restore) = self
+            let (model, level, tier, restore) = self
                 .mode_target(target.as_deref(), &base)
                 .unwrap_or_else(|error| {
                     // The leaf is already written; navigation must not fail half-moved.
                     warn!(%error, "mode model unavailable after navigation");
-                    (base.model.clone(), base.thinking, None)
+                    (base.model.clone(), base.thinking, base.tier, None)
                 });
-            self.switch_live(&current, model.clone(), level);
-            Some((model, level, restore))
+            self.switch_live(&current, model.clone(), level, tier);
+            Some((model, level, tier, restore))
         } else {
             None
         };
         self.record_current_selection().await?;
-        if let (Some(spec), Some((model, level, restore))) = (&target, switched) {
+        if let (Some(spec), Some((model, level, tier, restore))) = (&target, switched) {
             let _order = self.selection_order.lock().await;
             let live = self.selection();
             if live.model.provider == model.provider
                 && live.model.id == model.id
                 && live.thinking == level
+                && live.tier == tier
                 && self.journal.view().projection.mode_restore != restore
             {
                 self.append(vec![Entry::ModeChange {
@@ -151,18 +152,27 @@ impl SessionHooks {
         };
         let current = self.selection();
         let base = self.restore_base(restore, &current);
-        let (model, level, restore) = self.mode_target(spec.as_deref(), &base)?;
+        let (model, level, tier, restore) = self.mode_target(spec.as_deref(), &base)?;
         let model_changed =
             current.model.provider != model.provider || current.model.id != model.id;
         let mut entries = if model_changed {
-            self.model_entries(&current, &model, Some(level)).0
-        } else if current.thinking != level {
-            vec![Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: level,
-            }]
+            self.model_entries(&current, &model, Some(level), Some(tier))
+                .0
         } else {
-            Vec::new()
+            let mut entries = Vec::new();
+            if current.thinking != level {
+                entries.push(Entry::ThinkingLevelChange {
+                    base: journal::base(),
+                    thinking_level: level,
+                });
+            }
+            if current.tier != tier {
+                entries.push(Entry::ServiceTierChange {
+                    base: journal::base(),
+                    service_tier: tier,
+                });
+            }
+            entries
         };
         entries.push(Entry::ModeChange {
             base: journal::base(),
@@ -170,7 +180,7 @@ impl SessionHooks {
             restore,
         });
         self.append(entries).await?;
-        self.switch_live(&current, model, level);
+        self.switch_live(&current, model, level, tier);
         self.mode
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -193,18 +203,19 @@ impl SessionHooks {
                     .map(|model| Selection {
                         model: model.clone(),
                         thinking: restore.thinking_level,
+                        tier: restore.service_tier,
                     })
             })
             .unwrap_or_else(|| current.clone())
     }
 
-    /// The model and level `spec` runs with from `base`, plus the selection to restore on
+    /// The model, level and tier `spec` runs with from `base`, plus the selection to restore on
     /// leaving it when they differ.
     fn mode_target(
         &self,
         spec: Option<&ModeSpec>,
         base: &Selection,
-    ) -> Result<(Model, ThinkingLevel, Option<ModeRestore>), Error> {
+    ) -> Result<(Model, ThinkingLevel, ServiceTier, Option<ModeRestore>), Error> {
         let choice = spec
             .and_then(|spec| spec.model.as_deref())
             .map(|selector| {
@@ -214,6 +225,7 @@ impl SessionHooks {
                     .resolve_model(&self.inherited.models, selector)
             })
             .transpose()?;
+        let tier_suffix = choice.as_ref().and_then(|choice| choice.tier);
         let (model, thinking) = match choice {
             Some(choice) => (
                 choice.model.unwrap_or_else(|| base.model.clone()),
@@ -222,29 +234,45 @@ impl SessionHooks {
             None => (base.model.clone(), base.thinking),
         };
         let level = clamp_level(&model, thinking);
+        let tier = self.next_tier(base, &model, tier_suffix);
         let restore = (spec.is_some()
             && (base.model.provider != model.provider
                 || base.model.id != model.id
-                || base.thinking != level))
+                || base.thinking != level
+                || base.tier != tier))
             .then(|| ModeRestore {
                 provider: base.model.provider.clone(),
                 model_id: base.model.id.clone(),
                 thinking_level: base.thinking,
+                service_tier: base.tier,
             });
-        Ok((model, level, restore))
+        Ok((model, level, tier, restore))
     }
 
-    /// Applies `model` and `level` to the attached agent; a no-op before one attaches.
-    fn switch_live(&self, current: &Selection, model: Model, level: ThinkingLevel) {
+    /// Applies the selection to the attached agent; a no-op before one attaches.
+    fn switch_live(
+        &self,
+        current: &Selection,
+        model: Model,
+        level: ThinkingLevel,
+        tier: ServiceTier,
+    ) {
         let Some(agent) = self.agent.get().and_then(Weak::upgrade) else {
             return;
         };
         if current.model.provider != model.provider || current.model.id != model.id {
-            self.apply_selection(&agent, model, level);
-        } else if current.thinking != level {
-            agent.set_thinking(level);
-            self.selection
-                .send_modify(|selection| selection.thinking = level);
+            self.apply_selection(&agent, model, level, tier);
+        } else {
+            if current.thinking != level {
+                agent.set_thinking(level);
+                self.selection
+                    .send_modify(|selection| selection.thinking = level);
+            }
+            if current.tier != tier {
+                agent.set_service_tier(tier);
+                self.selection
+                    .send_modify(|selection| selection.tier = tier);
+            }
         }
     }
 

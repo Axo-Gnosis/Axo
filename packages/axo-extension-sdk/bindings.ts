@@ -312,6 +312,8 @@ export type AssistantMessage_Deserialize = {
 	providerThinkingLevel?: string | null,
 	/**  Thinking level the agent loop requested for this response. */
 	thinkingLevel?: ThinkingLevel | null,
+	/**  Tier that served this response: the provider's report, else the tier the request asked for. */
+	serviceTier?: ServiceTier,
 	usage: Usage_Deserialize,
 	stopReason: StopReason,
 	errorMessage?: string | null,
@@ -336,6 +338,8 @@ export type AssistantMessage_Serialize = {
 	providerThinkingLevel?: string,
 	/**  Thinking level the agent loop requested for this response. */
 	thinkingLevel?: ThinkingLevel,
+	/**  Tier that served this response: the provider's report, else the tier the request asked for. */
+	serviceTier?: ServiceTier,
 	usage: Usage_Serialize,
 	stopReason: StopReason,
 	errorMessage?: string,
@@ -550,12 +554,12 @@ export type CommandPolicy =
 "queued";
 
 /**  A built-in session operation, mode or registered command, decoded and validated. */
-export type Command_Deserialize = { type: "compact"; focus?: string | null } | { type: "shake"; mode: ShakeMode } | { type: "model"; model: string } | { type: "mode"; name: string; prompt?: string | null } | { type: "thinking"; level: ThinkingLevel } | { type: "navigate"; entry: EntryId; summarize: boolean; focus?: string | null } | 
+export type Command_Deserialize = { type: "compact"; focus?: string | null } | { type: "shake"; mode: ShakeMode } | { type: "model"; model: string } | { type: "mode"; name: string; prompt?: string | null } | { type: "thinking"; level: ThinkingLevel } | { type: "tier"; tier: ServiceTier } | { type: "navigate"; entry: EntryId; summarize: boolean; focus?: string | null } | 
 /**  A host-registered command; `args` is the rest of the line, trimmed. */
 { type: "registered"; name: string; args: string };
 
 /**  A built-in session operation, mode or registered command, decoded and validated. */
-export type Command_Serialize = { type: "compact"; focus: string | null } | { type: "shake"; mode: ShakeMode } | { type: "model"; model: string } | { type: "mode"; name: string; prompt: string | null } | { type: "thinking"; level: ThinkingLevel } | { type: "navigate"; entry: EntryId; summarize: boolean; focus: string | null } | 
+export type Command_Serialize = { type: "compact"; focus: string | null } | { type: "shake"; mode: ShakeMode } | { type: "model"; model: string } | { type: "mode"; name: string; prompt: string | null } | { type: "thinking"; level: ThinkingLevel } | { type: "tier"; tier: ServiceTier } | { type: "navigate"; entry: EntryId; summarize: boolean; focus: string | null } | 
 /**  A host-registered command; `args` is the rest of the line, trimmed. */
 { type: "registered"; name: string; args: string };
 
@@ -691,13 +695,15 @@ export type CompletionRequest = CompletionRequest_Serialize | CompletionRequest_
 /**  A single model request, independent of any session. */
 export type CompletionRequest_Deserialize = {
 	/**
-	 *  A model selector as `/model` takes it: `provider/id` or `@role`, either with an
-	 *  optional `:thinking` suffix.
+	 *  A model selector as `/model` takes it: `provider/id` or `@role`, optionally with
+	 *  `:thinking` and `:tier` suffixes in either order.
 	 */
 	model: string,
 	messages: Message_Deserialize[],
 	/**  Overrides the selector's thinking suffix; `off` when neither names a level. */
 	thinking?: ThinkingLevel | null,
+	/**  Overrides the selector's tier suffix; standard when neither names one. */
+	serviceTier?: ServiceTier | null,
 	maxTokens?: number | null,
 	temperature?: number | null,
 	toolChoice?: ToolChoice | null,
@@ -706,13 +712,15 @@ export type CompletionRequest_Deserialize = {
 /**  A single model request, independent of any session. */
 export type CompletionRequest_Serialize = {
 	/**
-	 *  A model selector as `/model` takes it: `provider/id` or `@role`, either with an
-	 *  optional `:thinking` suffix.
+	 *  A model selector as `/model` takes it: `provider/id` or `@role`, optionally with
+	 *  `:thinking` and `:tier` suffixes in either order.
 	 */
 	model: string,
 	messages: Message_Serialize[],
 	/**  Overrides the selector's thinking suffix; `off` when neither names a level. */
 	thinking: ThinkingLevel | null,
+	/**  Overrides the selector's tier suffix; standard when neither names one. */
+	serviceTier: ServiceTier | null,
 	maxTokens: number | null,
 	temperature: number | null,
 	toolChoice: ToolChoice | null,
@@ -960,6 +968,10 @@ export type Entry_Deserialize =
 } & {
 	thinkingLevel: ThinkingLevel,
 } & EntryBase_Deserialize | {
+	type: "service_tier_change",
+} & {
+	serviceTier: ServiceTier,
+} & EntryBase_Deserialize | {
 	type: "model_change",
 } & {
 	provider: string,
@@ -976,7 +988,7 @@ export type Entry_Deserialize =
 	type: "mode_change",
 } & {
 	mode?: string | null,
-	restore?: ModeRestore | null,
+	restore?: ModeRestore_Deserialize | null,
 } & EntryBase_Deserialize | 
 /**  Usage outside the transcript (e.g. `cache_warm`); never in context. */
 {
@@ -1188,6 +1200,10 @@ export type Entry_Serialize =
 } & {
 	thinkingLevel: ThinkingLevel,
 } & EntryBase_Serialize | {
+	type: "service_tier_change",
+} & {
+	serviceTier: ServiceTier,
+} & EntryBase_Serialize | {
 	type: "model_change",
 } & {
 	provider: string,
@@ -1204,7 +1220,7 @@ export type Entry_Serialize =
 	type: "mode_change",
 } & {
 	mode?: string,
-	restore?: ModeRestore,
+	restore?: ModeRestore_Serialize,
 } & EntryBase_Serialize | 
 /**  Usage outside the transcript (e.g. `cache_warm`); never in context. */
 {
@@ -1973,6 +1989,7 @@ export type LiveSnapshot_Deserialize = {
 	treeUsage: Usage_Deserialize,
 	model: Model_Deserialize,
 	thinking: ThinkingLevel,
+	serviceTier: ServiceTier,
 	agent?: string | null,
 	mode?: string | null,
 	effectiveMode?: string | null,
@@ -2006,6 +2023,7 @@ export type LiveSnapshot_Serialize = {
 	treeUsage: Usage_Serialize,
 	model: Model_Serialize,
 	thinking: ThinkingLevel,
+	serviceTier: ServiceTier,
 	agent: string | null,
 	mode: string | null,
 	effectiveMode: string | null,
@@ -2081,11 +2099,23 @@ export type Message_Serialize = {
 	role: "toolResult",
 } & ToolResultMessage_Serialize;
 
-/**  Model and thinking selection to restore when leaving a mode. */
-export type ModeRestore = {
+/**  Model, thinking level and service tier to restore when leaving a mode. */
+export type ModeRestore = ModeRestore_Serialize | ModeRestore_Deserialize;
+
+/**  Model, thinking level and service tier to restore when leaving a mode. */
+export type ModeRestore_Deserialize = {
 	provider: string,
 	modelId: string,
 	thinkingLevel: ThinkingLevel,
+	serviceTier?: ServiceTier,
+};
+
+/**  Model, thinking level and service tier to restore when leaving a mode. */
+export type ModeRestore_Serialize = {
+	provider: string,
+	modelId: string,
+	thinkingLevel: ThinkingLevel,
+	serviceTier: ServiceTier,
 };
 
 export type ModeResult = ModeResult_Serialize | ModeResult_Deserialize;
@@ -2186,6 +2216,11 @@ export type Model_Deserialize = {
 	thinkingLevelMap?: Partial<{ [key in ThinkingLevel]: string | null }> | null,
 	input: InputKind[],
 	cost: Cost_Deserialize,
+	/**
+	 *  Service tiers this model can be requested with → price multiplier over `cost`.
+	 *  Never contains `Standard`.
+	 */
+	serviceTiers?: Partial<{ [key in ServiceTier]: number | null }>,
 	contextWindow: number,
 	maxTokens: number,
 	compat?: Compat_Deserialize,
@@ -2201,6 +2236,11 @@ export type Model_Serialize = {
 	thinkingLevelMap?: Partial<{ [key in ThinkingLevel]: string | null }>,
 	input: InputKind[],
 	cost: Cost_Serialize,
+	/**
+	 *  Service tiers this model can be requested with → price multiplier over `cost`.
+	 *  Never contains `Standard`.
+	 */
+	serviceTiers?: Partial<{ [key in ServiceTier]: number | null }>,
 	contextWindow: number,
 	maxTokens: number,
 	compat: Compat_Serialize,
@@ -2398,12 +2438,14 @@ export type Projection_Deserialize = {
 	model?: string | null,
 	/**  The latest `thinking_level_change` on the path. */
 	thinking?: ThinkingLevel | null,
+	/**  The latest `service_tier_change` on the path. */
+	tier?: ServiceTier | null,
 	/**  The latest root persona selected by `agent_change` on the path. */
 	agent?: string | null,
 	/**  The latest mode selected by `mode_change` on the path. */
 	mode?: string | null,
-	/**  Selection saved by the latest mode change, cleared by model or thinking changes. */
-	modeRestore?: ModeRestore | null,
+	/**  Selection saved by the latest mode change, cleared by model, thinking or tier changes. */
+	modeRestore?: ModeRestore_Deserialize | null,
 	/**  Id of the entry the path ends at. */
 	leaf?: string | null,
 	path: number[],
@@ -2418,12 +2460,14 @@ export type Projection_Serialize = {
 	model: string | null,
 	/**  The latest `thinking_level_change` on the path. */
 	thinking: ThinkingLevel | null,
+	/**  The latest `service_tier_change` on the path. */
+	tier: ServiceTier | null,
 	/**  The latest root persona selected by `agent_change` on the path. */
 	agent: string | null,
 	/**  The latest mode selected by `mode_change` on the path. */
 	mode: string | null,
-	/**  Selection saved by the latest mode change, cleared by model or thinking changes. */
-	modeRestore: ModeRestore | null,
+	/**  Selection saved by the latest mode change, cleared by model, thinking or tier changes. */
+	modeRestore: ModeRestore_Serialize | null,
 	/**  Id of the entry the path ends at. */
 	leaf: string | null,
 	path: number[],
@@ -2761,6 +2805,27 @@ export type SeqEntry_Serialize = {
 	entry: Entry_Serialize,
 };
 
+/**
+ *  Provider service tier a request asks for. `Standard` sends no tier; adapters
+ *  translate the rest to each provider's wire word.
+ */
+export type ServiceTier = "standard" | "flex" | "fast" | "ultrafast";
+
+/**  Service-tier spreading rules. User settings only: a wider spread raises spending. */
+export type ServiceTierSettings = ServiceTierSettings_Serialize | ServiceTierSettings_Deserialize;
+
+/**  Service-tier spreading rules. User settings only: a wider spread raises spending. */
+export type ServiceTierSettings_Deserialize = {
+	/**  `reset` (default) returns to `standard` when the model changes; `keep` carries the tier over. */
+	onModelChange?: TierOnModelChange,
+};
+
+/**  Service-tier spreading rules. User settings only: a wider spread raises spending. */
+export type ServiceTierSettings_Serialize = {
+	/**  `reset` (default) returns to `standard` when the model changes; `keep` carries the tier over. */
+	onModelChange: TierOnModelChange,
+};
+
 export type SessionAcceptResultArgs = SessionAcceptResultArgs_Serialize | SessionAcceptResultArgs_Deserialize;
 
 export type SessionAcceptResultArgs_Deserialize = {
@@ -2908,6 +2973,8 @@ export type SessionEffectiveModeResult = SessionEffectiveModeResult_Serialize | 
 export type SessionEffectiveModeResult_Deserialize = ModeSpec_Deserialize | null;
 
 export type SessionEffectiveModeResult_Serialize = ModeSpec_Serialize | null;
+
+export type SessionEffectiveServiceTierResult = ServiceTier;
 
 export type SessionEntriesArgs = SessionEntriesArgs_Serialize | SessionEntriesArgs_Deserialize;
 
@@ -3306,6 +3373,8 @@ export type SessionSendArgs = {
 
 export type SessionSendResult = SendReceipt;
 
+export type SessionServiceTierResult = ServiceTier;
+
 export type SessionSetAgentArgs = SessionSetAgentArgs_Serialize | SessionSetAgentArgs_Deserialize;
 
 export type SessionSetAgentArgs_Deserialize = {
@@ -3351,6 +3420,12 @@ export type SessionSetNameResult = SessionSetNameResult_Serialize | SessionSetNa
 export type SessionSetNameResult_Deserialize = SeqEntry_Deserialize;
 
 export type SessionSetNameResult_Serialize = SeqEntry_Serialize;
+
+export type SessionSetServiceTierArgs = {
+	tier: ServiceTier,
+};
+
+export type SessionSetServiceTierResult = ServiceTier;
 
 export type SessionSetThinkingArgs = {
 	level: ThinkingLevel,
@@ -3490,9 +3565,11 @@ export type Settings = Settings_Serialize | Settings_Deserialize;
 export type Settings_Deserialize = {
 	/**  `provider/model-id`. */
 	defaultModel?: string | null,
-	/**  Role name → selector (`provider/model[:thinking]` or `:thinking`); `@role` selectors expand through it. User settings only. */
+	/**  Role name → selector (`provider/model[:thinking][:tier]` or suffixes alone); `@role` selectors expand through it. User settings only. */
 	modelRoles?: { [key in string]: string },
 	defaultThinkingLevel?: ThinkingLevel,
+	/**  What happens to the chosen service tier when the model changes. User settings only. */
+	serviceTier?: ServiceTierSettings_Deserialize,
 	/**  User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`. */
 	homeAgentsDir?: boolean,
 	steeringMode?: QueueMode,
@@ -3517,9 +3594,11 @@ export type Settings_Deserialize = {
 export type Settings_Serialize = {
 	/**  `provider/model-id`. */
 	defaultModel: string | null,
-	/**  Role name → selector (`provider/model[:thinking]` or `:thinking`); `@role` selectors expand through it. User settings only. */
+	/**  Role name → selector (`provider/model[:thinking][:tier]` or suffixes alone); `@role` selectors expand through it. User settings only. */
 	modelRoles: { [key in string]: string },
 	defaultThinkingLevel: ThinkingLevel,
+	/**  What happens to the chosen service tier when the model changes. User settings only. */
+	serviceTier: ServiceTierSettings_Serialize,
 	/**  User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`. */
 	homeAgentsDir: boolean,
 	steeringMode: QueueMode,
@@ -3618,6 +3697,8 @@ export type SpawnContext_Deserialize = {
 	writes?: WriteScope | null,
 	model: Model_Deserialize,
 	thinking: ThinkingLevel,
+	/**  The child's chosen service tier; it applies only on models that support it. */
+	serviceTier: ServiceTier,
 	task: PromptInput_Deserialize,
 	/**  The child's depth (1 for a root session's child). */
 	depth: number,
@@ -3641,6 +3722,8 @@ export type SpawnContext_Serialize = {
 	writes: WriteScope | null,
 	model: Model_Serialize,
 	thinking: ThinkingLevel,
+	/**  The child's chosen service tier; it applies only on models that support it. */
+	serviceTier: ServiceTier,
 	task: PromptInput_Serialize,
 	/**  The child's depth (1 for a root session's child). */
 	depth: number,
@@ -3825,6 +3908,8 @@ export type SubagentSettings_Deserialize = {
 	models?: { [key in string]: string },
 	/**  Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`. */
 	contextFiles?: RawContextFiles | null,
+	/**  Children's service tier when their cascade names none: `standard` (default) or the parent's (`inherit`). */
+	serviceTier?: SubagentTier,
 };
 
 /**  Child-session budgets and defaults. User settings only. */
@@ -3841,7 +3926,11 @@ export type SubagentSettings_Serialize = {
 	models: { [key in string]: string },
 	/**  Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`. */
 	contextFiles: ContextFiles | null,
+	/**  Children's service tier when their cascade names none: `standard` (default) or the parent's (`inherit`). */
+	serviceTier: SubagentTier,
 };
+
+export type SubagentTier = "standard" | "inherit";
 
 export type SubmissionKind = "prompt" | "steer" | "follow_up" | 
 /**  Held until a turn boundary or the next run; never starts a run. */
@@ -4081,6 +4170,8 @@ export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhi
 export type ThinkingTokenBudgetField = "thinking_token_budget" | "thinking_budget" | "thinking_budget_tokens";
 
 export type ThinkingVar = "thinking.enabled" | "thinking.effort" | "thinking.budget";
+
+export type TierOnModelChange = "reset" | "keep";
 
 export type ToolCall = ToolCall_Serialize | ToolCall_Deserialize;
 
@@ -4581,6 +4672,14 @@ export interface Session {
    */
   thinking(signal?: AbortSignal): Promise<SessionThinkingResult>;
   /**
+   * The chosen service tier; it applies only on models that support it.
+   */
+  serviceTier(signal?: AbortSignal): Promise<SessionServiceTierResult>;
+  /**
+   * The tier requests are sent with on the current model.
+   */
+  effectiveServiceTier(signal?: AbortSignal): Promise<SessionEffectiveServiceTierResult>;
+  /**
    * The effective configuration for this session.
    */
   config(signal?: AbortSignal): Promise<SessionConfigResult_Serialize>;
@@ -4653,7 +4752,7 @@ export interface Session {
   keywordMatches(text: SessionKeywordMatchesArgs["text"], signal?: AbortSignal): Promise<SessionKeywordMatchesResult>;
   // withheld: parseCommand — nested result; the wire method flattens it
   /**
-   * Runs a command under its policy: `model`/`thinking`, modes and registered commands
+   * Runs a command under its policy: `model`/`thinking`/`tier`, modes and registered commands
    * alongside a turn, `compact`/`shake`/`navigate` only when idle (`Error::Busy`
    * otherwise).
    */
@@ -4688,6 +4787,10 @@ export interface Session {
    * level applied.
    */
   setThinking(level: SessionSetThinkingArgs["level"], signal?: AbortSignal): Promise<SessionSetThinkingResult>;
+  /**
+   * Chooses the service tier from the next request; returns the tier the current model applies.
+   */
+  setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
   /**
    * Settles the pending question of tool call `call_id`.
    */
