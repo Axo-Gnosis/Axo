@@ -334,7 +334,7 @@ pub async fn run(bun: &Path, mode: Supervision) {
     drop(reopened);
 
     let mut options = host.session_options(Some("test/m"));
-    options.modes.push(axo::ModeSpec {
+    options.definitions.modes.push(axo::ModeSpec {
         name: "plan".into(),
         description: "Plan".into(),
         body: "Plan first.".into(),

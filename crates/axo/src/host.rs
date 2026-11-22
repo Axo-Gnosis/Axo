@@ -67,7 +67,12 @@ impl HostWire<'_> {
     ) -> Result<Catalog, Error> {
         let config = self.axo.config.clone();
         tokio::task::spawn_blocking(move || {
-            crate::axo::load_catalog(&*config, &cwd, project_access, &[], &[], &[])
+            crate::axo::load_catalog(
+                &*config,
+                &cwd,
+                project_access,
+                &crate::Definitions::default(),
+            )
         })
         .await
         .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))

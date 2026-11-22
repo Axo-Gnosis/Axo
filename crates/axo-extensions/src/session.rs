@@ -10,8 +10,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use axo::{
-    AgentSpec, CompletionRequest, Exposure, HostTool, KeywordSpec, ModeSpec, RegisteredCommand,
-    Registrations, Scheme, Session, SessionEvent, SessionEventKind, SessionOptions, SessionTools,
+    CompletionRequest, Definitions, Exposure, HostTool, RegisteredCommand, Registrations, Scheme,
+    Session, SessionEvent, SessionEventKind, SessionOptions, SessionTools,
 };
 use axo_ai::AssistantEvent;
 use futures::StreamExt;
@@ -59,9 +59,7 @@ pub(crate) struct Contribution {
     pub decl: SessionDecl,
     /// `(name, body)` in declaration order.
     pub sections: Vec<(String, String)>,
-    pub agents: Vec<AgentSpec>,
-    pub modes: Vec<ModeSpec>,
-    pub keywords: Vec<KeywordSpec>,
+    pub definitions: Definitions,
 }
 
 /// Extension-vs-extension scheme and section collisions, in enabled order; each is reported
@@ -98,29 +96,11 @@ pub(crate) fn collisions(contributions: &[Arc<Contribution>]) -> Vec<ExtensionDi
 }
 
 impl Extensions {
-    /// Sets `options.layer` to the enabled extensions, replacing any layer the caller set, and
-    /// puts their agents, modes and keywords ahead of the host's. No I/O, starts nothing.
+    /// Sets `options.layer` to the enabled extensions, replacing any layer the caller set.
+    /// The host's own `options.definitions` rank after the extensions'. No I/O, starts nothing.
     pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
         let contributions = self.inner.lock().contributions.clone();
         options.layer = layer(&contributions, &Arc::downgrade(&self.inner));
-        // Loaders keep the first of a name (files first): later-enabled extensions go first,
-        // and the host's own code definitions come last.
-        fn first<T: Clone>(
-            contributions: &[Arc<Contribution>],
-            of: impl Fn(&Contribution) -> &[T],
-            host: Vec<T>,
-        ) -> Vec<T> {
-            let mut all: Vec<T> = contributions
-                .iter()
-                .rev()
-                .flat_map(|c| of(c).iter().cloned())
-                .collect();
-            all.extend(host);
-            all
-        }
-        options.agents = first(&contributions, |c| &c.agents, options.agents);
-        options.modes = first(&contributions, |c| &c.modes, options.modes);
-        options.keywords = first(&contributions, |c| &c.keywords, options.keywords);
         options
     }
 
@@ -259,16 +239,29 @@ fn layer(contributions: &[Arc<Contribution>], inner: &Weak<Inner>) -> Registrati
                 .map(|(name, body)| (name.clone(), Some(body.clone()))),
         );
     }
+    // Unlike the other registrations, definitions keep the first of a name.
+    // ponytail: agents beat same-name teams here; ordered per-extension Definitions would preserve precedence across kinds.
+    for c in contributions.iter().rev() {
+        let defs = &mut parts.definitions;
+        defs.agents.extend_from_slice(&c.definitions.agents);
+        defs.teams.extend_from_slice(&c.definitions.teams);
+        defs.modes.extend_from_slice(&c.definitions.modes);
+        defs.keywords.extend_from_slice(&c.definitions.keywords);
+        defs.skills.extend_from_slice(&c.definitions.skills);
+    }
     parts
 }
 
 /// Whether two compositions install the same layer: the same extensions in the same order
-/// with the same declarations and sections.
+/// with the same declarations, sections and definitions.
 pub(crate) fn same_layer(a: &[Arc<Contribution>], b: &[Arc<Contribution>]) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(a, b)| a.ext == b.ext && a.decl == b.decl && a.sections == b.sections)
+        && a.iter().zip(b).all(|(a, b)| {
+            a.ext == b.ext
+                && a.decl == b.decl
+                && a.sections == b.sections
+                && a.definitions == b.definitions
+        })
 }
 
 /// Applies the current composition as `id`'s layer under the manager's config gate.

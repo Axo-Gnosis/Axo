@@ -19,9 +19,10 @@ use tracing::warn;
 
 use super::children::ChildSeed;
 use super::modes::ENTER_MODE;
-use super::{Inherited, Loaded, Registrations, Session, SessionHooks, SessionSetup};
+use super::{Inherited, Registrations, Session, SessionHooks, SessionSetup};
 use crate::config::SubagentSettings;
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
+use crate::context::definitions::{Definitions, FileDefinitions};
 use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
 use crate::coordination::SpawnReceipt;
 use crate::error::Error;
@@ -200,12 +201,9 @@ fn validate_output(output: Option<&Value>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn child_inherited(
-    hooks: &SessionHooks,
-    spec: &AgentSpec,
-    loaded: Loaded,
-) -> Arc<Inherited> {
+pub(super) fn child_inherited(hooks: &SessionHooks, spec: &AgentSpec) -> Arc<Inherited> {
     let parent = &hooks.inherited;
+    let defs = hooks.definitions.get();
     let base = hooks
         .shape_base
         .lock()
@@ -215,10 +213,13 @@ pub(super) fn child_inherited(
         config: parent.config.clone(),
         docs_dir: parent.docs_dir.clone(),
         harness_name: parent.harness_name.clone(),
-        agents: parent.agents.clone(),
-        modes: Vec::new(),
-        keywords: Vec::new(),
-        agent_diagnostics: Vec::new(),
+        files: Arc::new(FileDefinitions {
+            agents: defs.agents.clone(),
+            skills: defs.skills.clone(),
+            ..Default::default()
+        }),
+        definitions: Definitions::default(),
+        definition_diagnostics: Vec::new(),
         agent: Some(spec.clone()),
         streamer: parent.streamer.clone(),
         models: parent.models.clone(),
@@ -235,7 +236,7 @@ pub(super) fn child_inherited(
         commands: Vec::new(),
         layer: Registrations::default(),
         run_slots: parent.run_slots.clone(),
-        loaded: Some(loaded),
+        docs: Some(hooks.prompt.sources.docs),
     })
 }
 
@@ -321,7 +322,8 @@ impl SessionHooks {
             }
             (Some(name), None) => {
                 let spec = self
-                    .inherited
+                    .definitions
+                    .get()
                     .agents
                     .iter()
                     .find_map(|definition| match definition {
@@ -490,7 +492,7 @@ impl SessionHooks {
             header.spawn = Some(link.clone());
             let child_id = header.id.clone();
             let writer = self.inherited.store.create(header).await?;
-            let inherited = child_inherited(self, &link.spec, self.loaded());
+            let inherited = child_inherited(self, &link.spec);
             let expanded_model = format!("{}/{}", model.provider, model.id);
             let child = Arc::new(
                 Session::start(SessionSetup {
@@ -665,8 +667,8 @@ impl SessionHooks {
         } = request;
         let (members, charter, team_name) = match (team, members.is_empty()) {
             (Some(name), true) => {
-                let definition = self
-                    .inherited
+                let defs = self.definitions.get();
+                let definition = defs
                     .agents
                     .iter()
                     .find(|definition| definition.name() == name)
@@ -1130,15 +1132,12 @@ impl Tool for SpawnTool {
                 None => single_output(first.id.to_string()),
             });
         }
+        let defs = hooks.definitions.get();
         let named_team = agent.as_deref().and_then(|name| {
-            hooks
-                .inherited
-                .agents
-                .iter()
-                .find_map(|definition| match definition {
-                    AgentDef::Team(team) if team.name == name => Some(team),
-                    _ => None,
-                })
+            defs.agents.iter().find_map(|definition| match definition {
+                AgentDef::Team(team) if team.name == name => Some(team),
+                _ => None,
+            })
         });
         let is_team = if members.is_some() {
             if agent.is_some() || spec.is_some() {

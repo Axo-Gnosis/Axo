@@ -3,6 +3,7 @@
 //! Loaders never fail: problems become [`Diagnostic`]s that the session logs.
 
 pub mod agents;
+pub(crate) mod definitions;
 pub mod files;
 pub mod keywords;
 pub(crate) mod markdown;

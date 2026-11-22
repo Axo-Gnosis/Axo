@@ -65,12 +65,13 @@ use crate::commands::{self, Command, CommandInfo, RegisteredCommand};
 use crate::compaction::{self, Limits};
 use crate::config::{EffectiveConfig, ModelChoice, ProjectAccess};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs};
+use crate::context::definitions::{Definitions, FileDefinitions, LiveDefinitions, merge};
 use crate::context::files::NestedContext;
 use crate::context::keywords::{KeywordMatch, KeywordSpec};
 use crate::context::modes::{BashAccess, ModeSpec};
 use crate::context::prompt::PromptSources;
-use crate::context::skills::{Skill, load_skills};
-use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir};
+use crate::context::skills::Skill;
+use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::error::Error;
 use crate::exec::ExecEnv;
 use crate::exec::host::ProcessSupervisor;
@@ -99,12 +100,8 @@ pub struct SessionOptions {
     /// The root agent by name. `None` keeps the session's recorded agent (none for a new
     /// session); `Some` selects it, recording a change on reopen.
     pub agent: Option<String>,
-    /// Agent definitions supplied in code, after every file-defined one; the first name wins.
-    pub agents: Vec<AgentSpec>,
-    /// Mode definitions supplied in code, after every file-defined one; the first name wins.
-    pub modes: Vec<ModeSpec>,
-    /// Keyword definitions supplied in code, after every file-defined one; the first name wins.
-    pub keywords: Vec<KeywordSpec>,
+    /// Definitions supplied in code, after every file-defined one and after the layer's; the first name wins.
+    pub definitions: Definitions,
     /// Falls back to the session's last level, then `defaultThinkingLevel`; clamped to
     /// the model's supported levels.
     pub thinking: Option<ThinkingLevel>,
@@ -141,9 +138,7 @@ impl Default for SessionOptions {
             cwd: std::env::current_dir().unwrap_or_default(),
             model: None,
             agent: None,
-            agents: Vec::new(),
-            modes: Vec::new(),
-            keywords: Vec::new(),
+            definitions: Definitions::default(),
             thinking: None,
             ask_enabled: false,
             project_access: None,
@@ -160,9 +155,10 @@ impl Default for SessionOptions {
     }
 }
 
-/// One set of live registrations: the six lists a host passes in `SessionOptions`.
+/// One set of live registrations: the six lists and the definitions a host passes in `SessionOptions`.
 #[derive(Clone, Default)]
 pub struct Registrations {
+    pub definitions: Definitions,
     pub tools: Vec<HostTool>,
     pub tool_policies: Vec<Arc<dyn ToolPolicy>>,
     pub spawn_hooks: Vec<Arc<dyn SpawnHook>>,
@@ -562,11 +558,9 @@ pub(crate) struct Inherited {
     /// omits both.
     pub(crate) docs_dir: Option<PathBuf>,
     pub(crate) harness_name: String,
-    pub(crate) agents: Vec<AgentDef>,
-    pub(crate) modes: Vec<Arc<ModeSpec>>,
-    /// Every loaded keyword definition, disabled ones included; empty for children.
-    pub(crate) keywords: Vec<Arc<KeywordSpec>>,
-    pub(crate) agent_diagnostics: Vec<Diagnostic>,
+    pub(crate) files: Arc<FileDefinitions>,
+    pub(crate) definitions: Definitions,
+    pub(crate) definition_diagnostics: Vec<Diagnostic>,
     pub(crate) agent: Option<AgentSpec>,
     pub(crate) streamer: Arc<dyn Streamer>,
     /// Where `/model` looks up models.
@@ -589,15 +583,8 @@ pub(crate) struct Inherited {
     pub(crate) layer: Registrations,
     /// Child runs streaming at once under one root session and its live forks.
     pub(crate) run_slots: Arc<tokio::sync::Semaphore>,
-    /// `Some` for children: `session_schemes` skips skill discovery and docs materialization.
-    pub(crate) loaded: Option<Loaded>,
-}
-
-/// Skills and the docs flag a child takes from its parent instead of loading them again.
-#[derive(Clone)]
-pub(crate) struct Loaded {
-    pub(crate) skills: Vec<Skill>,
-    pub(crate) docs: bool,
+    /// Some for children: the parent's docs flag; skips docs materialization.
+    pub(crate) docs: Option<bool>,
 }
 
 /// Everything `Axo` resolved for a new, opened or forked session.
@@ -662,6 +649,7 @@ struct SessionHooks {
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
     preparing: AtomicUsize,
     prompt: SessionPrompt,
+    definitions: Arc<LiveDefinitions>,
     shape_base: Mutex<ShapeBase>,
     promoted: Mutex<Vec<String>>,
     mode: Mutex<modes::ModeState>,
@@ -904,11 +892,8 @@ impl SessionHooks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = layers.joined(|r| &r.spawn_hooks);
         let commands = layers.joined(|r| &r.commands);
-        let diagnostics = commands::registered_diagnostics(
-            &commands,
-            &self.inherited.modes,
-            &self.prompt.sources.skills,
-        );
+        let defs = self.definitions.get();
+        let diagnostics = commands::registered_diagnostics(&commands, &defs.modes, &defs.skills);
         *self.commands.lock().unwrap_or_else(PoisonError::into_inner) = commands;
         diagnostics
     }
@@ -952,14 +937,6 @@ impl SessionHooks {
 
     fn selection(&self) -> Selection {
         self.selection.borrow().clone()
-    }
-
-    /// What a child of this session reuses instead of loading again.
-    pub(super) fn loaded(&self) -> Loaded {
-        Loaded {
-            skills: self.prompt.sources.skills.clone(),
-            docs: self.prompt.sources.docs,
-        }
     }
 
     fn model(&self) -> Model {
@@ -1785,43 +1762,25 @@ pub(crate) struct LiveSchemes {
     pub(crate) deferred: Arc<tools::deferred::Deferred>,
 }
 
-/// Loads the skills a session in `cwd` sees and builds its file-backed schemes over them:
-/// `artifact://` and `local://` in the side folders beside the session file `path`,
-/// `skill://`, `axo://` docs when `docs_dir` is given, `proc://`, `agent://` and `tool://` when
-/// `live` is given, then `host` schemes. Open sessions and `Axo::schemes` both build
-/// them here, so given the same effective config a file-backed URL resolves alike
-/// whether its session is open or not; only open sessions get `proc://`, `agent://`
-/// and `tool://` (`Axo::schemes` passes no live state). A child passes its parent's
-/// `loaded` skills and docs flag, which skips discovery and docs materialization.
+/// Builds the session's file-backed schemes, plus the process, agent and tool schemes
+/// when live state is supplied. Children reuse their parent's docs flag.
 pub(crate) fn session_schemes(
-    config: &EffectiveConfig,
     docs_dir: Option<&Path>,
     name: &str,
     cx: SchemeContext,
     host: &[Arc<dyn Scheme>],
     live: Option<LiveSchemes>,
-    loaded: Option<&Loaded>,
-) -> Result<(Schemes, Vec<Skill>, Vec<Diagnostic>, bool), Error> {
-    let (skills, mut diagnostics) = match loaded {
-        Some(loaded) => (loaded.skills.clone(), Vec::new()),
-        None => {
-            let settings = &config.settings;
-            let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
-            load_skills(
-                &config.skill_roots,
-                home_agents.as_deref(),
-                &cx.cwd,
-                config.access != ProjectAccess::Ignore && settings.project.files.skills,
-            )
-        }
-    };
+    definitions: Arc<LiveDefinitions>,
+    docs: Option<bool>,
+) -> Result<(Schemes, Vec<Diagnostic>, bool), Error> {
+    let mut diagnostics = Vec::new();
     let mut builtins: Vec<Arc<dyn Scheme>> = vec![
-        Arc::new(SkillScheme::new(&skills)),
+        Arc::new(SkillScheme::new(definitions)),
         Arc::new(DirScheme::local(cx.session_dir.join(LOCAL_DIR))),
     ];
     let docs = docs_dir.is_some_and(|docs_dir| {
-        let ready = match loaded {
-            Some(loaded) => loaded.docs,
+        let ready = match docs {
+            Some(ready) => ready,
             None => match ensure_bundled_docs(docs_dir, name) {
                 Ok(()) => true,
                 Err(error) => {
@@ -1853,7 +1812,7 @@ pub(crate) fn session_schemes(
     }
     let artifacts = Arc::new(Artifacts::new(cx.session_dir.join(ARTIFACTS_DIR)));
     let schemes = Schemes::new(cx, artifacts, builtins, host)?;
-    Ok((schemes, skills, diagnostics, docs))
+    Ok((schemes, diagnostics, docs))
 }
 
 #[expose(block = SESSION_CORE, object = "session")]
@@ -1902,8 +1861,15 @@ impl Session {
                 .collect::<Vec<_>>()
         };
         let layer = &inherited.layer;
+        let (resolved, merge_diagnostics) = merge(
+            &inherited.files,
+            &[&layer.definitions, &inherited.definitions],
+        );
+        let definitions = Arc::new(LiveDefinitions::new(resolved));
+        let resolved = definitions.get();
         let layers = Layers {
             host: Registrations {
+                definitions: inherited.definitions.clone(),
                 tools: host_tools.clone(),
                 tool_policies: inherited.tool_policies.clone(),
                 spawn_hooks: inherited.spawn_hooks.clone(),
@@ -1912,6 +1878,7 @@ impl Session {
                 commands: inherited.commands.clone(),
             },
             layer: Registrations {
+                definitions: layer.definitions.clone(),
                 tools: layer.tools.clone(),
                 tool_policies: layer.tool_policies.clone(),
                 spawn_hooks: layer.spawn_hooks.clone(),
@@ -1957,8 +1924,7 @@ impl Session {
             .sessions
             .register(session_id.clone(), Arc::downgrade(&jobs));
         let deferred = Arc::new(tools::deferred::Deferred::default());
-        let (schemes, skills, skill_diagnostics, docs) = session_schemes(
-            config,
+        let (schemes, scheme_diagnostics, docs) = session_schemes(
             docs_dir.as_deref(),
             &inherited.harness_name,
             SchemeContext {
@@ -1973,7 +1939,8 @@ impl Session {
                 store: inherited.store.clone(),
                 deferred: deferred.clone(),
             }),
-            inherited.loaded.as_ref(),
+            definitions.clone(),
+            inherited.docs,
         )?;
         let (summary_prompts, summary_diagnostics) =
             compaction::summary::SummaryPrompts::load(&config.prompts, &inherited.harness_name);
@@ -2003,7 +1970,7 @@ impl Session {
                 .map(|team| inherited.sessions.team(&link.parent_session_id, team))
         });
         let (host, host_deferred) = tools::instantiate(&joined_tools, &session_tools);
-        let spawn_tool = Arc::new(SpawnTool::new(&inherited.agents, &settings.model_roles));
+        let spawn_tool = Arc::new(SpawnTool::new(&resolved.agents, &settings.model_roles));
         let depth = link.as_ref().map_or(0, |link| link.depth);
         let routes = AgentRoutes {
             session_id: session_id.clone(),
@@ -2040,7 +2007,7 @@ impl Session {
             });
         let enter_mode = link
             .is_none()
-            .then(|| modes::EnterModeTool::new(&inherited.modes))
+            .then(|| modes::EnterModeTool::new(&resolved.modes))
             .flatten()
             .map(Arc::new);
         let shape_base = ShapeBase {
@@ -2059,7 +2026,7 @@ impl Session {
             scheme_docs: session_tools.schemes.prompt_docs(),
             depth,
             has_peers,
-            has_modes: link.is_none() && !inherited.modes.is_empty(),
+            has_modes: link.is_none() && !resolved.modes.is_empty(),
             yield_tool,
             limits: link
                 .as_ref()
@@ -2073,7 +2040,7 @@ impl Session {
         let tools = prompt_shape.tools.clone();
         let selected_mode = if link.is_none() {
             projection.mode.as_ref().and_then(|name| {
-                inherited
+                resolved
                     .modes
                     .iter()
                     .find(|spec| &spec.name == name)
@@ -2096,20 +2063,21 @@ impl Session {
             .context
             .into_iter()
             .chain(shape_diagnostics.tools)
-            .chain(skill_diagnostics)
-            .chain(commands::reserved_skill_diagnostics(&skills))
+            .chain(scheme_diagnostics)
+            .chain(commands::reserved_skill_diagnostics(&resolved.skills))
             .chain(commands::hidden_skill_diagnostics(
-                &skills,
-                &inherited.modes,
+                &resolved.skills,
+                &resolved.modes,
             ))
             .chain(commands::registered_diagnostics(
                 &joined_commands,
-                &inherited.modes,
-                &skills,
+                &resolved.modes,
+                &resolved.skills,
             ))
             .chain(summary_diagnostics)
             .chain(section_diagnostics)
-            .chain(inherited.agent_diagnostics.iter().cloned())
+            .chain(inherited.definition_diagnostics.iter().cloned())
+            .chain(merge_diagnostics)
             .chain(mode_diagnostic)
             .collect();
         for diagnostic in &diagnostics {
@@ -2174,6 +2142,7 @@ impl Session {
             SessionHooks {
                 events: events.clone(),
                 inherited: inherited.clone(),
+                definitions: definitions.clone(),
                 session_id: session_id.clone(),
                 shape_base: Mutex::new(shape_base),
                 promoted: Mutex::new(Vec::new()),
@@ -2221,7 +2190,7 @@ impl Session {
                         name: inherited.harness_name.clone(),
                         cwd: cwd.clone(),
                         docs,
-                        skills,
+                        definitions,
                     },
                     shape: Mutex::new(prompt_shape),
                     state: Mutex::new(PromptState {
@@ -2502,16 +2471,16 @@ impl Session {
         })
     }
 
-    /// The skills loaded at start; the prompt's catalog and `/name` commands use these.
+    /// The skills in force now; the prompt's catalog and `/name` commands use these.
     #[ext]
-    pub fn skills(&self) -> &[Skill] {
-        &self.hooks.prompt.sources.skills
+    pub fn skills(&self) -> Vec<Skill> {
+        self.hooks.definitions.get().skills.clone()
     }
 
-    /// Agent and team definitions loaded at start; forks share them.
+    /// Agent and team definitions in force now.
     #[ext]
-    pub fn agents(&self) -> &[AgentDef] {
-        &self.inherited.agents
+    pub fn agents(&self) -> Vec<AgentDef> {
+        self.hooks.definitions.get().agents.clone()
     }
 
     /// Start-time context, skill, prompt, and scheme diagnostics, also logged as warnings.
@@ -2594,11 +2563,8 @@ impl Session {
     /// skills.
     #[ext]
     pub fn commands(&self) -> Vec<CommandInfo> {
-        commands::catalog(
-            &self.hooks.prompt.sources.skills,
-            self.modes(),
-            &self.hooks.commands(),
-        )
+        let defs = self.hooks.definitions.get();
+        commands::catalog(&defs.skills, &defs.modes, &self.hooks.commands())
     }
 
     /// Replaces the host's registered commands; returns the diagnostics of every registered
@@ -2616,11 +2582,8 @@ impl Session {
         let mut layers = self.hooks.registrations();
         layers.host.commands = commands;
         let commands = layers.joined(|r| &r.commands);
-        let diagnostics = commands::registered_diagnostics(
-            &commands,
-            self.modes(),
-            &self.hooks.prompt.sources.skills,
-        );
+        let defs = self.hooks.definitions.get();
+        let diagnostics = commands::registered_diagnostics(&commands, &defs.modes, &defs.skills);
         *self
             .hooks
             .commands
@@ -2629,17 +2592,16 @@ impl Session {
         Ok(diagnostics)
     }
 
-    /// The mode definitions available to this root session; empty for children.
+    /// The mode definitions in force now; empty for children.
     #[ext]
-    pub fn modes(&self) -> &[Arc<ModeSpec>] {
-        &self.hooks.inherited.modes
+    pub fn modes(&self) -> Vec<Arc<ModeSpec>> {
+        self.hooks.definitions.get().modes.clone()
     }
 
-    /// Every keyword definition loaded for this root session, disabled ones included;
-    /// empty for children.
+    /// Every keyword definition in force now, disabled ones included; empty for children.
     #[ext]
-    pub fn keywords(&self) -> &[Arc<KeywordSpec>] {
-        &self.hooks.inherited.keywords
+    pub fn keywords(&self) -> Vec<Arc<KeywordSpec>> {
+        self.hooks.definitions.get().keywords.clone()
     }
 
     /// The keywords that would fire in `text` typed as a message right now, as byte ranges
@@ -2665,14 +2627,15 @@ impl Session {
             Some(index) => (&rest[..index], rest[index..].trim()),
             None => (rest, ""),
         };
-        if self.modes().iter().any(|mode| mode.name == name) {
+        let defs = self.hooks.definitions.get();
+        if defs.modes.iter().any(|mode| mode.name == name) {
             return Some(Ok(Command::Mode {
                 name: name.to_owned(),
                 prompt: (!prompt.is_empty()).then(|| prompt.to_owned()),
             }));
         }
         let registered = self.hooks.commands();
-        commands::effective(&registered, self.modes())
+        commands::effective(&registered, &defs.modes)
             .iter()
             .any(|command| command.name == name)
             .then(|| {
@@ -2692,7 +2655,7 @@ impl Session {
             Command::Registered { name, args } => {
                 let handler = {
                     let registered = self.hooks.commands();
-                    commands::effective(&registered, self.modes())
+                    commands::effective(&registered, &self.hooks.definitions.get().modes)
                         .into_iter()
                         .find(|command| command.name == name)
                         .map(|command| command.handler.clone())
@@ -2799,7 +2762,9 @@ impl Session {
         let spec = name
             .map(|name| {
                 let spec = self
-                    .inherited
+                    .hooks
+                    .definitions
+                    .get()
                     .agents
                     .iter()
                     .find_map(|definition| match definition {
@@ -3005,10 +2970,41 @@ impl Session {
         .await
     }
 
-    /// Replaces the layer over the host's registrations in one pass. An invalid section
-    /// name or an invalid or reserved scheme name rejects the whole layer and changes
-    /// nothing. Live children keep what they were spawned with. Returns the new tool shape's
-    /// diagnostics, then those of every registered command.
+    /// Replaces the host's code-supplied definitions from the next request. File definitions
+    /// and the layer's keep their precedence. The selected persona and mode keep the copy they
+    /// were selected with. Returns merge, skill and command diagnostics, then the tool shape's.
+    /// Hosts pass definitions again on reopen.
+    #[ext(
+        skip = "replaces the host's own registrations; extensions register through their manifest"
+    )]
+    pub async fn set_definitions(
+        &self,
+        definitions: Definitions,
+    ) -> Result<Vec<Diagnostic>, Error> {
+        self.reject_child()?;
+        let hooks = self.hooks.clone();
+        detached(async move {
+            let _order = hooks.selection_order.lock().await;
+            hooks.registrations().host.definitions = definitions;
+            let mut diagnostics = hooks.stage_definitions();
+            let defs = hooks.definitions.get();
+            diagnostics.extend(commands::registered_diagnostics(
+                &hooks.commands(),
+                &defs.modes,
+                &defs.skills,
+            ));
+            diagnostics.extend(hooks.restage().await);
+            hooks.prompt.rebuild();
+            Ok(diagnostics)
+        })
+        .await
+    }
+
+    /// Replaces the layer over the host's registrations, and the layer's definitions, in one
+    /// pass. An invalid section name or an invalid or reserved scheme name rejects the whole
+    /// layer and changes nothing. Live children keep what they were spawned with. Returns the
+    /// new tool shape's diagnostics, then definition diagnostics, then those of every
+    /// registered command.
     #[ext(
         skip = "replaces the host's own registrations; extensions register through their manifest"
     )]
@@ -3028,9 +3024,10 @@ impl Session {
                 .cloned()
                 .collect();
             hooks.stage_schemes(schemes)?;
+            hooks.registrations().layer = layer;
+            let definition_diagnostics = hooks.stage_definitions();
             let (sections, tools, command_diagnostics) = {
-                let mut layers = hooks.registrations();
-                layers.layer = layer;
+                let layers = hooks.registrations();
                 let command_diagnostics = hooks.apply_registrations(&agent, &layers);
                 (
                     layers.joined(|r| &r.sections),
@@ -3041,6 +3038,7 @@ impl Session {
             hooks.stage_sections(sections);
             let mut diagnostics = hooks.stage_tools(tools).await;
             hooks.prompt.rebuild();
+            diagnostics.extend(definition_diagnostics);
             diagnostics.extend(command_diagnostics);
             Ok::<_, Error>(diagnostics)
         })
@@ -3304,6 +3302,7 @@ impl Session {
         inherited.spawn_hooks = host.spawn_hooks;
         inherited.host_schemes = host.schemes;
         inherited.commands = host.commands;
+        inherited.definitions = host.definitions;
         inherited.layer = layer;
         let session = Session::start(SessionSetup {
             inherited: Arc::new(inherited),

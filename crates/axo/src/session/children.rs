@@ -468,7 +468,7 @@ impl SessionHooks {
         };
         let seed = Arc::new(ChildSeed {
             path: child.path.clone(),
-            inherited: child_inherited(self, &link.spec, self.loaded()),
+            inherited: child_inherited(self, &link.spec),
             link,
         });
         if recover {

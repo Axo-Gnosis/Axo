@@ -3,8 +3,8 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use axo::{
-    AgentSpec, BashAccess, Entry, HostTool, ModeSpec, RecoveryPolicy, SessionOptions, SessionTools,
-    SpawnRequest, WriteRoot, WriteScope,
+    AgentSpec, BashAccess, Definitions, Entry, HostTool, ModeSpec, RecoveryPolicy, SessionOptions,
+    SessionTools, SpawnRequest, WriteRoot, WriteScope,
 };
 use axo_agent::Tool;
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
@@ -583,13 +583,16 @@ async fn bash_and_write_ceilings_outlive_the_parent_mode() {
         ],
     );
     let opts = SessionOptions {
-        modes: vec![ModeSpec {
-            name: "inspect".into(),
-            description: "Inspect without writing.".into(),
-            bash: BashAccess::ReadOnly,
-            writes: Some(vec!["local://".into(), "plans".into()]),
+        definitions: Definitions {
+            modes: vec![ModeSpec {
+                name: "inspect".into(),
+                description: "Inspect without writing.".into(),
+                bash: BashAccess::ReadOnly,
+                writes: Some(vec!["local://".into(), "plans".into()]),
+                ..Default::default()
+            }],
             ..Default::default()
-        }],
+        },
         ..options(dir.path())
     };
     let cwd = opts.cwd.clone();
@@ -675,17 +678,20 @@ async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
 
     let captured_tools = Arc::new(Mutex::new(None));
     let opts = SessionOptions {
-        agents: vec![AgentSpec {
-            name: "planner".into(),
-            writes: Some(vec!["plans/ok.md".into(), "plans/linked".into()]),
+        definitions: Definitions {
+            agents: vec![AgentSpec {
+                name: "planner".into(),
+                writes: Some(vec!["plans/ok.md".into(), "plans/linked".into()]),
+                ..Default::default()
+            }],
+            modes: vec![ModeSpec {
+                name: "plan".into(),
+                description: "Write only in plans.".into(),
+                writes: Some(vec!["plans".into()]),
+                ..Default::default()
+            }],
             ..Default::default()
-        }],
-        modes: vec![ModeSpec {
-            name: "plan".into(),
-            description: "Write only in plans.".into(),
-            writes: Some(vec!["plans".into()]),
-            ..Default::default()
-        }],
+        },
         tools: vec![HostTool::direct(Arc::new({
             let captured_tools = captured_tools.clone();
             move |tools: &Arc<SessionTools>| -> Arc<dyn Tool> {

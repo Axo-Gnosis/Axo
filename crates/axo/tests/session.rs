@@ -1213,7 +1213,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
     };
     let mut initial = options(dir.path());
     initial.agent = Some("a".into());
-    initial.agents = vec![a.clone(), b.clone()];
+    initial.definitions.agents = vec![a.clone(), b.clone()];
     let session = host.axo.create_session(initial).await.unwrap();
     assert_eq!(session.agent().unwrap().name, "a");
     assert!(session.spawn_link().is_none());
@@ -1224,7 +1224,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
 
     // Reopening without `agent` re-resolves the recorded persona by name.
     let mut reopen_options = options(dir.path());
-    reopen_options.agents = vec![a.clone(), b];
+    reopen_options.definitions.agents = vec![a.clone(), b];
     let reopened = host.axo.open_session(&path, reopen_options).await.unwrap();
     assert_eq!(reopened.agent().unwrap().name, "a");
     reopened
@@ -1307,7 +1307,7 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
         ..Default::default()
     };
     let mut settings = options(dir.path());
-    settings.agents = vec![root, child.clone()];
+    settings.definitions.agents = vec![root, child.clone()];
     let session = host.create_session(settings).await.unwrap();
     assert!(matches!(
         session.set_agent(Some("child-only")).await,
@@ -1333,7 +1333,7 @@ mod keywords {
     use std::time::Duration;
 
     use axo::context::keywords::{KeywordMatch, KeywordSpec};
-    use axo::{Command, Entry, PromptPart, SessionOptions};
+    use axo::{Command, Definitions, Entry, PromptPart, SessionOptions};
     use axo_agent::RunOutcome;
     use axo_ai::testing::{RecordedRequest, reply_text};
     use axo_ai::{Message, ScriptedTurn, UserBlock};
@@ -1355,7 +1355,10 @@ mod keywords {
 
     fn keyword_options(dir: &Path, keyword: KeywordSpec) -> SessionOptions {
         SessionOptions {
-            keywords: vec![keyword],
+            definitions: Definitions {
+                keywords: vec![keyword],
+                ..Default::default()
+            },
             ..options(dir)
         }
     }

@@ -3,7 +3,7 @@ mod common;
 use std::path::Path;
 
 use axo::{
-    AgentSpec, Entry, JobKind, SessionEvent, SessionOptions, SpawnRequest, TeamHandle,
+    AgentSpec, Definitions, Entry, JobKind, SessionEvent, SessionOptions, SpawnRequest, TeamHandle,
     TeamMemberRequest, TeamRef, TeamRequest,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
@@ -14,20 +14,23 @@ use tokio::sync::broadcast;
 
 fn team_options(dir: &Path) -> SessionOptions {
     SessionOptions {
-        agents: vec![
-            AgentSpec {
-                name: "alpha".into(),
-                description: "Alpha does A".into(),
-                model: Some("test/a".into()),
-                ..Default::default()
-            },
-            AgentSpec {
-                name: "beta".into(),
-                description: "Beta does B".into(),
-                model: Some("test/b".into()),
-                ..Default::default()
-            },
-        ],
+        definitions: Definitions {
+            agents: vec![
+                AgentSpec {
+                    name: "alpha".into(),
+                    description: "Alpha does A".into(),
+                    model: Some("test/a".into()),
+                    ..Default::default()
+                },
+                AgentSpec {
+                    name: "beta".into(),
+                    description: "Beta does B".into(),
+                    model: Some("test/b".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
         ..options(dir)
     }
 }

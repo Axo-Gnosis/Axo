@@ -754,9 +754,7 @@ impl Inner {
                         ext: ext.id.clone(),
                         decl: found.member.session.clone(),
                         sections: found.sections,
-                        agents: found.agents,
-                        modes: found.modes,
-                        keywords: found.keywords,
+                        definitions: found.definitions,
                     });
                     (found.member, contribution, found.entry_error)
                 }

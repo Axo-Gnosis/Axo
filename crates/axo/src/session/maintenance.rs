@@ -231,7 +231,7 @@ impl SessionHooks {
                 &view.projection,
                 &view.entries,
                 self.tools.schemes.artifacts(),
-                &self.prompt.sources.skills,
+                &self.definitions.get().skills,
                 mode,
             )?;
             let Some(elision) = elision.filter(|elision| !elision.edits.is_empty()) else {

@@ -55,7 +55,8 @@ impl SessionHooks {
     }
 
     fn catalog_mode(&self, name: Option<&String>) -> Option<Arc<ModeSpec>> {
-        self.inherited
+        self.definitions
+            .get()
             .modes
             .iter()
             .find(|spec| Some(&spec.name) == name)
@@ -327,7 +328,10 @@ impl Session {
         }
         let spec = name
             .map(|name| {
-                self.modes()
+                self.hooks
+                    .definitions
+                    .get()
+                    .modes
                     .iter()
                     .find(|spec| spec.name == name)
                     .cloned()

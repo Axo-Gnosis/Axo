@@ -235,11 +235,9 @@ struct RawMember {
     brief: Option<String>,
 }
 
+/// Reads agent and team files. Team members are checked after merging registrations.
 /// Blocking filesystem I/O; never fails (problems become diagnostics).
-pub fn load_agents(
-    roots: &[PathBuf],
-    programmatic: &[AgentSpec],
-) -> (Vec<AgentDef>, Vec<Diagnostic>) {
+pub fn load_agents(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<Diagnostic>) {
     let mut definitions = Vec::new();
     let mut diagnostics = Vec::new();
     let mut names = HashSet::new();
@@ -272,22 +270,46 @@ pub fn load_agents(
             }
         }
     }
-    for spec in programmatic {
+    (definitions, diagnostics)
+}
+
+pub(crate) fn merge_agents(
+    files: &[AgentDef],
+    code: &[AgentDef],
+) -> (Vec<AgentDef>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(AgentDef::name).collect();
+    for definition in code {
+        let name = definition.name();
+        let (kind, path) = match definition {
+            AgentDef::Agent(spec) => ("agent", &spec.path),
+            AgentDef::Team(team) => ("team", &team.path),
+        };
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
-                origin: spec.path.clone().map(DiagnosticOrigin::Path),
-                message: format!("agent \"{}\": {message}", spec.name),
+                origin: path.clone().map(DiagnosticOrigin::Path),
+                message: format!("{kind} \"{name}\": {message}"),
             });
         };
-        let mut spec = spec.clone();
-        spec.body = spec.body.trim().to_owned();
-        if !valid_name(&spec.name, &mut warn) || !validate_agent(&mut spec, &mut warn) {
+        if !valid_name(name, &mut warn) {
             continue;
         }
-        if names.insert(spec.name.clone()) {
-            definitions.push(AgentDef::Agent(spec));
+        let definition = match definition {
+            AgentDef::Agent(spec) => {
+                let mut spec = spec.clone();
+                spec.body = spec.body.trim().to_owned();
+                if !validate_agent(&mut spec, &mut warn) {
+                    continue;
+                }
+                AgentDef::Agent(spec)
+            }
+            AgentDef::Team(team) => AgentDef::Team(team.clone()),
+        };
+        if names.insert(name) {
+            definitions.push(definition);
         } else {
-            warn(format!("name \"{}\" collision", spec.name));
+            warn(format!("name \"{name}\" collision"));
         }
     }
     let agent_names: IndexMap<String, RunAs> = definitions

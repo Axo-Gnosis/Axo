@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo::ext::{Caller, InvokeError};
-use axo::{Error, ErrorCode, HostTool, SessionTools, ToolAccess};
+use axo::{Definitions, Error, ErrorCode, HostTool, SessionTools, ToolAccess};
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{ScriptedTurn, ThinkingLevel};
@@ -83,12 +83,15 @@ async fn extensions_can_select_modes_submit_tasks_and_render_hidden_skills() {
     let session = host
         .axo
         .create_session(axo::SessionOptions {
-            modes: vec![axo::ModeSpec {
-                name: "plan".into(),
-                description: "Plan".into(),
-                body: "Plan first.".into(),
+            definitions: Definitions {
+                modes: vec![axo::ModeSpec {
+                    name: "plan".into(),
+                    description: "Plan".into(),
+                    body: "Plan first.".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
+            },
             ..common::options(dir.path())
         })
         .await

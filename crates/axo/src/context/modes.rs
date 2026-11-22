@@ -123,10 +123,7 @@ struct Frontmatter {
 }
 
 /// Blocking filesystem I/O; never fails (problems become diagnostics).
-pub fn load_modes(
-    roots: &[PathBuf],
-    programmatic: &[ModeSpec],
-) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
+pub fn load_modes(roots: &[PathBuf]) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
     let mut definitions = Vec::new();
     let mut diagnostics = Vec::new();
     let mut names = HashSet::new();
@@ -159,7 +156,18 @@ pub fn load_modes(
             }
         }
     }
-    for spec in programmatic {
+    (definitions, diagnostics)
+}
+
+pub(crate) fn merge_modes(
+    files: &[ModeSpec],
+    code: &[ModeSpec],
+) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(|spec| spec.name.as_str()).collect();
+    for spec in code {
+        let name = spec.name.as_str();
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
                 origin: spec.path.clone().map(DiagnosticOrigin::Path),
@@ -171,7 +179,7 @@ pub fn load_modes(
         if !validate(&spec, &mut warn) {
             continue;
         }
-        if names.insert(spec.name.clone()) {
+        if names.insert(name) {
             definitions.push(spec);
         } else {
             warn(format!("name \"{}\" collision", spec.name));
@@ -304,7 +312,7 @@ mod tests {
             "---\nresult:\n  schema: {type: invalid}\n---\nBroken",
         )
         .unwrap();
-        let (modes, diagnostics) = load_modes(&[dir.path().to_path_buf()], &[]);
+        let (modes, diagnostics) = load_modes(&[dir.path().to_path_buf()]);
         assert_eq!(
             modes,
             vec![ModeSpec {
@@ -357,7 +365,7 @@ mod tests {
         let nested = dir.path().join("plan");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("roadmap.md"), BUNDLED).unwrap();
-        let (mut files, diagnostics) = load_modes(&[dir.path().to_path_buf()], &[]);
+        let (mut files, diagnostics) = load_modes(&[dir.path().to_path_buf()]);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let (parsed, diagnostics) = ModeSpec::parse("plan:roadmap", BUNDLED);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");

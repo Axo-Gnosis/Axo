@@ -14,9 +14,13 @@ use crate::config::{
     ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
 };
 use crate::context::Diagnostic;
-use crate::context::agents::{AgentDef, AgentSpec, RunAs, load_agents};
-use crate::context::keywords::{KeywordSpec, load_keywords};
-use crate::context::modes::{ModeSpec, load_modes};
+use crate::context::agents::{AgentDef, RunAs};
+use crate::context::definitions::{
+    Definitions, LiveDefinitions, ResolvedDefinitions, load_files, merge, skill_files,
+};
+use crate::context::keywords::KeywordSpec;
+use crate::context::modes::ModeSpec;
+use crate::context::skills::Skill;
 use crate::error::Error;
 use crate::exec::devshell::DevShellEnv;
 use crate::exec::host::{ProcessSupervisor, Supervision};
@@ -54,26 +58,23 @@ pub(crate) fn load_catalog(
     config: &dyn ConfigSource,
     cwd: &Path,
     project_access: Option<ProjectAccess>,
-    agents: &[AgentSpec],
-    modes: &[ModeSpec],
-    keywords: &[KeywordSpec],
+    definitions: &Definitions,
 ) -> Result<Catalog, Error> {
     let config = Arc::new(EffectiveConfig::resolve(config, cwd, project_access)?);
-    let (agents, mut diagnostics) = load_agents(&config.agent_roots, agents);
-    let (modes, mode_diagnostics) = load_modes(&config.mode_roots, modes);
-    diagnostics.extend(mode_diagnostics);
-    let (keywords, keyword_diagnostics) = load_keywords(&config.keyword_roots, keywords);
-    diagnostics.extend(keyword_diagnostics);
+    let (files, mut diagnostics) = load_files(&config, cwd);
+    let (resolved, merge_diagnostics) = merge(&files, &[definitions]);
+    diagnostics.extend(merge_diagnostics);
     Ok(Catalog {
         config,
-        agents,
-        modes: modes.into_iter().map(Arc::new).collect(),
-        keywords: keywords.into_iter().map(Arc::new).collect(),
+        agents: resolved.agents,
+        modes: resolved.modes,
+        keywords: resolved.keywords,
+        skills: resolved.skills,
         diagnostics,
     })
 }
 
-/// Configuration and agent, mode and keyword definitions resolved without starting a session.
+/// Configuration and definitions resolved without starting a session.
 #[derive(serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Catalog {
@@ -81,6 +82,7 @@ pub struct Catalog {
     pub agents: Vec<AgentDef>,
     pub modes: Vec<Arc<ModeSpec>>,
     pub keywords: Vec<Arc<KeywordSpec>>,
+    pub skills: Vec<Skill>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -356,8 +358,8 @@ impl Axo {
     /// Live `proc://` and `agent://` schemes are available only through an open session.
     /// Resolve for display; write to a session's files through an open `Session`.
     /// `project_access` is the `SessionOptions::project_access` the host
-    /// opens this session with (`None` uses the user policy), so `skill://` sees the same
-    /// skills as the open session.
+    /// opens this session with (`None` uses the user policy). Only file-discovered skills
+    /// are available here; code-supplied skills belong to the open session.
     #[ext(skip = "takes host scheme objects; a live session's schemes are reached through tools")]
     pub async fn schemes(
         &self,
@@ -367,8 +369,12 @@ impl Axo {
     ) -> Result<Schemes, Error> {
         let header = self.store.read_header(path).await?;
         let config = EffectiveConfig::resolve(&*self.config, &header.cwd, project_access)?;
-        let (schemes, _, diagnostics, _) = session_schemes(
-            &config,
+        let (skills, skill_diagnostics) = skill_files(&config, &header.cwd);
+        let definitions = Arc::new(LiveDefinitions::new(ResolvedDefinitions {
+            skills,
+            ..Default::default()
+        }));
+        let (schemes, diagnostics, _) = session_schemes(
             self.docs_dir().as_deref(),
             &self.name,
             SchemeContext {
@@ -378,9 +384,10 @@ impl Axo {
             },
             host,
             None,
+            definitions,
             None,
         )?;
-        for diagnostic in diagnostics {
+        for diagnostic in skill_diagnostics.into_iter().chain(diagnostics) {
             tracing::warn!("{diagnostic}");
         }
         Ok(schemes)
@@ -393,11 +400,9 @@ impl Axo {
         &self,
         cwd: &Path,
         project_access: Option<ProjectAccess>,
-        agents: &[AgentSpec],
-        modes: &[ModeSpec],
-        keywords: &[KeywordSpec],
+        definitions: &Definitions,
     ) -> Result<Catalog, Error> {
-        load_catalog(&*self.config, cwd, project_access, agents, modes, keywords)
+        load_catalog(&*self.config, cwd, project_access, definitions)
     }
 
     /// Where bundled docs are materialized; `None` without a cache directory.
@@ -420,9 +425,7 @@ impl Axo {
             cwd,
             model,
             agent,
-            agents,
-            modes,
-            keywords,
+            definitions,
             thinking,
             ask_enabled,
             project_access,
@@ -437,26 +440,29 @@ impl Axo {
             recovery: _,
         } = options;
 
-        let Catalog {
-            config,
-            agents,
-            modes,
-            keywords,
-            diagnostics: mut agent_diagnostics,
-        } = self.catalog(&cwd, project_access, &agents, &modes, &keywords)?;
+        let config = Arc::new(EffectiveConfig::resolve(
+            &*self.config,
+            &cwd,
+            project_access,
+        )?);
+        let (files, mut definition_diagnostics) = load_files(&config, &cwd);
+        let (resolved, _) = merge(&files, &[&layer.definitions, &definitions]);
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
-                let spec = agents.iter().find_map(|definition| match definition {
-                    AgentDef::Agent(spec) if spec.name == *name => Some(spec),
-                    _ => None,
-                });
+                let spec = resolved
+                    .agents
+                    .iter()
+                    .find_map(|definition| match definition {
+                        AgentDef::Agent(spec) if spec.name == *name => Some(spec),
+                        _ => None,
+                    });
                 match spec {
                     Some(spec) if spec.run_as != RunAs::Subagent => Some(spec.clone()),
                     Some(_) if explicit_agent => return Err(Error::AgentNotRoot(name.clone())),
                     None if explicit_agent => return Err(Error::AgentNotFound(name.clone())),
                     _ => {
-                        agent_diagnostics.push(Diagnostic {
+                        definition_diagnostics.push(Diagnostic {
                             origin: None,
                             message: format!("agent \"{name}\" from the session is unavailable; running without it"),
                         });
@@ -524,10 +530,9 @@ impl Axo {
                 config,
                 docs_dir: self.docs_dir(),
                 harness_name: self.name.clone(),
-                agents,
-                modes,
-                keywords,
-                agent_diagnostics,
+                files: Arc::new(files),
+                definitions,
+                definition_diagnostics,
                 agent,
                 streamer: self.streamer.clone(),
                 models: self.models.clone(),
@@ -544,7 +549,7 @@ impl Axo {
                 commands,
                 layer,
                 run_slots,
-                loaded: None,
+                docs: None,
             }),
             model,
             thinking,

@@ -88,25 +88,18 @@ impl Session {
                     // Recorded names, not a re-match: the journal and the injected text
                     // agree even when keyword settings changed since. A name whose
                     // definition is gone is skipped.
+                    let defs = self.hooks.definitions.get();
                     let keywords: Vec<_> = names
                         .iter()
                         .filter_map(|name| {
-                            self.hooks
-                                .inherited
-                                .keywords
+                            defs.keywords
                                 .iter()
                                 .find(|keyword| keyword.name == *name)
                                 .cloned()
                         })
                         .collect();
                     AgentMessage::Llm(Message::User(UserMessage {
-                        content: render(
-                            &parts,
-                            &self.hooks.prompt.sources.skills,
-                            &keywords,
-                            &self.hooks.tools,
-                        )
-                        .await,
+                        content: render(&parts, &defs.skills, &keywords, &self.hooks.tools).await,
                         timestamp: now_ms(),
                     }))
                 };

@@ -276,11 +276,11 @@ impl SessionHooks {
     /// and allowed in the current mode.
     pub(super) fn active_keywords(&self) -> Vec<Arc<KeywordSpec>> {
         let settings = &self.inherited.config.settings.keywords;
-        if self.child.is_some() || !settings.enabled || self.inherited.keywords.is_empty() {
+        let defs = self.definitions.get();
+        if self.child.is_some() || !settings.enabled || defs.keywords.is_empty() {
             return Vec::new();
         }
-        self.inherited
-            .keywords
+        defs.keywords
             .iter()
             .filter(|keyword| {
                 !settings.disabled.contains(&keyword.name)
@@ -474,7 +474,7 @@ impl Session {
         let prepared = prepare(parts, &self.hooks.tools).await?;
         let content = render(
             &prepared.parts,
-            &self.hooks.prompt.sources.skills,
+            &self.hooks.definitions.get().skills,
             keywords,
             &self.hooks.tools,
         )

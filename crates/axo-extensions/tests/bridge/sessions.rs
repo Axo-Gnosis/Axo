@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use axo::context::agents::AgentDef;
 use axo::{
     AgentSpec, BashAccess, CommandKind, Entry, Error, ProjectAccess, PromptInput, SchemeContext,
     SchemeUrl, Session, SessionEvent, SessionOptions, SpawnContext, SpawnDecision, SpawnOrigin,
@@ -23,6 +24,7 @@ use crate::{Case, Host, enabled, lines, phase, wait_for, wait_ready_after};
 
 pub const CASES: &[Case] = &[
     case!(tools_policy_state_command_and_events),
+    case!(live_package_definitions),
     case!(host_lifecycle_and_child_lookup),
     case!(command_reentry_is_refused),
     case!(command_reentry_through_a_turn_is_refused),
@@ -85,6 +87,71 @@ async fn attach(host: &Host, extensions: &Extensions) -> Arc<Session> {
     let session = Arc::new(host.axo.create_session(options).await.unwrap());
     extensions.attach(&session).await;
     session
+}
+
+async fn live_package_definitions() {
+    let host = Host::new().await;
+    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
+    host.write_package(
+        "root",
+        LAB,
+        &json!({
+            "id": LAB, "entry": "index.ts",
+            "definitions": {"agents": "agents", "skills": "skills"}
+        })
+        .to_string(),
+    );
+    let dir = host.path("root/lab");
+    std::fs::create_dir(dir.join("agents")).unwrap();
+    std::fs::create_dir_all(dir.join("skills/review")).unwrap();
+    let write_agent = |description: &str| {
+        std::fs::write(
+            dir.join("agents/helper.md"),
+            format!("---\nname: helper\ndescription: {description}\n---\nHelp.\n"),
+        )
+        .unwrap();
+    };
+    write_agent("Helps");
+    std::fs::write(
+        dir.join("agents/crew.md"),
+        "---\nname: crew\ndescription: A crew\nmembers:\n  - agent: helper\n---\nWork.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("skills/review/SKILL.md"),
+        "---\ndescription: Reviews changes\n---\nReview the diff.\n",
+    )
+    .unwrap();
+
+    let extensions = host.manager();
+    let enabled = enabled(&[(LAB, None)]);
+    extensions.configure(&enabled).await.unwrap();
+    let options = extensions.compose(options(&host));
+    let session = Arc::new(host.axo.create_session(options).await.unwrap());
+    assert!(
+        session
+            .agents()
+            .iter()
+            .any(|d| matches!(d, AgentDef::Team(t) if t.name == "crew"))
+    );
+    assert!(session.skills().iter().any(|s| s.name == "review"));
+    extensions.attach(&session).await;
+
+    write_agent("Helps with reviews");
+    extensions.configure(&enabled).await.unwrap();
+    assert!(session.agents().iter().any(|d| matches!(
+        d, AgentDef::Agent(a) if a.name == "helper" && a.description == "Helps with reviews"
+    )));
+    extensions.configure(&[]).await.unwrap();
+    assert!(
+        !session
+            .agents()
+            .iter()
+            .any(|d| matches!(d.name(), "crew" | "helper"))
+    );
+    assert!(!session.skills().iter().any(|s| s.name == "review"));
+    session.shutdown().await;
+    extensions.shutdown().await;
 }
 
 fn turn(id: &str, tool: &str, args: Value) -> [ScriptedTurn; 2] {

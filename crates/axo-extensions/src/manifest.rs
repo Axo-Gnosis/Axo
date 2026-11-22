@@ -8,10 +8,11 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
+use axo::Definitions;
 use axo::context::agents::{AgentDef, load_agents};
 use axo::context::keywords::load_keywords;
 use axo::context::modes::load_modes;
-use axo::{AgentSpec, KeywordSpec, ModeSpec};
+use axo::context::skills::load_skills;
 use axo_ai::{Model, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -157,13 +158,14 @@ struct SectionDecl {
     file: String,
 }
 
-/// Package-relative directories of agent, mode and keyword definitions.
+/// Package-relative definition directories; agents and teams share one directory.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DefinitionDirs {
     agents: Option<String>,
     modes: Option<String>,
     keywords: Option<String>,
+    skills: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -205,9 +207,7 @@ pub struct Discovered {
     pub diagnostics: Vec<String>,
     /// `(name, body)` in declaration order.
     pub sections: Vec<(String, String)>,
-    pub agents: Vec<AgentSpec>,
-    pub modes: Vec<ModeSpec>,
-    pub keywords: Vec<KeywordSpec>,
+    pub definitions: Definitions,
 }
 
 /// Locates and loads `id`'s package; see [`locate`] and [`load`].
@@ -338,31 +338,37 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
     let agent_dirs = definition_dir("agents", &dirs.agents).await?;
     let mode_dirs = definition_dir("modes", &dirs.modes).await?;
     let keyword_dirs = definition_dir("keywords", &dirs.keywords).await?;
-    let (agents, modes, keywords) = tokio::task::spawn_blocking(move || {
+    let skill_dirs = definition_dir("skills", &dirs.skills).await?;
+    let cwd = package.to_owned();
+    let (agents, modes, keywords, skills) = tokio::task::spawn_blocking(move || {
         (
-            load_agents(&agent_dirs, &[]),
-            load_modes(&mode_dirs, &[]),
-            load_keywords(&keyword_dirs, &[]),
+            load_agents(&agent_dirs),
+            load_modes(&mode_dirs),
+            load_keywords(&keyword_dirs),
+            load_skills(&skill_dirs, None, &cwd, false),
         )
     })
     .await
     .map_err(|error| fail(format!("cannot load definitions: {error}")))?;
-    let loaded = agents.1.iter().chain(&modes.1).chain(&keywords.1);
+    let loaded = agents
+        .1
+        .iter()
+        .chain(&modes.1)
+        .chain(&keywords.1)
+        .chain(&skills.1);
     diagnostics.extend(loaded.map(|diagnostic| format!("extension {id}: {diagnostic}")));
-    let agents = agents
-        .0
-        .into_iter()
-        .filter_map(|definition| match definition {
-            AgentDef::Agent(spec) => Some(spec),
-            AgentDef::Team(team) => {
-                diagnostics.push(format!(
-                    "extension {id}: team \"{}\" ignored; extensions contribute agents, not teams",
-                    team.name
-                ));
-                None
-            }
-        })
-        .collect();
+    let mut definitions = Definitions {
+        modes: modes.0,
+        keywords: keywords.0,
+        skills: skills.0,
+        ..Definitions::default()
+    };
+    for definition in agents.0 {
+        match definition {
+            AgentDef::Agent(agent) => definitions.agents.push(agent),
+            AgentDef::Team(team) => definitions.teams.push(team),
+        }
+    }
 
     let (entry, entry_error) = match resolve_entry(package, &manifest.entry).await {
         Ok(entry) => (entry, None),
@@ -389,9 +395,7 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
         entry_error,
         diagnostics,
         sections,
-        agents,
-        modes: modes.0,
-        keywords: keywords.0,
+        definitions,
     })
 }
 
@@ -811,7 +815,7 @@ mod tests {
                 "schemes": [{ "name": "lab" }, { "name": "notes", "promptDoc": "Notes", "writeReplay": "safe" }],
                 "commands": [{ "name": "hello", "description": "Greets", "argumentHint": "<who>" }],
                 "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
-                "definitions": { "agents": "agents", "modes": "modes", "keywords": "keywords" },
+                "definitions": { "agents": "agents", "modes": "modes", "keywords": "keywords", "skills": "skills" },
                 "toolPolicy": ["before", "after"], "spawnHook": true, "events": true,
             })
             .as_object()
@@ -819,7 +823,7 @@ mod tests {
             .clone(),
         );
         let dir = package(&root, "lab", &manifest, Some("index.ts"));
-        for sub in ["prompts", "agents", "modes", "keywords"] {
+        for sub in ["prompts", "agents", "modes", "keywords", "skills/review"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
         std::fs::write(dir.join("prompts/rules.md"), "Be careful.").unwrap();
@@ -831,6 +835,11 @@ mod tests {
         std::fs::write(
             dir.join("agents/crew.md"),
             "---\nname: crew\ndescription: A crew\nmembers:\n  - agent: helper\n---\nWork.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("skills/review/SKILL.md"),
+            "---\ndescription: Reviews changes\n---\nReview the diff.\n",
         )
         .unwrap();
         let found = discover("lab", &roots).await.unwrap();
@@ -863,17 +872,12 @@ mod tests {
             found.sections,
             [("lab_rules".to_owned(), "Be careful.".to_owned())]
         );
-        let names: Vec<&str> = found.agents.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["helper"]);
-        assert!(found.modes.is_empty() && found.keywords.is_empty());
-        assert!(
-            found
-                .diagnostics
-                .iter()
-                .any(|d| d.starts_with("extension lab: team \"crew\" ignored")),
-            "{:?}",
-            found.diagnostics
-        );
+        let definitions = found.definitions;
+        assert_eq!(definitions.agents[0].name, "helper");
+        assert_eq!(definitions.teams[0].name, "crew");
+        assert_eq!(definitions.skills[0].name, "review");
+        assert!(definitions.modes.is_empty() && definitions.keywords.is_empty());
+        assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
         // The activation wire shape: camelCase, every declaration whole.
         let wire = serde_json::to_value(session).unwrap();
         assert_eq!(wire["tools"][1]["executionMode"], "sequential");

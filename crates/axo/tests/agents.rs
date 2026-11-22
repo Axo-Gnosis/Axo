@@ -261,9 +261,9 @@ async fn root_agent_applies_its_switches() {
     assert!(problems.is_empty(), "{problems:?}");
     let loaded = session
         .agents()
-        .iter()
+        .into_iter()
         .find_map(|definition| match definition {
-            AgentDef::Agent(spec) if spec.name == "persona" => Some(spec.clone()),
+            AgentDef::Agent(spec) if spec.name == "persona" => Some(spec),
             _ => None,
         })
         .unwrap();

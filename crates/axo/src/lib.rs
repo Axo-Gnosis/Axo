@@ -32,6 +32,7 @@ pub use config::{
     SubagentSettings, SummaryRequest, UserConfig,
 };
 pub use context::agents::{AgentSpec, RunAs};
+pub use context::definitions::Definitions;
 pub use context::keywords::{KeywordMatch, KeywordSettings, KeywordSpec};
 pub use context::modes::{BashAccess, ModeResult, ModeSpec, ToolLimits};
 pub use context::prompt::valid_section_name;

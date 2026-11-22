@@ -427,24 +427,26 @@ export type CancelReason =
  */
 "shutdown";
 
-/**  Configuration and agent, mode and keyword definitions resolved without starting a session. */
+/**  Configuration and definitions resolved without starting a session. */
 export type Catalog = Catalog_Serialize | Catalog_Deserialize;
 
-/**  Configuration and agent, mode and keyword definitions resolved without starting a session. */
+/**  Configuration and definitions resolved without starting a session. */
 export type Catalog_Deserialize = {
 	config: EffectiveConfig_Deserialize,
 	agents: AgentDef_Deserialize[],
 	modes: ModeSpec_Deserialize[],
 	keywords: KeywordSpec_Deserialize[],
+	skills: Skill_Deserialize[],
 	diagnostics: Diagnostic_Deserialize[],
 };
 
-/**  Configuration and agent, mode and keyword definitions resolved without starting a session. */
+/**  Configuration and definitions resolved without starting a session. */
 export type Catalog_Serialize = {
 	config: EffectiveConfig_Serialize,
 	agents: AgentDef_Serialize[],
 	modes: ModeSpec_Serialize[],
 	keywords: KeywordSpec_Serialize[],
+	skills: Skill_Serialize[],
 	diagnostics: Diagnostic_Serialize[],
 };
 
@@ -4594,11 +4596,11 @@ export interface Session {
   // withheld: appendCustom — namespaced per caller; see the wire method
   // withheld: custom — namespaced per caller; see the wire method
   /**
-   * The skills loaded at start; the prompt's catalog and `/name` commands use these.
+   * The skills in force now; the prompt's catalog and `/name` commands use these.
    */
   skills(signal?: AbortSignal): Promise<SessionSkillsResult_Serialize>;
   /**
-   * Agent and team definitions loaded at start; forks share them.
+   * Agent and team definitions in force now.
    */
   agents(signal?: AbortSignal): Promise<SessionAgentsResult_Serialize>;
   /**
@@ -4637,12 +4639,11 @@ export interface Session {
   commands(signal?: AbortSignal): Promise<SessionCommandsResult_Serialize>;
   // withheld: setCommands — replaces the host's own registrations; extensions register through their manifest
   /**
-   * The mode definitions available to this root session; empty for children.
+   * The mode definitions in force now; empty for children.
    */
   modes(signal?: AbortSignal): Promise<SessionModesResult_Serialize>;
   /**
-   * Every keyword definition loaded for this root session, disabled ones included;
-   * empty for children.
+   * Every keyword definition in force now, disabled ones included; empty for children.
    */
   keywords(signal?: AbortSignal): Promise<SessionKeywordsResult_Serialize>;
   /**
@@ -4680,6 +4681,7 @@ export interface Session {
   // withheld: setSpawnHooks — replaces the host's own registrations; extensions register through their manifest
   // withheld: setSchemes — replaces the host's own registrations; extensions register through their manifest
   // withheld: setTools — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setDefinitions — replaces the host's own registrations; extensions register through their manifest
   // withheld: setLayer — replaces the host's own registrations; extensions register through their manifest
   /**
    * Sets the thinking level from the next request, clamped to the model; returns the

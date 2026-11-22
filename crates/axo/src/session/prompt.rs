@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::commands;
 use crate::config::EffectiveConfig;
 use crate::context::agents::{AgentSpec, ContextFiles};
+use crate::context::definitions::merge;
 use crate::context::files::{ContextFile, context_file_names, load_context_files};
 use crate::context::modes::ToolLimits;
 use crate::context::{Diagnostic, DiagnosticOrigin, home_agents_dir, project_root};
@@ -18,7 +20,8 @@ use axo_ai::{Message, SystemMessage, ToolSpec, now_ms};
 use axo_macros::expose;
 use tokio_util::sync::CancellationToken;
 
-use super::spawn::SPAWN;
+use super::modes::EnterModeTool;
+use super::spawn::{SPAWN, SpawnTool};
 use super::{Session, SessionHooks, journal};
 use crate::context::prompt::{
     PromptShape, PromptSources, Sections, build_sections, system_message,
@@ -406,16 +409,53 @@ impl SessionHooks {
         Ok(())
     }
 
+    /// Re-merges file and code definitions while the caller holds selection_order.
+    pub(super) fn stage_definitions(&self) -> Vec<Diagnostic> {
+        let (layer, host) = {
+            let layers = self.registrations();
+            (
+                layers.layer.definitions.clone(),
+                layers.host.definitions.clone(),
+            )
+        };
+        let (resolved, mut diagnostics) = merge(&self.inherited.files, &[&layer, &host]);
+        diagnostics.extend(commands::reserved_skill_diagnostics(&resolved.skills));
+        diagnostics.extend(commands::hidden_skill_diagnostics(
+            &resolved.skills,
+            &resolved.modes,
+        ));
+        if resolved == *self.definitions.get() {
+            return diagnostics;
+        }
+        let spawn = SpawnTool::new(
+            &resolved.agents,
+            &self.inherited.config.settings.model_roles,
+        );
+        spawn.attach(self.this.clone());
+        let enter_mode = EnterModeTool::new(&resolved.modes).map(|tool| {
+            tool.attach(self.this.clone());
+            Arc::new(tool) as Arc<dyn Tool>
+        });
+        {
+            let mut base = self
+                .shape_base
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = base.builtin.iter_mut().find(|tool| tool.name() == SPAWN) {
+                *entry = Arc::new(spawn);
+            }
+            base.enter_mode = enter_mode;
+            base.has_modes = !resolved.modes.is_empty();
+        }
+        self.definitions.set(resolved);
+        diagnostics
+    }
+
     /// Instantiates the joined host and layer tools, reshapes the tool lists under the
     /// current persona and installs them without rebuilding the prompt; returns the tool
     /// diagnostics. Callers hold `selection_order` inside `detached`.
     pub(super) async fn stage_tools(&self, tools: Vec<HostTool>) -> Vec<Diagnostic> {
         let (host, deferred) = tools::instantiate(&tools, &self.tools);
-        let spec = self
-            .agent_spec
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
         {
             let mut base = self
                 .shape_base
@@ -425,6 +465,15 @@ impl SessionHooks {
             base.host_deferred = deferred;
             base.host_tool_factories = tools;
         }
+        self.restage().await
+    }
+
+    pub(super) async fn restage(&self) -> Vec<Diagnostic> {
+        let spec = self
+            .agent_spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let (new_shape, _, diagnostics) = self.reshape(spec).await;
         {
             let mut shape = self
@@ -557,8 +606,9 @@ impl Session {
     /// Renders a discovered skill with command arguments, including skills hidden from the model.
     #[ext]
     pub async fn render_skill(&self, name: &str, args: &str) -> Result<String, Error> {
-        let skill = self
-            .skills()
+        let defs = self.hooks.definitions.get();
+        let skill = defs
+            .skills
             .iter()
             .find(|skill| skill.name == name)
             .ok_or_else(|| Error::SkillNotFound(name.to_owned()))?;

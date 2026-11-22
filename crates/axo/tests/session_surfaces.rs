@@ -22,7 +22,7 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.modes.push(ModeSpec {
+    opts.definitions.modes.push(ModeSpec {
         name: "plan".into(),
         body: "Plan carefully.".into(),
         ..Default::default()
@@ -180,7 +180,7 @@ async fn chained_follow_up_has_no_intermediate_idle_event() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.modes.push(ModeSpec {
+    opts.definitions.modes.push(ModeSpec {
         name: "plan".into(), body: "Produce a plan.".into(),
         result: Some(axo::ModeResult {
             schema: json!({"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}),

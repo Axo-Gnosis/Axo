@@ -81,6 +81,23 @@ pub fn load_skills(
     (skills, diagnostics)
 }
 
+pub(crate) fn merge_skills(files: &[Skill], code: &[Skill]) -> (Vec<Skill>, Vec<Diagnostic>) {
+    let mut skills = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(|skill| skill.name.as_str()).collect();
+    for skill in code {
+        if names.insert(skill.name.as_str()) {
+            skills.push(skill.clone());
+        } else {
+            diagnostics.push(Diagnostic {
+                message: format!("name \"{}\" collision", skill.name),
+                origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
+            });
+        }
+    }
+    (skills, diagnostics)
+}
+
 /// Every `SKILL.md` under `root`. A directory holding one is a skill root and is not
 /// descended further, so skills never nest; dotfiles, `node_modules` and
 /// `.gitignore`/`.ignore`/`.fdignore` matches are skipped, and symlinks are followed.

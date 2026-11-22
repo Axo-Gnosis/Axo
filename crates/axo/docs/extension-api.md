@@ -16,8 +16,8 @@ Extensions are trusted code; nothing here is a sandbox.
 | config |  | The effective configuration for this session. |
 | setName | name? | Sets the file-wide session name; newlines become spaces and blank names clear it. May be called while a run is active; this entry contributes no context message. |
 | name |  | The latest session name in file order, independent of the selected branch. |
-| skills |  | The skills loaded at start; the prompt's catalog and /name commands use these. |
-| agents |  | Agent and team definitions loaded at start; forks share them. |
+| skills |  | The skills in force now; the prompt's catalog and /name commands use these. |
+| agents |  | Agent and team definitions in force now. |
 | diagnostics |  | Start-time context, skill, prompt, and scheme diagnostics, also logged as warnings. |
 | jobs |  | The background jobs read proc:// lists (promoted, retained and rebuilt, finished ones included), ascending. |
 | killJob | id | Stops job id (bg_N or agent_N), reporting whether it was running. |
@@ -25,8 +25,8 @@ Extensions are trusted code; nothing here is a sandbox.
 | background | callId | Requests promotion of every foreground command the call started. A command that finishes first stays foreground. |
 | tools |  | The tools this session exposes: direct ones in prompt order, then deferred catalog entries. Reading it promotes nothing. |
 | commands |  | The commands a host may offer: built-ins, modes, registered commands, then unhidden skills. |
-| modes |  | The mode definitions available to this root session; empty for children. |
-| keywords |  | Every keyword definition loaded for this root session, disabled ones included; empty for children. |
+| modes |  | The mode definitions in force now; empty for children. |
+| keywords |  | Every keyword definition in force now, disabled ones included; empty for children. |
 | keywordMatches | text | The keywords that would fire in text typed as a message right now, as byte ranges into text. A leading /command token is skipped, as on submission. |
 | runCommand | command | Runs a command under its policy: model/thinking, modes and registered commands alongside a turn, compact/shake/navigate only when idle (Error::Busy otherwise). |
 | abort |  | Stops the active run (CancelReason::User). Stopping an active run holds queued input and job results until the user's next input or resume_wakes; input sent after the Stop starts the next run once this one settles. An idle Stop changes nothing. |
@@ -92,6 +92,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | SESSION_CORE::set_spawn_hooks | replaces the host's own registrations; extensions register through their manifest |
 | SESSION_CORE::set_schemes | replaces the host's own registrations; extensions register through their manifest |
 | SESSION_CORE::set_tools | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_CORE::set_definitions | replaces the host's own registrations; extensions register through their manifest |
 | SESSION_CORE::set_layer | replaces the host's own registrations; extensions register through their manifest |
 | SESSION_CORE::subscribe | live receiver; the bridge serves session.subscribe |
 | SESSION_CORE::attach | returns a live receiver; use entries, live and subscribe |

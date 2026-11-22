@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::config::PromptOverride;
+use crate::context::definitions::LiveDefinitions;
 use crate::context::files::ContextFile;
 use crate::context::skills::{Skill, escape_xml};
 
@@ -53,7 +54,7 @@ pub(crate) struct PromptSources {
     /// Whether the bundled documentation scheme is available.
     pub docs: bool,
     /// Skills with `disable_model_invocation` are left out of the listing.
-    pub skills: Vec<Skill>,
+    pub definitions: Arc<LiveDefinitions>,
 }
 
 /// Inputs which change when the host switches a session's persona, sections or tools.
@@ -142,7 +143,8 @@ pub(crate) fn build_sections(
     }
 
     let has_tool = |name: &str| shape.tools.iter().any(|tool| tool.name() == name);
-    let visible: Vec<&Skill> = sources
+    let defs = sources.definitions.get();
+    let visible: Vec<&Skill> = defs
         .skills
         .iter()
         .filter(|skill| !skill.disable_model_invocation)
@@ -278,7 +280,7 @@ mod tests {
             delegation: false,
             team: None,
             docs: false,
-            skills: Vec::new(),
+            definitions: Arc::default(),
         };
         let mut shape = PromptShape {
             prompts,

@@ -458,7 +458,7 @@ async fn registered_commands_list_after_modes_and_run_their_handler() {
     let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![done()]).await;
     let hello = Arc::new(Hello::default());
     let mut opts = options(dir.path());
-    opts.modes.push(ModeSpec {
+    opts.definitions.modes.push(ModeSpec {
         name: "plan".into(),
         body: "Plan carefully.".into(),
         ..Default::default()

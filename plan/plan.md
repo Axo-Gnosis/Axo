@@ -318,7 +318,7 @@ Preserve the [implemented extension contracts](../crates/axo/docs/extending.md#3
 - `append_custom` / `custom` provide branch-scoped metadata without adding model context. Reuse them rather than inventing extension persistence; extension-owned settings files serve a different purpose.
 - Tool, section, persona, mode, model and thinking controls retain their Rust behavior during a run. Subsequent requests see changes at their boundaries; routed calls keep implementation snapshots.
 - Reopen requires executable registrations and host section configuration to be supplied again; the journal does not reconstruct closures. Preserve replay/error contracts and never retry an uncertain external effect merely because a runner restarted.
-- Live host setters replace tool policies, spawn hooks, schemes, sections and command registrations; `Session::set_layer` replaces a second registration set applied after them. Store, configuration and default streamer remain builder choices. `LoopHooks` is the session's driver, not an arbitrary request-rewrite plugin.
+- Live host setters replace tool policies, spawn hooks, schemes, sections, commands and definitions; `Session::set_layer` independently replaces the layer (see [Live definitions](../crates/axo/docs/extending.md#live-definitions) for definition precedence). Store, configuration and default streamer remain builder choices. `LoopHooks` is the session's driver, not an arbitrary request-rewrite plugin.
 
 Directly submitted slash text can expand a skill hidden in the command catalog: prompt submission is distinct from command parsing. The catalog and parser use built-ins, modes, registered commands, then skills.
 

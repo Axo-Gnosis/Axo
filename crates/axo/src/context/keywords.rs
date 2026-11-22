@@ -69,12 +69,9 @@ struct Frontmatter {
     extra: Map<String, Value>,
 }
 
-/// Blocking filesystem I/O; never fails (problems become diagnostics). Roots load before
-/// `programmatic`, and the first definition of a name wins.
-pub fn load_keywords(
-    roots: &[PathBuf],
-    programmatic: &[KeywordSpec],
-) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
+/// Blocking filesystem I/O; never fails (problems become diagnostics). The first
+/// definition of a name wins.
+pub fn load_keywords(roots: &[PathBuf]) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
     let mut definitions = Vec::new();
     let mut diagnostics = Vec::new();
     let mut names = HashSet::new();
@@ -107,7 +104,18 @@ pub fn load_keywords(
             }
         }
     }
-    for spec in programmatic {
+    (definitions, diagnostics)
+}
+
+pub(crate) fn merge_keywords(
+    files: &[KeywordSpec],
+    code: &[KeywordSpec],
+) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(|spec| spec.name.as_str()).collect();
+    for spec in code {
+        let name = spec.name.as_str();
         let mut warn = |message| {
             diagnostics.push(Diagnostic {
                 origin: spec.path.clone().map(DiagnosticOrigin::Path),
@@ -119,7 +127,7 @@ pub fn load_keywords(
         if !validate(&spec, &mut warn) {
             continue;
         }
-        if names.insert(spec.name.clone()) {
+        if names.insert(name) {
             definitions.push(spec);
         } else {
             warn(format!("name \"{}\" collision", spec.name));
