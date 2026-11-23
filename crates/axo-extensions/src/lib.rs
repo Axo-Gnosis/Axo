@@ -18,19 +18,19 @@ mod session;
 mod store;
 mod wire_value;
 
-pub use lifecycle::{
-    ForkReceipt, Forked, LIFECYCLE_METHODS, Lifecycle, LifecycleMethod, SessionRequest,
-};
+pub use lifecycle::{ForkReceipt, Forked, Lifecycle, SessionRequest, lifecycle_methods};
 pub use remote::Failure;
 pub use store::{InstallError, InstalledExtension};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
 pub use axo::EnabledExtension;
+use axo::ext;
 use axo::{Axo, EnvMap, ExtensionListError, ProcessSupervisor};
 pub use axo_ai::ProviderOrigin;
 use axo_ai::{Credential, LoginInteraction, Provider, ProviderLayer, ProviderLogin};
@@ -47,20 +47,28 @@ use crate::session::Contribution;
 const EVENT_CAPACITY: usize = 256;
 
 /// The extension SDK version this bridge provides. A package's `extension.json` `sdk` must be
-/// caret-compatible with it: the same major above 0, else the same minor above 0, else equal.
+/// no newer than this version: the same major above 0, else the same minor above 0, else equal.
 pub const SDK_VERSION: &str = "0.0.0";
 
 /// Registers the bridge's own wire types.
 #[doc(hidden)]
 pub fn wire_types(types: specta::Types) -> specta::Types {
     types
+        .register::<Credential>()
+        .register::<axo_ai::DeviceCode>()
+        .register::<axo_ai::LoginPrompt>()
+        .register::<axo_ai::LoginSelect>()
+        .register::<peer::HostErrorCode>()
         .register::<session::bindings::ToolRunArgs<'static>>()
         .register::<session::bindings::BeforeToolCall<'static>>()
         .register::<session::bindings::AfterToolCall<'static>>()
+        .register::<session::bindings::ToolResult>()
+        .register::<session::bindings::PolicyBlock>()
+        .register::<session::bindings::PolicyOverride>()
+        .register::<session::bindings::SpawnReply>()
+        .register::<session::bindings::SchemeResolution>()
         .register::<axo::ToolScope>()
         .register::<axo::SpawnContext<'static>>()
-        .register::<SessionRequest>()
-        .register::<ForkReceipt>()
         .register::<axo::CompletionRequest>()
         .register::<axo_ai::AssistantEvent>()
 }
@@ -192,6 +200,8 @@ pub enum BridgeError {
     ShutDown,
     #[error("unknown extension {0:?}")]
     UnknownExtension(String),
+    #[error("extension {0}: installed dependencies are managed by Extensions::install")]
+    InstalledDependencies(String),
     /// `install_dependencies` failed; the message carries Bun's output.
     #[error("{0}")]
     DependencyInstall(String),
@@ -218,6 +228,7 @@ struct Inner {
     state: Mutex<State>,
     /// Closes admission: every proxy's retirement token is a child.
     closed: CancellationToken,
+    teardown_done: AtomicBool,
     events: broadcast::Sender<ExtensionEvent>,
     /// The next placement serial; reports carry it so a replaced placement cannot write.
     serials: AtomicU64,
@@ -233,6 +244,8 @@ struct State {
     /// Last accepted declarations per enabled extension, kept through failed rescans so a
     /// broken package keeps its surfaces (failing closed) instead of losing them.
     accepted: HashMap<String, (Member, Arc<Contribution>)>,
+    /// Stable through rescans of the same package, never reused after removal.
+    admissions: HashMap<String, u64>,
     /// Statuses not owned by a placement (not admitted, or admitted but unable to run).
     overrides: HashMap<String, ExtensionStatus>,
     diagnostics: Vec<ExtensionDiagnostic>,
@@ -255,37 +268,38 @@ struct State {
 impl State {
     /// The committed status of every enabled extension, in enabled order.
     fn statuses(&self) -> Vec<ExtensionStatus> {
-        self.enabled
-            .iter()
-            .map(|ext| {
-                let mut status = self
-                    .overrides
-                    .get(&ext.id)
-                    .or_else(|| self.last.get(&ext.id).map(|(_, status)| status))
-                    .cloned()
-                    .unwrap_or_else(|| ExtensionStatus {
-                        id: ext.id.clone(),
-                        group: ext.group.clone(),
-                        generation: 0,
-                        phase: ExtensionPhase::Cold,
-                        reason: None,
-                    });
-                // A runner not yet started is waiting on (or blocked by) its dependencies.
-                let waiting = matches!(
-                    status.phase,
-                    ExtensionPhase::Cold | ExtensionPhase::Starting
-                );
-                if waiting && self.installing.contains(&ext.id) {
-                    status.phase = ExtensionPhase::Installing;
-                } else if let Some(reason) = self.install_failed.get(&ext.id)
-                    && status.phase == ExtensionPhase::Cold
-                {
-                    status.phase = ExtensionPhase::Disabled;
-                    status.reason = Some(reason.clone());
-                }
-                status
-            })
-            .collect()
+        self.enabled.iter().map(|ext| self.status(ext)).collect()
+    }
+
+    fn status(&self, ext: &EnabledExtension) -> ExtensionStatus {
+        let mut status = self
+            .overrides
+            .get(&ext.id)
+            .or_else(|| self.last.get(&ext.id).map(|(_, status)| status))
+            .cloned()
+            .unwrap_or_else(|| ExtensionStatus {
+                id: ext.id.clone(),
+                group: ext.group.clone(),
+                generation: 0,
+                phase: ExtensionPhase::Cold,
+                reason: None,
+            });
+        if !matches!(
+            status.phase,
+            ExtensionPhase::Unavailable | ExtensionPhase::Disabled
+        ) {
+            if let Some(reason) = self.install_failed.get(&ext.id) {
+                status.phase = ExtensionPhase::Disabled;
+                status.reason = Some(reason.clone());
+            } else if matches!(
+                status.phase,
+                ExtensionPhase::Cold | ExtensionPhase::Starting
+            ) && self.installing.contains(&ext.id)
+            {
+                status.phase = ExtensionPhase::Installing;
+            }
+        }
+        status
     }
 }
 
@@ -310,11 +324,17 @@ enum Rearm {
     Retry(String),
     /// Always: the package's code changed.
     Reload(String),
+    /// Dependency install completed for this admission and, for background work, placement.
+    Installed {
+        id: String,
+        admission: u64,
+        placement: Option<u64>,
+    },
 }
 
 impl Rearm {
     fn id(&self) -> &str {
-        let (Rearm::Retry(id) | Rearm::Reload(id)) = self;
+        let (Rearm::Retry(id) | Rearm::Reload(id) | Rearm::Installed { id, .. }) = self;
         id
     }
 }
@@ -357,6 +377,7 @@ impl Extensions {
                 config: tokio::sync::Mutex::new(()),
                 state: Mutex::new(State::default()),
                 closed: CancellationToken::new(),
+                teardown_done: AtomicBool::new(false),
                 events,
                 serials: AtomicU64::new(1),
                 sessions: Arc::new(session::Registry::new(inner.clone())),
@@ -431,19 +452,33 @@ impl Extensions {
         let inner = Arc::clone(&self.inner);
         let id = id.to_owned();
         run(async move {
-            let enabled = inner.lock().enabled.iter().any(|ext| ext.id == id);
-            if !enabled || id.contains('/') {
+            if inner.closed.is_cancelled() {
+                return Err(BridgeError::ShutDown);
+            }
+            let Some(admission) = inner.lock().admissions.get(&id).copied() else {
                 return Err(BridgeError::UnknownExtension(id));
+            };
+            if id.contains('/') {
+                return Err(BridgeError::InstalledDependencies(id));
             }
             let (package, _) = manifest::locate(&id, &inner.options)
                 .await
                 .map_err(BridgeError::DependencyInstall)?;
             inner.forget_install_failure(&id);
             inner
-                .ensure_dependencies(&id, &package)
+                .ensure_dependencies(&id, &package, admission)
                 .await
                 .map_err(BridgeError::DependencyInstall)?;
-            inner.reconcile(None, Some(Rearm::Reload(id))).await
+            inner
+                .reconcile(
+                    None,
+                    Some(Rearm::Installed {
+                        id,
+                        admission,
+                        placement: None,
+                    }),
+                )
+                .await
         })
         .await
         .unwrap_or(Err(BridgeError::ShutDown))
@@ -494,41 +529,33 @@ impl Extensions {
     /// One entry per runner that is currently alive, in the enabled order of its first
     /// member. A runner whose memory cannot be read is omitted.
     pub async fn memory(&self) -> Vec<RunnerMemory> {
-        let placements: Vec<Installed> = {
+        let (metadata, containers): (Vec<_>, Vec<_>) = {
             let state = self.inner.lock();
-            let mut placements: Vec<(usize, Installed)> = state
-                .placements
-                .values()
-                .map(|installed| {
-                    let first = installed.members.first().map(|m| m.id.as_str());
-                    let position = state
-                        .enabled
-                        .iter()
-                        .position(|ext| Some(ext.id.as_str()) == first);
-                    (position.unwrap_or(usize::MAX), installed.clone())
+            state
+                .enabled
+                .iter()
+                .filter_map(|ext| {
+                    let (_, placement) = state.member_of.get(&ext.id)?;
+                    let installed = state.placements.get(&Key::of(ext))?;
+                    if installed.members.first()?.id != ext.id {
+                        return None;
+                    }
+                    let container = placement.container()?;
+                    let members = installed.members.iter().map(|m| m.id.clone()).collect();
+                    Some(((members, installed.group.clone()), container))
                 })
-                .collect();
-            placements.sort_by_key(|(position, _)| *position);
-            placements
-                .into_iter()
-                .map(|(_, installed)| installed)
-                .collect()
+                .unzip()
         };
-        let live: Vec<_> = placements
-            .into_iter()
-            .filter_map(|installed| {
-                let container = installed.placement.container()?;
-                let members = installed.members.iter().map(|m| m.id.clone()).collect();
-                Some((members, installed.group, container))
-            })
-            .collect();
         tokio::task::spawn_blocking(move || {
-            live.into_iter()
-                .filter_map(|(members, group, container)| {
+            let samples = axo::exec::host::Container::memory_batch(&containers);
+            metadata
+                .into_iter()
+                .zip(samples)
+                .filter_map(|((members, group), bytes)| {
                     Some(RunnerMemory {
                         members,
                         group,
-                        pss_bytes: container.memory()?,
+                        pss_bytes: bytes?,
                     })
                 })
                 .collect()
@@ -549,8 +576,24 @@ impl Extensions {
 
 impl Drop for Extensions {
     fn drop(&mut self) {
-        // Fences proxies now; placements tear down when their last owner drops.
+        // Fence retained callbacks before asynchronous layer withdrawal.
         self.inner.closed.cancel();
+        if self.inner.teardown_done.load(Ordering::Acquire) {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(inner.teardown());
+        } else {
+            let _ = std::thread::Builder::new().spawn(move || {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    let _ = runtime.block_on(inner.teardown());
+                }
+            });
+        }
     }
 }
 
@@ -577,51 +620,75 @@ impl Inner {
         self.lock().statuses()
     }
 
-    /// Applies `change` and emits `StateChanged` if `id`'s committed status moved.
-    fn mark(&self, id: &str, change: impl FnOnce(&mut State)) {
+    fn mark(&self, id: &str, package: &Path, admission: u64, change: impl FnOnce(&mut State)) {
         let mut state = self.lock();
-        let status = |state: &State| state.statuses().into_iter().find(|s| s.id == id);
-        let before = status(&state);
-        change(&mut state);
-        if let Some(after) = status(&state)
-            && Some(&after) != before.as_ref()
+        if state.admissions.get(id) != Some(&admission)
+            || state
+                .accepted
+                .get(id)
+                .is_none_or(|(m, _)| m.package != package)
         {
-            let _ = self.events.send(ExtensionEvent::StateChanged(after));
+            return;
         }
+        self.change_status(&mut state, id, change);
+    }
+
+    /// Publish gates before notifying observers, using the same committed projection.
+    fn change_status(&self, state: &mut State, id: &str, change: impl FnOnce(&mut State)) {
+        let Some(index) = state.enabled.iter().position(|ext| ext.id == id) else {
+            return;
+        };
+        let before = state.status(&state.enabled[index]);
+        change(state);
+        let after = state.status(&state.enabled[index]);
+        if before == after {
+            return;
+        }
+        let reason = gate(&after);
+        for (provider, binding) in &mut state.bindings {
+            if binding.ext == id && binding.gate != reason {
+                self.layer.set_unavailable(provider, reason.clone());
+                binding.gate.clone_from(&reason);
+            }
+        }
+        let _ = self.events.send(ExtensionEvent::StateChanged(after));
     }
 
     fn forget_install_failure(&self, id: &str) {
         self.deps.forget(id);
-        self.mark(id, |state| {
-            state.install_failed.remove(id);
-        });
     }
 
     /// Installs authored `id`'s dependencies unless current, publishing `Installing` while Bun
     /// runs and `Disabled` with the reason when it fails. `Ok(true)` when an install ran.
-    async fn ensure_dependencies(&self, id: &str, package: &Path) -> Result<bool, String> {
+    async fn ensure_dependencies(
+        &self,
+        id: &str,
+        package: &Path,
+        admission: u64,
+    ) -> Result<bool, String> {
         let started = || {
-            self.mark(id, |state| {
+            self.mark(id, package, admission, |state| {
                 state.installing.insert(id.to_owned());
             })
         };
-        let result = tokio::select! {
-            result = self.deps.ensure(id, package, started) => result,
-            () = self.closed.cancelled() => return Err(BridgeError::ShutDown.to_string()),
+        let finished = |result: &Result<bool, String>| {
+            self.mark(id, package, admission, |state| {
+                state.installing.remove(id);
+                match result {
+                    Ok(_) => state.install_failed.remove(id),
+                    Err(reason) => state.install_failed.insert(id.to_owned(), reason.clone()),
+                };
+            })
         };
-        self.mark(id, |state| {
-            state.installing.remove(id);
-            match &result {
-                Ok(_) => state.install_failed.remove(id),
-                Err(reason) => state.install_failed.insert(id.to_owned(), reason.clone()),
-            };
-        });
-        result
+        tokio::select! {
+            result = self.deps.ensure(id, admission, package, started, finished) => result,
+            () = self.closed.cancelled() => Err(BridgeError::ShutDown.to_string()),
+        }
     }
 
     /// What a placement runs before starting a generation: an authored member waits for its
     /// dependencies. Holds the manager weakly, so a placement never keeps it alive.
-    fn preparer(self: &Arc<Self>) -> Prepare {
+    fn preparer(self: &Arc<Self>, serial: u64) -> Prepare {
         let inner = Arc::downgrade(self);
         Arc::new(move |member: Member| {
             let inner = inner.clone();
@@ -632,8 +699,19 @@ impl Inner {
                 if member.id.contains('/') || !inner.options.auto_install {
                     return Ok(());
                 }
+                let admission = {
+                    let state = inner.lock();
+                    if state
+                        .member_of
+                        .get(&member.id)
+                        .is_none_or(|(s, _)| *s != serial)
+                    {
+                        return Err(format!("extension {} was replaced", member.id));
+                    }
+                    state.admissions[&member.id]
+                };
                 inner
-                    .ensure_dependencies(&member.id, &member.package)
+                    .ensure_dependencies(&member.id, &member.package, admission)
                     .await
                     .map(drop)
             })
@@ -643,10 +721,27 @@ impl Inner {
     /// Installs `id`'s stale dependencies in the background. A runner that was already live
     /// is reloaded once they changed (its in-flight calls fail, as for any reload); a cold one
     /// is not, since a call may be waiting on it.
-    fn spawn_install(self: Arc<Self>, id: String, package: PathBuf, was_running: bool) {
+    fn spawn_install(
+        self: Arc<Self>,
+        id: String,
+        package: PathBuf,
+        admission: u64,
+        running: Option<u64>,
+    ) {
         tokio::spawn(async move {
-            if self.ensure_dependencies(&id, &package).await == Ok(true) && was_running {
-                let _ = self.reconcile(None, Some(Rearm::Reload(id))).await;
+            if self.ensure_dependencies(&id, &package, admission).await == Ok(true)
+                && let Some(serial) = running
+            {
+                let _ = self
+                    .reconcile(
+                        None,
+                        Some(Rearm::Installed {
+                            id,
+                            admission,
+                            placement: Some(serial),
+                        }),
+                    )
+                    .await;
             }
         });
     }
@@ -666,16 +761,10 @@ impl Inner {
         {
             return;
         }
-        let gate = gate(&status);
-        let State { bindings, last, .. } = &mut *state;
-        for (provider, binding) in bindings.iter_mut() {
-            if binding.ext == status.id && binding.serial == Some(serial) && binding.gate != gate {
-                binding.gate = gate.clone();
-                self.layer.set_unavailable(provider, gate.clone());
-            }
-        }
-        last.insert(status.id.clone(), (serial, status.clone()));
-        let _ = self.events.send(ExtensionEvent::StateChanged(status));
+        let id = status.id.clone();
+        self.change_status(&mut state, &id, |state| {
+            state.last.insert(status.id.clone(), (serial, status));
+        });
     }
 
     async fn reconcile(
@@ -690,6 +779,18 @@ impl Inner {
         // Placements, acceptance and bindings change only under `config`.
         let (enabled, accepted, installed, old_bindings) = {
             let state = self.lock();
+            if let Some(Rearm::Installed {
+                id,
+                admission,
+                placement,
+            }) = &rearm
+                && (state.admissions.get(id) != Some(admission)
+                    || placement.is_some_and(|serial| {
+                        state.member_of.get(id).is_none_or(|(s, _)| *s != serial)
+                    }))
+            {
+                return Ok(());
+            }
             (
                 enabled.unwrap_or_else(|| state.enabled.clone()),
                 state.accepted.clone(),
@@ -708,7 +809,7 @@ impl Inner {
                 .iter()
                 .find(|(_, old)| old.members.iter().any(|m| m.id == id))?;
             let stuck = match rearm {
-                Rearm::Reload(_) => true,
+                Rearm::Reload(_) | Rearm::Installed { .. } => true,
                 Rearm::Retry(_) => {
                     old.placement.load_disabled().iter().any(|m| m == id)
                         || old.placement.status().iter().any(|s| {
@@ -733,6 +834,16 @@ impl Inner {
                     .map(|ext| manifest::discover(&ext.id, options))
             )
         );
+        let bun_usable = bun.is_none();
+        let stale_checks = join_all(enabled.iter().zip(&found).map(|(ext, result)| async move {
+            let found = result.as_ref().ok()?;
+            if bun_usable && found.entry_error.is_none() && !ext.id.contains('/') {
+                Some(deps::stale(&found.member.package).await)
+            } else {
+                None
+            }
+        }))
+        .await;
         let mut accepted_next = HashMap::new();
         let mut overrides = HashMap::new();
         let mut diagnostics = Vec::new();
@@ -741,7 +852,8 @@ impl Inner {
         let mut contributions = Vec::new();
         // Admitted authored extensions whose dependencies need installing.
         let mut stale = Vec::new();
-        for (ext, result) in enabled.iter().zip(found) {
+        let mut current = HashSet::new();
+        for ((ext, result), stale_check) in enabled.iter().zip(found).zip(stale_checks) {
             let (member, contribution, problem) = match result {
                 Ok(found) => {
                     diagnostics.extend(found.diagnostics.into_iter().map(|message| {
@@ -770,9 +882,9 @@ impl Inner {
                 },
             };
             let mut problem = problem.or_else(|| bun.clone());
-            if problem.is_none() && !ext.id.contains('/') {
+            if let Some(stale_check) = stale_check {
                 let id = &ext.id;
-                match deps::stale(&member.package).await {
+                match stale_check {
                     Err(error) => problem = Some(format!("extension {id}: {error}")),
                     Ok(true) if !options.auto_install => {
                         problem = Some(format!(
@@ -780,7 +892,9 @@ impl Inner {
                         ));
                     }
                     Ok(true) => stale.push((id.clone(), member.package.clone())),
-                    Ok(false) => {}
+                    Ok(false) => {
+                        current.insert(id.clone());
+                    }
                 }
             }
             if let Some(problem) = &problem {
@@ -843,7 +957,7 @@ impl Inner {
                 self.options.clone(),
                 Arc::clone(&self.supervisor),
                 reporter(Arc::downgrade(&self), serial),
-                self.preparer(),
+                self.preparer(serial),
                 Arc::clone(&self.sessions) as Arc<dyn Actions>,
             );
             if let Some(old) = old
@@ -928,6 +1042,9 @@ impl Inner {
             let serial = placed.map(|(serial, _)| *serial);
             let reused = old_bindings.get(*provider).filter(|old| {
                 old.ext == ext.id
+                    && accepted
+                        .get(&ext.id)
+                        .is_some_and(|(m, _)| m.package == usable[ext.id.as_str()].0.package)
                     && old.serial == serial
                     && old.descriptor == **descriptor
                     && (serial.is_some() || old.gate == problem)
@@ -962,8 +1079,10 @@ impl Inner {
                     gate: problem,
                 },
             };
-            // Discovery validated these; checking again keeps `replace` below infallible.
-            if let Err(error) = binding.provider.validate() {
+            // Reused bindings already passed validation; check fresh ones before fencing.
+            if reused.is_none()
+                && let Err(error) = binding.provider.validate()
+            {
                 join_all(fresh.iter().map(|p| p.shutdown())).await;
                 return Err(error.into());
             }
@@ -990,26 +1109,60 @@ impl Inner {
                     state.last.insert(status.id.clone(), (serial, status));
                 }
             }
-            for binding in bindings.values_mut() {
-                if let Some(serial) = binding.serial {
-                    binding.gate = state
-                        .last
-                        .get(&binding.ext)
-                        .filter(|(s, _)| *s == serial)
-                        .and_then(|(_, status)| gate(status));
+            let same_package = |id: &String| {
+                accepted
+                    .get(id)
+                    .zip(accepted_next.get(id))
+                    .is_some_and(|((old, _), (new, _))| old.package == new.package)
+            };
+            for id in &current {
+                if state.install_failed.contains_key(id) {
+                    self.deps.forget(id);
                 }
+            }
+            state
+                .install_failed
+                .retain(|id, _| same_package(id) && !current.contains(id));
+            state.installing.retain(same_package);
+            state.admissions.retain(|id, _| same_package(id));
+            for ext in &enabled {
+                if !state.admissions.contains_key(&ext.id) {
+                    state
+                        .admissions
+                        .insert(ext.id.clone(), self.serials.fetch_add(1, Ordering::Relaxed));
+                }
+            }
+            state.overrides = overrides;
+            let after: Vec<_> = enabled.iter().map(|ext| state.status(ext)).collect();
+            let gates: HashMap<_, _> = after.iter().map(|s| (s.id.as_str(), gate(s))).collect();
+            for binding in bindings.values_mut() {
+                binding.gate.clone_from(&gates[binding.ext.as_str()]);
             }
             for (provider, old) in &state.bindings {
                 if !kept.contains(provider) {
                     old.retired.cancel();
                 }
             }
-            self.layer.replace(
-                bindings
-                    .values()
-                    .map(|binding| (binding.provider.clone(), binding.gate.clone()))
-                    .collect(),
-            )?;
+            if kept.len() != bindings.len()
+                || kept.len() != state.bindings.len()
+                || bindings
+                    .iter()
+                    .any(|(id, binding)| state.bindings[id].gate != binding.gate)
+            {
+                self.layer.replace(
+                    bindings
+                        .values()
+                        .map(|binding| {
+                            let package = &usable[binding.ext.as_str()].0.package;
+                            (
+                                credential_owner(&binding.ext, package),
+                                binding.provider.clone(),
+                                binding.gate.clone(),
+                            )
+                        })
+                        .collect(),
+                )?;
+            }
             let retired: Vec<Arc<Placement>> = state
                 .placements
                 .iter()
@@ -1022,7 +1175,6 @@ impl Inner {
                 .collect();
             state.enabled = enabled;
             state.accepted = accepted_next;
-            state.overrides = overrides;
             state.placements = placements;
             state.member_of = member_of;
             state.bindings = bindings;
@@ -1031,7 +1183,7 @@ impl Inner {
             let old_collisions = std::mem::replace(&mut state.collisions, collisions);
             let old_diagnostics = std::mem::replace(&mut state.diagnostics, diagnostics);
 
-            for status in state.statuses() {
+            for status in after {
                 if !before.contains(&status) {
                     let _ = self.events.send(ExtensionEvent::StateChanged(status));
                 }
@@ -1052,16 +1204,15 @@ impl Inner {
                         .send(ExtensionEvent::Diagnostic(diagnostic.clone()));
                 }
             }
-            let installs: Vec<(String, PathBuf, bool)> = stale
+            let installs: Vec<_> = stale
                 .into_iter()
                 .map(|(id, package)| {
-                    let running = state.last.get(&id).is_some_and(|(_, status)| {
-                        !matches!(
-                            status.phase,
-                            ExtensionPhase::Cold | ExtensionPhase::Starting
-                        )
-                    });
-                    (id, package, running)
+                    let running = state
+                        .member_of
+                        .get(&id)
+                        .and_then(|(serial, placement)| placement.container().map(|_| *serial));
+                    let admission = state.admissions[&id];
+                    (id, package, admission, running)
                 })
                 .collect();
             (retired, unchanged, installs)
@@ -1074,15 +1225,19 @@ impl Inner {
             session::reapply(&self).await;
         }
         join_all(retired.iter().map(|p| p.shutdown())).await;
-        for (id, package, was_running) in installs {
-            Arc::clone(&self).spawn_install(id, package, was_running);
+        for (id, package, admission, running) in installs {
+            Arc::clone(&self).spawn_install(id, package, admission, running);
         }
         Ok(())
     }
 
     async fn teardown(self: Arc<Self>) -> Result<(), BridgeError> {
+        // `closed` is already cancelled: wait out store mutators admitted before it, without
+        // holding the write guard while a mutator may still need `config` to publish.
+        drop(self.deps.store_work.write().await);
         let _config = self.config.lock().await;
         let state = std::mem::take(&mut *self.lock());
+        self.layer.replace(Vec::new())?;
         // With no contributions left, this restores every session to its host registrations.
         session::reapply(&self).await;
         self.sessions.clear();
@@ -1094,7 +1249,7 @@ impl Inner {
         drop(hook);
         join_all(state.placements.values().map(|p| p.placement.shutdown())).await;
         drop(state);
-        self.layer.replace(Vec::new())?;
+        self.teardown_done.store(true, Ordering::Release);
         Ok(())
     }
 }
@@ -1133,6 +1288,16 @@ fn unavailable(ext: &EnabledExtension, reason: String) -> ExtensionStatus {
         phase: ExtensionPhase::Unavailable,
         reason: Some(reason),
     }
+}
+
+fn credential_owner(ext: &str, package: &Path) -> String {
+    let path = package.as_os_str().as_encoded_bytes();
+    let mut owner = String::with_capacity("extension//".len() + ext.len() + 2 * path.len());
+    write!(owner, "extension/{ext}/").expect("writing to String");
+    for byte in path {
+        write!(owner, "{byte:02x}").expect("writing to String");
+    }
+    owner
 }
 
 fn validate_options(options: &ExtensionOptions) -> Result<(), BridgeError> {

@@ -10,7 +10,7 @@ use axo_ai::ToolCall;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tools::{FileWrite, SessionTools};
+use crate::tools::{FileWrite, SessionTools, ToolAccess};
 
 const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
     "Use write only for new files or complete rewrites.",
@@ -79,17 +79,13 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ToolContext { call, cancel, .. } = cx;
         let WriteArgs { path, content } =
-            serde_json::from_value(Value::Object(call.arguments.clone()))
+            serde_json::from_value(Value::Object(cx.call.arguments.clone()))
                 .map_err(|error| ToolError(error.to_string()))?;
-        self.tools
-            .file_tool_output(
-                &cancel,
-                &path,
-                FileWrite::Replace(content.into_bytes()),
-                |shown| format!("Successfully wrote to {shown}"),
-            )
+        ToolAccess::new(self.tools.clone(), cx)
+            .file_tool_output(path, FileWrite::Replace(content.into_bytes()), |shown| {
+                format!("Successfully wrote to {shown}")
+            })
             .await
     }
 }

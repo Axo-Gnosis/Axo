@@ -227,8 +227,6 @@ async fn run(
     };
     let prepared = prepare(opts.rewrite.as_deref(), model, request, cancel, reply).await?;
 
-    // ponytail: the body is copied per attempt; switch to `bytes::Bytes` if large
-    // transcripts make this show up.
     let response = send(
         || {
             http.post(&prepared.url)

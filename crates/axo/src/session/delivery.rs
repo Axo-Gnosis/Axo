@@ -113,7 +113,7 @@ struct Preparing(Arc<SessionHooks>);
 impl Drop for Preparing {
     fn drop(&mut self) {
         if self.0.preparing.fetch_sub(1, Ordering::AcqRel) == 1 {
-            JobHost::results_ready(&*self.0);
+            self.0.drive_delivery(false);
         }
     }
 }
@@ -179,31 +179,21 @@ impl SessionHooks {
         })
     }
 
-    /// For the owner of `running`: starts a run delivering every pending job result;
-    /// false when nothing is pending.
-    fn start_delivery(&self, agent: Arc<Agent>, hooks: Arc<SessionHooks>) -> bool {
-        if !self.tools.runner.jobs.has_pending() {
-            return false;
-        }
-        let delivery = self.reserve_delivery();
-        if delivery.is_empty() {
-            return false;
-        }
-        let messages = self.run_input(delivery, None);
-        spawn_run(agent, hooks, messages, "job result delivery run failed");
-        true
+    /// Ends the current ownership claim, chaining any ready delivery without going idle.
+    pub(super) fn release_or_deliver(&self) {
+        self.drive_delivery(true);
     }
 
-    /// Ends the busy state its caller owns, unless queued steers, follow-ups or pending
-    /// delivery start a run first: then `running` stays set and the run settles like any
-    /// other. Called wherever the session would go idle.
-    pub(super) fn release_or_deliver(&self) {
-        // The claim a Stop targeted ends here; a Stop never carries over to the next owner.
-        self.stop_requested.store(false, Ordering::Release);
+    /// An idle wake and an owner releasing the session choose their next input under
+    /// the same lock, so a sender cannot strand work between the drain and release.
+    fn drive_delivery(&self, releasing: bool) {
         let mut next = None;
         self.activity.send_if_modified(|activity| {
-            // Queue draining and the idle decision share the ownership lock. A sender
-            // either joins this chain or claims a genuinely idle session afterwards.
+            if releasing {
+                self.stop_requested.store(false, Ordering::Release);
+            } else if activity.running {
+                return false;
+            }
             if self.deliverable(activity)
                 && let Some((agent, hooks)) = self.owners()
             {
@@ -215,11 +205,11 @@ impl SessionHooks {
                 };
                 if !queued.is_empty() || !delivery.is_empty() {
                     next = Some((agent, hooks, delivery, queued));
-                    return false;
                 }
             }
-            activity.running = false;
-            true
+            let was_running = activity.running;
+            activity.running = next.is_some();
+            was_running != activity.running
         });
         if let Some((agent, hooks, delivery, queued)) = next {
             let failed = if queued.is_empty() {
@@ -231,26 +221,6 @@ impl SessionHooks {
             let mut messages = self.run_input(delivery, None);
             messages.extend(queued);
             spawn_run(agent, hooks, messages, failed);
-            return;
-        }
-        // A result that became pending meanwhile found `running` set and left its
-        // delivery to this transition.
-        self.deliver_if_idle();
-    }
-
-    /// Starts delivery when the session is idle and pending results may start a run.
-    /// While a run or maintenance owns the session, its steering hook or its idle
-    /// transition delivers instead.
-    fn deliver_if_idle(&self) {
-        let Some((agent, hooks)) = self.owners() else {
-            return;
-        };
-        while self.may_deliver() && self.tools.runner.jobs.has_pending() && self.claim_idle() {
-            if self.start_delivery(agent.clone(), hooks.clone()) {
-                return;
-            }
-            self.activity
-                .send_modify(|activity| activity.running = false);
         }
     }
 
@@ -420,7 +390,12 @@ impl Session {
             };
             saved.keep();
             drop(preparing);
-            hooks.set_auto_paused(false);
+            hooks.activity.send_if_modified(|_| {
+                if !hooks.stop_requested.load(Ordering::Acquire) {
+                    hooks.set_auto_paused(false);
+                }
+                false
+            });
             // A keyword's model applies like `/model`: recorded after the submission,
             // before the run's first request.
             if let Some(choice) = choice
@@ -512,10 +487,12 @@ impl Session {
         detached(async move {
             // Wait for a submission being appended to reach the agent's queue.
             let order = hooks.queue_order.lock().await;
-            let Some(input) = QueuedInput::find(&hooks.journal.view().entries, id.clone()) else {
+            let Some(input) = hooks.journal.view().entries.iter().rev()
+                .find(|seq| matches!(&seq.entry, Entry::Submission { submission_id, .. } if submission_id == &id))
+                .and_then(|seq| QueuedInput::from_submission(&seq.entry)) else {
                 return Err(Error::NotQueued(id));
             };
-            let Some(message) = agent.remove_queued(&id) else {
+            let Some((message, behind)) = agent.remove_queued(&id) else {
                 return Err(Error::NotQueued(id));
             };
             let tombstone = Entry::SubmissionWithdrawn {
@@ -523,11 +500,13 @@ impl Session {
                 submission_id: id,
             };
             if let Err(error) = hooks.append(vec![tombstone]).await {
-                enqueue(&agent, &hooks, input.kind, message);
-                drop(order);
-                if hooks.claim_idle() {
-                    hooks.release_or_deliver();
+                {
+                    let _live = hooks.live();
+                    agent.restore_queued(matches!(input.kind, SubmissionKind::Prompt | SubmissionKind::Steer), behind, message);
+                    let _ = hooks.events.send(Arc::new(SessionEvent::QueueChanged));
                 }
+                drop(order);
+                hooks.drive_delivery(false);
                 return Err(error);
             }
             Ok(input)
@@ -591,9 +570,7 @@ impl Session {
     #[ext]
     pub fn resume_wakes(&self) {
         self.hooks.set_auto_paused(false);
-        if self.hooks.claim_idle() {
-            self.hooks.release_or_deliver();
-        }
+        self.hooks.drive_delivery(false);
     }
 
     /// Saves and queues a teammate's message, read at the next turn boundary; on an idle
@@ -664,7 +641,7 @@ impl Session {
         detached(async move {
             // Awaits only the journal and the selection order, which never wait on the
             // session.
-            let _order = hooks.queue_order.lock().await;
+            let order = hooks.queue_order.lock().await;
             hooks.append(vec![entry]).await?;
             if let Some(saved) = saved {
                 saved.keep();
@@ -677,14 +654,20 @@ impl Session {
             if !matches!(kind, SubmissionKind::Quiet | SubmissionKind::Mail) {
                 hooks.set_auto_paused(false);
             }
-            enqueue(&agent, &hooks, kind, message);
-            Ok::<(), Error>(())
+            if matches!(kind, SubmissionKind::Steer | SubmissionKind::FollowUp) {
+                let _live = hooks.live();
+                enqueue(&agent, &hooks, kind, message);
+                let _ = hooks.events.send(Arc::new(SessionEvent::QueueChanged));
+            } else {
+                enqueue(&agent, &hooks, kind, message);
+            }
+            drop(order);
+            if kind != SubmissionKind::Quiet {
+                hooks.drive_delivery(false);
+            }
+            Ok(())
         })
-        .await?;
-        if kind != SubmissionKind::Quiet && self.hooks.claim_idle() {
-            self.hooks.release_or_deliver();
-        }
-        Ok(())
+        .await
     }
 
     /// Validates and renders a new child's task; writes nothing.
@@ -719,24 +702,11 @@ impl Session {
         first.saved.keep();
         Ok(first.message)
     }
-
-    /// Runs the task `claim_first` saved; returns when the run settles.
-    pub(super) async fn run_first(&self, message: QueuedMessage) -> Result<RunOutcome, Error> {
-        let messages = self
-            .hooks
-            .run_input(self.hooks.reserve_delivery(), Some(message));
-        run_to_settle(
-            self.agent.clone(),
-            self.hooks.clone(),
-            RunRequest::Prompt(messages),
-        )
-        .await
-    }
 }
 #[async_trait]
 impl JobHost for SessionHooks {
     fn results_ready(&self) {
-        self.deliver_if_idle();
+        self.drive_delivery(false);
     }
 
     fn mail_changed(&self, unread: u32) {

@@ -24,7 +24,7 @@ async fn concurrent_refreshes_rotate_the_token_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("auth.json");
     FileCredentialStore::new(path.clone())
-        .set("openai-codex", oauth("old", "r0", 0))
+        .set("loaded/openai-codex", oauth("old", "r0", 0))
         .await
         .unwrap();
 
@@ -36,7 +36,7 @@ async fn concurrent_refreshes_rotate_the_token_once() {
             tokio::spawn(async move {
                 store
                     .update(
-                        "openai-codex",
+                        "loaded/openai-codex",
                         Box::new(move |current: Option<Credential>| {
                             async move {
                                 match current {

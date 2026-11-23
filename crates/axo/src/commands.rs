@@ -79,7 +79,7 @@ pub struct RegisteredCommand {
 
 /// How a command behaves while a turn is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum CommandPolicy {
     /// Runs during a turn or maintenance and takes effect from the next request.
     Alongside,
@@ -92,7 +92,7 @@ pub enum CommandPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, specta::Type)]
 #[serde(
     tag = "kind",
-    rename_all = "snake_case",
+    rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
 pub enum CommandKind {
@@ -458,19 +458,31 @@ pub fn valid_command_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(|c: char| c.is_whitespace() || c == '/')
 }
 
+fn registration_allowed(name: &str, modes: &[Arc<ModeSpec>]) -> bool {
+    valid_command_name(name) && !is_builtin(name) && !modes.iter().any(|mode| mode.name == name)
+}
+
+pub(crate) fn registered_winner<'a>(
+    name: &str,
+    registered: &'a [RegisteredCommand],
+    modes: &[Arc<ModeSpec>],
+) -> Option<&'a RegisteredCommand> {
+    if !registration_allowed(name, modes) {
+        return None;
+    }
+    registered.iter().rev().find(|command| command.name == name)
+}
+
 /// The registered commands that take effect: valid names not taken by a built-in or a
 /// mode, the last registration of each name, at the position its name was first seen.
-pub(crate) fn effective<'a>(
+fn effective<'a>(
     registered: &'a [RegisteredCommand],
     modes: &[Arc<ModeSpec>],
 ) -> Vec<&'a RegisteredCommand> {
     let mut winners: Vec<&RegisteredCommand> = Vec::new();
     for command in registered {
         let name = command.name.as_str();
-        if !valid_command_name(name)
-            || is_builtin(name)
-            || modes.iter().any(|mode| mode.name == name)
-        {
+        if !registration_allowed(name, modes) {
             continue;
         }
         match winners.iter_mut().find(|winner| winner.name == name) {

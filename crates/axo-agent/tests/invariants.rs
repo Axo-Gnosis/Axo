@@ -1713,7 +1713,8 @@ async fn removing_the_only_steer_clears_the_signal() {
         id: Some("s1".into()),
     });
     assert!(h.agent.remove_queued("unknown").is_none());
-    let removed = h.agent.remove_queued("s1").expect("queued steer");
+    let (removed, behind) = h.agent.remove_queued("s1").expect("queued steer");
+    assert_eq!(behind, 0);
     assert_eq!(removed.id.as_deref(), Some("s1"));
     assert!(h.agent.remove_queued("s1").is_none());
 
@@ -1723,6 +1724,36 @@ async fn removing_the_only_steer_clears_the_signal() {
         h.request(1),
         labels(&["user:go", "assistant:ToolUse", "result:c1"])
     );
+}
+
+#[test]
+fn rollback_after_prefix_drain_preserves_order() {
+    let h = setup(Vec::new(), Vec::new(), |_| {});
+    for steering in [true, false] {
+        for id in ["A", "B", "C", "D"] {
+            let message = QueuedMessage {
+                id: Some(id.into()),
+                message: user(id),
+            };
+            if steering {
+                h.agent.steer(message);
+            } else {
+                h.agent.follow_up(message);
+            }
+        }
+        let (b, behind) = h.agent.remove_queued("B").unwrap();
+        assert_eq!(behind, 2);
+        assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("A"));
+        h.agent.restore_queued(steering, behind, b);
+        assert_eq!(h.agent.queued_ids(), ["B", "C", "D"]);
+
+        let (b, behind) = h.agent.remove_queued("B").unwrap();
+        assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("C"));
+        assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("D"));
+        h.agent.restore_queued(steering, behind, b);
+        assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("B"));
+        assert!(h.agent.queued_ids().is_empty());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2135,6 +2166,90 @@ async fn stop_keeps_a_cooperative_tools_own_result() {
         !names.contains(&"result:g1:Operation aborted".to_owned()),
         "{names:?}"
     );
+}
+
+struct ArmedTool {
+    schema: Value,
+    admitted: Notify,
+    recovering: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for ArmedTool {
+    fn name(&self) -> &str {
+        "armed"
+    }
+
+    fn description(&self) -> &str {
+        "Parks with a mutation to settle."
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let dropped = CancellationToken::new();
+        let _guard = dropped.clone().drop_guard();
+        let recovering = self.recovering.clone();
+        let release = self.release.clone();
+        cx.on_hard_stop(async move {
+            assert!(dropped.is_cancelled(), "execute must be dropped first");
+            recovering.notify_one();
+            release.notified().await;
+            Some(ToolOutput {
+                content: vec![UserBlock::Text {
+                    text: "Operation aborted".into(),
+                }],
+                is_error: true,
+                details: Some(json!({ "mutation": "committed" })),
+                ..Default::default()
+            })
+        });
+        self.admitted.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn hard_stop_finishes_armed_mutation_before_emitting_result() {
+    let tool = Arc::new(ArmedTool {
+        schema: json!({ "type": "object" }),
+        admitted: Notify::new(),
+        recovering: Arc::default(),
+        release: Arc::default(),
+    });
+    let events = Arc::new(ToolEvents::default());
+    let agent = bare_agent(
+        vec![turn(&[("a1", "armed", json!({}))])],
+        vec![tool.clone()],
+        events.clone(),
+    );
+    let run = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.prompt(vec![user("go").into()]).await }
+    });
+    tokio::time::timeout(SETTLE, async {
+        tool.admitted.notified().await;
+        agent.cancel(CancelReason::User);
+        tool.recovering.notified().await;
+        assert!(events.names().is_empty());
+        tool.release.notify_one();
+        assert_eq!(
+            run.await.unwrap().unwrap(),
+            RunOutcome::Aborted(CancelReason::User)
+        );
+    })
+    .await
+    .expect("hard stop settles");
+    assert_eq!(events.names(), ["end:a1", "result:a1:Operation aborted"]);
+    let messages = agent.messages();
+    let Some(AgentMessage::Llm(Message::ToolResult(result))) = messages.last() else {
+        panic!("missing terminal result");
+    };
+    assert!(result.is_error);
+    assert_eq!(result.details, Some(json!({ "mutation": "committed" })));
 }
 
 /// Marks that it ran.

@@ -17,9 +17,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::delivery::Activity;
-use super::spawn::child_inherited;
+use super::spawn::child_seed;
 use super::team::TeamState;
-use super::{Inherited, RecoveryPolicy, Session, SessionHooks, SessionSetup, journal};
+use super::{
+    Inherited, Layers, RecoveryPolicy, Registrations, Session, SessionHooks, SessionSetup, journal,
+};
 use crate::error::Error;
 use crate::jobs::child::{ended_runs, run_message};
 use crate::jobs::{ChildRef, JobRegistry};
@@ -52,12 +54,20 @@ struct Slot {
     seed: Arc<ChildSeed>,
     live: Option<Arc<Session>>,
     weak: Weak<Session>,
+    residency: CancellationToken,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.residency.cancel();
+    }
 }
 
 /// What reopening a child needs.
 pub(crate) struct ChildSeed {
     pub(crate) path: PathBuf,
     pub(crate) inherited: Arc<Inherited>,
+    pub(crate) registrations: Registrations,
     pub(crate) link: SpawnLink,
 }
 
@@ -91,18 +101,20 @@ impl ChildLog {
 
 impl SessionTable {
     pub(crate) fn insert_live(&self, id: String, seed: Arc<ChildSeed>, session: Arc<Session>) {
-        let old = self
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                id.clone(),
-                Slot {
-                    seed: seed.clone(),
-                    weak: Arc::downgrade(&session),
-                    live: Some(session),
-                },
-            );
+        let old = {
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            slots
+                .insert(
+                    id.clone(),
+                    Slot {
+                        seed: seed.clone(),
+                        weak: Arc::downgrade(&session),
+                        live: Some(session),
+                        residency: CancellationToken::new(),
+                    },
+                )
+                .inspect(|slot| slot.residency.cancel())
+        };
         // Dropping a session can remove its children from this table.
         drop(old);
         if let Some(parent) = self.registry(&seed.link.parent_session_id) {
@@ -119,6 +131,7 @@ impl SessionTable {
                 seed,
                 live: None,
                 weak: Weak::new(),
+                residency: CancellationToken::new(),
             });
     }
 
@@ -129,6 +142,21 @@ impl SessionTable {
         slot.live.clone().or_else(|| slot.weak.upgrade())
     }
 
+    pub(crate) fn observe(
+        &self,
+        id: &str,
+    ) -> Option<(
+        tokio::sync::broadcast::Receiver<Arc<crate::SessionEvent>>,
+        CancellationToken,
+    )> {
+        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = slots.get(id)?;
+        Some((
+            slot.live.as_ref()?.subscribe(),
+            slot.residency.child_token(),
+        ))
+    }
+
     /// The live session, re-pinned in the table so it stays resident while it works.
     fn pin(&self, id: &str) -> Option<Arc<Session>> {
         let (session, parent) = {
@@ -136,11 +164,12 @@ impl SessionTable {
             let slot = slots.get_mut(id)?;
             let repin = slot.live.is_none();
             if repin {
-                slot.live = slot.weak.upgrade();
+                slot.live = Some(slot.weak.upgrade()?);
+                slot.residency = CancellationToken::new();
             }
             (
                 slot.live.clone(),
-                (repin && slot.live.is_some()).then(|| slot.seed.link.parent_session_id.clone()),
+                repin.then(|| slot.seed.link.parent_session_id.clone()),
             )
         };
         if let Some(parent) = parent.and_then(|parent| self.registry(&parent)) {
@@ -164,9 +193,11 @@ impl SessionTable {
     pub(crate) fn park(&self, id: &str) {
         let parked = {
             let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-            slots
-                .get_mut(id)
-                .map(|slot| (slot.live.take(), slot.seed.link.parent_session_id.clone()))
+            slots.get_mut(id).and_then(|slot| {
+                let live = slot.live.take()?;
+                slot.residency.cancel();
+                Some((live, slot.seed.link.parent_session_id.clone()))
+            })
         };
         if let Some((session, parent)) = parked {
             if let Some(parent) = self.registry(&parent) {
@@ -179,7 +210,10 @@ impl SessionTable {
     pub(crate) fn remove(&self, ids: &[String]) {
         let removed: Vec<_> = {
             let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-            ids.iter().filter_map(|id| slots.remove(id)).collect()
+            ids.iter()
+                .filter_map(|id| slots.remove(id))
+                .inspect(|slot| slot.residency.cancel())
+                .collect()
         };
         drop(removed);
     }
@@ -297,6 +331,11 @@ pub(super) async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
     );
     Box::pin(Session::start(SessionSetup {
         inherited: seed.inherited.clone(),
+        layers: Layers {
+            host: seed.registrations.clone(),
+            ..Default::default()
+        },
+        merged: None,
         model,
         thinking,
         tier: projection.tier.unwrap_or_default(),
@@ -467,11 +506,7 @@ impl SessionHooks {
             warn!(%child_id, "child session has no spawn link");
             return Ok(());
         };
-        let seed = Arc::new(ChildSeed {
-            path: child.path.clone(),
-            inherited: child_inherited(self, &link.spec),
-            link,
-        });
+        let seed = Arc::new(child_seed(self, child.path.clone(), link));
         if recover {
             let child = revive(&seed).await?;
             self.inherited

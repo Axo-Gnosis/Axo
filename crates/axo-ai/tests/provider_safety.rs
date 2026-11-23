@@ -287,11 +287,22 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
                     format!("data: {event}\n\n")
                 }
                 ApiKind::OpenAiCompletions => {
-                    let chunk = json!({
-                        "service_tier": echo, "usage": {"prompt_tokens": 4},
-                        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]
-                    });
-                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                    let finish =
+                        json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+                    let usage = json!({"prompt_tokens": 4});
+                    let billing = if supported && chosen != served {
+                        let counts = if chosen == Fast {
+                            json!({"usage": usage})
+                        } else {
+                            json!({"choices": [{"usage": usage}]})
+                        };
+                        let tier = json!({"service_tier": echo});
+                        format!("data: {counts}\n\ndata: {tier}\n\n")
+                    } else {
+                        let chunk = json!({"service_tier": echo, "usage": usage});
+                        format!("data: {chunk}\n\n")
+                    };
+                    format!("{billing}data: {finish}\n\ndata: [DONE]\n\n")
                 }
                 ApiKind::AnthropicMessages => {
                     let mut usage = json!({"input_tokens": 4});
@@ -342,6 +353,7 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
             );
             assert_eq!(message.stop_reason, axo_ai::StopReason::Stop, "{message:?}");
             assert_eq!(message.service_tier, served, "{api:?}");
+            assert_eq!(message.usage.input, 4, "{api:?}");
             assert_eq!(
                 message.usage.cost.total,
                 if served == Fast { 8.0 } else { 4.0 },

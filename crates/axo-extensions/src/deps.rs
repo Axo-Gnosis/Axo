@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use axo::{
@@ -39,14 +39,19 @@ pub async fn fingerprint(package: &Path) -> Result<Option<String>, String> {
     else {
         return Err("package.json: not a JSON object".into());
     };
-    let declares = ["dependencies", "devDependencies", "optionalDependencies"]
-        .iter()
-        .any(|key| {
-            fields
-                .get(*key)
-                .and_then(Value::as_object)
-                .is_some_and(|deps| !deps.is_empty())
-        });
+    let declares = [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .any(|key| {
+        fields
+            .get(*key)
+            .and_then(Value::as_object)
+            .is_some_and(|deps| !deps.is_empty())
+    });
     if !declares {
         return Ok(None);
     }
@@ -101,7 +106,7 @@ pub async fn install(
     };
     let deadline = tokio::time::Instant::now() + INSTALL_DEADLINE;
     let output = supervisor
-        .output(spec, Some(deadline))
+        .output_stderr_tail(spec, Some(deadline), OUTPUT_TAIL)
         .await
         .map_err(|error| match error {
             OutputError::TimedOut => format!(
@@ -111,11 +116,10 @@ pub async fn install(
             OutputError::Failed(message) => message,
         })?;
     if !output.status.success() {
-        let tail = &output.stderr[output.stderr.len().saturating_sub(OUTPUT_TAIL)..];
         return Err(format!(
             "bun install failed ({}): {}",
             output.status,
-            String::from_utf8_lossy(tail).trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     // Bun may have written `bun.lock`, which changes the fingerprint.
@@ -133,11 +137,17 @@ pub struct Deps {
     bun: Option<PathBuf>,
     env: Arc<EnvMap>,
     supervisor: Arc<ProcessSupervisor>,
-    /// Per-extension install locks, shared with the store's install calls. Never held across
-    /// an await.
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Extension → (fingerprint, reason) of its last failed install.
-    failed: Mutex<HashMap<String, (String, String)>>,
+    /// Per-authored-extension locks; a lock remains interned while anyone can wait for it.
+    locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    pub(crate) store_work: tokio::sync::RwLock<()>,
+    /// Extension → (package admission, fingerprint, reason) of its last failed install.
+    failed: Mutex<HashMap<String, InstallFailure>>,
+}
+
+struct InstallFailure {
+    admission: u64,
+    fingerprint: String,
+    reason: String,
 }
 
 impl Deps {
@@ -147,14 +157,21 @@ impl Deps {
             env,
             supervisor,
             locks: Mutex::default(),
+            store_work: tokio::sync::RwLock::default(),
             failed: Mutex::default(),
         }
     }
 
     /// The lock serializing every install of `id`.
-    pub fn lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(locks.entry(id.to_owned()).or_default())
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Installs `package`'s dependencies unless they are current, calling `started` right
@@ -163,37 +180,54 @@ impl Deps {
     pub async fn ensure(
         &self,
         id: &str,
+        admission: u64,
         package: &Path,
         started: impl FnOnce(),
+        finished: impl FnOnce(&Result<bool, String>),
     ) -> Result<bool, String> {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
-        let named = |error: String| format!("extension {id}: {error}");
-        let Some(fingerprint) = fingerprint(package).await.map_err(named)? else {
-            return Ok(false);
-        };
-        if stamped(package, &fingerprint).await {
-            return Ok(false);
-        }
-        if let Some((failed, reason)) = self.failures().get(id)
-            && *failed == fingerprint
-        {
-            return Err(reason.clone());
-        }
-        started();
-        let result = match usable_bun(self.bun.as_deref()).await {
-            Ok(bun) => install(bun, &self.env, &self.supervisor, package, false).await,
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(()) => Ok(true),
-            Err(error) => {
-                let reason = named(error);
-                self.failures()
-                    .insert(id.to_owned(), (fingerprint, reason.clone()));
-                Err(reason)
+        let result = async {
+            let named = |error: String| format!("extension {id}: {error}");
+            let Some(fingerprint) = fingerprint(package).await.map_err(named)? else {
+                return Ok(false);
+            };
+            if stamped(package, &fingerprint).await {
+                return Ok(false);
+            }
+            if let Some(failed) = self.failures().get(id)
+                && failed.admission == admission
+                && failed.fingerprint == fingerprint
+            {
+                return Err(failed.reason.clone());
+            }
+            started();
+            let result = match usable_bun(self.bun.as_deref()).await {
+                Ok(bun) => install(bun, &self.env, &self.supervisor, package, false).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    let reason = named(error);
+                    self.failures().insert(
+                        id.to_owned(),
+                        InstallFailure {
+                            admission,
+                            fingerprint,
+                            reason: reason.clone(),
+                        },
+                    );
+                    Err(reason)
+                }
             }
         }
+        .await;
+        if result.is_ok() {
+            self.forget(id);
+        }
+        finished(&result);
+        result
     }
 
     /// Clears `id`'s remembered failure so the next [`Deps::ensure`] runs Bun again.
@@ -201,7 +235,7 @@ impl Deps {
         self.failures().remove(id);
     }
 
-    fn failures(&self) -> std::sync::MutexGuard<'_, HashMap<String, (String, String)>> {
+    fn failures(&self) -> std::sync::MutexGuard<'_, HashMap<String, InstallFailure>> {
         self.failed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

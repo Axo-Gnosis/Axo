@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use crate::error::Error;
 use crate::tools::FileLedger;
 use crate::tools::changes::Omitted;
+use crate::tools::files::{open_regular, read_limited};
 
 /// Files larger than this are recorded by hash only (`Omitted::TooLarge`).
 pub const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
@@ -62,10 +63,12 @@ impl SnapshotStore {
         let Some(dest) = self.blob_path(sha256) else {
             return Some(Omitted::IoError);
         };
-        if tokio::fs::metadata(&dest)
-            .await
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64)
-        {
+        let usable = async || {
+            tokio::fs::symlink_metadata(&dest)
+                .await
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64)
+        };
+        if usable().await {
             return None;
         }
         let temp = self.dir.join(format!(
@@ -73,35 +76,44 @@ impl SnapshotStore {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        // Renamed over any existing blob: identical content-addressed bytes are harmless to
-        // replace, and a torn blob gets repaired.
+        let omitted = |error: io::Error| {
+            tracing::warn!(path = %dest.display(), %error, "could not store file snapshot");
+            Some(Omitted::IoError)
+        };
+        if let Err(error) = tokio::fs::create_dir_all(&self.dir).await {
+            return omitted(error);
+        }
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => return omitted(error),
+        };
         let written = async {
-            tokio::fs::create_dir_all(&self.dir).await?;
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-                .await?;
             file.write_all(bytes).await?;
             let mut permissions = file.metadata().await?.permissions();
             permissions.set_readonly(true);
             file.set_permissions(permissions).await?;
-            file.sync_all().await?;
-            drop(file);
-            match tokio::fs::rename(&temp, &dest).await {
-                Err(_) if tokio::fs::metadata(&dest).await.is_ok() => Ok(()),
-                result => result,
-            }
+            file.sync_all().await
         }
         .await;
-        match written {
-            Ok(()) => None,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&temp).await;
-                tracing::warn!(path = %dest.display(), %error, "could not store file snapshot");
-                Some(Omitted::IoError)
-            }
+        drop(file);
+        let (error, rename_failed) = match written {
+            Ok(()) => match tokio::fs::rename(&temp, &dest).await {
+                Ok(()) => return None,
+                Err(error) => (error, true),
+            },
+            Err(error) => (error, false),
+        };
+        if let Err(cleanup) = tokio::fs::remove_file(&temp).await {
+            tracing::warn!(path = %temp.display(), %cleanup, "could not remove snapshot temp");
+        } else if rename_failed && usable().await {
+            return None;
         }
+        omitted(error)
     }
 
     /// The bytes stored under `sha256`, verified against it.
@@ -110,10 +122,24 @@ impl SnapshotStore {
         let path = self
             .blob_path(sha256)
             .ok_or_else(|| Error::InvalidInput(format!("Invalid snapshot hash: {sha256}")))?;
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(source) => return Err(Error::Io { path, source }),
-        };
+        let file = open_regular(&path).await.map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let bytes = read_limited(file, MAX_SNAPSHOT_BYTES)
+            .await
+            .and_then(|bytes| {
+                bytes.ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        "snapshot exceeds the maximum blob size",
+                    )
+                })
+            })
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
         if FileLedger::hash(&bytes) != sha256 {
             return Err(Error::Io {
                 path,
@@ -152,6 +178,30 @@ mod tests {
             panic!("tampered blob must fail");
         };
         assert_eq!(source.kind(), ErrorKind::InvalidData);
+
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_SNAPSHOT_BYTES + 1)
+            .unwrap();
+        let Err(Error::Io { source, .. }) = store.read(&sha).await else {
+            panic!("oversized blob must fail");
+        };
+        assert_eq!(source.kind(), ErrorKind::InvalidData);
+        assert_eq!(source.to_string(), "snapshot exceeds the maximum blob size");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_directory_destination_without_leaking_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path().to_path_buf());
+        let sha = FileLedger::hash(b"hello");
+        let dest = store.blob_path(&sha).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        for _ in 0..2 {
+            assert_eq!(store.put(&sha, b"hello").await, Some(Omitted::IoError));
+            assert!(dest.is_dir());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
     }
 
     #[tokio::test]

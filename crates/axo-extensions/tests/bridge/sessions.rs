@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axo::context::agents::AgentDef;
+use axo::ext::Caller;
 use axo::{
     AgentSpec, BashAccess, CommandKind, Entry, Error, ProjectAccess, PromptInput, SchemeContext,
     SchemeUrl, Session, SessionEvent, SessionOptions, SpawnContext, SpawnDecision, SpawnOrigin,
@@ -32,12 +33,16 @@ pub const CASES: &[Case] = &[
     case!(filtered_session_subscription),
     case!(completion_stream_and_unsubscribe),
     case!(detach_closes_subscriptions),
+    case!(child_observation_ends_on_park),
+    case!(deferred_extension_tool_does_not_retain_session_tools),
     case!(subscription_ends_with_its_generation),
     case!(unavailable_policy_fails_closed),
     case!(removed_policy_allows),
+    case!(dropped_manager_fences_hooks_and_restores_layer),
     case!(before_only_policy_skips_after),
     case!(concurrent_cold_calls_restart_and_disable),
     case!(failures_reach_the_host_typed),
+    case!(tool_reservations_follow_session_modes),
 ];
 
 const LAB: &str = "lab";
@@ -352,40 +357,84 @@ async fn tools_policy_state_command_and_events() {
     fork.shutdown().await;
 }
 
-#[derive(Default)]
-struct ForkHost(Mutex<Vec<Arc<Session>>>);
+struct ForkHost {
+    host: Arc<Host>,
+    sessions: Mutex<Vec<Arc<Session>>>,
+}
+
+impl ForkHost {
+    fn hold(&self, session: Session) -> Arc<Session> {
+        let session = Arc::new(session);
+        self.sessions.lock().unwrap().push(session.clone());
+        session
+    }
+
+    fn options(&self, caller: &Caller, request: SessionRequest) -> SessionOptions {
+        assert_eq!(caller.namespace.as_deref(), Some(LAB));
+        assert!(matches!(request, SessionRequest {
+            model: None, agent: None, thinking: None, project_access: None, sections
+        } if sections.is_empty()));
+        options(&self.host)
+    }
+}
 
 #[async_trait]
 impl Lifecycle for ForkHost {
-    async fn create(&self, _: PathBuf, _: SessionRequest) -> Result<Arc<Session>, Error> {
-        panic!("unexpected create")
+    async fn create(
+        &self,
+        caller: &Caller,
+        cwd: PathBuf,
+        request: SessionRequest,
+    ) -> Result<Arc<Session>, Error> {
+        let mut options = self.options(caller, request);
+        options.cwd = cwd;
+        Ok(self.hold(self.host.axo.create_session(options).await?))
     }
-    async fn open(&self, _: PathBuf, _: SessionRequest) -> Result<Arc<Session>, Error> {
-        panic!("unexpected open")
+    async fn open(
+        &self,
+        caller: &Caller,
+        path: PathBuf,
+        request: SessionRequest,
+    ) -> Result<Arc<Session>, Error> {
+        let options = self.options(caller, request);
+        Ok(self.hold(self.host.axo.open_session(&path, options).await?))
     }
-    async fn fork(&self, session: Arc<Session>, entry: axo::EntryId) -> Result<Forked, Error> {
+    async fn fork(
+        &self,
+        caller: &Caller,
+        session: Arc<Session>,
+        entry: axo::EntryId,
+    ) -> Result<Forked, Error> {
+        assert_eq!(caller.namespace.as_deref(), Some(LAB));
         let fork = session.fork(&entry).await?;
-        let session = Arc::new(fork.session);
-        self.0.lock().unwrap().push(session.clone());
         Ok(Forked {
-            session,
+            session: self.hold(fork.session),
             editable: fork.editable,
         })
     }
-    async fn close(&self, id: String) -> Result<(), Error> {
-        let session = self.0.lock().unwrap().pop().unwrap();
-        assert_eq!(session.id(), id);
+    async fn close(&self, caller: &Caller, id: String) -> Result<(), Error> {
+        assert_eq!(caller.namespace.as_deref(), Some(LAB));
+        let session = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let index = sessions
+                .iter()
+                .position(|session| session.id() == id)
+                .ok_or(Error::SessionNotFound(id))?;
+            sessions.swap_remove(index)
+        };
         session.shutdown().await;
         Ok(())
     }
 }
 
 async fn host_lifecycle_and_child_lookup() {
-    let host = Host::scripted(vec![
-        ScriptedTurn::Reply(reply_text("parent ready")),
-        ScriptedTurn::Reply(reply_text("child done")),
-    ])
-    .await;
+    let host = Arc::new(
+        Host::scripted(vec![
+            ScriptedTurn::Reply(reply_text("parent ready")),
+            ScriptedTurn::Reply(reply_text("child done")),
+        ])
+        .await,
+    );
     package(&host, false);
     host.script(LAB, "command", "invoke");
     let extensions = host.manager();
@@ -414,7 +463,9 @@ async fn host_lifecycle_and_child_lookup() {
         json!([session.id(), leaf.entry.id().unwrap()]),
     );
     assert_eq!(
-        invoke(fork.clone()).await.unwrap_err(),
+        invoke(host_call("forkSession", json!([])))
+            .await
+            .unwrap_err(),
         (
             "no_lifecycle".into(),
             "the host registered no session lifecycle hook".into()
@@ -431,7 +482,10 @@ async fn host_lifecycle_and_child_lookup() {
             .any(|info| info["id"] == session.id())
     );
 
-    let hook = Arc::new(ForkHost::default());
+    let hook = Arc::new(ForkHost {
+        host: host.clone(),
+        sessions: Mutex::default(),
+    });
     extensions.set_lifecycle(Some(hook.clone()));
     assert_eq!(
         invoke(host_call("forkSession", json!([session.id()])))
@@ -440,14 +494,47 @@ async fn host_lifecycle_and_child_lookup() {
             .0,
         "invalid_arguments"
     );
+    assert_eq!(
+        invoke(host_call(
+            "forkSession",
+            json!(["missing", leaf.entry.id().unwrap()])
+        ))
+        .await
+        .unwrap_err()
+        .0,
+        "no_session"
+    );
+    assert_eq!(
+        invoke(host_call(
+            "createSession",
+            json!([host.path("work"), null, {"namespace":"other"}])
+        ))
+        .await
+        .unwrap_err()
+        .0,
+        "invalid_arguments"
+    );
+    // A lookup failure in the host hook is a native error, not a bridge lookup refusal.
+    assert_eq!(
+        invoke(host_call("closeSession", json!([session.id()])))
+            .await
+            .unwrap_err()
+            .0,
+        "session_not_found"
+    );
+    assert_eq!(
+        invoke(name(session.id())).await.unwrap(),
+        json!(session.name())
+    );
     let receipt = invoke(fork).await.unwrap();
     let id = receipt["session"].as_str().unwrap();
     assert_ne!(id, session.id());
-    let expected = {
-        let held = hook.0.lock().unwrap();
+    assert_eq!(receipt, json!({"session": id, "editable": null}));
+    let (expected, path) = {
+        let held = hook.sessions.lock().unwrap();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].id(), id);
-        json!(held[0].name())
+        (json!(held[0].name()), held[0].path().to_path_buf())
     };
     assert_eq!(invoke(name(id)).await.unwrap(), expected);
     assert_eq!(
@@ -457,6 +544,18 @@ async fn host_lifecycle_and_child_lookup() {
         Value::Null
     );
     assert_eq!(invoke(name(id)).await.unwrap_err().0, "no_session");
+
+    for (method, path) in [("createSession", host.path("work")), ("openSession", path)] {
+        for args in [json!([path]), json!([path, null])] {
+            let result = invoke(host_call(method, args)).await.unwrap();
+            let id = result.as_str().unwrap();
+            assert!(invoke(name(id)).await.is_ok());
+            invoke(host_call("closeSession", json!([id])))
+                .await
+                .unwrap();
+            assert_eq!(invoke(name(id)).await.unwrap_err().0, "no_session");
+        }
+    }
 
     let child = session
         .spawn(axo::SpawnRequest {
@@ -701,6 +800,98 @@ fn streamed(host: &Host) -> Vec<Value> {
         .collect()
 }
 
+async fn child_observation_ends_on_park() {
+    for drop_parent in [false, true] {
+        let host = Host::scripted(vec![ScriptedTurn::HangUntilCancel]).await;
+        package(&host, false);
+        host.script(LAB, "command", "subscribe");
+        let extensions = host.manager();
+        extensions
+            .configure(&enabled(&[(LAB, None)]))
+            .await
+            .unwrap();
+        let parent = attach(&host, &extensions).await;
+        let child = parent
+            .spawn(axo::SpawnRequest {
+                task: "wait".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .session;
+        wait_for("child turn", || child.is_running()).await;
+        let weak = Arc::downgrade(&child);
+        let command = format!("/hello {}", child.id());
+        let subscribe = async || {
+            let command = parent.parse_command(&command).unwrap().unwrap();
+            parent.run_command(command).await.unwrap();
+        };
+        subscribe().await;
+        let subs = host.path("ctl/lab/subs");
+        let records = lines(&subs);
+        let [id] = records.as_slice() else {
+            panic!("expected one subscription: {records:?}")
+        };
+        assert!(id.starts_with("s:"));
+        let closed = json!({ "sub": id, "closed": true });
+        let closure = || streamed(&host).contains(&closed);
+        if drop_parent {
+            drop(child);
+            drop(parent);
+            wait_for("child stream closed on parent drop", closure).await;
+        } else {
+            child.abort();
+            wait_for("child stream closed on park", closure).await;
+            subscribe().await;
+            assert_eq!(lines(&subs), [id.as_str(), "no_session"]);
+            drop(child);
+        }
+        wait_for("child released", || weak.upgrade().is_none()).await;
+        extensions.shutdown().await;
+    }
+}
+
+async fn deferred_extension_tool_does_not_retain_session_tools() {
+    let host = Host::new().await;
+    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
+    package(&host, false);
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+    let mut options = extensions.compose(options(&host));
+    // Capture the session state at the factory boundary without changing its product.
+    let weak = Arc::new(std::sync::OnceLock::new());
+    let probe = options
+        .layer
+        .tools
+        .iter_mut()
+        .find(|tool| tool.exposure == axo::Exposure::Deferred)
+        .unwrap();
+    let factory = probe.factory.clone();
+    probe.factory = Arc::new({
+        let weak = weak.clone();
+        move |tools| {
+            weak.get_or_init(|| Arc::downgrade(tools));
+            factory(tools)
+        }
+    });
+    let session = Arc::new(host.axo.create_session(options).await.unwrap());
+    extensions.attach(&session).await;
+    assert!(
+        session
+            .tools()
+            .iter()
+            .any(|t| { t.name == "probe" && t.exposure == axo::Exposure::Deferred })
+    );
+    let tools = weak.get().expect("deferred tool factory ran");
+    assert!(tools.upgrade().is_some());
+    drop(session);
+    wait_for("session tools released", || tools.upgrade().is_none()).await;
+    extensions.shutdown().await;
+}
+
 /// Detaching a session tells each of its subscriptions' listeners that it closed.
 async fn detach_closes_subscriptions() {
     let host = Host::new().await;
@@ -784,6 +975,106 @@ async fn removed_policy_allows() {
     assert!(!error && text.contains("built-in contents"), "{text}");
     session.shutdown().await;
     extensions.shutdown().await;
+}
+
+async fn dropped_manager_fences_hooks_and_restores_layer() {
+    for outside in [true, false] {
+        let host = Host::scripted(read("unused").into()).await;
+        package(&host, false);
+        let extensions = host.manager();
+        extensions
+            .configure(&enabled(&[(LAB, None)]))
+            .await
+            .unwrap();
+        let retained = extensions.compose(options(&host)).layer;
+        let session = attach(&host, &extensions).await;
+        assert!(session.commands().iter().any(|info| info.name == "hello"));
+        assert!(
+            session
+                .tools()
+                .iter()
+                .any(|t| t.name == "read" && t.origin.as_deref() == Some("extension lab"))
+        );
+        if outside {
+            std::thread::spawn(move || drop(extensions)).join().unwrap();
+        } else {
+            drop(extensions);
+        }
+        wait_for("restoration of host registrations", || {
+            !session.commands().iter().any(|info| info.name == "hello")
+                && session
+                    .tools()
+                    .iter()
+                    .any(|t| t.name == "read" && t.origin.is_none())
+        })
+        .await;
+
+        let scope = ToolScope {
+            session_id: session.id().into(),
+            depth: 0,
+            agent: None,
+            mode: None,
+            bash: BashAccess::Full,
+            writes: None,
+        };
+        let context = axo_agent::AgentContext {
+            messages: vec![],
+            tools: vec![],
+            deferred: vec![],
+        };
+        let tool_call = axo_ai::ToolCall {
+            id: "r".into(),
+            name: "read".into(),
+            arguments: Default::default(),
+            arguments_error: None,
+        };
+        let assistant_message = &reply_tool_calls(&[("r", "read", json!({}))]);
+        let cancel = CancellationToken::new();
+        let before = BeforeToolCallContext {
+            assistant_message,
+            tool_call: &tool_call,
+            context: &context,
+        };
+        let after = axo_agent::AfterToolCallContext {
+            assistant_message,
+            tool_call: &tool_call,
+            context: &context,
+            result: &Default::default(),
+        };
+        let closed = "extension lab: the extension manager is shut down";
+        let policy = &retained.tool_policies[0];
+        assert!(
+            matches!(policy.before_tool_call(&scope, before, &cancel).await.unwrap(),
+            ToolCallDecision::Block { reason: Some(reason), terminate: false } if reason.contains(closed))
+        );
+        assert_eq!(
+            policy
+                .after_tool_call(&scope, after, &cancel)
+                .await
+                .unwrap_err()
+                .0,
+            closed
+        );
+        let spawn = SpawnContext {
+            spec: &AgentSpec::default(),
+            agent: None,
+            mode: None,
+            limits: &ToolLimits::default(),
+            bash: BashAccess::Full,
+            writes: None,
+            model: &host.models.find("test/m").unwrap(),
+            thinking: ThinkingLevel::Off,
+            service_tier: axo_ai::ServiceTier::Standard,
+            task: &PromptInput::from("review"),
+            depth: 1,
+            parent_session_id: session.id(),
+            origin: &SpawnOrigin::Host,
+            team: None,
+        };
+        assert!(matches!(retained.spawn_hooks[0].before_spawn(&spawn).await,
+            SpawnDecision::Block(reason) if reason.contains(closed)));
+        session.shutdown().await;
+    }
 }
 
 /// A policy declaring only `before` is never asked `after` a tool call.
@@ -968,5 +1259,63 @@ async fn failures_reach_the_host_typed() {
         other => panic!("expected a host failure, got {other:?}"),
     }
     session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+async fn tool_reservations_follow_session_modes() {
+    let host = Host::new().await;
+    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
+    host.write_package("root", LAB, &json!({
+        "id": LAB, "entry": "index.ts",
+        "tools": [
+            {"name": "yield", "description": "Lab yield", "parameters": {"type": "object"}},
+            {"name": "call", "description": "Lab call", "exposure": "deferred", "parameters": {"type": "object"}}
+        ],
+        "commands": [{"name": "hello", "description": "Say hello"}]
+    }).to_string());
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[(LAB, None)]))
+        .await
+        .unwrap();
+
+    for has_modes in [false, true] {
+        let mut opts = options(&host);
+        if has_modes {
+            opts.definitions.modes.push(axo::ModeSpec {
+                name: "plan".into(),
+                description: "Make a plan".into(),
+                body: "Plan first.".into(),
+                ..Default::default()
+            });
+        }
+        let session = Arc::new(
+            host.axo
+                .create_session(extensions.compose(opts))
+                .await
+                .unwrap(),
+        );
+        extensions.attach(&session).await;
+        let tools = session.tools();
+        let installed = |name, description| {
+            tools
+                .iter()
+                .any(|t| t.name == name && t.description == description)
+        };
+        assert_eq!(installed("yield", "Lab yield"), !has_modes);
+        assert!(!installed("call", "Lab call"));
+        let diagnostics = session.diagnostics();
+        let warned = |message| diagnostics.iter().any(|d| d.message == message);
+        assert!(warned(
+            "host tool \"call\" is reserved for deferred tools; ignored"
+        ));
+        assert_eq!(
+            warned("host tool \"yield\" is reserved for modes; ignored"),
+            has_modes
+        );
+        let command = session.parse_command("/hello hi").unwrap().unwrap();
+        session.run_command(command).await.unwrap();
+        session.shutdown().await;
+    }
     extensions.shutdown().await;
 }

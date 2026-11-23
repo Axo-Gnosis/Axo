@@ -42,7 +42,7 @@ pub use coordination::{
     KillReceipt, SendIdentity, SendKind, SendReceipt, SpawnReceipt, SubmissionProvenance,
     WaitReason, WaitReceipt,
 };
-pub use error::{Error, ErrorCode};
+pub use error::{CompletionDetails, Error, ErrorCode};
 pub use exec::devshell::DevShellEnv;
 pub use exec::host::{
     OutputChunk, OutputError, OutputStream, Pipe, PipeChunk, ProcessSupervisor, Sandbox,
@@ -77,6 +77,7 @@ pub use tools::{
     FileRecord, FileWrite, HostTool, LedgerRecord, LineDiff, MAX_SNAPSHOT_BYTES, Omitted, Question,
     QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange, ToolAccess,
     ToolFactory, WriteRoot, WriteScope, Written, file_changes, file_details, file_records, squash,
+    valid_tool_name,
 };
 
 #[cfg(doctest)]

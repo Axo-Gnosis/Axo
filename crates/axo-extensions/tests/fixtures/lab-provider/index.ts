@@ -20,7 +20,8 @@ import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type {
-  Credential,
+  CredentialInput,
+  CredentialOutput,
   Extension,
   LoginInteraction,
   ProviderRequest,
@@ -83,7 +84,7 @@ const activate: Extension = ({ id, dataDir }) => {
   spawnChild(dataDir);
   const key = id === "lab-provider" ? "lab" : id;
 
-  async function login(ui: LoginInteraction, signal: AbortSignal): Promise<Credential> {
+  async function login(ui: LoginInteraction, signal: AbortSignal): Promise<CredentialInput> {
     const device = await post("/device", {}, signal);
     const { userCode, verificationUrl } = device;
     if (typeof userCode !== "string" || typeof verificationUrl !== "string") {
@@ -96,7 +97,7 @@ const activate: Extension = ({ id, dataDir }) => {
     return { type: "oauth", access, refresh, expires: Date.now() + 60_000 };
   }
 
-  async function refresh(credential: Credential, signal: AbortSignal): Promise<Credential> {
+  async function refresh(credential: CredentialOutput, signal: AbortSignal): Promise<CredentialInput> {
     if (credential.type !== "oauth") throw new Error("lab refresh needs an OAuth credential");
     const reply = await post("/refresh", { refresh: credential.refresh }, signal);
     const next = tokens(reply, "/refresh");

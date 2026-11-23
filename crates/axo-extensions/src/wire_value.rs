@@ -35,6 +35,14 @@ pub(crate) fn encode_request(request: ProviderRequest) -> Value {
     Value::Object(encoded)
 }
 
+fn header_map(count: usize) -> Result<HeaderMap, &'static str> {
+    // The largest HeaderMap has 32,768 buckets at a 75% load factor.
+    if count > 24_576 {
+        return Err("too many headers");
+    }
+    HeaderMap::try_with_capacity(count).map_err(|_| "too many headers")
+}
+
 /// Checks and rebuilds a runner's replacement request.
 pub(crate) fn decode_request(value: Value, label: &str) -> Result<ProviderRequest, String> {
     let bad = |what: &str| format!("{label}: invalid request ({what})");
@@ -54,7 +62,7 @@ pub(crate) fn decode_request(value: Value, label: &str) -> Result<ProviderReques
     let Some(Value::Array(pairs)) = fields.remove("headers") else {
         return Err(bad("headers"));
     };
-    let mut headers = HeaderMap::with_capacity(pairs.len());
+    let mut headers = header_map(pairs.len()).map_err(bad)?;
     for (index, pair) in pairs.into_iter().enumerate() {
         let Value::Array(pair) = pair else {
             return Err(bad(&format!("header {index}")));
@@ -142,7 +150,7 @@ fn check_credential_headers(headers: &Value) -> Result<(), String> {
     let Value::Object(headers) = headers else {
         return Err("headers".into());
     };
-    let mut seen = HeaderMap::with_capacity(headers.len());
+    let mut seen = header_map(headers.len())?;
     for (name, value) in headers {
         let parsed =
             HeaderName::from_bytes(name.as_bytes()).map_err(|_| "header name".to_owned())?;
@@ -211,6 +219,36 @@ mod tests {
         assert_eq!(back.headers, request.headers);
         let dup: Vec<_> = back.headers.get_all("x-dup").iter().collect();
         assert_eq!(dup, ["one", "two"]);
+    }
+
+    #[test]
+    fn header_counts_are_bounded_before_map_construction() {
+        for count in [24_576, 24_577] {
+            let mut request = json!({ "url": "https://example.test", "body": null });
+            request["headers"] = Value::Array(vec![json!(["x-dup", "v"]); count]);
+            let mut credential =
+                json!({ "type": "oauth", "access": "a", "refresh": "r", "expires": 1 });
+            credential["headers"] =
+                Value::Object((0..count).map(|i| (format!("x-{i}"), "v".into())).collect());
+            let request = decode_request(request, LABEL);
+            let credential = decode_credential(credential, LABEL);
+            if count == 24_576 {
+                assert_eq!(request.unwrap().headers.len(), count);
+                let Credential::Oauth { headers, .. } = credential.unwrap() else {
+                    panic!("not oauth");
+                };
+                assert_eq!(headers.len(), count);
+            } else {
+                assert_eq!(
+                    request.unwrap_err(),
+                    format!("{LABEL}: invalid request (too many headers)")
+                );
+                assert_eq!(
+                    credential.unwrap_err(),
+                    format!("{LABEL}: invalid credential (too many headers)")
+                );
+            }
+        }
     }
 
     #[test]

@@ -633,7 +633,7 @@ async fn bash_and_write_ceilings_outlive_the_parent_mode() {
     assert_eq!(restricted_header["spawn"]["bash"], "readOnly");
     assert_eq!(
         restricted_header["spawn"]["writes"],
-        json!(restricted_link.writes)
+        json!([[{"type": "url", "value": "local://"}, {"type": "path", "value": cwd.join("plans")}]])
     );
     assert!(free_header["spawn"].get("bash").is_none());
     assert!(free_header["spawn"].get("writes").is_none());

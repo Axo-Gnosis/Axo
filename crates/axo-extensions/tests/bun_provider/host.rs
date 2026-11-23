@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use axo::ext::Caller;
 use axo::{
     Axo, ConfigLayer, ConfigSource, EnabledExtension, EntryId, EnvMap, JsonlStore, ProjectAccess,
     Session, SessionOptions, StaticEnv, Supervision, UserConfig,
@@ -73,22 +74,32 @@ impl TestLifecycle {
 impl Lifecycle for TestLifecycle {
     async fn create(
         &self,
+        caller: &Caller,
         cwd: PathBuf,
         request: SessionRequest,
     ) -> Result<Arc<Session>, axo::Error> {
+        assert_eq!(caller.namespace.as_deref(), Some(SESSION));
         Ok(self.hold(self.axo.create_session(self.options(cwd, request)?).await?))
     }
 
     async fn open(
         &self,
+        caller: &Caller,
         path: PathBuf,
         request: SessionRequest,
     ) -> Result<Arc<Session>, axo::Error> {
+        assert_eq!(caller.namespace.as_deref(), Some(SESSION));
         let options = self.options(PathBuf::new(), request)?;
         Ok(self.hold(self.axo.open_session(&path, options).await?))
     }
 
-    async fn fork(&self, session: Arc<Session>, entry: EntryId) -> Result<Forked, axo::Error> {
+    async fn fork(
+        &self,
+        caller: &Caller,
+        session: Arc<Session>,
+        entry: EntryId,
+    ) -> Result<Forked, axo::Error> {
+        assert_eq!(caller.namespace.as_deref(), Some(SESSION));
         self.forks.fetch_add(1, Ordering::Relaxed);
         let fork = session.fork(&entry).await?;
         Ok(Forked {
@@ -97,7 +108,8 @@ impl Lifecycle for TestLifecycle {
         })
     }
 
-    async fn close(&self, session_id: String) -> Result<(), axo::Error> {
+    async fn close(&self, caller: &Caller, session_id: String) -> Result<(), axo::Error> {
+        assert_eq!(caller.namespace.as_deref(), Some(SESSION));
         let session = {
             let mut sessions = self.sessions.lock().unwrap();
             let index = sessions

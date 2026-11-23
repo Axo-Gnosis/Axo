@@ -198,6 +198,29 @@ pub async fn run(bun: &Path, mode: Supervision) {
     bounded(session.run_command(ask)).await.unwrap();
     assert_posted(&session, &format!("{count}: {reply}")).await;
 
+    api.lane("m", vec![ScriptedTurn::Error("offline".into())]);
+    let report = session
+        .parse_command("/ask-model report-error")
+        .unwrap()
+        .unwrap();
+    bounded(session.run_command(report)).await.unwrap();
+    let entries = session.attach(None).await.missed;
+    let posted = entries
+        .iter()
+        .rev()
+        .find_map(|seq| lab_text(&seq.entry))
+        .expect("no reported completion error");
+    let error: Value = serde_json::from_str(posted).unwrap();
+    assert_eq!(error["code"], "completion");
+    assert_eq!(error["message"], "Completion failed: offline");
+    let details = &error["details"];
+    assert_eq!(details["stopReason"], "error");
+    assert_eq!(details.get("failure"), Some(&Value::Null));
+    assert_eq!(
+        serde_json::from_value::<axo_ai::Usage>(details["usage"].clone()).unwrap(),
+        axo_ai::Usage::default()
+    );
+
     let fork_here = session.parse_command("/fork-here").unwrap().unwrap();
     bounded(session.run_command(fork_here)).await.unwrap();
     assert_eq!(host.lifecycle.forks.load(Ordering::Relaxed), 1);
@@ -501,15 +524,28 @@ fn last_user_text(request: &axo_ai::testing::RecordedRequest) -> impl Iterator<I
         .filter_map(UserBlock::as_text)
 }
 
+fn lab_text(entry: &Entry) -> Option<&str> {
+    if let Entry::Submission {
+        custom: Some(SubmittedCustom { custom_type, .. }),
+        parts,
+        ..
+    } = entry
+        && custom_type == "lab-session:lab"
+        && let [PromptPart::Text { text }] = parts.as_slice()
+    {
+        Some(text)
+    } else {
+        None
+    }
+}
+
 async fn assert_posted(session: &Session, expected: &str) {
-    let posted = session.attach(None).await.missed.iter().any(|seq| {
-        matches!(
-            &seq.entry,
-            Entry::Submission { custom: Some(SubmittedCustom { custom_type, .. }), parts, .. }
-                if custom_type == "lab-session:lab"
-                    && matches!(parts.as_slice(), [PromptPart::Text { text }] if text == expected)
-        )
-    });
+    let posted = session
+        .attach(None)
+        .await
+        .missed
+        .iter()
+        .any(|seq| lab_text(&seq.entry) == Some(expected));
     assert!(
         posted,
         "no lab submission with text {expected:?} was journaled"

@@ -38,8 +38,8 @@ use crate::transcript::{
     Transcript, render_system_message_update, resolve_transcript_tools, system_message_text,
 };
 use crate::types::{
-    AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, ServiceTier, StopReason,
-    ThinkingLevel, ToolCall, ToolSpec, Usage, UserBlock,
+    AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, StopReason, ThinkingLevel,
+    ToolCall, ToolSpec, Usage, UserBlock,
 };
 
 /// Delta fields that carry reasoning text, in the order they are read: llama.cpp uses
@@ -1038,7 +1038,7 @@ fn http_error_message(status: u16, text: &str, body: Option<&Value>) -> String {
 
 /// Usage from a chunk's `usage` (pi `parseChunkUsage`). `cached_tokens` are cache reads;
 /// `completion_tokens` already include reasoning tokens.
-fn parse_usage(raw: &Value, model: &Model, tier: ServiceTier) -> Usage {
+fn parse_usage(raw: &Value) -> Usage {
     let count = |value: Option<&Value>| {
         value
             .and_then(Value::as_f64)
@@ -1061,7 +1061,7 @@ fn parse_usage(raw: &Value, model: &Model, tier: ServiceTier) -> Usage {
             .and_then(|details| details.get("reasoning_tokens")),
     )
     .unwrap_or(0);
-    let mut usage = Usage {
+    Usage {
         input,
         output,
         cache_read,
@@ -1070,9 +1070,7 @@ fn parse_usage(raw: &Value, model: &Model, tier: ServiceTier) -> Usage {
         reasoning: Some(reasoning),
         total_tokens: input + output + cache_read + cache_write,
         cost: Default::default(),
-    };
-    calculate_cost(model, &mut usage, tier);
-    usage
+    }
 }
 
 /// Map a `finish_reason` to a stop reason and, for failures, an error message.
@@ -1244,30 +1242,31 @@ impl Response {
         {
             self.reply.message.response_model = Some(name.to_owned());
         }
-        if let Some(echo) = chunk.get("service_tier").and_then(Value::as_str) {
-            self.reply.message.service_tier = served_tier(echo);
-        }
-        let usage = chunk.get("usage").filter(|usage| truthy(Some(usage)));
-        if let Some(usage) = usage {
-            self.reply.message.usage =
-                parse_usage(usage, &self.model, self.reply.message.service_tier);
-        }
-
-        let Some(choice) = chunk
+        let choice = chunk
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .filter(|choice| truthy(Some(choice)))
-        else {
-            return;
-        };
-        // Some providers (Moonshot) report usage on the choice.
-        if usage.is_none()
-            && let Some(usage) = choice.get("usage").filter(|usage| truthy(Some(usage)))
-        {
-            self.reply.message.usage =
-                parse_usage(usage, &self.model, self.reply.message.service_tier);
+            .filter(|choice| truthy(Some(choice)));
+        // Some providers (Moonshot) report usage on the choice instead.
+        let usage = chunk
+            .get("usage")
+            .filter(|u| truthy(Some(u)))
+            .or_else(|| choice?.get("usage").filter(|u| truthy(Some(u))));
+        let message = &mut self.reply.message;
+        if let Some(raw) = usage {
+            message.usage = parse_usage(raw);
         }
+        let tier = chunk
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(served_tier)
+            .unwrap_or(message.service_tier);
+        let tier_changed = tier != message.service_tier;
+        message.service_tier = tier;
+        if usage.is_some() || tier_changed {
+            calculate_cost(&self.model, &mut message.usage, tier);
+        }
+        let Some(choice) = choice else { return };
         if let Some(reason) = choice
             .get("finish_reason")
             .and_then(Value::as_str)

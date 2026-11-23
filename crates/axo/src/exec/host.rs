@@ -2,6 +2,7 @@
 //! group or a cgroup v2 job directory depending on the host-chosen [`Supervision`]
 //! ([`ProcessSupervisor`]), with kill escalation and output capture.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::io;
@@ -212,12 +213,38 @@ impl ProcessSupervisor {
         spec: ExecSpec,
         deadline: Option<Instant>,
     ) -> Result<Output, OutputError> {
+        self.capture(spec, deadline, None).await
+    }
+
+    /// Runs like [`Self::output`], draining stdout without retaining it and keeping
+    /// only the last `limit` bytes of stderr.
+    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    pub async fn output_stderr_tail(
+        &self,
+        spec: ExecSpec,
+        deadline: Option<Instant>,
+        limit: usize,
+    ) -> Result<Output, OutputError> {
+        self.capture(spec, deadline, Some(limit)).await
+    }
+}
+
+impl ProcessSupervisor {
+    async fn capture(
+        &self,
+        spec: ExecSpec,
+        deadline: Option<Instant>,
+        stderr_tail: Option<usize>,
+    ) -> Result<Output, OutputError> {
         let program = spec.program.clone();
         let mut process = self.spawn(spec).await.map_err(OutputError::Failed)?;
         let (stdout, stderr) = (process.stdout.take(), process.stderr.take());
         let run = async {
-            let (status, stdout, stderr) =
-                tokio::join!(process.wait(), read_all(stdout), read_all(stderr));
+            let (status, stdout, stderr) = tokio::join!(
+                process.wait(),
+                read_pipe(stdout, stderr_tail.map(|_| 0)),
+                read_pipe(stderr, stderr_tail),
+            );
             status.map(|status| Output {
                 status,
                 stdout,
@@ -480,12 +507,36 @@ fn env_records(env: &EnvMap) -> Vec<u8> {
     records
 }
 
-async fn read_all(reader: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Some(mut reader) = reader {
-        let _ = reader.read_to_end(&mut buf).await;
+async fn read_pipe(reader: Option<impl AsyncRead + Unpin>, tail: Option<usize>) -> Vec<u8> {
+    let Some(mut reader) = reader else {
+        return Vec::new();
+    };
+    match tail {
+        None => {
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf).await;
+            buf
+        }
+        Some(0) => {
+            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            Vec::new()
+        }
+        Some(limit) => {
+            let mut ring = VecDeque::new();
+            let mut reader = BufReader::new(reader);
+            while let Ok(bytes) = reader.fill_buf().await {
+                let n = bytes.len();
+                if n == 0 {
+                    break;
+                }
+                let suffix = &bytes[n.saturating_sub(limit)..];
+                ring.drain(..ring.len().saturating_sub(limit - suffix.len()));
+                ring.extend(suffix.iter().copied());
+                reader.consume(n);
+            }
+            ring.into()
+        }
     }
-    buf
 }
 
 /// Removes a still-empty job directory on drop unless disarmed.
@@ -735,42 +786,53 @@ impl Container {
         self.kill();
     }
 
-    /// PSS in bytes summed over every process in the container, or `None` when none can be
-    /// read. Blocking `/proc` reads; async callers use `spawn_blocking`.
+    /// PSS in bytes per container, in input order; `None` when no process was readable.
+    /// Blocking; all requested process groups share one walk of `/proc`.
     #[ext(skip = "live process handles; commands go through tools.runCommand")]
-    pub fn memory(&self) -> Option<u64> {
-        let pids: Vec<String> = match &*self.0 {
-            Scope::Cgroup(dir) => std::fs::read_to_string(dir.join("cgroup.procs"))
-                .ok()?
-                .lines()
-                .map(str::to_owned)
-                .collect(),
-            Scope::Group(pgid) => {
-                let pgid = pgid.as_raw_nonzero().to_string();
-                std::fs::read_dir("/proc")
-                    .ok()?
-                    .flatten()
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
-                    .filter(|pid| {
-                        // After the command's closing `)`: `state ppid pgrp …`.
-                        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                            stat.rsplit_once(')')
-                                .and_then(|(_, rest)| rest.split_whitespace().nth(2))
-                                == Some(pgid.as_str())
-                        })
-                    })
-                    .collect()
+    pub fn memory_batch(containers: &[Self]) -> Vec<Option<u64>> {
+        let mut groups = std::collections::HashMap::new();
+        for container in containers {
+            if let Scope::Group(pgid) = &*container.0 {
+                groups.insert(pgid.as_raw_nonzero().get(), None);
             }
-        };
-        pids.iter()
-            .filter_map(|pid| {
-                let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
-                let line = rollup.lines().find(|line| line.starts_with("Pss:"))?;
-                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-                Some(kb * 1024)
+        }
+        if !groups.is_empty()
+            && let Ok(entries) = std::fs::read_dir("/proc")
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name
+                    .to_str()
+                    .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+                else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    continue;
+                };
+                // After the command's closing `)`: `state ppid pgrp …`.
+                let group = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                    .and_then(|s| s.parse::<i32>().ok());
+                if let Some(total) = group.and_then(|g| groups.get_mut(&g))
+                    && let Some(bytes) = pss(pid)
+                {
+                    *total.get_or_insert(0) += bytes;
+                }
+            }
+        }
+        containers
+            .iter()
+            .map(|container| match &*container.0 {
+                Scope::Group(pgid) => groups[&pgid.as_raw_nonzero().get()],
+                Scope::Cgroup(dir) => std::fs::read_to_string(dir.join("cgroup.procs"))
+                    .ok()?
+                    .lines()
+                    .filter_map(pss)
+                    .reduce(|a, b| a + b),
             })
-            .reduce(|a, b| a + b)
+            .collect()
     }
 
     /// Whether `pid` is in this job cgroup; cgroup mode only.
@@ -783,6 +845,13 @@ impl Container {
             .and_then(|contents| supervisor::cgroup_dir(&contents))
             .is_some_and(|found| found == *dir)
     }
+}
+
+fn pss(pid: &str) -> Option<u64> {
+    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let line = rollup.lines().find(|line| line.starts_with("Pss:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// Resolves once a cgroup guardian has died, after killing the job; pending forever in

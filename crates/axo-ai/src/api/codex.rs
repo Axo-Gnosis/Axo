@@ -81,12 +81,7 @@ fn build_request(
     transcript: &Transcript,
     opts: &StreamOptions,
 ) -> Result<ProviderRequest, String> {
-    let token = opts
-        .auth
-        .api_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| format!("No API key for provider: {}", model.provider))?;
+    let token = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
     let session_id: Option<String> = opts
         .simple
         .session_id
@@ -99,7 +94,6 @@ fn build_request(
     // default: a credential's `chatgpt-account-id` header replaces it, and other tokens
     // send none.
     let mut protocol_headers = vec![
-        ("Authorization".to_owned(), Some(format!("Bearer {token}"))),
         (
             "OpenAI-Beta".to_owned(),
             Some("responses=experimental".to_owned()),
@@ -118,8 +112,13 @@ fn build_request(
     }
     let headers = header_map([[("originator".to_owned(), Some("axo".to_owned()))]
         .into_iter()
-        .chain(account_id(token).map(|id| ("chatgpt-account-id".to_owned(), Some(id))))
+        .chain(
+            token
+                .and_then(account_id)
+                .map(|id| ("chatgpt-account-id".to_owned(), Some(id))),
+        )
         .chain(opts.configured_headers())
+        .chain(token.map(|token| ("Authorization".to_owned(), Some(format!("Bearer {token}")))))
         .chain(protocol_headers)])?;
 
     let base_url = opts.base_url(model);

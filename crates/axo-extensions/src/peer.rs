@@ -2,10 +2,10 @@
 //! Unix-socket connection bound to one generation.
 //!
 //! Frames are a 4-byte big-endian length plus UTF-8 JSON, at most [`MAX_FRAME`] bytes both
-//! ways. One reader demultiplexes without awaiting user code; one writer serializes frames,
-//! letting pings and small reader-originated replies jump ahead of the byte-budgeted data
-//! queue. Rust calls use IDs `h:<n>` (shared with pings), runner calls `r:<n>`. A call's
-//! future owns its pending entry: dropping it queues a cancel frame behind the call frame.
+//! ways. One reader demultiplexes without awaiting user code. Calls and callback replies
+//! reserve their encoded bytes before allocation; only heartbeat pings bypass the data
+//! queue. Rust calls use IDs `h:<n>` (shared with pings), runner calls `r:<n>`. Dropping a
+//! sent call queues a cancel in a separately bounded slot behind its call frame.
 //! A runner call naming a `parent` belongs to that host call and runs inside its future
 //! through the [`Callbacks`] it was given; one without a parent is a session action, run
 //! on its own task through the connection's [`Actions`] with the [`Origin`] it arrived on.
@@ -14,13 +14,16 @@
 //! every pending call with [`CallError::Unavailable`].
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axo::ext::{DispatchCode, InvokeErrorCode};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -35,7 +38,7 @@ pub const PROTOCOL: u64 = 2;
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Bytes of data frames queued ahead of the socket before senders wait for room.
 const QUEUE_LIMIT: usize = 2 * MAX_FRAME;
-/// Small frames (pings, reader-originated replies) waiting ahead of the data queue.
+/// Heartbeat pings waiting ahead of the data queue.
 const CONTROL_SLOTS: usize = 64;
 /// Cancel frames queued behind their calls; none left means the writer is stuck.
 const CANCEL_SLOTS: usize = 256;
@@ -45,11 +48,51 @@ pub const HANDSHAKE: Duration = Duration::from_secs(15);
 pub const PING_EVERY: Duration = Duration::from_secs(2);
 pub const PONG_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Why Rust refuses a runner call; `code` and `message` go to the runner as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(untagged)]
+pub enum HostErrorCode {
+    Invoke(InvokeErrorCode),
+    Bridge(BridgeCode),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeCode {
+    NoLifecycle,
+    NoSubscription,
+    Unsupported,
+    #[allow(dead_code)] // Produced by the SDK runner.
+    Stalled,
+    Unavailable,
+    Invalid,
+    TooLarge,
+    Interaction,
+}
+
+impl From<InvokeErrorCode> for HostErrorCode {
+    fn from(code: InvokeErrorCode) -> Self {
+        Self::Invoke(code)
+    }
+}
+
+impl From<DispatchCode> for HostErrorCode {
+    fn from(code: DispatchCode) -> Self {
+        Self::Invoke(InvokeErrorCode::Dispatch(code))
+    }
+}
+
+impl From<BridgeCode> for HostErrorCode {
+    fn from(code: BridgeCode) -> Self {
+        Self::Bridge(code)
+    }
+}
+
+/// Why Rust refuses a runner call; the runner receives these fields as-is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-    pub code: std::borrow::Cow<'static, str>,
+    pub code: HostErrorCode,
     pub message: String,
+    pub details: Option<Value>,
 }
 
 /// Serves the runner's calls made under one host call (`parent`).
@@ -104,16 +147,22 @@ pub enum CallError {
     Invalid,
 }
 
-/// Encodes one frame: 4-byte big-endian length plus JSON. `None` if it exceeds the bound.
-pub fn encode(value: &Value) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; 4];
-    serde_json::to_writer(&mut buf, value).ok()?;
-    let len = buf.len() - 4;
-    if len > MAX_FRAME {
-        return None;
+/// Counts JSON bytes without storing them or accepting an oversized body.
+#[derive(Default)]
+struct BodyLength(usize);
+
+impl Write for BodyLength {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_FRAME - self.0 {
+            return Err(io::Error::other("frame too large"));
+        }
+        self.0 += bytes.len();
+        Ok(bytes.len())
     }
-    buf[..4].copy_from_slice(&(len as u32).to_be_bytes());
-    Some(buf)
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Reads one frame, checking the length before allocating. `Ok(None)` is a clean EOF at a
@@ -376,8 +425,7 @@ impl Inner {
         call.insert("ext".into(), ext.into());
         call.insert("method".into(), method.into());
         call.insert("args".into(), args);
-        let frame = inner.frame(Value::Object(call)).ok_or(CallError::Invalid)?;
-        inner.enqueue(frame).await?;
+        inner.enqueue(Value::Object(call)).await?;
         outstanding.sent = true;
 
         let mut served = FuturesUnordered::new();
@@ -411,41 +459,57 @@ impl Inner {
         drop(calls);
     }
 
-    fn frame(&self, mut value: Value) -> Option<Vec<u8>> {
+    fn tagged(&self, mut value: Value) -> Value {
+        value["generation"] = Value::String(self.tag.clone());
         value
-            .as_object_mut()?
-            .insert("generation".into(), Value::String(self.tag.clone()));
-        encode(&value)
     }
 
-    /// Queues a data frame once the byte budget has room.
-    async fn enqueue(&self, frame: Vec<u8>) -> Result<(), CallError> {
+    /// Counts the tagged body, reserving its exact framed size before encoding.
+    async fn enqueue(&self, value: Value) -> Result<(), CallError> {
+        let value = self.tagged(value);
+        let mut length = BodyLength::default();
+        serde_json::to_writer(&mut length, &value).map_err(|_| CallError::Invalid)?;
+        let frame_len = 4 + length.0;
         let permit = tokio::select! {
+            biased;
             _ = self.closed.cancelled() => return Err(CallError::Unavailable),
-            permit = self.budget.clone().acquire_many_owned(frame.len() as u32) => {
+            permit = self.budget.clone().acquire_many_owned(frame_len as u32) => {
                 permit.map_err(|_| CallError::Unavailable)?
             }
         };
+        let mut frame = Vec::with_capacity(frame_len);
+        frame.extend_from_slice(&(length.0 as u32).to_be_bytes());
+        serde_json::to_writer(&mut frame, &value).map_err(|_| CallError::Invalid)?;
         self.data
             .send((frame, permit))
             .map_err(|_| CallError::Unavailable)
     }
 
+    /// Only locally generated pings and cancels bypass the byte budget.
+    fn small_frame(&self, kind: &str, id: u64) -> Vec<u8> {
+        let value = self.tagged(json!({"type": kind, "id": format!("h:{id}")}));
+        let mut frame = vec![0; 4];
+        serde_json::to_writer(&mut frame, &value).expect("fixed control frame");
+        let len = (frame.len() - 4) as u32;
+        frame[..4].copy_from_slice(&len.to_be_bytes());
+        frame
+    }
+
     /// Queues a cancel behind the call it withdraws; tears down rather than block.
     fn cancel(&self, id: u64) {
-        let frame = self.frame(json!({"type": "cancel", "id": format!("h:{id}")}));
-        let queued = frame.zip(self.cancels.clone().try_acquire_owned().ok());
-        if !queued.is_some_and(|queued| self.data.send(queued).is_ok()) {
+        let queued = self.cancels.clone().try_acquire_owned().is_ok_and(|slot| {
+            self.data
+                .send((self.small_frame("cancel", id), slot))
+                .is_ok()
+        });
+        if !queued {
             self.close();
         }
     }
 
-    /// Sends a small frame ahead of the data queue without waiting.
-    fn control(&self, value: Value) {
-        let sent = self
-            .frame(value)
-            .is_some_and(|frame| self.control.try_send(frame).is_ok());
-        if !sent {
+    /// Sends a heartbeat ahead of the data queue without waiting.
+    fn ping(&self, id: u64) {
+        if self.control.try_send(self.small_frame("ping", id)).is_err() {
             self.close();
         }
     }
@@ -621,17 +685,28 @@ impl Inner {
         if self.lock().callbacks.remove(&id).is_none() {
             return;
         }
-        let reply = match answer {
-            Ok(value) => json!({"type": "ok", "id": &id, "value": value}),
-            Err(Refusal { code, message }) => {
-                json!({"type": "error", "id": &id, "code": code, "message": message})
+        let mut reply = Map::new();
+        reply.insert("id".into(), id.as_str().into());
+        match answer {
+            Ok(value) => {
+                reply.insert("type".into(), "ok".into());
+                reply.insert("value".into(), value);
             }
-        };
-        let frame = self.frame(reply).or_else(|| {
-            self.frame(json!({"type": "error", "id": id, "code": "too_large", "message": "host reply exceeds 64 MiB"}))
-        });
-        if let Some(frame) = frame {
-            let _ = self.enqueue(frame).await;
+            Err(Refusal {
+                code,
+                message,
+                details,
+            }) => {
+                reply.insert("type".into(), "error".into());
+                reply.insert("code".into(), json!(code));
+                reply.insert("message".into(), message.into());
+                if let Some(details) = details {
+                    reply.insert("details".into(), details);
+                }
+            }
+        }
+        if self.enqueue(Value::Object(reply)).await == Err(CallError::Invalid) {
+            let _ = self.enqueue(json!({"type": "error", "id": id, "code": BridgeCode::TooLarge, "message": "host reply exceeds 64 MiB"})).await;
         }
     }
 }
@@ -695,7 +770,7 @@ async fn heartbeat(inner: Arc<Inner>) {
             state.pings.insert(id);
             id
         };
-        inner.control(json!({"type": "ping", "id": format!("h:{id}")}));
+        inner.ping(id);
     }
 }
 
@@ -774,8 +849,9 @@ mod tests {
                         std::future::pending().await
                     }
                     _ => Err(Refusal {
-                        code: "no_session".into(),
+                        code: DispatchCode::NoSession.into(),
                         message: "session s is not attached".into(),
+                        details: None,
                     }),
                 }
             })
@@ -918,6 +994,7 @@ mod tests {
         async fn prompt(&self, prompt: &LoginPrompt) -> Result<String, Error> {
             self.push(format!("prompt {}", prompt.message));
             match prompt.message.as_str() {
+                "oversized" => Ok("x".repeat(MAX_FRAME)),
                 "never" => {
                     let _mark = DropMark(&self.dropped);
                     std::future::pending().await
@@ -1295,21 +1372,48 @@ mod tests {
                 .await;
                 raw.send(callback("r:3", "prompt", json!({"message": 5})))
                     .await;
-                raw.send(callback("r:4", "teleport", json!({}))).await;
+                raw.send(callback("r:4", "teleport", json!(7))).await;
+                raw.send(callback(
+                    "r:5",
+                    "prompt",
+                    json!({"message": "typo", "placeholer": "x", "secret": false}),
+                ))
+                .await;
+                for (id, options) in [
+                    ("r:6", json!([{"id": "i", "label": "L", "extra": 1}])),
+                    ("r:7", json!([["i", "L"]])),
+                    ("r:8", json!([])),
+                ] {
+                    raw.send(callback(
+                        id,
+                        "select",
+                        json!({"message": "invalid", "options": options}),
+                    ))
+                    .await;
+                }
                 let mut replies = std::collections::BTreeMap::new();
-                while replies.len() < 5 {
+                while replies.len() < 9 {
                     let frame = raw.next().await.unwrap();
                     replies.insert(frame["id"].as_str().unwrap().to_owned(), frame);
                 }
                 assert_eq!(replies["r:0"]["type"], "error");
                 assert_eq!(replies["r:1"]["code"], "invalid");
                 assert_eq!(replies["r:2"]["value"], "one");
-                assert_eq!(replies["r:3"]["code"], "invalid");
+                for id in ["r:3", "r:5", "r:6", "r:7", "r:8"] {
+                    assert_eq!(replies[id]["type"], "error");
+                    assert_eq!(replies[id]["code"], "invalid");
+                    assert_eq!(replies[id]["message"], "invalid arguments");
+                }
+                assert_eq!(replies["r:4"]["type"], "error");
                 assert_eq!(replies["r:4"]["code"], "unsupported");
+                assert_eq!(replies["r:4"]["message"], "unknown host method");
                 raw.send(ok(&login, credential("done"))).await;
             }
         );
         assert_eq!(login.unwrap()["access"], "done");
+        let mut events = ui.events();
+        events.sort();
+        assert_eq!(events, ["prompt refuse", "select bogus", "select pick"]);
     }
 
     #[tokio::test]
@@ -1513,6 +1617,72 @@ mod tests {
             .await,
             Err(CallError::Unavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn outbound_frames_reserve_encoded_bytes_before_allocation() {
+        let (peer, mut raw) = pair().await;
+        let held = peer
+            .inner
+            .budget
+            .try_acquire_many(QUEUE_LIMIT as u32)
+            .unwrap();
+        {
+            let mut pending = std::pin::pin!(peer.call("a", "withdrawn", Value::Null, None));
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+        drop(held);
+        let (result, ()) = tokio::join!(peer.call("a", "next", Value::Null, None), async {
+            let (id, _, method) = called(&raw.next().await.unwrap());
+            assert_eq!(method, "next");
+            raw.send(ok(&id, json!("delivered"))).await;
+        });
+        assert_eq!(result.unwrap(), "delivered");
+    }
+
+    #[test]
+    fn counting_body_length_stops_at_the_limit_without_retaining_bytes() {
+        let mut count = BodyLength::default();
+        let chunk = [0; 4096];
+        for _ in 0..MAX_FRAME / chunk.len() {
+            count.write_all(&chunk).unwrap();
+        }
+        count.write_all(&chunk[..MAX_FRAME % chunk.len()]).unwrap();
+        assert_eq!(count.0, MAX_FRAME);
+        assert!(count.write(&[0]).is_err());
+        assert_eq!(count.0, MAX_FRAME);
+        assert_eq!(size_of::<BodyLength>(), size_of::<usize>());
+    }
+
+    #[tokio::test]
+    async fn oversized_callback_answer_is_refused_without_closing() {
+        let (peer, mut raw) = pair().await;
+        let ui = Ui::default();
+        let callbacks = LoginCallbacks(&ui);
+        let (login, ()) = tokio::join!(
+            peer.call("a", "login", json!({"provider": "p"}), Some(&callbacks)),
+            async {
+                let (parent, ..) = called(&raw.next().await.unwrap());
+                let prompt = |id: &str, message: &str| {
+                    json!({"type": "call", "id": id,
+                    "parent": parent, "ext": "a", "method": "prompt",
+                    "args": {"message": message, "secret": false}})
+                };
+                raw.send(prompt("r:0", "oversized")).await;
+                assert_eq!(
+                    raw.next().await.unwrap(),
+                    json!({"generation": "7", "type": "error", "id": "r:0",
+                        "code": "too_large", "message": "host reply exceeds 64 MiB"})
+                );
+                raw.send(prompt("r:1", "next")).await;
+                assert_eq!(
+                    raw.next().await.unwrap(),
+                    json!({"generation": "7", "type": "ok", "id": "r:1", "value": "answer-next"})
+                );
+                raw.send(ok(&parent, credential("fresh"))).await;
+            }
+        );
+        assert_eq!(login.unwrap()["access"], "fresh");
     }
 
     #[tokio::test]

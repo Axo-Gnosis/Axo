@@ -281,20 +281,38 @@ impl Agent {
             .collect()
     }
 
-    /// Removes the queued steering or follow-up message with this id; `None` once it was
-    /// drained. Removing the last steering message clears the steer signal under the same lock.
-    pub fn remove_queued(&self, id: &str) -> Option<QueuedMessage> {
+    /// Removes an input and returns how many messages followed it in its queue. To
+    /// roll back with `restore_queued`, serialize producers and other removals for
+    /// that queue across the operation; consumers may still drain the front.
+    pub fn remove_queued(&self, id: &str) -> Option<(QueuedMessage, usize)> {
         let mut state = self.lock();
         let is = |m: &QueuedMessage| m.id.as_deref() == Some(id);
         if let Some(at) = state.steering.iter().position(is) {
+            let behind = state.steering.len() - at - 1;
             let removed = state.steering.remove(at);
             if state.steering.is_empty() {
                 self.steer_pending.send_replace(false);
             }
-            return removed;
+            return removed.map(|message| (message, behind));
         }
         let at = state.follow_up.iter().position(is)?;
-        state.follow_up.remove(at)
+        let behind = state.follow_up.len() - at - 1;
+        state.follow_up.remove(at).map(|message| (message, behind))
+    }
+
+    /// Restores a removed message relative to the surviving suffix of its original
+    /// queue. See `remove_queued` for the serialization required during rollback.
+    pub fn restore_queued(&self, steering: bool, behind: usize, message: QueuedMessage) {
+        let mut state = self.lock();
+        let queue = if steering {
+            &mut state.steering
+        } else {
+            &mut state.follow_up
+        };
+        queue.insert(queue.len().saturating_sub(behind), message);
+        if steering {
+            self.steer_pending.send_replace(true);
+        }
     }
 
     /// Takes the next messages of the steering (`true`) or follow-up queue per its mode.
@@ -369,6 +387,16 @@ impl Agent {
     /// Takes effect from the next provider request.
     pub fn set_service_tier(&self, t: ServiceTier) {
         self.lock().service_tier = t;
+    }
+
+    /// Installs the next request's selection under the same lock used to sample it.
+    pub fn set_selection(&self, model: Option<Model>, thinking: ThinkingLevel, tier: ServiceTier) {
+        let mut state = self.lock();
+        if let Some(model) = model {
+            state.model = model;
+        }
+        state.thinking = thinking;
+        state.service_tier = tier;
     }
 
     /// Takes effect from the next turn; the change is declared to the model with a

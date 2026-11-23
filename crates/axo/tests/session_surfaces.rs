@@ -39,13 +39,16 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
         }
         until(|| !host.api.requests().is_empty()).await;
     }).await;
-    session.set_mode(Some("plan")).await.unwrap();
-    let attached = session.attach(None).await;
-    assert!(session.is_running());
-    assert!(attached.live.running);
-    assert_eq!(attached.live.mode.as_deref(), Some("plan"));
-    assert!(attached.live.effective_mode.is_none());
-    assert!(session.effective_mode().is_none());
+    within(async {
+        session.set_mode(Some("plan")).await.unwrap();
+        let attached = session.attach(None).await;
+        assert!(session.is_running());
+        assert!(attached.live.running);
+        assert_eq!(attached.live.mode.as_deref(), Some("plan"));
+        assert!(attached.live.effective_mode.is_none());
+        assert!(session.effective_mode().is_none());
+    })
+    .await;
     session.abort();
     within(run).await.unwrap().unwrap();
     assert!(!session.is_running());
@@ -206,18 +209,34 @@ async fn chained_follow_up_has_no_intermediate_idle_event() {
         }
     })
     .await;
-    session.follow_up("continue afterwards").await.unwrap();
+    within(session.follow_up("continue afterwards"))
+        .await
+        .unwrap();
     session
         .accept_result("result", axo::AcceptResultOptions::default())
         .unwrap();
     within(run).await.unwrap().unwrap();
     within(async {
+        let mut saw_follow_up_reply = false;
         loop {
-            if let SessionEvent::Activity(state) = &*events.recv().await.unwrap() {
-                states.push(state.running);
-                if !state.running {
-                    break;
+            match &*events.recv().await.unwrap() {
+                SessionEvent::Entry(entry) => {
+                    if let axo::Entry::Message {
+                        message: axo_agent::AgentMessage::Llm(axo_ai::Message::Assistant(message)),
+                        ..
+                    } = &entry.entry
+                        && matches!(message.content.as_slice(), [axo_ai::AssistantBlock::Text { text, .. }] if text == "follow-up complete")
+                    {
+                        saw_follow_up_reply = true;
+                    }
                 }
+                SessionEvent::Activity(state) => {
+                    states.push(state.running);
+                    if saw_follow_up_reply && !state.running {
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
     })

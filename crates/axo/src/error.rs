@@ -2,6 +2,15 @@ use std::path::PathBuf;
 
 use axo_macros::expose;
 
+/// Data reported by a terminal completion error, including any billed usage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionDetails {
+    pub failure: Option<axo_ai::ProviderFailure>,
+    pub usage: axo_ai::Usage,
+    pub stop_reason: axo_ai::StopReason,
+}
+
 /// Every error `axo` returns.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -30,8 +39,11 @@ pub enum Error {
     NoModel,
     #[error("Model not found: {0}")]
     ModelNotFound(String),
-    #[error("Completion failed: {0}")]
-    Completion(String),
+    #[error("Completion failed: {message}")]
+    Completion {
+        message: String,
+        details: Option<Box<CompletionDetails>>,
+    },
     #[error("Mode not found: {0}")]
     ModeNotFound(String),
     #[error("Skill not found: {0}")]
@@ -151,7 +163,7 @@ impl Error {
             Self::Scheme(_) => ErrorCode::Scheme,
             Self::NoModel => ErrorCode::NoModel,
             Self::ModelNotFound(_) => ErrorCode::ModelNotFound,
-            Self::Completion(_) => ErrorCode::Completion,
+            Self::Completion { .. } => ErrorCode::Completion,
             Self::ModeNotFound(_) => ErrorCode::ModeNotFound,
             Self::SkillNotFound(_) => ErrorCode::SkillNotFound,
             Self::AgentNotFound(_) => ErrorCode::AgentNotFound,

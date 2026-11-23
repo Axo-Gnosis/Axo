@@ -4,7 +4,8 @@ use serde_json::Value;
 
 use super::{HostMessage, LiveSnapshot, Session, SpawnRequest, TeamRequest};
 use crate::ext::{Base64, Caller};
-use crate::jobs::CommandOutput;
+use crate::jobs::{CommandOutput, JobRegistry};
+use crate::store::{page_limit, page_range};
 use crate::{Command, Error, OutputChunk, OutputProgress, SeqEntry, SpawnReceipt};
 
 /// A bounded page of raw command output and its latest progress.
@@ -33,6 +34,19 @@ pub(crate) struct SessionWire<'a> {
 impl<'a> SessionWire<'a> {
     fn wire(session: &'a Session, caller: &'a Caller) -> Self {
         Self { session, caller }
+    }
+
+    async fn open_output(
+        &self,
+        id: String,
+        lookup: fn(&JobRegistry, &str, &std::path::Path) -> Option<CommandOutput>,
+    ) -> Result<Option<CommandOutput>, Error> {
+        let tools = self.session.hooks.tools.clone();
+        tokio::task::spawn_blocking(move || {
+            lookup(&tools.runner.jobs, &id, tools.schemes.artifacts().dir())
+        })
+        .await
+        .map_err(|err| Error::Host(Box::new(err)))
     }
 
     fn scoped(&self, custom_type: String) -> Result<String, Error> {
@@ -109,7 +123,10 @@ impl SessionWire<'_> {
         offset: u64,
         limit: u64,
     ) -> Result<Option<OutputPage>, Error> {
-        output_page(self.session.command_output(&call_id), offset, limit).await
+        let output = self
+            .open_output(call_id, JobRegistry::command_output)
+            .await?;
+        output_page(output, offset, limit).await
     }
 
     /// Reads up to one MiB from the call's newest command, labeled by stream, at a byte offset.
@@ -120,7 +137,10 @@ impl SessionWire<'_> {
         offset: u64,
         limit: u64,
     ) -> Result<Option<Vec<OutputChunk>>, Error> {
-        output_chunks(self.session.command_output(&call_id), offset, limit).await
+        let output = self
+            .open_output(call_id, JobRegistry::command_output)
+            .await?;
+        output_chunks(output, offset, limit).await
     }
 
     /// Reads up to one MiB of raw output from a job at a byte offset.
@@ -131,7 +151,8 @@ impl SessionWire<'_> {
         offset: u64,
         limit: u64,
     ) -> Result<Option<OutputPage>, Error> {
-        output_page(self.session.job_output(&job_id), offset, limit).await
+        let output = self.open_output(job_id, JobRegistry::job_output).await?;
+        output_page(output, offset, limit).await
     }
 
     /// Reads up to one MiB from a job, labeled by stream, at a byte offset.
@@ -142,21 +163,18 @@ impl SessionWire<'_> {
         offset: u64,
         limit: u64,
     ) -> Result<Option<Vec<OutputChunk>>, Error> {
-        output_chunks(self.session.job_output(&job_id), offset, limit).await
+        let output = self.open_output(job_id, JobRegistry::job_output).await?;
+        output_chunks(output, offset, limit).await
     }
 
-    /// Reads journal entries after a sequence number (default 256, clamped to 1..=1024).
+    /// Reads journal entries after a sequence number, with the same limits as `host.readSession`.
     #[ext]
     pub fn entries(&self, after: Option<u64>, limit: Option<u32>) -> EntryPage {
         self.session.hooks.journal.read(|view| {
-            let start = after.map_or(0, |seq| view.entries.partition_point(|e| e.seq <= seq));
-            let remaining = &view.entries[start..];
-            let count = remaining
-                .len()
-                .min(limit.unwrap_or(256).clamp(1, 1024) as usize);
+            let (range, more) = page_range(&view.entries, after, page_limit(limit));
             EntryPage {
-                entries: remaining[..count].to_vec(),
-                more: count < remaining.len(),
+                entries: view.entries[range].to_vec(),
+                more,
             }
         })
     }

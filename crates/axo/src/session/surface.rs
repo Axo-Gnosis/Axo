@@ -152,8 +152,9 @@ impl SessionHooks {
             .collect();
     }
 
-    pub(super) fn advance(&self) {
-        let mode_changed = {
+    pub(super) async fn advance(&self) {
+        let _order = self.selection_order.lock().await;
+        let (mode_changed, selected) = {
             let mut mode = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
             let same = match (&mode.selected, &mode.effective) {
                 (Some(selected), Some(effective)) => Arc::ptr_eq(selected, effective),
@@ -170,10 +171,28 @@ impl SessionHooks {
                         mode: mode.effective.as_ref().map(|spec| spec.name.clone()),
                     }));
             }
-            !same
+            (!same, mode.selected.is_some())
         };
         if mode_changed {
             self.rescope();
+        }
+        let reserve =
+            self.child.is_none() && (selected || !self.definitions.get().modes.is_empty());
+        let restaged = {
+            let mut base = self
+                .shape_base
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if base.tool_base.reserve_mode_tools == reserve {
+                false
+            } else {
+                Arc::make_mut(&mut base.tool_base).reserve_mode_tools = reserve;
+                true
+            }
+        };
+        if restaged {
+            self.restage();
+            self.prompt.rebuild();
         }
         let requested = self.tools.deferred.take_requested();
         let support = self.model().tool_support();
@@ -191,7 +210,7 @@ impl SessionHooks {
             }
             promoted.len() != before
         };
-        if mode_changed || changed {
+        if changed || (mode_changed && !restaged) {
             self.install_tools();
         }
     }

@@ -95,7 +95,7 @@ pub(crate) async fn send_with_retry(
 pub(crate) struct Prepared {
     pub url: String,
     pub headers: HeaderMap,
-    pub body: String,
+    pub body: bytes::Bytes,
 }
 
 /// Runs the provider's rewrite (once per request, before any retry) and serializes the
@@ -122,7 +122,7 @@ pub(crate) async fn prepare(
         },
     };
     Ok(Prepared {
-        body: request.body.to_string(),
+        body: request.body.to_string().into(),
         url: request.url,
         headers: request.headers,
     })

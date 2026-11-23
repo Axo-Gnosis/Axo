@@ -6,13 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo_ai::thinking::clamp_level;
-use axo_ai::{Models, ServiceTier, Streamer};
+use axo_ai::{Models, Streamer};
 use axo_macros::expose;
 use serde_json::Value;
 
 use crate::config::{
-    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, TierOnModelChange,
-    UserConfig,
+    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, ProjectAccess, UserConfig,
 };
 use crate::context::Diagnostic;
 use crate::context::agents::{AgentDef, RunAs};
@@ -30,7 +29,8 @@ use crate::ext::{Caller, HOST, InvokeError, MODELS};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::session::children::SessionTable;
 use crate::session::{
-    Inherited, RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes,
+    Inherited, Layers, RecoveryPolicy, Registrations, Session, SessionOptions, SessionSetup,
+    session_schemes,
 };
 use crate::store::{
     Header, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
@@ -321,6 +321,19 @@ impl Axo {
         self.sessions.session(id).await
     }
 
+    /// Observes a currently resident child without reviving it. The token is canceled
+    /// when this residency ends; canceling it does not affect the child or other observers.
+    #[ext(skip = "live receiver; the bridge serves session.subscribe")]
+    pub fn observe_child(
+        &self,
+        id: &str,
+    ) -> Option<(
+        tokio::sync::broadcast::Receiver<Arc<crate::SessionEvent>>,
+        tokio_util::sync::CancellationToken,
+    )> {
+        self.sessions.observe(id)
+    }
+
     /// Reads a saved session without locking it.
     #[ext(skip = "a whole journal can exceed a frame; host.readSession pages it")]
     pub async fn open_session_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error> {
@@ -448,7 +461,7 @@ impl Axo {
             project_access,
         )?);
         let (files, mut definition_diagnostics) = load_files(&config, &cwd, keywords_enabled);
-        let (resolved, _) = merge(&files, &[&layer.definitions, &definitions]);
+        let (resolved, merge_diagnostics) = merge(&files, &[&layer.definitions, &definitions]);
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
@@ -497,14 +510,11 @@ impl Axo {
                 choice.model.ok_or(Error::NoModel)?
             }
         };
-        let same = projection.model.as_deref()
-            == Some(format!("{}/{}", model.provider, model.id).as_str());
-        let tier = tier_suffix.unwrap_or(
-            if same || settings.service_tier.on_model_change == TierOnModelChange::Keep {
-                projection.tier.unwrap_or_default()
-            } else {
-                ServiceTier::Standard
-            },
+        let tier = settings.service_tier.on_model_change.select_tier(
+            projection.model.as_deref().and_then(|s| s.split_once('/')),
+            &model,
+            projection.tier.unwrap_or_default(),
+            tier_suffix,
         );
         let thinking = clamp_level(
             &model,
@@ -544,7 +554,6 @@ impl Axo {
                 docs_dir: self.docs_dir(),
                 harness_name: self.name.clone(),
                 files: Arc::new(files),
-                definitions,
                 definition_diagnostics,
                 agent,
                 streamer: self.streamer.clone(),
@@ -552,18 +561,24 @@ impl Axo {
                 exec,
                 supervisor: self.supervisor.clone(),
                 ask_enabled,
-                host_sections: sections,
-                host_tools,
-                host_schemes,
-                tool_policies,
                 store: self.store.clone(),
                 sessions: self.sessions.clone(),
-                spawn_hooks,
-                commands,
-                layer,
                 run_slots,
                 docs: None,
             }),
+            layers: Layers {
+                host: Registrations {
+                    definitions,
+                    sections,
+                    tools: host_tools,
+                    schemes: host_schemes,
+                    tool_policies,
+                    spawn_hooks,
+                    commands,
+                },
+                layer,
+            },
+            merged: Some((resolved, merge_diagnostics)),
             model,
             thinking,
             tier,

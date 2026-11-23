@@ -34,18 +34,24 @@ pub(crate) struct ShapeBase {
     pub config: Arc<EffectiveConfig>,
     pub cwd: PathBuf,
     pub project: bool,
-    pub builtin: Vec<Arc<dyn Tool>>,
-    pub host_tools: Vec<Hosted>,
-    pub host_deferred: Vec<Hosted>,
+    pub(super) tool_base: Arc<ToolBase>,
     pub host_tool_factories: Vec<HostTool>,
     pub host_sections: Vec<(String, Option<String>)>,
     /// The live schemes' prompt docs.
     pub scheme_docs: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct ToolBase {
+    pub builtin: Vec<Arc<dyn Tool>>,
+    pub host_tools: Vec<Hosted>,
+    pub host_deferred: Vec<Hosted>,
+    pub max_depth: u32,
     pub depth: u32,
     pub has_peers: bool,
     pub call: Arc<dyn Tool>,
     pub enter_mode: Option<Arc<dyn Tool>>,
-    pub has_modes: bool,
+    pub reserve_mode_tools: bool,
     pub yield_tool: Option<Arc<dyn Tool>>,
     /// The inherited mode ceiling of a child; empty on a root.
     pub limits: ToolLimits,
@@ -58,12 +64,11 @@ pub(crate) struct NestedParts {
     pub startup: Vec<ContextFile>,
 }
 
-/// A shape's findings, split so a tools-only change can return only its own.
-pub(crate) struct ShapeDiagnostics {
-    /// Context-file name and loading findings.
-    pub context: Vec<Diagnostic>,
-    /// Tool merge, reservation, collision and allowlist findings.
-    pub tools: Vec<Diagnostic>,
+struct ShapedTools {
+    tools: Vec<Arc<dyn Tool>>,
+    deferred: Vec<Arc<dyn Tool>>,
+    origins: HashMap<String, String>,
+    diagnostics: Vec<Diagnostic>,
 }
 
 /// Derives the mutable prompt and tool surface without changing live session state.
@@ -71,10 +76,9 @@ pub(crate) struct ShapeDiagnostics {
 pub(crate) fn shape(
     base: &ShapeBase,
     agent: Option<&AgentSpec>,
-) -> (PromptShape, NestedParts, ShapeDiagnostics) {
+) -> (PromptShape, NestedParts, Vec<Diagnostic>) {
     let settings = &base.config.settings;
     let mut context = Vec::new();
-    let mut diagnostics = Vec::new();
     let mut names = settings.context_files.clone();
     let disabled = matches!(
         agent.and_then(|spec| spec.context_files.as_ref()),
@@ -118,8 +122,27 @@ pub(crate) fn shape(
         .filter(|(_, enabled)| !**enabled)
         .map(|(name, _)| (name.clone(), None))
         .collect();
-    let (mut tools, merge_diagnostics) = tools::merge_tools(base.builtin.clone(), &base.host_tools);
-    diagnostics.extend(merge_diagnostics);
+    let shaped = shape_tools(&base.tool_base, agent);
+    let shape = PromptShape {
+        prompts: base.config.prompts.clone(),
+        agent: agent
+            .map(|spec| spec.body.trim())
+            .filter(|body| !body.is_empty())
+            .map(str::to_owned),
+        tools: shaped.tools,
+        deferred: shaped.deferred,
+        origins: shaped.origins,
+        tool_diagnostics: shaped.diagnostics,
+        context_files: nested.startup.clone(),
+        agent_sections,
+        host_sections: base.host_sections.clone(),
+        scheme_docs: base.scheme_docs.clone(),
+    };
+    (shape, nested, context)
+}
+
+fn shape_tools(base: &ToolBase, agent: Option<&AgentSpec>) -> ShapedTools {
+    let (mut tools, mut diagnostics) = tools::merge_tools(base.builtin.clone(), &base.host_tools);
     let reserved = |hosted: &Hosted, message: &str| Diagnostic {
         origin: hosted.origin.clone().map(DiagnosticOrigin::Host),
         message: message.into(),
@@ -136,7 +159,7 @@ pub(crate) fn shape(
         ));
     }
     tools.retain(|tool| tool.name() != CALL);
-    if base.has_modes {
+    if base.reserve_mode_tools {
         if let Some(hosted) = base
             .host_tools
             .iter()
@@ -154,7 +177,7 @@ pub(crate) fn shape(
     let mut deferred_owners: HashMap<&str, Option<&str>> = HashMap::new();
     for hosted in &base.host_deferred {
         let name = hosted.tool.name();
-        if name == CALL || (base.has_modes && name == YIELD) {
+        if name == CALL || (base.reserve_mode_tools && name == YIELD) {
             continue;
         }
         let origin = hosted.origin.clone().map(DiagnosticOrigin::Host);
@@ -221,7 +244,7 @@ pub(crate) fn shape(
         tools.retain(|tool| base.limits.permits(tool.name()));
         deferred.retain(|tool| base.limits.permits(tool.name()));
     }
-    if base.depth >= settings.subagents.max_depth {
+    if base.depth >= base.max_depth {
         tools.retain(|tool| tool.name() != SPAWN);
     }
     let has_spawn = tools.iter().any(|tool| tool.name() == SPAWN);
@@ -235,7 +258,7 @@ pub(crate) fn shape(
         tools.retain(|tool| tool.name() != YIELD);
         tools.push(yield_tool.clone());
     }
-    if !deferred.is_empty() || base.has_modes {
+    if !deferred.is_empty() || base.reserve_mode_tools {
         tools.push(base.call.clone());
     }
     // Labels of the host registrations that survived, matched by instance.
@@ -251,25 +274,12 @@ pub(crate) fn shape(
             Some((tool.name().to_owned(), hosted.origin.clone()?))
         })
         .collect();
-    let shape = PromptShape {
-        prompts: base.config.prompts.clone(),
-        agent: agent
-            .map(|spec| spec.body.trim())
-            .filter(|body| !body.is_empty())
-            .map(str::to_owned),
+    ShapedTools {
         tools,
         deferred,
-        context_files: nested.startup.clone(),
-        agent_sections,
-        host_sections: base.host_sections.clone(),
         origins,
-        scheme_docs: base.scheme_docs.clone(),
-    };
-    let diagnostics = ShapeDiagnostics {
-        context,
-        tools: diagnostics,
-    };
-    (shape, nested, diagnostics)
+        diagnostics,
+    }
 }
 
 /// The last prompt build and the exec-environment note and local date it used.
@@ -350,13 +360,26 @@ fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
 
+fn recorded_prompt(messages: &[AgentMessage]) -> Option<(Sections, Vec<ToolSpec>)> {
+    let system = axo_ai::transcript::replay_system_message(messages.iter().filter_map(
+        |message| match message {
+            AgentMessage::Llm(Message::System(system)) => Some(system),
+            _ => None,
+        },
+    ))?;
+    let sections = system
+        .sections
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, body)| body.map(|body| (name, body)))
+        .collect();
+    Some((sections, system.tools_added))
+}
+
 impl SessionHooks {
     /// Derives `spec`'s prompt and tool shape from the current base on a blocking thread:
-    /// context-file loading does blocking file I/O. Logs its diagnostics and returns them.
-    pub(super) async fn reshape(
-        &self,
-        spec: Option<AgentSpec>,
-    ) -> (PromptShape, NestedParts, ShapeDiagnostics) {
+    /// context-file loading does blocking file I/O. Logs context and tool diagnostics.
+    pub(super) async fn reshape(&self, spec: Option<AgentSpec>) -> (PromptShape, NestedParts) {
         let base = self
             .shape_base
             .lock()
@@ -367,10 +390,10 @@ impl SessionHooks {
                 Ok(shaped) => shaped,
                 Err(join) => std::panic::resume_unwind(join.into_panic()),
             };
-        for diagnostic in diagnostics.context.iter().chain(&diagnostics.tools) {
+        for diagnostic in diagnostics.iter().chain(&new_shape.tool_diagnostics) {
             tracing::warn!("{diagnostic}");
         }
-        (new_shape, nested, diagnostics)
+        (new_shape, nested)
     }
 
     /// Puts the joined host and layer sections in the base and the live shape without
@@ -410,22 +433,21 @@ impl SessionHooks {
     }
 
     /// Re-merges file and code definitions while the caller holds selection_order.
-    pub(super) fn stage_definitions(&self) -> Vec<Diagnostic> {
-        let (layer, host) = {
+    pub(super) fn stage_definitions(&self) -> (bool, Vec<Diagnostic>) {
+        let (resolved, mut diagnostics) = {
             let layers = self.registrations();
-            (
-                layers.layer.definitions.clone(),
-                layers.host.definitions.clone(),
+            merge(
+                &self.inherited.files,
+                &[&layers.layer.definitions, &layers.host.definitions],
             )
         };
-        let (resolved, mut diagnostics) = merge(&self.inherited.files, &[&layer, &host]);
         diagnostics.extend(commands::reserved_skill_diagnostics(&resolved.skills));
         diagnostics.extend(commands::hidden_skill_diagnostics(
             &resolved.skills,
             &resolved.modes,
         ));
         if resolved == *self.definitions.get() {
-            return diagnostics;
+            return (false, diagnostics);
         }
         let spawn = SpawnTool::new(
             &resolved.agents,
@@ -436,57 +458,74 @@ impl SessionHooks {
             tool.attach(self.this.clone());
             Arc::new(tool) as Arc<dyn Tool>
         });
+        let reserve_mode_tools = self.child.is_none()
+            && (!resolved.modes.is_empty() || {
+                let mode = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
+                mode.selected.is_some() || mode.effective.is_some()
+            });
         {
             let mut base = self
                 .shape_base
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let base = Arc::make_mut(&mut base.tool_base);
             if let Some(entry) = base.builtin.iter_mut().find(|tool| tool.name() == SPAWN) {
                 *entry = Arc::new(spawn);
             }
             base.enter_mode = enter_mode;
-            base.has_modes = !resolved.modes.is_empty();
+            base.reserve_mode_tools = reserve_mode_tools;
         }
         self.definitions.set(resolved);
-        diagnostics
+        (true, diagnostics)
     }
 
     /// Instantiates the joined host and layer tools, reshapes the tool lists under the
     /// current persona and installs them without rebuilding the prompt; returns the tool
     /// diagnostics. Callers hold `selection_order` inside `detached`.
-    pub(super) async fn stage_tools(&self, tools: Vec<HostTool>) -> Vec<Diagnostic> {
+    pub(super) fn stage_tools(&self, tools: Vec<HostTool>) -> Vec<Diagnostic> {
         let (host, deferred) = tools::instantiate(&tools, &self.tools);
         {
             let mut base = self
                 .shape_base
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            base.host_tool_factories = tools;
+            let base = Arc::make_mut(&mut base.tool_base);
             base.host_tools = host;
             base.host_deferred = deferred;
-            base.host_tool_factories = tools;
         }
-        self.restage().await
+        self.restage()
     }
 
-    pub(super) async fn restage(&self) -> Vec<Diagnostic> {
+    pub(super) fn restage(&self) -> Vec<Diagnostic> {
+        let base = self
+            .shape_base
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .tool_base
+            .clone();
         let spec = self
             .agent_spec
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let (new_shape, _, diagnostics) = self.reshape(spec).await;
+        let shaped = shape_tools(&base, spec.as_ref());
+        for diagnostic in &shaped.diagnostics {
+            tracing::warn!("{diagnostic}");
+        }
         {
             let mut shape = self
                 .prompt
                 .shape
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            shape.tools = new_shape.tools;
-            shape.deferred = new_shape.deferred;
-            shape.origins = new_shape.origins;
+            shape.tools = shaped.tools;
+            shape.deferred = shaped.deferred;
+            shape.origins = shaped.origins;
+            shape.tool_diagnostics = shaped.diagnostics.clone();
         }
         self.install_tools();
-        diagnostics.tools
+        shaped.diagnostics
     }
 
     /// Rebuilds the prompt for `note` and today's date; a change goes out as a pending
@@ -517,24 +556,7 @@ impl SessionHooks {
         };
         let message = {
             let view = self.journal.view();
-            let mut effective = axo_ai::transcript::replay_system_message(
-                view.projection
-                    .messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        AgentMessage::Llm(Message::System(system)) => Some(system),
-                        _ => None,
-                    }),
-            );
-            let previous = effective.as_mut().map(|system| {
-                system
-                    .sections
-                    .take()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(name, body)| body.map(|body| (name, body)))
-                    .collect::<Sections>()
-            });
+            let previous = recorded_prompt(&view.projection.messages);
             let tools: Vec<_> = self
                 .declared_tools()
                 .iter()
@@ -545,12 +567,10 @@ impl SessionHooks {
                 })
                 .collect();
             let changes = axo_ai::transcript::tool_state_changes(
-                effective
-                    .as_ref()
-                    .map_or(&[], |system| system.tools_added.as_slice()),
+                previous.as_ref().map_or(&[], |(_, tools)| tools.as_slice()),
                 &tools,
             );
-            let system = system_message(previous.as_ref(), &current);
+            let system = system_message(previous.as_ref().map(|(sections, _)| sections), &current);
             if system.is_none()
                 && changes.tools_added.is_empty()
                 && changes.tools_removed.is_empty()
@@ -625,21 +645,7 @@ impl Session {
     #[ext]
     pub fn inspect_prompt(&self) -> PromptInspection {
         let view = self.hooks.journal.view();
-        let recorded =
-            axo_ai::transcript::replay_system_message(view.projection.messages.iter().filter_map(
-                |message| match message {
-                    AgentMessage::Llm(Message::System(system)) => Some(system),
-                    _ => None,
-                },
-            ))
-            .map(|system| {
-                system
-                    .sections
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(name, body)| body.map(|body| (name, body)))
-                    .collect()
-            });
+        let recorded = recorded_prompt(&view.projection.messages).map(|(sections, _)| sections);
         PromptInspection {
             latest_built: self.hooks.prompt.sections(),
             recorded,

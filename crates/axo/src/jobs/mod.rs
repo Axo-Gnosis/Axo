@@ -348,6 +348,11 @@ enum Kind {
     Child(Box<ChildRun>),
 }
 
+enum OutputKey<'a> {
+    Call(&'a str),
+    Job(JobId),
+}
+
 struct Job {
     kind: Kind,
     admission: Admission,
@@ -1573,11 +1578,11 @@ impl JobRegistry {
         call_id: &str,
         artifacts_dir: &Path,
     ) -> Option<CommandOutput> {
-        self.find_output(artifacts_dir, |_, run| run.call_id == call_id)
+        self.find_output(artifacts_dir, OutputKey::Call(call_id))
     }
 
     pub(crate) fn job_output(&self, job_id: &str, artifacts_dir: &Path) -> Option<CommandOutput> {
-        self.find_output(artifacts_dir, |id, _| id.to_string() == job_id)
+        self.find_output(artifacts_dir, OutputKey::Job(JobId::parse(job_id)?))
     }
 
     pub(crate) fn command_jobs(&self, call_id: &str) -> Vec<String> {
@@ -1591,40 +1596,49 @@ impl JobRegistry {
             .collect()
     }
 
-    fn find_output(
-        &self,
-        artifacts_dir: &Path,
-        wanted: impl Fn(&JobId, &CommandRun) -> bool,
-    ) -> Option<CommandOutput> {
-        let state = self.lock();
-        state.jobs.iter().rev().find_map(|(id, job)| {
-            let Kind::Command(run) = &job.kind else {
-                return None;
+    fn find_output(&self, artifacts_dir: &Path, key: OutputKey<'_>) -> Option<CommandOutput> {
+        let (id, artifact, path, progress) = {
+            let state = self.lock();
+            let (id, run) = match key {
+                OutputKey::Job(id) => match &state.jobs.get(&id)?.kind {
+                    Kind::Command(run) => (id, run),
+                    Kind::Child(_) => return None,
+                },
+                OutputKey::Call(call) => {
+                    state
+                        .jobs
+                        .iter()
+                        .rev()
+                        .find_map(|(id, job)| match &job.kind {
+                            Kind::Command(run) if run.call_id == call => Some((*id, run)),
+                            _ => None,
+                        })?
+                }
             };
-            if !wanted(id, run) {
-                return None;
-            }
-            if run.output.path.as_os_str().is_empty() {
-                let path = artifacts_dir.join(format!(
-                    "{}.{}",
-                    run.artifact,
-                    crate::schemes::artifact::command_log_tail(&run.tool, &run.call_id)
-                ));
-                return CommandOutput::open(id.to_string(), run.artifact, &path).ok();
-            }
-            let file = std::fs::File::open(&run.output.path).ok()?;
-            Some(CommandOutput::new(
-                id.to_string(),
-                run.artifact,
-                run.output.path.clone(),
-                file,
-                std::fs::File::open(crate::schemes::artifact::stream_index_path(
-                    &run.output.path,
-                ))
-                .ok(),
-                run.output.progress.subscribe(),
-            ))
-        })
+            let (path, progress) = if run.output.path.as_os_str().is_empty() {
+                let tail = crate::schemes::artifact::command_log_tail(&run.tool, &run.call_id);
+                (artifacts_dir.join(format!("{}.{tail}", run.artifact)), None)
+            } else {
+                (
+                    run.output.path.clone(),
+                    Some(run.output.progress.subscribe()),
+                )
+            };
+            (id, run.artifact, path, progress)
+        };
+        let Some(progress) = progress else {
+            return CommandOutput::open(id.to_string(), artifact, &path).ok();
+        };
+        let file = std::fs::File::open(&path).ok()?;
+        let index = std::fs::File::open(crate::schemes::artifact::stream_index_path(&path)).ok();
+        Some(CommandOutput::new(
+            id.to_string(),
+            artifact,
+            path,
+            file,
+            index,
+            progress,
+        ))
     }
 
     pub(crate) fn background(&self, call_id: &str) -> bool {

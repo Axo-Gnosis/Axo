@@ -1,10 +1,12 @@
 //! The default [`SessionStore`]: one JSONL file per session under
 //! `<root>/--<encoded cwd>--/` (pi `session-manager.ts:589-594`, `1079-1080`).
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use axo_agent::AgentMessage;
@@ -15,8 +17,39 @@ use serde_json::Value;
 use super::{Entry, Header, SeqEntry, SessionInfo, SessionStore, SessionWriter};
 use crate::error::Error;
 
+const MAX_CHECKPOINTS: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    identity: (u64, u64),
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    fn read(file: &File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        Ok(Self {
+            identity: (meta.dev(), meta.ino()),
+            len: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PageCheckpoint {
+    stamp: FileStamp,
+    after: Option<u64>,
+    next_seq: u64,
+    offset: u64,
+}
+
 pub struct JsonlStore {
     root: PathBuf,
+    checkpoints: Arc<Mutex<VecDeque<PageCheckpoint>>>,
 }
 
 #[expose(block = JSONL_STORE_BLOCK, object = "types")]
@@ -24,7 +57,10 @@ impl JsonlStore {
     /// A store rooted at the host-chosen directory `root`.
     #[ext(skip = "host construction")]
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            checkpoints: Arc::default(),
+        }
     }
 
     /// `<root>/--<cwd without leading separator, with / \ : replaced by ->--`.
@@ -220,32 +256,64 @@ impl SessionStore for JsonlStore {
         limit: usize,
     ) -> Result<(Header, Vec<SeqEntry>, bool), Error> {
         let target = path.to_path_buf();
+        let checkpoints = Arc::clone(&self.checkpoints);
         blocking(path, move || {
             let path = target.as_path();
             let io = |err| io_error(path, err);
             let mut reader = BufReader::new(File::open(path).map_err(io)?);
+            let stamp = FileStamp::read(reader.get_ref()).map_err(io)?;
             let mut line = Vec::new();
-            reader.read_until(b'\n', &mut line).map_err(io)?;
+            let mut offset = reader.read_until(b'\n', &mut line).map_err(io)? as u64;
             let header = parse_header(path, line.strip_suffix(b"\n").unwrap_or(&line))?;
-            let mut entries = Vec::new();
-            for seq in 0u64.. {
-                line.clear();
-                if reader.read_until(b'\n', &mut line).map_err(io)? == 0 {
-                    break;
-                }
-                if after.is_some_and(|after| seq <= after) {
-                    continue;
-                }
-                if let Some(entry) =
-                    parse_entry(path, seq, line.strip_suffix(b"\n").unwrap_or(&line))
-                {
-                    if entries.len() == limit {
-                        return Ok((header, entries, true));
-                    }
-                    entries.push(entry);
-                }
+            let mut seq = 0;
+            let wanted = after.map_or(0, |s| s.saturating_add(1));
+            let resume = checkpoints
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|c| c.stamp == stamp && (c.next_seq <= wanted || c.after == after))
+                .copied();
+            if let Some(c) = resume {
+                reader.seek(SeekFrom::Start(c.offset)).map_err(io)?;
+                offset = c.offset;
+                seq = c.next_seq;
             }
-            Ok((header, entries, false))
+            let mut entries = Vec::new();
+            let more = loop {
+                let bytes = if after.is_some_and(|after| seq <= after) {
+                    reader.skip_until(b'\n').map_err(io)?
+                } else {
+                    line.clear();
+                    let bytes = reader.read_until(b'\n', &mut line).map_err(io)?;
+                    if let Some(entry) = parse_entry(path, seq, &line) {
+                        if entries.len() == limit {
+                            // Leave the checkpoint at the start of this lookahead entry.
+                            break true;
+                        }
+                        entries.push(entry);
+                    }
+                    bytes
+                };
+                if bytes == 0 {
+                    break false;
+                }
+                seq += 1;
+                offset += bytes as u64;
+            };
+            if stamp == FileStamp::read(reader.get_ref()).map_err(io)? {
+                let mut cache = checkpoints.lock().unwrap_or_else(PoisonError::into_inner);
+                cache.retain(|c| c.stamp.identity != stamp.identity);
+                if cache.len() == MAX_CHECKPOINTS {
+                    cache.pop_front();
+                }
+                cache.push_back(PageCheckpoint {
+                    stamp,
+                    after: entries.last().map(|entry| entry.seq).or(after),
+                    next_seq: seq,
+                    offset,
+                });
+            }
+            Ok((header, entries, more))
         })
         .await
     }
@@ -277,28 +345,38 @@ impl SessionStore for JsonlStore {
                 let info = File::open(&path)
                     .map_err(|err| io_error(&path, err))
                     .and_then(|file| {
-                        let modified = file
-                            .metadata()
-                            .and_then(|meta| meta.modified())
-                            .map_err(|err| io_error(&path, err))?;
-                        let header = header_line(&path, file)?;
-                        Ok(SessionInfo {
-                            path: path.clone(),
+                        let meta = file.metadata().map_err(|err| io_error(&path, err))?;
+                        let key = (meta.mtime(), meta.mtime_nsec());
+                        let millis = i128::from(key.0) * 1000 + i128::from(key.1) / 1_000_000;
+                        let modified_at = i64::try_from(millis).map_err(|_| {
+                            io_error(
+                                &path,
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "file modification time outside Unix millisecond range",
+                                ),
+                            )
+                        })?;
+                        Ok((key, modified_at, header_line(&path, file)?))
+                    });
+                match info {
+                    Ok((key, modified_at, header)) => sessions.push((
+                        key,
+                        SessionInfo {
+                            path,
                             id: header.id,
                             timestamp: header.timestamp,
                             cwd: header.cwd,
                             parent_session: header.parent_session,
                             spawn: header.spawn,
-                            modified,
-                        })
-                    });
-                match info {
-                    Ok(info) => sessions.push(info),
+                            modified_at,
+                        },
+                    )),
                     Err(err) => tracing::warn!(path = %path.display(), %err, "skipping unreadable session file"),
                 }
             }
-            sessions.sort_by_key(|info| std::cmp::Reverse(info.modified));
-            Ok(sessions)
+            sessions.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
+            Ok(sessions.into_iter().map(|(_, info)| info).collect())
         })
         .await
     }
@@ -424,5 +502,73 @@ mod tests {
             .unwrap();
         assert!(next_writer.try_lock().is_ok());
         drop(inherited);
+    }
+
+    #[tokio::test]
+    async fn saved_pages_match_physical_lines_after_resume_and_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let store = JsonlStore::new(dir.path().to_owned());
+        let header = Header::new(dir.path().to_owned(), None, None);
+        let header_line = serde_json::to_string(&header).unwrap();
+        let first = r#"{"type":"session_info","id":"a","timestamp":"t","name":"first"}"#;
+        let unknown = r#"{"type":"future","data":42}"#;
+        let last = r#"{"type":"session_info","id":"b","timestamp":"t","name":"last"}"#;
+        let prefix = format!("{header_line}\n{first}\n\nbad\n");
+        let file = format!("{prefix}{unknown}\n{last}");
+        fs::write(&path, &file).unwrap();
+        let (_, expected, _) = parse(&path, file.as_bytes()).unwrap();
+        assert_eq!(expected.len(), 3);
+        assert!(matches!(expected[1].entry, Entry::Unknown(_)));
+
+        let (saved_header, mut seen, more) = store.read_page(&path, None, 1).await.unwrap();
+        assert_eq!(saved_header, header);
+        assert_eq!(seen, expected[..1]);
+        assert!(more);
+        let c = store.checkpoints.lock().unwrap()[0];
+        assert_eq!(c.after, Some(seen[0].seq));
+        assert_eq!((c.next_seq, c.offset), (3, prefix.len() as u64));
+        for index in 1..expected.len() {
+            let after = Some(seen[index - 1].seq);
+            let (_, page, more) = store.read_page(&path, after, 1).await.unwrap();
+            assert_eq!(page, expected[index..=index]);
+            assert_eq!(more, index + 1 < expected.len());
+            seen.extend(page);
+        }
+        assert_eq!(seen, expected);
+
+        for (after, limit) in [
+            (Some(2), 1),
+            (None, 0),
+            (Some(0), 0),
+            (Some(u64::MAX), 0),
+            (Some(u64::MAX), 1),
+            (Some(1), usize::MAX),
+            (None, 1),
+        ] {
+            let (_, page, more) = store.read_page(&path, after, limit).await.unwrap();
+            let (range, expected_more) = super::super::page_range(&expected, after, limit);
+            assert_eq!(page, expected[range]);
+            assert_eq!(more, expected_more);
+        }
+
+        // Same length, but the next valid entry now precedes the cached offset.
+        let replacement = format!("{header_line}\n{first}\n{unknown}\n\nbad\n{last}");
+        assert_eq!(replacement.len(), file.len());
+        let new_path = dir.path().join("replacement");
+        fs::write(&new_path, &replacement).unwrap();
+        fs::rename(new_path, &path).unwrap();
+        let (_, expected, _) = parse(&path, replacement.as_bytes()).unwrap();
+        let (_, page, more) = store.read_page(&path, Some(0), 1).await.unwrap();
+        assert_eq!(page, expected[1..2]);
+        assert!(more);
+
+        fs::write(&path, format!("{replacement}\n\nbad\n")).unwrap();
+        let (_, page, more) = store
+            .read_page(&path, Some(expected[1].seq), 1)
+            .await
+            .unwrap();
+        assert_eq!(page, expected[2..]);
+        assert!(!more);
     }
 }

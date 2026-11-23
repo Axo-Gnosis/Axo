@@ -4,6 +4,7 @@
 //! upstream in models.dev.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -79,7 +80,7 @@ const CODEX_FLOOR: [(&str, &str, u64, [f64; 4], bool); 7] = [
 /// One catalog fetch, mapped: what a rebuild needs from the feed without keeping the feed.
 pub(crate) struct CatalogModels {
     /// Every row axo can serve, in feed order.
-    pub models: Vec<Model>,
+    pub models: Vec<Arc<Model>>,
     /// API-key environment variables of each provider that contributed a model.
     pub envs: HashMap<String, Vec<String>>,
     /// Prices, Off support (effort `"none"` listed), and service-tier multipliers of the
@@ -95,12 +96,16 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
     let today = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
 
     for (provider_id, provider) in catalog {
+        if provider_id == codex::PROVIDER {
+            continue;
+        }
         let before = models.len();
         models.extend(
             provider
                 .models
                 .iter()
-                .filter_map(|(model_id, raw)| catalog_model(provider_id, model_id, raw, &today)),
+                .filter_map(|(model_id, raw)| catalog_model(provider_id, model_id, raw, &today))
+                .map(Arc::new),
         );
         if models.len() > before {
             envs.insert(provider_id.clone(), provider.env.clone());
@@ -131,7 +136,7 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
 pub(crate) fn build(
     catalog: Option<&CatalogModels>,
     discovered: Option<&[CodexModel]>,
-) -> (Vec<Model>, HashMap<String, Vec<String>>) {
+) -> (Vec<Arc<Model>>, HashMap<String, Vec<String>>) {
     let (mut models, mut envs) = catalog
         .map(|catalog| (catalog.models.clone(), catalog.envs.clone()))
         .unwrap_or_default();
@@ -160,15 +165,16 @@ pub(crate) fn build(
 }
 
 /// Without extended context, stop at the lowest context price tier's threshold.
-pub(crate) fn cap_at_price_tier(model: &mut Model) {
+pub(crate) fn cap_at_price_tier(model: &mut Arc<Model>) {
     if let Some(threshold) = model
         .cost
         .tiers
         .iter()
         .map(|tier| tier.input_tokens_above)
         .min()
+        && threshold < model.context_window
     {
-        model.context_window = model.context_window.min(threshold);
+        Arc::make_mut(model).context_window = threshold;
     }
 }
 
@@ -467,7 +473,7 @@ fn codex_model(
     efforts: &[String],
     tiers: &[String],
     catalog: Option<&CatalogModels>,
-) -> Model {
+) -> Arc<Model> {
     let openai = catalog.and_then(|catalog| catalog.openai.get(id));
     let floor = CODEX_FLOOR.iter().find(|row| row.0 == id);
     let cost = match (openai, floor) {
@@ -480,11 +486,15 @@ fn codex_model(
         None => floor.is_some_and(|row| row.4),
     };
     let mut map = thinking_map(efforts, false);
-    map.insert(ThinkingLevel::Off, off.then(|| "none".to_owned()));
+    if off {
+        map.entry(ThinkingLevel::Off)
+            .or_default()
+            .get_or_insert_with(|| "none".to_owned());
+    }
     // A list with no effort axo knows and no Off is a plain model, not a reasoning one with
     // nothing to select.
     let reasoning = map.values().any(Option::is_some);
-    Model {
+    Arc::new(Model {
         id: id.to_owned(),
         name: name.to_owned(),
         api: ApiKind::OpenAiCodexResponses,
@@ -509,7 +519,7 @@ fn codex_model(
         context_window,
         max_tokens: CODEX_MAX_TOKENS,
         compat: Compat::default(),
-    }
+    })
 }
 
 /// A floor row's prices with OpenAI's long-context tier (double input and cache, 1.5×

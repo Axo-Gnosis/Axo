@@ -32,7 +32,7 @@ use crate::event::{AssistantEvent, timed};
 use crate::model::{ApiKind, Compat, Cost, InputKind, Model};
 use crate::transcript::Transcript;
 use crate::transform::transform_messages;
-use crate::types::{AssistantMessage, ProviderFailure, StopReason};
+use crate::types::{AssistantMessage, ProviderFailure, ServiceTier, StopReason};
 
 use self::codex::CodexModel;
 use self::config::{ModelsConfig, merge_compat};
@@ -128,9 +128,70 @@ struct Inputs {
     /// The last Codex model list discovered or read from the cache; `None` uses the floor.
     codex: Option<Vec<CodexModel>>,
     /// The catalog as last fetched or read from the cache, mapped; `None` when there is none.
-    catalog: Option<Arc<rules::CatalogModels>>,
+    catalog: Option<rules::CatalogModels>,
     /// When that catalog was fetched; `None` when unknown or there is no catalog.
     catalog_fetched: Option<Instant>,
+}
+
+struct Candidate<'a> {
+    config: &'a ModelsConfig,
+    extended_context: bool,
+    catalog: Option<&'a rules::CatalogModels>,
+    codex: Option<&'a [CodexModel]>,
+}
+
+/// Only freshly fetched feeds. A failed catalog fetch can still accompany a useful account list.
+struct Pending {
+    catalog: Result<Option<(bytes::Bytes, rules::CatalogModels)>, Error>,
+    codex: Option<Vec<CodexModel>>,
+}
+
+impl Pending {
+    fn candidate<'a>(&'a self, inputs: &'a Inputs) -> Candidate<'a> {
+        Candidate {
+            config: &inputs.config,
+            extended_context: inputs.extended_context,
+            catalog: self
+                .catalog
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|(_, mapped)| mapped)
+                .or(inputs.catalog.as_ref()),
+            codex: self.codex.as_deref().or(inputs.codex.as_deref()),
+        }
+    }
+
+    /// Called only after the candidate builds. Never rewrite a retained feed.
+    async fn commit(self, inputs: &mut Inputs, dir: Option<&Path>) -> Result<(), Error> {
+        if let Some(dir) = dir {
+            if let Some(list) = &self.codex
+                && let Err(error) = codex::write(dir, list).await
+            {
+                tracing::warn!(
+                    "cannot write the Codex model cache in {}: {error}",
+                    dir.display()
+                );
+            }
+            if let Ok(Some((bytes, _))) = &self.catalog
+                && let Err(error) = catalog::write_atomic(&catalog::path(dir), bytes).await
+            {
+                tracing::warn!(
+                    "cannot write models.dev cache in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+        // Publish both inputs without yielding after the last cache write.
+        if let Some(list) = self.codex {
+            inputs.codex = Some(list);
+        }
+        if let Some((_, mapped)) = self.catalog? {
+            inputs.catalog = Some(mapped);
+            inputs.catalog_fetched = Some(Instant::now());
+        }
+        Ok(())
+    }
 }
 
 struct State {
@@ -141,7 +202,8 @@ struct State {
     layers: BTreeMap<u64, BTreeMap<String, Layered>>,
     /// Loaded models of providers that are not replaced, in loaded order, then each winning
     /// registered or layered provider's models in provider-id order.
-    snapshot: Arc<[Model]>,
+    snapshot: Arc<[Arc<Model>]>,
+    by_id: Vec<usize>,
 }
 
 impl State {
@@ -151,6 +213,7 @@ impl State {
             registered: BTreeMap::new(),
             layers: BTreeMap::new(),
             snapshot: Arc::new([]),
+            by_id: Vec::new(),
         };
         state.rebuild();
         state
@@ -158,7 +221,7 @@ impl State {
 
     fn rebuild(&mut self) {
         let winners = self.winners();
-        let snapshot = self
+        let snapshot: Arc<[Arc<Model>]> = self
             .loaded
             .models
             .iter()
@@ -166,7 +229,20 @@ impl State {
             .chain(winners.values().flat_map(|registered| &registered.models))
             .cloned()
             .collect();
+        self.by_id.clear();
+        self.by_id.extend(0..snapshot.len());
+        self.by_id
+            .sort_unstable_by_key(|&i| (&snapshot[i].provider, &snapshot[i].id, i));
         self.snapshot = snapshot;
+    }
+
+    fn lookup(&self, provider: &str, id: &str) -> Option<&Arc<Model>> {
+        let at = self.by_id.partition_point(|&i| {
+            let row = &self.snapshot[i];
+            (row.provider.as_str(), row.id.as_str()) < (provider, id)
+        });
+        let row = &self.snapshot[*self.by_id.get(at)?];
+        (row.provider == provider && row.id == id).then_some(row)
     }
 
     /// Each replaced provider id's winning registration: the newest layer containing it,
@@ -201,7 +277,7 @@ impl State {
 
 /// What `Models::load` and `Models::reload` build from the catalog and `models.jsonc`.
 struct Loaded {
-    models: Vec<Model>,
+    models: Vec<Arc<Model>>,
     providers: HashMap<String, Arc<ProviderAuth>>,
     /// Raw `models.jsonc` header values per (provider, model id), resolved at request time.
     config_headers: HashMap<(String, String), BTreeMap<String, String>>,
@@ -211,12 +287,15 @@ struct Loaded {
 
 struct Registered {
     auth: Arc<ProviderAuth>,
-    models: Vec<Model>,
+    models: Vec<Arc<Model>>,
     rewrite: Option<Arc<dyn RequestRewrite>>,
 }
 
 impl Registered {
-    fn new(provider: Provider) -> Result<(String, Registered), Error> {
+    fn new(provider: Provider, kind: &str, owner: &str) -> Result<(String, Registered), Error> {
+        if owner.is_empty() {
+            return Err(Error::Config("credential owner must not be empty".into()));
+        }
         provider.validate()?;
         let Provider {
             id,
@@ -228,6 +307,7 @@ impl Registered {
         } = provider;
         let auth = Arc::new(ProviderAuth {
             id: id.clone(),
+            slot: format!("{kind}/{owner}/{id}"),
             config_api_key: None,
             env,
             requires_key,
@@ -237,7 +317,7 @@ impl Registered {
             id,
             Registered {
                 auth,
-                models,
+                models: models.into_iter().map(Arc::new).collect(),
                 rewrite,
             },
         ))
@@ -252,7 +332,7 @@ struct Layered {
 
 impl Provider {
     /// Checks what `Models::register` and `ProviderLayer::replace` require: a non-empty id
-    /// without `/`, and models that all belong to it with distinct ids.
+    /// without `/`, and models belonging to it with distinct ids and no Standard-tier multiplier.
     pub fn validate(&self) -> Result<(), Error> {
         let id = &self.id;
         if id.is_empty() || id.contains('/') {
@@ -260,6 +340,11 @@ impl Provider {
         }
         let mut seen = HashSet::new();
         for model in &self.models {
+            if model.service_tiers.contains_key(&ServiceTier::Standard) {
+                return Err(Error::Config(
+                    "serviceTiers: \"standard\" has no multiplier".into(),
+                ));
+            }
             if &model.provider != id {
                 return Err(Error::Config(format!(
                     "provider {id}: model {} belongs to provider {}",
@@ -285,7 +370,7 @@ fn unavailable(provider: &str, reason: &str) -> Error {
 }
 
 struct Request {
-    model: Model,
+    model: Arc<Model>,
     auth: Arc<ProviderAuth>,
     headers: BTreeMap<String, String>,
     rewrite: Option<Arc<dyn RequestRewrite>>,
@@ -303,28 +388,50 @@ impl Models {
             catalog_fetched: None,
         };
         let mut age = Duration::ZERO;
+        let mut pending = Pending {
+            catalog: Ok(None),
+            codex: None,
+        };
         if let Some(dir) = opts.cache_dir.as_deref() {
             inputs.codex = codex::read(dir).await;
             match catalog::read(dir).await {
                 Some((cached, cached_age)) => {
-                    inputs.catalog = Some(Arc::new(rules::map_catalog(&cached)));
+                    inputs.catalog = Some(rules::map_catalog(&cached));
                     inputs.catalog_fetched = Instant::now().checked_sub(cached_age);
                     age = cached_age;
                 }
                 // A failed first fetch retries at the next interval, not in a loop.
                 None => {
-                    if let Err(error) =
-                        gather(&http, Some(dir), &opts.credentials, false, &mut inputs).await
-                    {
-                        tracing::warn!(
-                            "models.dev catalog unavailable, continuing without it: {error}"
-                        );
-                    }
+                    pending = gather(
+                        &http,
+                        Some(dir),
+                        &opts.credentials,
+                        &|_| true,
+                        &inputs.config,
+                    )
+                    .await;
                 }
             }
         }
-        let loaded = build(&inputs, &opts.credentials, &http, &|_| Vec::new()).await?;
-        let refresh_interval = inputs.config.refresh_interval;
+        let interval = Duration::from_secs(
+            inputs
+                .config
+                .refresh_interval
+                .unwrap_or(DEFAULT_REFRESH_INTERVAL),
+        );
+        let mut attempted = (!interval.is_zero() && age >= interval).then(HashSet::new);
+        let loaded = build(
+            pending.candidate(&inputs),
+            &opts.credentials,
+            &http,
+            &|_| Vec::new(),
+            &|_| true,
+            attempted.as_mut(),
+        )
+        .await?;
+        if let Err(error) = pending.commit(&mut inputs, opts.cache_dir.as_deref()).await {
+            tracing::warn!("models.dev catalog unavailable, continuing without it: {error}");
+        }
         let models = Models {
             shared: Arc::new(Shared {
                 state: RwLock::new(State::new(loaded)),
@@ -339,7 +446,7 @@ impl Models {
             codex: Arc::new(CodexApi::new(http)),
             timer: Mutex::new(None),
         };
-        models.start_timer(refresh_interval, age);
+        models.start_timer(interval, age, attempted);
         Ok(models)
     }
 
@@ -350,25 +457,30 @@ impl Models {
     pub async fn reload(&self, config: ModelsConfig, extended_context: bool) -> Result<(), Error> {
         let shared = &self.shared;
         let mut inputs = shared.inputs.lock().await;
-        let candidate = Inputs {
-            config,
+        let candidate = Candidate {
+            config: &config,
             extended_context,
-            codex: inputs.codex.clone(),
-            catalog: inputs.catalog.clone(),
-            catalog_fetched: inputs.catalog_fetched,
+            codex: inputs.codex.as_deref(),
+            catalog: inputs.catalog.as_ref(),
         };
-        let loaded = build(&candidate, &shared.credentials, &shared.http, &|id| {
-            shared.loaded_ids(id)
-        })
+        let loaded = build(
+            candidate,
+            &shared.credentials,
+            &shared.http,
+            &|id| shared.loaded_ids(id),
+            &|id| shared.read().runtime(id).is_none(),
+            None,
+        )
         .await?;
-        let refresh_interval = candidate.config.refresh_interval;
-        let age = candidate
+        let interval =
+            Duration::from_secs(config.refresh_interval.unwrap_or(DEFAULT_REFRESH_INTERVAL));
+        let age = inputs
             .catalog_fetched
             .map_or(Duration::MAX, |at| at.elapsed());
-        *inputs = candidate;
+        inputs.config = config;
+        inputs.extended_context = extended_context;
         shared.replace(loaded);
-        drop(inputs);
-        self.start_timer(refresh_interval, age);
+        self.start_timer(interval, age, None);
         Ok(())
     }
 
@@ -376,19 +488,18 @@ impl Models {
     /// failure the previous catalog stays and the error is returned; a provider whose
     /// discovery fails keeps its previous models. Registrations are kept.
     pub async fn refresh(&self) -> Result<(), Error> {
-        self.shared.refresh().await
+        self.shared.refresh(None).await
     }
 
     /// Restarts the refresh timer: the first refresh once the cache is `interval` old, then
     /// every `interval`. No timer without a cache directory or with an interval of 0.
-    fn start_timer(&self, refresh_interval: Option<u64>, age: Duration) {
-        let interval = Duration::from_secs(refresh_interval.unwrap_or(DEFAULT_REFRESH_INTERVAL));
+    fn start_timer(&self, interval: Duration, age: Duration, mut skip: Option<HashSet<String>>) {
         let task = (self.shared.cache_dir.is_some() && !interval.is_zero()).then(|| {
             let shared = Arc::clone(&self.shared);
             tokio::spawn(async move {
                 tokio::time::sleep(interval.saturating_sub(age)).await;
                 loop {
-                    if let Err(error) = shared.refresh().await {
+                    if let Err(error) = shared.refresh(skip.take().as_ref()).await {
                         tracing::warn!("model refresh failed: {error}");
                     }
                     tokio::time::sleep(interval).await;
@@ -405,9 +516,10 @@ impl Models {
     /// Adds `provider` and its models, replacing an earlier registration of the same id. While
     /// registered it fully replaces a loaded provider of that id: the loaded models, env vars,
     /// `models.jsonc` key, headers and overrides, and built-in login are unused until
-    /// `unregister`. A `ProviderLayer` provider of the same id hides it.
-    pub fn register(&self, provider: Provider) -> Result<(), Error> {
-        let (id, registered) = Registered::new(provider)?;
+    /// `unregister`. A `ProviderLayer` provider of the same id hides it. `owner` is the
+    /// host-assigned stable identity of the contributor whose credentials this registration uses.
+    pub fn register(&self, owner: &str, provider: Provider) -> Result<(), Error> {
+        let (id, registered) = Registered::new(provider, "registered", owner)?;
         let mut state = self.shared.write();
         state.registered.insert(id, registered);
         state.rebuild();
@@ -429,7 +541,7 @@ impl Models {
 
     /// A new, empty provider layer, newer than every existing one. The registry does not own
     /// it: the caller fills it with `ProviderLayer::replace` and drops it to remove it.
-    pub fn provider_layer(self: &Arc<Self>) -> ProviderLayer {
+    pub fn provider_layer(&self) -> ProviderLayer {
         ProviderLayer {
             shared: Arc::clone(&self.shared),
             ordinal: self.shared.next_layer.fetch_add(1, Ordering::Relaxed),
@@ -439,15 +551,20 @@ impl Models {
     /// Look up `provider/model-id` (the model id may itself contain `/`).
     pub fn find(&self, selector: &str) -> Option<Model> {
         let (provider, id) = selector.split_once('/')?;
-        self.all()
-            .iter()
-            .find(|model| model.provider == provider && model.id == id)
-            .cloned()
+        self.shared
+            .read()
+            .lookup(provider, id)
+            .map(|model| model.as_ref().clone())
+    }
+
+    /// The current model definition, including a reserved but unavailable winner.
+    pub fn lookup(&self, provider: &str, id: &str) -> Option<Arc<Model>> {
+        self.shared.read().lookup(provider, id).cloned()
     }
 
     /// Every model: loaded models of providers that are not replaced, then the winning
     /// registered and layered ones (unavailable providers included).
-    pub fn all(&self) -> Arc<[Model]> {
+    pub fn all(&self) -> Arc<[Arc<Model>]> {
         Arc::clone(&self.shared.read().snapshot)
     }
 
@@ -477,6 +594,11 @@ impl Models {
             .collect()
     }
 
+    /// Opaque credential-store key for the current provider origin, even when unavailable.
+    pub fn credential_slot(&self, provider: &str) -> Result<String, Error> {
+        Ok(self.provider(provider, false)?.slot.clone())
+    }
+
     /// Where the provider's credential would come from now, in auth order.
     /// Never resolves config values, refreshes OAuth tokens, or validates credentials.
     pub async fn credential_source(&self, provider: &str) -> Result<CredentialSource, Error> {
@@ -495,18 +617,26 @@ impl Models {
         provider: &str,
         interaction: &dyn LoginInteraction,
     ) -> Result<(), Error> {
-        let login = self
-            .provider(provider, true)?
+        let info = self.provider(provider, true)?;
+        let login = info
             .login
-            .clone()
+            .as_ref()
             .ok_or_else(|| Error::Auth(format!("provider {provider} does not support login")))?;
         let credential = login.login(interaction).await?;
-        self.shared.credentials.set(provider, credential).await?;
-        // A new ChatGPT login may unlock a different Codex model list.
-        if provider == codex_auth::PROVIDER && self.shared.read().runtime(provider).is_none() {
+        self.shared.credentials.set(&info.slot, credential).await?;
+        // Only a login for this still-visible loaded Codex record should refresh the account list.
+        if provider == codex_auth::PROVIDER && {
+            let state = self.shared.read();
+            state.runtime(provider).is_none()
+                && state
+                    .loaded
+                    .providers
+                    .get(provider)
+                    .is_some_and(|current| Arc::ptr_eq(current, &info))
+        } {
             let shared = Arc::clone(&self.shared);
             tokio::spawn(async move {
-                if let Err(error) = shared.refresh().await {
+                if let Err(error) = shared.refresh_codex().await {
                     tracing::warn!("model refresh failed: {error}");
                 }
             });
@@ -547,14 +677,13 @@ impl Models {
     /// `ProviderUnavailable` when its provider is reserved but cannot run.
     fn request(&self, model: &Model) -> Result<Request, Error> {
         let state = self.shared.read();
-        let model = state
-            .snapshot
-            .iter()
-            .find(|current| current.provider == model.provider && current.id == model.id)
-            .ok_or_else(|| Error::UnknownModel {
-                provider: model.provider.clone(),
-                model: model.id.clone(),
-            })?;
+        let model =
+            state
+                .lookup(&model.provider, &model.id)
+                .ok_or_else(|| Error::UnknownModel {
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                })?;
         if let Some((registered, unavailability)) = state.runtime(&model.provider) {
             if let Some(reason) = unavailability {
                 return Err(unavailable(&model.provider, reason));
@@ -624,22 +753,59 @@ impl Shared {
             .collect()
     }
 
-    async fn refresh(&self) -> Result<(), Error> {
+    async fn refresh(&self, skip: Option<&HashSet<String>>) -> Result<(), Error> {
         let mut inputs = self.inputs.lock().await;
-        let codex_replaced = self.read().runtime(codex_auth::PROVIDER).is_some();
-        let result = gather(
+        let visible = |id: &str| self.read().runtime(id).is_none();
+        let pending = gather(
             &self.http,
             self.cache_dir.as_deref(),
             &self.credentials,
-            codex_replaced,
-            &mut inputs,
+            &visible,
+            &inputs.config,
         )
         .await;
-        // A failed catalog fetch leaves `inputs.catalog`, so discovery changes still apply.
-        let loaded = build(&inputs, &self.credentials, &self.http, &|id| {
-            self.loaded_ids(id)
+        self.publish(&mut inputs, pending, &|id| {
+            !skip.is_some_and(|set| set.contains(id)) && visible(id)
         })
+        .await
+    }
+
+    async fn refresh_codex(&self) -> Result<(), Error> {
+        let mut inputs = self.inputs.lock().await;
+        let Some(list) = discover_codex(&self.http, &self.credentials, &inputs.config, &|id| {
+            self.read().runtime(id).is_none()
+        })
+        .await
+        else {
+            return Ok(());
+        };
+        self.publish(
+            &mut inputs,
+            Pending {
+                codex: Some(list),
+                catalog: Ok(None),
+            },
+            &|_| false,
+        )
+        .await
+    }
+
+    async fn publish(
+        &self,
+        inputs: &mut Inputs,
+        pending: Pending,
+        discover: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<(), Error> {
+        let loaded = build(
+            pending.candidate(inputs),
+            &self.credentials,
+            &self.http,
+            &|id| self.loaded_ids(id),
+            discover,
+            None,
+        )
         .await?;
+        let result = pending.commit(inputs, self.cache_dir.as_deref()).await;
         self.replace(loaded);
         result
     }
@@ -648,12 +814,12 @@ impl Shared {
 impl ProviderLayer {
     /// Replaces this layer's providers with `entries`; `Some(reason)` reserves a provider as
     /// unavailable (see `set_unavailable`). Every entry is validated (`Provider::validate`,
-    /// no repeated id) before anything changes; on `Err` the previous contents stay. An
-    /// empty list removes this layer's providers.
-    pub fn replace(&self, entries: Vec<(Provider, Option<String>)>) -> Result<(), Error> {
+    /// nonempty stable credential owner, no repeated id) before anything changes; on `Err`
+    /// the previous contents stay. An empty list removes this layer's providers.
+    pub fn replace(&self, entries: Vec<(String, Provider, Option<String>)>) -> Result<(), Error> {
         let mut layer = BTreeMap::new();
-        for (provider, unavailable) in entries {
-            let (id, provider) = Registered::new(provider)?;
+        for (owner, provider, unavailable) in entries {
+            let (id, provider) = Registered::new(provider, "layer", &owner)?;
             match layer.entry(id) {
                 Entry::Occupied(entry) => {
                     return Err(Error::Config(format!(
@@ -671,7 +837,9 @@ impl ProviderLayer {
         }
         let mut state = self.shared.write();
         if layer.is_empty() {
-            state.layers.remove(&self.ordinal);
+            if state.layers.remove(&self.ordinal).is_none() {
+                return Ok(());
+            }
         } else {
             state.layers.insert(self.ordinal, layer);
         }
@@ -726,53 +894,33 @@ impl Drop for ProviderLayer {
     }
 }
 
-/// Downloads the Codex model list (unless a registration replaces `openai-codex`) and the
-/// catalog concurrently, saves them to the cache, and records them in `inputs`. The catalog
-/// is skipped without a cache directory. `Err` is a catalog failure and leaves
-/// `inputs.catalog` and the catalog cache as they were; a Codex failure only logs and keeps
-/// `inputs.codex`.
+/// Fetch independent feeds concurrently. Neither is committed until their candidate builds.
 async fn gather(
     http: &reqwest::Client,
     cache_dir: Option<&Path>,
     credentials: &Arc<dyn CredentialStore>,
-    codex_replaced: bool,
-    inputs: &mut Inputs,
-) -> Result<(), Error> {
-    let codex = async {
-        if codex_replaced {
-            None
-        } else {
-            discover_codex(http, cache_dir, credentials, &inputs.config).await
-        }
-    };
+    visible: &(dyn Fn(&str) -> bool + Sync),
+    config: &ModelsConfig,
+) -> Pending {
+    let codex = discover_codex(http, credentials, config, visible);
     let catalog = async {
         match cache_dir {
-            Some(dir) => {
-                let url = inputs.config.catalog_url.as_deref().unwrap_or(catalog::URL);
-                fetch_catalog(http, dir, url).await.map(Some)
+            Some(_) => {
+                let url = config.catalog_url.as_deref().unwrap_or(catalog::URL);
+                fetch_catalog(http, url).await.map(Some)
             }
             None => Ok(None),
         }
     };
     let (codex, catalog) = futures::future::join(codex, catalog).await;
-    // Before `catalog?`, so a catalog failure does not discard the Codex list.
-    if let Some(list) = codex {
-        inputs.codex = Some(list);
-    }
-    if let Some(mapped) = catalog? {
-        inputs.catalog = Some(Arc::new(mapped));
-        inputs.catalog_fetched = Some(Instant::now());
-    }
-    Ok(())
+    Pending { codex, catalog }
 }
 
-/// Downloads and maps the catalog at `url` and saves it under `dir`. A feed that maps to no
-/// model (its schema drifted) is an error and is not saved.
+/// Downloads and maps the catalog. A feed with no usable models is not a candidate.
 async fn fetch_catalog(
     http: &reqwest::Client,
-    dir: &Path,
     url: &str,
-) -> Result<rules::CatalogModels, Error> {
+) -> Result<(bytes::Bytes, rules::CatalogModels), Error> {
     let (bytes, catalog) = catalog::fetch(http, url).await?;
     let mapped = rules::map_catalog(&catalog);
     if mapped.models.is_empty() {
@@ -780,23 +928,20 @@ async fn fetch_catalog(
             "models.dev catalog has no usable models".into(),
         ));
     }
-    if let Err(error) = catalog::write_atomic(&catalog::path(dir), &bytes).await {
-        tracing::warn!(
-            "cannot write models.dev cache in {}: {error}",
-            dir.display()
-        );
-    }
-    Ok(mapped)
+    Ok((bytes, mapped))
 }
 
 /// The account's current Codex list. `None` without Codex credentials, or after a warning
 /// when the request fails.
 async fn discover_codex(
     http: &reqwest::Client,
-    cache_dir: Option<&Path>,
     credentials: &Arc<dyn CredentialStore>,
     config: &ModelsConfig,
+    visible: &(dyn Fn(&str) -> bool + Sync),
 ) -> Option<Vec<CodexModel>> {
+    if !visible(codex_auth::PROVIDER) {
+        return None;
+    }
     let provider = config.providers.get(codex_auth::PROVIDER);
     let config_base_url = provider.and_then(|provider| provider.base_url.clone());
     let auth = catalog_provider_auth(codex_auth::PROVIDER.to_owned(), Vec::new(), config, http);
@@ -817,21 +962,14 @@ async fn discover_codex(
             let base_url = config_base_url
                 .or_else(|| auth.base_url.clone())
                 .unwrap_or_else(|| codex_auth::BASE_URL.to_owned());
+            if !visible(codex_auth::PROVIDER) {
+                return None;
+            }
             codex::discover(http, &base_url, auth).await
         }
     };
     match result {
-        Ok(list) => {
-            if let Some(dir) = cache_dir
-                && let Err(error) = codex::write(dir, &list).await
-            {
-                tracing::warn!(
-                    "cannot write the Codex model cache in {}: {error}",
-                    dir.display()
-                );
-            }
-            Some(list)
-        }
+        Ok(list) => Some(list),
         Err(error) => {
             tracing::warn!("Codex model discovery failed, keeping the previous list: {error}");
             None
@@ -853,22 +991,25 @@ fn catalog_provider_auth(
         requires_key: true,
         login: (id == codex_auth::PROVIDER)
             .then(|| Arc::new(CodexLogin::new(http.clone())) as Arc<dyn ProviderLogin>),
+        slot: format!("loaded/{id}"),
         id,
     }
 }
 
-/// Builds the loaded catalog from `inputs`: models.dev and Codex models, patched and extended
+/// Builds the loaded catalog from candidate models.dev and Codex feeds, patched and extended
 /// by `models.jsonc`, with discovered models of `openai-completions` config providers. A
 /// provider whose discovery fails keeps the ids `previous` returns for it.
 async fn build(
-    inputs: &Inputs,
+    candidate: Candidate<'_>,
     credentials: &Arc<dyn CredentialStore>,
     http: &reqwest::Client,
     previous: &(dyn Fn(&str) -> Vec<String> + Sync),
+    visible: &(dyn Fn(&str) -> bool + Sync),
+    attempted: Option<&mut HashSet<String>>,
 ) -> Result<Loaded, Error> {
-    let config = &inputs.config;
-    let (mut models, envs) = rules::build(inputs.catalog.as_deref(), inputs.codex.as_deref());
-    if !inputs.extended_context {
+    let config = candidate.config;
+    let (mut models, envs) = rules::build(candidate.catalog, candidate.codex);
+    if !candidate.extended_context {
         models.iter_mut().for_each(rules::cap_at_price_tier);
     }
     let mut providers: HashMap<String, Arc<ProviderAuth>> = envs
@@ -886,10 +1027,15 @@ async fn build(
             && !providers.contains_key(id.as_str())
     };
     let to_discover: Vec<_> = config.providers.iter().filter(discoverable).collect();
+    // Only stale-cache startup asks for this set, and every startup target is visible.
+    if let Some(attempted) = attempted {
+        attempted.extend(to_discover.iter().map(|(id, _)| (*id).clone()));
+    }
     for (id, provider) in &config.providers {
         providers.entry(id.clone()).or_insert_with(|| {
             Arc::new(ProviderAuth {
                 id: id.clone(),
+                slot: format!("loaded/{id}"),
                 config_api_key: provider.api_key.clone(),
                 env: Vec::new(),
                 requires_key: false,
@@ -900,10 +1046,11 @@ async fn build(
     let results = futures::future::join_all(to_discover.iter().map(|(id, provider)| {
         discover::discover(
             http,
-            Arc::clone(&providers[id.as_str()]),
-            Arc::clone(credentials),
+            &providers[id.as_str()],
+            credentials,
             provider.base_url.as_deref().unwrap_or_default(),
-            provider.headers.clone(),
+            &provider.headers,
+            visible,
         )
     }))
     .await;
@@ -911,13 +1058,17 @@ async fn build(
         .iter()
         .zip(results)
         .map(|((id, provider), result)| {
-            let ids = result.unwrap_or_else(|error| {
-                let base_url = provider.base_url.as_deref().unwrap_or_default();
-                tracing::warn!(
-                    "model discovery for provider {id} at {base_url} failed, keeping its previous models: {error}"
-                );
-                previous(id)
-            });
+            let ids = match result {
+                Ok(Some(ids)) => ids,
+                Ok(None) => previous(id),
+                Err(error) => {
+                    let base_url = provider.base_url.as_deref().unwrap_or_default();
+                    tracing::warn!(
+                        "model discovery for provider {id} at {base_url} failed, keeping its previous models: {error}"
+                    );
+                    previous(id)
+                }
+            };
             (id.as_str(), ids)
         })
         .collect();
@@ -931,13 +1082,17 @@ async fn build(
             .filter(|model| &model.provider == provider_id)
         {
             if let Some(base_url) = &provider.base_url {
-                model.base_url = base_url.clone();
+                Arc::make_mut(model).base_url.clone_from(base_url);
                 config_base_urls.insert((provider_id.clone(), model.id.clone()));
             }
             if let Some(api) = provider.api {
-                model.api = api;
+                Arc::make_mut(model).api = api;
             }
-            merge_compat(model, provider.compat.as_ref())?;
+            if let Some(compat) = &provider.compat
+                && !compat.is_empty()
+            {
+                merge_compat(Arc::make_mut(model), Some(compat))?;
+            }
             if !provider.headers.is_empty() {
                 config_headers
                     .entry((model.provider.clone(), model.id.clone()))
@@ -987,7 +1142,7 @@ async fn build(
                         .find(|model| &model.provider == provider_id && model.id == config.id)
                     {
                         Some(model) => {
-                            config.patch.apply(model, headers)?;
+                            apply_patch(&config.patch, model, headers)?;
                             if config.patch.base_url.is_some() {
                                 config_base_urls.insert((provider_id.clone(), config.id.clone()));
                             }
@@ -1001,7 +1156,7 @@ async fn build(
                             headers.extend(provider.headers.clone());
                             config.patch.apply(&mut model, headers)?;
                             config_base_urls.insert((provider_id.clone(), config.id.clone()));
-                            models.push(model);
+                            models.push(Arc::new(model));
                         }
                     }
                 }
@@ -1014,7 +1169,7 @@ async fn build(
                             .insert((provider_id.clone(), id.clone()), provider.headers.clone());
                     }
                     config_base_urls.insert((provider_id.clone(), id.clone()));
-                    models.push(model);
+                    models.push(Arc::new(model));
                 }
             }
         }
@@ -1027,7 +1182,7 @@ async fn build(
                 let headers = config_headers
                     .entry((provider_id.clone(), model_id.clone()))
                     .or_default();
-                patch.apply(model, headers)?;
+                apply_patch(patch, model, headers)?;
                 if patch.base_url.is_some() {
                     config_base_urls.insert((provider_id.clone(), model_id.clone()));
                 }
@@ -1042,6 +1197,36 @@ async fn build(
         config_headers,
         config_base_urls,
     })
+}
+
+fn apply_patch(
+    patch: &config::ModelPatch,
+    model: &mut Arc<Model>,
+    headers: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    // A header-only patch changes request authentication, not the shared model definition.
+    if matches!(
+        patch,
+        config::ModelPatch {
+            name: None,
+            api: None,
+            base_url: None,
+            reasoning: None,
+            thinking_level_map: None,
+            input: None,
+            cost: None,
+            service_tiers: None,
+            context_window: None,
+            max_tokens: None,
+            compat: None,
+            headers: _
+        }
+    ) {
+        headers.extend(patch.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+        Ok(())
+    } else {
+        patch.apply(Arc::make_mut(model), headers)
+    }
 }
 
 impl Streamer for Models {
@@ -1122,4 +1307,87 @@ fn failed(
     message.error_message = Some(error);
     message.failure = failure;
     stream::iter([AssistantEvent::Error { reason, message }]).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn post_login_refresh_only_discovers_codex() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                let path = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .split('?')
+                    .next()
+                    .unwrap();
+                let body = match path {
+                    "/v1/models" => r#"{"data":[{"id":"other"}]}"#,
+                    "/codex/models" => r#"{"models":[{"slug":"account","context_window":4096}]}"#,
+                    _ => "{}",
+                };
+                send.send(path.to_owned()).unwrap();
+                loop {
+                    line.clear();
+                    if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(catalog::path(dir.path()), b"{}")
+            .await
+            .unwrap();
+        let credentials = Arc::new(crate::FileCredentialStore::new(
+            dir.path().join("auth.json"),
+        ));
+        let models = Models::load(ModelsOptions {
+            cache_dir: Some(dir.path().to_owned()),
+            credentials: credentials.clone(),
+            extended_context: false,
+            http_client: None,
+            config: serde_json::from_value(serde_json::json!({
+                "catalogUrl": format!("{url}/api.json"), "refreshInterval": 0,
+                "providers": {
+                    "openai-codex": {"baseUrl": url},
+                    "local": {"baseUrl": format!("{url}/v1"), "api": "openai-completions"}
+                }
+            }))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests.try_recv().unwrap(), "/v1/models");
+        assert!(models.find("openai-codex/account").is_none());
+        credentials
+            .set(
+                &models.credential_slot("openai-codex").unwrap(),
+                crate::Credential::ApiKey {
+                    key: "token".into(),
+                },
+            )
+            .await
+            .unwrap();
+        models.shared.refresh_codex().await.unwrap();
+        assert_eq!(requests.try_recv().unwrap(), "/codex/models");
+        assert!(requests.try_recv().is_err());
+        assert!(models.find("openai-codex/account").is_some());
+        assert!(models.find("local/other").is_some());
+        server.abort();
+    }
 }

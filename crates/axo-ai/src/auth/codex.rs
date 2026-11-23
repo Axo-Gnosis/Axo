@@ -30,7 +30,7 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const SCOPE: &str = "openid profile email offline_access";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 const ORIGINATOR: &str = "axo";
-/// The provider id credentials are stored under.
+/// The provider selector for built-in Codex.
 pub const PROVIDER: &str = "openai-codex";
 /// The ChatGPT backend serving Codex models.
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -212,9 +212,9 @@ async fn credential_from_response(
         access: access.to_owned(),
         refresh: refresh.to_owned(),
         expires,
-        headers: BTreeMap::from([("chatgpt-account-id".to_owned(), account_id.clone())]),
+        headers: BTreeMap::from([("chatgpt-account-id".to_owned(), account_id)]),
         base_url: None,
-        extra: Map::from_iter([("accountId".to_owned(), Value::String(account_id))]),
+        extra: Map::new(),
     })
 }
 

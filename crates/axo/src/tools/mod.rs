@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_macros::expose;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use regex::Regex;
 use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
@@ -104,10 +105,21 @@ pub struct SessionTools {
 /// built-ins do.
 pub type ToolFactory = Arc<dyn Fn(&Arc<SessionTools>) -> Arc<dyn Tool> + Send + Sync>;
 
+/// Tests tool name syntax, independently of session-specific reservations.
+pub fn valid_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
 /// Whether a host tool is declared directly or discovered through `tool://`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum Exposure {
+    #[default]
     Direct,
     Deferred,
 }
@@ -225,40 +237,38 @@ impl SessionTools {
         &self.schemes.context().session_id
     }
 
-    /// Records a completed write under the caller's `lock_file` guard. `before` is
-    /// the content read under that guard, or `None` for a new file. Changed bytes
-    /// produce a snapshot-backed change alongside the updated ledger record.
+    /// Records a completed write under the caller's `lock_file` guard, reusing the
+    /// verified before digest for its snapshot.
     async fn record_change(
         &self,
         path: &Path,
         url: Option<&str>,
-        before: Option<Vec<u8>>,
+        before: writes::Before,
         after: Vec<u8>,
     ) -> FileRecord {
+        let (before_blob, before) = match before {
+            writes::Before::Identical(hash) => {
+                return FileRecord {
+                    ledger: self.ledger.record_hash(path, hash, FileAccess::Modify),
+                    change: None,
+                };
+            }
+            writes::Before::Created => (None, Vec::new()),
+            writes::Before::Changed { bytes, sha256 } => {
+                (Some(self.blob(sha256, &bytes).await), bytes)
+            }
+        };
         let after_sha = FileLedger::hash(&after);
         let ledger = self
             .ledger
             .record_hash(path, after_sha.clone(), FileAccess::Modify);
-        if before.as_deref() == Some(after.as_slice()) {
-            return FileRecord {
-                ledger,
-                change: None,
-            };
-        }
-        let before_blob = match &before {
-            Some(bytes) => {
-                let sha256 = FileLedger::hash(bytes);
-                Some(self.blob(sha256, bytes).await)
-            }
-            None => None,
-        };
         let after_blob = self.blob(after_sha, &after).await;
-        let created = before.is_none();
+        let created = before_blob.is_none();
         let label = (!created).then(|| url.map_or_else(|| path.display().to_string(), Into::into));
-        let diff = changes::line_diff(before.unwrap_or_default(), after, label).await;
+        let diff = changes::line_diff(before, after, label).await;
         let change = FileChange {
             path: path.to_string_lossy().into_owned(),
-            key: file_key(path).to_string_lossy().into_owned(),
+            key: URL_SAFE_NO_PAD.encode(file_key(path).as_os_str().as_encoded_bytes()),
             url: url.map(Into::into),
             created,
             before: before_blob,
@@ -303,20 +313,34 @@ impl SessionTools {
     /// Cleans and resolves a scheme URL or ordinary filesystem path.
     #[ext]
     pub async fn locate(&self, path: &str) -> Result<Located, ToolError> {
+        Ok(self.locate_handler(path).await?.0)
+    }
+
+    async fn locate_handler(
+        &self,
+        path: &str,
+    ) -> Result<(Located, Option<Arc<dyn crate::Scheme>>), ToolError> {
         let Some(url) = self.parse_url(path)? else {
-            return Ok(Located::File {
-                path: self.resolve_path(path),
-                url: None,
-                writable: true,
-            });
+            return Ok((
+                Located::File {
+                    path: self.resolve_path(path),
+                    url: None,
+                    writable: true,
+                },
+                None,
+            ));
         };
-        match self.schemes.resolve(&url).await? {
-            Target::File { path, writable } => Ok(Located::File {
-                url: Some(url),
-                path,
-                writable,
-            }),
-            Target::Virtual => Ok(Located::Virtual { url }),
+        let (handler, target) = self.schemes.resolve_handler(&url).await?;
+        match target {
+            Target::File { path, writable } => Ok((
+                Located::File {
+                    url: Some(url),
+                    path,
+                    writable,
+                },
+                None,
+            )),
+            Target::Virtual => Ok((Located::Virtual { url }, Some(handler))),
         }
     }
 

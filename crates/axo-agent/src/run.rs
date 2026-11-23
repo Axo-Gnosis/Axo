@@ -29,7 +29,7 @@ use crate::hooks::{
 use crate::message::{AgentMessage, QueuedMessage, last_non_system, unanswered_calls};
 use crate::tool::{
     ExecutionMode, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
-    ToolUpdate, ToolUpdates,
+    ToolUpdate, ToolUpdates, execute_call,
 };
 
 pub struct Routed<'a> {
@@ -157,7 +157,7 @@ enum Prepared {
     Ready(Arc<dyn Tool>, ToolCall),
 }
 
-/// How long a stopped call may take to return on its own before its task is aborted.
+/// How long a stopped call may take to return on its own before its future is dropped.
 /// Covers bash's SIGTERM→SIGKILL grace (1 s) plus its drain.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
@@ -165,10 +165,11 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// updates arrive on.
 // ponytail: a loop panic drops the batch unjoined; stragglers are bounded by the job registry's settle-time cleanup
 struct Batch {
-    tasks: JoinSet<(Result<ToolOutput, ToolError>, u64)>,
+    tasks: JoinSet<(Result<ToolOutput, ToolError>, u64, bool)>,
     calls: HashMap<Id, Spawned>,
     /// A child of the run's token; also fired when persisting the batch fails.
     cancel: CancellationToken,
+    hard_stop: CancellationToken,
     sender: mpsc::UnboundedSender<(Arc<str>, ToolUpdate)>,
     updates: mpsc::UnboundedReceiver<(Arc<str>, ToolUpdate)>,
 }
@@ -180,6 +181,7 @@ impl Batch {
             tasks: JoinSet::new(),
             calls: HashMap::new(),
             cancel: run_cancel.child_token(),
+            hard_stop: CancellationToken::new(),
             sender,
             updates,
         }
@@ -697,9 +699,10 @@ impl Run<'_> {
             invocation,
         };
         let started = Instant::now();
+        let hard_stop = batch.hard_stop.clone();
         let task = batch.tasks.spawn(async move {
-            let result = tool.execute(cx).await;
-            (result, elapsed_ms(started))
+            let (result, executed) = execute_call(tool.as_ref(), cx, &hard_stop).await;
+            (result, elapsed_ms(started), executed)
         });
         batch.calls.insert(
             task.id(),
@@ -715,7 +718,7 @@ impl Run<'_> {
     /// Awaits the batch's tasks, forwarding their updates, and emits each
     /// `ToolExecutionEnd` (after `after_tool_call`, on this task) as its call completes.
     /// Cancellation is cooperative: each call's token fires and the loop keeps joining;
-    /// calls still running `STOP_GRACE` later are aborted and end as aborted. A
+    /// calls still running `STOP_GRACE` later are dropped and any armed recovery settles. A
     /// persistence failure stops the batch the same way and is returned only after every
     /// call was joined. A panicked call ends as an error. Returns the outcomes in
     /// completion order.
@@ -727,7 +730,6 @@ impl Run<'_> {
         drop(batch.sender);
         let mut finished = Vec::with_capacity(batch.calls.len());
         let mut stopping: Option<Instant> = None;
-        let mut aborted = false;
         let mut failure: Option<Error> = None;
         loop {
             let joined = tokio::select! {
@@ -746,10 +748,9 @@ impl Run<'_> {
                     continue;
                 }
                 () = tokio::time::sleep_until(stopping.unwrap_or_else(Instant::now).into()),
-                    if stopping.is_some() && !aborted =>
+                    if stopping.is_some() && !batch.hard_stop.is_cancelled() =>
                 {
-                    batch.tasks.abort_all();
-                    aborted = true;
+                    batch.hard_stop.cancel();
                     continue;
                 }
                 joined = batch.tasks.join_next_with_id() => joined,
@@ -766,12 +767,11 @@ impl Run<'_> {
                 continue;
             }
             let (output, duration_ms, executed) = match result {
-                Ok((result, duration_ms)) => (
+                Ok((result, duration_ms, executed)) => (
                     result.unwrap_or_else(|error| error_output(error.0)),
                     duration_ms,
-                    true,
+                    executed,
                 ),
-                // Aborted after the grace above: the call never returned.
                 Err(error) if error.is_cancelled() => (
                     error_output("Operation aborted"),
                     elapsed_ms(spawned.started),

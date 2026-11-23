@@ -5,11 +5,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 use axo_ai::thinking::supported_levels;
 use axo_ai::{
-    ApiKind, Error, FileCredentialStore, Models, ModelsConfig, ModelsOptions, ThinkingLevel,
-    TranscriptToolSupport,
+    ApiKind, Error, FileCredentialStore, Models, ModelsConfig, ModelsOptions, Provider,
+    ThinkingLevel, TranscriptToolSupport,
 };
 use serde_json::{Value, json};
 
@@ -77,6 +78,16 @@ impl Feed {
             .lock()
             .unwrap()
             .insert(path.into(), (status, body.to_string()));
+    }
+
+    fn gets(&self, path: &str) -> usize {
+        let prefix = format!("GET {path} ");
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|head| head.starts_with(&prefix))
+            .count()
     }
 }
 
@@ -271,6 +282,71 @@ async fn refresh_applies_new_catalog_data_and_keeps_the_last_good_one() {
 }
 
 #[tokio::test]
+async fn rejected_catalog_does_not_replace_bootable_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = Feed::start();
+    feed.set("/api.json", 200, &catalog_of(&["a"]));
+    let config = json!({
+        "refreshInterval": 0,
+        "catalogUrl": format!("{}/api.json", feed.url),
+        "providers": {"p": {"models": [{"id": "a", "name": "patched"}]}}
+    });
+    let models = load(dir.path(), config.clone(), false).await;
+    let cache = dir.path().join("models.dev.v2.json");
+    let cached = std::fs::read(&cache).unwrap();
+
+    feed.set("/api.json", 200, &catalog_of(&["b"]));
+    assert!(matches!(
+        models.refresh().await,
+        Err(Error::Config(message)) if message.contains(r#"models.jsonc: model p/a has no "api""#)
+    ));
+    assert_eq!(std::fs::read(&cache).unwrap(), cached);
+    assert_eq!(models.find("p/a").unwrap().name, "patched");
+    assert!(models.find("p/b").is_none());
+    models
+        .reload(serde_json::from_value(config.clone()).unwrap(), false)
+        .await
+        .unwrap();
+    assert_eq!(models.find("p/a").unwrap().name, "patched");
+    drop(models);
+    let reopened = load(dir.path(), config, false).await;
+    assert_eq!(reopened.find("p/a").unwrap().name, "patched");
+    assert_eq!(feed.gets("/api.json"), 2);
+}
+
+#[tokio::test]
+async fn stale_start_discovers_config_provider_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = std::fs::File::create(dir.path().join("models.dev.v2.json")).unwrap();
+    serde_json::to_writer(&mut cache, &catalog_of(&["old"])).unwrap();
+    cache.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+    drop(cache);
+
+    let feed = Feed::start();
+    feed.set("/api.json", 200, &catalog_of(&["new"]));
+    feed.set("/v1/models", 200, &json!({"data": [{"id": "discovered"}]}));
+    let config = json!({
+        "refreshInterval": 3600,
+        "catalogUrl": format!("{}/api.json", feed.url),
+        "providers": {"local": {"api": "openai-completions", "baseUrl": format!("{}/v1", feed.url)}}
+    });
+    let models = load(dir.path(), config, false).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while models.find("p/new").is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stale catalog was not refreshed");
+    let counts = || [feed.gets("/api.json"), feed.gets("/v1/models")];
+    assert_eq!(counts(), [1, 1]);
+    assert!(models.find("local/discovered").is_some());
+
+    models.refresh().await.unwrap();
+    assert_eq!(counts(), [2, 2]);
+}
+
+#[tokio::test]
 async fn failed_discovery_keeps_previous_models() {
     let dir = tempfile::tempdir().unwrap();
     let feed = Feed::start();
@@ -292,6 +368,92 @@ async fn failed_discovery_keeps_previous_models() {
 }
 
 #[tokio::test]
+async fn hidden_discovery_keeps_loaded_ids_without_contacting_the_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = Feed::start();
+    feed.set("/api.json", 200, &catalog_of(&["a"]));
+    feed.set("/v1/models", 200, &json!({"data": [{"id": "old"}]}));
+    feed.set(
+        "/codex/models",
+        200,
+        &json!({"models": [{"slug": "account", "context_window": 4096}]}),
+    );
+    std::fs::write(
+        dir.path().join("auth.json"),
+        r#"{"loaded/openai-codex":{"type":"api_key","key":"token"}}"#,
+    )
+    .unwrap();
+    let config = json!({
+        "refreshInterval": 0,
+        "catalogUrl": format!("{}/api.json", feed.url),
+        "providers": {
+            "local": {"api": "openai-completions", "baseUrl": format!("{}/v1", feed.url)},
+            "openai-codex": {"baseUrl": feed.url}
+        }
+    });
+    let models = Arc::new(load(dir.path(), config.clone(), false).await);
+    let request_counts = || {
+        let heads = feed.requests.lock().unwrap();
+        ["GET /v1/models ", "GET /codex/models?"]
+            .map(|prefix| heads.iter().filter(|head| head.starts_with(prefix)).count())
+    };
+    assert_eq!(request_counts(), [1, 1]);
+    let old = models.find("local/old").unwrap();
+    let account = models.find("openai-codex/account").unwrap();
+    feed.set("/v1/models", 200, &json!({"data": [{"id": "new"}]}));
+    feed.set("/api.json", 200, &catalog_of(&["b"]));
+
+    for gated in [false, true] {
+        let layer = models.provider_layer();
+        let replacements = [&old, &account].map(|model| {
+            let mut winner = model.clone();
+            winner.id = "winner".into();
+            Provider {
+                id: winner.provider.clone(),
+                models: vec![winner],
+                env: Vec::new(),
+                requires_key: false,
+                login: None,
+                rewrite: None,
+            }
+        });
+        if gated {
+            layer
+                .replace(
+                    replacements
+                        .map(|p| ("package".into(), p, Some("not ready".into())))
+                        .into(),
+                )
+                .unwrap();
+        } else {
+            for provider in replacements {
+                models.register("host", provider).unwrap();
+            }
+        }
+        models
+            .reload(serde_json::from_value(config.clone()).unwrap(), false)
+            .await
+            .unwrap();
+        models.refresh().await.unwrap();
+        assert_eq!(request_counts(), [1, 1]);
+        assert!(models.find("p/b").is_some());
+        drop(layer);
+        if !gated {
+            assert!(models.unregister("local"));
+            assert!(models.unregister("openai-codex"));
+        }
+        assert_eq!(models.find("local/old").as_ref(), Some(&old));
+        assert_eq!(models.find("openai-codex/account").as_ref(), Some(&account));
+        assert!(models.find("local/winner").is_none());
+        assert!(models.find("local/new").is_none());
+    }
+    models.refresh().await.unwrap();
+    assert_eq!(request_counts(), [2, 2]);
+    assert!(models.find("local/new").is_some());
+    assert!(models.find("local/old").is_none());
+}
+
+#[tokio::test]
 async fn codex_models_come_from_the_account_list() {
     let dir = tempfile::tempdir().unwrap();
     let feed = Feed::start();
@@ -305,12 +467,15 @@ async fn codex_models_come_from_the_account_list() {
     };
     let mut bare = row("gpt-bare", "list");
     bare["supported_reasoning_levels"] = json!([{"effort": "ultra"}]);
+    let mut switchable = row("gpt-switchable", "list");
+    switchable["supported_reasoning_levels"] = json!([{"effort": "none"}, {"effort": "low"}]);
     feed.set(
         "/codex/models",
         200,
-        &json!({"models": [row("gpt-new", "list"), row("gpt-hidden", "hide"), bare]}),
+        &json!({"models": [row("gpt-new", "list"), row("gpt-hidden", "hide"), bare, switchable]}),
     );
     let mut catalog = catalog_of(&["a"]);
+    catalog["openai-codex"] = catalog_of(&["gpt-new", "impostor"])["p"].clone();
     catalog["openai"] = json!({"models": {"gpt-new": {
         "capabilities": {"reasoning": {"supported": true, "effort": ["none", "low", "high"]}},
         "cost": {"text": {"input": {"price": 3}, "output": {"price": 9}}}
@@ -326,6 +491,16 @@ async fn codex_models_come_from_the_account_list() {
     let models = load(dir.path(), config(&feed.url), true).await;
 
     let model = models.find("openai-codex/gpt-new").unwrap();
+    assert_eq!(model.api, ApiKind::OpenAiCodexResponses);
+    assert_eq!(
+        models
+            .all()
+            .iter()
+            .filter(|row| row.provider == "openai-codex" && row.id == "gpt-new")
+            .count(),
+        1
+    );
+    assert!(models.find("openai-codex/impostor").is_none());
     assert_eq!((model.cost.input, model.cost.output), (3.0, 9.0));
     assert_eq!(
         supported_levels(&model),
@@ -337,6 +512,15 @@ async fn codex_models_come_from_the_account_list() {
     let bare = models.find("openai-codex/gpt-bare").unwrap();
     assert!(!bare.reasoning);
     assert_eq!(supported_levels(&bare), [ThinkingLevel::Off]);
+    let switchable = models.find("openai-codex/gpt-switchable").unwrap();
+    assert_eq!(
+        supported_levels(&switchable),
+        [ThinkingLevel::Off, ThinkingLevel::Low]
+    );
+    assert_eq!(
+        switchable.thinking_level_map.unwrap()[&ThinkingLevel::Off].as_deref(),
+        Some("none")
+    );
     let requests = feed.requests.lock().unwrap().clone();
     let listed = requests
         .iter()

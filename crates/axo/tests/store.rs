@@ -94,6 +94,8 @@ fn branched_tree() -> Vec<SeqEntry> {
         Entry::ThinkingLevelChange {
             base: base("think", Some("aA")),
             thinking_level: ThinkingLevel::High,
+            automatic: false,
+            service_tier: None,
         },
         user_entry("uX", Some("think"), "omitted question"),
         assistant_entry("aX", "uX", "kept answer"),

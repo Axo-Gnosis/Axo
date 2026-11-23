@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, PoisonError};
 
 use async_trait::async_trait;
-use axo::ext::InvokeError;
+use axo::ext::{Caller, InvokeError, Meta};
 use axo::{EntryId, Error, ProjectAccess, PromptPart, Session};
 use axo_ai::ThinkingLevel;
+use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,11 +41,26 @@ pub struct ForkReceipt {
 /// shutdown, so a hook that needs the manager holds a `Weak<Extensions>`.
 #[async_trait]
 pub trait Lifecycle: Send + Sync {
-    async fn create(&self, cwd: PathBuf, request: SessionRequest) -> Result<Arc<Session>, Error>;
-    async fn open(&self, path: PathBuf, request: SessionRequest) -> Result<Arc<Session>, Error>;
-    async fn fork(&self, session: Arc<Session>, entry: EntryId) -> Result<Forked, Error>;
+    async fn create(
+        &self,
+        caller: &Caller,
+        cwd: PathBuf,
+        request: SessionRequest,
+    ) -> Result<Arc<Session>, Error>;
+    async fn open(
+        &self,
+        caller: &Caller,
+        path: PathBuf,
+        request: SessionRequest,
+    ) -> Result<Arc<Session>, Error>;
+    async fn fork(
+        &self,
+        caller: &Caller,
+        session: Arc<Session>,
+        entry: EntryId,
+    ) -> Result<Forked, Error>;
     /// Shut the session down and release it.
-    async fn close(&self, session_id: String) -> Result<(), Error>;
+    async fn close(&self, caller: &Caller, session_id: String) -> Result<(), Error>;
 }
 
 impl Extensions {
@@ -58,54 +74,107 @@ impl Extensions {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum Method {
-    Create,
-    Open,
-    Fork,
-    Close,
+pub(crate) struct LifecycleTarget {
+    inner: Arc<Inner>,
+    hook: Arc<dyn Lifecycle>,
 }
 
-/// One lifecycle method: its wire name, its TypeScript parameters and result as the SDK
-/// types them, and its decoder.
-pub struct LifecycleMethod {
-    pub name: &'static str,
-    pub params: &'static str,
-    pub result: &'static str,
-    pub(crate) method: Method,
+struct LifecycleWire<'a> {
+    target: &'a LifecycleTarget,
+    caller: &'a Caller,
 }
 
-pub const LIFECYCLE_METHODS: &[LifecycleMethod] = &[
-    LifecycleMethod {
-        name: "createSession",
-        params: "cwd: string, request?: SessionRequest",
-        result: "string",
-        method: Method::Create,
-    },
-    LifecycleMethod {
-        name: "openSession",
-        params: "path: string, request?: SessionRequest",
-        result: "string",
-        method: Method::Open,
-    },
-    LifecycleMethod {
-        name: "forkSession",
-        params: "sessionId: string, entryId: string",
-        result: "ForkReceipt",
-        method: Method::Fork,
-    },
-    LifecycleMethod {
-        name: "closeSession",
-        params: "sessionId: string",
-        result: "void",
-        method: Method::Close,
-    },
-];
+#[expose(block = HOST_LIFECYCLE, object = "hostLifecycle", target = LifecycleTarget)]
+impl<'a> LifecycleWire<'a> {
+    fn wire(target: &'a LifecycleTarget, caller: &'a Caller) -> Self {
+        Self { target, caller }
+    }
 
-impl Method {
+    async fn attach(&self, session: Arc<Session>) -> String {
+        self.target.inner.attach(&session).await;
+        session.id().to_owned()
+    }
+
+    #[ext]
+    pub async fn create_session(
+        &self,
+        cwd: PathBuf,
+        request: Option<SessionRequest>,
+    ) -> Result<String, InvokeError> {
+        let session = self
+            .target
+            .hook
+            .create(self.caller, cwd, request.unwrap_or_default())
+            .await?;
+        Ok(self.attach(session).await)
+    }
+
+    #[ext]
+    pub async fn open_session(
+        &self,
+        path: PathBuf,
+        request: Option<SessionRequest>,
+    ) -> Result<String, InvokeError> {
+        let session = self
+            .target
+            .hook
+            .open(self.caller, path, request.unwrap_or_default())
+            .await?;
+        Ok(self.attach(session).await)
+    }
+
+    #[ext]
+    pub async fn fork_session(
+        &self,
+        session_id: String,
+        entry_id: EntryId,
+    ) -> Result<ForkReceipt, InvokeError> {
+        let session = self.target.inner.resolve_session(&session_id).await?;
+        let fork = self
+            .target
+            .hook
+            .fork(self.caller, session, entry_id)
+            .await?;
+        Ok(ForkReceipt {
+            session: self.attach(fork.session).await,
+            editable: fork.editable,
+        })
+    }
+
+    #[ext]
+    pub async fn close_session(&self, session_id: String) -> Result<(), InvokeError> {
+        self.target
+            .hook
+            .close(self.caller, session_id.clone())
+            .await?;
+        self.target.inner.sessions.detach(&session_id);
+        Ok(())
+    }
+}
+
+#[doc(hidden)]
+pub fn lifecycle_methods() -> impl Iterator<Item = &'static Meta> {
+    HOST_LIFECYCLE.entries.iter().map(|entry| &entry.meta)
+}
+
+pub(super) struct LifecycleCall(
+    for<'a> fn(&'a LifecycleTarget, &'a Caller, Vec<Value>) -> axo::ext::CallFut<'a>,
+);
+
+pub(super) fn lookup(name: &str) -> Option<LifecycleCall> {
+    HOST_LIFECYCLE
+        .entries
+        .iter()
+        .find(|entry| entry.meta.name == name)?
+        .call
+        .map(LifecycleCall)
+}
+
+impl LifecycleCall {
     pub(super) async fn invoke(
         self,
-        inner: &Arc<Inner>,
+        inner: Arc<Inner>,
+        caller: Caller,
         args: Vec<Value>,
     ) -> Result<Value, Refusal> {
         let hook = inner
@@ -114,43 +183,12 @@ impl Method {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| Refusal {
-                code: "no_lifecycle".into(),
+                code: crate::peer::BridgeCode::NoLifecycle.into(),
                 message: "the host registered no session lifecycle hook".into(),
+                details: None,
             })?;
-        let args = Value::Array(args);
-        let invalid = |e: serde_json::Error| InvokeError::InvalidArguments(e.to_string());
-        match self {
-            Self::Create | Self::Open => {
-                #[derive(Deserialize)]
-                struct Request(PathBuf, #[serde(default)] Option<SessionRequest>);
-                let Request(path, request) = serde_json::from_value(args).map_err(invalid)?;
-                let request = request.unwrap_or_default();
-                let session = match self {
-                    Self::Create => hook.create(path, request).await,
-                    _ => hook.open(path, request).await,
-                }
-                .map_err(InvokeError::from)?;
-                inner.attach(&session).await;
-                Ok(session.id().into())
-            }
-            Self::Fork => {
-                let (id, entry): (String, EntryId) =
-                    serde_json::from_value(args).map_err(invalid)?;
-                let session = inner.resolve_session(&id).await?;
-                let fork = hook.fork(session, entry).await.map_err(InvokeError::from)?;
-                inner.attach(&fork.session).await;
-                serde_json::to_value(ForkReceipt {
-                    session: fork.session.id().to_owned(),
-                    editable: fork.editable,
-                })
-                .map_err(|error| InvokeError::Encode(error.to_string()).into())
-            }
-            Self::Close => {
-                let (id,): (String,) = serde_json::from_value(args).map_err(invalid)?;
-                hook.close(id.clone()).await.map_err(InvokeError::from)?;
-                inner.sessions.detach(&id);
-                Ok(Value::Null)
-            }
-        }
+        (self.0)(&LifecycleTarget { inner, hook }, &caller, args)
+            .await
+            .map_err(Into::into)
     }
 }

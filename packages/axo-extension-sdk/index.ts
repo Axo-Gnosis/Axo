@@ -22,38 +22,27 @@
 // match both ways:
 // - `providers` is keyed by the provider IDs declared there. A provider declared with
 //   `"login": true` must supply both `login` and `refresh`; `"rewrite": true` requires
-//   `rewrite`.
+//   `rewrite`. A provider with neither flag may omit its handler entry.
 // - `tools`, `schemes` and `commands` are keyed by the declared names, one handler each.
 // - `toolPolicy` is present exactly when the manifest's `"toolPolicy"` lists hooks, and defines
 //   exactly the listed hooks (`"before"`, `"after"`). `spawnHook` and `onEntry` are present
 //   exactly when the manifest sets `"spawnHook"` and `"events"`.
 // Unknown keys, undeclared names and missing handlers fail activation.
 
-import type { AfterToolCall, AgentSpec, AssistantEvent, BeforeToolCall, CompletionRequest, ErrorCode, Host, HostLifecycle, Model, Models, SeqEntry, Session, SessionEvent, SessionEventKind, SpawnContext, ToolCall, ToolScope, Tools, UserBlock, Value } from "./bindings.ts";
+import type {
+  AfterToolCall, AssistantEvent, BeforeToolCall, CompletionDetails, CompletionRequest, CredentialInput, CredentialOutput,
+  DeviceCodeInput, Host, HostErrorCode, HostLifecycle, LoginPromptInput, LoginSelectInput, Model, Models,
+  PolicyBlockInput, PolicyOverrideInput, SchemeResolutionInput, SeqEntry, Session, SessionEvent,
+  SessionEventKind, SpawnContext, SpawnReplyInput, ToolCall, ToolResultInput, ToolScope, Tools,
+  UserBlock, Value,
+} from "./bindings.ts";
 export type * from "./bindings.ts";
 
-// ---- Credentials (the Rust `axo_ai::auth::Credential` serde shape) ----
-
-export interface ApiKeyCredential {
-  type: "api_key";
-  key: string;
-}
-
-export interface OAuthCredential {
-  type: "oauth";
-  access: string;
-  refresh: string;
-  /** Expiry in milliseconds since the epoch. */
-  expires: number;
-  /** Extra request headers this credential authorizes with. */
-  headers?: Record<string, string>;
-  /** Base URL override for requests made with this credential. */
-  baseUrl?: string;
-  /** Provider-specific fields, stored flattened beside the standard ones. */
-  [field: string]: unknown;
-}
-
-export type Credential = ApiKeyCredential | OAuthCredential;
+/** A rejected host call. Completion details are present only when the stream reported a terminal error. */
+export type HostCallError = Error & (
+  | { readonly code: "completion"; readonly details?: CompletionDetails }
+  | { readonly code: Exclude<HostErrorCode, "completion">; readonly details?: never }
+);
 
 // ---- Request rewrite ----
 
@@ -71,29 +60,6 @@ export interface ProviderRequest {
 
 // ---- Login interaction (the host UI) ----
 
-export interface DeviceCode {
-  userCode: string;
-  verificationUrl: string;
-  expiresInSeconds?: number;
-}
-
-export interface LoginPrompt {
-  message: string;
-  placeholder?: string;
-  /** The answer is a secret; the host masks it. */
-  secret: boolean;
-}
-
-export interface LoginOption {
-  id: string;
-  label: string;
-}
-
-export interface LoginSelect {
-  message: string;
-  options: LoginOption[];
-}
-
 /**
  * What a login asks of the host UI. Display methods resolve once the host has shown the
  * request. `prompt` and `select` resolve with the answer (`select` with the chosen option
@@ -102,9 +68,9 @@ export interface LoginSelect {
  */
 export interface LoginInteraction {
   openUrl(url: string, instructions?: string): Promise<void>;
-  deviceCode(code: DeviceCode): Promise<void>;
-  prompt(prompt: LoginPrompt, signal?: AbortSignal): Promise<string>;
-  select(select: LoginSelect, signal?: AbortSignal): Promise<string>;
+  deviceCode(code: DeviceCodeInput): Promise<void>;
+  prompt(prompt: LoginPromptInput, signal?: AbortSignal): Promise<string>;
+  select(select: LoginSelectInput, signal?: AbortSignal): Promise<string>;
   /** A non-secret status line for the login in progress. */
   progress(message: string): Promise<void>;
 }
@@ -114,9 +80,9 @@ export interface LoginInteraction {
 type LoginHandlers =
   | {
       /** Runs the login; axo stores the returned credential. */
-      login(ui: LoginInteraction, signal: AbortSignal): Promise<Credential>;
+      login(ui: LoginInteraction, signal: AbortSignal): Promise<CredentialInput>;
       /** Exchanges an expiring OAuth credential for a fresh one, under axo's credential lock. */
-      refresh(credential: Credential, signal: AbortSignal): Promise<Credential>;
+      refresh(credential: CredentialOutput, signal: AbortSignal): Promise<CredentialInput>;
     }
   | { login?: never; refresh?: never };
 
@@ -135,8 +101,10 @@ export type SessionStreamEvent =
   | { type: "closed"; value: null };
 
 /**
- * Acts on one session while the host has it attached; calls on a session the host no longer
- * tracks reject.
+ * Actions address an attached session or a known child, reviving a parked child if needed.
+ * Subscriptions never revive a child: they observe attached sessions or currently resident
+ * children, end on detach or loss of residency respectively, and reject with `no_session`
+ * for an unattached nonresident or unknown ID.
  */
 export type SessionHandle = Session & {
   readonly id: string;
@@ -145,35 +113,6 @@ export type SessionHandle = Session & {
     kinds?: SessionEventKind[],
   ): Promise<{ close(): Promise<void> }>;
 };
-
-export type HostErrorCode =
-  | ErrorCode
-  | "unknown_object"
-  | "unknown_method"
-  | "invalid_arguments"
-  | "encode"
-  | "tool"
-  | "no_lifecycle"
-  | "no_session"
-  | "no_subscription"
-  | "unsupported"
-  | "stalled"
-  /** The extension manager is shut down. */
-  | "unavailable"
-  /** The bridge could not decode the action's arguments. */
-  | "invalid"
-  /** The host's reply would exceed the 64 MiB frame bound. */
-  | "too_large";
-
-export interface ToolResult {
-  /** Model-facing result. */
-  content: UserBlock[];
-  /** Host/log data; never reaches the model. */
-  details?: Value;
-  isError?: boolean;
-  /** Hint to stop after this batch; only honored when every result in the batch sets it. */
-  terminate?: boolean;
-}
 
 export interface ToolRun {
   call: ToolCall;
@@ -184,13 +123,13 @@ export interface ToolRun {
   /** Aborts when the host cancels the call. */
   signal: AbortSignal;
   /**
-   * A partial result the host shows while the tool runs. The result is sent only after the host
-   * has answered every update; one the host refuses is dropped.
+   * Shows a partial result. Await updates for sustained output: a full host-call queue drops
+   * the update. Host refusals are nonfatal; the tool result waits for all admitted updates.
    */
-  update(update: { content: UserBlock[]; details?: Value }): void;
+  update(update: { content: UserBlock[]; details?: Value }): Promise<void>;
 }
 
-export type ToolHandler = (run: ToolRun) => Promise<ToolResult>;
+export type ToolHandler = (run: ToolRun) => Promise<ToolResultInput>;
 
 /**
  * Sees the assistant message and tool call. `before` blocks with an optional reason; `after`
@@ -201,19 +140,19 @@ export interface ToolPolicy {
     scope: ToolScope,
     cx: BeforeToolCall,
     signal: AbortSignal,
-  ): Promise<null | { block: true; reason?: string; terminate?: boolean }>;
+  ): Promise<PolicyBlockInput | null>;
   after?(
     scope: ToolScope,
     cx: AfterToolCall,
     signal: AbortSignal,
-  ): Promise<null | { content?: UserBlock[]; details?: Value; isError?: boolean; terminate?: boolean }>;
+  ): Promise<PolicyOverrideInput | null>;
 }
 
 /** `null` allows the spawn; `block` refuses it with a reason; `replace` spawns another `AgentSpec`. */
 export type SpawnHook = (
   spawn: SpawnContext,
   signal: AbortSignal,
-) => Promise<null | { block: string } | { replace: AgentSpec }>;
+) => Promise<SpawnReplyInput | null>;
 
 export interface SchemeHandlerContext {
   /** The scheme name, without `://`. */
@@ -224,7 +163,7 @@ export interface SchemeHandlerContext {
 /** Serves `<scheme>://<path>` URLs. */
 export interface SchemeHandlers {
   /** `"virtual"` serves reads and writes here; `file` maps the URL to an absolute path. */
-  resolve(path: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<"virtual" | { file: string; writable: boolean }>;
+  resolve(path: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<SchemeResolutionInput>;
   read?(path: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<string>;
   /** Returns a short confirmation for the model. */
   write?(path: string, content: string, cx: SchemeHandlerContext, signal: AbortSignal): Promise<string>;
@@ -253,7 +192,7 @@ export interface ExtensionContext {
   dataDir: string;
   host: HostHandle;
   models: ModelsHandle;
-  /** Session actions for an attached session or its child by ID. */
+  /** Address an attached session or known child. Actions can revive a child; subscriptions cannot. */
   session(id: string): SessionHandle;
 }
 

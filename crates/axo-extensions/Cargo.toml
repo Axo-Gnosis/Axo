@@ -12,6 +12,7 @@ async-trait.workspace = true
 axo = { path = "../axo" }
 axo-agent = { path = "../axo-agent" }
 axo-ai = { path = "../axo-ai" }
+axo-macros = { path = "../axo-macros" }
 base64.workspace = true
 futures.workspace = true
 rand.workspace = true
@@ -20,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 specta.workspace = true
+specta-typescript.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -31,7 +33,6 @@ url.workspace = true
 axo-ai = { path = "../axo-ai", features = ["testing"] }
 rustix.workspace = true
 specta-serde.workspace = true
-specta-typescript.workspace = true
 specta-util.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::ext::{Base64, Caller};
+use crate::store::page_limit;
 use crate::{
     AgentSpec, Axo, Catalog, Command, Diagnostic, EntryId, Error, FileChange, Header, JobInfo,
     KeywordSpec, ModeSpec, ProjectAccess, Projection, SeqEntry, SquashedChange, context,
@@ -43,7 +44,7 @@ impl HostWire<'_> {
         let (header, entries, more) = self
             .axo
             .store
-            .read_page(&path, after, limit.unwrap_or(256).clamp(1, 1024) as usize)
+            .read_page(&path, after, page_limit(limit))
             .await?;
         Ok(SessionPage {
             header,
@@ -94,6 +95,12 @@ impl HostWire<'_> {
     #[ext]
     pub fn valid_scheme_name(&self, name: String) -> bool {
         crate::valid_scheme_name(&name)
+    }
+
+    /// Tests tool name syntax, independently of session-specific reservations.
+    #[ext]
+    pub fn valid_tool_name(&self, name: String) -> bool {
+        crate::valid_tool_name(&name)
     }
 
     /// Parses a slash command; returns null for ordinary input.

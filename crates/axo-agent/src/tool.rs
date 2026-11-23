@@ -2,11 +2,13 @@
 //! handles; the per-call state arrives in a [`ToolContext`].
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axo_ai::{JsonMap, ToolCall, UserBlock};
-use serde::Serialize;
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -37,8 +39,8 @@ pub trait Tool: Send + Sync {
     /// Runs one validated call on its own task. An `Err` becomes an error result the
     /// model sees; a tool that reports a failure with output (e.g. a failing command)
     /// returns `Ok` with `is_error: true`. Must honor `cx.cancel`: on Stop the loop
-    /// waits up to 3 s for the call to return, then aborts its task, so cleanup must
-    /// not depend on returning.
+    /// waits up to 3 s for the call to return, then drops its future. Use
+    /// [`ToolContext::on_hard_stop`] to settle an admitted mutation after that drop.
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -80,6 +82,55 @@ pub struct ToolContext {
     pub invocation: ToolInvocationId,
 }
 
+type Interrupted = BoxFuture<'static, Option<ToolOutput>>;
+
+tokio::task_local! {
+    static INTERRUPTED: RefCell<Option<Interrupted>>;
+}
+
+impl ToolContext {
+    /// Arms one recovery future on the current native agent call, before admitting a
+    /// mutation. It runs only if the loop forcibly drops `execute`. Direct calls and
+    /// detached tasks have no agent-owned result to recover, so registration there
+    /// drops the future unused. Registering twice on one call is a programming error.
+    pub fn on_hard_stop(
+        &self,
+        recovery: impl Future<Output = Option<ToolOutput>> + Send + 'static,
+    ) {
+        let _ = INTERRUPTED.try_with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "hard-stop recovery already registered");
+            *slot = Some(Box::pin(recovery));
+        });
+    }
+}
+
+pub(crate) async fn execute_call(
+    tool: &dyn Tool,
+    cx: ToolContext,
+    hard_stop: &CancellationToken,
+) -> (Result<ToolOutput, ToolError>, bool) {
+    INTERRUPTED
+        .scope(RefCell::new(None), async {
+            tokio::select! {
+                biased;
+                result = tool.execute(cx) => return (result, true),
+                () = hard_stop.cancelled() => {}
+            }
+            // The select has dropped execute and released anything it held.
+            let recovery = INTERRUPTED.with(|slot| slot.take());
+            let output = match recovery {
+                Some(recovery) => recovery.await,
+                None => None,
+            };
+            (
+                output.ok_or_else(|| ToolError("Operation aborted".into())),
+                false,
+            )
+        })
+        .await
+}
+
 /// Streams one call's partial results to the loop, which emits them as
 /// `ToolExecutionUpdate`s; updates sent before the call returns precede its end.
 #[derive(Clone)]
@@ -106,7 +157,8 @@ impl ToolUpdates {
 
 /// How the tool calls of one assistant message run. A batch runs sequentially when any
 /// tool in it asks for it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ExecutionMode {
     #[default]
     Parallel,
@@ -114,7 +166,8 @@ pub enum ExecutionMode {
 }
 
 /// Recovery policy for a call whose durable intent exists but whose outcome is unknown.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Replay {
     /// Never re-run; the call is recorded as interrupted.
     #[default]

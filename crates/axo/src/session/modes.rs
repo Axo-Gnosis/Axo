@@ -25,7 +25,7 @@ pub(super) struct ModeState {
 
 /// Mode state at the position navigation is leaving.
 pub(super) struct ModeOrigin {
-    mode: Option<String>,
+    mode: Option<Arc<ModeSpec>>,
     restore: Option<ModeRestore>,
 }
 
@@ -47,10 +47,9 @@ impl SessionHooks {
     }
 
     pub(super) fn mode_origin(&self) -> ModeOrigin {
-        let view = self.journal.view();
         ModeOrigin {
-            mode: view.projection.mode.clone(),
-            restore: view.projection.mode_restore.clone(),
+            mode: self.selected_mode(),
+            restore: self.journal.view().projection.mode_restore.clone(),
         }
     }
 
@@ -66,8 +65,15 @@ impl SessionHooks {
     /// Follows the current position's mode after navigation. Crossing into or out of a mode
     /// switches the model as entering or leaving it would, then records the live selection.
     pub(super) async fn rebase_mode(&self, origin: ModeOrigin) -> Result<(), Error> {
-        let target = self.catalog_mode(self.journal.view().projection.mode.as_ref());
-        let left = self.catalog_mode(origin.mode.as_ref());
+        let left = origin.mode;
+        let target = {
+            let view = self.journal.view();
+            let name = view.projection.mode.as_ref();
+            left.as_ref()
+                .filter(|spec| Some(&spec.name) == name)
+                .cloned()
+                .or_else(|| self.catalog_mode(name))
+        };
         let crossed =
             target.as_ref().map(|spec| &spec.name) != left.as_ref().map(|spec| &spec.name);
         let switched = if crossed {
@@ -164,6 +170,8 @@ impl SessionHooks {
                 entries.push(Entry::ThinkingLevelChange {
                     base: journal::base(),
                     thinking_level: level,
+                    automatic: false,
+                    service_tier: None,
                 });
             }
             if current.tier != tier {
@@ -261,18 +269,10 @@ impl SessionHooks {
             return;
         };
         if current.model.provider != model.provider || current.model.id != model.id {
-            self.apply_selection(&agent, model, level, tier);
-        } else {
-            if current.thinking != level {
-                agent.set_thinking(level);
-                self.selection
-                    .send_modify(|selection| selection.thinking = level);
-            }
-            if current.tier != tier {
-                agent.set_service_tier(tier);
-                self.selection
-                    .send_modify(|selection| selection.tier = tier);
-            }
+            let definition = self.registry_definition(&model);
+            self.apply_selection(&agent, model, level, tier, definition);
+        } else if current.thinking != level || current.tier != tier {
+            self.apply_suffixes(&agent, level, tier);
         }
     }
 
@@ -351,9 +351,7 @@ impl Session {
     /// Selects a root-session mode; instructions and limits take effect at the next request boundary.
     #[ext]
     pub async fn set_mode(&self, name: Option<&str>) -> Result<(), Error> {
-        if self.hooks.child.is_some() {
-            return Err(Error::InvalidInput("Modes belong to root sessions".into()));
-        }
+        self.reject_child()?;
         let spec = name
             .map(|name| {
                 self.hooks
@@ -421,8 +419,14 @@ impl Session {
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct AcceptResultOptions {
+    #[serde(default, deserialize_with = "present_replacement")]
+    #[specta(type = Option<Value>)]
     pub replacement: Option<Value>,
     pub message: Option<String>,
+}
+
+fn present_replacement<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 /// A mode result waiting for the host's review.

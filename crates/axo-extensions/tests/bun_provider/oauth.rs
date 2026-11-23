@@ -121,7 +121,8 @@ pub async fn login(host: &Host) {
     assert_eq!(host.server.count("/token"), tokens + 1);
     assert_eq!(host.server.rejected(), Vec::<String>::new());
 
-    match host.store.get("lab").await.unwrap() {
+    let slot = host.models.credential_slot("lab").unwrap();
+    match host.store.get(&slot).await.unwrap() {
         Some(Credential::Oauth {
             access,
             refresh,
@@ -195,7 +196,8 @@ async fn shared_refresh(host: &Host) {
         assert!(request.head.starts_with("POST /inference "));
     }
 
-    match host.store.get("lab").await.unwrap() {
+    let slot = host.models.credential_slot("lab").unwrap();
+    match host.store.get(&slot).await.unwrap() {
         Some(Credential::Oauth {
             access,
             refresh,

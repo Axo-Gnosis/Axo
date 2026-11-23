@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use axo_ai::estimate::{estimate_blocks_tokens, estimate_message_tokens, estimate_text_tokens};
 use axo_ai::{
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::ext::Caller;
-use crate::{Axo, EffectiveConfig, Error, ProjectAccess};
+use crate::{Axo, CompletionDetails, EffectiveConfig, Error, ProjectAccess};
 
 /// A single model request, independent of any session.
 #[derive(Debug, Clone, Deserialize, specta::Type)]
@@ -79,18 +80,24 @@ impl Axo {
             match event {
                 AssistantEvent::Done { message, .. } => return Ok(message),
                 AssistantEvent::Error { message, .. } => {
-                    return Err(Error::Completion(
-                        message
+                    return Err(Error::Completion {
+                        message: message
                             .error_message
                             .unwrap_or_else(|| "completion failed".into()),
-                    ));
+                        details: Some(Box::new(CompletionDetails {
+                            failure: message.failure,
+                            usage: message.usage,
+                            stop_reason: message.stop_reason,
+                        })),
+                    });
                 }
                 _ => {}
             }
         }
-        Err(Error::Completion(
-            "the stream ended without a final message".into(),
-        ))
+        Err(Error::Completion {
+            message: "the stream ended without a final message".into(),
+            details: None,
+        })
     }
 }
 
@@ -114,7 +121,8 @@ impl ModelsWire<'_> {
 
     /// Lists every model in the host registry.
     #[ext]
-    pub fn all(&self) -> Vec<Model> {
+    pub fn all(&self) -> Vec<Arc<Model>> {
+        // Handle clones only; the dispatch macro types `Arc<T>` as `T`, which rejects `Arc<[_]>`.
         self.axo.models().all().to_vec()
     }
 

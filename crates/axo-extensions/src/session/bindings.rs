@@ -1,7 +1,7 @@
 //! The session capabilities an extension contributes, each served by one remote call per use.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use axo::{
@@ -18,16 +18,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{Remote, decode};
-use crate::manifest::{self, CommandDecl, SchemeDecl, ToolDecl};
-use crate::peer::{Callbacks, Refusal};
+use crate::manifest::{CommandDecl, SchemeDecl, ToolDecl};
+use crate::peer::{BridgeCode, Callbacks, Refusal};
 use crate::remote::{CALL_DEADLINE, Failure};
-
-fn replay(replay: manifest::Replay) -> Replay {
-    match replay {
-        manifest::Replay::Never => Replay::Never,
-        manifest::Replay::Safe => Replay::Safe,
-    }
-}
 
 #[derive(Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -65,9 +58,9 @@ struct SpawnArgs<'a> {
 }
 
 /// A tool result as the runner sends it.
-#[derive(Deserialize)]
+#[derive(Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Output {
+pub(crate) struct ToolResult {
     content: Vec<UserBlock>,
     #[serde(default)]
     details: Option<Value>,
@@ -82,7 +75,7 @@ pub(super) struct RemoteTool {
     pub remote: Remote,
     pub decl: Arc<ToolDecl>,
     pub session: String,
-    pub tools: Arc<SessionTools>,
+    pub tools: Weak<SessionTools>,
 }
 
 #[async_trait]
@@ -100,14 +93,11 @@ impl Tool for RemoteTool {
     }
 
     fn execution_mode(&self) -> ExecutionMode {
-        match self.decl.execution_mode {
-            manifest::ExecutionMode::Parallel => ExecutionMode::Parallel,
-            manifest::ExecutionMode::Sequential => ExecutionMode::Sequential,
-        }
+        self.decl.execution_mode
     }
 
     fn replay(&self, _call: &ToolCall) -> Replay {
-        replay(self.decl.replay)
+        self.decl.replay
     }
 
     fn prompt_guidelines(&self) -> &[Cow<'static, str>] {
@@ -116,7 +106,11 @@ impl Tool for RemoteTool {
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let (ext, name) = (&self.remote.ext, &self.decl.name);
-        let access = ToolAccess::new(self.tools.clone(), cx.clone());
+        let tools = self
+            .tools
+            .upgrade()
+            .ok_or_else(|| ToolError(format!("extension {ext} tool {name}: session is closed")))?;
+        let access = ToolAccess::new(tools, cx.clone());
         let args = serde_json::to_value(ToolRunArgs {
             tool: name,
             session: &self.session,
@@ -144,7 +138,7 @@ impl Tool for RemoteTool {
             value = call => value.map_err(|failure| ToolError(failure.to_string())),
         }
         .and_then(|value| {
-            let output: Output = serde_json::from_value(value).map_err(|_| {
+            let output: ToolResult = serde_json::from_value(value).map_err(|_| {
                 ToolError(format!("extension {ext} tool {name}: returned an invalid result"))
             })?;
             Ok(ToolOutput {
@@ -196,8 +190,9 @@ impl Callbacks for ToolCalls<'_> {
                 } = decode(args)?;
                 if object != "tools" {
                     return Err(Refusal {
-                        code: "unsupported".into(),
+                        code: BridgeCode::Unsupported.into(),
                         message: format!("unknown object: {object}"),
+                        details: None,
                     });
                 }
                 let caller = axo::ext::Caller {
@@ -209,8 +204,9 @@ impl Callbacks for ToolCalls<'_> {
                     .map_err(Refusal::from)
             }
             _ => Err(Refusal {
-                code: "unsupported".into(),
+                code: BridgeCode::Unsupported.into(),
                 message: "unknown host method".into(),
+                details: None,
             }),
         }
     }
@@ -230,7 +226,7 @@ async fn unless_canceled<T>(
 }
 
 /// An extension's tool policy. Fails closed: a policy that cannot answer blocks the call,
-/// unless its extension was removed on purpose ([`Failure::Removed`]), which allows it.
+/// unless its extension was removed from a live manager ([`Failure::Removed`]).
 pub(super) struct RemotePolicy {
     pub remote: Remote,
     /// Whether the handler defines `before`; an undeclared hook allows without a call.
@@ -239,19 +235,37 @@ pub(super) struct RemotePolicy {
     pub after: bool,
 }
 
-#[derive(Deserialize)]
+struct True;
+
+impl<'de> Deserialize<'de> for True {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if bool::deserialize(deserializer)? {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom("expected true"))
+        }
+    }
+}
+
+impl specta::Type for True {
+    fn definition(_: &mut specta::Types) -> specta::datatype::DataType {
+        specta_typescript::define("true").into()
+    }
+}
+
+#[derive(Deserialize, specta::Type)]
 #[serde(deny_unknown_fields)]
-struct Block {
-    block: bool,
+pub(crate) struct PolicyBlock {
+    block: True,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     terminate: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Override {
+pub(crate) struct PolicyOverride {
     #[serde(default)]
     content: Option<Vec<UserBlock>>,
     #[serde(default)]
@@ -302,17 +316,17 @@ impl ToolPolicy for RemotePolicy {
             Err(failure) => block(format!(
                 "extension {ext}: tool policy unavailable: {failure}"
             )),
-            Ok(Value::Null) => ToolCallDecision::Allow,
             Ok(value) => match serde_json::from_value(value) {
-                Ok(Block {
-                    block: true,
+                Ok(None) => ToolCallDecision::Allow,
+                Ok(Some(PolicyBlock {
+                    block: True,
                     reason,
                     terminate,
-                }) => ToolCallDecision::Block {
+                })) => ToolCallDecision::Block {
                     reason,
                     terminate: terminate.unwrap_or(false),
                 },
-                _ => block(format!(
+                Err(_) => block(format!(
                     "extension {ext}: tool policy returned an invalid decision"
                 )),
             },
@@ -354,38 +368,30 @@ impl ToolPolicy for RemotePolicy {
             Err(Failure::Removed(_)) => return Ok(None),
             Err(failure) => return Err(ToolError(failure.to_string())),
         };
-        if value.is_null() {
-            return Ok(None);
-        }
-        let Override {
-            content,
-            details,
-            is_error,
-            terminate,
-        } = serde_json::from_value(value).map_err(|_| {
+        let reply: Option<PolicyOverride> = serde_json::from_value(value).map_err(|_| {
             ToolError(format!(
                 "extension {ext}: tool policy returned an invalid result"
             ))
         })?;
-        Ok(Some(AfterToolCallResult {
-            content,
-            details,
-            is_error,
-            terminate,
+        Ok(reply.map(|reply| AfterToolCallResult {
+            content: reply.content,
+            details: reply.details,
+            is_error: reply.is_error,
+            terminate: reply.terminate,
         }))
     }
 }
 
 /// An extension's spawn hook. Fails closed: a hook that cannot answer blocks the spawn,
-/// unless its extension was removed on purpose ([`Failure::Removed`]), which allows it.
+/// unless its extension was removed from a live manager ([`Failure::Removed`]).
 pub(super) struct RemoteSpawnHook {
     pub remote: Remote,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 #[allow(clippy::large_enum_variant)] // Decoded once and moved into `SpawnDecision`, which is unboxed too.
-enum Spawned {
+pub(crate) enum SpawnReply {
     Block(String),
     Replace(AgentSpec),
 }
@@ -411,10 +417,10 @@ impl SpawnHook for RemoteSpawnHook {
             Err(failure) => SpawnDecision::Block(format!(
                 "extension {ext}: spawn hook unavailable: {failure}"
             )),
-            Ok(Value::Null) => SpawnDecision::Allow,
             Ok(value) => match serde_json::from_value(value) {
-                Ok(Spawned::Block(reason)) => SpawnDecision::Block(reason),
-                Ok(Spawned::Replace(spec)) => SpawnDecision::Replace(spec),
+                Ok(None) => SpawnDecision::Allow,
+                Ok(Some(SpawnReply::Block(reason))) => SpawnDecision::Block(reason),
+                Ok(Some(SpawnReply::Replace(spec))) => SpawnDecision::Replace(spec),
                 Err(error) => SpawnDecision::Block(format!(
                     "extension {ext}: spawn hook returned an invalid decision: {error}"
                 )),
@@ -429,9 +435,45 @@ pub(super) struct RemoteScheme {
     pub decl: SchemeDecl,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, specta::Type)]
+#[serde(untagged)]
+pub(crate) enum SchemeResolution {
+    Virtual(
+        #[serde(deserialize_with = "virtual_target")]
+        #[specta(type = VirtualTarget)]
+        VirtualTarget,
+    ),
+    File(FileTarget),
+}
+
+#[derive(Deserialize, specta::Type)]
+pub(crate) enum VirtualTarget {
+    #[serde(rename = "virtual")]
+    Virtual,
+}
+
+// An externally tagged unit enum also accepts {"virtual":null}. Only accept its string form.
+fn virtual_target<'de, D: serde::Deserializer<'de>>(de: D) -> Result<VirtualTarget, D::Error> {
+    struct StringVisitor;
+
+    impl serde::de::Visitor<'_> for StringVisitor {
+        type Value = VirtualTarget;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a virtual target string")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<VirtualTarget, E> {
+            VirtualTarget::deserialize(serde::de::value::StrDeserializer::new(value))
+        }
+    }
+
+    de.deserialize_str(StringVisitor)
+}
+
+#[derive(Deserialize, specta::Type)]
 #[serde(deny_unknown_fields)]
-struct FileTarget {
+pub(crate) struct FileTarget {
     file: std::path::PathBuf,
     writable: bool,
 }
@@ -497,14 +539,18 @@ impl Scheme for RemoteScheme {
 
     async fn resolve(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<Target, ToolError> {
         let value = self.call("schemeResolve", url, cx, None).await?;
-        if value.as_str() == Some("virtual") {
-            return Ok(Target::Virtual);
-        }
+        // Serde also accepts positional arrays for structs; file targets are objects.
+        let object = value.is_object();
         match serde_json::from_value(value) {
-            Ok(FileTarget { file, writable }) if file.is_absolute() => Ok(Target::File {
-                path: file,
-                writable,
-            }),
+            Ok(SchemeResolution::Virtual(VirtualTarget::Virtual)) => Ok(Target::Virtual),
+            Ok(SchemeResolution::File(FileTarget { file, writable }))
+                if object && file.is_absolute() =>
+            {
+                Ok(Target::File {
+                    path: file,
+                    writable,
+                })
+            }
             _ => Err(self.invalid("resolve")),
         }
     }
@@ -525,7 +571,7 @@ impl Scheme for RemoteScheme {
     }
 
     fn write_replay(&self) -> Replay {
-        replay(self.decl.write_replay)
+        self.decl.write_replay
     }
 }
 
@@ -550,5 +596,21 @@ impl CommandHandler for RemoteCommand {
             .await
             .map(drop)
             .map_err(|failure| Error::Host(Box::new(failure)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheme_virtual_target_is_a_string_literal() {
+        assert!(matches!(
+            serde_json::from_value(json!("virtual")),
+            Ok(SchemeResolution::Virtual(VirtualTarget::Virtual))
+        ));
+        for value in [json!({"virtual": null}), json!("file"), json!(0)] {
+            assert!(serde_json::from_value::<SchemeResolution>(value).is_err());
+        }
     }
 }

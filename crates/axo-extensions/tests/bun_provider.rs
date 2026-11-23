@@ -22,11 +22,11 @@ mod server;
 mod sessions;
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use axo::Supervision;
+use axo::{ProcessSupervisor, Supervision, exec::host::ExecSpec};
 
 const ROUTE: &str = "axo-supervisor";
 /// Wall-clock bound for the whole binary, so a hang fails instead of stalling CI.
@@ -43,18 +43,19 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
-    let bun = match usable(PathBuf::from(bun)) {
+    std::thread::spawn(|| {
+        std::thread::sleep(LIMIT);
+        eprintln!("bun_provider: timed out after {} s", LIMIT.as_secs());
+        std::process::exit(1);
+    });
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let bun = match runtime.block_on(usable(PathBuf::from(bun))) {
         Ok(bun) => bun,
         Err(problem) => {
             eprintln!("bun_provider: AXO_TEST_BUN is set but unusable: {problem}");
             return ExitCode::FAILURE;
         }
     };
-    std::thread::spawn(|| {
-        std::thread::sleep(LIMIT);
-        eprintln!("bun_provider: timed out after {} s", LIMIT.as_secs());
-        std::process::exit(1);
-    });
     let mut modes = vec![("group", Supervision::ProcessGroup)];
     if std::env::var_os("AXO_TEST_CGROUP").is_some() {
         modes.push((
@@ -66,7 +67,6 @@ fn main() -> ExitCode {
             },
         ));
     }
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         for (name, mode) in &modes {
             oauth::run(&bun, mode.clone()).await;
@@ -89,16 +89,22 @@ fn main() -> ExitCode {
 }
 
 /// `bun` must be an absolute path that actually runs `--version`.
-fn usable(bun: PathBuf) -> Result<PathBuf, String> {
+async fn usable(bun: PathBuf) -> Result<PathBuf, String> {
     if !bun.is_absolute() {
         return Err(format!("{} is not an absolute path", bun.display()));
     }
-    let output = std::process::Command::new(&bun)
-        .arg("--version")
-        .env_clear()
-        .current_dir(Path::new("/"))
-        .output()
-        .map_err(|error| format!("{}: {error}", bun.display()))?;
+    let spec = ExecSpec {
+        program: bun.clone(),
+        args: vec!["--version".into()],
+        cwd: "/".into(),
+        env: Default::default(),
+        sandbox: None,
+    };
+    let deadline = tokio::time::Instant::now() + host::WAIT_LIMIT;
+    let output = ProcessSupervisor::new(Supervision::ProcessGroup)
+        .output(spec, Some(deadline))
+        .await
+        .map_err(|error| format!("{} --version: {error}", bun.display()))?;
     if !output.status.success() {
         return Err(format!("{} --version: {}", bun.display(), output.status));
     }

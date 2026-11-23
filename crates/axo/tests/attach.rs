@@ -5,19 +5,20 @@ mod common;
 
 use std::sync::Arc;
 
-use axo::{Entry, SeqEntry};
-use axo::{PromptRequest, PromptResult, SessionEvent};
+use axo::{
+    Entry, JsonlStore, KeywordSpec, PromptPart, PromptRequest, PromptResult, SeqEntry, Session,
+    SessionEvent, SubmissionKind,
+};
 use axo_agent::{AgentEvent, AgentMessage, CancelReason, RunOutcome};
 use axo_ai::testing::reply_text;
-use axo_ai::{AssistantBlock, AssistantEvent, Message, ScriptedTurn};
-use common::{axo, options, within};
+use axo_ai::{AssistantBlock, AssistantEvent, Message, ScriptedApi, ScriptedTurn};
+use common::{GatedStore, WriteGate, axo, axo_with, options, within};
+use serde_json::json;
+use tokio::task::JoinHandle;
 
-#[tokio::test]
-async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
-    let dir = tempfile::tempdir().unwrap();
-    let axo = axo(dir.path(), vec![ScriptedTurn::HangUntilCancel]).await;
-    let session = Arc::new(axo.create_session(options(dir.path())).await.unwrap());
-
+async fn start_hanging_prompt(
+    session: &Arc<Session>,
+) -> JoinHandle<Result<RunOutcome, axo::Error>> {
     let mut probe = session.attach(None).await.events;
     let run = tokio::spawn({
         let session = session.clone();
@@ -34,6 +35,15 @@ async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
         }
     })
     .await;
+    run
+}
+
+#[tokio::test]
+async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let axo = axo(dir.path(), vec![ScriptedTurn::HangUntilCancel]).await;
+    let session = Arc::new(axo.create_session(options(dir.path())).await.unwrap());
+    let run = start_hanging_prompt(&session).await;
 
     let all = session.attach(None).await.missed;
     let seq = all[all.len() / 2].seq;
@@ -71,6 +81,89 @@ async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
         }
     })
     .await;
+    assert_eq!(
+        within(run).await.unwrap().unwrap(),
+        RunOutcome::Aborted(CancelReason::User)
+    );
+}
+
+#[tokio::test]
+async fn attach_between_submission_and_enqueue_observes_queue_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = WriteGate::new(
+        |entry| matches!(entry, Entry::ModelChange { model_id, .. } if model_id == "second"),
+    );
+    let (axo, _, _) = axo_with(
+        dir.path(),
+        json!([{"id":"m"},{"id":"second"}]),
+        json!({}),
+        Arc::new(GatedStore {
+            inner: JsonlStore::new(dir.path().join("sessions")),
+            gate: gate.clone(),
+        }),
+        Arc::new(ScriptedApi::new(vec![ScriptedTurn::HangUntilCancel])),
+    )
+    .await;
+    let mut opts = options(dir.path());
+    opts.definitions.keywords.push(KeywordSpec {
+        name: "switch".into(),
+        model: Some("test/second".into()),
+        ..Default::default()
+    });
+    let session = Arc::new(axo.create_session(opts).await.unwrap());
+    let run = start_hanging_prompt(&session).await;
+    let mut probe = session.attach(None).await.events;
+    let follow_up = tokio::spawn({
+        let session = session.clone();
+        async move { session.follow_up("switch").await }
+    });
+    within(gate.entered.notified()).await;
+    let (seq, id) = within(async {
+        loop {
+            if let SessionEvent::Entry(seq) = &*probe.recv().await.unwrap()
+                && let Entry::Submission {
+                    kind: SubmissionKind::FollowUp,
+                    submission_id,
+                    ..
+                } = &seq.entry
+            {
+                break (seq.seq, submission_id.clone());
+            }
+        }
+    })
+    .await;
+    let mut attach = within(session.attach(Some(seq))).await;
+    assert!(attach.live.queued.is_empty());
+    assert!(attach.missed.is_empty());
+
+    gate.release.notify_one();
+    within(async {
+        while !matches!(
+            &*attach.events.recv().await.unwrap(),
+            SessionEvent::QueueChanged
+        ) {}
+    })
+    .await;
+    let snapshot = within(session.attach(Some(seq))).await;
+    assert!(matches!(snapshot.live.queued.as_slice(), [item] if item.submission_id == id));
+    within(follow_up).await.unwrap().unwrap();
+
+    within(session.follow_up("later")).await.unwrap();
+    within(session.steer("now")).await.unwrap();
+    let snapshot = within(session.attach(Some(seq))).await;
+    let texts: Vec<_> = snapshot
+        .live
+        .queued
+        .iter()
+        .map(|item| {
+            let [PromptPart::Text { text }] = item.parts.as_slice() else {
+                panic!("expected a text submission");
+            };
+            text.as_str()
+        })
+        .collect();
+    assert_eq!(texts, ["now", "switch", "later"]);
+    session.abort();
     assert_eq!(
         within(run).await.unwrap().unwrap(),
         RunOutcome::Aborted(CancelReason::User)

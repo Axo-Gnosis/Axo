@@ -122,9 +122,19 @@ impl Projection {
                 self.model = Some(format!("{provider}/{model_id}"));
                 self.mode_restore = None;
             }
-            Entry::ThinkingLevelChange { thinking_level, .. } => {
+            Entry::ThinkingLevelChange {
+                thinking_level,
+                automatic,
+                service_tier,
+                ..
+            } => {
                 self.thinking = Some(*thinking_level);
-                self.mode_restore = None;
+                if let Some(tier) = service_tier {
+                    self.tier = Some(*tier);
+                }
+                if !automatic {
+                    self.mode_restore = None;
+                }
             }
             Entry::ServiceTierChange { service_tier, .. } => {
                 self.tier = Some(*service_tier);

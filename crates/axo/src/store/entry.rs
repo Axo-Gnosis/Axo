@@ -5,7 +5,6 @@
 use std::borrow::Borrow;
 use std::fmt;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use axo_agent::AgentMessage;
 use axo_ai::{Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
@@ -314,6 +313,10 @@ pub enum Entry {
         #[serde(flatten)]
         base: EntryBase,
         thinking_level: ThinkingLevel,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        automatic: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<ServiceTier>,
     },
     ServiceTierChange {
         #[serde(flatten)]
@@ -758,8 +761,8 @@ pub struct SessionInfo {
     pub cwd: PathBuf,
     pub parent_session: Option<PathBuf>,
     pub spawn: Option<SpawnLink>,
-    /// File modification time.
-    pub modified: SystemTime,
+    /// File modification time in Unix milliseconds.
+    pub modified_at: i64,
 }
 
 #[derive(Deserialize, specta::Type)]
@@ -793,6 +796,10 @@ mod tests {
 
         link["writes"] = json!([]);
         assert!(read(&link).is_err());
+        for old_root in [json!({"path": "/repo/plans"}), json!({"url": "local://"})] {
+            link["writes"] = json!([[old_root]]);
+            assert!(read(&link).is_err());
+        }
 
         link["writes"] = json!([[]]);
         assert_eq!(

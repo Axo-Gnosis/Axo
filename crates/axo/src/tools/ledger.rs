@@ -23,7 +23,7 @@ const SYMLINK_HOPS: usize = 40;
 /// canonicalized and the missing tail re-appended, so a file not created yet keys the
 /// same through a symlinked parent. A symlink that does not resolve (its target is
 /// missing) is followed by hand, so the key is where a write through it would land.
-/// Falls back to the path itself when nothing resolves or a link loops.
+/// If no ancestor resolves, or the symlink hop limit is reached, returns the last path examined.
 pub(crate) fn file_key(path: &Path) -> PathBuf {
     let mut path = path.to_path_buf();
     for _ in 0..SYMLINK_HOPS {
@@ -170,7 +170,7 @@ impl FileLedger {
         absolute: &Path,
         shown_path: &str,
         current: &[u8],
-    ) -> Result<(), ToolError> {
+    ) -> Result<String, ToolError> {
         match self.recorded(absolute) {
             None => Err(ToolError(format!(
                 "File has not been read in this session: {shown_path}. Read it first."
@@ -178,7 +178,7 @@ impl FileLedger {
             Some(hash) if hash != Self::hash(current) => Err(ToolError(format!(
                 "File changed since it was last read: {shown_path}. Read it again before editing."
             ))),
-            Some(_) => Ok(()),
+            Some(hash) => Ok(hash),
         }
     }
 

@@ -150,6 +150,14 @@ async fn a_labeled_tool_replaces_a_built_in_until_the_host_drops_it() {
         .find(|tool| tool.name == "read")
         .unwrap();
     assert_eq!(read.origin.as_deref(), Some("b"));
+    assert!(
+        session
+            .set_definitions(Default::default())
+            .await
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic.message == "tool \"read\" from b replaces the built-in")
+    );
     within(session.prompt("read it")).await.unwrap();
     assert_eq!(
         result(&session, "c1").await,
@@ -308,11 +316,12 @@ async fn sections_omitted_from_the_next_set_disappear() {
         "<lab_rules>\nFollow lab rules.\n</lab_rules>"
     );
 
+    let error = session
+        .set_sections(vec![section("other", "X"), section("Bad Name", "x")])
+        .await
+        .unwrap_err();
     assert!(
-        session
-            .set_sections(vec![("Bad Name".into(), Some("x".into()))])
-            .await
-            .is_err()
+        matches!(error, Error::InvalidInput(message) if message == "Invalid system prompt section name: Bad Name")
     );
     assert!(
         session
@@ -323,6 +332,33 @@ async fn sections_omitted_from_the_next_set_disappear() {
     );
 
     session.set_sections(vec![]).await.unwrap();
+    assert!(
+        !session
+            .inspect_prompt()
+            .latest_built
+            .unwrap()
+            .contains_key("lab_rules")
+    );
+    session
+        .set_sections(vec![
+            section("lab_rules", "A"),
+            section("other", "X"),
+            section("lab_rules", "B"),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        session.inspect_prompt().latest_built.unwrap()["lab_rules"],
+        "<lab_rules>\nB\n</lab_rules>"
+    );
+    session
+        .set_section("lab_rules", Some("C".into()))
+        .await
+        .unwrap();
+    let built = session.inspect_prompt().latest_built.unwrap();
+    assert_eq!(built["lab_rules"], "<lab_rules>\nC\n</lab_rules>");
+    assert!(built.get_index_of("lab_rules").unwrap() < built.get_index_of("other").unwrap());
+    session.set_section("lab_rules", None).await.unwrap();
     assert!(
         !session
             .inspect_prompt()
@@ -365,6 +401,7 @@ async fn the_layer_and_host_registrations_change_independently() {
     )
     .await;
     let first = Arc::new(Counter::default());
+    let weak = Arc::downgrade(&first);
     let mut opts = options(dir.path());
     opts.sections = vec![section("lab_a", "A1")];
     opts.layer = Registrations {
@@ -373,6 +410,7 @@ async fn the_layer_and_host_registrations_change_independently() {
         ..Registrations::default()
     };
     let session = host.axo.create_session(opts).await.unwrap();
+    drop(first);
     let built = session.inspect_prompt().latest_built.unwrap();
     assert!(built.contains_key("lab_a") && built.contains_key("lab_b"));
 
@@ -389,6 +427,7 @@ async fn the_layer_and_host_registrations_change_independently() {
         })
         .await
         .unwrap();
+    assert!(weak.upgrade().is_none());
 
     // A bad section name rejects the whole layer and keeps the one in place.
     assert!(
@@ -409,7 +448,6 @@ async fn the_layer_and_host_registrations_change_independently() {
         !system.contains("A1\n</lab_a>") && !system.contains("lab_b"),
         "{system}"
     );
-    assert_eq!(first.0.load(Ordering::SeqCst), 0);
     assert_eq!(second.0.load(Ordering::SeqCst), 1);
 
     // Clearing the host's policies leaves the layer's in place.

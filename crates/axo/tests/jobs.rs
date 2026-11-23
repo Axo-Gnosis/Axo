@@ -415,6 +415,79 @@ async fn foreground_output_handle_survives_completion_and_host_can_promote() {
     session.shutdown().await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn abandoned_drain_marks_foreground_capture_partial() {
+    for length in [5, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let command = format!(
+            "echo \"$BASHPID\" > shell.pid; printf '%0{length}d' 0; while [[ ! -e release ]]; do sleep 0.01; done"
+        );
+        let host = common::host(
+            dir.path(),
+            json!([{"id": "m"}]),
+            json!({"bash": {"promoteAfterMs": 60000}}),
+            vec![
+                ScriptedTurn::Reply(reply_tool_calls(&[(
+                    "c1",
+                    "bash",
+                    json!({"command": command}),
+                )])),
+                ScriptedTurn::Reply(reply_text("finished")),
+            ],
+        )
+        .await;
+        let options = bash_options(dir.path());
+        let cwd = options.cwd.clone();
+        let session = Arc::new(host.axo.create_session(options).await.unwrap());
+        let prompt = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("Run the command.").await }
+        });
+        until(|| session.command_output("c1").is_some()).await;
+        let output = session.command_output("c1").unwrap();
+        let mut progress = output.progress();
+        within(async {
+            while progress.borrow().bytes < length {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await;
+        // Keep the pipe open outside the job without leaving a process in its container.
+        let pid = std::fs::read_to_string(cwd.join("shell.pid")).unwrap();
+        let pipe = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/{}/fd/1", pid.trim()))
+            .unwrap();
+        std::fs::write(cwd.join("release"), []).unwrap();
+        within(async {
+            while !progress.borrow().done {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await;
+        drop(pipe);
+        assert!(progress.borrow().capture_failed);
+        assert_eq!(progress.borrow().bytes, length);
+        assert_eq!(
+            output.read(0..length).await.unwrap(),
+            vec![b'0'; length as usize]
+        );
+        assert_eq!(within(prompt).await.unwrap().unwrap(), RunOutcome::Done);
+        let text = tool_text(&session.attach(None).await.missed, "c1");
+        assert!(text.contains("[Output capture failed: output drain deadline expired. Showing partial output only.]"), "{text}");
+        assert!(!text.contains("Full output:"), "{text}");
+        let lines = journal(&session);
+        let result = only(&lines, "foreground result", |line| {
+            line["message"]["toolCallId"] == "c1"
+        });
+        let details = &lines[result]["message"]["details"];
+        assert_eq!(details["exit"], json!({"type": "exited", "code": 0}));
+        assert!(details.get("fullOutput").is_none());
+        session.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn async_job_result_is_delivered_once_by_idle_wake() {
     let dir = tempfile::tempdir().unwrap();

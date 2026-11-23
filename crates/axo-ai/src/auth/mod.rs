@@ -27,7 +27,7 @@ pub struct ModelAuth {
 /// A stored credential (`auth.json` value). An OAuth credential carries everything a request
 /// needs (token, extra headers, base URL); one that expires within the refresh margin is
 /// first refreshed through its provider's `ProviderLogin::refresh`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {
     ApiKey {
@@ -43,8 +43,10 @@ pub enum Credential {
         headers: BTreeMap<String, String>,
         /// Base URL override for requests made with this credential.
         #[serde(default, rename = "baseUrl", skip_serializing_if = "Option::is_none")]
+        // The bridge accepts an omitted override, but a supplied override must be a URL.
+        #[specta(type = String)]
         base_url: Option<String>,
-        /// Provider-specific fields, e.g. Codex `accountId`.
+        /// Provider-specific fields.
         #[serde(flatten)]
         extra: Map<String, Value>,
     },
@@ -57,15 +59,15 @@ pub type CredentialUpdate = Box<
 
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
-    async fn get(&self, provider: &str) -> Result<Option<Credential>, Error>;
-    async fn set(&self, provider: &str, credential: Credential) -> Result<(), Error>;
-    async fn remove(&self, provider: &str) -> Result<(), Error>;
-    /// Runs `update` on `provider`'s credential while holding the store's exclusive lock
+    async fn get(&self, slot: &str) -> Result<Option<Credential>, Error>;
+    async fn set(&self, slot: &str, credential: Credential) -> Result<(), Error>;
+    async fn remove(&self, slot: &str) -> Result<(), Error>;
+    /// Runs `update` on `slot`'s credential while holding the store's exclusive lock
     /// (across processes) from the read to the write, and saves the result when it is
     /// `Some`. Returns the credential stored afterwards.
     async fn update(
         &self,
-        provider: &str,
+        slot: &str,
         update: CredentialUpdate,
     ) -> Result<Option<Credential>, Error>;
 }

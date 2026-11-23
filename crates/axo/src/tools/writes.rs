@@ -5,14 +5,14 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
-use axo_agent::{ToolError, ToolOutput};
-use axo_ai::UserBlock;
+use axo_agent::ToolError;
 use axo_macros::expose;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use super::files::{error_code, fs_error};
-use super::{FileAccess, FileRecord, Located, SessionTools, file_details, file_key, lock_file};
+use super::files::{error_code, fs_error, open_regular, read_limited};
+use super::{FileAccess, FileLedger, FileRecord, Located, SessionTools, file_key, lock_file};
 use crate::schemes::SchemeUrl;
 
 type EditFile<'a> = dyn FnOnce(&[u8], &str) -> Result<Vec<u8>, ToolError> + Send + 'a;
@@ -32,19 +32,31 @@ pub enum Written {
     Virtual(String),
 }
 
-// Built-ins attach nested context using the native path, which needn't be UTF-8.
-#[allow(clippy::large_enum_variant)] // One owned result per write; boxing would add an allocation.
-enum Stored {
-    File(FileRecord, PathBuf),
-    Virtual(String),
+pub(super) enum Before {
+    Created,
+    Identical(String),
+    Changed { bytes: Vec<u8>, sha256: String },
+}
+
+pub(super) struct PreparedFile {
+    absolute: PathBuf,
+    label: Option<String>,
+    before: Before,
+    after: Vec<u8>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+pub(super) enum Prepared {
+    File(PreparedFile),
+    Virtual { url: SchemeUrl, text: String },
 }
 
 #[allow(clippy::large_enum_variant)] // One owned result per read; boxing would add an allocation.
-pub enum FileRead {
+pub enum FileRead<T = Vec<u8>> {
     File {
         path: PathBuf,
         label: Option<String>,
-        bytes: Vec<u8>,
+        bytes: T,
         record: FileRecord,
     },
     Virtual {
@@ -63,7 +75,7 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), ToolError> {
 
 /// One place a scope layer permits writes under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
 pub enum WriteRoot {
     /// An absolute directory.
     Path(PathBuf),
@@ -205,62 +217,91 @@ impl SessionTools {
         path: &str,
         limit: Option<u64>,
     ) -> Result<FileRead, ToolError> {
-        check_cancel(cancel)?;
-        match self.locate(path).await? {
-            Located::Virtual { url } => {
-                let text = self.schemes.read(&url).await?;
-                if let Some(limit) = limit
-                    && text.len() as u64 > limit
-                {
-                    return Err(ToolError(format!(
-                        "{url} is {} bytes; this read is limited to {limit} bytes",
-                        text.len()
-                    )));
+        self.read_file_as(cancel, path, limit, |bytes, _| Ok(bytes))
+            .await
+    }
+
+    pub(super) async fn read_file_as<T: AsRef<[u8]>>(
+        &self,
+        cancel: &CancellationToken,
+        request: &str,
+        limit: Option<u64>,
+        convert: impl FnOnce(Vec<u8>, &str) -> Result<T, ToolError> + Send,
+    ) -> Result<FileRead<T>, ToolError> {
+        let read = async {
+            match self.locate_handler(request).await? {
+                (Located::Virtual { url }, Some(handler)) => {
+                    let text = handler.read(&url, self.schemes.context()).await?;
+                    if let Some(limit) = limit
+                        && text.len() as u64 > limit
+                    {
+                        return Err(ToolError(format!(
+                            "{url} is {} bytes; this read is limited to {limit} bytes",
+                            text.len()
+                        )));
+                    }
+                    Ok(FileRead::Virtual { url, text })
                 }
-                Ok(FileRead::Virtual { url, text })
-            }
-            Located::File { url, path, .. } => {
-                let path = if url.is_none() {
-                    super::existing_variant(path)
-                } else {
-                    path
-                };
-                let label = url.map(|url| url.to_string());
-                let _guard = lock_file(&path).await;
-                if let Some(limit) = limit
-                    && let Ok(meta) = tokio::fs::metadata(&path).await
-                    && meta.len() > limit
-                {
-                    return Err(ToolError(format!(
-                        "{} is {} bytes; this read is limited to {limit} bytes",
-                        super::shown(&path, label.as_deref()).display(),
-                        meta.len()
-                    )));
-                }
-                let bytes = tokio::fs::read(&path).await.map_err(|error| {
-                    let syscall = if error.kind() == ErrorKind::IsADirectory {
-                        "read"
+                (Located::File { url, path, .. }, None) => {
+                    let path = if url.is_none() {
+                        super::existing_variant(path)
                     } else {
-                        "access"
+                        path
                     };
-                    ToolError(fs_error(
-                        &error,
-                        syscall,
-                        super::shown(&path, label.as_deref()),
-                    ))
-                })?;
-                check_cancel(cancel)?;
-                let ledger = self.ledger.record(&path, &bytes, FileAccess::Read);
-                Ok(FileRead::File {
-                    path,
-                    label,
-                    bytes,
-                    record: FileRecord {
-                        ledger,
-                        change: None,
-                    },
-                })
+                    let label = url.map(|url| url.to_string());
+                    let _guard = lock_file(&path).await;
+                    let shown = super::shown(&path, label.as_deref());
+                    let io_error = |error: std::io::Error| {
+                        let syscall = if error.kind() == ErrorKind::IsADirectory {
+                            "read"
+                        } else {
+                            "access"
+                        };
+                        ToolError(fs_error(&error, syscall, shown))
+                    };
+                    let mut file = open_regular(&path).await.map_err(|error| {
+                        if error.kind() == ErrorKind::InvalidInput && error.raw_os_error().is_none()
+                        {
+                            ToolError(format!("{} is not a regular file", shown.display()))
+                        } else {
+                            io_error(error)
+                        }
+                    })?;
+                    let bytes = if let Some(limit) = limit {
+                        read_limited(file, limit)
+                            .await
+                            .map_err(io_error)?
+                            .ok_or_else(|| {
+                                ToolError(format!(
+                                    "{} exceeds the read limit of {limit} bytes",
+                                    shown.display()
+                                ))
+                            })?
+                    } else {
+                        let mut bytes = Vec::new();
+                        file.read_to_end(&mut bytes).await.map_err(io_error)?;
+                        bytes
+                    };
+                    let bytes = convert(bytes, request)?;
+                    check_cancel(cancel)?;
+                    let ledger = self.ledger.record(&path, bytes.as_ref(), FileAccess::Read);
+                    Ok(FileRead::File {
+                        path,
+                        label,
+                        bytes,
+                        record: FileRecord {
+                            ledger,
+                            change: None,
+                        },
+                    })
+                }
+                _ => unreachable!("only virtual targets retain their resolving handler"),
             }
+        };
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(ToolError("Operation aborted".into())),
+            result = read => result,
         }
     }
 
@@ -272,47 +313,24 @@ impl SessionTools {
         path: &str,
         write: FileWrite<'_>,
     ) -> Result<(Written, String), ToolError> {
-        let (stored, shown) = self.store_file(cancel, path, write).await?;
-        let written = match stored {
-            Stored::File(record, _) => Written::File(record),
-            Stored::Virtual(text) => Written::Virtual(text),
-        };
-        Ok((written, shown))
-    }
-
-    pub(super) async fn file_tool_output(
-        &self,
-        cancel: &CancellationToken,
-        path: &str,
-        write: FileWrite<'_>,
-        message: impl FnOnce(&str) -> String,
-    ) -> Result<ToolOutput, ToolError> {
-        let (stored, shown) = self.store_file(cancel, path, write).await?;
-        Ok(match stored {
-            Stored::File(record, absolute) => {
-                let mut content = vec![UserBlock::Text {
-                    text: message(&shown),
-                }];
-                content.extend(self.context.attach(&absolute).await);
-                ToolOutput {
-                    content,
-                    details: Some(file_details(&[record])),
-                    ..ToolOutput::default()
-                }
+        match self.prepare_file(cancel, path, write).await? {
+            Prepared::Virtual { url, text } => Ok((Written::Virtual(text), url.to_string())),
+            Prepared::File(file) => {
+                let (record, _, label) = self.commit_file(cancel, file).await?;
+                Ok((
+                    Written::File(record),
+                    label.unwrap_or_else(|| path.to_owned()),
+                ))
             }
-            Stored::Virtual(text) => ToolOutput {
-                content: vec![UserBlock::Text { text }],
-                ..ToolOutput::default()
-            },
-        })
+        }
     }
 
-    async fn store_file(
+    pub(super) async fn prepare_file(
         &self,
         cancel: &CancellationToken,
         path: &str,
         write: FileWrite<'_>,
-    ) -> Result<(Stored, String), ToolError> {
+    ) -> Result<Prepared, ToolError> {
         let located = self.locate(path).await?;
         self.check_write(&located).await?;
         let (absolute, label) = match located {
@@ -337,26 +355,24 @@ impl SessionTools {
                 let content = std::str::from_utf8(&content)
                     .map_err(|_| ToolError(format!("{url} takes text")))?;
                 let text = self.schemes.write(&url, content).await?;
-                return Ok((Stored::Virtual(text), url.to_string()));
+                return Ok(Prepared::Virtual { url, text });
             }
         };
         let shown = super::shown(&absolute, label.as_deref());
         let shown_path = label.as_deref().unwrap_or(path);
         let _guard = lock_file(&absolute).await;
-        // Never race an in-flight filesystem operation against cancellation: hold the
-        // lock until it settles and the ledger reflects what was written.
         check_cancel(cancel)?;
         let (before, after) = match write {
             FileWrite::Replace(content) => {
                 let before = match tokio::fs::read(&absolute).await {
-                    Ok(current) => {
-                        // Identical content is safe even on replay after a crash.
-                        if current != content {
-                            self.ledger.check_fresh(&absolute, shown_path, &current)?;
-                        }
-                        Some(current)
+                    Ok(current) if current == content => {
+                        Before::Identical(FileLedger::hash(&content))
                     }
-                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Ok(bytes) => Before::Changed {
+                        sha256: self.ledger.check_fresh(&absolute, shown_path, &bytes)?,
+                        bytes,
+                    },
+                    Err(error) if error.kind() == ErrorKind::NotFound => Before::Created,
                     Err(error) => return Err(ToolError(fs_error(&error, "open", shown))),
                 };
                 if let Some(dir) = absolute.parent() {
@@ -391,11 +407,38 @@ impl SessionTools {
                     .await
                     .map_err(|error| ToolError(fs_error(&error, "read", shown)))?;
                 check_cancel(cancel)?;
-                self.ledger.check_fresh(&absolute, shown_path, &bytes)?;
+                let sha256 = self.ledger.check_fresh(&absolute, shown_path, &bytes)?;
                 let after = edit(&bytes, shown_path)?;
-                (Some(bytes), after)
+                let before = if after == bytes {
+                    Before::Identical(sha256)
+                } else {
+                    Before::Changed { bytes, sha256 }
+                };
+                (before, after)
             }
         };
+        Ok(Prepared::File(PreparedFile {
+            absolute,
+            label,
+            before,
+            after,
+            _guard,
+        }))
+    }
+
+    pub(super) async fn commit_file(
+        &self,
+        cancel: &CancellationToken,
+        file: PreparedFile,
+    ) -> Result<(FileRecord, PathBuf, Option<String>), ToolError> {
+        let PreparedFile {
+            absolute,
+            label,
+            before,
+            after,
+            _guard,
+        } = file;
+        let shown = super::shown(&absolute, label.as_deref());
         check_cancel(cancel)?;
         tokio::fs::write(&absolute, &after)
             .await
@@ -403,10 +446,7 @@ impl SessionTools {
         let record = self
             .record_change(&absolute, label.as_deref(), before, after)
             .await;
-        Ok((
-            Stored::File(record, absolute),
-            label.unwrap_or_else(|| path.to_owned()),
-        ))
+        Ok((record, absolute, label))
     }
 }
 

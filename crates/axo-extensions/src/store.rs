@@ -9,13 +9,14 @@
 //! missing or half-swapped package, and a running runner keeps reading its own version folder
 //! until it is reloaded. axo never downloads anything; the host hands it a local folder.
 
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::{BufWriter, ErrorKind, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axo::EnabledExtension;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use crate::manifest::{self, MANIFEST};
 use crate::process::usable_bun;
@@ -47,6 +48,8 @@ pub struct InstalledExtension {
 pub enum InstallError {
     #[error("no extension store configured")]
     NoStore,
+    #[error("{0}")]
+    InvalidOptions(String),
     /// Bun is missing or not executable.
     #[error("{0}")]
     Bun(String),
@@ -125,16 +128,37 @@ pub async fn read_record(dir: &Path) -> Result<Option<Record>, String> {
     Ok(Some(record))
 }
 
-/// Replaces `<dir>/install.json` atomically: a synced temporary file renamed into place.
-fn write_record(dir: &Path, record: &Record) -> Result<(), InstallError> {
-    let write = || -> std::io::Result<()> {
-        let mut file = tempfile::NamedTempFile::new_in(dir)?;
-        file.write_all(&serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?)?;
-        file.as_file().sync_all()?;
-        file.persist(dir.join(RECORD))?;
-        Ok(())
-    };
-    write().map_err(|error| io(&dir.join(RECORD), "cannot write", error))
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, InstallError> + Send + 'static,
+) -> Result<T, InstallError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| InstallError::Io(format!("extension store worker: {e}")))?
+}
+
+fn private_dir(dir: &Path) -> Result<(), InstallError> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| io(dir, "cannot create", e))
+}
+
+async fn exists(path: &Path) -> Result<bool, InstallError> {
+    tokio::fs::try_exists(path)
+        .await
+        .map_err(|e| io(path, "cannot inspect", e))
+}
+
+fn pending(dir: &Path) -> (PathBuf, PathBuf) {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("validated extension id");
+    (
+        dir.with_file_name(format!(".remove-{name}")),
+        dir.with_file_name(format!(".purge-{name}")),
+    )
 }
 
 fn io(path: &Path, what: &str, error: std::io::Error) -> InstallError {
@@ -143,7 +167,7 @@ fn io(path: &Path, what: &str, error: std::io::Error) -> InstallError {
 
 /// Copies a package tree: directories, regular files and symlinks (recreated as links),
 /// skipping a top-level `node_modules` and `.git`.
-fn copy_package(from: &Path, to: &Path, top: bool) -> Result<(), InstallError> {
+fn copy_package(from: &Path, to: &Path, top: bool, excluded: &Path) -> Result<(), InstallError> {
     let entries = std::fs::read_dir(from).map_err(|error| io(from, "cannot read", error))?;
     for entry in entries {
         let entry = entry.map_err(|error| io(from, "cannot read", error))?;
@@ -156,8 +180,11 @@ fn copy_package(from: &Path, to: &Path, top: bool) -> Result<(), InstallError> {
             .file_type()
             .map_err(|error| io(&source, "cannot inspect", error))?;
         if kind.is_dir() {
+            if source == excluded {
+                continue;
+            }
             std::fs::create_dir(&target).map_err(|error| io(&target, "cannot create", error))?;
-            copy_package(&source, &target, false)?;
+            copy_package(&source, &target, false, excluded)?;
         } else if kind.is_file() {
             std::fs::copy(&source, &target).map_err(|error| io(&source, "cannot copy", error))?;
         } else if kind.is_symlink() {
@@ -175,8 +202,52 @@ fn copy_package(from: &Path, to: &Path, top: bool) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// Under the advisory lock, discard interrupted stages, then create a complete private copy.
+fn stage(
+    source: &Path,
+    store: &Path,
+    id: &str,
+    record: Option<&Record>,
+) -> Result<PathBuf, InstallError> {
+    let source = source
+        .canonicalize()
+        .map_err(|e| io(source, "cannot resolve", e))?;
+    let store = store
+        .canonicalize()
+        .map_err(|e| io(store, "cannot resolve", e))?;
+    let dir = store.join(id);
+    if source.starts_with(&dir) || (source.starts_with(&store) && dir.starts_with(&source)) {
+        return Err(InstallError::InvalidPackage(
+            "source overlaps the destination extension directory".into(),
+        ));
+    }
+    private_dir(&dir)?;
+    for entry in std::fs::read_dir(&dir).map_err(|e| io(&dir, "cannot read", e))? {
+        let entry = entry.map_err(|e| io(&dir, "cannot read", e))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if version_name(&name)
+            && !record.is_some_and(|r| {
+                r.current.as_str() == name.as_ref() || r.previous.as_deref() == Some(name.as_ref())
+            })
+        {
+            std::fs::remove_dir_all(entry.path())
+                .map_err(|e| io(&entry.path(), "cannot remove", e))?;
+        }
+    }
+    let version = tempfile::Builder::new()
+        .prefix("v-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(&dir)
+        .map_err(|e| io(&dir, "cannot create a version folder in", e))?;
+    copy_package(&source, version.path(), true, &store)?;
+    Ok(version.keep())
+}
+
 impl Inner {
     fn store(&self) -> Result<&Path, InstallError> {
+        crate::validate_options(&self.options)
+            .map_err(|e| InstallError::InvalidOptions(e.to_string()))?;
         self.options.store.as_deref().ok_or(InstallError::NoStore)
     }
 
@@ -184,12 +255,64 @@ impl Inner {
         self.lock().enabled.iter().any(|ext| ext.id == id)
     }
 
-    /// The per-extension install lock, or `Busy`; shared with authored dependency installs.
-    fn claim(&self, id: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, InstallError> {
-        self.deps
-            .lock(id)
-            .try_lock_owned()
-            .map_err(|_| InstallError::Busy(id.to_owned()))
+    fn check_open(&self) -> Result<(), InstallError> {
+        if self.closed.is_cancelled() {
+            Err(InstallError::ShutDown)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn claim(&self, store: &Path, id: &str) -> Result<std::fs::File, InstallError> {
+        self.check_open()?;
+        if !installed_id(id) {
+            return Err(InstallError::NotInstalled(id.to_owned()));
+        }
+        let path = store.join(".locks").join(id);
+        let id = id.to_owned();
+        blocking(move || {
+            private_dir(path.parent().expect("lock has a publisher"))?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|e| io(&path, "cannot open", e))?;
+            match file.try_lock() {
+                Ok(()) => Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => Err(InstallError::Busy(id)),
+                Err(std::fs::TryLockError::Error(e)) => Err(io(&path, "cannot lock", e)),
+            }
+        })
+        .await
+    }
+
+    async fn publish(&self, dir: &Path, record: Record) -> Result<Record, InstallError> {
+        self.check_open()?;
+        let dest = dir.join(RECORD);
+        let folder = dir.to_owned();
+        let (temp, record) = blocking(move || {
+            let prepare = || -> std::io::Result<_> {
+                let mut file = tempfile::NamedTempFile::new_in(&folder)?;
+                let mut writer = BufWriter::new(file.as_file_mut());
+                serde_json::to_writer_pretty(&mut writer, &record)
+                    .map_err(std::io::Error::other)?;
+                writer.flush()?;
+                drop(writer);
+                file.as_file().sync_all()?;
+                Ok((file.into_temp_path(), record))
+            };
+            prepare().map_err(|e| io(&folder.join(RECORD), "cannot write", e))
+        })
+        .await?;
+        let _config = self.config.lock().await;
+        self.check_open()?;
+        tokio::fs::rename(&temp, &dest)
+            .await
+            .map_err(|e| io(&dest, "cannot publish", e))?;
+        Ok(record)
     }
 
     /// Replaces `id`'s placement so the next call runs the version the record now names.
@@ -215,18 +338,29 @@ impl Inner {
         origin: String,
         replace_origin: bool,
     ) -> Result<InstalledExtension, InstallError> {
+        let _work = self.deps.store_work.read().await;
+        self.check_open()?;
         let store = self.store()?;
+        if !source.is_absolute() {
+            return Err(InstallError::InvalidPackage(format!(
+                "source {} is not an absolute path",
+                source.display()
+            )));
+        }
         let bun = usable_bun(self.options.bun.as_deref())
             .await
             .map_err(InstallError::Bun)?;
         let path = source.join(MANIFEST);
         let invalid =
             |what: String| InstallError::InvalidPackage(format!("{}: {what}", path.display()));
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|error| invalid(format!("cannot read: {error}")))?;
-        let Head { id, sdk } =
-            serde_json::from_str(&text).map_err(|error| invalid(format!("invalid: {error}")))?;
+        let Head { id, sdk } = {
+            let mut file = manifest::open_regular(&path).await.map_err(invalid)?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .await
+                .map_err(|e| invalid(format!("cannot read: {e}")))?;
+            serde_json::from_str(&text).map_err(|e| invalid(format!("invalid: {e}")))?
+        };
         if !installed_id(&id) {
             return Err(invalid(format!("id {id:?} is not publisher/name")));
         }
@@ -245,14 +379,14 @@ impl Inner {
             }
             Some(_) => {}
         }
-        let _claim = self.claim(&id)?;
-
+        let _claim = self.claim(store, &id).await?;
         let dir = store.join(&id);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|error| io(&dir, "cannot create", error))?;
+        let (remove, purge) = pending(&dir);
+        if exists(&remove).await? || exists(&purge).await? {
+            return Err(InstallError::Io(format!(
+                "extension {id}: uninstall cleanup is pending; retry uninstall"
+            )));
+        }
         let record = read_record(&dir).await.map_err(InstallError::Io)?;
         if let Some(record) = &record
             && record.origin != origin
@@ -264,86 +398,57 @@ impl Inner {
                 offered: origin,
             });
         }
-        // Leftovers of an install that crashed or was canceled.
-        let kept: Vec<&str> = record
-            .iter()
-            .flat_map(|record| [Some(record.current.as_str()), record.previous.as_deref()])
-            .flatten()
-            .collect();
-        let entries = std::fs::read_dir(&dir).map_err(|error| io(&dir, "cannot read", error))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if version_name(&name) && !kept.contains(&name.as_ref()) {
-                let _ = std::fs::remove_dir_all(entry.path());
+        self.check_open()?;
+        let stage_store = store.to_owned();
+        let (version, id, record) = blocking(move || {
+            let version = stage(&source, &stage_store, &id, record.as_ref())?;
+            Ok((version, id, record))
+        })
+        .await?;
+        let result = async {
+            self.check_open()?;
+            let found = manifest::load(&id, &version).await.map_err(InstallError::InvalidPackage)?;
+            if let Some(error) = found.entry_error {
+                return Err(InstallError::InvalidPackage(error));
             }
-        }
-
-        // Removed on any failure (or cancellation) until the record names it.
-        let version = tempfile::Builder::new()
-            .prefix("v-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(&dir)
-            .map_err(|error| io(&dir, "cannot create a version folder in", error))?;
-        let (from, to) = (source.clone(), version.path().to_owned());
-        tokio::task::spawn_blocking(move || copy_package(&from, &to, true))
-            .await
-            .map_err(|error| {
-                InstallError::Io(format!("copying {}: {error}", source.display()))
-            })??;
-        let found = manifest::load(&id, version.path())
-            .await
-            .map_err(InstallError::InvalidPackage)?;
-        if let Some(error) = found.entry_error {
-            return Err(InstallError::InvalidPackage(error));
-        }
-        let fingerprint = deps::fingerprint(version.path())
-            .await
-            .map_err(|error| InstallError::InvalidPackage(format!("extension {id}: {error}")))?;
-        if fingerprint.is_some() {
-            if !version.path().join("bun.lock").exists() {
-                return Err(InstallError::MissingLockfile(id));
+            let fingerprint = deps::fingerprint(&version).await
+                .map_err(|e| InstallError::InvalidPackage(format!("extension {id}: {e}")))?;
+            if fingerprint.is_some() {
+                if !exists(&version.join("bun.lock")).await? {
+                    return Err(InstallError::MissingLockfile(id.clone()));
+                }
+                tokio::select! {
+                    biased;
+                    () = self.closed.cancelled() => return Err(InstallError::ShutDown),
+                    result = deps::install(bun, &self.options.env, &self.supervisor, &version, true) => {
+                        result.map_err(|output| InstallError::InstallFailed { id: id.clone(), output })?;
+                    }
+                }
             }
-            deps::install(
-                bun,
-                &self.options.env,
-                &self.supervisor,
-                version.path(),
-                true,
-            )
-            .await
-            .map_err(|output| InstallError::InstallFailed {
-                id: id.clone(),
-                output,
-            })?;
-        }
-
-        let version = version.keep();
-        let current = version
-            .file_name()
-            .expect("a version folder has a name")
-            .to_string_lossy()
-            .into_owned();
-        let next = Record {
-            origin: origin.clone(),
-            current,
-            previous: record.as_ref().map(|record| record.current.clone()),
-        };
-        {
-            let _config = self.config.lock().await;
-            if let Err(error) = write_record(&dir, &next) {
-                let _ = std::fs::remove_dir_all(&version);
+            let current = version.file_name().expect("a version folder has a name").to_string_lossy().into_owned();
+            self.publish(&dir, Record {
+                origin, current,
+                previous: record.as_ref().map(|r| r.current.clone()),
+            }).await
+        }.await;
+        let next = match result {
+            Ok(next) => next,
+            Err(error) => {
+                tokio::fs::remove_dir_all(&version)
+                    .await
+                    .map_err(|e| io(&version, "cannot remove", e))?;
                 return Err(error);
             }
-        }
+        };
+        let has_previous = record.is_some();
         if let Some(stale) = record.and_then(|record| record.previous) {
             let _ = tokio::fs::remove_dir_all(dir.join(stale)).await;
         }
         self.reload_installed(&id).await?;
         Ok(InstalledExtension {
             id,
-            origin,
-            has_previous: next.previous.is_some(),
+            origin: next.origin,
+            has_previous,
         })
     }
 
@@ -351,11 +456,10 @@ impl Inner {
         self: Arc<Self>,
         id: String,
     ) -> Result<InstalledExtension, InstallError> {
+        let _work = self.deps.store_work.read().await;
+        self.check_open()?;
         let store = self.store()?;
-        if !installed_id(&id) {
-            return Err(InstallError::NotInstalled(id));
-        }
-        let _claim = self.claim(&id)?;
+        let _claim = self.claim(store, &id).await?;
         let dir = store.join(&id);
         let record = read_record(&dir)
             .await
@@ -365,15 +469,16 @@ impl Inner {
             return Err(InstallError::NoPrevious(id));
         };
         // Swapped, so a second rollback goes forward again.
-        let next = Record {
-            origin: record.origin,
-            current: previous,
-            previous: Some(record.current),
-        };
-        {
-            let _config = self.config.lock().await;
-            write_record(&dir, &next)?;
-        }
+        let next = self
+            .publish(
+                &dir,
+                Record {
+                    origin: record.origin,
+                    current: previous,
+                    previous: Some(record.current),
+                },
+            )
+            .await?;
         self.reload_installed(&id).await?;
         Ok(InstalledExtension {
             id,
@@ -387,27 +492,41 @@ impl Inner {
         id: String,
         delete_data: bool,
     ) -> Result<(), InstallError> {
+        let _work = self.deps.store_work.read().await;
+        self.check_open()?;
         let store = self.store()?;
-        if !installed_id(&id) {
-            return Err(InstallError::NotInstalled(id));
-        }
-        let _claim = self.claim(&id)?;
-        // Under `config`, so a concurrent `configure` cannot enable it midway.
-        let _config = self.config.lock().await;
-        if self.enabled(&id) {
-            return Err(InstallError::Enabled(id));
-        }
+        let _claim = self.claim(store, &id).await?;
         let dir = store.join(&id);
-        if read_record(&dir).await.map_err(InstallError::Io)?.is_none() {
-            return Err(InstallError::NotInstalled(id));
-        }
-        tokio::fs::remove_dir_all(&dir)
-            .await
-            .map_err(|error| io(&dir, "cannot remove", error))?;
-        if let Some(publisher) = dir.parent() {
-            let _ = tokio::fs::remove_dir(publisher).await;
-        }
-        if delete_data {
+        let (remove, purge) = pending(&dir);
+        let purging = {
+            let _config = self.config.lock().await;
+            self.check_open()?;
+            if self.enabled(&id) {
+                return Err(InstallError::Enabled(id));
+            }
+            if exists(&purge).await? {
+                true
+            } else if exists(&remove).await? {
+                if delete_data {
+                    self.check_open()?;
+                    tokio::fs::rename(&remove, &purge)
+                        .await
+                        .map_err(|e| io(&remove, "cannot mark for purge", e))?;
+                }
+                delete_data
+            } else {
+                if read_record(&dir).await.map_err(InstallError::Io)?.is_none() {
+                    return Err(InstallError::NotInstalled(id));
+                }
+                let tomb = if delete_data { &purge } else { &remove };
+                self.check_open()?;
+                tokio::fs::rename(&dir, tomb)
+                    .await
+                    .map_err(|e| io(&dir, "cannot mark for removal", e))?;
+                delete_data
+            }
+        };
+        if purging {
             let data = self.options.data_dir(&id);
             match tokio::fs::remove_dir_all(&data).await {
                 Err(error) if error.kind() != ErrorKind::NotFound => {
@@ -420,26 +539,50 @@ impl Inner {
                 let _ = tokio::fs::remove_dir(publisher).await;
             }
         }
+        let tomb = if purging { purge } else { remove };
+        tokio::fs::remove_dir_all(&tomb)
+            .await
+            .map_err(|e| io(&tomb, "cannot remove", e))?;
+        if let Some(publisher) = dir.parent() {
+            let _ = tokio::fs::remove_dir(publisher).await;
+        }
         Ok(())
     }
 
     pub(crate) async fn installed(&self) -> Result<Vec<InstalledExtension>, InstallError> {
         let store = self.store()?;
         let mut found = Vec::new();
-        let publishers = match std::fs::read_dir(store) {
+        let mut publishers = match tokio::fs::read_dir(store).await {
             Ok(publishers) => publishers,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(found),
             Err(error) => return Err(io(store, "cannot read", error)),
         };
-        for publisher in publishers.flatten() {
-            let Ok(names) = std::fs::read_dir(publisher.path()) else {
+        while let Some(publisher) = publishers
+            .next_entry()
+            .await
+            .map_err(|e| io(store, "cannot read", e))?
+        {
+            if publisher.file_name() == ".locks" {
+                continue;
+            }
+            let Ok(mut names) = tokio::fs::read_dir(publisher.path()).await else {
                 continue;
             };
-            for name in names.flatten() {
+            while let Some(name) = names
+                .next_entry()
+                .await
+                .map_err(|e| io(&publisher.path(), "cannot read", e))?
+            {
+                let name_part = name.file_name();
+                if name_part.as_encoded_bytes().starts_with(b".purge-")
+                    || name_part.as_encoded_bytes().starts_with(b".remove-")
+                {
+                    continue;
+                }
                 let id = format!(
                     "{}/{}",
                     publisher.file_name().to_string_lossy(),
-                    name.file_name().to_string_lossy()
+                    name_part.to_string_lossy()
                 );
                 if let Ok(Some(record)) = read_record(&name.path()).await {
                     found.push(InstalledExtension {

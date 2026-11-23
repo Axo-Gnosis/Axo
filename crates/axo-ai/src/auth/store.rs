@@ -1,4 +1,4 @@
-//! `auth.json`: a JSON object `{ "<provider>": Credential }`, only ever replaced by rename and
+//! `auth.json`: a JSON object `{ "<slot>": Credential }`, only ever replaced by rename and
 //! written under an OS file lock on its `auth.json.lock` sidecar.
 
 use std::fs::{File, OpenOptions};
@@ -78,14 +78,12 @@ fn read_object(text: &str) -> Result<Map<String, Value>, Error> {
     }
 }
 
-/// Parses `provider`'s stored value.
-fn parse_credential(provider: &str, value: Option<Value>) -> Result<Option<Credential>, Error> {
+/// Parses `slot`'s stored value.
+fn parse_credential(slot: &str, value: Option<Value>) -> Result<Option<Credential>, Error> {
     value
         .map(|value| {
             serde_json::from_value(value).map_err(|_| {
-                Error::Auth(format!(
-                    "Invalid auth.json credential for provider \"{provider}\""
-                ))
+                Error::Auth(format!("Invalid auth.json credential for slot \"{slot}\""))
             })
         })
         .transpose()
@@ -120,32 +118,32 @@ async fn blocking<T: Send + 'static>(
 
 #[async_trait]
 impl CredentialStore for FileCredentialStore {
-    async fn get(&self, provider: &str) -> Result<Option<Credential>, Error> {
+    async fn get(&self, slot: &str) -> Result<Option<Credential>, Error> {
         let path = self.path.clone();
-        let provider = provider.to_owned();
-        blocking(move || parse_credential(&provider, read(&path)?.remove(&provider))).await
+        let slot = slot.to_owned();
+        blocking(move || parse_credential(&slot, read(&path)?.remove(&slot))).await
     }
 
-    async fn set(&self, provider: &str, credential: Credential) -> Result<(), Error> {
+    async fn set(&self, slot: &str, credential: Credential) -> Result<(), Error> {
         let path = self.path.clone();
-        let provider = provider.to_owned();
+        let slot = slot.to_owned();
         let value = serde_json::to_value(credential)?;
         blocking(move || {
             let _lock = lock_writers(&path)?;
             let mut data = read(&path)?;
-            data.insert(provider, value);
+            data.insert(slot, value);
             write(&path, &data)
         })
         .await
     }
 
-    async fn remove(&self, provider: &str) -> Result<(), Error> {
+    async fn remove(&self, slot: &str) -> Result<(), Error> {
         let path = self.path.clone();
-        let provider = provider.to_owned();
+        let slot = slot.to_owned();
         blocking(move || {
             let _lock = lock_writers(&path)?;
             let mut data = read(&path)?;
-            data.remove(&provider);
+            data.remove(&slot);
             write(&path, &data)
         })
         .await
@@ -153,7 +151,7 @@ impl CredentialStore for FileCredentialStore {
 
     async fn update(
         &self,
-        provider: &str,
+        slot: &str,
         update: CredentialUpdate,
     ) -> Result<Option<Credential>, Error> {
         let path = self.path.clone();
@@ -162,11 +160,11 @@ impl CredentialStore for FileCredentialStore {
             move || Ok((lock_writers(&path)?, read(&path)?))
         })
         .await?;
-        let current = parse_credential(provider, data.get(provider).cloned())?;
+        let current = parse_credential(slot, data.get(slot).cloned())?;
         let Some(next) = update(current.clone()).await? else {
             return Ok(current);
         };
-        data.insert(provider.to_owned(), serde_json::to_value(&next)?);
+        data.insert(slot.to_owned(), serde_json::to_value(&next)?);
         blocking(move || {
             // The lock moves into the write so it is held until the rename lands.
             let _lock = lock;

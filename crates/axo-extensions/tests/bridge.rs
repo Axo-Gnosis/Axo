@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axo::{Axo, EnabledExtension, EnvMap, JsonlStore};
@@ -415,14 +416,17 @@ pub fn assert_unavailable(event: &AssistantEvent, needle: &str) {
 /// Registers a native runtime provider `<provider>/m` sending to `url`.
 pub fn register_native(models: &Models, provider: &str, url: &str) {
     models
-        .register(axo_ai::Provider {
-            id: provider.into(),
-            models: vec![serde_json::from_value(model_json(provider, url)).unwrap()],
-            env: Vec::new(),
-            requires_key: false,
-            login: None,
-            rewrite: None,
-        })
+        .register(
+            "host",
+            axo_ai::Provider {
+                id: provider.into(),
+                models: vec![serde_json::from_value(model_json(provider, url)).unwrap()],
+                env: Vec::new(),
+                requires_key: false,
+                login: None,
+                rewrite: None,
+            },
+        )
         .unwrap();
 }
 
@@ -447,6 +451,8 @@ pub fn error_text(event: &AssistantEvent) -> String {
 pub struct Http {
     pub url: String,
     requests: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    stopped: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Http {
@@ -455,10 +461,15 @@ impl Http {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = requests.clone();
-        std::thread::spawn(move || {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let worker = std::thread::spawn(move || {
             use std::io::Write;
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
                 let request = axo_ai::testing::read_http_request_parts(&mut stream);
                 seen.lock().unwrap().push(request);
                 let body = r#"{"error":{"message":"stub"}}"#;
@@ -469,7 +480,12 @@ impl Http {
                 );
             }
         });
-        Http { url, requests }
+        Http {
+            url,
+            requests,
+            stopped,
+            worker: Some(worker),
+        }
     }
 
     pub fn clear(&self) {
@@ -478,6 +494,19 @@ impl Http {
 
     pub fn requests(&self) -> Vec<(String, Value)> {
         self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Http {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.url.trim_start_matches("http://"));
+        if let Some(worker) = self.worker.take()
+            && let Err(panic) = worker.join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -900,10 +929,17 @@ mod fake {
                     let request = if script == "completion" {
                         json!({ "completion": { "model": "test/m", "messages": [] } })
                     } else {
-                        json!({ "session": args["session"], "kinds": ["entry"] })
+                        let target = args["args"].as_str().filter(|id| !id.is_empty())
+                            .unwrap_or_else(|| args["session"].as_str().unwrap());
+                        json!({ "session": target, "kinds": ["entry"] })
                     };
-                    let reply = self.ask(ext, None, "subscribe", request).await?;
-                    append(&self.control.join(ext).join("subs"), reply["sub"].as_str().unwrap());
+                    let result = self.ask(ext, None, "subscribe", request).await;
+                    let subs = self.control.join(ext).join("subs");
+                    match result {
+                        Ok(reply) => append(&subs, reply["sub"].as_str().unwrap()),
+                        Err((code, _)) if script == "subscribe" => append(&subs, &code),
+                        Err(error) => return Err(error),
+                    }
                     Ok(Value::Null)
                 }
                 "command" if script == "unsubscribe" => {

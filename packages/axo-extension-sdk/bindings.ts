@@ -416,6 +416,8 @@ export type BeforeToolCall_Serialize = {
 	toolCall: ToolCall_Serialize,
 };
 
+export type BridgeCode = "no_lifecycle" | "no_subscription" | "unsupported" | "stalled" | "unavailable" | "invalid" | "too_large" | "interaction";
+
 export type CacheControlFormat = "anthropic";
 
 /**  Why a run was cancelled. */
@@ -549,7 +551,7 @@ export type CommandPolicy =
 /**  Runs during a turn or maintenance and takes effect from the next request. */
 "alongside" | 
 /**  `Error::Busy` during a turn or maintenance. */
-"when_idle" | 
+"whenIdle" | 
 /**  Expanded, then sent through whichever path the app used (`prompt`, `steer`, `follow_up`). */
 "queued";
 
@@ -689,6 +691,23 @@ export type Compat_Serialize = {
 	supportsMidConvoToolChanges?: boolean,
 };
 
+/**  Data reported by a terminal completion error, including any billed usage. */
+export type CompletionDetails = CompletionDetails_Serialize | CompletionDetails_Deserialize;
+
+/**  Data reported by a terminal completion error, including any billed usage. */
+export type CompletionDetails_Deserialize = {
+	failure?: ProviderFailure_Deserialize | null,
+	usage: Usage_Deserialize,
+	stopReason: StopReason,
+};
+
+/**  Data reported by a terminal completion error, including any billed usage. */
+export type CompletionDetails_Serialize = {
+	failure: ProviderFailure_Serialize | null,
+	usage: Usage_Serialize,
+	stopReason: StopReason,
+};
+
 /**  A single model request, independent of any session. */
 export type CompletionRequest = CompletionRequest_Serialize | CompletionRequest_Deserialize;
 
@@ -800,8 +819,49 @@ export type Cost_Serialize = {
 	tiers?: CostTier[],
 };
 
+/**
+ *  A stored credential (`auth.json` value). An OAuth credential carries everything a request
+ *  needs (token, extra headers, base URL); one that expires within the refresh margin is
+ *  first refreshed through its provider's `ProviderLogin::refresh`.
+ */
+export type Credential = Credential_Serialize | Credential_Deserialize;
+
 /**  Where a provider's credential comes from, without resolving or validating it. */
 export type CredentialSource = { type: "config" } | { type: "apiKey" } | { type: "oauth" } | { type: "env"; value: string } | { type: "none" };
+
+/**
+ *  A stored credential (`auth.json` value). An OAuth credential carries everything a request
+ *  needs (token, extra headers, base URL); one that expires within the refresh margin is
+ *  first refreshed through its provider's `ProviderLogin::refresh`.
+ */
+export type Credential_Deserialize = { type: "api_key"; key: string } | {
+	type: "oauth",
+} & {
+	access: string,
+	refresh: string,
+	/**  Expiry in milliseconds since the epoch. */
+	expires: number,
+	/**  Extra request headers this credential authorizes with. */
+	headers?: { [key in string]: string },
+	/**  Base URL override for requests made with this credential. */
+	baseUrl?: string,
+} & { [key in string]: Value };
+
+/**
+ *  A stored credential (`auth.json` value). An OAuth credential carries everything a request
+ *  needs (token, extra headers, base URL); one that expires within the refresh margin is
+ *  first refreshed through its provider's `ProviderLogin::refresh`.
+ */
+export type Credential_Serialize = { type: "api_key"; key: string } | {
+	type: "oauth",
+} & {
+	access: string,
+	refresh: string,
+	/**  Expiry in milliseconds since the epoch. */
+	expires: number,
+	/**  Extra request headers this credential authorizes with. */
+	headers?: { [key in string]: string },
+} & { [key in string]: Value };
 
 export type CustomMessageContent = string | UserBlock[];
 
@@ -813,6 +873,20 @@ export type DevShellMode =
 "direnv" | 
 /**  The nearest `flake.nix` dev shell (up to the git root); `.envrc` is ignored. */
 "nix";
+
+export type DeviceCode = DeviceCode_Serialize | DeviceCode_Deserialize;
+
+export type DeviceCode_Deserialize = {
+	userCode: string,
+	verificationUrl: string,
+	expiresInSeconds?: number | null,
+};
+
+export type DeviceCode_Serialize = {
+	userCode: string,
+	verificationUrl: string,
+	expiresInSeconds?: number,
+};
 
 /**  A non-fatal problem found while loading context resources. */
 export type Diagnostic = Diagnostic_Serialize | Diagnostic_Deserialize;
@@ -837,6 +911,8 @@ export type Diagnostic_Serialize = {
 	origin: DiagnosticOrigin | null,
 	message: string,
 };
+
+export type DispatchCode = "unknown_object" | "unknown_method" | "invalid_arguments" | "encode" | "tool" | "no_session";
 
 /**  What one session runs with. */
 export type EffectiveConfig = EffectiveConfig_Serialize | EffectiveConfig_Deserialize;
@@ -967,6 +1043,8 @@ export type Entry_Deserialize =
 	type: "thinking_level_change",
 } & {
 	thinkingLevel: ThinkingLevel,
+	automatic?: boolean,
+	serviceTier?: ServiceTier | null,
 } & EntryBase_Deserialize | {
 	type: "service_tier_change",
 } & {
@@ -1199,6 +1277,8 @@ export type Entry_Serialize =
 	type: "thinking_level_change",
 } & {
 	thinkingLevel: ThinkingLevel,
+	automatic?: boolean,
+	serviceTier?: ServiceTier,
 } & EntryBase_Serialize | {
 	type: "service_tier_change",
 } & {
@@ -1461,6 +1541,11 @@ export type FileRecord_Serialize = {
 	change?: FileChange_Serialize,
 };
 
+export type FileTarget = {
+	file: string,
+	writable: boolean,
+};
+
 export type ForkReceipt = ForkReceipt_Serialize | ForkReceipt_Deserialize;
 
 export type ForkReceipt_Deserialize = {
@@ -1509,6 +1594,8 @@ export type HostDelivery =
 "followUp" | 
 /**  The next turn boundary or run start; never starts a run. */
 "quiet";
+
+export type HostErrorCode = InvokeErrorCode | BridgeCode;
 
 export type HostFileChangesArgs = HostFileChangesArgs_Serialize | HostFileChangesArgs_Deserialize;
 
@@ -1559,6 +1646,49 @@ export type HostJobsFromEntriesResult = HostJobsFromEntriesResult_Serialize | Ho
 export type HostJobsFromEntriesResult_Deserialize = JobInfo_Deserialize[];
 
 export type HostJobsFromEntriesResult_Serialize = JobInfo_Serialize[];
+
+export type HostLifecycleCloseSessionArgs = {
+	sessionId: string,
+};
+
+export type HostLifecycleCreateSessionArgs = HostLifecycleCreateSessionArgs_Serialize | HostLifecycleCreateSessionArgs_Deserialize;
+
+export type HostLifecycleCreateSessionArgs_Deserialize = {
+	cwd: string,
+	request?: SessionRequest_Deserialize | null,
+};
+
+export type HostLifecycleCreateSessionArgs_Serialize = {
+	cwd: string,
+	request: SessionRequest_Serialize | null,
+};
+
+export type HostLifecycleCreateSessionResult = string;
+
+export type HostLifecycleForkSessionArgs = {
+	sessionId: string,
+	entryId: EntryId,
+};
+
+export type HostLifecycleForkSessionResult = HostLifecycleForkSessionResult_Serialize | HostLifecycleForkSessionResult_Deserialize;
+
+export type HostLifecycleForkSessionResult_Deserialize = ForkReceipt_Deserialize;
+
+export type HostLifecycleForkSessionResult_Serialize = ForkReceipt_Serialize;
+
+export type HostLifecycleOpenSessionArgs = HostLifecycleOpenSessionArgs_Serialize | HostLifecycleOpenSessionArgs_Deserialize;
+
+export type HostLifecycleOpenSessionArgs_Deserialize = {
+	path: string,
+	request?: SessionRequest_Deserialize | null,
+};
+
+export type HostLifecycleOpenSessionArgs_Serialize = {
+	path: string,
+	request: SessionRequest_Serialize | null,
+};
+
+export type HostLifecycleOpenSessionResult = string;
 
 export type HostListSessionsArgs = {
 	cwd: string,
@@ -1737,6 +1867,12 @@ export type HostValidSectionNameArgs = {
 
 export type HostValidSectionNameResult = boolean;
 
+export type HostValidToolNameArgs = {
+	name: string,
+};
+
+export type HostValidToolNameResult = boolean;
+
 export type InlineSpec = InlineSpec_Serialize | InlineSpec_Deserialize;
 
 export type InlineSpec_Deserialize = {
@@ -1760,6 +1896,8 @@ export type InlineSpec_Serialize = {
 };
 
 export type InputKind = "text" | "image";
+
+export type InvokeErrorCode = ErrorCode | DispatchCode;
 
 /**  One job, for hosts. */
 export type JobInfo = JobInfo_Serialize | JobInfo_Deserialize;
@@ -2047,6 +2185,32 @@ export type Located_Serialize =
 { type: "file"; url: SchemeUrl | null; path: string; writable: boolean } | 
 /**  A resource whose handler performs reads and writes; use `Schemes::read`/`Schemes::write`. */
 { type: "virtual"; url: SchemeUrl };
+
+export type LoginOption = {
+	id: string,
+	label: string,
+};
+
+export type LoginPrompt = LoginPrompt_Serialize | LoginPrompt_Deserialize;
+
+export type LoginPrompt_Deserialize = {
+	message: string,
+	placeholder?: string | null,
+	/**  The answer is a secret; the host should mask it. */
+	secret: boolean,
+};
+
+export type LoginPrompt_Serialize = {
+	message: string,
+	placeholder?: string,
+	/**  The answer is a secret; the host should mask it. */
+	secret: boolean,
+};
+
+export type LoginSelect = {
+	message: string,
+	options: LoginOption[],
+};
 
 export type MaintenanceKind = "compact" | "shake" | "branchSummary";
 
@@ -2374,6 +2538,36 @@ export type PendingResult = {
 	result: Value,
 	/**  The original mode's result schema, used to validate host replacements. */
 	schema: Value,
+};
+
+export type PolicyBlock = PolicyBlock_Serialize | PolicyBlock_Deserialize;
+
+export type PolicyBlock_Deserialize = {
+	block: true,
+	reason?: string | null,
+	terminate?: boolean | null,
+};
+
+export type PolicyBlock_Serialize = {
+	block: true,
+	reason: string | null,
+	terminate: boolean | null,
+};
+
+export type PolicyOverride = PolicyOverride_Serialize | PolicyOverride_Deserialize;
+
+export type PolicyOverride_Deserialize = {
+	content?: UserBlock[] | null,
+	details?: Value | null,
+	isError?: boolean | null,
+	terminate?: boolean | null,
+};
+
+export type PolicyOverride_Serialize = {
+	content: UserBlock[] | null,
+	details: Value | null,
+	isError: boolean | null,
+	terminate: boolean | null,
 };
 
 export type ProjectAccess = 
@@ -2770,6 +2964,12 @@ export type SchemeContext = {
 	cwd: string,
 };
 
+export type SchemeResolution = SchemeResolution_Serialize | SchemeResolution_Deserialize;
+
+export type SchemeResolution_Deserialize = VirtualTarget | FileTarget;
+
+export type SchemeResolution_Serialize = VirtualTarget | FileTarget;
+
 /**
  *  A recognized URL: `scheme` is lowercase and `path` is everything after `://`,
  *  verbatim, without decoding or splitting query strings and fragments.
@@ -2997,13 +3197,15 @@ export type SessionEntriesResult_Serialize = EntryPage_Serialize;
 export type SessionEvent = SessionEvent_Serialize | SessionEvent_Deserialize;
 
 /**  The `type` tag of a [`SessionEvent`], used to select which events to receive. */
-export type SessionEventKind = "agent" | "activity" | "entry" | "questionPending" | "questionResolved" | "maintenanceStart" | "maintenanceEnd" | "retry" | "job" | "jobGone" | "context" | "autoPaused" | "mode" | "effectiveMode" | "modeResult" | "modeResultResolved" | "treeUsage";
+export type SessionEventKind = "agent" | "activity" | "entry" | "queueChanged" | "questionPending" | "questionResolved" | "maintenanceStart" | "maintenanceEnd" | "retry" | "job" | "jobGone" | "context" | "autoPaused" | "mode" | "effectiveMode" | "modeResult" | "modeResultResolved" | "treeUsage";
 
 export type SessionEvent_Deserialize = { type: "agent"; value: AgentEvent_Deserialize } | 
 /**  Authoritative ownership state, including maintenance and navigation. */
 { type: "activity"; value: Activity_Deserialize } | 
 /**  An entry was appended to the session. */
 { type: "entry"; value: SeqEntry_Deserialize } | 
+/**  The pending input queue changed; refresh the live queued snapshot. */
+{ type: "queueChanged" } | 
 /**  An `ask` call is waiting for `Session::answer` or `Session::dismiss`. */
 { type: "questionPending"; value: {
 	callId: string,
@@ -3065,6 +3267,8 @@ export type SessionEvent_Serialize = { type: "agent"; value: AgentEvent_Serializ
 { type: "activity"; value: Activity_Serialize } | 
 /**  An entry was appended to the session. */
 { type: "entry"; value: SeqEntry_Serialize } | 
+/**  The pending input queue changed; refresh the live queued snapshot. */
+{ type: "queueChanged" } | 
 /**  An `ask` call is waiting for `Session::answer` or `Session::dismiss`. */
 { type: "questionPending"; value: {
 	callId: string,
@@ -3144,8 +3348,8 @@ export type SessionInfo_Deserialize = {
 	cwd: string,
 	parentSession?: string | null,
 	spawn?: SpawnLink_Deserialize | null,
-	/**  File modification time. */
-	modified: SystemTime,
+	/**  File modification time in Unix milliseconds. */
+	modifiedAt: number,
 };
 
 /**  One listed session, built from its header line and file metadata. */
@@ -3156,8 +3360,8 @@ export type SessionInfo_Serialize = {
 	cwd: string,
 	parentSession: string | null,
 	spawn: SpawnLink_Serialize | null,
-	/**  File modification time. */
-	modified: SystemTime,
+	/**  File modification time in Unix milliseconds. */
+	modifiedAt: number,
 };
 
 export type SessionInspectPromptResult = SessionInspectPromptResult_Serialize | SessionInspectPromptResult_Deserialize;
@@ -3793,6 +3997,12 @@ export type SpawnOrigin =
 
 export type SpawnReceipt = ({ job: string }) & { jobs?: never; team?: never } | ({ team: string; jobs: { [key in string]: string } }) & { job?: never };
 
+export type SpawnReply = SpawnReply_Serialize | SpawnReply_Deserialize;
+
+export type SpawnReply_Deserialize = ({ block: string }) & { replace?: never } | ({ replace: AgentSpec_Deserialize }) & { block?: never };
+
+export type SpawnReply_Serialize = ({ block: string }) & { replace?: never } | ({ replace: AgentSpec_Serialize }) & { block?: never };
+
 export type SpawnRequest = SpawnRequest_Serialize | SpawnRequest_Deserialize;
 
 export type SpawnRequest_Deserialize = {
@@ -4006,11 +4216,6 @@ export type SystemMessage_Serialize = {
 	toolsAdded?: ToolSpec[],
 	toolsRemoved?: string[],
 	timestamp: number,
-};
-
-export type SystemTime = {
-	secs_since_epoch: number,
-	nanos_since_epoch: number,
 };
 
 /**  A team member's place in its team; stored in its spawn link. */
@@ -4236,6 +4441,9 @@ export type ToolOutput_Serialize = {
 	terminate: boolean,
 };
 
+/**  A tool result as the runner sends it. */
+export type ToolResult = ToolResult_Serialize | ToolResult_Deserialize;
+
 export type ToolResultMessage = ToolResultMessage_Serialize | ToolResultMessage_Deserialize;
 
 export type ToolResultMessage_Deserialize = {
@@ -4258,6 +4466,22 @@ export type ToolResultMessage_Serialize = {
 	timestamp: number,
 	/**  Milliseconds the tool's execution took (monotonic clock). */
 	durationMs?: number,
+};
+
+/**  A tool result as the runner sends it. */
+export type ToolResult_Deserialize = {
+	content: UserBlock[],
+	details?: Value | null,
+	isError?: boolean | null,
+	terminate?: boolean | null,
+};
+
+/**  A tool result as the runner sends it. */
+export type ToolResult_Serialize = {
+	content: UserBlock[],
+	details: Value | null,
+	isError: boolean | null,
+	terminate: boolean | null,
 };
 
 export type ToolRunArgs = ToolRunArgs_Serialize | ToolRunArgs_Deserialize;
@@ -4556,18 +4780,20 @@ export type UserMessage_Serialize = {
 
 export type Value = null | boolean | number | string | Value[] | { [key in string]: Value };
 
+export type VirtualTarget = "virtual";
+
 /**  A present scope must contain at least one layer. */
 export type WriteCeilingInput = null | WriteScope;
 
 /**  One place a scope layer permits writes under. */
 export type WriteRoot = 
 /**  An absolute directory. */
-({ path: string }) & { url?: never } | 
+{ type: "path"; value: string } | 
 /**
  *  A registered scheme URL prefix `scheme://path` without a trailing `/`.
  *  `local://` stays symbolic: in a child it means the child's own local dir.
  */
-({ url: string }) & { path?: never };
+{ type: "url"; value: string };
 
 /**
  *  A write scope: a target must be permitted by every layer (persona or child spec,
@@ -4648,6 +4874,16 @@ export type text = {
 	type: "text",
 	text: string,
 };
+export type CredentialInput = Credential_Deserialize;
+export type DeviceCodeInput = DeviceCode_Deserialize;
+export type LoginPromptInput = LoginPrompt_Deserialize;
+export type LoginSelectInput = LoginSelect;
+export type ToolResultInput = ToolResult_Deserialize;
+export type PolicyBlockInput = PolicyBlock_Deserialize;
+export type PolicyOverrideInput = PolicyOverride_Deserialize;
+export type SpawnReplyInput = SpawnReply_Deserialize;
+export type SchemeResolutionInput = SchemeResolution_Deserialize;
+export type CredentialOutput = Credential_Serialize;
 
 export interface Session {
   /**
@@ -4893,7 +5129,7 @@ export interface Session {
    */
   jobChunks(jobId: SessionJobChunksArgs["jobId"], offset: SessionJobChunksArgs["offset"], limit: SessionJobChunksArgs["limit"], signal?: AbortSignal): Promise<SessionJobChunksResult_Serialize>;
   /**
-   * Reads journal entries after a sequence number (default 256, clamped to 1..=1024).
+   * Reads journal entries after a sequence number, with the same limits as `host.readSession`.
    */
   entries(after?: SessionEntriesArgs_Deserialize["after"], limit?: SessionEntriesArgs_Deserialize["limit"], signal?: AbortSignal): Promise<SessionEntriesResult_Serialize>;
   /**
@@ -5113,6 +5349,7 @@ export interface Host {
   // withheld: createSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: openSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: session — returns a live session; ctx.session(id) reaches it
+  // withheld: observeChild — live receiver; the bridge serves session.subscribe
   // withheld: openSessionRead — a whole journal can exceed a frame; host.readSession pages it
   // withheld: readSnapshot — bytes cross as base64
   /**
@@ -5150,6 +5387,10 @@ export interface Host {
    * Tests whether a scheme name is valid.
    */
   validSchemeName(name: HostValidSchemeNameArgs["name"], signal?: AbortSignal): Promise<HostValidSchemeNameResult>;
+  /**
+   * Tests tool name syntax, independently of session-specific reservations.
+   */
+  validToolName(name: HostValidToolNameArgs["name"], signal?: AbortSignal): Promise<HostValidToolNameResult>;
   /**
    * Parses a slash command; returns null for ordinary input.
    */
@@ -5246,8 +5487,8 @@ export interface Models {
 }
 
 export interface HostLifecycle {
-  createSession(cwd: string, request?: SessionRequest, signal?: AbortSignal): Promise<string>;
-  openSession(path: string, request?: SessionRequest, signal?: AbortSignal): Promise<string>;
-  forkSession(sessionId: string, entryId: string, signal?: AbortSignal): Promise<ForkReceipt>;
-  closeSession(sessionId: string, signal?: AbortSignal): Promise<void>;
+  createSession(cwd: HostLifecycleCreateSessionArgs_Deserialize["cwd"], request?: HostLifecycleCreateSessionArgs_Deserialize["request"], signal?: AbortSignal): Promise<HostLifecycleCreateSessionResult>;
+  openSession(path: HostLifecycleOpenSessionArgs_Deserialize["path"], request?: HostLifecycleOpenSessionArgs_Deserialize["request"], signal?: AbortSignal): Promise<HostLifecycleOpenSessionResult>;
+  forkSession(sessionId: HostLifecycleForkSessionArgs["sessionId"], entryId: HostLifecycleForkSessionArgs["entryId"], signal?: AbortSignal): Promise<HostLifecycleForkSessionResult_Serialize>;
+  closeSession(sessionId: HostLifecycleCloseSessionArgs["sessionId"], signal?: AbortSignal): Promise<void>;
 }

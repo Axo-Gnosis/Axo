@@ -14,6 +14,8 @@ use crate::types::now_ms;
 /// What `resolve_auth` needs to know about one provider.
 pub(crate) struct ProviderAuth {
     pub id: String,
+    /// Opaque storage key bound to the provider origin at construction.
+    pub slot: String,
     /// The raw `apiKey` from `models.jsonc`; resolved here with [`resolve_config_value`].
     pub config_api_key: Option<String>,
     /// Environment variables checked in order; the first non-empty one wins.
@@ -124,7 +126,7 @@ pub(crate) async fn credential_source(
     if info.config_api_key.is_some() {
         return Ok(CredentialSource::Config);
     }
-    Ok(match store.get(&info.id).await? {
+    Ok(match store.get(&info.slot).await? {
         Some(Credential::ApiKey { .. }) => CredentialSource::ApiKey,
         Some(Credential::Oauth { .. }) => CredentialSource::Oauth,
         None => env_credential(info, env)
@@ -162,44 +164,43 @@ pub(crate) async fn resolve_auth(
     } else {
         ModelAuth::default()
     };
-    if auth.api_key.is_some() {
-        return Ok(auth);
-    }
-    let stored = match store.get(&info.id).await? {
-        Some(Credential::Oauth { expires, .. }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
-            refresh(&info, &store).await?
-        }
-        other => other,
-    };
-    match stored {
-        Some(Credential::ApiKey { key }) => auth.api_key = Some(key),
-        Some(Credential::Oauth {
-            access,
-            headers,
-            base_url,
-            ..
-        }) => {
-            auth.api_key = Some(access);
-            // `models.jsonc` headers and base URL win over the credential's.
-            if !config_base_url {
-                auth.base_url = base_url;
+    if auth.api_key.is_none() {
+        let stored = match store.get(&info.slot).await? {
+            Some(Credential::Oauth { expires, .. }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
+                refresh(&info, &store).await?
             }
-            for (name, value) in headers {
-                if !auth
-                    .headers
-                    .keys()
-                    .any(|existing| existing.eq_ignore_ascii_case(&name))
-                {
-                    auth.headers.insert(name, value);
+            other => other,
+        };
+        match stored {
+            Some(Credential::ApiKey { key }) => auth.api_key = Some(key),
+            Some(Credential::Oauth {
+                access,
+                headers,
+                base_url,
+                ..
+            }) => {
+                auth.api_key = Some(access);
+                // `models.jsonc` headers and base URL win over the credential's.
+                if !config_base_url {
+                    auth.base_url = base_url;
+                }
+                for (name, value) in headers {
+                    if !auth
+                        .headers
+                        .keys()
+                        .any(|existing| existing.eq_ignore_ascii_case(&name))
+                    {
+                        auth.headers.insert(name, value);
+                    }
                 }
             }
-        }
-        None => {
-            auth.api_key =
-                env_credential(&info, |name| std::env::var(name).ok()).map(|(_, value)| value);
+            None => {
+                auth.api_key =
+                    env_credential(&info, |name| std::env::var(name).ok()).map(|(_, value)| value);
+            }
         }
     }
-    if auth.api_key.is_none() && info.requires_key {
+    if info.requires_key && auth.api_key.as_deref().is_none_or(str::is_empty) {
         return Err(Error::NoApiKey {
             provider: info.id.clone(),
         });
@@ -222,11 +223,11 @@ async fn refresh(
     };
     // The lock and the rotated token live together in one spawned update: a cancelled request
     // can neither release the lock mid-refresh nor drop the new credential before it is saved.
-    let (store, provider) = (Arc::clone(store), info.id.clone());
+    let (store, slot) = (Arc::clone(store), info.slot.clone());
     tokio::spawn(async move {
         store
             .update(
-                &provider,
+                &slot,
                 Box::new(move |current: Option<Credential>| {
                     async move {
                         match current {
@@ -259,6 +260,7 @@ mod tests {
         let store = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
         let mut info = ProviderAuth {
             id: "custom".into(),
+            slot: "loaded/custom".into(),
             config_api_key: Some("!must not execute".into()),
             env: vec!["EMPTY".into(), "FIRST".into(), "SECOND".into()],
             requires_key: false,
@@ -276,7 +278,7 @@ mod tests {
         };
         store
             .set(
-                &info.id,
+                &info.slot,
                 Credential::ApiKey {
                     key: "stored".into(),
                 },
@@ -300,13 +302,13 @@ mod tests {
             base_url: None,
             extra: Default::default(),
         };
-        store.set(&info.id, expired.clone()).await.unwrap();
+        store.set(&info.slot, expired.clone()).await.unwrap();
         assert_eq!(
             credential_source(&info, store.as_ref(), env).await.unwrap(),
             CredentialSource::Oauth
         );
-        assert_eq!(store.get(&info.id).await.unwrap(), Some(expired));
-        store.remove(&info.id).await.unwrap();
+        assert_eq!(store.get(&info.slot).await.unwrap(), Some(expired));
+        store.remove(&info.slot).await.unwrap();
         assert_eq!(
             credential_source(&info, store.as_ref(), env).await.unwrap(),
             CredentialSource::Env("FIRST".into())

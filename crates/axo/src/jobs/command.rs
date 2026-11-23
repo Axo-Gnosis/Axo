@@ -754,6 +754,13 @@ impl CommandTask {
         let stop = if stopped { *lock(&control.stop) } else { None };
         // Stopped jobs were killed; anything left is merely still dying.
         let retained = stop.is_none() && process.has_leftovers();
+        if pipes_open && !retained {
+            capture_error.get_or_insert_with(|| "output drain deadline expired".to_owned());
+            shared
+                .output
+                .progress
+                .send_modify(|p| p.capture_failed = true);
+        }
         // Fixed before the spool decision: from here on the job cannot be promoted, and a
         // promoted job's spool backs the artifact URL its call already returned.
         let promoted = jobs.finishing(id);
@@ -765,8 +772,8 @@ impl CommandTask {
         };
         // The model gets a log URL only for complete captures; retained and promoted rows
         // reference their log through the journal regardless, so partial logs stay readable there.
-        let full_output =
-            (truncated && capture_error.is_none()).then(|| format!("artifact://{artifact}"));
+        let full_output = (truncated && capture_error.is_none() && !pipes_open)
+            .then(|| format!("artifact://{artifact}"));
         let keep = full_output.is_some() || retained || promoted;
         if !keep {
             spool = None;
@@ -941,27 +948,20 @@ impl CommandTask {
             }
         }
         drop(readers);
+        let mut failed = capture_error.is_some() || pipes_open;
         if let Some(index) = &mut index {
             let bytes = shared.output.progress.borrow().bytes;
-            let failed = capture_error.is_some() || pipes_open;
-            if write_span(index, bytes, if failed { TAG_FAILED } else { TAG_END })
+            failed |= write_span(index, bytes, if failed { TAG_FAILED } else { TAG_END })
                 .await
-                .is_err()
-                || failed
-            {
-                shared
-                    .output
-                    .progress
-                    .send_modify(|p| p.capture_failed = true);
-            }
+                .is_err();
         }
         drop(spool);
         process.close().await;
         drop(live);
-        shared
-            .output
-            .progress
-            .send_modify(|progress| progress.done = true);
+        shared.output.progress.send_modify(|progress| {
+            progress.capture_failed |= failed;
+            progress.done = true;
+        });
         jobs.closed(id);
     }
 }

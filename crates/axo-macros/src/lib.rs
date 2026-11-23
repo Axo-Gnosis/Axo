@@ -497,7 +497,14 @@ fn entry(
                     result_ty = Some(id);
                 }
             }
-            let call = format_ident!("__ext_{}_{}", object, ident.unraw());
+            let mut thunk = String::from("__ext_");
+            for (i, ch) in object.char_indices() {
+                if i != 0 && ch.is_ascii_uppercase() {
+                    thunk.push('_');
+                }
+                thunk.push(ch.to_ascii_lowercase());
+            }
+            let call = format_ident!("{thunk}_{}", ident.unraw());
             let await_ = sig.asyncness.map(|_| quote!(.await));
             let encode = quote_spanned!(span=> ::serde_json::to_value(&out));
             defs.extend(quote! {
@@ -525,7 +532,7 @@ fn entry(
     let args_name = type_name(&args_ty);
     let result_name = type_name(&result_ty);
     Ok(quote! {
-        crate::ext::Entry {
+        crate::ext::MethodEntry {
             call: #call,
             meta: crate::ext::Meta {
                 name: #name, rust_name: #rust_name, doc: #doc, params: &[#(#params),*],

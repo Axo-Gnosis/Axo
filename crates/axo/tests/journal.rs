@@ -7,104 +7,21 @@ mod common;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use axo::{
-    Axo, Command, Entry, Header, JobStatus, JsonlStore, SeqEntry, Session, SessionEvent,
-    SessionInfo, SessionStore, SessionWriter,
-};
+use axo::{Axo, Command, Entry, JobStatus, JsonlStore, Session, SessionEvent, SessionStore};
 use axo_agent::RunOutcome;
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
     AssistantEvent, Message, Model, ScriptedApi, ScriptedTurn, SimpleStreamOptions, Streamer,
     Transcript, UserBlock,
 };
-use common::{bash_options, journal, only, within};
+use common::{GatedStore, WriteGate, bash_options, journal, only, within};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
-
-/// Holds the first append matching `stops` until released.
-struct WriteGate {
-    stops: fn(&Entry) -> bool,
-    armed: AtomicBool,
-    entered: Notify,
-    release: Notify,
-}
-
-impl WriteGate {
-    fn new(stops: fn(&Entry) -> bool) -> Arc<Self> {
-        Arc::new(Self {
-            stops,
-            armed: AtomicBool::new(true),
-            entered: Notify::new(),
-            release: Notify::new(),
-        })
-    }
-}
-
-struct GatedWriter {
-    inner: Box<dyn SessionWriter>,
-    gate: Arc<WriteGate>,
-}
-
-#[async_trait]
-impl SessionWriter for GatedWriter {
-    async fn append(&mut self, entry: Entry) -> Result<SeqEntry, axo::Error> {
-        if (self.gate.stops)(&entry) && self.gate.armed.swap(false, Ordering::AcqRel) {
-            self.gate.entered.notify_one();
-            self.gate.release.notified().await;
-        }
-        self.inner.append(entry).await
-    }
-
-    fn path(&self) -> &Path {
-        self.inner.path()
-    }
-}
-
-/// A `JsonlStore` whose writers stop at `gate`.
-struct GatedStore {
-    inner: JsonlStore,
-    gate: Arc<WriteGate>,
-}
-
-#[async_trait]
-impl SessionStore for GatedStore {
-    async fn create(&self, header: Header) -> Result<Box<dyn SessionWriter>, axo::Error> {
-        Ok(Box::new(GatedWriter {
-            inner: self.inner.create(header).await?,
-            gate: self.gate.clone(),
-        }))
-    }
-
-    async fn open_write(
-        &self,
-        path: &Path,
-    ) -> Result<(Header, Vec<SeqEntry>, Box<dyn SessionWriter>), axo::Error> {
-        let (header, entries, inner) = self.inner.open_write(path).await?;
-        let writer = GatedWriter {
-            inner,
-            gate: self.gate.clone(),
-        };
-        Ok((header, entries, Box::new(writer)))
-    }
-
-    async fn open_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), axo::Error> {
-        self.inner.open_read(path).await
-    }
-
-    async fn read_header(&self, path: &Path) -> Result<Header, axo::Error> {
-        self.inner.read_header(path).await
-    }
-
-    async fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, axo::Error> {
-        self.inner.list(cwd).await
-    }
-}
 
 /// Streams from `api`, holding request number `at` (0-based) until released.
 struct GatedStreamer {

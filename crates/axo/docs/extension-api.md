@@ -58,7 +58,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | commandChunks | callId, offset, limit | Reads up to one MiB from the call's newest command, labeled by stream, at a byte offset. |
 | jobOutput | jobId, offset, limit | Reads up to one MiB of raw output from a job at a byte offset. |
 | jobChunks | jobId, offset, limit | Reads up to one MiB from a job, labeled by stream, at a byte offset. |
-| entries | after?, limit? | Reads journal entries after a sequence number (default 256, clamped to 1..=1024). |
+| entries | after?, limit? | Reads journal entries after a sequence number, with the same limits as host.readSession. |
 | live |  | Takes a snapshot of the current live session state. |
 | compact | focus? | Summarizes eligible history without submitting an ordinary user turn; focus tells the summary what to prioritize (blank focus counts as none). |
 | shake | mode | Removes eligible blocks into recoverable session artifacts, without model calls. |
@@ -164,6 +164,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | validCommandName | name | Tests whether a command name is valid. |
 | validSectionName | name | Tests whether a prompt section name is valid. |
 | validSchemeName | name | Tests whether a scheme name is valid. |
+| validToolName | name | Tests tool name syntax, independently of session-specific reservations. |
 | parseCommand | text | Parses a slash command; returns null for ordinary input. |
 | decodeCommand | name, args | Decodes a named command and its JSON arguments. |
 | parseAgent | defaultName, markdown | Parses an agent definition and returns its diagnostics. |
@@ -190,6 +191,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | AXO::create_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::open_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::session | returns a live session; ctx.session(id) reaches it |
+| AXO::observe_child | live receiver; the bridge serves session.subscribe |
 | AXO::open_session_read | a whole journal can exceed a frame; host.readSession pages it |
 | AXO::read_snapshot | bytes cross as base64 |
 | AXO::schemes | takes host scheme objects; a live session's schemes are reached through tools |
@@ -295,6 +297,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | PROCESS_SUPERVISOR_BLOCK::new | live process handles; commands go through tools.runCommand |
 | PROCESS_SUPERVISOR_BLOCK::spawn | live process handles; commands go through tools.runCommand |
 | PROCESS_SUPERVISOR_BLOCK::output | live process handles; commands go through tools.runCommand |
+| PROCESS_SUPERVISOR_BLOCK::output_stderr_tail | live process handles; commands go through tools.runCommand |
 | PROCESS_BLOCK::capture_output | live process handles; commands go through tools.runCommand |
 | PROCESS_BLOCK::wait | live process handles; commands go through tools.runCommand |
 | PROCESS_BLOCK::guardian_lost | live process handles; commands go through tools.runCommand |
@@ -303,8 +306,8 @@ Extensions are trusted code; nothing here is a sandbox.
 | CONTAINER_BLOCK::kill | live process handles; commands go through tools.runCommand |
 | CONTAINER_BLOCK::populated | live process handles; commands go through tools.runCommand |
 | CONTAINER_BLOCK::terminate | live process handles; commands go through tools.runCommand |
-| CONTAINER_BLOCK::memory | live process handles; commands go through tools.runCommand |
-| INVOKE_ERROR_BLOCK::code | errors cross as { code, message } |
+| CONTAINER_BLOCK::memory_batch | live process handles; commands go through tools.runCommand |
+| INVOKE_ERROR_BLOCK::code | errors cross as { code, message, details? } |
 | HOST_TOOL_BLOCK::direct | construction or internal state rebuilding with no meaning across the wire |
 | HOST_TOOL_BLOCK::deferred | construction or internal state rebuilding with no meaning across the wire |
 | HOST_TOOL_BLOCK::with_origin | construction or internal state rebuilding with no meaning across the wire |

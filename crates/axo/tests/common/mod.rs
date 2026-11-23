@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use axo::{
     Axo, ConfigLayer, ConfigSource, Error, ProjectAccess, Session, SessionEvent, SessionOptions,
     SpawnRequest, StaticEnv, UserConfig,
 };
-use axo::{Entry, JsonlStore, SeqEntry, SessionStore};
+use axo::{Entry, Header, JsonlStore, SeqEntry, SessionInfo, SessionStore, SessionWriter};
 use axo_agent::{AgentMessage, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::reply_text;
 use axo_ai::{
@@ -19,9 +20,93 @@ use axo_ai::{
     ScriptedApi, ScriptedTurn, StopReason, Streamer, UserBlock,
 };
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Holds the first append matching `stops` until released.
+pub struct WriteGate {
+    pub stops: fn(&Entry) -> bool,
+    pub armed: AtomicBool,
+    pub entered: Notify,
+    pub release: Notify,
+    pub fail: AtomicBool,
+}
+
+impl WriteGate {
+    pub fn new(stops: fn(&Entry) -> bool) -> Arc<Self> {
+        Arc::new(Self {
+            stops,
+            armed: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Notify::new(),
+            fail: AtomicBool::new(false),
+        })
+    }
+}
+
+pub struct GatedWriter {
+    pub inner: Box<dyn SessionWriter>,
+    pub gate: Arc<WriteGate>,
+}
+
+#[async_trait]
+impl SessionWriter for GatedWriter {
+    async fn append(&mut self, entry: Entry) -> Result<SeqEntry, Error> {
+        if (self.gate.stops)(&entry) && self.gate.armed.swap(false, Ordering::AcqRel) {
+            self.gate.entered.notify_one();
+            self.gate.release.notified().await;
+            if self.gate.fail.swap(false, Ordering::AcqRel) {
+                return Err(Error::InvalidInput("injected append failure".into()));
+            }
+        }
+        self.inner.append(entry).await
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+}
+
+/// A `JsonlStore` whose writers stop at `gate`.
+pub struct GatedStore {
+    pub inner: JsonlStore,
+    pub gate: Arc<WriteGate>,
+}
+
+#[async_trait]
+impl SessionStore for GatedStore {
+    async fn create(&self, header: Header) -> Result<Box<dyn SessionWriter>, Error> {
+        Ok(Box::new(GatedWriter {
+            inner: self.inner.create(header).await?,
+            gate: self.gate.clone(),
+        }))
+    }
+
+    async fn open_write(
+        &self,
+        path: &Path,
+    ) -> Result<(Header, Vec<SeqEntry>, Box<dyn SessionWriter>), Error> {
+        let (header, entries, inner) = self.inner.open_write(path).await?;
+        let writer = GatedWriter {
+            inner,
+            gate: self.gate.clone(),
+        };
+        Ok((header, entries, Box::new(writer)))
+    }
+
+    async fn open_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error> {
+        self.inner.open_read(path).await
+    }
+
+    async fn read_header(&self, path: &Path) -> Result<Header, Error> {
+        self.inner.read_header(path).await
+    }
+
+    async fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, Error> {
+        self.inner.list(cwd).await
+    }
+}
 
 pub fn transient(delay: Option<u64>) -> ScriptedTurn {
     let mut message = reply_text("");
@@ -263,6 +348,15 @@ pub async fn until(mut ready: impl FnMut() -> bool) {
         }
     })
     .await;
+}
+
+/// Drives `prompt` until `ready` (e.g. the hanging request arrived), then drops the
+/// caller; the run continues. A fixed timeout races the prompt's progress under load.
+pub async fn start_hanging<T>(prompt: impl Future<Output = T>, ready: impl FnMut() -> bool) {
+    tokio::select! {
+        _ = prompt => panic!("the run settled; it should hang until cancelled"),
+        () = until(ready) => {}
+    }
 }
 
 /// Waits for an entry matching `matches`, already written or yet to come.

@@ -156,12 +156,21 @@ async fn logins_and_refresh_run_through_the_runner() {
     let host = Host::new().await;
     let http = Http::start();
     host.package("root", "alpha", &[("pa", &http.url, true, false)]);
-    host.package("root", "beta", &[("pb", &http.url, true, false)]);
+    let beta_http = Http::start();
+    host.package(
+        "root",
+        "beta",
+        &[
+            ("pa", &beta_http.url, true, false),
+            ("pb", &http.url, true, false),
+        ],
+    );
     let extensions = host.manager();
-    extensions
-        .configure(&enabled(&[("alpha", Some("g")), ("beta", Some("g"))]))
-        .await
-        .unwrap();
+    let alpha_wins = enabled(&[("beta", Some("g")), ("alpha", Some("g"))]);
+    let beta_wins = enabled(&[("alpha", Some("g")), ("beta", Some("g"))]);
+    extensions.configure(&alpha_wins).await.unwrap();
+    let pa = host.models.credential_slot("pa").unwrap();
+    let pb = host.models.credential_slot("pb").unwrap();
 
     // The first login starts the shared runner and waits for activation.
     let first = Ui::new(Some("first"));
@@ -175,7 +184,7 @@ async fn logins_and_refresh_run_through_the_runner() {
         ]
     );
     assert_eq!(
-        access(host.store.get("pa").await.unwrap()).as_deref(),
+        access(host.store.get(&pa).await.unwrap()).as_deref(),
         Some("access-first")
     );
 
@@ -187,20 +196,20 @@ async fn logins_and_refresh_run_through_the_runner() {
     assert_eq!(one.events().len(), 3);
     assert_eq!(two.events().len(), 3);
     assert_eq!(
-        access(host.store.get("pa").await.unwrap()).as_deref(),
+        access(host.store.get(&pa).await.unwrap()).as_deref(),
         Some("access-one")
     );
     assert_eq!(
-        access(host.store.get("pb").await.unwrap()).as_deref(),
+        access(host.store.get(&pb).await.unwrap()).as_deref(),
         Some("access-two")
     );
     assert_eq!(host.pids().len(), 1);
 
     // An expiring credential is refreshed through the runner and stored before the request.
-    host.store.set("pa", expiring()).await.unwrap();
+    host.store.set(&pa, expiring()).await.unwrap();
     request(&host, "pa").await;
     assert_eq!(
-        access(host.store.get("pa").await.unwrap()).as_deref(),
+        access(host.store.get(&pa).await.unwrap()).as_deref(),
         Some("refreshed")
     );
     let requests = http.requests();
@@ -216,7 +225,47 @@ async fn logins_and_refresh_run_through_the_runner() {
             .count(),
         1
     );
+
+    // Reordering claimants in the same layer must not lend alpha's token to beta.
+    extensions.configure(&beta_wins).await.unwrap();
+    let beta_pa = host.models.credential_slot("pa").unwrap();
+    assert_ne!(pa, beta_pa);
+    assert_eq!(host.store.get(&beta_pa).await.unwrap(), None);
+    request(&host, "pa").await;
+    assert!(beta_http.requests().is_empty());
+    host.models
+        .login("pa", &Ui::new(Some("beta")))
+        .await
+        .unwrap();
+    request(&host, "pa").await;
+    let requests = beta_http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        header(&requests[0].0, "authorization"),
+        Some("Bearer access-beta")
+    );
+
+    extensions.configure(&alpha_wins).await.unwrap();
+    assert_eq!(host.models.credential_slot("pa").unwrap(), pa);
+    request(&host, "pa").await;
+    let requests = http.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        header(&requests[1].0, "authorization"),
+        Some("Bearer refreshed")
+    );
     extensions.shutdown().await;
+
+    // Even the same extension ID in a different package root is a new principal.
+    host.package("root2", "alpha", &[("pa", &http.url, true, false)]);
+    let mut options = host.options();
+    options.roots.reverse();
+    let other = host.manager_with(options);
+    other.configure(&alpha_wins).await.unwrap();
+    let other_pa = host.models.credential_slot("pa").unwrap();
+    assert_ne!(other_pa, pa);
+    assert_eq!(host.store.get(&other_pa).await.unwrap(), None);
+    other.shutdown().await;
 }
 
 async fn crash_counts_once_and_the_third_disables_the_group_until_retry() {
@@ -401,6 +450,7 @@ async fn removal_and_shutdown_end_a_waiting_login() {
     for shutdown in [false, true] {
         let extensions = host.manager();
         extensions.configure(&list).await.unwrap();
+        let pa = host.models.credential_slot("pa").unwrap();
         let ui = Ui::new(None);
         let login = host.models.login("pa", &ui);
         tokio::pin!(login);
@@ -423,7 +473,7 @@ async fn removal_and_shutdown_end_a_waiting_login() {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(host.store.get("pa").await.unwrap(), None);
+        assert_eq!(host.store.get(&pa).await.unwrap(), None);
         if shutdown {
             assert!(!alive(pid));
         }
@@ -497,12 +547,13 @@ async fn interrupted_callbacks_send_no_http_and_store_nothing() {
         .await
         .unwrap();
     let before = expiring();
-    host.store.set("lab", before.clone()).await.unwrap();
+    let slot = host.models.credential_slot("lab").unwrap();
+    host.store.set(&slot, before.clone()).await.unwrap();
 
     // Runner death during refresh: nothing stored, nothing sent, one named failure.
     host.script("lab-provider", "refresh", "exit");
     assert_unavailable(&request(&host, "lab").await, "lab-provider");
-    assert_eq!(host.store.get("lab").await.unwrap(), Some(before));
+    assert_eq!(host.store.get(&slot).await.unwrap(), Some(before));
     assert!(http.requests().is_empty());
     // Generation 1 died mid-refresh; wait for its replacement.
     wait_ready_after(&extensions, "lab-provider", 1).await;
@@ -518,7 +569,7 @@ async fn interrupted_callbacks_send_no_http_and_store_nothing() {
         "{text}"
     );
     assert_eq!(
-        access(host.store.get("lab").await.unwrap()).as_deref(),
+        access(host.store.get(&slot).await.unwrap()).as_deref(),
         Some("refreshed")
     );
     assert!(http.requests().is_empty());

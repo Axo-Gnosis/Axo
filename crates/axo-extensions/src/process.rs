@@ -26,24 +26,18 @@ const BUNFIG: &str = "[install]\nauto = \"disable\"\n";
 const MAX_SOCKET_PATH: usize = 107;
 
 /// Why a generation did not start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StartError {
     /// Host inputs or the filesystem prevent starting at all; retrying cannot help
     /// until the host corrects them.
+    #[error("{0}")]
     Setup(String),
     /// The runner died, hung or failed its handshake; counts against the placement.
+    #[error("{0}")]
     Crash(String),
     /// `stop` was canceled first.
+    #[error("stopped")]
     Stopped,
-}
-
-impl std::fmt::Display for StartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StartError::Setup(msg) | StartError::Crash(msg) => f.write_str(msg),
-            StartError::Stopped => f.write_str("stopped"),
-        }
-    }
 }
 
 /// A running, authenticated runner. Dropping it kills the container, stops the
@@ -73,10 +67,18 @@ impl Generation {
         let bun = usable_bun(options.bun.as_deref())
             .await
             .map_err(StartError::Setup)?;
-        let dir = private_dir(&options.runtime_dir)?;
+        let runtime_dir = options.runtime_dir.clone();
+        let dir = tokio::select! {
+            biased;
+            () = stop.cancelled() => return Err(StartError::Stopped),
+            result = tokio::task::spawn_blocking(move || {
+                let dir = private_dir(&runtime_dir)?;
+                write(&dir.path().join("runner.ts"), RUNNER)?;
+                write(&dir.path().join("bunfig.toml"), BUNFIG)?;
+                Ok::<_, StartError>(dir)
+            }) => result.map_err(|error| StartError::Setup(format!("cannot prepare extension runner directory: {error}")))??,
+        };
         let runner = dir.path().join("runner.ts");
-        write(&runner, RUNNER)?;
-        write(&dir.path().join("bunfig.toml"), BUNFIG)?;
 
         let socket = dir.path().join("rpc");
         if socket.as_os_str().len() > MAX_SOCKET_PATH {
@@ -145,7 +147,7 @@ impl Generation {
             () = stop.cancelled() => Err(StartError::Stopped),
         };
         drop(listener);
-        let _ = std::fs::remove_file(&socket);
+        let _ = tokio::fs::remove_file(&socket).await;
 
         match outcome {
             Ok(peer) => Ok(Generation {

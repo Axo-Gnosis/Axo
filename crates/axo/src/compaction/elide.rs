@@ -40,7 +40,9 @@ pub(crate) struct Elision {
 
 fn artifact(artifacts: &Artifacts, extension: &str, bytes: Vec<u8>) -> (u64, Artifact) {
     // Discarded preparations may leave harmless gaps in the artifact IDs.
-    let (n, path) = artifacts.allocate(&format!("shake.{extension}"));
+    let (n, path) = artifacts
+        .allocate(&format!("shake.{extension}"))
+        .expect("built-in shake extensions are not reserved");
     (n, Artifact { path, bytes })
 }
 

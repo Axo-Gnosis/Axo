@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use specta::Type;
 
 use crate::api::RequestRewrite;
 use crate::auth::Credential;
@@ -52,28 +54,34 @@ pub trait LoginInteraction: Send + Sync {
     async fn progress(&self, message: &str);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeviceCode {
     pub user_code: String,
     pub verification_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoginPrompt {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
     /// The answer is a secret; the host should mask it.
     pub secret: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoginSelect {
     pub message: String,
     pub options: Vec<LoginOption>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoginOption {
     pub id: String,
     pub label: String,

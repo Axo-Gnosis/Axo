@@ -11,7 +11,7 @@
 // - Tool `burst` sends 300 updates in a plain loop, then returns `burst`.
 // - `/hello <args>` posts a quiet, displayed `lab` message with text `<args>`.
 // - `/flood` holds every runner host-call slot with `/hold-0`..`/hold-127` (one command may run
-//   once per session at a time), then posts the error code of a queued 129th `/hold`.
+//   once per session at a time), withdraws a full queue, then posts the next queued call's stall code.
 // - Each journal entry appends its `type` and a newline to `dataDir/entries`.
 // - Scheme `lab://` is virtual; reading `lab://<path>` returns `read:<path>`.
 //
@@ -97,10 +97,18 @@ const activate: Extension = ({ dataDir, host, models, session: getSession }) => 
     hello: (args, session) => session.post({ customType: "lab", text: args, display: true, delivery: "quiet" }),
     async "ask-model"(args, session) {
       const count = (await models.all()).length;
-      const reply = await models.complete({
-        model: "test/m",
-        messages: [{ role: "user", content: args, timestamp: Date.now() }],
-      });
+      let reply;
+      try {
+        reply = await models.complete({
+          model: "test/m",
+          messages: [{ role: "user", content: args, timestamp: Date.now() }],
+        });
+      } catch (error) {
+        if (args !== "report-error" || !(error instanceof Error && "code" in error && "details" in error)) throw error;
+        const { code, message, details } = error;
+        await session.post({ customType: "lab", text: JSON.stringify({ code, message, details }), display: true, delivery: "quiet" });
+        return;
+      }
       const text = Array.isArray(reply.content)
         ? reply.content.flatMap(block => block.type === "text" ? [block.text] : []).join("")
         : reply.content;
@@ -137,10 +145,22 @@ const activate: Extension = ({ dataDir, host, models, session: getSession }) => 
     async flood(_args, session, signal) {
       const release = new AbortController();
       floods.set(session.id, AbortSignal.any([signal, release.signal]));
-      const run = (name: string) => session.runCommand({ type: "registered", name, args: "" });
+      const run = (name: string, ...stop: [] | [AbortSignal]) => session.runCommand({ type: "registered", name, args: "" }, ...stop);
       const occupied = Promise.allSettled(Array.from({ length: SLOTS }, (_, i) => run(`hold-${i}`)));
       let text = "not stalled";
       try {
+        const controllers = Array.from({ length: SLOTS }, () => new AbortController());
+        const waiting = Promise.allSettled(controllers.map(({ signal }) => run("hold", signal)));
+        try {
+          await run("hold");
+          throw new Error("full queue accepted another call");
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "busy" && error.message === "host call queue is full")) throw error;
+        }
+        controllers.forEach((controller, i) => controller.abort(new Error(`withdraw ${i}`)));
+        for (const [i, result] of (await waiting).entries()) {
+          if (result.status !== "rejected" || result.reason !== controllers[i]!.signal.reason) throw new Error("queued withdrawal lost its reason");
+        }
         await run("hold");
       } catch (error) {
         if (!(error instanceof Error && "code" in error)) throw error;

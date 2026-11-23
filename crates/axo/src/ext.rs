@@ -8,7 +8,7 @@ use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Axo, Error, ErrorCode, Session};
+use crate::{Axo, CompletionDetails, Error, ErrorCode, Session};
 
 pub type CallFut<'a> = Pin<Box<dyn Future<Output = Result<Value, InvokeError>> + Send + 'a>>;
 type Call<T> = for<'a> fn(&'a T, &'a Caller, Vec<Value>) -> CallFut<'a>;
@@ -35,7 +35,7 @@ pub struct Meta {
     pub register: fn(specta::Types) -> specta::Types,
 }
 
-pub struct Entry<T: 'static> {
+pub struct MethodEntry<T: 'static> {
     pub call: Option<Call<T>>,
     pub meta: Meta,
 }
@@ -43,7 +43,7 @@ pub struct Entry<T: 'static> {
 pub struct Block<T: 'static> {
     pub name: &'static str,
     pub object: &'static str,
-    pub entries: &'static [Entry<T>],
+    pub entries: &'static [MethodEntry<T>],
 }
 
 pub(crate) struct Table<T: 'static> {
@@ -93,6 +93,24 @@ impl<T> Table<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(untagged)]
+pub enum InvokeErrorCode {
+    Native(ErrorCode),
+    Dispatch(DispatchCode),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchCode {
+    UnknownObject,
+    UnknownMethod,
+    InvalidArguments,
+    Encode,
+    Tool,
+    NoSession,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InvokeError {
     #[error("Unknown object: {0}")]
@@ -105,24 +123,28 @@ pub enum InvokeError {
     Encode(String),
     #[error("{0}")]
     Tool(String),
+    #[error("{0}")]
+    NoSession(String),
     #[error("{message}")]
-    Failed { code: ErrorCode, message: String },
+    Failed {
+        code: ErrorCode,
+        message: String,
+        details: Option<Box<CompletionDetails>>,
+    },
 }
 
 #[expose(block = INVOKE_ERROR_BLOCK, object = "types")]
 impl InvokeError {
-    #[ext(skip = "errors cross as { code, message }")]
-    pub fn code(&self) -> String {
+    #[ext(skip = "errors cross as { code, message, details? }")]
+    pub fn code(&self) -> InvokeErrorCode {
         match self {
-            Self::UnknownObject(_) => "unknown_object".into(),
-            Self::UnknownMethod(_) => "unknown_method".into(),
-            Self::InvalidArguments(_) => "invalid_arguments".into(),
-            Self::Encode(_) => "encode".into(),
-            Self::Tool(_) => "tool".into(),
-            Self::Failed { code, .. } => match serde_json::to_value(code).expect("unit enum") {
-                Value::String(code) => code,
-                _ => unreachable!("ErrorCode must serialize as a string"),
-            },
+            Self::UnknownObject(_) => InvokeErrorCode::Dispatch(DispatchCode::UnknownObject),
+            Self::UnknownMethod(_) => InvokeErrorCode::Dispatch(DispatchCode::UnknownMethod),
+            Self::InvalidArguments(_) => InvokeErrorCode::Dispatch(DispatchCode::InvalidArguments),
+            Self::Encode(_) => InvokeErrorCode::Dispatch(DispatchCode::Encode),
+            Self::Tool(_) => InvokeErrorCode::Dispatch(DispatchCode::Tool),
+            Self::NoSession(_) => InvokeErrorCode::Dispatch(DispatchCode::NoSession),
+            Self::Failed { code, .. } => InvokeErrorCode::Native(*code),
         }
     }
 }
@@ -132,6 +154,10 @@ impl From<Error> for InvokeError {
         Self::Failed {
             code: error.code(),
             message: error.to_string(),
+            details: match error {
+                Error::Completion { details, .. } => details,
+                _ => None,
+            },
         }
     }
 }

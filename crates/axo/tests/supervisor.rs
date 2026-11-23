@@ -31,6 +31,8 @@ fn main() -> ExitCode {
         println!("supervisor: unusable_root_fails_closed ... ok");
         dropping_a_group_process_kills_its_group().await;
         println!("supervisor: dropping_a_group_process_kills_its_group ... ok");
+        bounded_capture_drains_both_pipes().await;
+        println!("supervisor: bounded_capture_drains_both_pipes ... ok");
         sandbox_writes_only_beneath_writable(Supervision::ProcessGroup).await;
         println!("supervisor: sandbox_writes_only_beneath_writable (group) ... ok");
         if std::env::var_os("AXO_TEST_CGROUP").is_some() {
@@ -58,6 +60,29 @@ fn bash(script: &str, cwd: &Path) -> ExecSpec {
         cwd: cwd.to_path_buf(),
         env: (*env).clone(),
         sandbox: None,
+    }
+}
+
+async fn bounded_capture_drains_both_pipes() {
+    let supervisor = ProcessSupervisor::new(Supervision::ProcessGroup);
+    for limit in [4096, 0] {
+        let spec = bash(
+            "set -e; head -c 2097152 /dev/zero; head -c 2097152 /dev/zero >&2; printf 'stderr-end' >&2; exit 23",
+            Path::new("/"),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let output = supervisor
+            .output_stderr_tail(spec, Some(deadline), limit)
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+        assert!(output.stdout.is_empty());
+        let mut expected = vec![0; limit];
+        if limit != 0 {
+            let suffix = b"stderr-end";
+            expected[limit - suffix.len()..].copy_from_slice(suffix);
+        }
+        assert_eq!(output.stderr, expected);
     }
 }
 

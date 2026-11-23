@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::tools::files::{detect_line_ending, normalize_to_lf, restore_line_endings, split_bom};
-use crate::tools::{FileWrite, SessionTools};
+use crate::tools::{FileWrite, SessionTools, ToolAccess};
 
 const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
     "When changing several places in one file, use one edit call with several entries in edits[].",
@@ -91,9 +91,8 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ToolContext { call, cancel, .. } = cx;
         let EditArgs { path, edits } =
-            serde_json::from_value(Value::Object(call.arguments.clone()))
+            serde_json::from_value(Value::Object(cx.call.arguments.clone()))
                 .map_err(|error| ToolError(error.to_string()))?;
         if edits.is_empty() {
             return Err(ToolError(
@@ -115,8 +114,8 @@ impl Tool for EditTool {
             let new_content = apply_edits(&base, edits, path).map_err(ToolError)?;
             Ok(format!("{bom}{}", restore_line_endings(&new_content, ending)).into_bytes())
         }));
-        self.tools
-            .file_tool_output(&cancel, &path, edit, |shown| {
+        ToolAccess::new(self.tools.clone(), cx)
+            .file_tool_output(path, edit, |shown| {
                 format!("Successfully replaced {block_count} block(s) in {shown}.")
             })
             .await
@@ -341,9 +340,11 @@ fn apply_preserving_unchanged_lines(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::Permissions;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -352,19 +353,25 @@ mod tests {
         ToolUpdates,
     };
     use axo_ai::{ToolCall, UserBlock};
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use tokio::sync::broadcast;
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
     use crate::context::files::NestedContext;
+    use crate::ext::Caller;
     use crate::jobs::JobRegistry;
     use crate::jobs::command::CommandRunner;
     use crate::schemes::artifact::Artifacts;
     use crate::schemes::dir::DirScheme;
     use crate::schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
     use crate::tools::ask::PendingQuestions;
-    use crate::tools::{FileAccess, FileLedger, SessionTools};
+    use crate::tools::{
+        FileAccess, FileChange, FileLedger, FileRead, SessionTools, ToolAccess, lock_file, squash,
+    };
     use crate::{ProcessSupervisor, StaticEnv, Supervision};
 
     struct Vv;
@@ -457,35 +464,35 @@ mod tests {
             std::fs::read(self.path(name)).expect("read fixture")
         }
 
-        /// Converts tool failures to the same error output exposed by the agent.
-        async fn call(&self, tool: &str, args: Value) -> ToolOutput {
-            let tool = self
-                .tools
-                .iter()
-                .find(|candidate| candidate.name() == tool)
-                .expect("tool registered");
+        fn context(tool: &str, args: Value) -> ToolContext {
             let Value::Object(arguments) = args else {
                 panic!("arguments must be an object");
             };
             let call = Arc::new(ToolCall {
-                id: format!("call-{}", tool.name()),
-                name: tool.name().to_owned(),
+                id: format!("call-{tool}"),
+                name: tool.to_owned(),
                 arguments,
                 arguments_error: None,
             });
-            tool.execute(ToolContext {
+            ToolContext {
                 call,
                 cancel: CancellationToken::new(),
                 updates: ToolUpdates::sink(),
                 steer: SteerSignal::never(),
                 invocation: ToolInvocationId(0),
-            })
-            .await
-            .unwrap_or_else(|error| ToolOutput {
-                content: vec![UserBlock::Text { text: error.0 }],
-                is_error: true,
-                ..ToolOutput::default()
-            })
+            }
+        }
+
+        /// Converts tool failures to the same error output exposed by the agent.
+        async fn call(&self, name: &str, args: Value) -> ToolOutput {
+            let tool = self.tools.iter().find(|tool| tool.name() == name).unwrap();
+            tool.execute(Self::context(name, args))
+                .await
+                .unwrap_or_else(|error| ToolOutput {
+                    content: vec![UserBlock::Text { text: error.0 }],
+                    is_error: true,
+                    ..ToolOutput::default()
+                })
         }
 
         async fn read(&self, name: &str) {
@@ -504,6 +511,188 @@ mod tests {
 
     fn change(output: &ToolOutput) -> Value {
         output.details.as_ref().expect("details")["files"][0]["change"].clone()
+    }
+
+    #[tokio::test]
+    async fn rejected_reads_do_not_grant_freshness() {
+        let fx = Fixture::new();
+        fx.put("bad", &[0xff]);
+        let access = ToolAccess::new(fx.session.clone(), Fixture::context("host", json!({})));
+        let caller = Caller::default();
+        let args = || vec![json!("bad")];
+        let error = access
+            .invoke("readFile", args(), &caller)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "File is not valid UTF-8: bad");
+        assert!(fx.session.ledger.recorded(&fx.path("bad")).is_none());
+        let output = access.finish(Ok(ToolOutput::default())).await.unwrap();
+        assert!(
+            output
+                .details
+                .as_ref()
+                .and_then(|d| d.get("files"))
+                .is_none()
+        );
+        let write = json!({ "path": "bad", "content": "changed" });
+        assert!(fx.call("write", write.clone()).await.is_error);
+        assert_eq!(fx.get("bad"), [0xff]);
+
+        assert_eq!(
+            access
+                .invoke("readFileBytes", args(), &caller)
+                .await
+                .unwrap(),
+            "/w=="
+        );
+        let files = access
+            .finish(Ok(ToolOutput::default()))
+            .await
+            .unwrap()
+            .details
+            .unwrap();
+        let files = files["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["ledger"]["access"], "read");
+        assert_eq!(files[0]["ledger"]["sha256"], FileLedger::hash(&[0xff]));
+        assert!(!fx.call("write", write).await.is_error);
+        assert_eq!(fx.get("bad"), b"changed");
+
+        let cancel = CancellationToken::new();
+        let deadline = Duration::from_secs(2);
+        let fifo = fx.path("fifo");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::RWXU).unwrap();
+        let result = timeout(deadline, fx.session.read_file(&cancel, "fifo", None)).await;
+        if result.is_err() {
+            // Let a regressed blocking open reach EOF so runtime shutdown won't hang.
+            drop(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&fifo)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            result.expect("FIFO read hung").err().unwrap().0,
+            format!("{} is not a regular file", fifo.display())
+        );
+        assert!(fx.session.ledger.recorded(&fifo).is_none());
+
+        #[cfg(target_os = "linux")]
+        {
+            let path = "/proc/self/status";
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+            let error = fx
+                .session
+                .read_file(&cancel, path, Some(1))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.0, format!("{path} exceeds the read limit of 1 bytes"));
+            assert!(fx.session.ledger.recorded(Path::new(path)).is_none());
+        }
+
+        fx.put("locked", b"content");
+        let guard = lock_file(&fx.path("locked")).await;
+        let mut read = std::pin::pin!(fx.session.read_file(&cancel, "locked", None));
+        assert!(futures::poll!(&mut read).is_pending());
+        cancel.cancel();
+        let error = timeout(deadline, read)
+            .await
+            .expect("read waited for lock")
+            .err()
+            .unwrap();
+        assert_eq!(error.0, "Operation aborted");
+        assert!(fx.session.ledger.recorded(&fx.path("locked")).is_none());
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn virtual_read_uses_the_resolving_handler() {
+        struct Once {
+            schemes: Schemes,
+            resolves: AtomicUsize,
+            reads: AtomicUsize,
+        }
+        #[async_trait]
+        impl Scheme for Once {
+            fn name(&self) -> &str {
+                "vv"
+            }
+
+            async fn resolve(&self, _: &SchemeUrl, _: &SchemeContext) -> Result<Target, ToolError> {
+                if self.resolves.fetch_add(1, Ordering::Relaxed) != 0 {
+                    return Err(ToolError("resolved twice".into()));
+                }
+                // A second lookup would now get the built-in Vv, which can't read.
+                self.schemes.set_host(&[]).unwrap();
+                Ok(Target::Virtual)
+            }
+
+            async fn read(&self, _: &SchemeUrl, _: &SchemeContext) -> Result<String, ToolError> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok("original".into())
+            }
+        }
+
+        let fx = Fixture::new();
+        let schemes = &fx.session.schemes;
+        let path = "vv://resource";
+        for direct in [false, true] {
+            let handler = Arc::new(Once {
+                schemes: schemes.clone(),
+                resolves: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
+            });
+            schemes
+                .set_host(&[handler.clone() as Arc<dyn Scheme>])
+                .unwrap();
+            let text = if direct {
+                schemes.read(&schemes.exact(path).unwrap()).await.unwrap()
+            } else {
+                let read = fx
+                    .session
+                    .read_file(&CancellationToken::new(), path, None)
+                    .await
+                    .unwrap();
+                let FileRead::Virtual { text, .. } = read else {
+                    panic!("expected virtual text")
+                };
+                text
+            };
+            assert_eq!(text, "original");
+            assert_eq!(handler.resolves.load(Ordering::Relaxed), 1);
+            assert_eq!(handler.reads.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_native_targets_do_not_squash_together() {
+        let fx = Fixture::new();
+        let mut changes = Vec::new();
+        for (alias, byte, old, new) in [
+            ("first", 0xfe, "original", "one"),
+            ("second", 0xff, "original", "two"),
+            ("also-first", 0xfe, "one", "three"),
+        ] {
+            let target = fx.dir.path().join(std::ffi::OsStr::from_bytes(&[byte]));
+            if old == "original" {
+                std::fs::write(&target, old).unwrap();
+            }
+            symlink(&target, fx.path(alias)).unwrap();
+            fx.read(alias).await;
+            let output = fx.edit(alias, &[(old, new)]).await;
+            let change: FileChange = serde_json::from_value(change(&output)).unwrap();
+            assert_eq!(
+                URL_SAFE_NO_PAD.decode(&change.key).unwrap(),
+                target.canonicalize().unwrap().as_os_str().as_bytes()
+            );
+            changes.push(change);
+        }
+        assert_ne!(changes[0].key, changes[1].key);
+        assert_eq!(changes[0].key, changes[2].key);
+        assert_eq!(squash(&changes).len(), 2);
     }
 
     #[tokio::test]

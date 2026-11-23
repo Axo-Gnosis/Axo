@@ -13,30 +13,24 @@ use crate::placement::Placement;
 pub const CALL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Why a call failed; the text names the call's label and is safe to show.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Failure {
     /// No runner could take the call, it stopped mid-call, or the deadline passed.
+    #[error("{0}")]
     Unavailable(String),
     /// The extension's handler failed.
+    #[error("{0}")]
     Method(String),
     /// Rejected locally; nothing was sent.
+    #[error("{0}")]
     Invalid(String),
-    /// The extension is no longer enabled or its manager is shut down; nothing can answer.
+    /// The manager is live but the extension is no longer enabled.
+    #[error("{0}")]
     Removed(String),
+    /// The manager has closed or vanished: stale hooks must fail closed.
+    #[error("{0}")]
+    ManagerGone(String),
 }
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Failure::Unavailable(text)
-            | Failure::Method(text)
-            | Failure::Invalid(text)
-            | Failure::Removed(text) => f.write_str(text),
-        }
-    }
-}
-
-impl std::error::Error for Failure {}
 
 /// One call on `placement`'s current generation, never retried: a replacement generation
 /// gets only new operations. `label` names the call in every failure.

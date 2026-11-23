@@ -9,23 +9,26 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axo_ai::testing::read_http_request_parts;
 use axo_ai::{
-    ApiKind, AssistantEvent, Compat, Cost, Credential, CredentialStore, DeviceCode, Error,
-    FileCredentialStore, InputKind, LoginInteraction, LoginPrompt, LoginSelect, Message, Model,
-    Models, ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderOrigin, ProviderRequest,
-    RequestRewrite, SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript,
-    is_retryable_error, now_ms,
+    ApiKind, AssistantEvent, Compat, Cost, Credential, CredentialSource, CredentialStore,
+    DeviceCode, Error, FileCredentialStore, InputKind, LoginInteraction, LoginPrompt, LoginSelect,
+    Message, Model, Models, ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderOrigin,
+    ProviderRequest, RequestRewrite, ServiceTier, SimpleStreamOptions, Streamer, SystemMessage,
+    TextBlock, Transcript, is_retryable_error, now_ms,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// Answers `count` connections in turn with a 400 and returns each request's head and body.
 fn server(count: usize) -> (String, JoinHandle<Vec<(String, Value)>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let body = r#"{"error":{"message":"stop"}}"#;
     let response = format!(
@@ -33,9 +36,23 @@ fn server(count: usize) -> (String, JoinHandle<Vec<(String, Value)>>) {
         body.len()
     );
     let thread = std::thread::spawn(move || {
-        (0..count)
-            .map(|_| {
-                let (mut stream, _) = listener.accept().unwrap();
+        (1..=count)
+            .map(|ordinal| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "timed out waiting for provider request {ordinal}/{count}"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
                 let request = read_http_request_parts(&mut stream);
                 stream.write_all(response.as_bytes()).unwrap();
                 request
@@ -43,6 +60,15 @@ fn server(count: usize) -> (String, JoinHandle<Vec<(String, Value)>>) {
             .collect()
     });
     (url, thread)
+}
+
+fn assert_server_error(id: &str, event: AssistantEvent) {
+    assert!(
+        matches!(&event, AssistantEvent::Error { message, .. }
+            if message.failure.as_ref().and_then(|f| f.status) == Some(400)
+                && message.error_message.as_deref().is_some_and(|s| s.contains("stop"))),
+        "{id}: expected fixture HTTP 400 (stop), got {event:?}"
+    );
 }
 
 fn model(provider: &str, id: &str, api: ApiKind, base_url: &str) -> Model {
@@ -197,6 +223,7 @@ impl RequestRewrite for ScriptedRewrite {
 #[derive(Default)]
 struct ScriptedInteraction {
     events: Mutex<Vec<String>>,
+    prompt_gate: Option<(Notify, Notify)>,
 }
 
 #[async_trait]
@@ -213,6 +240,10 @@ impl LoginInteraction for ScriptedInteraction {
     }
 
     async fn prompt(&self, _prompt: &LoginPrompt) -> Result<String, Error> {
+        if let Some((entered, resume)) = &self.prompt_gate {
+            entered.notify_one();
+            resume.notified().await;
+        }
         Ok("pasted-code".into())
     }
 
@@ -243,18 +274,22 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
         ("codex", ApiKind::OpenAiCodexResponses),
     ];
     models
-        .register(Provider {
-            requires_key: true,
-            login: Some(login.clone()),
-            rewrite: Some(Arc::new(ScriptedRewrite)),
-            ..provider(
-                "scripted",
-                apis.iter()
-                    .map(|(id, api)| model("scripted", id, *api, "http://127.0.0.1:9"))
-                    .collect(),
-            )
-        })
+        .register(
+            "host",
+            Provider {
+                requires_key: true,
+                login: Some(login.clone()),
+                rewrite: Some(Arc::new(ScriptedRewrite)),
+                ..provider(
+                    "scripted",
+                    apis.iter()
+                        .map(|(id, api)| model("scripted", id, *api, "http://127.0.0.1:9"))
+                        .collect(),
+                )
+            },
+        )
         .unwrap();
+    let slot = models.credential_slot("scripted").unwrap();
 
     // 1. The registration is visible.
     let info = models.providers();
@@ -269,17 +304,14 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
         ["url https://login.test/authorize", "progress waiting"]
     );
     assert!(matches!(
-        store.get("scripted").await.unwrap(),
+        store.get(&slot).await.unwrap(),
         Some(Credential::Oauth { access, refresh, .. }) if access == "access-0" && refresh == "pasted-code"
     ));
 
     // 3. Every wire API refreshes once, applies the stored auth, and sends the rewrite.
     for (id, _) in apis {
         let model = models.find(&format!("scripted/{id}")).unwrap();
-        assert!(matches!(
-            stream(&models, &model).await,
-            AssistantEvent::Error { .. }
-        ));
+        assert_server_error(id, stream(&models, &model).await);
     }
     let requests = server.join().unwrap();
     for ((head, body), (id, api)) in requests.iter().zip(apis) {
@@ -313,7 +345,7 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
     assert!(models.find("scripted/anthropic").is_none());
     assert!(!models.providers().iter().any(|info| info.id == "scripted"));
     assert!(matches!(
-        store.get("scripted").await.unwrap(),
+        store.get(&slot).await.unwrap(),
         Some(Credential::Oauth { access, .. }) if access == "access-1"
     ));
     let events = stream_events(&models, &stale).await;
@@ -335,15 +367,18 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
             .unwrap()
     };
     models
-        .register(provider(
-            "openai-codex",
-            vec![model(
+        .register(
+            "host",
+            provider(
                 "openai-codex",
-                "only",
-                ApiKind::OpenAiCodexResponses,
-                "http://127.0.0.1:9",
-            )],
-        ))
+                vec![model(
+                    "openai-codex",
+                    "only",
+                    ApiKind::OpenAiCodexResponses,
+                    "http://127.0.0.1:9",
+                )],
+            ),
+        )
         .unwrap();
     assert!(models.find("openai-codex/gpt-6-sol").is_none());
     assert!(models.find("openai-codex/only").is_some());
@@ -361,7 +396,10 @@ async fn config_base_url_beats_the_credential() {
     let (models, store) = load(&dir).await;
     let credential_url = "http://127.0.0.1:9";
     let credential = oauth("access", "refresh", i64::MAX, "1", credential_url);
-    store.set("scripted", credential).await.unwrap();
+    store
+        .set("loaded/scripted", credential.clone())
+        .await
+        .unwrap();
     let config = ModelsConfig::parse_jsonc(
         &json!({"providers": {"scripted": {
             "api": "openai-completions",
@@ -374,14 +412,7 @@ async fn config_base_url_beats_the_credential() {
     models.reload(config, false).await.unwrap();
     let model = models.find("scripted/only").unwrap();
     assert_eq!(models.auth(&model).await.unwrap().base_url, None);
-    let AssistantEvent::Error { message, .. } = stream(&models, &model).await else {
-        panic!("expected the test server's error");
-    };
-    let error = message.error_message.as_deref();
-    assert!(
-        error.is_some_and(|error| error.contains("stop")),
-        "unexpected provider error: {error:?}"
-    );
+    assert_server_error("scripted/only", stream(&models, &model).await);
     let requests = server.join().unwrap();
     assert_eq!(
         header(&requests[0].0, "authorization"),
@@ -390,8 +421,11 @@ async fn config_base_url_beats_the_credential() {
 
     models.reload(ModelsConfig::default(), false).await.unwrap();
     models
-        .register(provider("scripted", vec![model.clone()]))
+        .register("host", provider("scripted", vec![model.clone()]))
         .unwrap();
+    assert_eq!(models.auth(&model).await.unwrap().base_url, None);
+    let slot = models.credential_slot("scripted").unwrap();
+    store.set(&slot, credential).await.unwrap();
     assert_eq!(
         models.auth(&model).await.unwrap().base_url.as_deref(),
         Some(credential_url)
@@ -420,10 +454,13 @@ async fn failed_rewrite_ends_the_stream_without_sending() {
     let (models, _) = load(&dir).await;
     let model = model("scripted", "only", ApiKind::OpenAiCompletions, &url);
     models
-        .register(Provider {
-            rewrite: Some(Arc::new(FailingRewrite)),
-            ..provider("scripted", vec![model.clone()])
-        })
+        .register(
+            "host",
+            Provider {
+                rewrite: Some(Arc::new(FailingRewrite)),
+                ..provider("scripted", vec![model.clone()])
+            },
+        )
         .unwrap();
 
     match stream(&models, &model).await {
@@ -448,10 +485,13 @@ async fn reload_keeps_registrations_and_survives_bad_config() {
     let dir = tempfile::tempdir().unwrap();
     let (models, _) = load(&dir).await;
     models
-        .register(provider(
-            "scripted",
-            vec![model("scripted", "only", ApiKind::OpenAiCompletions, &url)],
-        ))
+        .register(
+            "host",
+            provider(
+                "scripted",
+                vec![model("scripted", "only", ApiKind::OpenAiCompletions, &url)],
+            ),
+        )
         .unwrap();
     let before = models.find("scripted/only").unwrap();
 
@@ -464,10 +504,7 @@ async fn reload_keeps_registrations_and_survives_bad_config() {
     models.reload(config, false).await.unwrap();
     assert!(models.find("custom/one").is_some());
     assert!(models.find("scripted/only").is_some());
-    assert!(matches!(
-        stream(&models, &before).await,
-        AssistantEvent::Error { .. }
-    ));
+    assert_server_error("scripted/only", stream(&models, &before).await);
     let requests = server.join().unwrap();
     assert_eq!(requests[0].1["model"], "only");
 
@@ -497,31 +534,54 @@ fn assert_unavailable(event: AssistantEvent, reason: &str) {
 #[tokio::test]
 async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     let dir = tempfile::tempdir().unwrap();
-    let models = Arc::new(load(&dir).await.0);
+    let (models, _) = load(&dir).await;
     let native = model(
         "lab",
         "native",
         ApiKind::OpenAiCompletions,
         "http://127.0.0.1:9",
     );
-    models.register(provider("lab", vec![native])).unwrap();
+    models
+        .register("host", provider("lab", vec![native]))
+        .unwrap();
     let a_model = model("lab", "a", ApiKind::OpenAiCompletions, "http://127.0.0.1:9");
     let b_model = model("lab", "b", ApiKind::AnthropicMessages, "http://127.0.0.1:9");
 
     let a = models.provider_layer();
     assert_eq!(a.hidden("lab"), Some(ProviderOrigin::Registered));
     assert_eq!(a.hidden("nothing"), None);
-    a.replace(vec![(provider("lab", vec![a_model.clone()]), None)])
-        .unwrap();
+    a.replace(vec![(
+        "a".into(),
+        provider("lab", vec![a_model.clone()]),
+        None,
+    )])
+    .unwrap();
     assert_eq!(models.find("lab/a"), Some(a_model.clone()));
     assert!(models.find("lab/native").is_none());
 
     let b = models.provider_layer();
     assert_eq!(b.hidden("lab"), Some(ProviderOrigin::Layer));
-    b.replace(vec![(provider("lab", vec![b_model.clone()]), None)])
+    let before = models.all();
+    let unchanged = before
+        .iter()
+        .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-sol")
         .unwrap();
-    assert_eq!(models.find("lab/b"), Some(b_model));
+    b.replace(vec![(
+        "b".into(),
+        provider("lab", vec![b_model.clone()]),
+        None,
+    )])
+    .unwrap();
+    assert_eq!(models.find("lab/b"), Some(b_model.clone()));
     assert!(models.find("lab/a").is_none());
+    let after = models.all();
+    let retained = after
+        .iter()
+        .find(|model| model.provider == unchanged.provider && model.id == unchanged.id)
+        .unwrap();
+    assert!(Arc::ptr_eq(unchanged, retained));
+    assert!(before.iter().any(|m| m.provider == "lab" && m.id == "a"));
+    assert!(!before.iter().any(|m| m.provider == "lab" && m.id == "b"));
     assert_eq!(
         models
             .providers()
@@ -531,7 +591,7 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
         1
     );
 
-    // An invalid replacement changes nothing: wrong model owner, then a repeated id.
+    // Every invalid batch leaves the previous layer intact, even if its first entry is valid.
     let stray = model(
         "other",
         "x",
@@ -540,19 +600,45 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     );
     assert!(matches!(
         b.replace(vec![
-            (provider("fresh", Vec::new()), None),
-            (provider("lab", vec![stray]), None),
+            ("a".into(), provider("fresh", Vec::new()), None),
+            ("b".into(), provider("lab", vec![stray]), None),
         ]),
         Err(Error::Config(_))
     ));
     assert!(matches!(
         b.replace(vec![
-            (provider("fresh", Vec::new()), None),
-            (provider("fresh", Vec::new()), None),
+            ("a".into(), provider("fresh", Vec::new()), None),
+            ("b".into(), provider("fresh", Vec::new()), None),
         ]),
         Err(Error::Config(message)) if message.contains("duplicate provider id")
     ));
-    assert!(models.find("lab/b").is_some());
+    assert!(matches!(
+        b.replace(vec![
+            ("a".into(), provider("fresh", Vec::new()), None),
+            (String::new(), provider("lab", Vec::new()), None),
+        ]),
+        Err(Error::Config(message)) if message == "credential owner must not be empty"
+    ));
+    assert!(matches!(
+        models.register("", provider("fresh", Vec::new())),
+        Err(Error::Config(message)) if message == "credential owner must not be empty"
+    ));
+    let mut mispriced = b_model.clone();
+    mispriced.service_tiers.insert(ServiceTier::Standard, 2.0);
+    let invalid = || provider("lab", vec![mispriced.clone()]);
+    for result in [
+        models.register("host", invalid()),
+        b.replace(vec![
+            ("a".into(), provider("fresh", Vec::new()), None),
+            ("b".into(), invalid(), None),
+        ]),
+    ] {
+        assert!(matches!(
+            result,
+            Err(Error::Config(message)) if message == r#"serviceTiers: "standard" has no multiplier"#
+        ));
+    }
+    assert_eq!(models.find("lab/b"), Some(b_model));
     assert!(!models.providers().iter().any(|info| info.id == "fresh"));
 
     // The host changes its native registration and reloads while it is hidden.
@@ -563,7 +649,7 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
         "http://127.0.0.1:9",
     );
     models
-        .register(provider("lab", vec![changed.clone()]))
+        .register("host", provider("lab", vec![changed.clone()]))
         .unwrap();
     models.reload(ModelsConfig::default(), false).await.unwrap();
     assert!(models.find("lab/changed").is_none());
@@ -573,6 +659,9 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     // reveals exactly the current native registration.
     b.replace(Vec::new()).unwrap();
     assert_eq!(models.find("lab/a"), Some(a_model));
+    let emptied = models.all();
+    b.replace(Vec::new()).unwrap();
+    assert!(Arc::ptr_eq(&emptied, &models.all()));
     drop(a);
     assert_eq!(models.find("lab/changed"), Some(changed));
     assert!(models.find("lab/a").is_none());
@@ -601,13 +690,13 @@ async fn unavailable_layer_provider_stays_selectable_and_fails_before_auth() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let dir = tempfile::tempdir().unwrap();
     let (models, _) = load(&dir).await;
-    let models = Arc::new(models);
     let lab = model("lab", "only", ApiKind::OpenAiCompletions, &url);
     let reason = "extension lab-provider timed out (group personal)";
     let layer = models.provider_layer();
     // Requires a key and has none: the unavailable check comes first.
     layer
         .replace(vec![(
+            "extension/lab".into(),
             Provider {
                 requires_key: true,
                 login: Some(Arc::new(UnreachableLogin)),
@@ -618,6 +707,10 @@ async fn unavailable_layer_provider_stays_selectable_and_fails_before_auth() {
         )])
         .unwrap();
 
+    assert_eq!(
+        models.credential_slot("lab").unwrap(),
+        "layer/extension/lab/lab"
+    );
     assert_eq!(models.find("lab/only"), Some(lab.clone()));
     assert!(matches!(
         models.auth(&lab).await,
@@ -664,11 +757,11 @@ async fn interrupted_refresh_keeps_its_typed_error_through_the_store() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let dir = tempfile::tempdir().unwrap();
     let (models, store) = load(&dir).await;
-    let models = Arc::new(models);
     let lab = model("lab", "only", ApiKind::OpenAiCompletions, &url);
     let layer = models.provider_layer();
     layer
         .replace(vec![(
+            "extension/lab".into(),
             Provider {
                 requires_key: true,
                 login: Some(Arc::new(InterruptedRefresh)),
@@ -678,7 +771,8 @@ async fn interrupted_refresh_keeps_its_typed_error_through_the_store() {
         )])
         .unwrap();
     let expiring = oauth("access-0", "refresh-0", now_ms() + 60_000, "0", &url);
-    store.set("lab", expiring.clone()).await.unwrap();
+    let slot = models.credential_slot("lab").unwrap();
+    store.set(&slot, expiring.clone()).await.unwrap();
 
     assert!(matches!(
         models.auth(&lab).await,
@@ -688,9 +782,175 @@ async fn interrupted_refresh_keeps_its_typed_error_through_the_store() {
         stream(&models, &lab).await,
         "extension lab-provider stopped",
     );
-    assert_eq!(store.get("lab").await.unwrap(), Some(expiring));
+    assert_eq!(store.get(&slot).await.unwrap(), Some(expiring));
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[tokio::test]
+async fn credential_slots_follow_the_origin_not_the_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (models, store) = load(&dir).await;
+    let models = Arc::new(models);
+    let config = ModelsConfig::parse_jsonc(
+        r#"{"providers":{"lab":{"api":"openai-completions","baseUrl":"http://127.0.0.1:9","models":[{"id":"only"}]}}}"#,
+    )
+    .unwrap();
+    models.reload(config, false).await.unwrap();
+    let model = models.find("lab/only").unwrap();
+    let login = Arc::new(ScriptedLogin {
+        base_url: model.base_url.clone(),
+        refreshes: AtomicUsize::new(0),
+    });
+    let entry = || Provider {
+        login: Some(login.clone()),
+        ..provider("lab", vec![model.clone()])
+    };
+    let key = |value: &str| Credential::ApiKey { key: value.into() };
+    let fresh_slot = async |expected: &str| {
+        let slot = models.credential_slot("lab").unwrap();
+        assert_eq!(slot, expected);
+        assert_eq!(
+            models.credential_source("lab").await.unwrap(),
+            CredentialSource::None
+        );
+        slot
+    };
+
+    // Bare pre-cutover credentials must neither authenticate a new principal nor be erased.
+    store.set("lab", key("ambiguous")).await.unwrap();
+    let loaded = fresh_slot("loaded/lab").await;
+    let expired = oauth(
+        "loaded-secret",
+        "loaded-refresh",
+        0,
+        "loaded",
+        &model.base_url,
+    );
+    store.set(&loaded, expired.clone()).await.unwrap();
+    models.register("host", entry()).unwrap();
+    let native = fresh_slot("registered/host/lab").await;
+    store.set(&native, key("native-secret")).await.unwrap();
+
+    let a = models.provider_layer();
+    a.replace(vec![("ext/a".into(), entry(), None)]).unwrap();
+    let alpha = fresh_slot("layer/ext/a/lab").await;
+    store.set(&alpha, key("alpha-secret")).await.unwrap();
+    let b = models.provider_layer();
+    b.replace(vec![("ext/b".into(), entry(), None)]).unwrap();
+    let beta = fresh_slot("layer/ext/b/lab").await;
+    models
+        .login("lab", &ScriptedInteraction::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        models.auth(&model).await.unwrap().api_key.as_deref(),
+        Some("access-1")
+    );
+    assert_eq!(login.refreshes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        store.get(&beta).await.unwrap(),
+        Some(Credential::Oauth { access, refresh, .. }) if access == "access-1" && refresh == "refresh-1"
+    ));
+    assert_eq!(store.get(&alpha).await.unwrap(), Some(key("alpha-secret")));
+    assert_eq!(
+        store.get(&native).await.unwrap(),
+        Some(key("native-secret"))
+    );
+    assert_eq!(store.get(&loaded).await.unwrap(), Some(expired.clone()));
+
+    drop(b);
+    assert_eq!(
+        models.auth(&model).await.unwrap().api_key.as_deref(),
+        Some("alpha-secret")
+    );
+    drop(a);
+    assert_eq!(
+        models.auth(&model).await.unwrap().api_key.as_deref(),
+        Some("native-secret")
+    );
+
+    // Swap owners while the user is responding. Completing the login still belongs to host.
+    let interaction = ScriptedInteraction {
+        prompt_gate: Some((Notify::new(), Notify::new())),
+        ..Default::default()
+    };
+    let (entered, resume) = interaction.prompt_gate.as_ref().unwrap();
+    let (result, other) = tokio::join!(models.login("lab", &interaction), async {
+        entered.notified().await;
+        models.register("other", entry()).unwrap();
+        let other = fresh_slot("registered/other/lab").await;
+        resume.notify_one();
+        other
+    });
+    result.unwrap();
+    assert_eq!(store.get(&other).await.unwrap(), None);
+    assert!(matches!(
+        store.get(&native).await.unwrap(),
+        Some(Credential::Oauth { access, refresh, .. }) if access == "access-0" && refresh == "pasted-code"
+    ));
+    assert!(models.unregister("lab"));
+    assert_eq!(models.credential_slot("lab").unwrap(), loaded);
+    assert_eq!(
+        models.credential_source("lab").await.unwrap(),
+        CredentialSource::Oauth
+    );
+    assert_eq!(store.get(&loaded).await.unwrap(), Some(expired));
+    assert_eq!(store.get("lab").await.unwrap(), Some(key("ambiguous")));
+}
+
+#[tokio::test]
+async fn keyless_codex_rewrite_reaches_http() {
+    let (url, server) = server(1);
+    let model = model("lab", "only", ApiKind::OpenAiCodexResponses, &url);
+    let dir = tempfile::tempdir().unwrap();
+    let (models, store) = load(&dir).await;
+    models
+        .register(
+            "host",
+            Provider {
+                rewrite: Some(Arc::new(ScriptedRewrite)),
+                ..provider("lab", vec![model.clone()])
+            },
+        )
+        .unwrap();
+    let AssistantEvent::Error { message, .. } = stream(&models, &model).await else {
+        panic!("expected the test server's error");
+    };
+    assert!(message.error_message.as_deref().unwrap().contains("stop"));
+    let requests = server.join().unwrap();
+    let head = &requests[0].0;
+    assert!(head.starts_with("POST /rewritten "), "{head}");
+    assert_eq!(header(head, "x-rewritten"), Some("yes"));
+    assert_eq!(header(head, "authorization"), None);
+    assert_eq!(header(head, "chatgpt-account-id"), None);
+
+    // A required but missing/empty key must fail at setup, before even invoking the rewrite.
+    models
+        .register(
+            "host",
+            Provider {
+                requires_key: true,
+                rewrite: Some(Arc::new(FailingRewrite)),
+                ..provider("lab", vec![model.clone()])
+            },
+        )
+        .unwrap();
+    let slot = models.credential_slot("lab").unwrap();
+    for credential in [None, Some(Credential::ApiKey { key: String::new() })] {
+        if let Some(credential) = credential {
+            store.set(&slot, credential).await.unwrap();
+        }
+        let events = stream_events(&models, &model).await;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AssistantEvent::Error { message, .. }]
+                    if message.error_message.as_deref() == Some("No API key for provider: lab")
+            ),
+            "{events:?}"
+        );
+    }
 }

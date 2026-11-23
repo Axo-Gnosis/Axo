@@ -16,7 +16,7 @@ use axo_agent::{
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::{current_system_message, current_system_prompt};
-use axo_ai::{Message, RecordedRequest, ScriptedTurn, UserBlock};
+use axo_ai::{Message, RecordedRequest, ScriptedTurn, ServiceTier, ThinkingLevel, UserBlock};
 use common::{host, journal, options, within};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -250,6 +250,94 @@ async fn mode_model_override_restores_only_its_own_selection() {
     session.set_mode(None).await.unwrap();
     assert_eq!(session.model().id, "third");
     assert!(session.mode().is_none());
+    session.shutdown().await;
+}
+
+async fn planner_session(dir: &Path) -> (common::Host, axo::Session) {
+    let host = host(
+        dir,
+        json!([{"id":"m","reasoning":true}, {"id":"planner","reasoning":true}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("planned"))],
+    )
+    .await;
+    let mut opts = mode_options(dir);
+    opts.model = Some("test/m:low:fast".into());
+    opts.definitions.modes[0].model = Some("test/planner:high:standard".into());
+    let session = host.axo.create_session(opts).await.unwrap();
+    (host, session)
+}
+
+fn assert_original_selection(session: &axo::Session) {
+    assert!(session.mode().is_none());
+    assert_eq!(session.model().id, "m");
+    assert_eq!(session.thinking(), ThinkingLevel::Low);
+    // Fast is the chosen tier even though m only serves Standard.
+    assert_eq!(session.service_tier(), ServiceTier::Fast);
+}
+
+#[tokio::test]
+async fn registry_clamp_preserves_mode_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, session) = planner_session(dir.path()).await;
+    assert_original_selection(&session);
+    session.set_mode(Some("plan")).await.unwrap();
+    assert_eq!(session.thinking(), ThinkingLevel::High);
+    let saved = axo::project(&session.attach(None).await.missed, None)
+        .mode_restore
+        .expect("entering plan saved the original selection");
+    let config = json!({"providers":{"test":{
+        "api":"openai-completions", "baseUrl":"http://127.0.0.1:9/v1",
+        "models":[{"id":"m","reasoning":true}, {"id":"planner","reasoning":false}]
+    }}});
+    host.models
+        .reload(serde_json::from_value(config).unwrap(), false)
+        .await
+        .unwrap();
+    within(session.prompt("Plan.")).await.unwrap();
+    assert_eq!(session.model().id, "planner");
+    assert_eq!(session.thinking(), ThinkingLevel::Off);
+    let lines = journal(&session);
+    let clamp = common::only(&lines, "automatic clamp", |line| {
+        line["type"] == "thinking_level_change" && line["automatic"] == true
+    });
+    assert_eq!(lines[clamp]["thinkingLevel"], "off");
+    assert_eq!(
+        axo::project(&session.attach(None).await.missed, None).mode_restore,
+        Some(saved)
+    );
+    session.set_mode(None).await.unwrap();
+    assert_original_selection(&session);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn navigation_out_of_removed_mode_restores_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_host, session) = planner_session(dir.path()).await;
+    let before = session.append_custom("before-mode", None).await.unwrap();
+    session.set_mode(Some("plan")).await.unwrap();
+    let pinned = session.mode().unwrap();
+    let inside = session.append_custom("inside-mode", None).await.unwrap();
+    within(session.prompt("Plan.")).await.unwrap();
+    session
+        .set_definitions(Definitions::default())
+        .await
+        .unwrap();
+    assert!(session.modes().is_empty());
+    let inside = EntryId(inside.entry.id().unwrap().to_owned());
+    within(session.navigate(Some(inside), Default::default()))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&pinned, &session.mode().unwrap()));
+    assert_eq!(session.model().id, "planner");
+    assert_eq!(session.thinking(), ThinkingLevel::High);
+    assert_eq!(session.service_tier(), ServiceTier::Standard);
+    let before = EntryId(before.entry.id().unwrap().to_owned());
+    within(session.navigate(Some(before), Default::default()))
+        .await
+        .unwrap();
+    assert_original_selection(&session);
     session.shutdown().await;
 }
 
@@ -966,6 +1054,15 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
             .is_err()
     );
     assert_eq!(session.attach(None).await.live.pending_results.len(), 1);
+    let null = serde_json::from_value(json!({"replacement":null})).unwrap();
+    assert!(matches!(
+        session.accept_result("revised", null),
+        Err(axo::Error::InvalidInput(message)) if message.starts_with("Invalid mode result:")
+    ));
+    assert_eq!(
+        session.attach(None).await.live.pending_results[0].call_id,
+        "revised"
+    );
     session
         .accept_result(
             "revised",
@@ -1018,17 +1115,61 @@ async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
 }
 
 #[tokio::test]
-async fn accepting_without_a_continuation_ends_the_run() {
+async fn review_replacement_distinguishes_missing_from_null() {
+    let missing: AcceptResultOptions = serde_json::from_value(json!({})).unwrap();
+    let null: AcceptResultOptions = serde_json::from_value(json!({"replacement":null})).unwrap();
+    assert_eq!(missing.replacement, None);
+    assert_eq!(null.replacement, Some(Value::Null));
+
     let dir = tempfile::tempdir().unwrap();
     let host = host(
         dir.path(),
         json!([{"id":"m"}]),
         json!({}),
         vec![ScriptedTurn::Reply(reply_tool_calls(&[(
-            "final-plan",
+            "nullable",
             "call",
-            json!({"tool":"yield", "args":{"plan":"ready"}}),
+            json!({"tool":"yield","args":{"result":"proposal"}}),
         )]))],
+    )
+    .await;
+    let mut opts = result_options(dir.path(), true, None);
+    opts.definitions.modes[0].result.as_mut().unwrap().schema = json!({"type":["string","null"]});
+    let session = Arc::new(host.axo.create_session(opts).await.unwrap());
+    session.set_mode(Some("plan")).await.unwrap();
+    let mut events = session.attach(None).await.events;
+    let run = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Propose a value.").await }
+    });
+    assert_eq!(
+        next_mode_result(&mut events).await,
+        ("nullable".into(), "plan".into(), json!("proposal"), true)
+    );
+    session.accept_result("nullable", null).unwrap();
+    result_resolved(&mut events, "nullable", ResultResolution::Accepted).await;
+    within(run).await.unwrap().unwrap();
+    let result = only_result(&journal(&session), "nullable");
+    assert_eq!(result["details"]["originalResult"], "proposal");
+    assert_eq!(result["details"].get("acceptedResult"), Some(&Value::Null));
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn accepting_without_a_continuation_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "final-plan",
+                "call",
+                json!({"tool":"yield", "args":{"plan":"ready"}}),
+            )])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
     )
     .await;
     let mut opts = result_options(dir.path(), true, None);
@@ -1043,6 +1184,10 @@ async fn accepting_without_a_continuation_ends_the_run() {
         |diagnostic| diagnostic.message == "host tool \"yield\" is reserved for modes; ignored"
     ));
     session.set_mode(Some("plan")).await.unwrap();
+    session
+        .set_definitions(Definitions::default())
+        .await
+        .unwrap();
     let mut events = session.attach(None).await.events;
     let run = tokio::spawn({
         let session = session.clone();
@@ -1057,6 +1202,9 @@ async fn accepting_without_a_continuation_ends_the_run() {
             true
         )
     );
+    let tools = declared(&host.api.requests()[0]);
+    assert!(tools.iter().any(|name| name == "call"));
+    assert!(!tools.iter().any(|name| name == "yield"));
     session
         .accept_result("final-plan", AcceptResultOptions::default())
         .unwrap();
@@ -1065,6 +1213,14 @@ async fn accepting_without_a_continuation_ends_the_run() {
     assert!(session.mode().is_none());
     assert!(session.attach(None).await.live.pending_results.is_empty());
     assert_eq!(host.api.requests().len(), 1);
+    within(session.prompt("List the tools after review."))
+        .await
+        .unwrap();
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 2);
+    let tools = declared(&requests[1]);
+    assert!(tools.iter().any(|name| name == "yield"));
+    assert!(!tools.iter().any(|name| name == "call"));
     session.shutdown().await;
 }
 

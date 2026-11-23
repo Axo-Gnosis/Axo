@@ -208,12 +208,7 @@ async fn input_queued_when_a_run_stops_survives_reopening() {
         )
         .await;
         let mut session = host.axo.create_session(options(dir.path())).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
-                .await
-                .is_err(),
-            "the first run hangs until cancelled"
-        );
+        common::start_hanging(session.prompt("first"), || host.api.requests().len() == 1).await;
         within(session.post(axo::HostMessage {
             custom_type: "host-note".into(),
             text: "quiet note".into(),
@@ -415,11 +410,7 @@ async fn resume_wakes_sends_held_input() {
     )
     .await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
-            .await
-            .is_err()
-    );
+    common::start_hanging(session.prompt("first"), || host.api.requests().len() == 1).await;
     within(session.steer("held")).await.unwrap();
     session.abort();
     common::entry(&session, |entry| matches!(entry, Entry::RunEnd { .. })).await;
@@ -457,6 +448,272 @@ async fn resume_wakes_sends_held_input() {
     session.shutdown().await;
 }
 
+async fn gated_host(
+    dir: &std::path::Path,
+    gate: &Arc<common::WriteGate>,
+    turns: Vec<ScriptedTurn>,
+) -> (axo::Axo, Arc<axo_ai::ScriptedApi>) {
+    let api = Arc::new(axo_ai::ScriptedApi::new(turns));
+    let store = Arc::new(common::GatedStore {
+        inner: JsonlStore::new(dir.join("sessions")),
+        gate: gate.clone(),
+    });
+    let (host, ..) =
+        common::axo_with(dir, json!([{"id": "m"}]), json!({}), store, api.clone()).await;
+    (host, api)
+}
+
+#[tokio::test]
+async fn stop_during_submission_holds_later_job_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = common::WriteGate::new(
+        |entry| matches!(entry, Entry::Submission { request_id: Some(id), .. } if id == "blocked"),
+    );
+    let (host, api) = gated_host(
+        dir.path(),
+        &gate,
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "while [ ! -e release ]; do sleep 0.02; done; echo done", "async": true}),
+            )])),
+            ScriptedTurn::Reply(reply_text("job started")),
+            ScriptedTurn::Reply(reply_text("job delivered")),
+        ],
+    )
+    .await;
+    let opts = common::bash_options(dir.path());
+    let release = opts.cwd.join("release");
+    let session = host.create_session(opts).await.unwrap();
+    assert_eq!(
+        within(session.prompt("start")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let prompt = session.prompt_with(axo::PromptRequest {
+        request_id: Some("blocked".into()),
+        input: "next".into(),
+    });
+    let (result, ()) = within(async {
+        tokio::join!(prompt, async {
+            gate.entered.notified().await;
+            session.abort();
+            gate.release.notify_one();
+        })
+    })
+    .await;
+    assert!(matches!(
+        result.unwrap(),
+        axo::PromptResult::Settled {
+            outcome: RunOutcome::Aborted(axo_agent::CancelReason::User),
+            ..
+        }
+    ));
+    let live = session.attach(None).await.live;
+    assert!(!live.running && live.auto_paused);
+
+    std::fs::write(release, "").unwrap();
+    common::until(|| {
+        session
+            .jobs()
+            .iter()
+            .flat_map(|job| &job.messages)
+            .any(|msg| msg.id == "bg_1" && msg.delivery == axo::MessageDelivery::Pending)
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            common::delivered(&session, "bg_1")
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(api.requests().len(), 2);
+    let ends = common::run_ends(&session);
+    session.resume_wakes();
+    common::delivered(&session, "bg_1").await;
+    common::until(|| common::run_ends(&session) > ends).await;
+    let attached = session.attach(None).await;
+    assert_eq!(
+        attached
+            .missed
+            .iter()
+            .filter_map(|seq| match &seq.entry {
+                Entry::Message { delivered_jobs, .. } => Some(delivered_jobs),
+                _ => None,
+            })
+            .flatten()
+            .filter(|id| id.as_str() == "bg_1")
+            .count(),
+        1
+    );
+    assert_eq!(api.requests().len(), 3);
+    session.shutdown().await;
+}
+
+#[derive(Default)]
+struct FailingScheme {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl axo::Scheme for FailingScheme {
+    fn name(&self) -> &str {
+        "blocked"
+    }
+
+    fn prompt_doc(&self) -> &str {
+        "A reference that fails to resolve."
+    }
+
+    async fn resolve(
+        &self,
+        _: &axo::SchemeUrl,
+        _: &axo::SchemeContext,
+    ) -> Result<axo::Target, ToolError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(ToolError("rejected reference".into()))
+    }
+}
+
+async fn queue_input(session: &axo::Session, kind: SubmissionKind, text: &str) {
+    match kind {
+        SubmissionKind::Steer => within(session.steer(text)).await.unwrap(),
+        SubmissionKind::FollowUp => within(session.follow_up(text)).await.unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn unsuccessful_preparation_wakes_accepted_input() {
+    for kind in [SubmissionKind::Steer, SubmissionKind::FollowUp] {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = common::host(
+                dir.path(),
+                json!([{"id": "m"}]),
+                json!({}),
+                vec![ScriptedTurn::Reply(reply_text("ok"))],
+            )
+            .await;
+            let scheme = Arc::new(FailingScheme::default());
+            let mut opts = options(dir.path());
+            opts.schemes.push(scheme.clone());
+            let session = Arc::new(host.axo.create_session(opts).await.unwrap());
+            let preparing = tokio::spawn({
+                let session = session.clone();
+                async move {
+                    session
+                        .prompt(vec![PromptPart::File {
+                            path: "blocked://file".into(),
+                        }])
+                        .await
+                }
+            });
+            within(scheme.entered.notified()).await;
+            queue_input(&session, kind, "accepted").await;
+            let queued = session.attach(None).await.live.queued;
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].kind, kind);
+            assert!(host.api.requests().is_empty());
+            if cancel {
+                preparing.abort();
+                assert!(within(preparing).await.unwrap_err().is_cancelled());
+            } else {
+                scheme.release.notify_one();
+                assert!(matches!(
+                    within(preparing).await.unwrap(),
+                    Err(axo::Error::InvalidInput(_))
+                ));
+            }
+
+            common::entry(&session, |entry| {
+                matches!(
+                    entry,
+                    Entry::RunEnd {
+                        outcome: axo::RunOutcome::Done,
+                        ..
+                    }
+                )
+            })
+            .await;
+            let requests = host.api.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                user_texts(&requests[0])
+                    .into_iter()
+                    .filter(|text| *text == "accepted")
+                    .count(),
+                1
+            );
+            let attached = session.attach(None).await;
+            assert!(attached.live.queued.is_empty());
+            assert_eq!(attached.missed.iter().filter(|seq| {
+                matches!(&seq.entry, Entry::Message { submission_id: Some(id), .. } if *id == queued[0].submission_id)
+            }).count(), 1);
+            session.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_withdrawal_preserves_queue_order() {
+    for kind in [SubmissionKind::Steer, SubmissionKind::FollowUp] {
+        let dir = tempfile::tempdir().unwrap();
+        let gate =
+            common::WriteGate::new(|entry| matches!(entry, Entry::SubmissionWithdrawn { .. }));
+        let (host, api) = gated_host(dir.path(), &gate, vec![ScriptedTurn::HangUntilCancel]).await;
+        let session = Arc::new(host.create_session(options(dir.path())).await.unwrap());
+        let run = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("start").await }
+        });
+        common::until(|| !api.requests().is_empty()).await;
+        for text in ["A", "B", "C"] {
+            queue_input(&session, kind, text).await;
+        }
+        let ids = |queue: Vec<axo::QueuedInput>| {
+            queue
+                .into_iter()
+                .map(|input| input.submission_id)
+                .collect::<Vec<_>>()
+        };
+        let before = session.attach(None).await.live.queued;
+        assert_eq!(before.len(), 3);
+        for (input, text) in before.iter().zip(["A", "B", "C"]) {
+            assert_eq!(input.kind, kind);
+            assert_eq!(input.parts, [PromptPart::Text { text: text.into() }]);
+        }
+        let before = ids(before);
+        let (withdrawn, ()) = within(async {
+            tokio::join!(session.withdraw(&before[1]), async {
+                gate.entered.notified().await;
+                gate.fail.store(true, Ordering::Release);
+                gate.release.notify_one();
+            })
+        })
+        .await;
+        assert!(withdrawn.is_err());
+        let attached = session.attach(None).await;
+        assert_eq!(ids(attached.live.queued), before);
+        assert!(
+            !attached
+                .missed
+                .iter()
+                .any(|seq| matches!(seq.entry, Entry::SubmissionWithdrawn { .. }))
+        );
+        session.abort();
+        assert_eq!(
+            within(run).await.unwrap().unwrap(),
+            RunOutcome::Aborted(axo_agent::CancelReason::User)
+        );
+        session.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn withdrawn_input_is_never_delivered() {
     for reopen in [false, true] {
@@ -472,11 +729,7 @@ async fn withdrawn_input_is_never_delivered() {
         )
         .await;
         let mut session = host.axo.create_session(options(dir.path())).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
-                .await
-                .is_err()
-        );
+        common::start_hanging(session.prompt("first"), || host.api.requests().len() == 1).await;
         within(session.post(axo::HostMessage {
             custom_type: "host_note".into(),
             text: "withdraw this host message".into(),
@@ -549,22 +802,19 @@ async fn withdrawn_input_is_never_delivered() {
 #[tokio::test]
 async fn dropping_a_prompt_future_still_settles_its_run() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = axo(
+    let host = common::host(
         dir.path(),
+        json!([{"id": "m"}]),
+        json!({}),
         vec![
             ScriptedTurn::HangUntilCancel,
             ScriptedTurn::Reply(reply_text("second")),
         ],
     )
     .await;
-    let session = axo.create_session(options(dir.path())).await.unwrap();
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
-            .await
-            .is_err(),
-        "the first run hangs until cancelled"
-    );
+    common::start_hanging(session.prompt("first"), || host.api.requests().len() == 1).await;
     let mut events = session.attach(None).await.events;
     session.abort();
     within(async {
@@ -1008,9 +1258,69 @@ async fn failed_cancelled_and_oversized_navigation_do_not_move_the_leaf() {
 }
 
 #[tokio::test]
+async fn suffix_pair_is_one_journal_selection() {
+    use axo_ai::{ServiceTier, ThinkingLevel};
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        json!([{"id": "m", "reasoning": true, "serviceTiers": {"fast": 2}}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("saved"))],
+    )
+    .await;
+    let session = host
+        .axo
+        .create_session(axo::SessionOptions {
+            model: Some("test/m:low:standard".into()),
+            ..options(dir.path())
+        })
+        .await
+        .unwrap();
+    within(session.prompt("persist this session"))
+        .await
+        .unwrap();
+    assert_eq!(session.thinking(), ThinkingLevel::Low);
+    assert_eq!(session.service_tier(), ServiceTier::Standard);
+    let before = common::journal(&session).len();
+    let selector = || axo::Command::Model {
+        model: ":high:fast".into(),
+    };
+    session.run_command(selector()).await.unwrap();
+    let lines = common::journal(&session);
+    let [change] = &lines[before..] else {
+        panic!("expected one selection line: {:?}", &lines[before..]);
+    };
+    assert_eq!(change["type"], "thinking_level_change");
+    assert_eq!(change["thinkingLevel"], "high");
+    assert_eq!(change["serviceTier"], "fast");
+    assert_eq!(session.thinking(), ThinkingLevel::High);
+    assert_eq!(session.service_tier(), ServiceTier::Fast);
+    session.run_command(selector()).await.unwrap();
+    assert_eq!(common::journal(&session), lines);
+
+    let path = session.path().to_path_buf();
+    session.shutdown().await;
+    drop(session);
+    let reopened = host
+        .axo
+        .open_session(
+            &path,
+            axo::SessionOptions {
+                model: None,
+                ..options(dir.path())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.thinking(), ThinkingLevel::High);
+    assert_eq!(reopened.service_tier(), ServiceTier::Fast);
+}
+
+#[tokio::test]
 async fn sessions_follow_registry_changes_but_keep_host_copies() {
     let dir = tempfile::tempdir().unwrap();
-    let turns = ["one", "two"].map(|text| ScriptedTurn::Reply(reply_text(text)));
+    let turns = ["one", "two", "three"].map(|text| ScriptedTurn::Reply(reply_text(text)));
     let host = common::host(
         dir.path(),
         json!([{"id": "m", "contextWindow": 200000}]),
@@ -1019,15 +1329,15 @@ async fn sessions_follow_registry_changes_but_keep_host_copies() {
     )
     .await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
-    let config = json!({"providers": {"test": {
-        "api": "openai-completions",
-        "baseUrl": "http://127.0.0.1:9/v1",
-        "models": [{"id": "m", "contextWindow": 50000}],
-    }}});
-    host.models
-        .reload(serde_json::from_value(config).unwrap(), false)
-        .await
-        .unwrap();
+    let config = |window: u32| {
+        serde_json::from_value(json!({"providers": {"test": {
+            "api": "openai-completions",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "models": [{"id": "m", "contextWindow": window}],
+        }}}))
+        .unwrap()
+    };
+    host.models.reload(config(50_000), false).await.unwrap();
     within(session.prompt("first")).await.unwrap();
     assert_eq!(session.model().context_window, 50_000);
     let lines = common::journal(&session);
@@ -1047,6 +1357,16 @@ async fn sessions_follow_registry_changes_but_keep_host_copies() {
     session.set_model(copy).await.unwrap();
     within(session.prompt("second")).await.unwrap();
     assert_eq!(session.model().context_window, 30_000);
+    host.models.reload(config(70_000), false).await.unwrap();
+    within(session.prompt("third")).await.unwrap();
+    assert_eq!(session.model().context_window, 70_000);
+    let windows: Vec<_> = host
+        .api
+        .requests()
+        .iter()
+        .map(|request| request.model.context_window)
+        .collect();
+    assert_eq!(windows, [50_000, 30_000, 70_000]);
 }
 
 #[tokio::test]
@@ -1330,7 +1650,6 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
 
 mod keywords {
     use std::path::Path;
-    use std::time::Duration;
 
     use axo::context::keywords::{KeywordMatch, KeywordSpec};
     use axo::{Command, Definitions, Entry, PromptPart, SessionOptions};
@@ -1612,12 +1931,7 @@ mod keywords {
                 .create_session(keyword_options(dir.path(), orchestrate()))
                 .await
                 .unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), session.prompt("first"))
-                    .await
-                    .is_err(),
-                "the first run hangs until cancelled"
-            );
+            common::start_hanging(session.prompt("first"), || host.api.requests().len() == 1).await;
             within(session.steer("orchestrate later")).await.unwrap();
             entry(
                 &session,

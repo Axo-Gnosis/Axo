@@ -31,23 +31,19 @@ impl Scheme for SkillScheme {
     }
 
     async fn resolve(&self, url: &SchemeUrl, _cx: &SchemeContext) -> Result<Target, ToolError> {
-        let skills: Vec<_> = self
-            .definitions
-            .get()
+        let defs = self.definitions.get();
+        let skill = defs
             .skills
             .iter()
-            .map(|skill| (skill.name.clone(), skill.path.clone()))
-            .collect();
-        let (name, skill_md) = skills
-            .iter()
-            .filter(|(name, _)| {
+            .filter(|skill| {
+                let name = &skill.name;
                 url.path == *name
                     || url
                         .path
                         .strip_prefix(name.as_str())
                         .is_some_and(|rest| rest.starts_with('/'))
             })
-            .max_by_key(|(name, _)| name.len())
+            .max_by_key(|skill| skill.name.len())
             .ok_or_else(|| {
                 let name = url
                     .path
@@ -55,14 +51,14 @@ impl Scheme for SkillScheme {
                     .map_or(url.path.as_str(), |(name, _)| name);
                 ToolError(format!(
                     "Unknown skill: {name}. Available: {}",
-                    super::available(skills.iter().map(|(name, _)| name.clone()).collect())
+                    super::available(defs.skills.iter().map(|skill| skill.name.clone()).collect())
                 ))
             })?;
-        let path = if url.path.len() == name.len() {
-            skill_md.clone()
+        let path = if url.path == skill.name {
+            skill.path.clone()
         } else {
-            let rest = url.path[name.len()..].trim_start_matches('/');
-            let root = skill_md.parent().unwrap_or_else(|| Path::new("."));
+            let rest = url.path[skill.name.len()..].trim_start_matches('/');
+            let root = skill.path.parent().unwrap_or_else(|| Path::new("."));
             join_contained(root, url, rest, false)?
         };
         Ok(Target::File {

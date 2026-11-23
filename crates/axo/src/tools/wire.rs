@@ -32,6 +32,14 @@ pub struct ToolAccess {
     in_flight: Arc<tokio::sync::RwLock<()>>,
 }
 
+async fn take_records(
+    in_flight: &tokio::sync::RwLock<()>,
+    records: &Mutex<Vec<FileRecord>>,
+) -> Vec<FileRecord> {
+    let _gate = in_flight.write().await;
+    std::mem::take(&mut *records.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
 #[expose(block = TOOLS_ACCESS, object = "tools")]
 impl ToolAccess {
     #[ext(skip = "host-side construction and dispatch")]
@@ -66,11 +74,13 @@ impl ToolAccess {
         &self,
         result: Result<ToolOutput, ToolError>,
     ) -> Result<ToolOutput, ToolError> {
-        drop(self.in_flight.write().await);
-        let records =
-            std::mem::take(&mut *self.records.lock().unwrap_or_else(PoisonError::into_inner));
+        let records = take_records(&self.in_flight, &self.records).await;
         if records.is_empty() {
-            return result;
+            let mut output = result?;
+            if let Some(Value::Object(details)) = &mut output.details {
+                details.remove("files");
+            }
+            return Ok(output);
         }
         let mut output = result.unwrap_or_else(|ToolError(text)| ToolOutput {
             content: vec![UserBlock::Text { text }],
@@ -89,7 +99,7 @@ impl ToolAccess {
 
     /// Runs a file operation as its own task, so a caller dropped mid-call cannot split
     /// the operation from its record. `finish` waits for it.
-    async fn settled<T: Send + 'static>(
+    pub(super) async fn settled<T: Send + 'static>(
         &self,
         op: impl Future<Output = Result<(T, Option<FileRecord>), ToolError>> + Send + 'static,
     ) -> Result<T, ToolError> {
@@ -115,6 +125,59 @@ impl ToolAccess {
             },
         }
     }
+
+    pub(super) async fn file_tool_output(
+        &self,
+        path: String,
+        write: FileWrite<'_>,
+        message: impl FnOnce(&str) -> String + Send,
+    ) -> Result<ToolOutput, ToolError> {
+        use super::writes::Prepared;
+
+        let file = match self
+            .tools
+            .prepare_file(&self.cx.cancel, &path, write)
+            .await?
+        {
+            Prepared::Virtual { text, .. } => {
+                return Ok(ToolOutput {
+                    content: vec![UserBlock::Text { text }],
+                    ..Default::default()
+                });
+            }
+            Prepared::File(file) => file,
+        };
+        let tools = self.tools.clone();
+        let cancel = self.cx.cancel.clone();
+        let in_flight = self.in_flight.clone();
+        let records = self.records.clone();
+        self.cx.on_hard_stop(async move {
+            let records = take_records(&in_flight, &records).await;
+            (!records.is_empty()).then(|| ToolOutput {
+                content: vec![UserBlock::Text {
+                    text: "Operation aborted".into(),
+                }],
+                is_error: true,
+                details: Some(super::file_details(&records)),
+                ..Default::default()
+            })
+        });
+        let (absolute, label) = self
+            .settled(async move {
+                let (record, absolute, label) = tools.commit_file(&cancel, file).await?;
+                Ok(((absolute, label), Some(record)))
+            })
+            .await?;
+        let mut content = vec![UserBlock::Text {
+            text: message(label.as_deref().unwrap_or(&path)),
+        }];
+        content.extend(self.tools.context.attach(&absolute).await);
+        self.finish(Ok(ToolOutput {
+            content,
+            ..Default::default()
+        }))
+        .await
+    }
 }
 
 /// The reserved numeric id and path for a session artifact.
@@ -134,18 +197,23 @@ impl<'a> ToolsWire<'a> {
         Self { access }
     }
 
-    async fn read(&self, path: String) -> Result<Vec<u8>, ToolError> {
+    async fn read<T: AsRef<[u8]> + Send + 'static>(
+        &self,
+        path: String,
+        file: fn(Vec<u8>, &str) -> Result<T, ToolError>,
+        virtual_text: fn(String) -> T,
+    ) -> Result<T, ToolError> {
         let tools = self.access.tools.clone();
         let cancel = self.access.cx.cancel.clone();
         self.access
             .settled(async move {
                 Ok(
                     match tools
-                        .read_file(&cancel, &path, Some(WIRE_READ_LIMIT))
+                        .read_file_as(&cancel, &path, Some(WIRE_READ_LIMIT), file)
                         .await?
                     {
                         FileRead::File { bytes, record, .. } => (bytes, Some(record)),
-                        FileRead::Virtual { text, .. } => (text.into_bytes(), None),
+                        FileRead::Virtual { text, .. } => (virtual_text(text), None),
                     },
                 )
             })
@@ -164,14 +232,23 @@ impl ToolsWire<'_> {
     /// Reads a filesystem or scheme resource as UTF-8 text.
     #[ext]
     pub async fn read_file(&self, path: String) -> Result<String, ToolError> {
-        String::from_utf8(self.read(path.clone()).await?)
-            .map_err(|_| ToolError(format!("File is not valid UTF-8: {path}")))
+        self.read(
+            path,
+            |bytes, path| {
+                String::from_utf8(bytes)
+                    .map_err(|_| ToolError(format!("File is not valid UTF-8: {path}")))
+            },
+            std::convert::identity,
+        )
+        .await
     }
 
     /// Reads a filesystem or scheme resource as base64 bytes.
     #[ext]
     pub async fn read_file_bytes(&self, path: String) -> Result<Base64, ToolError> {
-        self.read(path).await.map(Base64)
+        self.read(path, |bytes, _| Ok(bytes), String::into_bytes)
+            .await
+            .map(Base64)
     }
 
     /// Writes text using the session's write scope and freshness guard.
@@ -289,9 +366,15 @@ impl ToolsWire<'_> {
 
     /// Reserves a numbered artifact path without creating the file.
     #[ext]
-    pub fn allocate_artifact(&self, tail: String) -> ArtifactSlot {
-        let (id, path) = self.access.tools.schemes.artifacts().allocate(&tail);
-        ArtifactSlot { id, path }
+    pub fn allocate_artifact(&self, tail: String) -> Result<ArtifactSlot, Error> {
+        let (id, path) = self
+            .access
+            .tools
+            .schemes
+            .artifacts()
+            .allocate(&tail)
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        Ok(ArtifactSlot { id, path })
     }
 
     /// Finds a session artifact by numeric id.

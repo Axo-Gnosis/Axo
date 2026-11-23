@@ -2,6 +2,7 @@
 //! range of changes into the net change per file.
 
 use std::collections::HashMap;
+use std::fmt::{self, Write};
 use std::time::Duration;
 
 use axo_ai::ToolResultMessage;
@@ -111,7 +112,7 @@ pub struct SquashedChange {
     pub diff: Option<LineDiff>,
 }
 
-/// All mutations recorded by a successful tool result, in order.
+/// All mutations recorded by a tool result, in order, including mutations from a call that subsequently failed.
 pub fn file_changes(result: &ToolResultMessage) -> Vec<FileChange> {
     crate::tools::file_records(result)
         .into_iter()
@@ -177,15 +178,29 @@ fn diff_text(before: &[u8], after: &[u8], label: Option<&str>) -> Option<LineDif
     if let Some(label) = label
         && line_diff.first_changed_line.is_some()
     {
-        let patch = diff
-            .unified_diff()
-            .context_radius(CONTEXT_LINES)
-            .header(label, label)
-            .to_string();
-        if patch.len() > MAX_INLINE_PATCH_BYTES {
-            line_diff.patch_truncated = true;
+        struct Patch(String);
+        impl Write for Patch {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                if s.len() > MAX_INLINE_PATCH_BYTES - self.0.len() {
+                    return Err(fmt::Error);
+                }
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+        let mut patch = Patch(String::new());
+        if write!(
+            &mut patch,
+            "{}",
+            diff.unified_diff()
+                .context_radius(CONTEXT_LINES)
+                .header(label, label)
+        )
+        .is_ok()
+        {
+            line_diff.patch = Some(patch.0);
         } else {
-            line_diff.patch = Some(patch);
+            line_diff.patch_truncated = true;
         }
     }
     Some(line_diff)
@@ -305,6 +320,24 @@ mod tests {
                 patch: None,
                 patch_truncated: false,
             }),
+        }
+    }
+
+    #[test]
+    fn inline_patch_byte_boundary() {
+        let diff = |after: &[u8]| diff_text(b"a\n", after, Some("f")).unwrap();
+        let small = diff(b"b\n").patch.unwrap().len();
+        for extra in [0, 1] {
+            let mut after = vec![b'b'; 1 + MAX_INLINE_PATCH_BYTES - small + extra];
+            after.push(b'\n');
+            let diff = diff(&after);
+            assert_eq!((diff.additions, diff.deletions), (1, 1));
+            assert_eq!(diff.first_changed_line, Some(1));
+            assert_eq!(diff.patch_truncated, extra != 0);
+            assert_eq!(
+                diff.patch.map(|s| s.len()),
+                (extra == 0).then_some(MAX_INLINE_PATCH_BYTES)
+            );
         }
     }
 

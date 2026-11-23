@@ -212,6 +212,25 @@ pub enum TierOnModelChange {
     Keep,
 }
 
+impl TierOnModelChange {
+    pub(crate) fn select_tier(
+        self,
+        previous: Option<(&str, &str)>,
+        model: &Model,
+        chosen: ServiceTier,
+        explicit: Option<ServiceTier>,
+    ) -> ServiceTier {
+        explicit.unwrap_or_else(|| {
+            if self == Self::Keep || previous == Some((model.provider.as_str(), model.id.as_str()))
+            {
+                chosen
+            } else {
+                ServiceTier::Standard
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum SubagentTier {
@@ -604,8 +623,11 @@ pub struct UserConfig {
 /// any other acquisition failure as `Error::Host(Box::new(err))`.
 // ponytail: blocking calls; make async if a host needs network-backed config
 pub trait ConfigSource: Send + Sync {
-    /// Called once per `create_session`, `open_session`, `Axo::schemes`, `Axo::catalog`, and `Axo::stream`
-    /// (which `Axo::complete` uses), before anything else.
+    /// Sampled once when effective configuration is resolved, before any project callback.
+    /// Session creation first asks the store to create a writer; opening first opens the
+    /// writer and rejects child sessions; `Axo::schemes` first reads the saved header.
+    /// Failures before resolution do not call `user`. `Axo::catalog` and `Axo::stream`
+    /// also resolve configuration; `Axo::complete` uses `stream`.
     fn user(&self) -> Result<UserConfig, Error>;
     /// The project contribution for a session in `cwd`. The project root is `axo::context::project_root(cwd)`.
     /// Called at most once per such call, after `user`, and only when the effective access is `Read` or `Trust`

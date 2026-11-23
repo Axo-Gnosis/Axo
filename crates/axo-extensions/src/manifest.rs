@@ -8,14 +8,16 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use axo::Definitions;
 use axo::context::agents::{AgentDef, load_agents};
 use axo::context::keywords::load_keywords;
 use axo::context::modes::load_modes;
 use axo::context::skills::load_skills;
+use axo::{Definitions, Exposure};
+use axo_agent::{ExecutionMode, Replay};
 use axo_ai::{Model, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use crate::{ExtensionOptions, SDK_VERSION, store};
 
@@ -106,30 +108,6 @@ pub struct ToolDecl {
     pub execution_mode: ExecutionMode,
     #[serde(default)]
     pub guidelines: Vec<Cow<'static, str>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Exposure {
-    #[default]
-    Direct,
-    Deferred,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Replay {
-    #[default]
-    Never,
-    Safe,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExecutionMode {
-    #[default]
-    Parallel,
-    Sequential,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,7 +252,11 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
     let path = package.join(MANIFEST);
     let mut diagnostics = Vec::new();
     let fail = |what: String| format!("extension {id}: {}: {what}", path.display());
-    let text = tokio::fs::read_to_string(&path)
+    let mut text = String::new();
+    open_regular(&path)
+        .await
+        .map_err(fail)?
+        .read_to_string(&mut text)
         .await
         .map_err(|error| fail(format!("cannot read: {error}")))?;
     let manifest: Manifest =
@@ -317,7 +299,11 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
             ))
         };
         let file = resolve_inside(package, &section.file).await.map_err(what)?;
-        let body = tokio::fs::read_to_string(&file)
+        let mut body = String::new();
+        open_regular(&file)
+            .await
+            .map_err(what)?
+            .read_to_string(&mut body)
             .await
             .map_err(|error| what(format!("cannot be read: {error}")))?;
         sections.push((section.name.clone(), body));
@@ -399,9 +385,9 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
     })
 }
 
-/// Whether a package built for SDK `declared` runs on `provided`, by the caret rule: the same
-/// major when it is above 0, else the same minor when that is above 0, else the same version.
-/// Both must be exactly `major.minor.patch`.
+/// Both SDKs must be `major.minor.patch`. `provided` must be at least `declared`
+/// and share its major if nonzero, its major and minor for `0.y.z` with nonzero
+/// `y`, or its exact version for `0.0.z`.
 pub fn compatible(declared: &str, provided: &str) -> bool {
     fn parse(version: &str) -> Option<[u64; 3]> {
         let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
@@ -411,11 +397,12 @@ pub fn compatible(declared: &str, provided: &str) -> bool {
     let (Some(d), Some(p)) = (parse(declared), parse(provided)) else {
         return false;
     };
-    match d {
-        [0, 0, _] => d == p,
-        [0, _, _] => d[..2] == p[..2],
-        _ => d[0] == p[0],
-    }
+    p >= d
+        && match d {
+            [0, 0, _] => d == p,
+            [0, _, _] => d[..2] == p[..2],
+            _ => d[0] == p[0],
+        }
 }
 
 /// Names and shapes the session declarations must have to be admitted.
@@ -439,15 +426,8 @@ fn validate_session(manifest: &Manifest) -> Result<(), String> {
     }
     for tool in &manifest.tools {
         let name = &tool.name;
-        let valid = (1..=64).contains(&name.len())
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-        if !valid {
+        if !axo::valid_tool_name(name) {
             return Err(format!("tool name {name:?} is invalid"));
-        }
-        if matches!(name.as_str(), "call" | "yield") {
-            return Err(format!("tool \"{name}\" is reserved"));
         }
         if tool.parameters.get("type").and_then(Value::as_str) != Some("object") {
             return Err(format!(
@@ -516,17 +496,20 @@ async fn resolve_entry(package: &Path, entry: &str) -> Result<PathBuf, String> {
 /// placement runs it again just before activating the member, since the file may have
 /// changed since the last scan.
 pub async fn check_entry(entry: &Path) -> Result<(), String> {
+    open_regular(entry).await.map(drop)
+}
+
+pub(crate) async fn open_regular(path: &Path) -> Result<tokio::fs::File, String> {
     // File type first: opening a FIFO would block.
-    let metadata = tokio::fs::metadata(entry)
+    let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|error| format!("cannot be read: {error}"))?;
     if !metadata.is_file() {
         return Err("is not a regular file".into());
     }
-    tokio::fs::File::open(entry)
+    tokio::fs::File::open(path)
         .await
-        .map_err(|error| format!("cannot be read: {error}"))?;
-    Ok(())
+        .map_err(|error| format!("cannot be read: {error}"))
 }
 
 #[cfg(test)]
@@ -555,8 +538,10 @@ mod tests {
             ("0.0.0", "0.0.0", true),
             ("0.0.1", "0.0.0", false),
             ("0.2.0", "0.2.9", true),
+            ("0.2.9", "0.2.0", false),
             ("0.2.0", "0.3.0", false),
             ("1.2.0", "1.9.0", true),
+            ("1.9.0", "1.2.0", false),
             ("1.0.0", "2.0.0", false),
             ("1.0", "1.0.0", false),
             ("1.0.0.0", "1.0.0", false),
@@ -621,6 +606,61 @@ mod tests {
             std::fs::write(dir.join(entry), "export default () => ({});").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn special_files_are_rejected_before_read() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = package(
+            temp.path(),
+            "lab",
+            &json!({
+                "id": "lab",
+                "entry": "index.ts",
+                "sections": [{ "name": "rules", "file": "rules.md" }],
+            }),
+            Some("index.ts"),
+        );
+        for (name, context) in [
+            ("rules.md", "section \"rules\" file \"rules.md\""),
+            (MANIFEST, "extension.json:"),
+        ] {
+            let fifo = dir.join(name);
+            if name == MANIFEST {
+                std::fs::remove_file(&fifo).unwrap();
+            }
+            rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::RWXU).unwrap();
+
+            // Keep the watchdog outside Tokio: runtime shutdown waits for blocked file I/O.
+            let (tx, rx) = mpsc::channel();
+            let package = dir.clone();
+            let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let _ = tx.send(runtime.block_on(load("lab", &package)).unwrap_err());
+            });
+            let error = rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|error| {
+                    // Release a regressed reader without blocking if it has already exited.
+                    drop(
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&fifo),
+                    );
+                    panic!("loading {} did not finish: {error}", fifo.display());
+                });
+            worker.join().unwrap();
+            assert!(
+                error.contains(&format!("{context} is not a regular file")),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -807,8 +847,8 @@ mod tests {
         manifest.as_object_mut().unwrap().extend(
             json!({
                 "tools": [
-                    { "name": "read", "description": "Reads", "parameters": { "type": "object" } },
-                    { "name": "probe", "description": "Probes", "parameters": { "type": "object" },
+                    { "name": "yield", "description": "Yields", "parameters": { "type": "object" } },
+                    { "name": "call", "description": "Calls", "parameters": { "type": "object" },
                       "exposure": "deferred", "replay": "safe", "executionMode": "sequential",
                       "guidelines": ["Probe first"] },
                 ],
@@ -845,16 +885,16 @@ mod tests {
         let found = discover("lab", &roots).await.unwrap();
         assert_eq!(found.entry_error, None);
         let session = &found.member.session;
-        let [read, probe] = session.tools.as_slice() else {
+        let [direct, deferred] = session.tools.as_slice() else {
             panic!("two tools")
         };
         assert_eq!(
-            (read.exposure, read.replay, read.execution_mode),
+            (direct.exposure, direct.replay, direct.execution_mode),
             (Exposure::Direct, Replay::Never, ExecutionMode::Parallel)
         );
-        assert!(read.guidelines.is_empty());
+        assert!(direct.guidelines.is_empty());
         assert_eq!(
-            (probe.exposure, probe.replay, probe.execution_mode),
+            (deferred.exposure, deferred.replay, deferred.execution_mode),
             (Exposure::Deferred, Replay::Safe, ExecutionMode::Sequential)
         );
         assert_eq!(
@@ -880,6 +920,11 @@ mod tests {
         assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
         // The activation wire shape: camelCase, every declaration whole.
         let wire = serde_json::to_value(session).unwrap();
+        assert_eq!(wire["tools"][0]["exposure"], "direct");
+        assert_eq!(wire["tools"][0]["replay"], "never");
+        assert_eq!(wire["tools"][0]["executionMode"], "parallel");
+        assert_eq!(wire["tools"][1]["exposure"], "deferred");
+        assert_eq!(wire["tools"][1]["replay"], "safe");
         assert_eq!(wire["tools"][1]["executionMode"], "sequential");
         assert_eq!(wire["schemes"][1]["writeReplay"], "safe");
         assert_eq!(wire["toolPolicy"], json!(["before", "after"]));
@@ -897,9 +942,9 @@ mod tests {
         };
         let tool = |name: &str| json!({ "name": name, "description": "d", "parameters": { "type": "object" } });
         not_admitted(
-            "reserved",
-            json!({ "tools": [tool("yield")] }),
-            "tool \"yield\" is reserved",
+            "bad-name",
+            json!({ "tools": [tool("bad/name")] }),
+            "tool name \"bad/name\" is invalid",
         )
         .await;
         not_admitted(

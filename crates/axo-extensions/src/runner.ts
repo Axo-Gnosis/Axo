@@ -10,7 +10,7 @@
 //   {type:"hello",protocol:2,nonce,generation}
 // Every frame after that, both ways, carries `generation` (the same opaque string).
 //   {type:"call",id,ext,method,args,parent?}  id "h:<n>" from Rust, "r:<n>" from the runner
-//   {type:"ok",id,value} | {type:"error",id,code,message}  terminal reply to a call
+//   {type:"ok",id,value} | {type:"error",id,code,message,details?}  terminal reply (details only from Rust)
 //   {type:"cancel",id}                         withdraw a call the sender made
 //   {type:"ping",id} -> {type:"pong",id}       Rust pings; the runner answers from its event loop.
 //                                              While the socket is blocked an unsent pong is
@@ -60,13 +60,14 @@ import type {
   BeforeToolCall,
   CommandHandler,
   CompletionStreamEvent,
-  Credential,
+  CredentialOutput,
   Extension,
   Handlers,
   HostHandle,
   LoginInteraction,
   Model,
   ModelsHandle,
+  ProviderHandlers,
   ProviderRequest,
   SchemeHandlerContext,
   SchemeHandlers,
@@ -78,7 +79,7 @@ import type {
   ToolCall,
   ToolHandler,
   ToolPolicy,
-  ToolResult,
+  ToolResultInput,
   ToolRun,
   ToolScope,
 } from "../../../packages/axo-extension-sdk/index.ts";
@@ -116,6 +117,7 @@ class HostError extends Error {
   constructor(
     readonly code: string,
     message: string,
+    readonly details?: unknown,
   ) {
     super(message);
     this.name = "HostError";
@@ -203,20 +205,33 @@ function sendPong(id: string): void {
 }
 
 /**
- * Queues a frame on its turn. Skips it when `live()` turned false while waiting;
- * otherwise resolves "ok" or why the frame could not be encoded.
+ * Queues a frame on its turn. A withdrawn waiter releases the payload without
+ * waiting for socket progress.
  */
-async function send(frame: Frame, live: () => boolean = () => true): Promise<"ok" | "too_large" | "invalid"> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  turns.push(resolve);
+async function send(frame: Frame, withdrawal?: AbortSignal, enqueued?: () => void): Promise<"ok" | "too_large" | "invalid"> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  const turn = () => resolve(true);
+  const withdraw = () => {
+    const index = turns.indexOf(turn);
+    if (index !== -1) {
+      turns.splice(index, 1);
+      resolve(false);
+    }
+  };
+  turns.push(turn);
+  withdrawal?.addEventListener("abort", withdraw, { once: true });
   grant();
-  await promise;
+  const acquired = await promise;
+  withdrawal?.removeEventListener("abort", withdraw);
+  if (!acquired) return "ok";
   try {
-    if (!live()) return "ok";
+    if (withdrawal?.aborted) return "ok";
     const buf = encode(frame);
+    if (withdrawal?.aborted) return "ok"; // JSON serialization can invoke author code.
     if (typeof buf === "string") return buf;
     frames.push(buf);
     queued += buf.length;
+    enqueued?.();
     return "ok";
   } finally {
     granted = false;
@@ -325,6 +340,8 @@ const pending = new Map<string, { resolve(value: unknown): void; reject(error: E
 let nextId = 0n;
 /** Live runner calls Rust has not answered: half of peer.rs `MAX_CALLBACKS`, whose overflow ends the generation. */
 const MAX_HOST_CALLS = 128;
+let activeHostCalls = 0; // excludes the reserved subscription rollback slot
+const acknowledged = Promise.resolve();
 /** Calls waiting for a slot under `MAX_HOST_CALLS`, started in order. */
 const queuedHostCalls: { start(): void; reject(error: Error): void }[] = [];
 // ponytail: a stall is detected, not prevented; exempt re-entrant calls from the slot cap if real workloads hit it
@@ -335,8 +352,7 @@ function resetStallTimer(): void {
   clearTimeout(stallTimer);
   stallTimer = queuedHostCalls.length ? setTimeout(() => {
     stallTimer = undefined;
-    for (const call of queuedHostCalls) call.reject(new HostError("stalled", "too many nested host calls"));
-    queuedHostCalls.length = 0;
+    for (const call of queuedHostCalls.splice(0)) call.reject(new HostError("stalled", "too many nested host calls"));
   }, STALL_MS) : undefined;
 }
 
@@ -364,7 +380,7 @@ function onFrame(frame: Frame): void {
       if (frame.type === "ok") return waiter.resolve(frame.value);
       const code = typeof frame.code === "string" ? frame.code : "error";
       const message = typeof frame.message === "string" ? frame.message : "host error";
-      return waiter.reject(new HostError(code, message));
+      return waiter.reject(new HostError(code, message, frame.details));
     }
     default:
       violation("unknown frame type");
@@ -409,18 +425,12 @@ function errorReply(id: string, error: unknown, method: string): Frame {
 
 // ---- Rust -> runner methods ----
 
-interface Provider {
-  login?: (ui: LoginInteraction, signal: AbortSignal) => Promise<Credential>;
-  refresh?: (credential: Credential, signal: AbortSignal) => Promise<Credential>;
-  rewrite?: (model: Readonly<Model>, request: ProviderRequest, signal: AbortSignal) => Promise<ProviderRequest>;
-}
-
 /** A tool policy hook the manifest declares. */
 type PolicyHook = "before" | "after";
 
 /** One activated extension's bound handlers, exactly as its activate call declared them. */
 interface Active {
-  providers: Map<string, Provider>;
+  providers: Map<string, ProviderHandlers>;
   tools: Map<string, ToolHandler>;
   schemes: Map<string, SchemeHandlers>;
   commands: Map<string, CommandHandler>;
@@ -547,7 +557,7 @@ async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
       if (subscription?.ext !== ext) throw new Fail("unsupported", "no stream listener");
       let event: StreamEvent;
       if (args.closed === true) {
-        subscriptions.delete(sub);
+        subscription.remove();
         event = { type: "closed", value: null };
       } else if (typeof args.lagged === "number") {
         event = { type: "lagged", value: { skipped: args.lagged } };
@@ -573,19 +583,15 @@ async function provider(id: string, call: Call, active: Active | undefined, args
   switch (method) {
     case "login": {
       if (!handlers?.login) throw new Fail("unsupported", "no login handler");
-      const notices = new Set<Promise<void>>();
+      const notices = { pending: new Set<Promise<void>>(), failed: false };
       const value = await handlers.login(interaction(ext, { id, signal }, notices), signal);
-      // A credential never outruns a display or progress message the host has not acknowledged.
-      try {
-        while (notices.size) await Promise.all(notices);
-      } catch {
-        throw new Fail("failed", "login display not acknowledged");
-      }
+      while (notices.pending.size) await Promise.allSettled(notices.pending);
+      if (notices.failed) throw new Fail("failed", "login display not acknowledged");
       return credential(value, method);
     }
     case "refresh": {
       if (!handlers?.refresh) throw new Fail("unsupported", "no refresh handler");
-      const input = credential(args.credential, "refresh argument");
+      const input = credential(args.credential, "refresh argument") as CredentialOutput;
       return credential(await handlers.refresh(input, signal), method);
     }
     default: {
@@ -597,7 +603,7 @@ async function provider(id: string, call: Call, active: Active | undefined, args
   }
 }
 
-async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): Promise<ToolResult> {
+async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): Promise<ToolResultInput> {
   const { ext, controller } = call;
   const signal = controller.signal;
   const parent: Parent = { id, signal };
@@ -614,28 +620,30 @@ async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): 
     update(update) {
       const u = local(isRecord(update), "update", update);
       const content = local(Array.isArray(u.content), "update content", u.content);
-      const sent = callHost(ext, "update", { content, details: u.details }, parent);
+      if (signal.aborted || queuedHostCalls.length >= MAX_HOST_CALLS) return acknowledged;
+      const sent = callHost(ext, "update", { content, details: u.details }, parent).then(done, done);
+      function done() { updates.delete(sent); }
       updates.add(sent);
-      const done = () => updates.delete(sent);
-      sent.then(done, done);
+      return sent;
     },
   };
-  let value: ToolResult;
+  let value: ToolResultInput;
   try {
     value = await handler(run);
   } catch (error) {
     // An unhandled host tool refusal is a model-facing tool error, not an author exception.
     if (!(error instanceof HostError && error.code === "tool")) throw error;
     value = { content: [{ type: "text", text: error.message }], isError: true };
+  } finally {
+    while (updates.size) await Promise.allSettled(updates);
   }
-  while (updates.size) await Promise.allSettled(updates);
   const result = decision(value, "tool", {
     content: "array",
     details: "any?",
     isError: "boolean?",
     terminate: "boolean?",
   });
-  return (result ?? invalidReply("tool")) as unknown as ToolResult;
+  return (result ?? invalidReply("tool")) as unknown as ToolResultInput;
 }
 
 function toolCall(value: unknown, what: string): ToolCall {
@@ -665,7 +673,7 @@ function decision(value: unknown, label: string, shape: Record<string, Check | `
     const optional = spec.endsWith("?");
     const check = (optional ? spec.slice(0, -1) : spec) as Check;
     const ok =
-      v === undefined
+      v === undefined || (v === null && optional)
         ? optional
         : check === "any" ||
           (check === "true" && v === true) ||
@@ -732,6 +740,13 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
   };
   if (extensions.has(ext) || activating.has(ext)) throw new Fail("invalid", "already activated");
   activating.add(ext);
+  const lifetime = new AbortController();
+  const cancel = () => {
+    activating.delete(ext);
+    lifetime.abort(signal.reason);
+  };
+  signal.addEventListener("abort", cancel, { once: true });
+  let committed = false;
   try {
     let module: { default?: unknown };
     try {
@@ -740,6 +755,7 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
     } catch {
       return fail("import failed");
     }
+    signal.throwIfAborted();
     if (typeof module.default !== "function") return fail("default export is not a function");
     let result: unknown;
     try {
@@ -748,9 +764,9 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
         dataDir,
         host: object(ext, "host", {}) as HostHandle,
         models: object(ext, "models", {
-          stream: (request, listener) => openSubscription(ext, { completion: request }, listener),
+          stream: (request, listener) => openSubscription(ext, { completion: request }, listener, lifetime.signal),
         } satisfies Pick<ModelsHandle, "stream">) as ModelsHandle,
-        session: (id) => handle(ext, local(typeof id === "string", "session id", id)),
+        session: (id) => handle(ext, local(typeof id === "string", "session id", id), lifetime.signal),
       });
     } catch {
       return fail("activation threw");
@@ -778,10 +794,14 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
       spawnHook: single(handlers.spawnHook, decl.spawnHook, "spawn hook", (h) => method<SpawnHook>(h, handlers)),
       onEntry: single(handlers.onEntry, decl.events, "entry", (h) => method<Active["onEntry"]>(h, handlers)),
     };
-    if (!signal.aborted) extensions.set(ext, active);
+    signal.throwIfAborted();
+    extensions.set(ext, active);
+    committed = true;
     return null;
   } finally {
-    activating.delete(ext);
+    signal.removeEventListener("abort", cancel);
+    if (!signal.aborted) activating.delete(ext);
+    if (!committed) lifetime.abort();
   }
 }
 
@@ -832,15 +852,15 @@ function single<T>(value: unknown, declared: boolean, kind: string, bind: (handl
   return (value === undefined ? undefined : bind(value)) ?? fail(`${kind} handler missing`);
 }
 
-function providers(value: unknown, declared: { id: string; login: boolean; rewrite: boolean }[]): Map<string, Provider> {
+function providers(value: unknown, declared: { id: string; login: boolean; rewrite: boolean }[]): Map<string, ProviderHandlers> {
   const returned: Frame =
     value === undefined ? {} : isRecord(value) ? value : fail("activation did not return a provider record");
   for (const key of Object.keys(returned)) {
     if (!declared.some((p) => p.id === key)) fail("activation returned an undeclared provider");
   }
-  const out = new Map<string, Provider>();
+  const out = new Map<string, ProviderHandlers>();
   for (const [i, p] of declared.entries()) {
-    const value = returned[p.id];
+    const value = Object.hasOwn(returned, p.id) ? returned[p.id] : undefined;
     if (value === undefined && !p.login && !p.rewrite) continue;
     if (typeof value !== "object" || value === null) fail(`provider ${i}: handlers missing`);
     const h = value as Record<string, unknown>;
@@ -848,7 +868,7 @@ function providers(value: unknown, declared: { id: string; login: boolean; rewri
     for (const key of Object.keys(h)) {
       if (!Object.hasOwn(wants, key)) fail(`provider ${i}: undeclared method`);
     }
-    const bound: Provider = {};
+    const bound: ProviderHandlers = {};
     for (const [key, wanted] of Object.entries(wants)) {
       const fn = h[key];
       if (wanted && typeof fn !== "function") fail(`provider ${i}: ${key} is not a function`);
@@ -864,7 +884,7 @@ function providers(value: unknown, declared: { id: string; login: boolean; rewri
 
 type StreamEvent = SessionStreamEvent | CompletionStreamEvent;
 type StreamListener = (event: StreamEvent) => void | Promise<void>;
-const subscriptions = new Map<string, { ext: string; listener: StreamListener }>();
+const subscriptions = new Map<string, { ext: string; listener: StreamListener; remove(): void }>();
 const registering = new Map<Promise<unknown>, string>();
 /** The methods each object forwards; sent with every activation. */
 const methods = new Map<string, Set<string>>();
@@ -885,35 +905,66 @@ function object<T extends object>(ext: string, name: string, base: T, target?: s
 }
 
 /** Session actions for one session Rust can resolve by ID. */
-function handle(ext: string, id: string): SessionHandle {
+function handle(ext: string, id: string, lifetime?: AbortSignal): SessionHandle {
   const subscribe: SessionHandle["subscribe"] = (listener, kinds) =>
-    openSubscription(ext, { session: id, kinds }, listener);
+    openSubscription(ext, { session: id, kinds }, listener, lifetime);
   return object(ext, "session", { id, subscribe }, id) as SessionHandle;
 }
 
-async function openSubscription<E extends StreamEvent>(ext: string, args: Frame, listener: (event: E) => void | Promise<void>) {
-  const reply = callHost(ext, "subscribe", args);
+// Only IDs and owners outlive a failed activation; no listener or author context is retained.
+const rollbacks = new Map<string, string>();
+function rollbackSubscription(sub: string, ext: string): void {
+  const running = rollbacks.size !== 0;
+  rollbacks.set(sub, ext);
+  if (running) return;
+  void (async () => {
+    for (const [id, owner] of rollbacks) {
+      try {
+        await startHostCall(owner, "unsubscribe", { sub: id }, undefined, undefined, true);
+      } catch (error) {
+        if (!(error instanceof HostError && error.code === "no_subscription")) violation("subscription rollback failed");
+      }
+      rollbacks.delete(id);
+    }
+  })();
+}
+
+async function openSubscription<E extends StreamEvent>(ext: string, args: Frame, listener: (event: E) => void | Promise<void>, lifetime?: AbortSignal) {
+  lifetime?.throwIfAborted();
+  const reply = callHost(ext, "subscribe", args, undefined, lifetime);
   registering.set(reply, ext);
   try {
     const sub = text(record(await reply, "subscribe reply").sub, "subscription id");
-    // Rust sends only the event type requested for this subscription ID.
-    subscriptions.set(sub, { ext, listener: listener as StreamListener });
-    // Memoized; the listener stays registered until Rust confirms, so a failed close retries.
     let closing: Promise<void> | undefined;
+    const remove = () => {
+      subscriptions.delete(sub);
+      lifetime?.removeEventListener("abort", rollback);
+    };
+    const rollback = () => {
+      remove();
+      if (!closing) rollbackSubscription(sub, ext);
+    };
+    if (lifetime?.aborted) {
+      rollbackSubscription(sub, ext);
+      return { close: () => acknowledged };
+    }
+    subscriptions.set(sub, { ext, listener: listener as StreamListener, remove });
+    lifetime?.addEventListener("abort", rollback, { once: true });
     return {
       close() {
         closing ??= (async () => {
           if (!subscriptions.has(sub)) return;
           try {
-            await callHost(ext, "unsubscribe", { sub });
+            await callHost(ext, "unsubscribe", { sub }, undefined, lifetime);
           } catch (error) {
             // The host already ended the stream: closed either way.
             if (!(error instanceof HostError && error.code === "no_subscription")) {
               closing = undefined;
+              if (lifetime?.aborted) rollbackSubscription(sub, ext);
               throw error;
             }
           }
-          subscriptions.delete(sub);
+          remove();
         })();
         return closing;
       },
@@ -929,7 +980,7 @@ async function openSubscription<E extends StreamEvent>(ext: string, args: Frame,
  * The host UI for one login. Display calls (openUrl, deviceCode, progress) are tracked in
  * `notices` until Rust acknowledges them so the login cannot return past an undelivered one.
  */
-function interaction(ext: string, parent: Parent, notices: Set<Promise<void>>): LoginInteraction {
+function interaction(ext: string, parent: Parent, notices: { pending: Set<Promise<void>>; failed: boolean }): LoginInteraction {
   const ask = (method: string, args: Frame, own?: AbortSignal) => callHost(ext, method, args, parent, own);
   const notify = (method: string, build: () => Frame): Promise<void> => {
     let delivered: Promise<void>;
@@ -938,10 +989,12 @@ function interaction(ext: string, parent: Parent, notices: Set<Promise<void>>): 
     } catch (error) {
       return Promise.reject(error);
     }
-    notices.add(delivered);
-    // Fulfilled notices are forgotten; a rejected one stays so the login fails on it. The
-    // no-op handler marks the rejection handled, so an unawaited call cannot crash the runner.
-    delivered.then(() => notices.delete(delivered), () => {});
+    notices.pending.add(delivered);
+    // Keep failure, not every rejected promise; callers can still await the original rejection.
+    delivered.then(() => notices.pending.delete(delivered), () => {
+      notices.failed = true;
+      notices.pending.delete(delivered);
+    });
     return delivered;
   };
   const optional = (value: unknown, what: string): string | undefined =>
@@ -960,8 +1013,8 @@ function interaction(ext: string, parent: Parent, notices: Set<Promise<void>>): 
           userCode: local(typeof c.userCode === "string", "deviceCode userCode", c.userCode),
           verificationUrl: local(typeof c.verificationUrl === "string", "deviceCode verificationUrl", c.verificationUrl),
           expiresInSeconds:
-            expires === undefined
-              ? undefined
+            expires == null
+              ? expires
               : local(Number.isSafeInteger(expires) && expires >= 0, "deviceCode expiresInSeconds", expires),
         };
       }),
@@ -972,7 +1025,7 @@ function interaction(ext: string, parent: Parent, notices: Set<Promise<void>>): 
           "prompt",
           {
             message: local(typeof p.message === "string", "prompt message", p.message),
-            placeholder: optional(p.placeholder, "prompt placeholder"),
+            placeholder: optional(p.placeholder ?? undefined, "prompt placeholder"),
             secret: local(typeof p.secret === "boolean", "prompt secret", p.secret),
           },
           signal,
@@ -1024,57 +1077,89 @@ interface Parent {
  * session action, independent of any call.
  */
 function callHost(ext: string, method: string, args: Frame, parent?: Parent, own?: AbortSignal): Promise<unknown> {
-  const { promise, resolve, reject } = Promise.withResolvers<unknown>();
   const outer = parent?.signal;
-  const start = () => {
-    if (parent && (parent.signal.aborted || !calls.has(parent.id))) {
-      reject(parent.signal.reason ?? new Error("call finished"));
-      return;
-    }
-    if (own?.aborted) {
-      reject(own.reason);
-      return;
-    }
-    const id = `r:${nextId++}`;
-    let sent = false;
-    const settle = (finish: () => void) => {
-      pending.delete(id);
-      outer?.removeEventListener("abort", onOuter);
-      own?.removeEventListener("abort", onOwn);
-      finish();
-      // A queued start that rejects early takes no slot, so the loop moves on.
-      while (pending.size < MAX_HOST_CALLS && queuedHostCalls.length) queuedHostCalls.shift()!.start();
+  if (parent && (outer!.aborted || !calls.has(parent.id))) {
+    return Promise.reject(outer!.reason ?? new Error("call finished"));
+  }
+  if (own?.aborted) return Promise.reject(own.reason);
+  if (activeHostCalls < MAX_HOST_CALLS) return startHostCall(ext, method, args, parent, own);
+  if (queuedHostCalls.length >= MAX_HOST_CALLS) return Promise.reject(new HostError("busy", "host call queue is full"));
+  const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+  const detach = () => {
+    outer?.removeEventListener("abort", withdraw);
+    own?.removeEventListener("abort", withdraw);
+  };
+  const withdraw = () => {
+    const index = queuedHostCalls.indexOf(entry);
+    if (index === -1) return;
+    queuedHostCalls.splice(index, 1);
+    entry.reject(outer?.aborted ? outer.reason : own!.reason);
+    if (!queuedHostCalls.length) resetStallTimer();
+  };
+  const entry = {
+    start() {
+      detach();
+      resolve(startHostCall(ext, method, args, parent, own));
+    },
+    reject(error: Error) {
+      detach();
+      reject(error);
+    },
+  };
+  queuedHostCalls.push(entry);
+  outer?.addEventListener("abort", withdraw, { once: true });
+  own?.addEventListener("abort", withdraw, { once: true });
+  if (queuedHostCalls.length === 1) resetStallTimer();
+  return promise;
+}
+
+/** Rollback unsubscribes use one separate serial slot even when ordinary calls are stalled. */
+function startHostCall(ext: string, method: string, args: Frame, parent?: Parent, own?: AbortSignal, rollback = false): Promise<unknown> {
+  const outer = parent?.signal;
+  if (outer?.aborted) return Promise.reject(outer.reason);
+  if (own?.aborted) return Promise.reject(own.reason);
+  if (!rollback) activeHostCalls++;
+  const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+  const id = `r:${nextId++}`;
+  const writer = new AbortController();
+  let sent = false;
+  const settle = (finish: () => void) => {
+    if (!pending.delete(id)) return;
+    if (!sent) writer.abort();
+    outer?.removeEventListener("abort", onOuter);
+    own?.removeEventListener("abort", onOwn);
+    finish();
+    if (!rollback) {
+      activeHostCalls--;
+      while (activeHostCalls < MAX_HOST_CALLS && queuedHostCalls.length) queuedHostCalls.shift()!.start();
       resetStallTimer();
-    };
-    // The parent ended: Rust has already dropped its callbacks, so no cancel frame.
-    const onOuter = () => settle(() => reject(outer!.reason));
-    const onOwn = () =>
-      settle(() => {
-        if (sent) sendControl({ type: "cancel", id });
-        reject(own!.reason);
-      });
-    pending.set(id, {
-      resolve: (value) => settle(() => resolve(value)),
-      reject: (error) => settle(() => reject(error)),
-    });
-    outer?.addEventListener("abort", onOuter, { once: true });
-    own?.addEventListener("abort", onOwn, { once: true });
-    const frame = { type: "call", id, ext, method, args, parent: parent?.id };
-    void send(frame, () => (sent = pending.has(id))).then((status) => {
-      if (status !== "ok") pending.get(id)?.reject(new RangeError(`axo: ${method} arguments cannot be sent (${status})`));
+    }
+  };
+  const onOuter = () => settle(() => reject(outer!.reason));
+  const onOwn = () => {
+    // Registration/close must consume the host's answer once sent to roll back exactly once.
+    if (sent && (method === "subscribe" || method === "unsubscribe")) return;
+    settle(() => {
+      if (sent && !outer?.aborted) sendControl({ type: "cancel", id });
+      reject(own!.reason);
     });
   };
-  if (pending.size < MAX_HOST_CALLS) start();
-  else {
-    queuedHostCalls.push({ start, reject });
-    if (queuedHostCalls.length === 1) resetStallTimer();
-  }
+  pending.set(id, {
+    resolve: (value) => settle(() => resolve(value)),
+    reject: (error) => settle(() => reject(error)),
+  });
+  outer?.addEventListener("abort", onOuter, { once: true });
+  if (own !== outer) own?.addEventListener("abort", onOwn, { once: true });
+  const frame = { type: "call", id, ext, method, args, parent: parent?.id };
+  void send(frame, writer.signal, () => { sent = true; }).then((status) => {
+    if (status !== "ok") pending.get(id)?.reject(new RangeError(`axo: ${method} arguments cannot be sent (${status})`));
+  });
   return promise;
 }
 
 // ---- Value checks (Rust validates again before use) ----
 
-function credential(value: unknown, label: string): Credential {
+function credential(value: unknown, label: string): Frame {
   const bad = (what: string): never => {
     throw new Fail("invalid", `${label}: invalid credential (${what})`);
   };
@@ -1094,7 +1179,7 @@ function credential(value: unknown, label: string): Credential {
   } else {
     bad("type");
   }
-  return c as unknown as Credential;
+  return c;
 }
 
 function request(value: unknown, label: string): ProviderRequest {

@@ -12,6 +12,38 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+pub(super) async fn open_regular(path: &Path) -> io::Result<tokio::fs::File> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+        .await?;
+    let metadata = file.metadata().await?;
+    if metadata.is_dir() {
+        Err(ErrorKind::IsADirectory.into())
+    } else if !metadata.is_file() {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ))
+    } else {
+        Ok(file)
+    }
+}
+
+pub(super) async fn read_limited(
+    reader: impl AsyncRead + Unpin,
+    limit: u64,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
 
 /// The UTF-8 byte order mark.
 pub const BOM: &str = "\u{FEFF}";
@@ -263,4 +295,22 @@ fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
         .write_to(Cursor::new(&mut png), ImageFormat::Png)
         .ok()
         .map(|()| png)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_limited;
+
+    #[tokio::test]
+    async fn bounded_reader_stops_after_one_probe_byte() {
+        let mut input = b"abcdef".as_slice();
+        assert_eq!(read_limited(&mut input, 3).await.unwrap(), None);
+        assert_eq!(input, b"ef");
+        assert_eq!(
+            read_limited(b"abc".as_slice(), 3).await.unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(read_limited(b"".as_slice(), 0).await.unwrap(), Some(vec![]));
+        assert_eq!(read_limited(b"x".as_slice(), 0).await.unwrap(), None);
+    }
 }

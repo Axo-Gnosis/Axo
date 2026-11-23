@@ -215,7 +215,10 @@ async fn commands_during_a_run_follow_their_policy() {
         let session = session.clone();
         async move { session.prompt("original").await.unwrap() }
     });
-    while !matches!(&*events.recv().await.unwrap(), SessionEvent::Retry { .. }) {}
+    within(async {
+        while !matches!(&*events.recv().await.unwrap(), SessionEvent::Retry { .. }) {}
+    })
+    .await;
     let before = model_changes(&entries(&session).await);
 
     // Alongside: runs mid-turn.

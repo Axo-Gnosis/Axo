@@ -24,6 +24,23 @@ pub use project::{ProjectedSource, Projection, project};
 
 use crate::error::Error;
 
+const DEFAULT_PAGE_LIMIT: u32 = 256;
+const MAX_PAGE_LIMIT: u32 = 1024;
+
+pub(crate) fn page_limit(limit: Option<u32>) -> usize {
+    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT) as usize
+}
+
+pub(crate) fn page_range(
+    entries: &[SeqEntry],
+    after: Option<u64>,
+    limit: usize,
+) -> (std::ops::Range<usize>, bool) {
+    let start = after.map_or(0, |seq| entries.partition_point(|entry| entry.seq <= seq));
+    let end = start.saturating_add(limit).min(entries.len());
+    (start..end, end < entries.len())
+}
+
 /// Assistant-message usage after a run's start, excluding maintenance and derived totals.
 pub(crate) fn run_usage(entries: &[SeqEntry], run_id: &str) -> Usage {
     let Some(start) = entries
@@ -74,11 +91,9 @@ pub trait SessionStore: Send + Sync {
         limit: usize,
     ) -> Result<(Header, Vec<SeqEntry>, bool), Error> {
         let (header, mut entries) = self.open_read(path).await?;
-        let start = after.map_or(0, |seq| entries.partition_point(|entry| entry.seq <= seq));
-        let end = start.saturating_add(limit).min(entries.len());
-        let more = end < entries.len();
-        entries.truncate(end);
-        entries.drain(..start);
+        let (range, more) = page_range(&entries, after, limit);
+        entries.truncate(range.end);
+        entries.drain(..range.start);
         Ok((header, entries, more))
     }
 

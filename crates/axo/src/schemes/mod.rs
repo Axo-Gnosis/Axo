@@ -306,14 +306,23 @@ impl Schemes {
     /// (links, tool paths) use `exact` to recognize them, then this.
     #[ext(skip = "served by tools.locate, tools.readFile and tools.writeFile")]
     pub async fn resolve(&self, url: &SchemeUrl) -> Result<Target, ToolError> {
-        self.handler(url)?.resolve(url, &self.context).await
+        Ok(self.resolve_handler(url).await?.1)
+    }
+
+    pub(crate) async fn resolve_handler(
+        &self,
+        url: &SchemeUrl,
+    ) -> Result<(Arc<dyn Scheme>, Target), ToolError> {
+        let handler = self.handler(url)?;
+        let target = handler.resolve(url, &self.context).await?;
+        Ok((handler, target))
     }
 
     /// Reads a URL's virtual resource or resolved UTF-8 file.
     #[ext(skip = "served by tools.locate, tools.readFile and tools.writeFile")]
     pub async fn read(&self, url: &SchemeUrl) -> Result<String, ToolError> {
-        let handler = self.handler(url)?;
-        match handler.resolve(url, &self.context).await? {
+        let (handler, target) = self.resolve_handler(url).await?;
+        match target {
             Target::Virtual => handler.read(url, &self.context).await,
             Target::File { path, .. } => {
                 let bytes = tokio::fs::read(path).await.map_err(|error| {

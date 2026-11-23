@@ -348,7 +348,8 @@ async fn grant(host: &Host, provider: &str) {
         base_url: None,
         extra: serde_json::Map::new(),
     };
-    host.store.set(provider, credential).await.unwrap();
+    let slot = host.models.credential_slot(provider).unwrap();
+    host.store.set(&slot, credential).await.unwrap();
 }
 
 fn native_url(host: &Host) -> String {
@@ -372,14 +373,17 @@ fn register_native(host: &Host, provider: &str) -> Model {
     }))
     .unwrap();
     host.models
-        .register(Provider {
-            id: provider.into(),
-            models: vec![model.clone()],
-            env: Vec::new(),
-            requires_key: false,
-            login: None,
-            rewrite: None,
-        })
+        .register(
+            "host",
+            Provider {
+                id: provider.into(),
+                models: vec![model.clone()],
+                env: Vec::new(),
+                requires_key: false,
+                login: None,
+                rewrite: None,
+            },
+        )
         .unwrap();
     model
 }

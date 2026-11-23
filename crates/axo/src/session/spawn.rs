@@ -1,6 +1,7 @@
 //! Child derivation, host spawn policy, and asynchronous admission.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, PoisonError, Weak};
 
@@ -19,10 +20,13 @@ use tracing::warn;
 
 use super::children::ChildSeed;
 use super::modes::ENTER_MODE;
-use super::{Inherited, Registrations, Session, SessionHooks, SessionSetup};
+use super::{
+    Inherited, Layers, Registrations, RunRequest, Session, SessionHooks, SessionSetup,
+    run_to_settle,
+};
 use crate::config::{SubagentSettings, SubagentTier};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs, member_name_problem};
-use crate::context::definitions::{Definitions, FileDefinitions};
+use crate::context::definitions::FileDefinitions;
 use crate::context::modes::{BashAccess, ModeSpec, ToolLimits};
 use crate::coordination::SpawnReceipt;
 use crate::error::Error;
@@ -203,14 +207,17 @@ fn validate_output(output: Option<&Value>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn child_inherited(hooks: &SessionHooks, spec: &AgentSpec) -> Arc<Inherited> {
+pub(super) fn child_seed(hooks: &SessionHooks, path: PathBuf, link: SpawnLink) -> ChildSeed {
     let parent = &hooks.inherited;
     let defs = hooks.definitions.get();
-    let base = hooks
-        .shape_base
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    Arc::new(Inherited {
+    let (sections, tools) = {
+        let base = hooks
+            .shape_base
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (base.host_sections.clone(), base.host_tool_factories.clone())
+    };
+    let inherited = Arc::new(Inherited {
         cwd: parent.cwd.clone(),
         config: parent.config.clone(),
         docs_dir: parent.docs_dir.clone(),
@@ -220,26 +227,31 @@ pub(super) fn child_inherited(hooks: &SessionHooks, spec: &AgentSpec) -> Arc<Inh
             skills: defs.skills.clone(),
             ..Default::default()
         }),
-        definitions: Definitions::default(),
         definition_diagnostics: Vec::new(),
-        agent: Some(spec.clone()),
+        agent: Some(link.spec.clone()),
         streamer: parent.streamer.clone(),
         models: parent.models.clone(),
         exec: parent.exec.clone(),
         supervisor: parent.supervisor.clone(),
         ask_enabled: false,
-        host_sections: base.host_sections.clone(),
-        host_tools: base.host_tool_factories.clone(),
-        host_schemes: hooks.host_schemes(),
-        tool_policies: hooks.policies(),
         store: parent.store.clone(),
         sessions: parent.sessions.clone(),
-        spawn_hooks: hooks.spawn_hooks(),
-        commands: Vec::new(),
-        layer: Registrations::default(),
         run_slots: parent.run_slots.clone(),
         docs: Some(hooks.prompt.sources.docs),
-    })
+    });
+    ChildSeed {
+        path,
+        link,
+        inherited,
+        registrations: Registrations {
+            sections,
+            tools,
+            schemes: hooks.host_schemes(),
+            tool_policies: hooks.policies(),
+            spawn_hooks: hooks.spawn_hooks(),
+            ..Default::default()
+        },
+    }
 }
 
 #[expose(block = SESSION_SPAWN, object = "session")]
@@ -504,11 +516,16 @@ impl SessionHooks {
             header.spawn = Some(link.clone());
             let child_id = header.id.clone();
             let writer = self.inherited.store.create(header).await?;
-            let inherited = child_inherited(self, &link.spec);
+            let seed = Arc::new(child_seed(self, writer.path().to_path_buf(), link));
             let expanded_model = format!("{}/{}", model.provider, model.id);
             let child = Arc::new(
                 Session::start(SessionSetup {
-                    inherited: inherited.clone(),
+                    inherited: seed.inherited.clone(),
+                    layers: Layers {
+                        host: seed.registrations.clone(),
+                        ..Default::default()
+                    },
+                    merged: None,
                     model,
                     thinking,
                     tier,
@@ -517,24 +534,25 @@ impl SessionHooks {
                     entries: Vec::new(),
                     projection: Projection::default(),
                     recovery: None,
-                    link: Some(link.clone()),
+                    link: Some(seed.link.clone()),
                 })
                 .await?,
             );
             let first = child.prepare_first(task).await?;
-            prepared.push((child, inherited, link, expanded_model, first));
+            prepared.push((child, seed, expanded_model, first));
         }
         // ponytail: an I/O failure from here until the parent's child_start leaves unreachable
         // child files; add SessionStore::delete if that shows up.
         let mut claimed = Vec::with_capacity(prepared.len());
-        for (child, inherited, link, model, first) in prepared {
+        for (child, seed, model, first) in prepared {
             let message = child.claim_first(first).await?;
-            claimed.push((child, inherited, link, model, message));
+            claimed.push((child, seed, model, message));
         }
         let jobs = &self.tools.runner.jobs;
         let ids: Vec<_> = claimed
             .iter()
-            .map(|(child, _, link, model, _)| {
+            .map(|(child, seed, model, _)| {
+                let link = &seed.link;
                 jobs.reserve_child(ChildRun {
                     session_id: child.hooks.session_id.clone(),
                     call_id: tool.as_ref().map(|tool| tool.call_id.clone()),
@@ -572,20 +590,16 @@ impl SessionHooks {
         }
         let is_team = claimed
             .first()
-            .is_some_and(|(_, _, link, _, _)| link.team.is_some());
+            .is_some_and(|(_, seed, _, _)| seed.link.team.is_some());
         let mut handles = Vec::with_capacity(claimed.len());
         let mut first_runs = Vec::with_capacity(claimed.len());
-        for ((child, inherited, link, _, message), id) in claimed.into_iter().zip(ids) {
+        for ((child, seed, _, message), id) in claimed.into_iter().zip(ids) {
             self.inherited.sessions.insert_live(
                 child.hooks.session_id.clone(),
-                Arc::new(ChildSeed {
-                    path: child.path().to_path_buf(),
-                    inherited,
-                    link,
-                }),
+                seed,
                 child.clone(),
             );
-            first_runs.push((child.clone(), message));
+            first_runs.push(message);
             handles.push(ChildHandle {
                 job: id.to_string(),
                 session: child,
@@ -617,9 +631,8 @@ impl SessionHooks {
                 }
             });
         }
-        for (child, message) in first_runs {
-            let child_id = child.hooks.session_id.clone();
-            start_first_run(child, message, jobs.clone(), child_id);
+        for (handle, message) in handles.iter().zip(first_runs) {
+            start_first_run(&handle.session, message, jobs.clone());
         }
         Ok(handles)
     }
@@ -837,16 +850,15 @@ impl SessionHooks {
     }
 }
 
-fn start_first_run(
-    child: Arc<Session>,
-    message: QueuedMessage,
-    jobs: Arc<JobRegistry>,
-    child_id: String,
-) {
+fn start_first_run(child: &Session, message: QueuedMessage, jobs: Arc<JobRegistry>) {
+    // The residency slot and host handles own the session, not the task it must cancel on drop.
+    let agent = child.agent.clone();
+    let hooks = child.hooks.clone();
     tokio::spawn(async move {
-        if let Err(error) = child.run_first(message).await {
-            let started = child
-                .hooks
+        let messages = hooks.run_input(hooks.reserve_delivery(), Some(message));
+        if let Err(error) = run_to_settle(agent, hooks.clone(), RunRequest::Prompt(messages)).await
+        {
+            let started = hooks
                 .journal
                 .view()
                 .entries
@@ -855,7 +867,7 @@ fn start_first_run(
             if !started {
                 if let Err(error) = jobs
                     .child_message(
-                        &child_id,
+                        &hooks.session_id,
                         ChildMessage {
                             run_id: None,
                             text: format!("The task could not start: {error}"),

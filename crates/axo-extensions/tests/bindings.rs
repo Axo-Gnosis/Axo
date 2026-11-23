@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::fs;
 
-use axo::ext::objects;
+use axo::ext::{Meta, objects};
 use axo::{ErrorCode, SessionEvent, SessionEventKind};
 
 const PATH: &str = concat!(
@@ -9,15 +9,63 @@ const PATH: &str = concat!(
     "/../../packages/axo-extension-sdk/bindings.ts"
 );
 
+fn method(output: &mut String, meta: &Meta, phase: &impl Fn(&str, &str) -> String) {
+    if let Some(reason) = meta.skip {
+        writeln!(
+            output,
+            "  // withheld: {} — {}",
+            meta.name,
+            reason.replace(['\r', '\n'], " ")
+        )
+        .unwrap();
+        return;
+    }
+    if !meta.doc.is_empty() {
+        output.push_str("  /**\n");
+        for line in meta.doc.lines() {
+            writeln!(output, "   * {}", line.replace("*/", "*\\/")).unwrap();
+        }
+        output.push_str("   */\n");
+    }
+    write!(output, "  {}(", meta.name).unwrap();
+    if let Some(args_type) = meta.args_type {
+        let args_type = phase(args_type, "Deserialize");
+        let required = meta
+            .params
+            .iter()
+            .rposition(|param| !param.optional)
+            .map_or(0, |i| i + 1);
+        for (i, param) in meta.params.iter().enumerate() {
+            let optional = if i >= required { "?" } else { "" };
+            write!(
+                output,
+                "{name}{optional}: {args_type}[\"{name}\"], ",
+                name = param.name
+            )
+            .unwrap();
+        }
+    }
+    let result = meta.result_type.map(|name| phase(name, "Serialize"));
+    writeln!(
+        output,
+        "signal?: AbortSignal): Promise<{}>;",
+        result.as_deref().unwrap_or("void")
+    )
+    .unwrap();
+}
+
 fn bindings() -> String {
     let types = objects()
         .iter()
         .flat_map(|object| &object.blocks)
         .flat_map(|block| &block.entries)
+        .copied()
+        .chain(axo_extensions::lifecycle_methods())
         .fold(specta::Types::default(), |types, meta| {
             (meta.register)(types)
         })
         .register::<ErrorCode>()
+        .register::<axo::CompletionDetails>()
         .register::<SessionEvent>()
         .register::<SessionEventKind>();
     let types = specta_util::Remapper::new()
@@ -37,64 +85,42 @@ fn bindings() -> String {
             name.to_owned()
         }
     };
+    for name in [
+        "Credential",
+        "DeviceCode",
+        "LoginPrompt",
+        "LoginSelect",
+        "ToolResult",
+        "PolicyBlock",
+        "PolicyOverride",
+        "SpawnReply",
+        "SchemeResolution",
+    ] {
+        writeln!(
+            output,
+            "export type {name}Input = {};",
+            phase(name, "Deserialize")
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "export type CredentialOutput = {};",
+        phase("Credential", "Serialize")
+    )
+    .unwrap();
     for object in objects().iter().filter(|object| object.name != "types") {
         let mut name = object.name.chars();
         let first = name.next().unwrap().to_uppercase();
         writeln!(output, "\nexport interface {first}{} {{", name.as_str()).unwrap();
         for meta in object.blocks.iter().flat_map(|block| &block.entries) {
-            if let Some(reason) = meta.skip {
-                writeln!(
-                    output,
-                    "  // withheld: {} — {}",
-                    meta.name,
-                    reason.replace(['\r', '\n'], " ")
-                )
-                .unwrap();
-                continue;
-            }
-            if !meta.doc.is_empty() {
-                output.push_str("  /**\n");
-                for line in meta.doc.lines() {
-                    writeln!(output, "   * {}", line.replace("*/", "*\\/")).unwrap();
-                }
-                output.push_str("   */\n");
-            }
-            write!(output, "  {}(", meta.name).unwrap();
-            if let Some(args_type) = meta.args_type {
-                let args_type = phase(args_type, "Deserialize");
-                let required = meta
-                    .params
-                    .iter()
-                    .rposition(|param| !param.optional)
-                    .map_or(0, |i| i + 1);
-                for (i, param) in meta.params.iter().enumerate() {
-                    let optional = if i >= required { "?" } else { "" };
-                    write!(
-                        output,
-                        "{name}{optional}: {args_type}[\"{name}\"], ",
-                        name = param.name
-                    )
-                    .unwrap();
-                }
-            }
-            let result = meta.result_type.map(|name| phase(name, "Serialize"));
-            writeln!(
-                output,
-                "signal?: AbortSignal): Promise<{}>;",
-                result.as_deref().unwrap_or("void")
-            )
-            .unwrap();
+            method(&mut output, meta, &phase);
         }
         output.push_str("}\n");
     }
     output.push_str("\nexport interface HostLifecycle {\n");
-    for method in axo_extensions::LIFECYCLE_METHODS {
-        writeln!(
-            output,
-            "  {}({}, signal?: AbortSignal): Promise<{}>;",
-            method.name, method.params, method.result
-        )
-        .unwrap();
+    for meta in axo_extensions::lifecycle_methods() {
+        method(&mut output, meta, &phase);
     }
     output.push_str("}\n");
     output

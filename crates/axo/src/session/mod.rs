@@ -51,7 +51,7 @@ pub use self::modes::{AcceptResultOptions, PendingResult};
 use self::policy::{ModeGate, ScopeCell, effective_bash, effective_writes, tool_hooks};
 pub use self::policy::{ToolPolicy, ToolScope};
 pub use self::prompt::{ContextFilesInspection, PromptInspection};
-use self::prompt::{PromptState, SessionPrompt, ShapeBase, shape};
+use self::prompt::{PromptState, SessionPrompt, ShapeBase, ToolBase, shape};
 use self::resume::Resumption;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
 use self::spawn::SpawnTool;
@@ -63,9 +63,11 @@ pub(crate) use self::surface::TOOL_CATALOG;
 use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo, RegisteredCommand};
 use crate::compaction::{self, Limits};
-use crate::config::{EffectiveConfig, ModelChoice, ProjectAccess, TierOnModelChange};
+use crate::config::{EffectiveConfig, ModelChoice, ProjectAccess};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs};
-use crate::context::definitions::{Definitions, FileDefinitions, LiveDefinitions, merge};
+use crate::context::definitions::{
+    Definitions, FileDefinitions, LiveDefinitions, ResolvedDefinitions, merge,
+};
 use crate::context::files::NestedContext;
 use crate::context::keywords::{KeywordMatch, KeywordSpec};
 use crate::context::modes::{BashAccess, ModeSpec};
@@ -259,6 +261,8 @@ pub enum SessionEvent {
     Activity(Activity),
     /// An entry was appended to the session.
     Entry(SeqEntry),
+    /// The pending input queue changed; refresh the live queued snapshot.
+    QueueChanged,
     /// An `ask` call is waiting for `Session::answer` or `Session::dismiss`.
     QuestionPending {
         call_id: String,
@@ -329,6 +333,7 @@ pub enum SessionEventKind {
     Agent,
     Activity,
     Entry,
+    QueueChanged,
     QuestionPending,
     QuestionResolved,
     MaintenanceStart,
@@ -354,6 +359,7 @@ impl SessionEvent {
             Self::Agent(_) => SessionEventKind::Agent,
             Self::Activity(_) => SessionEventKind::Activity,
             Self::Entry(_) => SessionEventKind::Entry,
+            Self::QueueChanged => SessionEventKind::QueueChanged,
             Self::QuestionPending { .. } => SessionEventKind::QuestionPending,
             Self::QuestionResolved { .. } => SessionEventKind::QuestionResolved,
             Self::MaintenanceStart { .. } => SessionEventKind::MaintenanceStart,
@@ -522,28 +528,47 @@ pub struct QueuedInput {
 }
 
 impl QueuedInput {
-    /// The submission `id` as recorded in `entries`.
-    pub(super) fn find(entries: &[SeqEntry], id: String) -> Option<Self> {
-        entries
-            .iter()
-            .rev()
-            .find_map(|seq| match &seq.entry {
-                Entry::Submission {
-                    submission_id,
-                    kind,
-                    parts,
-                    custom,
-                    ..
-                } if *submission_id == id => Some((*kind, parts.clone(), custom.clone())),
-                _ => None,
-            })
-            .map(|(kind, parts, custom)| Self {
-                submission_id: id,
-                kind,
-                parts,
-                custom,
-            })
+    fn from_submission(entry: &Entry) -> Option<Self> {
+        let Entry::Submission {
+            submission_id,
+            kind,
+            parts,
+            custom,
+            ..
+        } = entry
+        else {
+            return None;
+        };
+        Some(Self {
+            submission_id: submission_id.clone(),
+            kind: *kind,
+            parts: parts.clone(),
+            custom: custom.clone(),
+        })
     }
+}
+
+fn queued_inputs(entries: &[SeqEntry], ids: Vec<String>) -> Vec<QueuedInput> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut positions: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    let mut slots = vec![None; ids.len()];
+    for seq in entries.iter().rev() {
+        if let Entry::Submission { submission_id, .. } = &seq.entry
+            && let Some(index) = positions.remove(submission_id.as_str())
+        {
+            slots[index] = QueuedInput::from_submission(&seq.entry);
+            if positions.is_empty() {
+                break;
+            }
+        }
+    }
+    slots.into_iter().flatten().collect()
 }
 
 /// A new session copied from a point of another.
@@ -564,7 +589,6 @@ pub(crate) struct Inherited {
     pub(crate) docs_dir: Option<PathBuf>,
     pub(crate) harness_name: String,
     pub(crate) files: Arc<FileDefinitions>,
-    pub(crate) definitions: Definitions,
     pub(crate) definition_diagnostics: Vec<Diagnostic>,
     pub(crate) agent: Option<AgentSpec>,
     pub(crate) streamer: Arc<dyn Streamer>,
@@ -574,18 +598,8 @@ pub(crate) struct Inherited {
     /// Runs every local command in its own supervised container (process group or cgroup).
     pub(crate) supervisor: Arc<ProcessSupervisor>,
     pub(crate) ask_enabled: bool,
-    pub(crate) host_sections: Vec<(String, Option<String>)>,
-    pub(crate) host_tools: Vec<HostTool>,
-    pub(crate) host_schemes: Vec<Arc<dyn Scheme>>,
-    pub(crate) tool_policies: Vec<Arc<dyn ToolPolicy>>,
     pub(crate) store: Arc<dyn SessionStore>,
     pub(crate) sessions: Arc<SessionTable>,
-    pub(crate) spawn_hooks: Vec<Arc<dyn SpawnHook>>,
-    /// Registered commands; empty for children.
-    pub(crate) commands: Vec<RegisteredCommand>,
-    /// Registrations applied after the host's own; empty for children, which inherit the
-    /// joined lists flat.
-    pub(crate) layer: Registrations,
     /// Child runs streaming at once under one root session and its live forks.
     pub(crate) run_slots: Arc<tokio::sync::Semaphore>,
     /// Some for children: the parent's docs flag; skips docs materialization.
@@ -595,6 +609,8 @@ pub(crate) struct Inherited {
 /// Everything `Axo` resolved for a new, opened or forked session.
 pub(crate) struct SessionSetup {
     pub(crate) inherited: Arc<Inherited>,
+    pub(crate) layers: Layers,
+    pub(crate) merged: Option<(ResolvedDefinitions, Vec<Diagnostic>)>,
     pub(crate) model: Model,
     /// Already clamped to the model.
     pub(crate) thinking: ThinkingLevel,
@@ -649,7 +665,7 @@ struct SessionHooks {
     selection_order: tokio::sync::Mutex<()>,
     /// The registry's definition of the selected model when it was last applied; a different
     /// one now means the registry changed. `None` when the registry does not have the model.
-    registry_model: Mutex<Option<Model>>,
+    registry_model: Mutex<Option<Arc<Model>>>,
     maintenance: Maintenance,
     /// Prompts between their fast-path admission and their run start; idle-wake delivery
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
@@ -729,7 +745,7 @@ async fn run_to_settle(
     hooks: Arc<SessionHooks>,
     request: RunRequest,
 ) -> Result<RunOutcome, Error> {
-    hooks.advance();
+    hooks.advance().await;
     // ponytail: a waiting child holds its slot while its own children queue; nested trees at maxConcurrent can deadlock — release the slot while in wait if maxDepth > 1 becomes common.
     // ponytail: only a team's first runs reserve slots together; later member runs queue one by one
     let _slot = if let Some(child) = &hooks.child {
@@ -811,17 +827,19 @@ fn detached<T: Send + 'static>(
     }
 }
 
-/// Rejects the first invalid section name in `sections`.
-fn check_sections(sections: &[(String, Option<String>)]) -> Result<(), Error> {
-    match sections
-        .iter()
-        .find(|(name, _)| !crate::context::prompt::valid_section_name(name))
-    {
-        Some((name, _)) => Err(Error::InvalidInput(format!(
-            "Invalid system prompt section name: {name}"
-        ))),
-        None => Ok(()),
+fn check_section_name(name: &str) -> Result<(), String> {
+    if crate::context::prompt::valid_section_name(name) {
+        Ok(())
+    } else {
+        Err(format!("Invalid system prompt section name: {name}"))
     }
+}
+
+fn check_sections(sections: &[(String, Option<String>)]) -> Result<(), Error> {
+    sections
+        .iter()
+        .try_for_each(|(name, _)| check_section_name(name))
+        .map_err(Error::InvalidInput)
 }
 
 /// Σ `Entry::usage` over `entries`: maintenance and failed requests included, run and job
@@ -1199,6 +1217,8 @@ impl SessionHooks {
             entries.push(Entry::ThinkingLevelChange {
                 base: journal::base(),
                 thinking_level: selection.thinking,
+                automatic: false,
+                service_tier: None,
             });
         }
         if tier.unwrap_or_default() != selection.tier {
@@ -1240,7 +1260,8 @@ impl SessionHooks {
         let current = self.selection();
         let (entries, level, tier) = self.model_entries(&current, &model, thinking, tier);
         self.append(entries).await?;
-        self.apply_selection(agent, model, level, tier);
+        let definition = self.registry_definition(&model);
+        self.apply_selection(agent, model, level, tier, definition);
         Ok(())
     }
 
@@ -1252,16 +1273,17 @@ impl SessionHooks {
         model: &Model,
         explicit: Option<ServiceTier>,
     ) -> ServiceTier {
-        explicit.unwrap_or_else(|| {
-            if (current.model.provider == model.provider && current.model.id == model.id)
-                || self.inherited.config.settings.service_tier.on_model_change
-                    == TierOnModelChange::Keep
-            {
-                current.tier
-            } else {
-                ServiceTier::Standard
-            }
-        })
+        self.inherited
+            .config
+            .settings
+            .service_tier
+            .on_model_change
+            .select_tier(
+                Some((&current.model.provider, &current.model.id)),
+                model,
+                current.tier,
+                explicit,
+            )
     }
 
     fn model_entries(
@@ -1282,6 +1304,8 @@ impl SessionHooks {
             entries.push(Entry::ThinkingLevelChange {
                 base: journal::base(),
                 thinking_level: level,
+                automatic: false,
+                service_tier: None,
             });
         }
         if tier != current.tier {
@@ -1299,16 +1323,13 @@ impl SessionHooks {
         model: Model,
         level: ThinkingLevel,
         tier: ServiceTier,
+        definition: Option<Arc<Model>>,
     ) {
-        if level != self.selection.borrow().thinking {
-            agent.set_thinking(level);
-        }
-        agent.set_service_tier(tier);
-        agent.set_model(model.clone());
+        agent.set_selection(Some(model.clone()), level, tier);
         *self
             .registry_model
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = self.registry_definition(&model);
+            .unwrap_or_else(PoisonError::into_inner) = definition;
         self.selection.send_replace(Selection {
             model,
             thinking: level,
@@ -1317,10 +1338,8 @@ impl SessionHooks {
         self.emit_context();
     }
 
-    fn registry_definition(&self, model: &Model) -> Option<Model> {
-        self.inherited
-            .models
-            .find(&format!("{}/{}", model.provider, model.id))
+    fn registry_definition(&self, model: &Model) -> Option<Arc<Model>> {
+        self.inherited.models.lookup(&model.provider, &model.id)
     }
 
     /// Adopts the registry's definition of the selected model when it changed since this session
@@ -1329,20 +1348,19 @@ impl SessionHooks {
     /// does a model the registry no longer has (its request then fails with `UnknownModel`).
     async fn follow_registry(&self) -> Result<(), Error> {
         let _order = self.selection_order.lock().await;
-        let current = self.selection();
-        let all = self.inherited.models.all();
-        let Some(now) = all
-            .iter()
-            .find(|model| model.provider == current.model.provider && model.id == current.model.id)
-        else {
-            return Ok(());
+        let (now, thinking, tier) = {
+            let current = self.selection.borrow();
+            let Some(now) = self.registry_definition(&current.model) else {
+                return Ok(());
+            };
+            (now, current.thinking, current.tier)
         };
         let applied = self
             .registry_model
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            == Some(now);
+            .is_some_and(|old| Arc::ptr_eq(old, &now) || old == &now);
         if applied {
             return Ok(());
         }
@@ -1350,56 +1368,62 @@ impl SessionHooks {
             return Ok(());
         };
         // Provider and id are unchanged, so only a clamped thinking level is journaled.
-        let level = clamp_level(now, current.thinking);
-        if level != current.thinking {
+        let level = clamp_level(&now, thinking);
+        if level != thinking {
             self.append(vec![Entry::ThinkingLevelChange {
                 base: journal::base(),
                 thinking_level: level,
+                automatic: true,
+                service_tier: None,
             }])
             .await?;
         }
-        self.apply_selection(&agent, now.clone(), level, current.tier);
+        self.apply_selection(&agent, (*now).clone(), level, tier, Some(now));
         Ok(())
     }
 
-    /// Records `level`, clamped to the model, then applies it once written; returns the
-    /// level applied.
-    async fn select_thinking(
+    /// Journal and publish the two suffixes as one selection, or leave both untouched.
+    async fn select_suffixes(
         &self,
         agent: &Agent,
-        level: ThinkingLevel,
-    ) -> Result<ThinkingLevel, Error> {
+        thinking: Option<ThinkingLevel>,
+        tier: Option<ServiceTier>,
+    ) -> Result<(ThinkingLevel, ServiceTier), Error> {
         let _order = self.selection_order.lock().await;
-        let current = self.selection();
-        let applied = clamp_level(&current.model, level);
-        if applied == current.thinking {
-            return Ok(applied);
-        }
-        self.append(vec![Entry::ThinkingLevelChange {
-            base: journal::base(),
-            thinking_level: applied,
-        }])
-        .await?;
-        agent.set_thinking(applied);
-        self.selection
-            .send_modify(|selection| selection.thinking = applied);
-        Ok(applied)
+        let (level, chosen, effective, entry) = {
+            let current = self.selection.borrow();
+            let level =
+                thinking.map_or(current.thinking, |level| clamp_level(&current.model, level));
+            let chosen = tier.unwrap_or(current.tier);
+            let effective = current.model.effective_tier(chosen);
+            let entry = if level != current.thinking {
+                Entry::ThinkingLevelChange {
+                    base: journal::base(),
+                    thinking_level: level,
+                    automatic: false,
+                    service_tier: (chosen != current.tier).then_some(chosen),
+                }
+            } else if chosen != current.tier {
+                Entry::ServiceTierChange {
+                    base: journal::base(),
+                    service_tier: chosen,
+                }
+            } else {
+                return Ok((level, effective));
+            };
+            (level, chosen, effective, entry)
+        };
+        self.append(vec![entry]).await?;
+        self.apply_suffixes(agent, level, chosen);
+        Ok((level, effective))
     }
 
-    async fn select_tier(&self, agent: &Agent, tier: ServiceTier) -> Result<ServiceTier, Error> {
-        let _order = self.selection_order.lock().await;
-        let current = self.selection();
-        if tier != current.tier {
-            self.append(vec![Entry::ServiceTierChange {
-                base: journal::base(),
-                service_tier: tier,
-            }])
-            .await?;
-            agent.set_service_tier(tier);
-            self.selection
-                .send_modify(|selection| selection.tier = tier);
-        }
-        Ok(current.model.effective_tier(tier))
+    fn apply_suffixes(&self, agent: &Agent, level: ThinkingLevel, tier: ServiceTier) {
+        agent.set_selection(None, level, tier);
+        self.selection.send_modify(|selection| {
+            selection.thinking = level;
+            selection.tier = tier;
+        });
     }
 
     /// Applies a resolved `/model` selector and any thinking or tier suffixes.
@@ -1414,12 +1438,8 @@ impl SessionHooks {
                     .await
             }
             None => {
-                if let Some(level) = choice.thinking {
-                    self.select_thinking(agent, level).await?;
-                }
-                if let Some(tier) = choice.tier {
-                    self.select_tier(agent, tier).await?;
-                }
+                self.select_suffixes(agent, choice.thinking, choice.tier)
+                    .await?;
                 Ok(())
             }
         }
@@ -1624,7 +1644,7 @@ impl LoopHooks for SessionHooks {
         turn: TurnContext<'_>,
         _cancel: &CancellationToken,
     ) -> Vec<AgentMessage> {
-        self.advance();
+        self.advance().await;
         let mut messages = self.take_system();
         if let Some(child) = &self.child
             && child.budget.requests() == child.budget.limit
@@ -1892,6 +1912,8 @@ impl Session {
     pub(crate) async fn start(setup: SessionSetup) -> Result<Session, Error> {
         let SessionSetup {
             inherited,
+            mut layers,
+            merged,
             model,
             thinking,
             tier,
@@ -1907,55 +1929,29 @@ impl Session {
             config,
             docs_dir,
             exec,
-            host_sections,
-            host_tools,
-            host_schemes,
             ..
         } = inherited.as_ref();
         let mut section_diagnostics = Vec::new();
-        let mut valid_sections = |sections: &[(String, Option<String>)]| {
-            sections
-                .iter()
-                .filter(|(name, _)| {
-                    let valid = crate::context::prompt::valid_section_name(name);
-                    if !valid {
-                        section_diagnostics.push(Diagnostic {
-                            origin: None,
-                            message: format!("Invalid system prompt section name: {name}"),
-                        });
-                    }
-                    valid
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let layer = &inherited.layer;
-        let (resolved, merge_diagnostics) = merge(
-            &inherited.files,
-            &[&layer.definitions, &inherited.definitions],
-        );
+        for sections in [&mut layers.host.sections, &mut layers.layer.sections] {
+            sections.retain(|(name, _)| match check_section_name(name) {
+                Ok(()) => true,
+                Err(message) => {
+                    section_diagnostics.push(Diagnostic {
+                        origin: None,
+                        message,
+                    });
+                    false
+                }
+            });
+        }
+        let (resolved, merge_diagnostics) = merged.unwrap_or_else(|| {
+            merge(
+                &inherited.files,
+                &[&layers.layer.definitions, &layers.host.definitions],
+            )
+        });
         let definitions = Arc::new(LiveDefinitions::new(resolved));
         let resolved = definitions.get();
-        let layers = Layers {
-            host: Registrations {
-                definitions: inherited.definitions.clone(),
-                tools: host_tools.clone(),
-                tool_policies: inherited.tool_policies.clone(),
-                spawn_hooks: inherited.spawn_hooks.clone(),
-                schemes: host_schemes.clone(),
-                sections: valid_sections(&host_sections[..]),
-                commands: inherited.commands.clone(),
-            },
-            layer: Registrations {
-                definitions: layer.definitions.clone(),
-                tools: layer.tools.clone(),
-                tool_policies: layer.tool_policies.clone(),
-                spawn_hooks: layer.spawn_hooks.clone(),
-                schemes: layer.schemes.clone(),
-                sections: valid_sections(&layer.sections[..]),
-                commands: layer.commands.clone(),
-            },
-        };
         let joined_tools = layers.joined(|r| &r.tools);
         let joined_policies = layers.joined(|r| &r.tool_policies);
         let joined_schemes = layers.joined(|r| &r.schemes);
@@ -2083,26 +2079,29 @@ impl Session {
             config: config.clone(),
             cwd: cwd.clone(),
             project,
-            builtin,
-            host_tools: host,
-            host_deferred,
-            call: Arc::new(tools::call::CallTool::new()),
-            enter_mode: enter_mode
-                .as_ref()
-                .map(|tool| tool.clone() as Arc<dyn Tool>),
             host_tool_factories: joined_tools,
             host_sections: layers.joined(|r| &r.sections),
             scheme_docs: session_tools.schemes.prompt_docs(),
-            depth,
-            has_peers,
-            has_modes: link.is_none() && !resolved.modes.is_empty(),
-            yield_tool,
-            limits: link
-                .as_ref()
-                .map(|link| link.limits.clone())
-                .unwrap_or_default(),
+            tool_base: Arc::new(ToolBase {
+                builtin,
+                host_tools: host,
+                host_deferred,
+                depth,
+                max_depth,
+                has_peers,
+                call: Arc::new(tools::call::CallTool::new()),
+                enter_mode: enter_mode
+                    .as_ref()
+                    .map(|tool| tool.clone() as Arc<dyn Tool>),
+                reserve_mode_tools: link.is_none() && !resolved.modes.is_empty(),
+                yield_tool,
+                limits: link
+                    .as_ref()
+                    .map(|link| link.limits.clone())
+                    .unwrap_or_default(),
+            }),
         };
-        let (prompt_shape, nested, shape_diagnostics) = shape(&shape_base, root_agent);
+        let (prompt_shape, nested, context_diagnostics) = shape(&shape_base, root_agent);
         session_tools
             .context
             .reset(nested.root, nested.names, &nested.startup);
@@ -2128,10 +2127,9 @@ impl Session {
                     "mode \"{name}\" from the session is unavailable; running without it"
                 ),
             });
-        let diagnostics: Vec<_> = shape_diagnostics
-            .context
+        let diagnostics: Vec<_> = context_diagnostics
             .into_iter()
-            .chain(shape_diagnostics.tools)
+            .chain(prompt_shape.tool_diagnostics.iter().cloned())
             .chain(scheme_diagnostics)
             .chain(commands::reserved_skill_diagnostics(&resolved.skills))
             .chain(commands::hidden_skill_diagnostics(
@@ -2238,11 +2236,7 @@ impl Session {
                 queue_order: tokio::sync::Mutex::new(()),
                 quiet: Mutex::new(Vec::new()),
                 selection_order: tokio::sync::Mutex::new(()),
-                registry_model: Mutex::new(
-                    inherited
-                        .models
-                        .find(&format!("{}/{}", model.provider, model.id)),
-                ),
+                registry_model: Mutex::new(inherited.models.lookup(&model.provider, &model.id)),
                 maintenance: Maintenance {
                     settings: settings.compaction.clone(),
                     prompts: summary_prompts,
@@ -2659,11 +2653,7 @@ impl Session {
         skip = "replaces the host's own registrations; extensions register through their manifest"
     )]
     pub fn set_commands(&self, commands: Vec<RegisteredCommand>) -> Result<Vec<Diagnostic>, Error> {
-        if self.hooks.child.is_some() {
-            return Err(Error::InvalidInput(
-                "Child sessions have no commands".into(),
-            ));
-        }
+        self.reject_child()?;
         let mut layers = self.hooks.registrations();
         layers.host.commands = commands;
         let commands = layers.joined(|r| &r.commands);
@@ -2719,8 +2709,13 @@ impl Session {
                 prompt: (!prompt.is_empty()).then(|| prompt.to_owned()),
             }));
         }
-        let registered = self.hooks.commands();
-        commands::effective(&registered, &defs.modes)
+        if !commands::valid_command_name(name) {
+            return None;
+        }
+        self.hooks
+            .commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|command| command.name == name)
             .then(|| {
@@ -2739,10 +2734,13 @@ impl Session {
         match command {
             Command::Registered { name, args } => {
                 let handler = {
-                    let registered = self.hooks.commands();
-                    commands::effective(&registered, &self.hooks.definitions.get().modes)
-                        .into_iter()
-                        .find(|command| command.name == name)
+                    let defs = self.hooks.definitions.get();
+                    let registered = self
+                        .hooks
+                        .commands
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    commands::registered_winner(&name, &registered, &defs.modes)
                         .map(|command| command.handler.clone())
                 };
                 let handler = handler.ok_or_else(|| Error::InvalidCommand {
@@ -2787,10 +2785,13 @@ impl Session {
     /// after the Stop starts the next run once this one settles. An idle Stop changes nothing.
     #[ext]
     pub fn abort(&self) {
-        if self.hooks.activity.borrow().running {
-            self.hooks.set_auto_paused(true);
-            self.hooks.stop_requested.store(true, Ordering::Release);
-        }
+        self.hooks.activity.send_if_modified(|activity| {
+            if activity.running {
+                self.hooks.stop_requested.store(true, Ordering::Release);
+                self.hooks.set_auto_paused(true);
+            }
+            false
+        });
         self.hooks.cancel_maintenance(false);
         self.agent.cancel(CancelReason::User);
     }
@@ -2840,11 +2841,7 @@ impl Session {
     /// mid-conversation system-message and tool changes.
     #[ext]
     pub async fn set_agent(&self, name: Option<&str>) -> Result<(), Error> {
-        if self.hooks.child.is_some() {
-            return Err(Error::InvalidInput(
-                "Child sessions keep the agent they were spawned with".into(),
-            ));
-        }
+        self.reject_child()?;
         let spec = name
             .map(|name| {
                 let spec = self
@@ -2892,9 +2889,10 @@ impl Session {
             });
             hooks.append(entries).await?;
             if let Some((model, level, tier)) = selection {
-                hooks.apply_selection(&agent, model, level, tier);
+                let definition = hooks.registry_definition(&model);
+                hooks.apply_selection(&agent, model, level, tier, definition);
             }
-            let (new_shape, nested, _) = hooks.reshape(spec.clone()).await;
+            let (new_shape, nested) = hooks.reshape(spec.clone()).await;
             *hooks
                 .prompt
                 .shape
@@ -2925,21 +2923,13 @@ impl Session {
     /// This is cache-heavy on models without mid-conversation system messages.
     #[ext(skip = "edits the host's own registrations; extensions register through their manifest")]
     pub async fn set_section(&self, name: &str, body: Option<String>) -> Result<(), Error> {
-        if self.hooks.child.is_some() {
-            return Err(Error::InvalidInput(
-                "Child sessions keep the prompt and tools they were spawned with".into(),
-            ));
-        }
-        if !crate::context::prompt::valid_section_name(name) {
-            return Err(Error::InvalidInput(format!(
-                "Invalid system prompt section name: {name}"
-            )));
-        }
+        self.reject_child()?;
+        check_section_name(name).map_err(Error::InvalidInput)?;
         let _order = self.hooks.selection_order.lock().await;
         let sections = {
             let mut layers = self.hooks.registrations();
             let sections = &mut layers.host.sections;
-            if let Some((_, value)) = sections.iter_mut().find(|(key, _)| key == name) {
+            if let Some((_, value)) = sections.iter_mut().rfind(|(key, _)| key == name) {
                 *value = body;
             } else {
                 sections.push((name.to_owned(), body));
@@ -3024,7 +3014,7 @@ impl Session {
     fn reject_child(&self) -> Result<(), Error> {
         if self.hooks.child.is_some() {
             return Err(Error::InvalidInput(
-                "Child sessions keep the registrations they were spawned with".into(),
+                "This operation is only available on root sessions".into(),
             ));
         }
         Ok(())
@@ -3037,11 +3027,7 @@ impl Session {
         skip = "replaces the host's own registrations; extensions register through their manifest"
     )]
     pub async fn set_tools(&self, tools: Vec<HostTool>) -> Result<Vec<Diagnostic>, Error> {
-        if self.hooks.child.is_some() {
-            return Err(Error::InvalidInput(
-                "Child sessions keep the prompt and tools they were spawned with".into(),
-            ));
-        }
+        self.reject_child()?;
         let hooks = self.hooks.clone();
         detached(async move {
             let _order = hooks.selection_order.lock().await;
@@ -3050,7 +3036,7 @@ impl Session {
                 layers.host.tools = tools;
                 layers.joined(|r| &r.tools)
             };
-            let diagnostics = hooks.stage_tools(tools).await;
+            let diagnostics = hooks.stage_tools(tools);
             hooks.prompt.rebuild();
             Ok(diagnostics)
         })
@@ -3073,15 +3059,28 @@ impl Session {
         detached(async move {
             let _order = hooks.selection_order.lock().await;
             hooks.registrations().host.definitions = definitions;
-            let mut diagnostics = hooks.stage_definitions();
+            let (changed, mut diagnostics) = hooks.stage_definitions();
             let defs = hooks.definitions.get();
             diagnostics.extend(commands::registered_diagnostics(
                 &hooks.commands(),
                 &defs.modes,
                 &defs.skills,
             ));
-            diagnostics.extend(hooks.restage().await);
-            hooks.prompt.rebuild();
+            if changed {
+                diagnostics.extend(hooks.restage());
+                hooks.prompt.rebuild();
+            } else {
+                diagnostics.extend(
+                    hooks
+                        .prompt
+                        .shape
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .tool_diagnostics
+                        .iter()
+                        .cloned(),
+                );
+            }
             Ok(diagnostics)
         })
         .await
@@ -3112,7 +3111,7 @@ impl Session {
                 .collect();
             hooks.stage_schemes(schemes)?;
             hooks.registrations().layer = layer;
-            let definition_diagnostics = hooks.stage_definitions();
+            let (_, definition_diagnostics) = hooks.stage_definitions();
             let (sections, tools, command_diagnostics) = {
                 let layers = hooks.registrations();
                 let command_diagnostics = hooks.apply_registrations(&agent, &layers);
@@ -3123,7 +3122,7 @@ impl Session {
                 )
             };
             hooks.stage_sections(sections);
-            let mut diagnostics = hooks.stage_tools(tools).await;
+            let mut diagnostics = hooks.stage_tools(tools);
             hooks.prompt.rebuild();
             diagnostics.extend(definition_diagnostics);
             diagnostics.extend(command_diagnostics);
@@ -3137,14 +3136,26 @@ impl Session {
     #[ext]
     pub async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error> {
         let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-        detached(async move { hooks.select_thinking(&agent, level).await }).await
+        detached(async move {
+            hooks
+                .select_suffixes(&agent, Some(level), None)
+                .await
+                .map(|s| s.0)
+        })
+        .await
     }
 
     /// Chooses the service tier from the next request; returns the tier the current model applies.
     #[ext]
     pub async fn set_service_tier(&self, tier: ServiceTier) -> Result<ServiceTier, Error> {
         let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-        detached(async move { hooks.select_tier(&agent, tier).await }).await
+        detached(async move {
+            hooks
+                .select_suffixes(&agent, None, Some(tier))
+                .await
+                .map(|s| s.1)
+        })
+        .await
     }
 
     /// Settles the pending question of tool call `call_id`.
@@ -3209,12 +3220,7 @@ impl Session {
                 .mode
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let queued = self
-                .agent
-                .queued_ids()
-                .into_iter()
-                .filter_map(|id| QueuedInput::find(&view.entries, id))
-                .collect();
+            let queued = queued_inputs(&view.entries, self.agent.queued_ids());
             let _tree = self
                 .hooks
                 .last_tree
@@ -3395,17 +3401,11 @@ impl Session {
         let projection = project(&entries, None);
         let mut inherited = (*self.inherited).clone();
         inherited.agent = self.agent();
-        let Layers { host, layer } = self.hooks.registrations().clone();
-        inherited.host_tools = host.tools;
-        inherited.host_sections = host.sections;
-        inherited.tool_policies = host.tool_policies;
-        inherited.spawn_hooks = host.spawn_hooks;
-        inherited.host_schemes = host.schemes;
-        inherited.commands = host.commands;
-        inherited.definitions = host.definitions;
-        inherited.layer = layer;
+        let layers = self.hooks.registrations().clone();
         let session = Session::start(SessionSetup {
             inherited: Arc::new(inherited),
+            layers,
+            merged: None,
             model,
             thinking,
             tier,

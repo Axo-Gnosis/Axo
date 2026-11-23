@@ -63,7 +63,13 @@ impl Artifacts {
 
     /// Reserves the next numeric ID and its path without creating either directory or file.
     #[ext(skip = "served by tools.allocateArtifact")]
-    pub fn allocate(&self, tail: &str) -> (u64, PathBuf) {
+    pub fn allocate(&self, tail: &str) -> io::Result<(u64, PathBuf)> {
+        if tail == "streams" || tail.ends_with(".streams") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact suffix .streams is reserved for command output indexes",
+            ));
+        }
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
         let next = next.get_or_insert_with(|| {
             // ponytail: an unreadable dir seeds 0; only collides if the dir is write-only
@@ -73,13 +79,13 @@ impl Artifacts {
         });
         let n = *next;
         *next = n.checked_add(1).expect("artifact IDs exhausted");
-        (n, self.dir.join(format!("{n}.{tail}")))
+        Ok((n, self.dir.join(format!("{n}.{tail}"))))
     }
 
     /// Creates a numbered file, registering it as live before any filesystem mutation.
     #[ext(skip = "live handle; tools.allocateArtifact")]
     pub async fn create(&self, tail: &str) -> io::Result<(u64, PathBuf, LiveArtifact)> {
-        let (id, path) = self.allocate(tail);
+        let (id, path) = self.allocate(tail)?;
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -237,6 +243,27 @@ impl Scheme for Artifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reserved_stream_suffix_does_not_consume_artifact_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = Artifacts::new(dir.path().join("artifacts"));
+        for tail in ["streams", "report.streams", "bash.call.log.streams"] {
+            let error = artifacts.allocate(tail).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "artifact suffix .streams is reserved for command output indexes"
+            );
+        }
+        assert!(artifacts.create("streams").await.is_err());
+        assert!(artifacts.live().is_empty());
+        assert!(!artifacts.dir().exists());
+        let (id, path, _guard) = artifacts.create("streams.log").await.unwrap();
+        assert_eq!(id, 0);
+        std::fs::write(stream_index_path(&path), []).unwrap();
+        assert_eq!(artifacts.find(id), Some(path));
+    }
 
     #[test]
     fn command_logs_maps_each_call_to_its_newest_log() {

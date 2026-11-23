@@ -16,8 +16,14 @@ pub const CASES: &[Case] = &[
     case!(authored_reinstalls_on_change),
     case!(authored_failure_is_visible_and_retryable),
     case!(call_waits_for_install),
+    case!(ready_install_failure_gates_static_provider),
     case!(auto_install_off),
     case!(install_update_rollback_uninstall),
+    case!(mixed_stale_results_keep_enabled_order),
+    case!(shared_store_writers_are_exclusive),
+    case!(shutdown_closes_store_admission),
+    case!(uninstall_data_cleanup_can_be_retried),
+    case!(nested_store_is_not_copied),
     case!(install_refusals),
 ];
 
@@ -133,6 +139,7 @@ async fn call_waits_for_install() {
     authored(&host, &http, "x");
     std::fs::write(host.path("ctl").join("install"), "hold").unwrap();
     let extensions = host.manager();
+    let mut events = extensions.subscribe();
     extensions
         .configure(&enabled(&[(AUTHORED, None)]))
         .await
@@ -140,7 +147,7 @@ async fn call_waits_for_install() {
     wait_phase(&extensions, AUTHORED, ExtensionPhase::Installing).await;
 
     let release = async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for("the held Bun invocation", || !installs(&host).is_empty()).await;
         assert_eq!(
             phase(&extensions, AUTHORED).phase,
             ExtensionPhase::Installing
@@ -149,11 +156,70 @@ async fn call_waits_for_install() {
             host.pids().is_empty(),
             "the runner started before its dependencies"
         );
+        loop {
+            if let axo_extensions::ExtensionEvent::StateChanged(status) =
+                events.recv().await.unwrap()
+                && status.id == AUTHORED
+                && status.generation > 0
+            {
+                assert_eq!(status.phase, ExtensionPhase::Installing);
+                assert_eq!(status, phase(&extensions, AUTHORED));
+                break;
+            }
+        }
         std::fs::write(host.path("ctl").join("install-release"), "").unwrap();
     };
     tokio::join!(call_lab(&host, &http), release);
     assert_eq!(phase(&extensions, AUTHORED).phase, ExtensionPhase::Ready);
     assert_eq!(installs(&host).len(), 1);
+}
+
+async fn ready_install_failure_gates_static_provider() {
+    let host = Host::new().await;
+    let http = Http::start();
+    host.package(
+        "root",
+        AUTHORED,
+        &[
+            ("lab", &http.url, false, true),
+            ("plain", &http.url, false, false),
+        ],
+    );
+    let extensions = host.manager();
+    let list = enabled(&[(AUTHORED, None)]);
+    extensions.configure(&list).await.unwrap();
+    call_lab(&host, &http).await;
+    let ready = wait_phase(&extensions, AUTHORED, ExtensionPhase::Ready).await;
+    let mut events = extensions.subscribe();
+    std::fs::write(host.path("ctl").join("install"), "fail:boom").unwrap();
+    write_dependencies(&host.path("root").join(AUTHORED), "changed");
+    extensions.configure(&list).await.unwrap();
+    let disabled = loop {
+        if let axo_extensions::ExtensionEvent::StateChanged(status) = events.recv().await.unwrap()
+            && status.id == AUTHORED
+            && status.phase == ExtensionPhase::Disabled
+        {
+            break status;
+        }
+    };
+    assert_eq!(disabled, phase(&extensions, AUTHORED));
+    assert_eq!(disabled.generation, ready.generation);
+    assert!(disabled.reason.as_deref().unwrap().contains("boom"));
+    let plain = find(&host.models, "plain").unwrap();
+    for rescan in [false, true] {
+        if rescan {
+            extensions.configure(&list).await.unwrap();
+        }
+        let event = stream(&host.models, &plain).await;
+        assert!(super::error_text(&event).contains(disabled.reason.as_deref().unwrap()));
+        assert_eq!(http.requests().len(), 1);
+    }
+    std::fs::remove_file(host.path("ctl").join("install")).unwrap();
+    extensions.retry(AUTHORED).await.unwrap();
+    wait_phase(&extensions, AUTHORED, ExtensionPhase::Cold).await;
+    stream(&host.models, &plain).await;
+    assert_eq!(http.requests().len(), 2);
+    extensions.shutdown().await;
 }
 
 async fn auto_install_off() {
@@ -187,6 +253,46 @@ async fn auto_install_off() {
     assert!(stamp(&package).exists());
     assert_eq!(phase(&extensions, AUTHORED).phase, ExtensionPhase::Cold);
     call_lab(&host, &http).await;
+}
+
+async fn mixed_stale_results_keep_enabled_order() {
+    let host = Host::new().await;
+    let ids = ["stale", "broken", "valid", "bad-deps"];
+    for id in ids {
+        host.package("root", id, &[]);
+    }
+    let root = host.path("root");
+    write_dependencies(&root.join("stale"), "x");
+    std::fs::remove_file(root.join("broken/index.ts")).unwrap();
+    std::fs::write(root.join("bad-deps/package.json"), "null").unwrap();
+    let mut options = host.options();
+    options.auto_install = false;
+    let extensions = host.manager_with(options);
+    extensions
+        .configure(&enabled(&ids.map(|id| (id, None))))
+        .await
+        .unwrap();
+    let status = extensions.status();
+    assert_eq!(
+        status.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ids
+    );
+    assert!(
+        status[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("dependencies are not installed")
+    );
+    assert!(status[1].reason.as_deref().unwrap().contains("index.ts"));
+    assert_eq!(status[2].phase, ExtensionPhase::Cold);
+    assert!(
+        status[3]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("package.json")
+    );
 }
 
 /// A source folder for installed extension `lab/pkg` declaring SDK `sdk`, a dependency, and
@@ -248,6 +354,16 @@ async fn install_update_rollback_uninstall() {
 
     let list = enabled(&[(INSTALLED, None)]);
     extensions.configure(&list).await.unwrap();
+    let error = extensions
+        .install_dependencies(INSTALLED)
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, BridgeError::InstalledDependencies(id) if id == INSTALLED));
+    assert_eq!(
+        error.to_string(),
+        format!("extension {INSTALLED}: installed dependencies are managed by Extensions::install")
+    );
+    assert_eq!(installs(&host).len(), 1);
     call_lab(&host, &http).await;
     let v1 = activated(&host);
     assert!(
@@ -332,6 +448,11 @@ async fn install_refusals() {
     );
 
     let unlocked = source(&host, &http, "0.0.0", false);
+    std::fs::write(
+        unlocked.join("package.json"),
+        r#"{"peerDependencies":{"peer":"1"}}"#,
+    )
+    .unwrap();
     assert_eq!(
         extensions.install(&unlocked, "git:b", false).await,
         Err(InstallError::MissingLockfile(INSTALLED.into()))
@@ -354,4 +475,199 @@ async fn install_refusals() {
         2,
         "a failed version folder was left behind"
     );
+
+    assert_eq!(
+        extensions.install(Path::new("src"), "git:b", false).await,
+        Err(InstallError::InvalidPackage(
+            "source src is not an absolute path".into()
+        ))
+    );
+    for name in ["store", "data_root"] {
+        let relative = PathBuf::from(host.dir.path().file_name().unwrap()).join(name);
+        let mut options = host.options();
+        if name == "store" {
+            options.store = Some(relative.clone());
+        } else {
+            options.data_root = relative.clone();
+        }
+        let manager = host.manager_with(options);
+        let expected = InstallError::InvalidOptions(format!(
+            "invalid extension options: {name} {} is not an absolute path",
+            relative.display()
+        ));
+        assert_eq!(manager.installed().await.unwrap_err(), expected);
+        assert_eq!(
+            manager.uninstall(INSTALLED, true).await.unwrap_err(),
+            expected
+        );
+        assert!(!relative.exists());
+    }
+
+    let fifo = src.join("extension.json");
+    std::fs::remove_file(&fifo).unwrap();
+    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::RWXU).unwrap();
+    // A regressed Tokio file open blocks a blocking-pool thread even if its future is
+    // dropped. Rescue that reader from outside the runtime; never block the writer.
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let pipe = fifo.clone();
+    let watchdog = std::thread::spawn(move || {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let mut delay = Duration::from_secs(5);
+        while finished.recv_timeout(delay) == Err(RecvTimeoutError::Timeout) {
+            match open(&pipe, OFlags::WRONLY | OFlags::NONBLOCK, Mode::empty()) {
+                Ok(_) => return true,
+                Err(rustix::io::Errno::NXIO) => delay = Duration::from_millis(10),
+                Err(error) => panic!("opening FIFO writer: {error}"),
+            }
+        }
+        false
+    });
+    let result = extensions.install(&src, "git:b", false).await;
+    drop(finish);
+    assert!(
+        !watchdog.join().unwrap(),
+        "install waited for a FIFO writer"
+    );
+    assert!(
+        matches!(&result, Err(InstallError::InvalidPackage(msg))
+            if msg.contains(fifo.to_str().unwrap()) && msg.contains("is not a regular file")),
+        "{result:?}"
+    );
+}
+
+fn current_version(store: &Path) -> PathBuf {
+    let package = store.join(INSTALLED);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(package.join("install.json")).unwrap()).unwrap();
+    package.join(record["current"].as_str().unwrap())
+}
+
+async fn shared_store_writers_are_exclusive() {
+    let host = Host::new().await;
+    let http = Http::start();
+    let src = source(&host, &http, "0.0.0", true);
+    let (a, b) = (host.manager(), host.manager());
+    let ctl = host.path("ctl");
+    std::fs::write(ctl.join("install"), "hold").unwrap();
+    let contend = async {
+        wait_for("manager A's staged install", || !installs(&host).is_empty()).await;
+        let invocation = installs(&host).pop().unwrap();
+        let stage = Path::new(
+            invocation
+                .strip_suffix(" install --frozen-lockfile")
+                .unwrap(),
+        );
+        let busy = InstallError::Busy(INSTALLED.into());
+        assert_eq!(b.install(&src, "git:b", false).await.unwrap_err(), busy);
+        assert_eq!(b.rollback(INSTALLED).await.unwrap_err(), busy);
+        assert_eq!(b.uninstall(INSTALLED, true).await.unwrap_err(), busy);
+        assert!(b.installed().await.unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(stage.join("index.ts")).unwrap(),
+            std::fs::read(src.join("index.ts")).unwrap()
+        );
+        std::fs::write(ctl.join("install-release"), "").unwrap();
+        stage.to_owned()
+    };
+    let (result, stage) = tokio::join!(a.install(&src, "git:a", false), contend);
+    assert_eq!(b.installed().await.unwrap(), [result.unwrap()]);
+    assert_eq!(current_version(&host.path("store")), stage);
+    assert!(stage.join("index.ts").is_file() && stamp(&stage).is_file());
+    assert_eq!(installs(&host).len(), 1);
+}
+
+async fn shutdown_closes_store_admission() {
+    let host = Host::new().await;
+    let http = Http::start();
+    let src = source(&host, &http, "0.0.0", true);
+    std::fs::remove_file(src.join("package.json")).unwrap();
+    let extensions = host.manager();
+    let initial = extensions.install(&src, "git:a", false).await.unwrap();
+    let before = record(&host);
+    let data = host.path("data/@installed").join(INSTALLED);
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("keep"), "saved").unwrap();
+
+    write_dependencies(&src, "update");
+    std::fs::write(host.path("ctl/install"), "hold").unwrap();
+    let shutdown = async {
+        wait_for("the held update", || !installs(&host).is_empty()).await;
+        extensions.shutdown().await;
+        assert_eq!(versions(&host), 1, "shutdown did not drain the update");
+    };
+    let (update, ()) = tokio::join!(extensions.install(&src, "git:a", false), shutdown);
+    assert_eq!(update, Err(InstallError::ShutDown));
+    assert_eq!(
+        extensions.install(&src, "git:b", true).await,
+        Err(InstallError::ShutDown)
+    );
+    assert_eq!(
+        extensions.rollback(INSTALLED).await,
+        Err(InstallError::ShutDown)
+    );
+    assert_eq!(
+        extensions.uninstall(INSTALLED, true).await,
+        Err(InstallError::ShutDown)
+    );
+    assert_eq!(extensions.installed().await.unwrap(), [initial]);
+    assert_eq!(record(&host), before);
+    assert_eq!(std::fs::read_to_string(data.join("keep")).unwrap(), "saved");
+    assert_eq!(installs(&host).len(), 1);
+}
+
+async fn uninstall_data_cleanup_can_be_retried() {
+    let host = Host::new().await;
+    let http = Http::start();
+    let extensions = host.manager();
+    let src = source(&host, &http, "0.0.0", true);
+    extensions.install(&src, "git:a", false).await.unwrap();
+    let data = host.path("data/@installed").join(INSTALLED);
+    std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+    std::fs::write(&data, "not a directory").unwrap();
+    let err = extensions.uninstall(INSTALLED, true).await.unwrap_err();
+    assert!(
+        matches!(&err, InstallError::Io(msg) if msg.contains(data.to_str().unwrap())),
+        "{err}"
+    );
+    let live = host.path("store").join(INSTALLED);
+    let pending = live.with_file_name(".purge-pkg");
+    assert!(!live.exists() && pending.is_dir() && data.is_file());
+    assert!(extensions.installed().await.unwrap().is_empty());
+    assert_eq!(
+        extensions.install(&src, "git:a", false).await,
+        Err(InstallError::Io(format!(
+            "extension {INSTALLED}: uninstall cleanup is pending; retry uninstall"
+        )))
+    );
+    assert_eq!(
+        extensions.rollback(INSTALLED).await,
+        Err(InstallError::NotInstalled(INSTALLED.into()))
+    );
+    std::fs::remove_file(&data).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("delete-me"), "").unwrap();
+    // A pending purge is durable even across managers, regardless of the retry flag.
+    host.manager().uninstall(INSTALLED, false).await.unwrap();
+    assert!(!live.exists() && !pending.exists() && !data.exists());
+}
+
+async fn nested_store_is_not_copied() {
+    let host = Host::new().await;
+    let http = Http::start();
+    let src = source(&host, &http, "0.0.0", true);
+    let alias = host.path("source-alias");
+    std::os::unix::fs::symlink(&src, &alias).unwrap();
+    let store = src.join(".axo/store");
+    let mut options = host.options();
+    options.store = Some(store.clone());
+    let extensions = host.manager_with(options);
+    extensions.install(&alias, "git:a", false).await.unwrap();
+    let current = current_version(&store);
+    assert_eq!(
+        std::fs::read(current.join("index.ts")).unwrap(),
+        std::fs::read(src.join("index.ts")).unwrap()
+    );
+    assert!(!current.join(".axo/store").exists());
 }

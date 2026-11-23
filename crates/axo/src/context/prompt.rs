@@ -77,6 +77,7 @@ pub(crate) struct PromptShape {
     pub scheme_docs: Vec<String>,
     /// Tool name → origin of the labeled host registration that supplies it.
     pub origins: HashMap<String, String>,
+    pub tool_diagnostics: Vec<crate::context::Diagnostic>,
 }
 
 const BUNDLED_DELEGATION: &str = include_str!("../../prompts/DELEGATION.md");
@@ -292,6 +293,7 @@ mod tests {
             host_sections: Vec::new(),
             scheme_docs: Vec::new(),
             origins: HashMap::new(),
+            tool_diagnostics: Vec::new(),
         };
         let sections = build_sections(&sources, &shape, None, "2026-10-22");
         assert_eq!(sections["system"], "<system>\nHost system.\n</system>");

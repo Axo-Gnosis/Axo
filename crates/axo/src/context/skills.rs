@@ -29,6 +29,24 @@ pub struct Skill {
 
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
+fn validate_skill(name: &str, description: &str, warn: &mut impl FnMut(String)) -> bool {
+    let present = !description.trim().is_empty();
+    if !present {
+        warn("description is required".into());
+    } else {
+        let count = description.chars().count();
+        if count > MAX_DESCRIPTION_LENGTH {
+            warn(format!(
+                "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({count})"
+            ));
+        }
+    }
+    for problem in namespaced_name_problems(name) {
+        warn(problem);
+    }
+    present
+}
+
 /// Discovers skills in order: `.agents/skills` from `cwd` up to the git root (skipped when
 /// `project` is false), each of `explicit_roots` (allowed project roots then user roots),
 /// then `<home_agents>/skills`. The first skill with a given name wins; later ones,
@@ -86,13 +104,19 @@ pub(crate) fn merge_skills(files: &[Skill], code: &[Skill]) -> (Vec<Skill>, Vec<
     let mut diagnostics = Vec::new();
     let mut names: HashSet<_> = files.iter().map(|skill| skill.name.as_str()).collect();
     for skill in code {
+        let mut warn = |message| {
+            diagnostics.push(Diagnostic {
+                message,
+                origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
+            })
+        };
+        if !validate_skill(&skill.name, &skill.description, &mut warn) {
+            continue;
+        }
         if names.insert(skill.name.as_str()) {
             skills.push(skill.clone());
         } else {
-            diagnostics.push(Diagnostic {
-                message: format!("name \"{}\" collision", skill.name),
-                origin: Some(DiagnosticOrigin::Path(skill.path.clone())),
-            });
+            warn(format!("name \"{}\" collision", skill.name));
         }
     }
     (skills, diagnostics)
@@ -147,15 +171,7 @@ fn load_skill_file(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) 
     let description = frontmatter
         .get("description")
         .and_then(serde_norway::Value::as_str)
-        .filter(|description| !description.trim().is_empty());
-    match description {
-        None => warn("description is required".into()),
-        Some(description) if description.chars().count() > MAX_DESCRIPTION_LENGTH => warn(format!(
-            "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({})",
-            description.chars().count()
-        )),
-        Some(_) => {}
-    }
+        .unwrap_or_default();
 
     let name = frontmatter
         .get("name")
@@ -164,14 +180,13 @@ fn load_skill_file(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) 
         .map(str::to_owned)
         .or_else(|| path.parent().map(|dir| derived_dir_name(root, dir)))
         .unwrap_or_default();
-    for problem in namespaced_name_problems(&name) {
-        warn(problem);
+    if !validate_skill(&name, description, &mut warn) {
+        return None;
     }
 
-    // Name problems are warnings; only a missing description drops the skill.
     Some(Skill {
         name,
-        description: description?.to_owned(),
+        description: description.to_owned(),
         path: path.to_path_buf(),
         disable_model_invocation: frontmatter
             .get("disable-model-invocation")

@@ -3,11 +3,14 @@ mod common;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use axo::ext::{Caller, InvokeError};
+use axo::ext::{Caller, InvokeError, InvokeErrorCode};
 use axo::{Definitions, Error, ErrorCode, HostTool, SessionTools, ToolAccess};
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{reply_text, reply_tool_calls};
-use axo_ai::{ScriptedTurn, ThinkingLevel};
+use axo_ai::{
+    AssistantEvent, AssistantMessage, Model, ProviderFailure, ScriptedTurn, SimpleStreamOptions,
+    StopReason, Streamer, ThinkingLevel, Transcript,
+};
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -187,6 +190,8 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
         .await
         .unwrap();
     assert_eq!(sessions[0]["id"], session.id());
+    assert!(sessions[0]["modifiedAt"].is_i64());
+    assert!(sessions[0].get("modified").is_none());
     let (_, expected) = axo.open_session_read(session.path()).await.unwrap();
     assert!(expected.len() > 1);
     let mut entries = Vec::new();
@@ -250,18 +255,13 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
         .invoke("models", "complete", vec![request], &caller)
         .await
         .unwrap_err();
-    assert_eq!(error.code(), "completion");
+    assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
     assert_eq!(error.to_string(), "Completion failed: offline");
 }
 
-#[tokio::test]
-async fn models_complete_rejects_a_stream_without_a_terminal_message() {
-    use axo_ai::{
-        AssistantEvent, AssistantMessage, Model, SimpleStreamOptions, Streamer, Transcript,
-    };
-
-    struct StartOnly;
-    impl Streamer for StartOnly {
+async fn completion_error(event: fn(&Model) -> AssistantEvent) -> InvokeError {
+    struct SingleEvent(fn(&Model) -> AssistantEvent);
+    impl Streamer for SingleEvent {
         fn stream(
             &self,
             model: &Model,
@@ -269,9 +269,7 @@ async fn models_complete_rejects_a_stream_without_a_terminal_message() {
             _: SimpleStreamOptions,
             _: tokio_util::sync::CancellationToken,
         ) -> futures::stream::BoxStream<'static, AssistantEvent> {
-            Box::pin(futures::stream::iter([AssistantEvent::Start {
-                partial: AssistantMessage::empty(model),
-            }]))
+            Box::pin(futures::stream::iter([(self.0)(model)]))
         }
     }
 
@@ -281,20 +279,70 @@ async fn models_complete_rejects_a_stream_without_a_terminal_message() {
         json!([{"id": "m"}]),
         json!({}),
         Arc::new(axo::JsonlStore::new(dir.path().join("sessions"))),
-        Arc::new(StartOnly),
+        Arc::new(SingleEvent(event)),
     )
     .await;
-    let error = axo
-        .invoke(
-            "models",
-            "complete",
-            vec![json!({"model": "test/m", "messages": []})],
-            &Caller::default(),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), "completion");
+    axo.invoke(
+        "models",
+        "complete",
+        vec![json!({"model": "test/m", "messages": []})],
+        &Caller::default(),
+    )
+    .await
+    .unwrap_err()
+}
+
+#[tokio::test]
+async fn models_complete_preserves_terminal_failure_details() {
+    let error = completion_error(|model| {
+        let mut message = AssistantMessage::empty(model);
+        message.stop_reason = StopReason::Aborted;
+        message.error_message = Some("provider interrupted".into());
+        message.usage.output = 17;
+        message.usage.total_tokens = 17;
+        message.usage.cost.output = 0.125;
+        message.usage.cost.total = 0.125;
+        message.failure = Some(ProviderFailure {
+            status: Some(429),
+            code: Some("rate_limit".into()),
+            retry_after_ms: Some(125),
+            should_retry: Some(true),
+        });
+        AssistantEvent::Error {
+            reason: message.stop_reason,
+            message,
+        }
+    })
+    .await;
+    assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
+    assert_eq!(error.to_string(), "Completion failed: provider interrupted");
+    let InvokeError::Failed {
+        details: Some(details),
+        ..
+    } = error
+    else {
+        panic!("expected terminal failure details")
+    };
+    assert_eq!(details.stop_reason, StopReason::Aborted);
+    assert_eq!(details.usage.output, 17);
+    assert_eq!(details.usage.total_tokens, 17);
+    assert_eq!(details.usage.cost.output, 0.125);
+    assert_eq!(details.usage.cost.total, 0.125);
+    assert_eq!(
+        json!(details.failure),
+        json!({"status":429, "code":"rate_limit", "retryAfterMs":125, "shouldRetry":true})
+    );
+}
+
+#[tokio::test]
+async fn models_complete_rejects_a_stream_without_a_terminal_message() {
+    let error = completion_error(|model| AssistantEvent::Start {
+        partial: AssistantMessage::empty(model),
+    })
+    .await;
+    assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
     assert!(error.to_string().contains("ended without a final message"));
+    assert!(matches!(error, InvokeError::Failed { details: None, .. }));
 }
 
 #[tokio::test]
@@ -365,7 +413,7 @@ async fn models_exposes_credential_sources_not_credentials() {
     let host = common::host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
     std::fs::write(
         dir.path().join("auth.json"),
-        r#"{"test":{"type":"api_key","key":"private-test-key"}}"#,
+        r#"{"loaded/test":{"type":"api_key","key":"private-test-key"}}"#,
     )
     .unwrap();
     let caller = Caller::default();
@@ -536,6 +584,84 @@ async fn tool_invocation_records_every_write_and_rejects_stale_files() {
         details["stale"],
         "File changed since it was last read: a.txt. Read it again before editing."
     );
+}
+
+struct FileDetailsProbe(Arc<SessionTools>);
+
+#[async_trait]
+impl Tool for FileDetailsProbe {
+    fn name(&self) -> &str {
+        "details_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Returns the same claimed file records with and without a real write."
+    }
+
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: LazyLock<Value> =
+            LazyLock::new(|| json!({"type": "object", "properties": {"write":{"type":"boolean"}}}));
+        &PARAMETERS
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let write = cx.call.arguments["write"] == true;
+        let access = ToolAccess::new(self.0.clone(), cx);
+        if write {
+            access
+                .invoke(
+                    "writeFile",
+                    vec![json!("real.txt"), json!("real")],
+                    &Caller::default(),
+                )
+                .await
+                .unwrap();
+        }
+        access
+            .finish(Ok(ToolOutput {
+                details: Some(json!({"sibling":42,"files":[{"ledger":{
+                    "path":"invented.txt","sha256":"0".repeat(64),"access":"modify"
+                }}]})),
+                ..Default::default()
+            }))
+            .await
+    }
+}
+
+#[tokio::test]
+async fn tool_result_file_records_are_harness_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let axo = common::axo(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[
+                ("without", "details_probe", json!({"write":false})),
+                ("with", "details_probe", json!({"write":true})),
+            ])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    )
+    .await;
+    let mut options = common::options(dir.path());
+    options.tools.push(HostTool::direct(Arc::new(|tools| {
+        Arc::new(FileDetailsProbe(tools.clone()))
+    })));
+    let session = axo.create_session(options).await.unwrap();
+    common::within(session.prompt("probe")).await.unwrap();
+    let lines = common::journal(&session);
+    for id in ["without", "with"] {
+        let i = common::only(&lines, id, |line| line["message"]["toolCallId"] == id);
+        let msg = &lines[i]["message"];
+        assert_eq!(msg["details"]["sibling"], 42);
+        let files = axo::file_records(&serde_json::from_value(msg.clone()).unwrap());
+        if id == "with" {
+            assert_eq!(files.len(), 1);
+            assert!(files[0].ledger.path.ends_with("real.txt"));
+        } else {
+            assert!(msg["details"].get("files").is_none());
+            assert!(files.is_empty());
+        }
+    }
 }
 
 struct DroppedWriteProbe(Arc<SessionTools>);

@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
+use axo::ext::InvokeError;
 use axo::{
-    CompletionRequest, Definitions, Exposure, HostTool, RegisteredCommand, Registrations, Scheme,
-    Session, SessionEvent, SessionEventKind, SessionOptions, SessionTools,
+    CompletionRequest, Definitions, HostTool, RegisteredCommand, Registrations, Scheme, Session,
+    SessionEvent, SessionEventKind, SessionOptions, SessionTools,
 };
 use axo_ai::AssistantEvent;
 use futures::StreamExt;
@@ -24,8 +25,8 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook, RemoteTool};
-use crate::manifest::{self, PolicyHook, SessionDecl};
-use crate::peer::{Actions, CallError, Callbacks, Origin, Refusal};
+use crate::manifest::{PolicyHook, SessionDecl};
+use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Origin, Refusal};
 use crate::remote::{self, CALL_DEADLINE, Failure};
 use crate::{ExtensionDiagnostic, ExtensionEvent, Extensions, Inner, gate};
 
@@ -44,7 +45,7 @@ pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
                     .map(|meta| meta.name)
                     .collect();
                 if object.name == "host" {
-                    names.extend(crate::LIFECYCLE_METHODS.iter().map(|method| method.name));
+                    names.extend(crate::lifecycle_methods().map(|method| method.name));
                 }
                 (object.name, names)
             })
@@ -156,7 +157,7 @@ impl Inner {
         }
     }
 
-    pub(super) async fn resolve_session(&self, id: &str) -> Result<Arc<Session>, Refusal> {
+    pub(super) async fn resolve_session(&self, id: &str) -> Result<Arc<Session>, InvokeError> {
         match self.sessions.session(id) {
             Ok(session) => Ok(session),
             Err(missing) => self
@@ -178,17 +179,14 @@ fn layer(contributions: &[Arc<Contribution>], inner: &Weak<Inner>) -> Registrati
         };
         let origin = format!("extension {}", c.ext);
         for decl in &c.decl.tools {
-            let exposure = match decl.exposure {
-                manifest::Exposure::Direct => Exposure::Direct,
-                manifest::Exposure::Deferred => Exposure::Deferred,
-            };
+            let exposure = decl.exposure;
             let (remote, decl) = (remote.clone(), Arc::new(decl.clone()));
             let factory = Arc::new(move |tools: &Arc<SessionTools>| {
                 Arc::new(RemoteTool {
                     remote: remote.clone(),
                     decl: Arc::clone(&decl),
                     session: tools.session_id().to_owned(),
-                    tools: Arc::clone(tools),
+                    tools: Arc::downgrade(tools),
                 }) as Arc<dyn axo_agent::Tool>
             });
             parts.tools.push(
@@ -375,8 +373,8 @@ async fn pump(
 }
 
 /// One subscription, bound to the runner generation that made it: it ends when that
-/// connection closes, on `unsubscribe`, on detach (after a `closed` frame), or when the
-/// session's channel closes (likewise after `closed`). It has at most one unacknowledged
+/// connection closes, on `unsubscribe`, or with a `closed` frame when the attachment,
+/// child residency, or session channel ends. It has at most one unacknowledged
 /// event and no delivery deadline; slow listeners learn of any resulting broadcast lag
 /// before they see the next available event.
 async fn stream(
@@ -387,16 +385,12 @@ async fn stream(
     kinds: Option<Vec<SessionEventKind>>,
     stop: CancellationToken,
 ) {
-    let closed = || json!({ "sub": id, "closed": true });
     let lagged = |n: u64| json!({ "sub": id, "lagged": n });
     loop {
         let args = tokio::select! {
             biased;
-            () = origin.closed() => break,
-            () = stop.cancelled() => {
-                let _ = origin.call(&ext, "stream", closed()).await;
-                break;
-            }
+            () = origin.closed() => return,
+            () = stop.cancelled() => break,
             received = events.recv() => match received {
                 Ok(event) => {
                     if kinds.as_ref().is_some_and(|k| !k.contains(&event.kind())) {
@@ -411,30 +405,25 @@ async fn stream(
                     }
                 }
                 Err(RecvError::Lagged(n)) => lagged(n),
-                Err(RecvError::Closed) => closed(),
+                Err(RecvError::Closed) => break,
             }
         };
-        let last = args.get("closed").is_some();
-        let delivered = tokio::select! {
+        let deliver = async {
+            match origin.call(&ext, "stream", args).await {
+                // Too large to frame: the listener learns it missed one.
+                Err(CallError::Invalid) => origin.call(&ext, "stream", lagged(1)).await,
+                result => result,
+            }
+        };
+        tokio::select! {
             biased;
-            () = stop.cancelled() => {
-                let _ = origin.call(&ext, "stream", closed()).await;
-                break;
-            }
-            delivered = origin.call(&ext, "stream", args) => delivered,
-        };
-        match delivered {
-            Ok(_) if !last => {}
-            // Too large to frame: the listener learns it missed one.
-            Err(CallError::Invalid) if !last => {
-                if origin.call(&ext, "stream", lagged(1)).await.is_err() {
-                    break;
-                }
-            }
-            // Done, the generation is gone, or the runner has no listener for it.
-            _ => break,
+            () = origin.closed() => return,
+            () = stop.cancelled() => break,
+            delivered = deliver => if delivered.is_err() { return; },
         }
     }
+    let close = origin.call(&ext, "stream", json!({ "sub": id, "closed": true }));
+    let _ = tokio::time::timeout(CALL_DEADLINE, close).await;
 }
 
 async fn completion_stream(
@@ -478,7 +467,7 @@ pub(crate) struct Remote {
 }
 
 fn shut(ext: &str) -> Failure {
-    Failure::Removed(format!(
+    Failure::ManagerGone(format!(
         "extension {ext}: the extension manager is shut down"
     ))
 }
@@ -493,13 +482,22 @@ impl Remote {
         deadline: Option<Duration>,
     ) -> Result<Value, Failure> {
         let ext = &self.ext;
-        let placement = {
+        let (placement, closed) = {
             let inner = self.inner.upgrade().ok_or_else(|| shut(ext))?;
+            let state = inner.lock();
             if inner.closed.is_cancelled() {
                 return Err(shut(ext));
             }
-            let state = inner.lock();
-            match state.member_of.get(ext) {
+            if state.install_failed.contains_key(ext)
+                && let Some(reason) = state
+                    .enabled
+                    .iter()
+                    .find(|e| &e.id == ext)
+                    .and_then(|e| gate(&state.status(e)))
+            {
+                return Err(Failure::Unavailable(reason));
+            }
+            let placement = match state.member_of.get(ext) {
                 Some((_, placement)) => Arc::clone(placement),
                 None => {
                     return Err(match state.overrides.get(ext).and_then(gate) {
@@ -507,10 +505,15 @@ impl Remote {
                         None => Failure::Removed(format!("extension {ext} is not enabled")),
                     });
                 }
-            }
+            };
+            (placement, inner.closed.clone())
         };
         let label = format!("extension {ext} {what}");
-        remote::call(&placement, ext, &label, method, args, callbacks, deadline).await
+        tokio::select! {
+            biased;
+            () = closed.cancelled() => Err(shut(ext)),
+            result = remote::call(&placement, ext, &label, method, args, callbacks, deadline) => result,
+        }
     }
 
     /// Claims `command` on `session` for this extension. `Failure::Invalid` while it is
@@ -518,6 +521,9 @@ impl Remote {
     pub(super) fn enter(&self, session: &str, command: &str) -> Result<Running, Failure> {
         let ext = &self.ext;
         let inner = self.inner.upgrade().ok_or_else(|| shut(ext))?;
+        if inner.closed.is_cancelled() {
+            return Err(shut(ext));
+        }
         let key = format!("{session}\0{ext}\0{command}");
         if !inner.sessions.running().insert(key.clone()) {
             return Err(Failure::Invalid(format!(
@@ -638,7 +644,7 @@ impl Registry {
         }
     }
 
-    fn session(&self, id: &str) -> Result<Arc<Session>, Refusal> {
+    fn session(&self, id: &str) -> Result<Arc<Session>, InvokeError> {
         let mut sessions = self.lock();
         let session = sessions.get(id).and_then(|a| a.session.upgrade());
         if session.is_none()
@@ -648,13 +654,10 @@ impl Registry {
         {
             pump.abort();
         }
-        session.ok_or_else(|| Refusal {
-            code: "no_session".into(),
-            message: format!("session {id} is not attached"),
-        })
+        session.ok_or_else(|| InvokeError::NoSession(format!("session {id} is not attached")))
     }
 
-    async fn subscribe(
+    fn subscribe(
         &self,
         inner: &Inner,
         origin: Origin,
@@ -678,29 +681,21 @@ impl Registry {
                 );
             }
         };
-        let install = |subs: &mut HashMap<String, Sub>, name, session: Arc<Session>, keep: bool| {
-            let events = session.subscribe();
-            let child = keep.then_some(session);
-            let stop = CancellationToken::new();
-            self.install(subs, ext, Some(name), stop.clone(), |ext, id| async move {
-                let _child = child;
-                stream(origin, ext, id, events, kinds, stop).await;
-            })
-        };
         // Lock before lookup so detach cannot miss an attached session's subscription.
-        let missing = {
-            let mut subs = self.subs();
-            match self.session(&name) {
-                Ok(session) => return Ok(install(&mut subs, name, session, false)),
-                Err(missing) => missing,
-            }
+        let mut subs = self.subs();
+        let (events, stop) = match self.session(&name) {
+            Ok(session) => (session.subscribe(), CancellationToken::new()),
+            Err(_) => inner.axo.observe_child(&name).ok_or_else(|| Refusal {
+                code: axo::ext::DispatchCode::NoSession.into(),
+                message: format!("session {name} is not attached or resident"),
+                details: None,
+            })?,
         };
-        let child = inner
-            .axo
-            .session(&name)
-            .await
-            .map_err(|error| child_error(missing, error))?;
-        Ok(install(&mut self.subs(), name, child, true))
+        Ok(
+            self.install(&mut subs, ext, Some(name), stop.clone(), |ext, id| {
+                stream(origin, ext, id, events, kinds, stop)
+            }),
+        )
     }
 
     fn install<F: Future<Output = ()> + Send + 'static>(
@@ -743,8 +738,9 @@ impl Registry {
             Ok(Value::Null)
         } else {
             Err(Refusal {
-                code: "no_subscription".into(),
+                code: BridgeCode::NoSubscription.into(),
                 message: "unknown subscription".into(),
+                details: None,
             })
         }
     }
@@ -784,33 +780,55 @@ struct Unsubscribe {
     sub: String,
 }
 
-fn decode<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refusal> {
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refusal> {
     serde_json::from_value(args).map_err(|_| Refusal {
-        code: "invalid".into(),
+        code: BridgeCode::Invalid.into(),
         message: "invalid arguments".into(),
+        details: None,
     })
 }
 
 impl From<axo::ext::InvokeError> for Refusal {
     fn from(error: axo::ext::InvokeError) -> Self {
-        Self {
-            code: error.code().into(),
-            message: error.to_string(),
+        let code = error.code().into();
+        if let InvokeError::Failed {
+            message, details, ..
+        } = error
+        {
+            match details.map(serde_json::to_value).transpose() {
+                Ok(details) => Self {
+                    code,
+                    message,
+                    details,
+                },
+                Err(error) => Self {
+                    code: axo::ext::DispatchCode::Encode.into(),
+                    message: error.to_string(),
+                    details: None,
+                },
+            }
+        } else {
+            Self {
+                code,
+                message: error.to_string(),
+                details: None,
+            }
         }
     }
 }
 
 fn unavailable() -> Refusal {
     Refusal {
-        code: "unavailable".into(),
+        code: BridgeCode::Unavailable.into(),
         message: "the extension manager is shut down".into(),
+        details: None,
     }
 }
 
-fn child_error(missing: Refusal, error: axo::Error) -> Refusal {
+fn child_error(missing: InvokeError, error: axo::Error) -> InvokeError {
     match error {
         axo::Error::SessionNotFound(_) => missing,
-        error => axo::ext::InvokeError::from(error).into(),
+        error => error.into(),
     }
 }
 
@@ -827,17 +845,15 @@ impl Actions for Registry {
             let inner = inner.ok_or_else(unavailable)?;
             match method.as_str() {
                 "subscribe" => {
-                    return inner
-                        .sessions
-                        .subscribe(&inner, origin, ext, decode(args)?)
-                        .await;
+                    return inner.sessions.subscribe(&inner, origin, ext, decode(args)?);
                 }
                 "unsubscribe" => return inner.sessions.unsubscribe(&ext, decode(args)?),
                 "invoke" => {}
                 _ => {
                     return Err(Refusal {
-                        code: "unsupported".into(),
+                        code: BridgeCode::Unsupported.into(),
                         message: "unknown host method".into(),
+                        details: None,
                     });
                 }
             }
@@ -846,8 +862,9 @@ impl Actions for Registry {
                 namespace: Some(ext),
             };
             let invalid = || Refusal {
-                code: "invalid".into(),
+                code: BridgeCode::Invalid.into(),
                 message: "invalid arguments".into(),
+                details: None,
             };
             match invoke.object.as_str() {
                 "session" => {
@@ -863,15 +880,11 @@ impl Actions for Registry {
                         return Err(invalid());
                     }
                     if invoke.object == "host"
-                        && let Some(m) = crate::LIFECYCLE_METHODS
-                            .iter()
-                            .find(|m| m.name == invoke.method)
+                        && let Some(call) = crate::lifecycle::lookup(&invoke.method)
                     {
-                        return crate::run(
-                            async move { m.method.invoke(&inner, invoke.args).await },
-                        )
-                        .await
-                        .unwrap_or_else(|| Err(unavailable()));
+                        return crate::run(call.invoke(inner, caller, invoke.args))
+                            .await
+                            .unwrap_or_else(|| Err(unavailable()));
                     }
                     inner
                         .axo
@@ -880,8 +893,9 @@ impl Actions for Registry {
                 }
                 other => {
                     return Err(Refusal {
-                        code: "unsupported".into(),
+                        code: BridgeCode::Unsupported.into(),
                         message: format!("unknown object: {other}"),
+                        details: None,
                     });
                 }
             }

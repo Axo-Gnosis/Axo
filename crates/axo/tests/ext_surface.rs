@@ -17,6 +17,7 @@ const FREE: &[(&str, &str)] = &[
     ("valid_command_name", "host.validCommandName"),
     ("valid_section_name", "host.validSectionName"),
     ("valid_scheme_name", "host.validSchemeName"),
+    ("valid_tool_name", "host.validToolName"),
     ("jobs_from_entries", "host.jobsFromEntries"),
     ("project", "host.project"),
     ("squash", "host.squash"),
@@ -318,4 +319,14 @@ fn public_surface_has_an_exposure_decision() {
         "{}",
         surface.problems.join("\n")
     );
+}
+
+#[test]
+fn tool_name_syntax_does_not_reserve_names() {
+    for name in ["-", "_", "Aa09_-", &"a".repeat(64), "call", "yield"] {
+        assert!(axo::valid_tool_name(name), "{name:?}");
+    }
+    for name in ["", &"a".repeat(65), "café", "a/b"] {
+        assert!(!axo::valid_tool_name(name), "{name:?}");
+    }
 }
