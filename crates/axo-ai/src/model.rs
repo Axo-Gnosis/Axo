@@ -68,7 +68,9 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Vec<InputKind>,
-    pub cost: Cost,
+    /// Prices in USD per million tokens; `None` when unknown (distinct from `Some` with `$0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
     /// Service tiers this model can be requested with → price multiplier over `cost`.
     /// Never contains `Standard`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

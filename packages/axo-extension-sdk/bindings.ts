@@ -1864,6 +1864,16 @@ export type HostReadSnapshotArgs = {
 
 export type HostReadSnapshotResult = Base64;
 
+export type HostSpawnParentArgs = {
+	id: string,
+};
+
+export type HostSpawnParentResult = HostSpawnParentResult_Serialize | HostSpawnParentResult_Deserialize;
+
+export type HostSpawnParentResult_Deserialize = string | null;
+
+export type HostSpawnParentResult_Serialize = string | null;
+
 export type HostSquashArgs = HostSquashArgs_Serialize | HostSquashArgs_Deserialize;
 
 export type HostSquashArgs_Deserialize = {
@@ -2440,7 +2450,8 @@ export type Model_Deserialize = {
 	reasoning: boolean,
 	thinkingLevelMap?: Partial<{ [key in ThinkingLevel]: string | null }> | null,
 	input: InputKind[],
-	cost: Cost_Deserialize,
+	/**  Prices in USD per million tokens; `None` when unknown (distinct from `Some` with `$0`). */
+	cost?: Cost_Deserialize | null,
 	/**
 	 *  Service tiers this model can be requested with → price multiplier over `cost`.
 	 *  Never contains `Standard`.
@@ -2460,7 +2471,8 @@ export type Model_Serialize = {
 	reasoning: boolean,
 	thinkingLevelMap?: Partial<{ [key in ThinkingLevel]: string | null }>,
 	input: InputKind[],
-	cost: Cost_Serialize,
+	/**  Prices in USD per million tokens; `None` when unknown (distinct from `Some` with `$0`). */
+	cost?: Cost_Serialize,
 	/**
 	 *  Service tiers this model can be requested with → price multiplier over `cost`.
 	 *  Never contains `Standard`.
@@ -2933,6 +2945,8 @@ export type QueuedInput_Deserialize = {
 	/**  `Prompt` (input requeued when the session reopened) is delivered like `Steer`. */
 	kind: SubmissionKind,
 	parts: PromptPart_Deserialize[],
+	/**  Who sent the input when it did not come from the user. */
+	provenance?: SubmissionProvenance_Deserialize | null,
 	/**  `Some` for a host `post` message; resubmit it with `Session::post`, not `steer`. */
 	custom?: SubmittedCustom | null,
 };
@@ -2943,6 +2957,8 @@ export type QueuedInput_Serialize = {
 	/**  `Prompt` (input requeued when the session reopened) is delivered like `Steer`. */
 	kind: SubmissionKind,
 	parts: PromptPart_Serialize[],
+	/**  Who sent the input when it did not come from the user. */
+	provenance?: SubmissionProvenance_Serialize,
 	/**  `Some` for a host `post` message; resubmit it with `Session::post`, not `steer`. */
 	custom: SubmittedCustom | null,
 };
@@ -4220,22 +4236,22 @@ export type SubmissionKind = "prompt" | "steer" | "follow_up" |
  */
 "mail";
 
-/**  The originating session and actual delivery route, independent of roster names. */
+/**  Who originated a non-user submission, independent of roster names. */
 export type SubmissionProvenance = SubmissionProvenance_Serialize | SubmissionProvenance_Deserialize;
 
-/**  The originating session and actual delivery route, independent of roster names. */
-export type SubmissionProvenance_Deserialize = {
-	sessionId: string,
-	route: SendKind,
-	name?: string | null,
-};
+/**  Who originated a non-user submission, independent of roster names. */
+export type SubmissionProvenance_Deserialize = 
+/**  An inter-agent routed submission (`send` or `mail`). */
+{ kind: "agent"; sessionId: string; route: SendKind; name?: string | null } | 
+/**  A submission sent by an extension through `Session::invoke`. */
+{ kind: "extension"; id: string };
 
-/**  The originating session and actual delivery route, independent of roster names. */
-export type SubmissionProvenance_Serialize = {
-	sessionId: string,
-	route: SendKind,
-	name?: string,
-};
+/**  Who originated a non-user submission, independent of roster names. */
+export type SubmissionProvenance_Serialize = 
+/**  An inter-agent routed submission (`send` or `mail`). */
+{ kind: "agent"; sessionId: string; route: SendKind; name?: string } | 
+/**  A submission sent by an extension through `Session::invoke`. */
+{ kind: "extension"; id: string };
 
 /**  The host-defined presentation of a submitted custom message. */
 export type SubmittedCustom = {
@@ -4836,7 +4852,8 @@ export type Usage_Deserialize = {
 	/**  Reasoning tokens, a subset of `output`, when the provider reports them. */
 	reasoning?: number | null,
 	totalTokens: number,
-	cost: UsageCost,
+	/**  Cost of this usage in USD; `None` when any contributing model's price is unknown. */
+	cost?: UsageCost | null,
 };
 
 export type Usage_Serialize = {
@@ -4849,7 +4866,8 @@ export type Usage_Serialize = {
 	/**  Reasoning tokens, a subset of `output`, when the provider reports them. */
 	reasoning?: number,
 	totalTokens: number,
-	cost: UsageCost,
+	/**  Cost of this usage in USD; `None` when any contributing model's price is unknown. */
+	cost?: UsageCost,
 };
 
 /**  Content of user messages and tool results. */
@@ -5146,27 +5164,10 @@ export interface Session {
   // withheld: subscribe — live receiver; the bridge serves session.subscribe
   // withheld: attach — returns a live receiver; use entries, live and subscribe
   // withheld: fork — lifecycle belongs to the host
-  /**
-   * Expands a `/skill args` invocation, saves the submission and runs the prompt;
-   * returns when the run settles. `Error::Busy` while a run is active (use
-   * `steer`/`follow_up`). Prompt text never runs a built-in command: hosts that offer
-   * typed commands parse them with `Command::parse` and call `run_command`.
-   */
-  prompt(input: SessionPromptArgs_Deserialize["input"], signal?: AbortSignal): Promise<SessionPromptResult>;
-  /**
-   * `prompt`, deduplicated by `request_id`: a request id that was already submitted
-   * returns its earlier submission and starts nothing, even while that run is active.
-   */
-  promptWith(request: SessionPromptWithArgs_Deserialize["request"], signal?: AbortSignal): Promise<SessionPromptWithResult_Serialize>;
-  /**
-   * Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
-   */
-  steer(input: SessionSteerArgs_Deserialize["input"], signal?: AbortSignal): Promise<void>;
-  /**
-   * Saves and queues a user message delivered when the active run would otherwise end;
-   * on an idle session it starts a run.
-   */
-  followUp(input: SessionFollowUpArgs_Deserialize["input"], signal?: AbortSignal): Promise<void>;
+  // withheld: prompt — records caller provenance; see the wire method
+  // withheld: promptWith — records caller provenance; see the wire method
+  // withheld: steer — records caller provenance; see the wire method
+  // withheld: followUp — records caller provenance; see the wire method
   /**
    * Takes a queued steer or follow-up back before it is delivered and returns it for
    * the host to edit and resubmit. `Error::NotQueued` once it was delivered or withdrawn.
@@ -5179,7 +5180,24 @@ export interface Session {
    */
   resumeWakes(signal?: AbortSignal): Promise<void>;
   /**
-   * Posts a durable host message with the requested delivery timing.
+   * Expands a `/skill args` invocation, saves the submission with caller provenance, and
+   * runs the prompt; returns when the run settles.
+   */
+  prompt(input: SessionPromptArgs_Deserialize["input"], signal?: AbortSignal): Promise<SessionPromptResult>;
+  /**
+   * `prompt`, deduplicated by `request_id`, recording caller provenance.
+   */
+  promptWith(request: SessionPromptWithArgs_Deserialize["request"], signal?: AbortSignal): Promise<SessionPromptWithResult_Serialize>;
+  /**
+   * Saves and queues a steering message with caller provenance.
+   */
+  steer(input: SessionSteerArgs_Deserialize["input"], signal?: AbortSignal): Promise<void>;
+  /**
+   * Saves and queues a follow-up message with caller provenance.
+   */
+  followUp(input: SessionFollowUpArgs_Deserialize["input"], signal?: AbortSignal): Promise<void>;
+  /**
+   * Posts a durable host message with the requested delivery timing and caller provenance.
    */
   post(message: SessionPostArgs["message"], signal?: AbortSignal): Promise<void>;
   /**
@@ -5439,11 +5457,18 @@ export interface Host {
   // withheld: builder — host construction
   // withheld: models — live registry; reached through the models object
   // withheld: invoke — the dispatcher itself
+  // withheld: invokeModels — the dispatcher itself
   // withheld: supervisor — live process handles; commands go through tools.runCommand
   // withheld: createSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: openSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: session — returns a live session; ctx.session(id) reaches it
   // withheld: observeChild — live receiver; the bridge serves session.subscribe
+  /**
+   * The parent session id of a known child, live or parked, without reviving it. `None`
+   * for a root session or an unknown id; an unknown id first waits for reopened sessions
+   * to finish registering their children.
+   */
+  spawnParent(id: HostSpawnParentArgs["id"], signal?: AbortSignal): Promise<HostSpawnParentResult_Serialize>;
   // withheld: openSessionRead — a whole journal can exceed a frame; host.readSession pages it
   // withheld: readSnapshot — bytes cross as base64
   /**
@@ -5542,7 +5567,9 @@ export interface Host {
    */
   substituteArgs(template: HostSubstituteArgsArgs["template"], args: HostSubstituteArgsArgs["args"], signal?: AbortSignal): Promise<HostSubstituteArgsResult>;
   // withheld: stream — live stream; served as models.stream
+  // withheld: streamWith — live stream; served as models.stream
   // withheld: complete — served as models.complete
+  // withheld: completeWith — served as models.complete
 }
 
 export interface Models {

@@ -203,6 +203,7 @@ async fn team_members_message_each_other_and_the_parent() {
     assert_eq!(
         b_lines[mail]["provenance"],
         json!({
+            "kind": "agent",
             "sessionId": handle.members[0].1.session.id(),
             "route": "mail",
             "name": "a",

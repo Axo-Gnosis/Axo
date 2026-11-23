@@ -1468,7 +1468,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ApiKind, Compat, Cost};
+    use crate::model::{ApiKind, Compat};
     use crate::types::ToolResultMessage;
 
     #[test]
@@ -1482,7 +1482,7 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![InputKind::Text],
-            cost: Cost::default(),
+            cost: None,
             service_tiers: Default::default(),
             context_window: 200_000,
             max_tokens: 4096,

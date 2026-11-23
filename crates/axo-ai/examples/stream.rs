@@ -158,15 +158,19 @@ async fn stream_once(
                 serde_json::Value::Object(call.arguments)
             ),
             AssistantEvent::Done { reason, message } => {
+                let cost = message
+                    .usage
+                    .cost
+                    .map(|cost| format!("${:.6}", cost.total))
+                    .unwrap_or_else(|| "unknown".into());
                 println!(
-                    "[done] {} usage={}/{} cost=${:.6}",
+                    "[done] {} usage={}/{} cost={cost}",
                     serde_json::to_value(reason)
                         .unwrap_or_default()
                         .as_str()
                         .unwrap_or(""),
                     message.usage.input,
                     message.usage.output,
-                    message.usage.cost.total
                 );
                 return Some(message);
             }

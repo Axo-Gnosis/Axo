@@ -77,6 +77,8 @@ const CODEX_FLOOR: [(&str, &str, u64, [f64; 4], bool); 7] = [
     ),
 ];
 
+pub(crate) type OpenAiRow = (Option<Cost>, bool, BTreeMap<ServiceTier, f64>);
+
 /// One catalog fetch, mapped: what a rebuild needs from the feed without keeping the feed.
 pub(crate) struct CatalogModels {
     /// Every row axo can serve, in feed order.
@@ -85,7 +87,7 @@ pub(crate) struct CatalogModels {
     pub envs: HashMap<String, Vec<String>>,
     /// Prices, Off support (effort `"none"` listed), and service-tier multipliers of the
     /// `openai` rows, which Codex models of the same id take.
-    pub openai: HashMap<String, (Cost, bool, BTreeMap<ServiceTier, f64>)>,
+    pub openai: HashMap<String, OpenAiRow>,
 }
 
 /// Maps every catalog row axo can serve, plus the `openai` prices Codex models take.
@@ -168,10 +170,8 @@ pub(crate) fn build(
 pub(crate) fn cap_at_price_tier(model: &mut Arc<Model>) {
     if let Some(threshold) = model
         .cost
-        .tiers
-        .iter()
-        .map(|tier| tier.input_tokens_above)
-        .min()
+        .as_ref()
+        .and_then(|cost| cost.tiers.iter().map(|tier| tier.input_tokens_above).min())
         && threshold < model.context_window
     {
         Arc::make_mut(model).context_window = threshold;
@@ -325,10 +325,14 @@ fn thinking_map(efforts: &[String], off: bool) -> ThinkingLevelMap {
     map
 }
 
-/// Base prices plus context-size tiers. Tier rates the feed omits keep the base price.
-/// Service-tier overrides are ignored here and read by [`catalog_tiers`].
-fn catalog_cost(cost: &DevCost) -> Cost {
+/// Base prices plus context-size tiers. Returns `None` when the feed omits both input and
+/// output prices. Tier rates the feed omits keep the base price. Service-tier overrides are
+/// ignored here and read by [`catalog_tiers`].
+fn catalog_cost(cost: &DevCost) -> Option<Cost> {
     let (input, output) = (&cost.text.input, &cost.text.output);
+    if input.price.is_none() && output.price.is_none() {
+        return None;
+    }
     let base = CostTier {
         input_tokens_above: 0,
         input: input.price.unwrap_or(0.0),
@@ -358,13 +362,13 @@ fn catalog_cost(cost: &DevCost) -> Cost {
             tier.cache_write = cache_write(entry.cache.write.as_ref()).unwrap_or(tier.cache_write);
         }
     }
-    Cost {
+    Some(Cost {
         input: base.input,
         output: base.output,
         cache_read: base.cache_read,
         cache_write: base.cache_write,
         tiers: tiers.into_values().collect(),
-    }
+    })
 }
 
 /// The tier a catalog `service_tier` name means on `api`, when axo knows its wire form.
@@ -478,8 +482,8 @@ fn codex_model(
     let floor = CODEX_FLOOR.iter().find(|row| row.0 == id);
     let cost = match (openai, floor) {
         (Some((cost, ..)), _) => cost.clone(),
-        (None, Some(&(.., prices, _))) => floor_cost(prices),
-        (None, None) => Cost::default(),
+        (None, Some(&(.., prices, _))) => Some(floor_cost(prices)),
+        (None, None) => None,
     };
     let off = match openai {
         Some(&(_, off, _)) => off,

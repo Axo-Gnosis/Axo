@@ -191,9 +191,9 @@ const HOST_BLOCKS: &[&Block<Axo>] = &[
     &crate::host::HOST_WIRE,
     &crate::models::AXO_MODELS,
 ];
-const MODEL_BLOCKS: &[&Block<Axo>] = &[&crate::models::MODELS_WIRE];
+const MODEL_BLOCKS: &[&Block<crate::models::ModelsTarget>] = &[&crate::models::MODELS_WIRE];
 pub(crate) static HOST: Table<Axo> = Table::new(HOST_BLOCKS);
-pub(crate) static MODELS: Table<Axo> = Table::new(MODEL_BLOCKS);
+pub(crate) static MODELS: Table<crate::models::ModelsTarget> = Table::new(MODEL_BLOCKS);
 
 pub struct Object {
     pub name: &'static str,

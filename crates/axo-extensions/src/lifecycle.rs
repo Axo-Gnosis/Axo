@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::peer::Refusal;
-use crate::{Extensions, Inner};
+use crate::{ExtensionScope, Extensions, Inner};
 
 #[derive(Debug, Clone, Default, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -20,6 +20,29 @@ pub struct SessionRequest {
     pub thinking: Option<ThinkingLevel>,
     pub project_access: Option<ProjectAccess>,
     pub sections: Vec<(String, Option<String>)>,
+}
+
+/// A session created or opened by [`Lifecycle`], paired with the [`ExtensionScope`] it
+/// belongs to (or `None` for host-wide extensions only).
+pub struct LifecycleSession {
+    pub session: Arc<Session>,
+    pub scope: Option<ExtensionScope>,
+}
+
+impl LifecycleSession {
+    pub fn unscoped(session: Arc<Session>) -> Self {
+        Self {
+            session,
+            scope: None,
+        }
+    }
+
+    pub fn scoped(session: Arc<Session>, scope: ExtensionScope) -> Self {
+        Self {
+            session,
+            scope: Some(scope),
+        }
+    }
 }
 
 pub struct Forked {
@@ -35,7 +58,10 @@ pub struct ForkReceipt {
 }
 
 /// Session lifecycle on behalf of extensions. The host builds the session its normal way
-/// ([`Extensions::compose`] on the options for create and open), keeps it alive and updates its UI.
+/// ([`Extensions::compose`] or [`ExtensionScope::compose`] on the options for create and open),
+/// keeps it alive and updates its UI. For `create` and `open`, the host returns the target
+/// folder's [`ExtensionScope`] (or `None` for host-wide extensions only), never the calling
+/// extension's scope. Forks inherit their source session's scope automatically.
 /// Each call runs to completion as its own task: a new session is created and attached even
 /// if the extension cancels the call or its runner goes away. The manager owns the hook until
 /// shutdown, so a hook that needs the manager holds a `Weak<Extensions>`.
@@ -46,13 +72,13 @@ pub trait Lifecycle: Send + Sync {
         caller: &Caller,
         cwd: PathBuf,
         request: SessionRequest,
-    ) -> Result<Arc<Session>, Error>;
+    ) -> Result<LifecycleSession, Error>;
     async fn open(
         &self,
         caller: &Caller,
         path: PathBuf,
         request: SessionRequest,
-    ) -> Result<Arc<Session>, Error>;
+    ) -> Result<LifecycleSession, Error>;
     async fn fork(
         &self,
         caller: &Caller,
@@ -75,7 +101,10 @@ impl Extensions {
 }
 
 pub(crate) struct LifecycleTarget {
-    inner: Arc<Inner>,
+    /// The unit (host or scope) that made the call, used to check session visibility.
+    caller_unit: Arc<Inner>,
+    /// The root `Extensions` unit, which owns the lifecycle hook and tracks all scopes.
+    root: Arc<Inner>,
     hook: Arc<dyn Lifecycle>,
 }
 
@@ -90,9 +119,12 @@ impl<'a> LifecycleWire<'a> {
         Self { target, caller }
     }
 
-    async fn attach(&self, session: Arc<Session>) -> String {
-        self.target.inner.attach(&session).await;
-        session.id().to_owned()
+    async fn attach(&self, created: LifecycleSession) -> String {
+        match created.scope {
+            Some(scope) => scope.attach(&created.session).await,
+            None => self.target.root.attach(&created.session).await,
+        }
+        created.session.id().to_owned()
     }
 
     #[ext]
@@ -101,12 +133,12 @@ impl<'a> LifecycleWire<'a> {
         cwd: PathBuf,
         request: Option<SessionRequest>,
     ) -> Result<String, InvokeError> {
-        let session = self
+        let created = self
             .target
             .hook
             .create(self.caller, cwd, request.unwrap_or_default())
             .await?;
-        Ok(self.attach(session).await)
+        Ok(self.attach(created).await)
     }
 
     #[ext]
@@ -115,12 +147,12 @@ impl<'a> LifecycleWire<'a> {
         path: PathBuf,
         request: Option<SessionRequest>,
     ) -> Result<String, InvokeError> {
-        let session = self
+        let created = self
             .target
             .hook
             .open(self.caller, path, request.unwrap_or_default())
             .await?;
-        Ok(self.attach(session).await)
+        Ok(self.attach(created).await)
     }
 
     #[ext]
@@ -129,25 +161,37 @@ impl<'a> LifecycleWire<'a> {
         session_id: String,
         entry_id: EntryId,
     ) -> Result<ForkReceipt, InvokeError> {
-        let session = self.target.inner.resolve_session(&session_id).await?;
+        let session = self.target.caller_unit.resolve_session(&session_id).await?;
+        let owner = self
+            .target
+            .root
+            .owner_of(&session_id)
+            .await
+            .unwrap_or_else(|| Arc::clone(&self.target.root));
         let fork = self
             .target
             .hook
             .fork(self.caller, session, entry_id)
             .await?;
+        owner.attach(&fork.session).await;
         Ok(ForkReceipt {
-            session: self.attach(fork.session).await,
+            session: fork.session.id().to_owned(),
             editable: fork.editable,
         })
     }
 
     #[ext]
     pub async fn close_session(&self, session_id: String) -> Result<(), InvokeError> {
+        if !self.target.caller_unit.owns_session(&session_id).await {
+            return Err(InvokeError::NoSession(format!(
+                "session {session_id} is not attached"
+            )));
+        }
         self.target
             .hook
             .close(self.caller, session_id.clone())
             .await?;
-        self.target.inner.sessions.detach(&session_id);
+        self.target.root.detach_anywhere(&session_id);
         Ok(())
     }
 }
@@ -173,11 +217,12 @@ pub(super) fn lookup(name: &str) -> Option<LifecycleCall> {
 impl LifecycleCall {
     pub(super) async fn invoke(
         self,
-        inner: Arc<Inner>,
+        caller_unit: Arc<Inner>,
         caller: Caller,
         args: Vec<Value>,
     ) -> Result<Value, Refusal> {
-        let hook = inner
+        let root = caller_unit.root();
+        let hook = root
             .lifecycle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -187,8 +232,16 @@ impl LifecycleCall {
                 message: "the host registered no session lifecycle hook".into(),
                 details: None,
             })?;
-        (self.0)(&LifecycleTarget { inner, hook }, &caller, args)
-            .await
-            .map_err(Into::into)
+        (self.0)(
+            &LifecycleTarget {
+                caller_unit,
+                root,
+                hook,
+            },
+            &caller,
+            args,
+        )
+        .await
+        .map_err(Into::into)
     }
 }

@@ -173,3 +173,12 @@ pub(crate) async fn read(cache_dir: &Path) -> Option<Vec<CodexModel>> {
 pub(crate) async fn write(cache_dir: &Path, models: &[CodexModel]) -> Result<(), Error> {
     write_atomic(&cache_dir.join(FILE), &serde_json::to_vec(models)?).await
 }
+
+/// Removes `<cache_dir>/codex-models.json` if present.
+pub(crate) async fn remove(cache_dir: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(cache_dir.join(FILE)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}

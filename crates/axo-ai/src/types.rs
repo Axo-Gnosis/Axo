@@ -254,7 +254,7 @@ pub enum ReasoningReplay {
     ReasoningDetails(Value),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub input: u64,
@@ -268,7 +268,24 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
     pub total_tokens: u64,
-    pub cost: UsageCost,
+    /// Cost of this usage in USD; `None` when any contributing model's price is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<UsageCost>,
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write_1h: None,
+            reasoning: None,
+            total_tokens: 0,
+            cost: Some(UsageCost::default()),
+        }
+    }
 }
 
 impl std::ops::AddAssign<&Usage> for Usage {
@@ -284,11 +301,17 @@ impl std::ops::AddAssign<&Usage> for Usage {
         if let Some(value) = next.reasoning {
             self.reasoning = Some(self.reasoning.unwrap_or(0).saturating_add(value));
         }
-        self.cost.input += next.cost.input;
-        self.cost.output += next.cost.output;
-        self.cost.cache_read += next.cost.cache_read;
-        self.cost.cache_write += next.cost.cache_write;
-        self.cost.total += next.cost.total;
+        self.cost = match (self.cost, next.cost) {
+            (Some(mut a), Some(b)) => {
+                a.input += b.input;
+                a.output += b.output;
+                a.cache_read += b.cache_read;
+                a.cache_write += b.cache_write;
+                a.total += b.total;
+                Some(a)
+            }
+            _ => None,
+        };
     }
 }
 

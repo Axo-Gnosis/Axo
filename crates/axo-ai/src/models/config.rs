@@ -147,7 +147,12 @@ impl ModelPatch {
             model.input = input.clone();
         }
         if let Some(cost) = &self.cost {
-            let target = &mut model.cost;
+            if model.cost.is_none() && (cost.input.is_none() || cost.output.is_none()) {
+                return Err(Error::Config(
+                    "cost: a model without known prices needs both \"input\" and \"output\"".into(),
+                ));
+            }
+            let target = model.cost.get_or_insert_with(crate::model::Cost::default);
             target.input = cost.input.unwrap_or(target.input);
             target.output = cost.output.unwrap_or(target.output);
             target.cache_read = cost.cache_read.unwrap_or(target.cache_read);

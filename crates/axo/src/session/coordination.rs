@@ -57,7 +57,7 @@ pub(crate) async fn send(
         session_id,
         receipt,
     };
-    let provenance = |route| SubmissionProvenance {
+    let provenance = |route| SubmissionProvenance::Agent {
         session_id: routes.session_id.clone(),
         route,
         name: routes.team.as_ref().map(|team| team.member.clone()),

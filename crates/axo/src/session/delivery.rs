@@ -312,24 +312,39 @@ impl Session {
     /// returns when the run settles. `Error::Busy` while a run is active (use
     /// `steer`/`follow_up`). Prompt text never runs a built-in command: hosts that offer
     /// typed commands parse them with `Command::parse` and call `run_command`.
-    #[ext]
+    #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunOutcome, Error> {
-        match self
-            .prompt_with(PromptRequest {
-                input: input.into(),
-                request_id: None,
-            })
-            .await?
-        {
+        self.prompt_new(input.into(), None).await
+    }
+
+    /// `prompt`, deduplicated by `request_id`: a request id that was already submitted
+    /// returns its earlier submission and starts nothing, even while that run is active.
+    #[ext(skip = "records caller provenance; see the wire method")]
+    pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
+        self.prompt_with_provenance(request, None).await
+    }
+
+    /// A prompt without request id: always new, so it settles with an outcome.
+    pub(super) async fn prompt_new(
+        &self,
+        input: PromptInput,
+        provenance: Option<crate::coordination::SubmissionProvenance>,
+    ) -> Result<RunOutcome, Error> {
+        let request = PromptRequest {
+            input,
+            request_id: None,
+        };
+        match self.prompt_with_provenance(request, provenance).await? {
             PromptResult::Settled { outcome, .. } => Ok(outcome),
             PromptResult::Duplicate(_) => unreachable!("a prompt without request id is new"),
         }
     }
 
-    /// `prompt`, deduplicated by `request_id`: a request id that was already submitted
-    /// returns its earlier submission and starts nothing, even while that run is active.
-    #[ext]
-    pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
+    pub(super) async fn prompt_with_provenance(
+        &self,
+        request: PromptRequest,
+        provenance: Option<crate::coordination::SubmissionProvenance>,
+    ) -> Result<PromptResult, Error> {
         let request_id = request.request_id.as_deref();
         // Fast path: a duplicate or busy prompt does no file or image work.
         if let Some(existing) = self.admit(request_id).await? {
@@ -348,7 +363,7 @@ impl Session {
             content,
             request.request_id.clone(),
             None,
-            None,
+            provenance,
             &keywords,
         );
         let mut entry = Some(entry);
@@ -458,7 +473,7 @@ impl Session {
     }
 
     /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
-    #[ext]
+    #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::Steer, input.into(), None, None)
             .await
@@ -467,7 +482,7 @@ impl Session {
 
     /// Saves and queues a user message delivered when the active run would otherwise end;
     /// on an idle session it starts a run.
-    #[ext]
+    #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
         self.queue(SubmissionKind::FollowUp, input.into(), None, None)
             .await
@@ -519,6 +534,14 @@ impl Session {
     /// Quiet messages wait for a turn boundary or the next run and never start a run.
     #[ext(skip = "namespaced per caller; see the wire method")]
     pub async fn post(&self, message: HostMessage) -> Result<(), Error> {
+        self.post_with_provenance(message, None).await
+    }
+
+    pub(super) async fn post_with_provenance(
+        &self,
+        message: HostMessage,
+        provenance: Option<crate::coordination::SubmissionProvenance>,
+    ) -> Result<(), Error> {
         if message.custom_type.is_empty() || message.text.trim().is_empty() {
             return Err(Error::InvalidInput(
                 "Host messages need a custom type and text".into(),
@@ -546,7 +569,7 @@ impl Session {
             keywords: Vec::new(),
             request_id: None,
             sender: None,
-            provenance: None,
+            provenance,
             custom: Some(SubmittedCustom {
                 custom_type: message.custom_type.clone(),
                 display: message.display,
@@ -592,6 +615,15 @@ impl Session {
             Some(provenance),
         )
         .await
+    }
+
+    pub(super) async fn queue_with_provenance(
+        &self,
+        kind: SubmissionKind,
+        input: PromptInput,
+        provenance: Option<crate::coordination::SubmissionProvenance>,
+    ) -> Result<String, Error> {
+        self.queue(kind, input, None, provenance).await
     }
 
     pub(super) async fn queue_routed(

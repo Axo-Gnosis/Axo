@@ -20,7 +20,7 @@ async fn accumulator_reproduces_done_message() {
         reasoning: true,
         thinking_level_map: None,
         input: vec![InputKind::Text],
-        cost: Cost::default(),
+        cost: Some(Cost::default()),
         service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 32_000,

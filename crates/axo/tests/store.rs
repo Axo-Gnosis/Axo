@@ -319,7 +319,7 @@ fn equal_timestamp_edits_invalidate_only_earlier_projected_usage_and_apply_borro
         } = entry
         {
             a.usage.input = 123;
-            a.usage.cost.total = 4.5;
+            a.usage.cost.as_mut().unwrap().total = 4.5;
         }
     }
     let mut entries: Vec<_> = [
@@ -368,7 +368,7 @@ fn equal_timestamp_edits_invalidate_only_earlier_projected_usage_and_apply_borro
     assert_eq!(usage(&projection.messages[2]).input, 123);
     if let Entry::Message { message, .. } = &entries[1].entry {
         assert_eq!(
-            usage(message).cost.total,
+            usage(message).cost.unwrap().total,
             4.5,
             "durable cost remains intact"
         );

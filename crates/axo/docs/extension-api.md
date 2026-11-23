@@ -43,13 +43,13 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | contextUsage |  | The current estimated context size and effective compaction limits. |
 | isRunning |  | Whether a run, maintenance or navigation currently owns the session. Observing idle does not reserve it against future submissions or background wakes. |
 | treeUsage |  | This session's own recorded spend plus every descendant's, maintenance included; SessionEvent::TreeUsage reports changes. |
-| prompt | input | Expands a /skill args invocation, saves the submission and runs the prompt; returns when the run settles. Error::Busy while a run is active (use steer/follow_up). Prompt text never runs a built-in command: hosts that offer typed commands parse them with Command::parse and call run_command. |
-| promptWith | request | prompt, deduplicated by request_id: a request id that was already submitted returns its earlier submission and starts nothing, even while that run is active. |
-| steer | input | Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run. |
-| followUp | input | Saves and queues a user message delivered when the active run would otherwise end; on an idle session it starts a run. |
 | withdraw | submissionId | Takes a queued steer or follow-up back before it is delivered and returns it for the host to edit and resubmit. Error::NotQueued once it was delivered or withdrawn. |
 | resumeWakes |  | Lifts the pause a Stop or a failed run left and, on an idle session, starts a run with the held steers or follow-ups, else with pending job results and mail. |
-| post | message | Posts a durable host message with the requested delivery timing. |
+| prompt | input | Expands a /skill args invocation, saves the submission with caller provenance, and runs the prompt; returns when the run settles. |
+| promptWith | request | prompt, deduplicated by request_id, recording caller provenance. |
+| steer | input | Saves and queues a steering message with caller provenance. |
+| followUp | input | Saves and queues a follow-up message with caller provenance. |
+| post | message | Posts a durable host message with the requested delivery timing and caller provenance. |
 | appendCustom | customType, data? | Appends branch-scoped state under the caller's custom type and returns the journal entry. |
 | custom | customType | Returns the latest value for the caller's custom type on the current branch, or null. |
 | spawn | request | Spawns one child and returns its receipt. |
@@ -102,6 +102,10 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | SESSION_CORE::subscribe | live receiver; the bridge serves session.subscribe |
 | SESSION_CORE::attach | returns a live receiver; use entries, live and subscribe |
 | SESSION_CORE::fork | lifecycle belongs to the host |
+| SESSION_DELIVERY::prompt | records caller provenance; see the wire method |
+| SESSION_DELIVERY::prompt_with | records caller provenance; see the wire method |
+| SESSION_DELIVERY::steer | records caller provenance; see the wire method |
+| SESSION_DELIVERY::follow_up | records caller provenance; see the wire method |
 | SESSION_DELIVERY::post | namespaced per caller; see the wire method |
 | SESSION_PROMPT::read_snapshot | bytes cross as base64 |
 | SESSION_SPAWN::spawn | returns live child sessions; the wire method returns the receipt |
@@ -158,6 +162,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 
 | Method | Parameters | Summary |
 | --- | --- | --- |
+| spawnParent | id | The parent session id of a known child, live or parked, without reviving it. None for a root session or an unknown id; an unknown id first waits for reopened sessions to finish registering their children. |
 | squashChanges | session, changes | SnapshotStore::squash over a session file's blobs: the net change per file across changes. Takes no lock. |
 | listSessions | cwd | Sessions started in cwd, most recently modified first. |
 | readSession | path, after?, limit? | Reads a saved session after a sequence number (default 256 entries, clamped to 1..=1024). |
@@ -189,6 +194,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | AXO::builder | host construction |
 | AXO::models | live registry; reached through the models object |
 | AXO::invoke | the dispatcher itself |
+| AXO::invoke_models | the dispatcher itself |
 | AXO::supervisor | live process handles; commands go through tools.runCommand |
 | AXO::create_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::open_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
@@ -199,7 +205,9 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | AXO::schemes | takes host scheme objects; a live session's schemes are reached through tools |
 | AXO::catalog | takes the host's programmatic definitions; the wire method resolves files only |
 | AXO_MODELS::stream | live stream; served as models.stream |
+| AXO_MODELS::stream_with | live stream; served as models.stream |
 | AXO_MODELS::complete | served as models.complete |
+| AXO_MODELS::complete_with | served as models.complete |
 
 ## models
 

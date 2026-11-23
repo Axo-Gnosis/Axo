@@ -17,7 +17,10 @@ use axo::{
 use axo_agent::{AgentEvent, AgentMessage, BeforeToolCallContext, ToolCallDecision, ToolError};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ThinkingLevel, UserBlock};
-use axo_extensions::{ExtensionPhase, Extensions, Failure, Forked, Lifecycle, SessionRequest};
+use axo_extensions::{
+    ExtensionPhase, ExtensionScope, Extensions, Failure, Forked, Lifecycle, LifecycleSession,
+    ScopeOptions, SessionRequest,
+};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -43,6 +46,7 @@ pub const CASES: &[Case] = &[
     case!(concurrent_cold_calls_restart_and_disable),
     case!(failures_reach_the_host_typed),
     case!(tool_reservations_follow_session_modes),
+    case!(extension_scopes_isolate_same_id_packages_providers_and_lifecycle),
 ];
 
 const LAB: &str = "lab";
@@ -385,19 +389,23 @@ impl Lifecycle for ForkHost {
         caller: &Caller,
         cwd: PathBuf,
         request: SessionRequest,
-    ) -> Result<Arc<Session>, Error> {
+    ) -> Result<LifecycleSession, Error> {
         let mut options = self.options(caller, request);
         options.cwd = cwd;
-        Ok(self.hold(self.host.axo.create_session(options).await?))
+        Ok(LifecycleSession::unscoped(
+            self.hold(self.host.axo.create_session(options).await?),
+        ))
     }
     async fn open(
         &self,
         caller: &Caller,
         path: PathBuf,
         request: SessionRequest,
-    ) -> Result<Arc<Session>, Error> {
+    ) -> Result<LifecycleSession, Error> {
         let options = self.options(caller, request);
-        Ok(self.hold(self.host.axo.open_session(&path, options).await?))
+        Ok(LifecycleSession::unscoped(
+            self.hold(self.host.axo.open_session(&path, options).await?),
+        ))
     }
     async fn fork(
         &self,
@@ -1317,5 +1325,309 @@ async fn tool_reservations_follow_session_modes() {
         session.run_command(command).await.unwrap();
         session.shutdown().await;
     }
+    extensions.shutdown().await;
+}
+
+async fn extension_scopes_isolate_same_id_packages_providers_and_lifecycle() {
+    let host = Host::new().await;
+    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
+    host.script("proj", "command", "invoke");
+
+    // Host-wide extension.
+    host.write_package(
+        "root",
+        "host-ext",
+        &json!({
+            "id": "host-ext",
+            "entry": "index.ts",
+            "tools": [{"name": "host_tool", "description": "Host tool", "parameters": {"type": "object"}}]
+        })
+        .to_string(),
+    );
+
+    // Two folders shipping DIFFERENT packages under the SAME extension id ("proj") and SAME provider id ("acme").
+    host.write_package(
+        "folder-a-root",
+        "proj",
+        &json!({
+            "id": "proj",
+            "entry": "index.ts",
+            "tools": [{"name": "tool_a", "description": "Tool A", "parameters": {"type": "object"}}],
+            "commands": [{"name": "probe", "description": "Probe A"}],
+            "providers": [{
+                "id": "acme",
+                "models": [{
+                    "id": "a-model", "name": "A Model", "api": "openai-completions",
+                    "provider": "acme", "baseUrl": "http://127.0.0.1:1/v1", "reasoning": false,
+                    "input": ["text"], "contextWindow": 8192, "maxTokens": 1024
+                }]
+            }]
+        })
+        .to_string(),
+    );
+    host.write_package(
+        "folder-b-root",
+        "proj",
+        &json!({
+            "id": "proj",
+            "entry": "index.ts",
+            "tools": [{"name": "tool_b", "description": "Tool B", "parameters": {"type": "object"}}],
+            "commands": [{"name": "probe", "description": "Probe B"}],
+            "providers": [{
+                "id": "acme",
+                "models": [{
+                    "id": "b-model", "name": "B Model", "api": "openai-completions",
+                    "provider": "acme", "baseUrl": "http://127.0.0.1:1/v1", "reasoning": false,
+                    "input": ["text"], "contextWindow": 8192, "maxTokens": 1024
+                }]
+            }]
+        })
+        .to_string(),
+    );
+
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[("host-ext", None)]))
+        .await
+        .unwrap();
+
+    let scope_a = extensions
+        .scope(ScopeOptions {
+            key: "folder-a".into(),
+            roots: vec![host.path("folder-a-root")],
+            data_root: host.path("data-a"),
+            auto_install: false,
+        })
+        .unwrap();
+    let scope_b = extensions
+        .scope(ScopeOptions {
+            key: "folder-b".into(),
+            roots: vec![host.path("folder-b-root")],
+            data_root: host.path("data-b"),
+            auto_install: false,
+        })
+        .unwrap();
+    // Duplicate active scope key is rejected.
+    assert!(
+        extensions
+            .scope(ScopeOptions {
+                key: "folder-a".into(),
+                roots: vec![host.path("folder-a-root")],
+                data_root: host.path("data-a2"),
+                auto_install: false,
+            })
+            .is_err()
+    );
+
+    scope_a
+        .configure(&enabled(&[("proj", None)]))
+        .await
+        .unwrap();
+    scope_b
+        .configure(&enabled(&[("proj", None)]))
+        .await
+        .unwrap();
+
+    // Providers and credential slots are isolated per scope and invisible to base Models.
+    assert!(host.axo.models().find("acme/a-model").is_none());
+    assert!(host.axo.models().find("acme/b-model").is_none());
+    assert!(scope_a.models().find("acme/a-model").is_some());
+    assert!(scope_a.models().find("acme/b-model").is_none());
+    assert!(scope_b.models().find("acme/b-model").is_some());
+    assert!(scope_b.models().find("acme/a-model").is_none());
+    assert_ne!(
+        scope_a.models().credential_slot("acme").unwrap(),
+        scope_b.models().credential_slot("acme").unwrap(),
+    );
+
+    // Unscoped, Scope A, and Scope B sessions see only their allowed tools.
+    let session_u = Arc::new(
+        host.axo
+            .create_session(extensions.compose(options(&host)))
+            .await
+            .unwrap(),
+    );
+    extensions.attach(&session_u).await;
+
+    let session_a = Arc::new(
+        host.axo
+            .create_session(scope_a.compose(options(&host)))
+            .await
+            .unwrap(),
+    );
+    scope_a.attach(&session_a).await;
+
+    let session_b = Arc::new(
+        host.axo
+            .create_session(scope_b.compose(options(&host)))
+            .await
+            .unwrap(),
+    );
+    scope_b.attach(&session_b).await;
+
+    let has_tool = |s: &Session, name: &str| s.tools().iter().any(|t| t.name == name);
+    assert!(has_tool(&session_u, "host_tool"));
+    assert!(!has_tool(&session_u, "tool_a"));
+    assert!(!has_tool(&session_u, "tool_b"));
+
+    assert!(has_tool(&session_a, "host_tool"));
+    assert!(has_tool(&session_a, "tool_a"));
+    assert!(!has_tool(&session_a, "tool_b"));
+
+    assert!(has_tool(&session_b, "host_tool"));
+    assert!(!has_tool(&session_b, "tool_a"));
+    assert!(has_tool(&session_b, "tool_b"));
+
+    let invoke_a = async |request: Value| -> Result<Value, (String, String)> {
+        let cmd = session_a
+            .parse_command(&format!("/probe {request}"))
+            .unwrap()
+            .unwrap();
+        session_a.run_command(cmd).await.unwrap();
+        serde_json::from_slice(&std::fs::read(host.path("ctl/proj/reply")).unwrap()).unwrap()
+    };
+
+    // Scoped extension in A sees A's models via models.find, not B's.
+    let found_a = invoke_a(json!({"object": "models", "method": "find", "args": ["acme/a-model"]}))
+        .await
+        .unwrap();
+    assert_eq!(found_a["id"], "a-model");
+    let found_b = invoke_a(json!({"object": "models", "method": "find", "args": ["acme/b-model"]}))
+        .await
+        .unwrap();
+    assert!(found_b.is_null());
+
+    // Scoped extension in A cannot access B's session, but CAN access A's own session.
+    let err = invoke_a(json!({
+        "object": "session", "target": session_b.id(), "method": "model", "args": []
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, "no_session");
+    invoke_a(json!({
+        "object": "session", "target": session_a.id(), "method": "model", "args": []
+    }))
+    .await
+    .unwrap();
+
+    // A parked child of B's session stays out of A's reach, and A's lookups never revive it.
+    let child = session_b
+        .spawn(axo::SpawnRequest {
+            task: "check".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let child_id = child.session.id().to_owned();
+    drop(child);
+    wait_for("B's child to park", || {
+        host.axo.observe_child(&child_id).is_none()
+    })
+    .await;
+    let child_model =
+        json!({"object": "session", "target": child_id, "method": "model", "args": []});
+    assert_eq!(invoke_a(child_model).await.unwrap_err().0, "no_session");
+    assert!(host.axo.observe_child(&child_id).is_none());
+
+    // Lifecycle::create called from Scope A targeting folder B attaches to Scope B.
+    struct ScopedLifecycle {
+        axo: Arc<axo::Axo>,
+        folder_b: PathBuf,
+        scope_b: ExtensionScope,
+        created: Mutex<Vec<Arc<Session>>>,
+    }
+    #[async_trait]
+    impl Lifecycle for ScopedLifecycle {
+        async fn create(
+            &self,
+            _caller: &Caller,
+            cwd: PathBuf,
+            _request: SessionRequest,
+        ) -> Result<LifecycleSession, Error> {
+            let opts = SessionOptions {
+                cwd: cwd.clone(),
+                model: Some("test/m".into()),
+                exec_env: Some(Arc::new(StaticEnv::host())),
+                ..SessionOptions::default()
+            };
+            let (opts, scope) = if cwd == self.folder_b {
+                (self.scope_b.compose(opts), Some(self.scope_b.clone()))
+            } else {
+                (opts, None)
+            };
+            let session = Arc::new(self.axo.create_session(opts).await?);
+            self.created.lock().unwrap().push(session.clone());
+            Ok(LifecycleSession { session, scope })
+        }
+        async fn open(
+            &self,
+            _caller: &Caller,
+            _path: PathBuf,
+            _request: SessionRequest,
+        ) -> Result<LifecycleSession, Error> {
+            unreachable!()
+        }
+        async fn fork(
+            &self,
+            _caller: &Caller,
+            session: Arc<Session>,
+            entry: axo::EntryId,
+        ) -> Result<Forked, Error> {
+            let fork = session.fork(&entry).await?;
+            let session = Arc::new(fork.session);
+            self.created.lock().unwrap().push(session.clone());
+            Ok(Forked {
+                session,
+                editable: fork.editable,
+            })
+        }
+        async fn close(&self, _caller: &Caller, _id: String) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    let folder_b = host.path("folder-b");
+    std::fs::create_dir_all(&folder_b).unwrap();
+    let lifecycle = Arc::new(ScopedLifecycle {
+        axo: Arc::clone(&host.axo),
+        folder_b: folder_b.clone(),
+        scope_b: scope_b.clone(),
+        created: Mutex::default(),
+    });
+    extensions.set_lifecycle(Some(lifecycle.clone()));
+
+    let created_id = invoke_a(json!({
+        "object": "host", "method": "createSession", "args": [folder_b, null]
+    }))
+    .await
+    .unwrap();
+    let created_in_b = lifecycle.created.lock().unwrap()[0].clone();
+    assert_eq!(created_id, created_in_b.id());
+    assert!(has_tool(&created_in_b, "host_tool"));
+    assert!(has_tool(&created_in_b, "tool_b"));
+    assert!(!has_tool(&created_in_b, "tool_a"));
+
+    // With a lifecycle installed, A still cannot close B's parked child, nor revive it trying.
+    let close_child = json!({"object": "host", "method": "closeSession", "args": [child_id]});
+    assert_eq!(invoke_a(close_child).await.unwrap_err().0, "no_session");
+    assert!(host.axo.observe_child(&child_id).is_none());
+
+    // Shutting down Scope A removes tool_a and acme/a-model while keeping host_tool and Scope B intact.
+    scope_a.shutdown().await;
+    assert!(scope_a.models().find("acme/a-model").is_none());
+    assert!(has_tool(&session_a, "host_tool"));
+    assert!(!has_tool(&session_a, "tool_a"));
+    assert!(scope_b.models().find("acme/b-model").is_some());
+    assert!(has_tool(&session_b, "tool_b"));
+
+    // Reconfiguring host extensions propagates to remaining scoped sessions.
+    extensions.configure(&[]).await.unwrap();
+    assert!(!has_tool(&session_b, "host_tool"));
+    assert!(has_tool(&session_b, "tool_b"));
+
+    created_in_b.shutdown().await;
+    session_u.shutdown().await;
+    session_a.shutdown().await;
+    session_b.shutdown().await;
     extensions.shutdown().await;
 }

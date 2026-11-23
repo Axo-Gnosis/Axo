@@ -40,8 +40,9 @@ use crate::tools::{FileChange, SnapshotStore, SquashedChange};
 pub struct Axo {
     name: String,
     models: Arc<Models>,
-    /// What sessions stream through: `models` unless the builder overrode it.
-    pub(crate) streamer: Arc<dyn Streamer>,
+    /// Test/host override for streaming; when `None`, each session or completion streams
+    /// through its own `Models` (the host's or its scoped view).
+    pub(crate) custom_streamer: Option<Arc<dyn Streamer>>,
     pub(crate) store: Arc<dyn SessionStore>,
     /// Sampled at every `create_session`, `open_session`, `schemes`, `catalog` and model completion.
     pub(crate) config: Arc<dyn ConfigSource>,
@@ -158,10 +159,6 @@ impl AxoBuilder {
 
     #[ext(skip = "host construction")]
     pub fn build(self) -> Axo {
-        let streamer: Arc<dyn Streamer> = match self.streamer {
-            Some(streamer) => streamer,
-            None => self.models.clone(),
-        };
         let base_env = StaticEnv::host().0;
         // Never fails here: supervision is checked on the first command, so hosts that
         // never run commands keep working.
@@ -169,7 +166,7 @@ impl AxoBuilder {
         Axo {
             name: self.name,
             models: self.models,
-            streamer,
+            custom_streamer: self.streamer,
             store: self.store,
             config: self.config.unwrap_or_else(|| Arc::new(NoConfig)),
             cache_dir: self.cache_dir,
@@ -212,9 +209,36 @@ impl Axo {
     ) -> Result<Value, InvokeError> {
         match object {
             "host" => HOST.invoke(self, method, args, caller).await,
-            "models" => MODELS.invoke(self, method, args, caller).await,
+            "models" => {
+                self.invoke_models(self.models.clone(), method, args, caller)
+                    .await
+            }
             _ => Err(InvokeError::UnknownObject(object.to_owned())),
         }
+    }
+
+    /// Calls an extension-accessible `models` method against `models` (for example a scoped
+    /// `Models` view) with positional JSON arguments.
+    #[ext(skip = "the dispatcher itself")]
+    pub async fn invoke_models(
+        &self,
+        models: Arc<Models>,
+        method: &str,
+        args: Vec<Value>,
+        caller: &Caller,
+    ) -> Result<Value, InvokeError> {
+        let target = crate::models::ModelsTarget {
+            models,
+            config: self.config.clone(),
+            custom_streamer: self.custom_streamer.clone(),
+        };
+        MODELS.invoke(&target, method, args, caller).await
+    }
+
+    pub(crate) fn streamer_for(&self, models: &Arc<Models>) -> Arc<dyn Streamer> {
+        self.custom_streamer
+            .clone()
+            .unwrap_or_else(|| models.clone())
     }
 
     /// The supervisor every local command runs under, for hosts that run other
@@ -334,6 +358,14 @@ impl Axo {
         self.sessions.observe(id)
     }
 
+    /// The parent session id of a known child, live or parked, without reviving it. `None`
+    /// for a root session or an unknown id; an unknown id first waits for reopened sessions
+    /// to finish registering their children.
+    #[ext]
+    pub async fn spawn_parent(&self, id: &str) -> Option<String> {
+        self.sessions.parent_of(id).await
+    }
+
     /// Reads a saved session without locking it.
     #[ext(skip = "a whole journal can exceed a frame; host.readSession pages it")]
     pub async fn open_session_read(&self, path: &Path) -> Result<(Header, Vec<SeqEntry>), Error> {
@@ -438,6 +470,7 @@ impl Axo {
         let SessionOptions {
             cwd,
             model,
+            models,
             agent,
             definitions,
             keywords_enabled,
@@ -454,6 +487,8 @@ impl Axo {
             layer,
             recovery: _,
         } = options;
+        let models = models.unwrap_or_else(|| self.models.clone());
+        let streamer = self.streamer_for(&models);
 
         let config = Arc::new(EffectiveConfig::resolve(
             &*self.config,
@@ -490,7 +525,7 @@ impl Axo {
         let settings = &config.settings;
 
         let cascade = settings.first_model(
-            &self.models,
+            &models,
             [
                 model.as_deref(),
                 projection.model.as_deref(),
@@ -504,7 +539,7 @@ impl Axo {
             Some(model) => model,
             None => {
                 let selector = config.default_model()?.ok_or(Error::NoModel)?;
-                let choice = settings.resolve_model(&self.models, &selector)?;
+                let choice = settings.resolve_model(&models, &selector)?;
                 suffix = suffix.or(choice.thinking);
                 tier_suffix = tier_suffix.or(choice.tier);
                 choice.model.ok_or(Error::NoModel)?
@@ -556,8 +591,8 @@ impl Axo {
                 files: Arc::new(files),
                 definition_diagnostics,
                 agent,
-                streamer: self.streamer.clone(),
-                models: self.models.clone(),
+                streamer,
+                models,
                 exec,
                 supervisor: self.supervisor.clone(),
                 ask_enabled,

@@ -20,7 +20,7 @@ use axo_ai::{
 };
 use axo_extensions::{
     ExtensionOptions, ExtensionPhase, ExtensionStatus, Extensions, Forked, Lifecycle,
-    SessionRequest,
+    LifecycleSession, SessionRequest,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -77,9 +77,11 @@ impl Lifecycle for TestLifecycle {
         caller: &Caller,
         cwd: PathBuf,
         request: SessionRequest,
-    ) -> Result<Arc<Session>, axo::Error> {
+    ) -> Result<LifecycleSession, axo::Error> {
         assert_eq!(caller.namespace.as_deref(), Some(SESSION));
-        Ok(self.hold(self.axo.create_session(self.options(cwd, request)?).await?))
+        Ok(LifecycleSession::unscoped(self.hold(
+            self.axo.create_session(self.options(cwd, request)?).await?,
+        )))
     }
 
     async fn open(
@@ -87,10 +89,12 @@ impl Lifecycle for TestLifecycle {
         caller: &Caller,
         path: PathBuf,
         request: SessionRequest,
-    ) -> Result<Arc<Session>, axo::Error> {
+    ) -> Result<LifecycleSession, axo::Error> {
         assert_eq!(caller.namespace.as_deref(), Some(SESSION));
         let options = self.options(PathBuf::new(), request)?;
-        Ok(self.hold(self.axo.open_session(&path, options).await?))
+        Ok(LifecycleSession::unscoped(
+            self.hold(self.axo.open_session(&path, options).await?),
+        ))
     }
 
     async fn fork(

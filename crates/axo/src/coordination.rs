@@ -18,14 +18,20 @@ pub enum SendKind {
     Mail,
 }
 
-/// The originating session and actual delivery route, independent of roster names.
+/// Who originated a non-user submission, independent of roster names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct SubmissionProvenance {
-    pub session_id: String,
-    pub route: SendKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SubmissionProvenance {
+    /// An inter-agent routed submission (`send` or `mail`).
+    Agent {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        route: SendKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// A submission sent by an extension through `Session::invoke`.
+    Extension { id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]

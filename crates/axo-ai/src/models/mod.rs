@@ -11,11 +11,12 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +30,7 @@ use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{CredentialStore, ModelAuth};
 use crate::error::Error;
 use crate::event::{AssistantEvent, timed};
-use crate::model::{ApiKind, Compat, Cost, InputKind, Model};
+use crate::model::{ApiKind, Compat, InputKind, Model};
 use crate::transcript::Transcript;
 use crate::transform::transform_messages;
 use crate::types::{AssistantMessage, ProviderFailure, ServiceTier, StopReason};
@@ -82,11 +83,10 @@ pub struct ModelsOptions {
 /// model and provider by provider/id; a missing model fails with `Error::UnknownModel`.
 pub struct Models {
     shared: Arc<Shared>,
+    scope: Option<Arc<Scope>>,
     anthropic: Arc<AnthropicApi>,
     completions: Arc<CompletionsApi>,
     codex: Arc<CodexApi>,
-    /// The refresh timer; replaced by `reload`, aborted on drop.
-    timer: Mutex<Option<AbortHandle>>,
 }
 
 /// An owned set of providers above the runtime registrations, created by
@@ -95,7 +95,8 @@ pub struct Models {
 /// only its providers and reveals whatever they hid.
 pub struct ProviderLayer {
     shared: Arc<Shared>,
-    /// Creation order within its registry; newer wins.
+    scope: Option<Arc<Scope>>,
+    /// Creation order within its registry or scope; newer wins.
     ordinal: u64,
 }
 
@@ -120,6 +121,43 @@ struct Shared {
     http: reqwest::Client,
     /// The next `ProviderLayer` ordinal.
     next_layer: AtomicU64,
+    /// Generation counter bumped whenever the base published snapshot or provider list changes.
+    changes: watch::Sender<u64>,
+    /// Live scoped views derived from this registry; pruned lazily.
+    scopes: Mutex<Vec<Weak<Scope>>>,
+    /// The refresh timer; replaced by `reload` from any view, aborted when the root drops.
+    timer: Mutex<Option<AbortHandle>>,
+}
+
+/// A scoped overlay above `Shared`'s base state: its own `register`/`ProviderLayer`s win over
+/// base providers for callers using the scoped `Models`, without affecting base or other scopes.
+struct Scope {
+    state: RwLock<ScopeState>,
+    changes: watch::Sender<u64>,
+}
+
+struct ScopeState {
+    registered: BTreeMap<String, Registered>,
+    layers: BTreeMap<u64, BTreeMap<String, Layered>>,
+    snapshot: Arc<[Arc<Model>]>,
+    by_id: Vec<usize>,
+    providers: Vec<ProviderInfo>,
+}
+
+impl Scope {
+    fn read(&self) -> RwLockReadGuard<'_, ScopeState> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, ScopeState> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn notify(&self, changed: bool) {
+        if changed {
+            self.changes.send_modify(|g| *g += 1);
+        }
+    }
 }
 
 struct Inputs {
@@ -204,6 +242,71 @@ struct State {
     /// registered or layered provider's models in provider-id order.
     snapshot: Arc<[Arc<Model>]>,
     by_id: Vec<usize>,
+    providers: Vec<ProviderInfo>,
+}
+
+fn build_snapshot(
+    loaded: &Loaded,
+    winners: &BTreeMap<&str, &Registered>,
+) -> (Arc<[Arc<Model>]>, Vec<usize>, Vec<ProviderInfo>) {
+    let snapshot: Arc<[Arc<Model>]> = loaded
+        .models
+        .iter()
+        .filter(|model| !winners.contains_key(model.provider.as_str()))
+        .chain(winners.values().flat_map(|registered| &registered.models))
+        .cloned()
+        .collect();
+    let mut by_id: Vec<usize> = (0..snapshot.len()).collect();
+    by_id.sort_unstable_by_key(|&i| (&snapshot[i].provider, &snapshot[i].id, i));
+    let mut providers: BTreeMap<&str, &ProviderAuth> = loaded
+        .providers
+        .iter()
+        .map(|(id, info)| (id.as_str(), info.as_ref()))
+        .collect();
+    providers.extend(
+        winners
+            .iter()
+            .map(|(&id, registered)| (id, registered.auth.as_ref())),
+    );
+    let providers = providers
+        .into_values()
+        .map(|info| ProviderInfo {
+            id: info.id.clone(),
+            env: info.env.clone(),
+            requires_key: info.requires_key,
+            login: info.login.is_some(),
+        })
+        .collect();
+    (snapshot, by_id, providers)
+}
+
+fn lookup_in<'a>(
+    snapshot: &'a [Arc<Model>],
+    by_id: &[usize],
+    provider: &str,
+    id: &str,
+) -> Option<&'a Arc<Model>> {
+    let at = by_id.partition_point(|&i| {
+        let row = &snapshot[i];
+        (row.provider.as_str(), row.id.as_str()) < (provider, id)
+    });
+    let row = &snapshot[*by_id.get(at)?];
+    (row.provider == provider && row.id == id).then_some(row)
+}
+
+/// The winning registration of `id` in one overlay: the newest layer containing it, else
+/// the runtime registration, with its unavailability reason.
+fn runtime_in<'a>(
+    layers: &'a BTreeMap<u64, BTreeMap<String, Layered>>,
+    registered: &'a BTreeMap<String, Registered>,
+    id: &str,
+) -> Option<(&'a Registered, Option<&'a str>)> {
+    layers
+        .values()
+        .rev()
+        .find_map(|layer| layer.get(id))
+        .map(|layered| (&layered.provider, layered.unavailable.as_deref()))
+        .or_else(|| registered.get(id).map(|registered| (registered, None)))
 }
 
 impl State {
@@ -214,35 +317,24 @@ impl State {
             layers: BTreeMap::new(),
             snapshot: Arc::new([]),
             by_id: Vec::new(),
+            providers: Vec::new(),
         };
         state.rebuild();
         state
     }
 
-    fn rebuild(&mut self) {
+    fn rebuild(&mut self) -> bool {
         let winners = self.winners();
-        let snapshot: Arc<[Arc<Model>]> = self
-            .loaded
-            .models
-            .iter()
-            .filter(|model| !winners.contains_key(model.provider.as_str()))
-            .chain(winners.values().flat_map(|registered| &registered.models))
-            .cloned()
-            .collect();
-        self.by_id.clear();
-        self.by_id.extend(0..snapshot.len());
-        self.by_id
-            .sort_unstable_by_key(|&i| (&snapshot[i].provider, &snapshot[i].id, i));
+        let (snapshot, by_id, providers) = build_snapshot(&self.loaded, &winners);
+        let changed = self.snapshot != snapshot || self.providers != providers;
+        self.by_id = by_id;
         self.snapshot = snapshot;
+        self.providers = providers;
+        changed
     }
 
     fn lookup(&self, provider: &str, id: &str) -> Option<&Arc<Model>> {
-        let at = self.by_id.partition_point(|&i| {
-            let row = &self.snapshot[i];
-            (row.provider.as_str(), row.id.as_str()) < (provider, id)
-        });
-        let row = &self.snapshot[*self.by_id.get(at)?];
-        (row.provider == provider && row.id == id).then_some(row)
+        lookup_in(&self.snapshot, &self.by_id, provider, id)
     }
 
     /// Each replaced provider id's winning registration: the newest layer containing it,
@@ -266,12 +358,51 @@ impl State {
     /// The winning registration of `id` that replaces the loaded provider, with its
     /// unavailability reason.
     fn runtime(&self, id: &str) -> Option<(&Registered, Option<&str>)> {
-        self.layers
-            .values()
-            .rev()
-            .find_map(|layer| layer.get(id))
-            .map(|layered| (&layered.provider, layered.unavailable.as_deref()))
-            .or_else(|| self.registered.get(id).map(|registered| (registered, None)))
+        runtime_in(&self.layers, &self.registered, id)
+    }
+}
+
+impl ScopeState {
+    fn new(base: &State) -> Self {
+        let mut state = ScopeState {
+            registered: BTreeMap::new(),
+            layers: BTreeMap::new(),
+            snapshot: Arc::new([]),
+            by_id: Vec::new(),
+            providers: Vec::new(),
+        };
+        state.rebuild(base);
+        state
+    }
+
+    fn rebuild(&mut self, base: &State) -> bool {
+        let mut winners = base.winners();
+        winners.extend(
+            self.registered
+                .iter()
+                .map(|(id, registered)| (id.as_str(), registered)),
+        );
+        for layer in self.layers.values() {
+            winners.extend(
+                layer
+                    .iter()
+                    .map(|(id, layered)| (id.as_str(), &layered.provider)),
+            );
+        }
+        let (snapshot, by_id, providers) = build_snapshot(&base.loaded, &winners);
+        let changed = self.snapshot != snapshot || self.providers != providers;
+        self.by_id = by_id;
+        self.snapshot = snapshot;
+        self.providers = providers;
+        changed
+    }
+
+    fn lookup(&self, provider: &str, id: &str) -> Option<&Arc<Model>> {
+        lookup_in(&self.snapshot, &self.by_id, provider, id)
+    }
+
+    fn runtime(&self, id: &str) -> Option<(&Registered, Option<&str>)> {
+        runtime_in(&self.layers, &self.registered, id)
     }
 }
 
@@ -440,14 +571,60 @@ impl Models {
                 credentials: opts.credentials,
                 http: http.clone(),
                 next_layer: AtomicU64::new(0),
+                changes: watch::Sender::new(0),
+                scopes: Mutex::new(Vec::new()),
+                timer: Mutex::new(None),
             }),
+            scope: None,
             anthropic: Arc::new(AnthropicApi::new(http.clone())),
             completions: Arc::new(CompletionsApi::new(http.clone())),
             codex: Arc::new(CodexApi::new(http)),
-            timer: Mutex::new(None),
         };
         models.start_timer(interval, age, attempted);
         Ok(models)
+    }
+
+    /// A scoped view over this registry's shared catalog, refresh timer, and credential store.
+    /// Providers added through `register` or `provider_layer` on the returned `Models` sit
+    /// above the base registry for callers using this view, without affecting the base
+    /// registry or sibling scopes. Dropping the scoped `Models` does not stop the base
+    /// refresh timer.
+    pub fn scoped(&self) -> Models {
+        // Hold the base read guard until the scope is registered, so no base change can
+        // land between building its state and `notify_base_changed` seeing it.
+        let base = self.shared.read();
+        let scope = Arc::new(Scope {
+            state: RwLock::new(ScopeState::new(&base)),
+            changes: watch::Sender::new(0),
+        });
+        {
+            let mut scopes = self
+                .shared
+                .scopes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            scopes.retain(|weak| weak.strong_count() > 0);
+            scopes.push(Arc::downgrade(&scope));
+        }
+        drop(base);
+        Models {
+            shared: Arc::clone(&self.shared),
+            scope: Some(scope),
+            anthropic: Arc::clone(&self.anthropic),
+            completions: Arc::clone(&self.completions),
+            codex: Arc::clone(&self.codex),
+        }
+    }
+
+    /// Subscribes to changes in the published model list or provider metadata. The generation
+    /// number increases whenever `all()` or `providers()` actually changes (from `reload`,
+    /// `refresh`, timer refreshes, Codex discovery, `register`/`unregister`, `ProviderLayer`,
+    /// or `logout`). An unchanged refresh does not bump the counter.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        match &self.scope {
+            Some(scope) => scope.changes.subscribe(),
+            None => self.shared.changes.subscribe(),
+        }
     }
 
     /// Rebuilds the loaded catalog from `config` in place, re-running model discovery; call it
@@ -507,7 +684,11 @@ impl Models {
             })
             .abort_handle()
         });
-        let mut timer = self.timer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut timer = self
+            .shared
+            .timer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(previous) = std::mem::replace(&mut *timer, task) {
             previous.abort();
         }
@@ -520,9 +701,22 @@ impl Models {
     /// host-assigned stable identity of the contributor whose credentials this registration uses.
     pub fn register(&self, owner: &str, provider: Provider) -> Result<(), Error> {
         let (id, registered) = Registered::new(provider, "registered", owner)?;
-        let mut state = self.shared.write();
-        state.registered.insert(id, registered);
-        state.rebuild();
+        if let Some(scope) = &self.scope {
+            let base = self.shared.read();
+            let mut state = scope.write();
+            state.registered.insert(id, registered);
+            let changed = state.rebuild(&base);
+            drop(state);
+            drop(base);
+            scope.notify(changed);
+            return Ok(());
+        }
+        let changed = {
+            let mut state = self.shared.write();
+            state.registered.insert(id, registered);
+            state.rebuild()
+        };
+        self.shared.notify_base_changed(changed);
         Ok(())
     }
 
@@ -531,10 +725,24 @@ impl Models {
     /// the next request resolves them again and fails with `Error::UnknownModel` if the model
     /// is no longer present.
     pub fn unregister(&self, provider: &str) -> bool {
-        let mut state = self.shared.write();
-        let removed = state.registered.remove(provider).is_some();
+        if let Some(scope) = &self.scope {
+            let base = self.shared.read();
+            let mut state = scope.write();
+            let removed = state.registered.remove(provider).is_some();
+            let changed = removed && state.rebuild(&base);
+            drop(state);
+            drop(base);
+            scope.notify(changed);
+            return removed;
+        }
+        let (removed, changed) = {
+            let mut state = self.shared.write();
+            let removed = state.registered.remove(provider).is_some();
+            let changed = removed && state.rebuild();
+            (removed, changed)
+        };
         if removed {
-            state.rebuild();
+            self.shared.notify_base_changed(changed);
         }
         removed
     }
@@ -544,6 +752,7 @@ impl Models {
     pub fn provider_layer(&self) -> ProviderLayer {
         ProviderLayer {
             shared: Arc::clone(&self.shared),
+            scope: self.scope.clone(),
             ordinal: self.shared.next_layer.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -551,47 +760,33 @@ impl Models {
     /// Look up `provider/model-id` (the model id may itself contain `/`).
     pub fn find(&self, selector: &str) -> Option<Model> {
         let (provider, id) = selector.split_once('/')?;
-        self.shared
-            .read()
-            .lookup(provider, id)
+        self.lookup(provider, id)
             .map(|model| model.as_ref().clone())
     }
 
     /// The current model definition, including a reserved but unavailable winner.
     pub fn lookup(&self, provider: &str, id: &str) -> Option<Arc<Model>> {
-        self.shared.read().lookup(provider, id).cloned()
+        match &self.scope {
+            Some(scope) => scope.read().lookup(provider, id).cloned(),
+            None => self.shared.read().lookup(provider, id).cloned(),
+        }
     }
 
     /// Every model: loaded models of providers that are not replaced, then the winning
     /// registered and layered ones (unavailable providers included).
     pub fn all(&self) -> Arc<[Arc<Model>]> {
-        Arc::clone(&self.shared.read().snapshot)
+        match &self.scope {
+            Some(scope) => Arc::clone(&scope.read().snapshot),
+            None => Arc::clone(&self.shared.read().snapshot),
+        }
     }
 
     /// Every known provider, loaded and winning registered or layered, sorted by id.
     pub fn providers(&self) -> Vec<ProviderInfo> {
-        let state = self.shared.read();
-        let mut providers: BTreeMap<&str, &ProviderAuth> = state
-            .loaded
-            .providers
-            .iter()
-            .map(|(id, info)| (id.as_str(), info.as_ref()))
-            .collect();
-        providers.extend(
-            state
-                .winners()
-                .into_iter()
-                .map(|(id, registered)| (id, registered.auth.as_ref())),
-        );
-        providers
-            .into_values()
-            .map(|info| ProviderInfo {
-                id: info.id.clone(),
-                env: info.env.clone(),
-                requires_key: info.requires_key,
-                login: info.login.is_some(),
-            })
-            .collect()
+        match &self.scope {
+            Some(scope) => scope.read().providers.clone(),
+            None => self.shared.read().providers.clone(),
+        }
     }
 
     /// Opaque credential-store key for the current provider origin, even when unavailable.
@@ -625,15 +820,7 @@ impl Models {
         let credential = login.login(interaction).await?;
         self.shared.credentials.set(&info.slot, credential).await?;
         // Only a login for this still-visible loaded Codex record should refresh the account list.
-        if provider == codex_auth::PROVIDER && {
-            let state = self.shared.read();
-            state.runtime(provider).is_none()
-                && state
-                    .loaded
-                    .providers
-                    .get(provider)
-                    .is_some_and(|current| Arc::ptr_eq(current, &info))
-        } {
+        if provider == codex_auth::PROVIDER && self.is_visible_loaded(provider, &info) {
             let shared = Arc::clone(&self.shared);
             tokio::spawn(async move {
                 if let Err(error) = shared.refresh_codex().await {
@@ -642,6 +829,61 @@ impl Models {
             });
         }
         Ok(())
+    }
+
+    /// Removes the stored credential for `provider`'s current origin and drops any
+    /// account-scoped state axo holds for it. For the built-in `openai-codex` provider,
+    /// forgets the discovered account list, deletes `<cache_dir>/codex-models.json`, and
+    /// rebuilds from the offline floor. Unknown providers fail with `Error::Config`; a
+    /// missing stored credential succeeds. Environment and `models.jsonc` keys are untouched.
+    /// If the cache file cannot be deleted, the logout still completes in memory and the I/O
+    /// error is returned; call again to retry the deletion.
+    pub async fn logout(&self, provider: &str) -> Result<(), Error> {
+        let info = self.provider(provider, false)?;
+        self.shared.credentials.remove(&info.slot).await?;
+        if provider == codex_auth::PROVIDER && self.is_visible_loaded(provider, &info) {
+            let mut inputs = self.shared.inputs.lock().await;
+            let removed = match self.shared.cache_dir.as_deref() {
+                Some(dir) => codex::remove(dir).await,
+                None => Ok(()),
+            };
+            if inputs.codex.take().is_some() {
+                let candidate = Candidate {
+                    config: &inputs.config,
+                    extended_context: inputs.extended_context,
+                    codex: None,
+                    catalog: inputs.catalog.as_ref(),
+                };
+                let loaded = build(
+                    candidate,
+                    &self.shared.credentials,
+                    &self.shared.http,
+                    &|id| self.shared.loaded_ids(id),
+                    &|_| false,
+                    None,
+                )
+                .await?;
+                self.shared.replace(loaded);
+            }
+            removed?;
+        }
+        Ok(())
+    }
+
+    /// Whether `info` is the currently visible loaded provider record for `id` in this view.
+    fn is_visible_loaded(&self, id: &str, info: &Arc<ProviderAuth>) -> bool {
+        let base = self.shared.read();
+        if let Some(scope) = &self.scope
+            && scope.read().runtime(id).is_some()
+        {
+            return false;
+        }
+        base.runtime(id).is_none()
+            && base
+                .loaded
+                .providers
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, info))
     }
 
     /// Resolve the key, headers and base-URL override for a request to `model`.
@@ -659,11 +901,20 @@ impl Models {
     /// The winning registered or layered provider of `id`, else the loaded one. With `run`,
     /// an unavailable provider is `Error::ProviderUnavailable`.
     fn provider(&self, id: &str, run: bool) -> Result<Arc<ProviderAuth>, Error> {
-        let state = self.shared.read();
-        match state.runtime(id) {
+        let base = self.shared.read();
+        if let Some(scope) = &self.scope {
+            let scope_state = scope.read();
+            if let Some((registered, unavailability)) = scope_state.runtime(id) {
+                return match unavailability {
+                    Some(reason) if run => Err(unavailable(id, reason)),
+                    _ => Ok(Arc::clone(&registered.auth)),
+                };
+            }
+        }
+        match base.runtime(id) {
             Some((_, Some(reason))) if run => Err(unavailable(id, reason)),
             Some((registered, _)) => Ok(Arc::clone(&registered.auth)),
-            None => state
+            None => base
                 .loaded
                 .providers
                 .get(id)
@@ -676,52 +927,83 @@ impl Models {
     /// provider/id and its provider. `UnknownModel` when the registry no longer has it,
     /// `ProviderUnavailable` when its provider is reserved but cannot run.
     fn request(&self, model: &Model) -> Result<Request, Error> {
-        let state = self.shared.read();
-        let model =
-            state
+        let base = self.shared.read();
+        if let Some(scope) = &self.scope {
+            let scope_state = scope.read();
+            let found = scope_state
                 .lookup(&model.provider, &model.id)
                 .ok_or_else(|| Error::UnknownModel {
                     provider: model.provider.clone(),
                     model: model.id.clone(),
                 })?;
-        if let Some((registered, unavailability)) = state.runtime(&model.provider) {
-            if let Some(reason) = unavailability {
-                return Err(unavailable(&model.provider, reason));
+            if let Some((registered, unavailability)) = scope_state.runtime(&found.provider) {
+                if let Some(reason) = unavailability {
+                    return Err(unavailable(&found.provider, reason));
+                }
+                return Ok(Request {
+                    model: found.clone(),
+                    auth: Arc::clone(&registered.auth),
+                    headers: BTreeMap::new(),
+                    rewrite: registered.rewrite.clone(),
+                    config_base_url: false,
+                });
             }
-            return Ok(Request {
-                model: model.clone(),
-                auth: Arc::clone(&registered.auth),
-                headers: BTreeMap::new(),
-                rewrite: registered.rewrite.clone(),
-                config_base_url: false,
-            });
+            return request_from_base(&base, found);
         }
-        let auth = state
-            .loaded
-            .providers
-            .get(&model.provider)
-            .cloned()
-            .ok_or_else(|| Error::Config(format!("unknown provider: {}", model.provider)))?;
-        let key = (model.provider.clone(), model.id.clone());
-        Ok(Request {
-            model: model.clone(),
-            auth,
-            headers: state
-                .loaded
-                .config_headers
-                .get(&key)
-                .cloned()
-                .unwrap_or_default(),
-            rewrite: None,
-            config_base_url: state.loaded.config_base_urls.contains(&key),
-        })
+        let found = base
+            .lookup(&model.provider, &model.id)
+            .ok_or_else(|| Error::UnknownModel {
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+            })?;
+        request_from_base(&base, found)
     }
+}
+
+fn request_from_base(state: &State, model: &Arc<Model>) -> Result<Request, Error> {
+    if let Some((registered, unavailability)) = state.runtime(&model.provider) {
+        if let Some(reason) = unavailability {
+            return Err(unavailable(&model.provider, reason));
+        }
+        return Ok(Request {
+            model: model.clone(),
+            auth: Arc::clone(&registered.auth),
+            headers: BTreeMap::new(),
+            rewrite: registered.rewrite.clone(),
+            config_base_url: false,
+        });
+    }
+    let auth = state
+        .loaded
+        .providers
+        .get(&model.provider)
+        .cloned()
+        .ok_or_else(|| Error::Config(format!("unknown provider: {}", model.provider)))?;
+    let key = (model.provider.clone(), model.id.clone());
+    Ok(Request {
+        model: model.clone(),
+        auth,
+        headers: state
+            .loaded
+            .config_headers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default(),
+        rewrite: None,
+        config_base_url: state.loaded.config_base_urls.contains(&key),
+    })
 }
 
 impl Drop for Models {
     fn drop(&mut self) {
-        let timer = self.timer.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if let Some(timer) = timer.take() {
+        if self.scope.is_none()
+            && let Some(timer) = self
+                .shared
+                .timer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        {
             timer.abort();
         }
     }
@@ -737,9 +1019,34 @@ impl Shared {
     }
 
     fn replace(&self, loaded: Loaded) {
-        let mut state = self.write();
-        state.loaded = loaded;
-        state.rebuild();
+        let changed = {
+            let mut state = self.write();
+            state.loaded = loaded;
+            state.rebuild()
+        };
+        self.notify_base_changed(changed);
+    }
+
+    fn notify_base_changed(&self, base_changed: bool) {
+        // A scope's snapshot and providers derive from the base's published ones plus its own
+        // overlays, so an unchanged base leaves every scope unchanged.
+        if !base_changed {
+            return;
+        }
+        self.changes.send_modify(|g| *g += 1);
+        let live: Vec<Arc<Scope>> = {
+            let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
+            scopes.retain(|weak| weak.strong_count() > 0);
+            scopes.iter().filter_map(Weak::upgrade).collect()
+        };
+        if live.is_empty() {
+            return;
+        }
+        let base = self.read();
+        for scope in live {
+            let changed = scope.write().rebuild(&base);
+            scope.notify(changed);
+        }
     }
 
     /// Ids of the loaded models of `provider`, kept when its discovery fails.
@@ -835,15 +1142,34 @@ impl ProviderLayer {
                 }
             }
         }
-        let mut state = self.shared.write();
-        if layer.is_empty() {
-            if state.layers.remove(&self.ordinal).is_none() {
-                return Ok(());
+        if let Some(scope) = &self.scope {
+            let base = self.shared.read();
+            let mut state = scope.write();
+            if layer.is_empty() {
+                if state.layers.remove(&self.ordinal).is_none() {
+                    return Ok(());
+                }
+            } else {
+                state.layers.insert(self.ordinal, layer);
             }
-        } else {
-            state.layers.insert(self.ordinal, layer);
+            let changed = state.rebuild(&base);
+            drop(state);
+            drop(base);
+            scope.notify(changed);
+            return Ok(());
         }
-        state.rebuild();
+        let changed = {
+            let mut state = self.shared.write();
+            if layer.is_empty() {
+                if state.layers.remove(&self.ordinal).is_none() {
+                    return Ok(());
+                }
+            } else {
+                state.layers.insert(self.ordinal, layer);
+            }
+            state.rebuild()
+        };
+        self.shared.notify_base_changed(changed);
         Ok(())
     }
 
@@ -852,6 +1178,18 @@ impl ProviderLayer {
     /// with `Error::ProviderUnavailable` before any credential lookup. Returns whether this
     /// layer has `id`.
     pub fn set_unavailable(&self, id: &str, reason: Option<String>) -> bool {
+        if let Some(scope) = &self.scope {
+            let mut state = scope.write();
+            let Some(layered) = state
+                .layers
+                .get_mut(&self.ordinal)
+                .and_then(|layer| layer.get_mut(id))
+            else {
+                return false;
+            };
+            layered.unavailable = reason;
+            return true;
+        }
         let mut state = self.shared.write();
         let Some(layered) = state
             .layers
@@ -868,16 +1206,36 @@ impl ProviderLayer {
     /// next-older layer with that id, else a `Models::register` registration, else a loaded
     /// provider. `None` when nothing beneath has that id. Newer layers are not considered.
     pub fn hidden(&self, provider: &str) -> Option<ProviderOrigin> {
-        let state = self.shared.read();
-        if state
+        let base = self.shared.read();
+        if let Some(scope) = &self.scope {
+            let state = scope.read();
+            if state
+                .layers
+                .range(..self.ordinal)
+                .any(|(_, layer)| layer.contains_key(provider))
+            {
+                return Some(ProviderOrigin::Layer);
+            }
+            if state.registered.contains_key(provider) {
+                return Some(ProviderOrigin::Registered);
+            }
+            if base
+                .layers
+                .values()
+                .any(|layer| layer.contains_key(provider))
+            {
+                return Some(ProviderOrigin::Layer);
+            }
+        } else if base
             .layers
             .range(..self.ordinal)
             .any(|(_, layer)| layer.contains_key(provider))
         {
-            Some(ProviderOrigin::Layer)
-        } else if state.registered.contains_key(provider) {
+            return Some(ProviderOrigin::Layer);
+        }
+        if base.registered.contains_key(provider) {
             Some(ProviderOrigin::Registered)
-        } else if state.loaded.providers.contains_key(provider) {
+        } else if base.loaded.providers.contains_key(provider) {
             Some(ProviderOrigin::Loaded)
         } else {
             None
@@ -887,9 +1245,23 @@ impl ProviderLayer {
 
 impl Drop for ProviderLayer {
     fn drop(&mut self) {
-        let mut state = self.shared.write();
-        if state.layers.remove(&self.ordinal).is_some() {
-            state.rebuild();
+        if let Some(scope) = &self.scope {
+            let base = self.shared.read();
+            let mut state = scope.write();
+            let changed = state.layers.remove(&self.ordinal).is_some() && state.rebuild(&base);
+            drop(state);
+            drop(base);
+            scope.notify(changed);
+            return;
+        }
+        let (removed, changed) = {
+            let mut state = self.shared.write();
+            let removed = state.layers.remove(&self.ordinal).is_some();
+            let changed = removed && state.rebuild();
+            (removed, changed)
+        };
+        if removed {
+            self.shared.notify_base_changed(changed);
         }
     }
 }
@@ -1121,7 +1493,7 @@ async fn build(
                 reasoning: false,
                 thinking_level_map: None,
                 input: vec![InputKind::Text],
-                cost: Cost::default(),
+                cost: None,
                 service_tiers: Default::default(),
                 context_window: 128_000,
                 max_tokens: 16_384,

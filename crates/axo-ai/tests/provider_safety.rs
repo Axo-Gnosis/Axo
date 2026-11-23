@@ -41,7 +41,7 @@ fn model(api: ApiKind, base_url: String) -> Model {
         reasoning: false,
         thinking_level_map: None,
         input: vec![InputKind::Text],
-        cost: Cost::default(),
+        cost: Some(Cost::default()),
         service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 4096,
@@ -320,7 +320,7 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
             };
             let (url, server) = server(200, "Content-Type: text/event-stream\r\n", &response);
             let mut model = model(api, url);
-            model.cost.input = 1_000_000.0; // One dollar per input token.
+            model.cost.as_mut().unwrap().input = 1_000_000.0; // One dollar per input token.
             if supported {
                 model.service_tiers.insert(Fast, 2.0);
             }
@@ -355,7 +355,7 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
             assert_eq!(message.service_tier, served, "{api:?}");
             assert_eq!(message.usage.input, 4, "{api:?}");
             assert_eq!(
-                message.usage.cost.total,
+                message.usage.cost.unwrap().total,
                 if served == Fast { 8.0 } else { 4.0 },
                 "{api:?}"
             );

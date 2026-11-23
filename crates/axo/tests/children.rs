@@ -170,6 +170,15 @@ async fn spawned_child_delivers_once_and_parks() {
     let weak = Arc::downgrade(&handle.session);
     drop(handle);
     until(|| weak.upgrade().is_none()).await;
+    assert_eq!(
+        host.axo.spawn_parent(&child_id).await.as_deref(),
+        Some(parent.id())
+    );
+    assert!(host.axo.spawn_parent(parent.id()).await.is_none());
+    assert!(
+        host.axo.observe_child(&child_id).is_none(),
+        "spawn_parent must not revive a parked child"
+    );
     let revived = within(host.axo.session(&child_id)).await.unwrap();
     assert_eq!(revived.id(), child_id);
     assert_eq!(revived.spawn_link().unwrap().depth, 1);

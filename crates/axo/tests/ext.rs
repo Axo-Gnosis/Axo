@@ -300,8 +300,8 @@ async fn models_complete_preserves_terminal_failure_details() {
         message.error_message = Some("provider interrupted".into());
         message.usage.output = 17;
         message.usage.total_tokens = 17;
-        message.usage.cost.output = 0.125;
-        message.usage.cost.total = 0.125;
+        message.usage.cost.as_mut().unwrap().output = 0.125;
+        message.usage.cost.as_mut().unwrap().total = 0.125;
         message.failure = Some(ProviderFailure {
             status: Some(429),
             code: Some("rate_limit".into()),
@@ -326,8 +326,8 @@ async fn models_complete_preserves_terminal_failure_details() {
     assert_eq!(details.stop_reason, StopReason::Aborted);
     assert_eq!(details.usage.output, 17);
     assert_eq!(details.usage.total_tokens, 17);
-    assert_eq!(details.usage.cost.output, 0.125);
-    assert_eq!(details.usage.cost.total, 0.125);
+    assert_eq!(details.usage.cost.unwrap().output, 0.125);
+    assert_eq!(details.usage.cost.unwrap().total, 0.125);
     assert_eq!(
         json!(details.failure),
         json!({"status":429, "code":"rate_limit", "retryAfterMs":125, "shouldRetry":true})
@@ -731,4 +731,140 @@ async fn failed_tool_invocation_waits_for_dropped_write_and_journals_it() {
         axo::file_records(&serde_json::from_value(result.clone()).unwrap()).len(),
         1
     );
+}
+
+#[tokio::test]
+async fn extension_submissions_record_provenance_live_and_in_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let axo = common::axo(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_text("user reply")),
+            ScriptedTurn::Reply(reply_text("ext prompt reply")),
+            ScriptedTurn::Reply(reply_text("ext follow-up reply")),
+        ],
+    )
+    .await;
+    let session = axo
+        .create_session(common::options(dir.path()))
+        .await
+        .unwrap();
+    let mut events = session.subscribe();
+
+    // Direct user prompt has provenance: None.
+    common::within(session.prompt("from user")).await.unwrap();
+
+    // Extension prompt, followUp, and post carry SubmissionProvenance::Extension.
+    let caller = Caller {
+        namespace: Some("my-ext".into()),
+    };
+    common::within(session.invoke("prompt", vec![json!("from ext")], &caller))
+        .await
+        .unwrap();
+    common::within(session.invoke(
+        "post",
+        vec![json!({
+            "customType": "note",
+            "text": "quiet note",
+            "display": true,
+            "delivery": "quiet"
+        })],
+        &caller,
+    ))
+    .await
+    .unwrap();
+    common::within(session.invoke("followUp", vec![json!("ext followup")], &caller))
+        .await
+        .unwrap();
+
+    // Wait for follow-up run to settle.
+    while session.is_running() {
+        let _ = events.recv().await;
+    }
+
+    let entries: Vec<_> = common::journal(&session)
+        .into_iter()
+        .filter(|line| line["type"] == "submission")
+        .collect();
+    assert_eq!(entries.len(), 4);
+    assert!(entries[0].get("provenance").is_none());
+    assert_eq!(
+        entries[1]["provenance"],
+        json!({"kind": "extension", "id": "my-ext"})
+    );
+    assert_eq!(
+        entries[2]["provenance"],
+        json!({"kind": "extension", "id": "my-ext"})
+    );
+    assert_eq!(entries[2]["custom"]["customType"], "my-ext:note");
+    assert_eq!(
+        entries[3]["provenance"],
+        json!({"kind": "extension", "id": "my-ext"})
+    );
+}
+
+#[tokio::test]
+async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let axo = common::axo(dir.path(), vec![]).await;
+    let scoped = Arc::new(axo.models().scoped());
+    let layer = scoped.provider_layer();
+    layer
+        .replace(vec![(
+            "@scope/folder-a/ext".into(),
+            axo_ai::Provider {
+                id: "folder-a".into(),
+                models: vec![axo_ai::Model {
+                    id: "local-1".into(),
+                    name: "Local 1".into(),
+                    api: axo_ai::ApiKind::OpenAiCompletions,
+                    provider: "folder-a".into(),
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: vec![axo_ai::InputKind::Text],
+                    cost: None,
+                    service_tiers: Default::default(),
+                    context_window: 8192,
+                    max_tokens: 1024,
+                    compat: Default::default(),
+                }],
+                env: Vec::new(),
+                requires_key: false,
+                login: None,
+                rewrite: None,
+            },
+            None,
+        )])
+        .unwrap();
+
+    // Base Axo cannot see folder-a/local-1; scoped session can.
+    let mut base_opts = common::options(dir.path());
+    base_opts.model = Some("folder-a/local-1".into());
+    assert!(axo.create_session(base_opts).await.is_err());
+
+    let mut scoped_opts = common::options(dir.path());
+    scoped_opts.models = Some(scoped.clone());
+    scoped_opts.model = Some("folder-a/local-1".into());
+    let session = axo.create_session(scoped_opts).await.unwrap();
+    assert_eq!(session.model().provider, "folder-a");
+    assert_eq!(session.model().id, "local-1");
+
+    // invoke_models sees the scoped provider while Axo::invoke("models", ..) does not.
+    let caller = Caller::default();
+    let found = axo
+        .invoke_models(
+            scoped.clone(),
+            "find",
+            vec![json!("folder-a/local-1")],
+            &caller,
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["id"], "local-1");
+    let missing = axo
+        .invoke("models", "find", vec![json!("folder-a/local-1")], &caller)
+        .await
+        .unwrap();
+    assert!(missing.is_null());
 }

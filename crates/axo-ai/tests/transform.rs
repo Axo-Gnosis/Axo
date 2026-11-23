@@ -17,7 +17,7 @@ fn model(api: ApiKind, provider: &str, id: &str, input: Vec<InputKind>) -> Model
         reasoning: true,
         thinking_level_map: None,
         input,
-        cost: Cost::default(),
+        cost: Some(Cost::default()),
         service_tiers: Default::default(),
         context_window: 200_000,
         max_tokens: 32_000,

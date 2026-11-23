@@ -260,19 +260,32 @@ impl SessionTable {
             .map(|slot| slot.seed.clone())
     }
 
+    /// The seed of a known child; an unknown id first waits for reopened sessions to
+    /// finish seeding their children.
+    async fn known_seed(&self, id: &str) -> Option<Arc<ChildSeed>> {
+        if let Some(seed) = self.seed_of(id) {
+            return Some(seed);
+        }
+        // A root opened moments ago may still be seeding its children.
+        let _ = self.reconciling.subscribe().wait_for(|n| *n == 0).await;
+        self.seed_of(id)
+    }
+
+    /// The parent session id of a known child, live or parked. Never revives it.
+    pub(crate) async fn parent_of(&self, id: &str) -> Option<String> {
+        self.known_seed(id)
+            .await
+            .map(|seed| seed.link.parent_session_id.clone())
+    }
+
     pub(crate) async fn session(&self, id: &str) -> Result<Arc<Session>, Error> {
         if let Some(session) = self.pin(id) {
             return Ok(session);
         }
-        let seed = match self.seed_of(id) {
-            Some(seed) => seed,
-            None => {
-                // A root opened moments ago may still be seeding its children.
-                let _ = self.reconciling.subscribe().wait_for(|n| *n == 0).await;
-                self.seed_of(id)
-                    .ok_or_else(|| Error::SessionNotFound(id.to_owned()))?
-            }
-        };
+        let seed = self
+            .known_seed(id)
+            .await
+            .ok_or_else(|| Error::SessionNotFound(id.to_owned()))?;
         let _gate = self.revive.lock().await;
         if let Some(session) = self.pin(id) {
             return Ok(session);

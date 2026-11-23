@@ -28,7 +28,7 @@ use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook,
 use crate::manifest::{PolicyHook, SessionDecl};
 use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Origin, Refusal};
 use crate::remote::{self, CALL_DEADLINE, Failure};
-use crate::{ExtensionDiagnostic, ExtensionEvent, Extensions, Inner, gate};
+use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionScope, Extensions, Inner, gate};
 
 /// The callable wire names for each extension object.
 pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
@@ -100,8 +100,8 @@ impl Extensions {
     /// Sets `options.layer` to the enabled extensions, replacing any layer the caller set.
     /// The host's own `options.definitions` rank after the extensions'. No I/O, starts nothing.
     pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
-        let contributions = self.inner.lock().contributions.clone();
-        options.layer = layer(&contributions, &Arc::downgrade(&self.inner));
+        let contributions = self.inner.effective_contributions();
+        options.layer = layer(&contributions);
         options
     }
 
@@ -120,6 +120,39 @@ impl Extensions {
     /// Composition diagnostics of the last apply to this session.
     pub fn session_diagnostics(&self, session_id: &str) -> Vec<String> {
         self.inner
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|attached| attached.diagnostics.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl ExtensionScope {
+    /// Sets `options.layer` to the parent manager's host-wide extensions followed by this
+    /// scope's extensions, and sets `options.models` to this scope's [`axo_ai::Models`] view.
+    /// No I/O, starts nothing.
+    pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
+        let contributions = self.inner().effective_contributions();
+        options.layer = layer(&contributions);
+        options.models = Some(self.models());
+        options
+    }
+
+    /// Tracks `session` in this scope for session actions and entry events and applies the
+    /// current `host + scope` composition as its layer.
+    pub async fn attach(&self, session: &Arc<Session>) {
+        self.inner().attach(session).await;
+    }
+
+    /// Stops tracking `session_id` in this scope; the session keeps what it has.
+    pub fn detach(&self, session_id: &str) {
+        self.inner().sessions.detach(session_id);
+    }
+
+    /// Composition diagnostics of the last apply to this session in this scope.
+    pub fn session_diagnostics(&self, session_id: &str) -> Vec<String> {
+        self.inner()
             .sessions
             .lock()
             .get(session_id)
@@ -158,21 +191,48 @@ impl Inner {
     }
 
     pub(super) async fn resolve_session(&self, id: &str) -> Result<Arc<Session>, InvokeError> {
-        match self.sessions.session(id) {
-            Ok(session) => Ok(session),
-            Err(missing) => self
+        if let Ok(session) = self.sessions.session(id) {
+            return Ok(session);
+        }
+        if self.scope.is_none() {
+            for scope in self.live_scopes() {
+                if let Ok(session) = scope.sessions.session(id) {
+                    return Ok(session);
+                }
+            }
+            let missing = InvokeError::NoSession(format!("session {id} is not attached"));
+            return self
                 .axo
                 .session(id)
                 .await
-                .map_err(|error| child_error(missing, error)),
+                .map_err(|error| child_error(missing, error));
         }
+        let missing = || InvokeError::NoSession(format!("session {id} is not attached"));
+        if !self.owns_session(id).await {
+            return Err(missing());
+        }
+        self.axo
+            .session(id)
+            .await
+            .map_err(|error| child_error(missing(), error))
+    }
+
+    /// Whether this scope owns `id`: it or its nearest attached spawn ancestor is attached here.
+    pub(super) async fn owns_session(&self, id: &str) -> bool {
+        let Some(meta) = &self.scope else {
+            return true;
+        };
+        meta.parent
+            .owner_of(id)
+            .await
+            .is_some_and(|owner| std::ptr::eq(Arc::as_ptr(&owner), self))
     }
 }
 
 /// Each contribution in enabled order, as one registration layer.
-fn layer(contributions: &[Arc<Contribution>], inner: &Weak<Inner>) -> Registrations {
+fn layer(contributions: &[(Weak<Inner>, Arc<Contribution>)]) -> Registrations {
     let mut parts = Registrations::default();
-    for c in contributions {
+    for (inner, c) in contributions {
         let remote = Remote {
             inner: inner.clone(),
             ext: c.ext.clone(),
@@ -239,7 +299,7 @@ fn layer(contributions: &[Arc<Contribution>], inner: &Weak<Inner>) -> Registrati
     }
     // Unlike the other registrations, definitions keep the first of a name.
     // ponytail: agents beat same-name teams here; ordered per-extension Definitions would preserve precedence across kinds.
-    for c in contributions.iter().rev() {
+    for (_, c) in contributions.iter().rev() {
         let defs = &mut parts.definitions;
         defs.agents.extend_from_slice(&c.definitions.agents);
         defs.teams.extend_from_slice(&c.definitions.teams);
@@ -275,12 +335,8 @@ async fn apply(inner: &Arc<Inner>, id: &str) {
     if session.spawn_link().is_some() {
         return;
     }
-    let contributions = if inner.closed.is_cancelled() {
-        Vec::new()
-    } else {
-        inner.lock().contributions.clone()
-    };
-    let layer = layer(&contributions, &Arc::downgrade(inner));
+    let contributions = inner.effective_contributions();
+    let layer = layer(&contributions);
     drop(contributions);
     let diagnostics: Vec<String> = match session.set_layer(layer).await {
         Ok(found) => found.iter().map(ToString::to_string).collect(),
@@ -302,8 +358,21 @@ async fn apply(inner: &Arc<Inner>, id: &str) {
     attached.diagnostics = diagnostics;
 }
 
-/// Reapplies the current composition to every live attached session.
+/// Reapplies the current composition to every live attached session (and, for the root
+/// manager, every live child scope's attached sessions).
 pub(crate) async fn reapply(inner: &Arc<Inner>) {
+    reapply_unit(inner).await;
+    if inner.scope.is_none() {
+        let scopes = inner.live_scopes();
+        join_all(scopes.iter().map(|scope| async {
+            let _config = scope.config.lock().await;
+            reapply_unit(scope).await;
+        }))
+        .await;
+    }
+}
+
+async fn reapply_unit(inner: &Arc<Inner>) {
     let ids: Vec<String> = {
         let mut sessions = inner.sessions.lock();
         sessions.retain(|_, attached| {
@@ -336,12 +405,11 @@ async fn pump(
                 let Some(strong) = inner.upgrade() else {
                     return;
                 };
-                let listeners: Vec<String> = strong
-                    .lock()
-                    .contributions
-                    .iter()
-                    .filter(|c| c.decl.events)
-                    .map(|c| c.ext.clone())
+                let listeners: Vec<(Weak<Inner>, String)> = strong
+                    .effective_contributions()
+                    .into_iter()
+                    .filter(|(_, c)| c.decl.events)
+                    .map(|(owner, c)| (owner, c.ext.clone()))
                     .collect();
                 drop(strong);
                 if listeners.is_empty() {
@@ -349,11 +417,8 @@ async fn pump(
                 }
                 let args = json!({ "sub": "entry", "session": id, "event": &*event });
                 let frames = std::iter::repeat_n(args, listeners.len());
-                for (ext, args) in listeners.into_iter().zip(frames) {
-                    let remote = Remote {
-                        inner: inner.clone(),
-                        ext,
-                    };
+                for ((owner, ext), args) in listeners.into_iter().zip(frames) {
+                    let remote = Remote { inner: owner, ext };
                     let _ = remote
                         .call("event", "stream", args, None, Some(CALL_DEADLINE))
                         .await;
@@ -644,6 +709,12 @@ impl Registry {
         }
     }
 
+    pub(crate) fn has(&self, id: &str) -> bool {
+        self.lock()
+            .get(id)
+            .is_some_and(|attached| attached.session.strong_count() > 0)
+    }
+
     fn session(&self, id: &str) -> Result<Arc<Session>, InvokeError> {
         let mut sessions = self.lock();
         let session = sessions.get(id).and_then(|a| a.session.upgrade());
@@ -657,7 +728,7 @@ impl Registry {
         session.ok_or_else(|| InvokeError::NoSession(format!("session {id} is not attached")))
     }
 
-    fn subscribe(
+    async fn subscribe(
         &self,
         inner: &Inner,
         origin: Origin,
@@ -670,7 +741,7 @@ impl Registry {
                 let stop = CancellationToken::new();
                 let events = inner
                     .axo
-                    .stream(completion, stop.clone())
+                    .stream_with(&inner.models, completion, stop.clone())
                     .map_err(axo::ext::InvokeError::from)?;
                 let guard = stop.clone().drop_guard();
                 return Ok(
@@ -681,15 +752,33 @@ impl Registry {
                 );
             }
         };
+        let allowed_child = self.has(&name) || inner.owns_session(&name).await;
         // Lock before lookup so detach cannot miss an attached session's subscription.
         let mut subs = self.subs();
-        let (events, stop) = match self.session(&name) {
-            Ok(session) => (session.subscribe(), CancellationToken::new()),
-            Err(_) => inner.axo.observe_child(&name).ok_or_else(|| Refusal {
+        let found = self.session(&name).ok().or_else(|| {
+            if inner.scope.is_none() {
+                inner
+                    .live_scopes()
+                    .into_iter()
+                    .find_map(|scope| scope.sessions.session(&name).ok())
+            } else {
+                None
+            }
+        });
+        let (events, stop) = match found {
+            Some(session) => (session.subscribe(), CancellationToken::new()),
+            None if allowed_child => inner.axo.observe_child(&name).ok_or_else(|| Refusal {
                 code: axo::ext::DispatchCode::NoSession.into(),
                 message: format!("session {name} is not attached or resident"),
                 details: None,
             })?,
+            None => {
+                return Err(Refusal {
+                    code: axo::ext::DispatchCode::NoSession.into(),
+                    message: format!("session {name} is not attached or resident"),
+                    details: None,
+                });
+            }
         };
         Ok(
             self.install(&mut subs, ext, Some(name), stop.clone(), |ext, id| {
@@ -845,7 +934,10 @@ impl Actions for Registry {
             let inner = inner.ok_or_else(unavailable)?;
             match method.as_str() {
                 "subscribe" => {
-                    return inner.sessions.subscribe(&inner, origin, ext, decode(args)?);
+                    return inner
+                        .sessions
+                        .subscribe(&inner, origin, ext, decode(args)?)
+                        .await;
                 }
                 "unsubscribe" => return inner.sessions.unsubscribe(&ext, decode(args)?),
                 "invoke" => {}
@@ -875,20 +967,27 @@ impl Actions for Registry {
                         .invoke(&invoke.method, invoke.args, &caller)
                         .await
                 }
-                "host" | "models" => {
+                "host" => {
                     if invoke.target.is_some() {
                         return Err(invalid());
                     }
-                    if invoke.object == "host"
-                        && let Some(call) = crate::lifecycle::lookup(&invoke.method)
-                    {
+                    if let Some(call) = crate::lifecycle::lookup(&invoke.method) {
                         return crate::run(call.invoke(inner, caller, invoke.args))
                             .await
                             .unwrap_or_else(|| Err(unavailable()));
                     }
                     inner
                         .axo
-                        .invoke(&invoke.object, &invoke.method, invoke.args, &caller)
+                        .invoke("host", &invoke.method, invoke.args, &caller)
+                        .await
+                }
+                "models" => {
+                    if invoke.target.is_some() {
+                        return Err(invalid());
+                    }
+                    inner
+                        .axo
+                        .invoke_models(inner.models.clone(), &invoke.method, invoke.args, &caller)
                         .await
                 }
                 other => {

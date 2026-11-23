@@ -1,11 +1,16 @@
+use axo_agent::RunOutcome;
 use axo_macros::expose;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{HostMessage, LiveSnapshot, Session, SpawnRequest, TeamRequest};
+use super::{
+    HostMessage, LiveSnapshot, PromptRequest, PromptResult, Session, SpawnRequest, TeamRequest,
+};
+use crate::coordination::SubmissionProvenance;
 use crate::ext::{Base64, Caller};
+use crate::input::PromptInput;
 use crate::jobs::{CommandOutput, JobRegistry};
-use crate::store::{page_limit, page_range};
+use crate::store::{SubmissionKind, page_limit, page_range};
 use crate::{Command, Error, OutputChunk, OutputProgress, SeqEntry, SpawnReceipt};
 
 /// A bounded page of raw command output and its latest progress.
@@ -58,18 +63,61 @@ impl<'a> SessionWire<'a> {
             None => custom_type,
         })
     }
+
+    fn provenance(&self) -> Option<SubmissionProvenance> {
+        self.caller
+            .namespace
+            .as_ref()
+            .map(|id| SubmissionProvenance::Extension { id: id.clone() })
+    }
 }
 
 #[expose(block = SESSION_WIRE, object = "session", target = Session)]
 impl SessionWire<'_> {
-    /// Posts a durable host message with the requested delivery timing.
+    /// Expands a `/skill args` invocation, saves the submission with caller provenance, and
+    /// runs the prompt; returns when the run settles.
+    #[ext]
+    pub async fn prompt(&self, input: PromptInput) -> Result<RunOutcome, Error> {
+        self.session.prompt_new(input, self.provenance()).await
+    }
+
+    /// `prompt`, deduplicated by `request_id`, recording caller provenance.
+    #[ext]
+    pub async fn prompt_with(&self, request: PromptRequest) -> Result<PromptResult, Error> {
+        self.session
+            .prompt_with_provenance(request, self.provenance())
+            .await
+    }
+
+    /// Saves and queues a steering message with caller provenance.
+    #[ext]
+    pub async fn steer(&self, input: PromptInput) -> Result<(), Error> {
+        self.session
+            .queue_with_provenance(SubmissionKind::Steer, input, self.provenance())
+            .await
+            .map(drop)
+    }
+
+    /// Saves and queues a follow-up message with caller provenance.
+    #[ext]
+    pub async fn follow_up(&self, input: PromptInput) -> Result<(), Error> {
+        self.session
+            .queue_with_provenance(SubmissionKind::FollowUp, input, self.provenance())
+            .await
+            .map(drop)
+    }
+
+    /// Posts a durable host message with the requested delivery timing and caller provenance.
     #[ext]
     pub async fn post(&self, message: HostMessage) -> Result<(), Error> {
         self.session
-            .post(HostMessage {
-                custom_type: self.scoped(message.custom_type)?,
-                ..message
-            })
+            .post_with_provenance(
+                HostMessage {
+                    custom_type: self.scoped(message.custom_type)?,
+                    ..message
+                },
+                self.provenance(),
+            )
             .await
     }
 

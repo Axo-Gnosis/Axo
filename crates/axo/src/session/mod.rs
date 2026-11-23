@@ -99,6 +99,9 @@ pub struct SessionOptions {
     /// A model selector (`provider/model`, `@role`, or thinking and tier suffixes alone);
     /// falls back to the session's last model, then the root agent's `model`, then `defaultModel`.
     pub model: Option<String>,
+    /// Overrides the host's model registry (and default streamer) for this session, its forks,
+    /// and its spawned children. `None` uses `Axo::models()`.
+    pub models: Option<Arc<Models>>,
     /// The root agent by name. `None` keeps the session's recorded agent (none for a new
     /// session); `Some` selects it, recording a change on reopen.
     pub agent: Option<String>,
@@ -142,6 +145,7 @@ impl Default for SessionOptions {
         Self {
             cwd: std::env::current_dir().unwrap_or_default(),
             model: None,
+            models: None,
             agent: None,
             definitions: Definitions::default(),
             keywords_enabled: true,
@@ -523,6 +527,9 @@ pub struct QueuedInput {
     /// `Prompt` (input requeued when the session reopened) is delivered like `Steer`.
     pub kind: SubmissionKind,
     pub parts: Vec<PromptPart>,
+    /// Who sent the input when it did not come from the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::coordination::SubmissionProvenance>,
     /// `Some` for a host `post` message; resubmit it with `Session::post`, not `steer`.
     pub custom: Option<store::SubmittedCustom>,
 }
@@ -533,6 +540,7 @@ impl QueuedInput {
             submission_id,
             kind,
             parts,
+            provenance,
             custom,
             ..
         } = entry
@@ -543,6 +551,7 @@ impl QueuedInput {
             submission_id: submission_id.clone(),
             kind: *kind,
             parts: parts.clone(),
+            provenance: provenance.clone(),
             custom: custom.clone(),
         })
     }

@@ -236,7 +236,7 @@ async fn catalog_rows_map_from_feed_data() {
         assert!(models.find(absent).is_none(), "{absent}");
     }
 
-    let cost = models.find("p/priced").unwrap().cost;
+    let cost = models.find("p/priced").unwrap().cost.unwrap();
     assert_eq!(cost.cache_write, 2.5);
     assert_eq!(cost.tiers.len(), 1);
     let tier = &cost.tiers[0];
@@ -501,7 +501,8 @@ async fn codex_models_come_from_the_account_list() {
         1
     );
     assert!(models.find("openai-codex/impostor").is_none());
-    assert_eq!((model.cost.input, model.cost.output), (3.0, 9.0));
+    let cost = model.cost.as_ref().unwrap();
+    assert_eq!((cost.input, cost.output), (3.0, 9.0));
     assert_eq!(
         supported_levels(&model),
         [ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
@@ -580,7 +581,7 @@ async fn explicit_windows_and_custom_models_bypass_price_caps() {
                             "api": "openai-codex-responses",
                             "baseUrl": "https://example.invalid",
                             "contextWindow": 600000,
-                            "cost": { "tiers": [{
+                            "cost": { "input": 1, "output": 2, "tiers": [{
                                 "inputTokensAbove": 100000,
                                 "input": 2, "output": 4,
                                 "cacheRead": 0, "cacheWrite": 0
@@ -705,4 +706,298 @@ async fn command_api_keys_are_configuration_errors() {
         models.auth(&models.find("openai-codex/gpt-6-sol").unwrap()).await,
         Err(Error::Config(message)) if message.contains("command config values")
     ));
+}
+
+#[tokio::test]
+async fn subscribe_and_scoped_views_isolate_and_propagate() {
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
+    let base = Models::load(ModelsOptions {
+        cache_dir: None,
+        extended_context: false,
+        config: ModelsConfig::default(),
+        credentials: credentials.clone(),
+        http_client: None,
+    })
+    .await
+    .unwrap();
+    let scope_a = base.scoped();
+    let scope_b = base.scoped();
+
+    let mut sub_base = base.subscribe();
+    let mut sub_a = scope_a.subscribe();
+    let mut sub_b = scope_b.subscribe();
+    assert_eq!(*sub_base.borrow(), 0);
+    assert_eq!(*sub_a.borrow(), 0);
+    assert_eq!(*sub_b.borrow(), 0);
+
+    // Unchanged reload does not wake subscribers.
+    base.reload(ModelsConfig::default(), false).await.unwrap();
+    assert!(!sub_base.has_changed().unwrap());
+    assert!(!sub_a.has_changed().unwrap());
+
+    // Scoped layer in A is visible only in A and wakes only A.
+    let layer_a = scope_a.provider_layer();
+    let make_provider = |id: &str, model_id: &str| axo_ai::Provider {
+        id: id.into(),
+        models: vec![axo_ai::Model {
+            id: model_id.into(),
+            name: model_id.into(),
+            api: axo_ai::ApiKind::OpenAiCompletions,
+            provider: id.into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![axo_ai::InputKind::Text],
+            cost: None,
+            service_tiers: Default::default(),
+            context_window: 8192,
+            max_tokens: 1024,
+            compat: Default::default(),
+        }],
+        env: Vec::new(),
+        requires_key: true,
+        login: None,
+        rewrite: None,
+    };
+    layer_a
+        .replace(vec![(
+            "@scope/a/ext".into(),
+            make_provider("acme", "a-model"),
+            None,
+        )])
+        .unwrap();
+    assert!(sub_a.has_changed().unwrap());
+    let _ = *sub_a.borrow_and_update();
+    assert!(!sub_base.has_changed().unwrap());
+    assert!(!sub_b.has_changed().unwrap());
+    assert!(scope_a.find("acme/a-model").is_some());
+    assert!(base.find("acme/a-model").is_none());
+    assert!(scope_b.find("acme/a-model").is_none());
+
+    // Scope B can register the same provider id with a different model and credential slot.
+    let layer_b = scope_b.provider_layer();
+    layer_b
+        .replace(vec![(
+            "@scope/b/ext".into(),
+            make_provider("acme", "b-model"),
+            None,
+        )])
+        .unwrap();
+    assert_eq!(
+        scope_a.credential_slot("acme").unwrap(),
+        "layer/@scope/a/ext/acme"
+    );
+    assert_eq!(
+        scope_b.credential_slot("acme").unwrap(),
+        "layer/@scope/b/ext/acme"
+    );
+    assert!(scope_b.find("acme/b-model").is_some());
+    assert!(scope_a.find("acme/b-model").is_none());
+
+    // Base registration propagates to base and both scopes.
+    base.register("host", make_provider("shared", "s-model"))
+        .unwrap();
+    assert!(sub_base.has_changed().unwrap());
+    assert!(sub_a.has_changed().unwrap());
+    assert!(sub_b.has_changed().unwrap());
+    assert!(scope_a.find("shared/s-model").is_some());
+    assert!(scope_b.find("shared/s-model").is_some());
+
+    // Dropping layer_a removes acme from A and bumps A's watch only.
+    let _ = *sub_base.borrow_and_update();
+    let _ = *sub_a.borrow_and_update();
+    let _ = *sub_b.borrow_and_update();
+    drop(layer_a);
+    assert!(sub_a.has_changed().unwrap());
+    assert!(!sub_base.has_changed().unwrap());
+    assert!(!sub_b.has_changed().unwrap());
+    assert!(scope_a.find("acme/a-model").is_none());
+    assert!(scope_b.find("acme/b-model").is_some());
+}
+
+#[tokio::test]
+async fn logout_removes_credential_and_clears_codex_cache() {
+    use axo_ai::CredentialStore;
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
+    tokio::fs::write(
+        dir.path().join("codex-models.json"),
+        serde_json::to_vec(&serde_json::json!([
+            {
+                "id": "account-only",
+                "name": "Account Only",
+                "contextWindow": 8192,
+                "image": false,
+                "efforts": []
+            }
+        ]))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let models = Models::load(ModelsOptions {
+        cache_dir: Some(dir.path().to_path_buf()),
+        extended_context: false,
+        config: ModelsConfig::parse_jsonc(r#"{"refreshInterval":0}"#).unwrap(),
+        credentials: credentials.clone(),
+        http_client: None,
+    })
+    .await
+    .unwrap();
+    let mut sub = models.subscribe();
+    let slot = models.credential_slot("openai-codex").unwrap();
+    credentials
+        .set(
+            &slot,
+            axo_ai::Credential::ApiKey {
+                key: "secret".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(models.find("openai-codex/account-only").is_some());
+    // Unknown Codex account model has unknown cost (None), distinct from $0.
+    assert_eq!(models.find("openai-codex/account-only").unwrap().cost, None);
+
+    // Unknown provider fails with Error::Config.
+    assert!(matches!(
+        models.logout("no-such-provider").await,
+        Err(Error::Config(_))
+    ));
+
+    // Logout removes credential, deletes codex-models.json, rebuilds from floor, and bumps S.
+    models.logout("openai-codex").await.unwrap();
+    assert!(credentials.get(&slot).await.unwrap().is_none());
+    assert!(!dir.path().join("codex-models.json").exists());
+    assert!(models.find("openai-codex/account-only").is_none());
+    assert!(models.find("openai-codex/gpt-6-sol").is_some());
+    assert!(sub.has_changed().unwrap());
+
+    // Second logout with no stored credential is a no-op Ok(()).
+    let _ = *sub.borrow_and_update();
+    models.logout("openai-codex").await.unwrap();
+    assert!(!sub.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn logout_reports_cache_removal_failure() {
+    use axo_ai::CredentialStore;
+    let dir = tempfile::tempdir().unwrap();
+    // A directory in the cache file's place makes its deletion fail.
+    std::fs::create_dir(dir.path().join("codex-models.json")).unwrap();
+    let credentials = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
+    let models = Models::load(ModelsOptions {
+        cache_dir: Some(dir.path().to_path_buf()),
+        extended_context: false,
+        config: ModelsConfig::parse_jsonc(r#"{"refreshInterval":0}"#).unwrap(),
+        credentials: credentials.clone(),
+        http_client: None,
+    })
+    .await
+    .unwrap();
+    let slot = models.credential_slot("openai-codex").unwrap();
+    credentials
+        .set(
+            &slot,
+            axo_ai::Credential::ApiKey {
+                key: "secret".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        models.logout("openai-codex").await,
+        Err(Error::Io(_))
+    ));
+    assert!(credentials.get(&slot).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn unknown_vs_free_cost_in_catalog_and_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = json!({
+        "p": {
+            "models": {
+                "unpriced": dev_row("chat-completions", "@ai-sdk/openai-compatible", json!({})),
+                "free": dev_row(
+                    "chat-completions",
+                    "@ai-sdk/openai-compatible",
+                    json!({"cost": {"text": {"input": {"price": 0.0}, "output": {"price": 0.0}}}})
+                ),
+            }
+        }
+    });
+    tokio::fs::write(
+        dir.path().join("models.dev.v2.json"),
+        serde_json::to_vec(&catalog).unwrap(),
+    )
+    .await
+    .unwrap();
+    let models = load(dir.path(), json!({"refreshInterval": 0}), false).await;
+    assert_eq!(models.find("p/unpriced").unwrap().cost, None);
+    assert_eq!(
+        models.find("p/free").unwrap().cost,
+        Some(axo_ai::Cost::default())
+    );
+
+    // A cost patch on an unpriced model must name both prices; cache prices default to 0.
+    let patched = |cost: Value| {
+        serde_json::from_value(json!({
+            "refreshInterval": 0,
+            "providers": {"p": {"modelOverrides": {"unpriced": {"cost": cost}}}}
+        }))
+        .unwrap()
+    };
+    let options = |config| ModelsOptions {
+        cache_dir: Some(dir.path().to_path_buf()),
+        extended_context: false,
+        config,
+        credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+        http_client: None,
+    };
+    match Models::load(options(patched(json!({"input": 3})))).await {
+        Err(Error::Config(message)) => assert!(message.contains("needs both"), "{message}"),
+        other => panic!("expected a config error, got {:?}", other.err()),
+    }
+    let priced = Models::load(options(patched(json!({"input": 3, "output": 9}))))
+        .await
+        .unwrap();
+    assert_eq!(
+        priced.find("p/unpriced").unwrap().cost,
+        Some(axo_ai::Cost {
+            input: 3.0,
+            output: 9.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            tiers: vec![],
+        })
+    );
+
+    let mut total = axo_ai::Usage::default();
+    let priced = axo_ai::Usage {
+        input: 10,
+        output: 5,
+        total_tokens: 15,
+        cost: Some(axo_ai::UsageCost {
+            input: 0.01,
+            output: 0.02,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: 0.03,
+        }),
+        ..Default::default()
+    };
+    total += &priced;
+    assert_eq!(total.cost.unwrap().total, 0.03);
+    let unpriced = axo_ai::Usage {
+        input: 10,
+        output: 5,
+        total_tokens: 15,
+        cost: None,
+        ..Default::default()
+    };
+    total += &unpriced;
+    assert_eq!(total.cost, None);
 }

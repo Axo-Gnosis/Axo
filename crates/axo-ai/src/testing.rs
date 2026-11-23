@@ -30,7 +30,7 @@ pub fn scripted_model() -> Model {
         reasoning: false,
         thinking_level_map: None,
         input: vec![InputKind::Text],
-        cost: Cost::default(),
+        cost: Some(Cost::default()),
         service_tiers: Default::default(),
         context_window: 100_000,
         max_tokens: 4096,

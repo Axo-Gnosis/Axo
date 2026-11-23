@@ -3,14 +3,22 @@
 use crate::model::Model;
 use crate::types::{ServiceTier, Usage, UsageCost};
 
-/// Compute `usage.cost` from the model's prices, store it, and return it.
+/// Compute `usage.cost` from the model's prices, store it, and return it. `None` when the
+/// model's pricing is unknown.
 ///
 /// The highest pricing tier whose input threshold the request exceeds applies to the
 /// whole request. 1h cache writes cost twice the base input price (Anthropic). `tier` is
 /// the service tier that served the response; its multiplier scales every component.
-pub(crate) fn calculate_cost(model: &Model, usage: &mut Usage, tier: ServiceTier) -> UsageCost {
+pub(crate) fn calculate_cost(
+    model: &Model,
+    usage: &mut Usage,
+    tier: ServiceTier,
+) -> Option<UsageCost> {
+    let Some(cost) = &model.cost else {
+        usage.cost = None;
+        return None;
+    };
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
-    let cost = &model.cost;
     let (mut input, mut output, mut cache_read, mut cache_write) =
         (cost.input, cost.output, cost.cache_read, cost.cache_write);
     let mut matched: Option<u64> = None;
@@ -36,6 +44,6 @@ pub(crate) fn calculate_cost(model: &Model, usage: &mut Usage, tier: ServiceTier
         total: 0.0,
     };
     result.total = result.input + result.output + result.cache_read + result.cache_write;
-    usage.cost = result;
-    result
+    usage.cost = Some(result);
+    Some(result)
 }
