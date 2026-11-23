@@ -115,7 +115,7 @@ impl ChildHandle {
 
 #[expose(block = TEAM_HANDLE_BLOCK, object = "types")]
 impl TeamHandle {
-    #[ext(skip = "live child handle; session.spawn returns the receipt")]
+    #[ext(skip = "live team handle; session.spawnTeam returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
         SpawnReceipt::Team {
             team: self.team.clone(),

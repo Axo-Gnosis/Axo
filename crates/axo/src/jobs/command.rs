@@ -214,7 +214,9 @@ impl CommandOutput {
     }
 
     /// The raw log file being read.
-    #[ext(skip = "live reader; session.commandOutput returns them in one page")]
+    #[ext(
+        skip = "live reader's local file; session.commandOutput and session.jobOutput return output bytes, not the path"
+    )]
     pub fn path(&self) -> &Path {
         &self.path
     }

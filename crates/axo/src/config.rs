@@ -285,7 +285,9 @@ impl Settings {
     }
 
     /// Resolves a model selector, expanding a user-defined `@role` if present.
-    #[ext(skip = "takes the live registry; session.setModel and models.complete resolve selectors")]
+    #[ext(
+        skip = "takes the live registry; the model command via session.runCommand and both models.complete and models.stream resolve selectors"
+    )]
     pub fn resolve_model(&self, models: &Models, selector: &str) -> Result<ModelChoice, Error> {
         let Some(rest) = selector.strip_prefix('@') else {
             return plain(models, selector);

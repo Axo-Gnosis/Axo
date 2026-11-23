@@ -151,7 +151,7 @@ pub enum ErrorCode {
 
 #[expose(block = ERROR_BLOCK, object = "types")]
 impl Error {
-    #[ext(skip = "errors cross as { code, message }")]
+    #[ext(skip = "errors cross as { code, message, details? }")]
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Ai(_) => ErrorCode::Ai,

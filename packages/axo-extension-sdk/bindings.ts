@@ -5059,7 +5059,7 @@ export interface Session {
    * entries. Reading it promotes nothing.
    */
   tools(signal?: AbortSignal): Promise<SessionToolsResult_Serialize>;
-  // withheld: schemes — live registry; exposed as its own object
+  // withheld: schemes — live registry; scheme operations are on tools (e.g. parseUrl, exactUrl, locate, readFile)
   /**
    * The commands a host may offer: built-ins, modes, registered commands, then unhidden
    * skills.

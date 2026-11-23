@@ -2633,7 +2633,9 @@ impl Session {
 
     /// This session's URL schemes: recognize with `exact`, resolve files with `resolve`,
     /// or read UTF-8 text from either file or virtual targets with `read`.
-    #[ext(skip = "live registry; exposed as its own object")]
+    #[ext(
+        skip = "live registry; scheme operations are on tools (e.g. parseUrl, exactUrl, locate, readFile)"
+    )]
     pub fn schemes(&self) -> &Schemes {
         &self.hooks.tools.schemes
     }

@@ -46,6 +46,7 @@ uuid.workspace = true
 [dev-dependencies]
 axo-agent = { path = "../axo-agent" }
 axo-ai = { path = "../axo-ai", features = ["testing"] }
+axo-extensions = { path = "../axo-extensions" }
 jsonc-parser.workspace = true
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 syn.workspace = true

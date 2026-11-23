@@ -96,6 +96,7 @@ dependencies = [
  "async-trait",
  "axo-agent",
  "axo-ai",
+ "axo-extensions",
  "axo-macros",
  "base64",
  "futures",

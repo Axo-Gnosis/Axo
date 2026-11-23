@@ -4,6 +4,8 @@
 
 Extensions are trusted code; nothing here is a sandbox.
 
+Wire arguments are positional. `?` marks a parameter that accepts `null` and can be omitted if trailing.
+
 ## session
 
 | Method | Parameters | Summary |
@@ -85,7 +87,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | SESSION_CORE::custom | namespaced per caller; see the wire method |
 | SESSION_CORE::command_output | live reader; the wire method reads one page |
 | SESSION_CORE::job_output | live reader; the wire method reads one page |
-| SESSION_CORE::schemes | live registry; exposed as its own object |
+| SESSION_CORE::schemes | live registry; scheme operations are on tools (e.g. parseUrl, exactUrl, locate, readFile) |
 | SESSION_CORE::set_commands | replaces the host's own registrations; extensions register through their manifest |
 | SESSION_CORE::parse_command | nested result; the wire method flattens it |
 | SESSION_CORE::shutdown | lifecycle belongs to the host |
@@ -235,7 +237,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | EFFECTIVE_CONFIG_BLOCK::default_model | derivable from the value in TypeScript |
 | ENABLED_EXTENSION_BLOCK::validate_all | no receiver; validates the host's own extension list |
 | PROJECT_SETTINGS_BLOCK::access_for | derivable from the value in TypeScript |
-| SETTINGS_BLOCK::resolve_model | takes the live registry; session.setModel and models.complete resolve selectors |
+| SETTINGS_BLOCK::resolve_model | takes the live registry; the model command via session.runCommand and both models.complete and models.stream resolve selectors |
 | AGENT_DEF_BLOCK::name | derivable from the value in TypeScript |
 | AGENT_SPEC_BLOCK::parse | no receiver; served by host.parseAgent |
 | RUN_AS_BLOCK::is_any | derivable from the value in TypeScript |
@@ -251,9 +253,9 @@ Extensions are trusted code; nothing here is a sandbox.
 | MODE_SPEC_BLOCK::parse | no receiver; served by host.parseMode |
 | TOOL_LIMITS_BLOCK::permits | derivable from the value in TypeScript |
 | TOOL_LIMITS_BLOCK::is_empty | derivable from the value in TypeScript |
-| ERROR_BLOCK::code | errors cross as { code, message } |
+| ERROR_BLOCK::code | errors cross as { code, message, details? } |
 | JOB_STATUS_BLOCK::label | derivable from the value in TypeScript |
-| COMMAND_OUTPUT_BLOCK::path | live reader; session.commandOutput returns them in one page |
+| COMMAND_OUTPUT_BLOCK::path | live reader's local file; session.commandOutput and session.jobOutput return output bytes, not the path |
 | COMMAND_OUTPUT_BLOCK::open | construction or internal state rebuilding with no meaning across the wire |
 | COMMAND_OUTPUT_BLOCK::read_chunks | live reader; session.commandChunks |
 | COMMAND_OUTPUT_BLOCK::job | live reader; session.commandOutput returns them in one page |
@@ -276,7 +278,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | PROJECTION_BLOCK::apply | construction or internal state rebuilding with no meaning across the wire |
 | SESSION_EVENT_BLOCK::kind | derivable from the value in TypeScript |
 | CHILD_HANDLE_BLOCK::receipt | live child handle; session.spawn returns the receipt |
-| TEAM_HANDLE_BLOCK::receipt | live child handle; session.spawn returns the receipt |
+| TEAM_HANDLE_BLOCK::receipt | live team handle; session.spawnTeam returns the receipt |
 | SCHEMES_BLOCK::new | construction or internal state rebuilding with no meaning across the wire |
 | SCHEMES_BLOCK::context | served by tools.schemeContext |
 | SCHEMES_BLOCK::artifacts | live handle; tools.allocateArtifact |
@@ -324,5 +326,5 @@ Extensions are trusted code; nothing here is a sandbox.
 ## Served by the extension bridge
 
 - session: subscribe.
-- host: session lifecycle methods (create, open, fork, close), typed as HostLifecycle in the SDK bindings. Without a lifecycle hook, these calls are refused with no_lifecycle.
+- host: `createSession(cwd, request?)`, `openSession(path, request?)`, `forkSession(sessionId, entryId)`, and `closeSession(sessionId)`, typed as `HostLifecycle` in the SDK bindings. Without a lifecycle hook, these calls are refused with `no_lifecycle`.
 - models: stream.
