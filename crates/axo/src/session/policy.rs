@@ -97,6 +97,11 @@ pub trait ToolPolicy: Send + Sync {
     ) -> Result<Option<AfterToolCallResult>, ToolError> {
         Ok(None)
     }
+
+    /// Who registered this policy; attached to the calls it blocks.
+    fn origin(&self) -> Option<&str> {
+        None
+    }
 }
 
 pub(super) type ScopeCell = Mutex<Arc<ToolScope>>;
@@ -123,9 +128,22 @@ impl ToolHooks for PolicyHook {
         call: BeforeToolCallContext<'_>,
         cancel: &CancellationToken,
     ) -> Result<ToolCallDecision, ToolError> {
-        self.policy
+        let decision = self
+            .policy
             .before_tool_call(&self.scope(), call, cancel)
-            .await
+            .await?;
+        Ok(match decision {
+            ToolCallDecision::Block {
+                reason,
+                terminate,
+                origin: None,
+            } => ToolCallDecision::Block {
+                reason,
+                terminate,
+                origin: self.policy.origin().map(str::to_owned),
+            },
+            decision => decision,
+        })
     }
 
     async fn after_tool_call(
@@ -179,6 +197,7 @@ impl ToolHooks for ModeGate {
             return Ok(ToolCallDecision::Block {
                 reason: Some(format!("{name} is unavailable in mode \"{}\".", mode.name)),
                 terminate: false,
+                origin: None,
             });
         }
         Ok(ToolCallDecision::Allow)

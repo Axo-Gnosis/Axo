@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
@@ -18,7 +18,8 @@ use axo::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::process::usable_bun;
+use crate::process::BunPath;
+use crate::{ExtensionProblem, ProblemKind, problem};
 
 /// Relative to the package; written only after a successful install.
 const STAMP: &str = "node_modules/.axo-install";
@@ -134,7 +135,7 @@ pub async fn install(
 /// Serializes installs per extension and remembers failures, so an unchanged broken package
 /// is not reinstalled on every rescan or call.
 pub struct Deps {
-    bun: Option<PathBuf>,
+    bun: BunPath,
     env: Arc<EnvMap>,
     supervisor: Arc<ProcessSupervisor>,
     /// Per-authored-extension locks; a lock remains interned while anyone can wait for it.
@@ -147,11 +148,11 @@ pub struct Deps {
 struct InstallFailure {
     admission: u64,
     fingerprint: String,
-    reason: String,
+    reason: ExtensionProblem,
 }
 
 impl Deps {
-    pub fn new(bun: Option<PathBuf>, env: Arc<EnvMap>, supervisor: Arc<ProcessSupervisor>) -> Self {
+    pub fn new(bun: BunPath, env: Arc<EnvMap>, supervisor: Arc<ProcessSupervisor>) -> Self {
         Self {
             bun,
             env,
@@ -183,13 +184,16 @@ impl Deps {
         admission: u64,
         package: &Path,
         started: impl FnOnce(),
-        finished: impl FnOnce(&Result<bool, String>),
-    ) -> Result<bool, String> {
+        finished: impl FnOnce(&Result<bool, ExtensionProblem>),
+    ) -> Result<bool, ExtensionProblem> {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
         let result = async {
-            let named = |error: String| format!("extension {id}: {error}");
-            let Some(fingerprint) = fingerprint(package).await.map_err(named)? else {
+            let named = |kind, error: String| problem(kind, format!("extension {id}: {error}"));
+            let Some(fingerprint) = fingerprint(package)
+                .await
+                .map_err(|error| named(ProblemKind::Invalid, error))?
+            else {
                 return Ok(false);
             };
             if stamped(package, &fingerprint).await {
@@ -202,14 +206,15 @@ impl Deps {
                 return Err(failed.reason.clone());
             }
             started();
-            let result = match usable_bun(self.bun.as_deref()).await {
-                Ok(bun) => install(bun, &self.env, &self.supervisor, package, false).await,
-                Err(error) => Err(error),
+            let result = match self.bun.usable().await {
+                Ok(bun) => install(&bun, &self.env, &self.supervisor, package, false)
+                    .await
+                    .map_err(|error| named(ProblemKind::DependencyInstall, error)),
+                Err(unusable) => Err(named(ProblemKind::Bun, unusable.message)),
             };
             match result {
                 Ok(()) => Ok(true),
-                Err(error) => {
-                    let reason = named(error);
+                Err(reason) => {
                     self.failures().insert(
                         id.to_owned(),
                         InstallFailure {

@@ -558,6 +558,24 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     .unwrap();
     assert_eq!(models.find("lab/a"), Some(a_model.clone()));
     assert!(models.find("lab/native").is_none());
+    assert_eq!(
+        models
+            .providers()
+            .iter()
+            .find(|info| info.id == "lab")
+            .unwrap()
+            .origin,
+        ProviderOrigin::Layer
+    );
+    assert_eq!(
+        models
+            .providers()
+            .iter()
+            .find(|info| info.id == "openai-codex")
+            .unwrap()
+            .origin,
+        ProviderOrigin::Loaded
+    );
 
     let b = models.provider_layer();
     assert_eq!(b.hidden("lab"), Some(ProviderOrigin::Layer));
@@ -664,6 +682,15 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     assert!(Arc::ptr_eq(&emptied, &models.all()));
     drop(a);
     assert_eq!(models.find("lab/changed"), Some(changed));
+    assert_eq!(
+        models
+            .providers()
+            .iter()
+            .find(|info| info.id == "lab")
+            .unwrap()
+            .origin,
+        ProviderOrigin::Registered
+    );
     assert!(models.find("lab/a").is_none());
     assert!(models.find("lab/native").is_none());
     drop(b);

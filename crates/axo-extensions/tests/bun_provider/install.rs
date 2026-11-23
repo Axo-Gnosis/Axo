@@ -35,7 +35,7 @@ pub async fn run(bun: &Path, mode: Supervision) {
     host.copy_fixture(FIXTURE, &source, INSTALLED);
     let installed = host
         .extensions
-        .install(&source, "test", false)
+        .install(&source, "test", None, false)
         .await
         .unwrap();
     assert_eq!(installed.id, INSTALLED);
@@ -46,7 +46,7 @@ pub async fn run(bun: &Path, mode: Supervision) {
     let record: Value =
         serde_json::from_str(&std::fs::read_to_string(store.join("install.json")).unwrap())
             .unwrap();
-    let version = store.join(record["current"].as_str().unwrap());
+    let version = store.join(record["current"]["folder"].as_str().unwrap());
     let bundle = host.path("root").join(BUNDLED);
     let mut env = EnvMap::new();
     env.insert("HOME".into(), host.path("home").into());

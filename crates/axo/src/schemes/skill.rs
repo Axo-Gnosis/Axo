@@ -88,6 +88,7 @@ mod tests {
             path: path.into(),
             disable_model_invocation: false,
             argument_hint: None,
+            origin: None,
         })
         .collect();
         let scheme = SkillScheme::new(Arc::new(LiveDefinitions::new(ResolvedDefinitions {

@@ -565,6 +565,12 @@ export type CommandInfo_Deserialize = {
 	name: string,
 	description: string,
 	policy: CommandPolicy,
+	/**
+	 *  Who registered it ([`RegisteredCommand::origin`], [`Skill::origin`],
+	 *  [`ModeSpec::origin`]); `None` for built-ins, definition files and unlabeled
+	 *  registrations.
+	 */
+	origin?: string | null,
 } & CommandKind_Deserialize;
 
 /**  One entry of the command catalog; hosts expose whichever entries they want, in any form. */
@@ -572,6 +578,12 @@ export type CommandInfo_Serialize = {
 	name: string,
 	description: string,
 	policy: CommandPolicy,
+	/**
+	 *  Who registered it ([`RegisteredCommand::origin`], [`Skill::origin`],
+	 *  [`ModeSpec::origin`]); `None` for built-ins, definition files and unlabeled
+	 *  registrations.
+	 */
+	origin: string | null,
 } & CommandKind_Serialize;
 
 export type CommandKind = CommandKind_Serialize | CommandKind_Deserialize;
@@ -2407,6 +2419,8 @@ export type ModeSpec_Deserialize = {
 	/**  The instructions (trimmed). */
 	body: string,
 	path?: string | null,
+	/**  Who supplied it in code; `None` for a mode read from a definition root. */
+	origin?: string | null,
 };
 
 /**
@@ -2437,6 +2451,8 @@ export type ModeSpec_Serialize = {
 	/**  The instructions (trimmed). */
 	body: string,
 	path: string | null,
+	/**  Who supplied it in code; `None` for a mode read from a definition root. */
+	origin: string | null,
 };
 
 export type Model = Model_Serialize | Model_Deserialize;
@@ -2913,7 +2929,18 @@ export type ProviderInfo = {
 	requiresKey: boolean,
 	/**  The provider supports `Models::login`. */
 	login: boolean,
+	/**  The winning contributor of this id. */
+	origin: ProviderOrigin,
 };
+
+/**  Where a provider comes from: see [`ProviderInfo::origin`] and [`ProviderLayer::hidden`]. */
+export type ProviderOrigin = 
+/**  An older `ProviderLayer`. */
+"layer" | 
+/**  A `Models::register` registration. */
+"registered" | 
+/**  The loaded catalog (models.dev, Codex, `models.jsonc`). */
+"loaded";
 
 export type QuestionOption = QuestionOption_Serialize | QuestionOption_Deserialize;
 
@@ -3923,6 +3950,8 @@ export type Skill_Deserialize = {
 	disableModelInvocation: boolean,
 	/**  `argument-hint`: placeholder text shown after `/name` until arguments are typed. */
 	argumentHint?: string | null,
+	/**  Who supplied it in code; `None` for a skill read from a definition root. */
+	origin?: string | null,
 };
 
 /**  One discovered skill. */
@@ -3935,6 +3964,8 @@ export type Skill_Serialize = {
 	disableModelInvocation: boolean,
 	/**  `argument-hint`: placeholder text shown after `/name` until arguments are typed. */
 	argumentHint: string | null,
+	/**  Who supplied it in code; `None` for a skill read from a definition root. */
+	origin: string | null,
 };
 
 /**

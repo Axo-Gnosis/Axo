@@ -9,6 +9,7 @@
 mod deps;
 mod lifecycle;
 mod manifest;
+mod origin;
 mod peer;
 mod placement;
 mod process;
@@ -21,8 +22,13 @@ mod wire_value;
 pub use lifecycle::{
     ForkReceipt, Forked, Lifecycle, LifecycleSession, SessionRequest, lifecycle_methods,
 };
+pub use manifest::{
+    CommandDecl, ExtensionPackage, PolicyHook, ProviderDecl, SchemeDecl, SessionDecl, ToolDecl,
+    inspect_package,
+};
+pub use origin::ExtensionOrigin;
 pub use remote::Failure;
-pub use store::{InstallError, InstalledExtension};
+pub use store::{InstallError, InstalledCopy, InstalledExtension};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -41,9 +47,10 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::deps::Deps;
-use crate::manifest::{Descriptor, Member};
+use crate::manifest::Member;
 use crate::peer::Actions;
 use crate::placement::{Placement, Prepare};
+use crate::process::BunPath;
 use crate::session::Contribution;
 
 const EVENT_CAPACITY: usize = 256;
@@ -79,7 +86,8 @@ pub fn wire_types(types: specta::Types) -> specta::Types {
 /// discovered from the working directory, `PATH` or home directories.
 #[derive(Debug, Clone)]
 pub struct ExtensionOptions {
-    /// The Bun executable. `None` leaves every extension `Unavailable`.
+    /// The Bun executable at construction; change it later with [`Extensions::set_bun`].
+    /// `None` leaves every extension `Unavailable`.
     pub bun: Option<PathBuf>,
     /// Package roots searched in order for `<root>/<id>/extension.json` (authored extensions).
     pub roots: Vec<PathBuf>,
@@ -133,8 +141,51 @@ pub struct ExtensionStatus {
     pub group: Option<String>,
     pub generation: u64,
     pub phase: ExtensionPhase,
-    /// A safe, human-readable reason for `Disabled`/`Unavailable` (and restarts).
-    pub reason: Option<String>,
+    /// Why it is not running. Set for `Disabled`, `Unavailable` and `Restarting`.
+    pub problem: Option<ExtensionProblem>,
+}
+
+/// Why an extension is not running. Key on `kind`; `message` is safe, human-readable text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExtensionProblem {
+    pub kind: ProblemKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProblemKind {
+    /// No Bun configured, or the configured path is not an executable file.
+    Bun,
+    /// No package: no `<root>/<id>/extension.json`, or not installed.
+    NotFound,
+    /// The package is present but rejected: manifest, SDK, sections, definitions, entry,
+    /// install record or `package.json`.
+    Invalid,
+    /// `auto_install` is off and dependencies are missing or stale.
+    DependenciesMissing,
+    /// `bun install` failed or timed out; `message` carries the end of its stderr.
+    DependencyInstall,
+    /// The extension's own activation was rejected.
+    Load,
+    /// The runner died, hung or failed its handshake.
+    Crash,
+    /// Host inputs prevent running: no store, runtime directory, socket path, spawn, data
+    /// directory.
+    Setup,
+}
+
+pub(crate) fn problem(kind: ProblemKind, message: impl Into<String>) -> ExtensionProblem {
+    ExtensionProblem {
+        kind,
+        message: message.into(),
+    }
+}
+
+/// A provider an extension unit currently publishes, and the enabled extension that wins it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExtensionProvider {
+    pub provider: String,
+    pub extension: String,
 }
 
 /// `winner` (an extension ID) hides `hidden` for `provider`. A snapshot from the last
@@ -277,6 +328,8 @@ struct Inner {
     lifecycle: Mutex<Option<Arc<dyn Lifecycle>>>,
     layer: ProviderLayer,
     supervisor: Arc<ProcessSupervisor>,
+    /// Shared with every scope, placement and install of the root manager.
+    bun: BunPath,
     options: ExtensionOptions,
     /// Serializes configuration changes and attachment so their live applies cannot cross.
     config: tokio::sync::Mutex<()>,
@@ -318,7 +371,7 @@ struct State {
     /// Authored extensions whose dependencies are being installed.
     installing: HashSet<String>,
     /// Authored extensions whose last dependency install failed, with the reason.
-    install_failed: HashMap<String, String>,
+    install_failed: HashMap<String, ExtensionProblem>,
 }
 
 impl State {
@@ -338,15 +391,15 @@ impl State {
                 group: ext.group.clone(),
                 generation: 0,
                 phase: ExtensionPhase::Cold,
-                reason: None,
+                problem: None,
             });
         if !matches!(
             status.phase,
             ExtensionPhase::Unavailable | ExtensionPhase::Disabled
         ) {
-            if let Some(reason) = self.install_failed.get(&ext.id) {
+            if let Some(problem) = self.install_failed.get(&ext.id) {
                 status.phase = ExtensionPhase::Disabled;
-                status.reason = Some(reason.clone());
+                status.problem = Some(problem.clone());
             } else if matches!(
                 status.phase,
                 ExtensionPhase::Cold | ExtensionPhase::Starting
@@ -408,7 +461,7 @@ struct Binding {
     ext: String,
     /// The placement serving it; `None` when the winner cannot run.
     serial: Option<u64>,
-    descriptor: Descriptor,
+    descriptor: ProviderDecl,
     provider: Provider,
     retired: CancellationToken,
     /// The registry gate currently published for it.
@@ -419,15 +472,17 @@ impl Extensions {
     pub fn new(axo: Arc<Axo>, options: ExtensionOptions) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let models = Arc::clone(axo.models());
+        let bun = BunPath::new(options.bun.clone());
         Self {
             inner: Arc::new_cyclic(|inner| Inner {
                 layer: models.provider_layer(),
                 supervisor: axo.supervisor(),
                 deps: Arc::new(Deps::new(
-                    options.bun.clone(),
+                    bun.clone(),
                     Arc::clone(&options.env),
                     axo.supervisor(),
                 )),
+                bun,
                 axo,
                 models,
                 scope: None,
@@ -453,7 +508,8 @@ impl Extensions {
         validate_scope_key(&options.key)?;
         let serial = self.inner.next_scope.fetch_add(1, Ordering::Relaxed);
         let ext_options = ExtensionOptions {
-            bun: self.inner.options.bun.clone(),
+            // Unused: the scope shares the root manager's `BunPath`.
+            bun: None,
             roots: options.roots,
             data_root: options.data_root,
             runtime_dir: self
@@ -500,8 +556,9 @@ impl Extensions {
         let inner = Arc::new_cyclic(|weak| Inner {
             layer: models.provider_layer(),
             supervisor: parent.axo.supervisor(),
+            bun: parent.bun.clone(),
             deps: Arc::new(Deps::new(
-                ext_options.bun.clone(),
+                parent.bun.clone(),
                 Arc::clone(&ext_options.env),
                 parent.axo.supervisor(),
             )),
@@ -550,6 +607,15 @@ impl Extensions {
         self.inner.lock().collisions.clone()
     }
 
+    /// The providers this manager currently publishes, sorted by provider ID, each with the
+    /// enabled extension that wins it. For a [`axo_ai::ProviderInfo`] whose `origin` is
+    /// [`ProviderOrigin::Layer`] in a scoped `Models` view, look in that scope's
+    /// [`ExtensionScope::providers`] first, then here (scope layers win over base layers); a
+    /// `Layer` provider in neither list belongs to a host-owned [`ProviderLayer`].
+    pub fn providers(&self) -> Vec<ExtensionProvider> {
+        self.inner.providers()
+    }
+
     pub fn diagnostics(&self) -> Vec<ExtensionDiagnostic> {
         self.inner.lock().diagnostics.clone()
     }
@@ -576,6 +642,38 @@ impl Extensions {
         self.inner.rearm(id, Rearm::Reload).await
     }
 
+    /// Replaces the Bun executable for this manager and every scope derived from it, then
+    /// rescans them and re-arms every extension whose problem is [`ProblemKind::Bun`].
+    /// Runners already alive keep running; the next generation uses the new path. A relative
+    /// path is [`BridgeError::InvalidOptions`] and changes nothing.
+    pub async fn set_bun(&self, bun: Option<PathBuf>) -> Result<(), BridgeError> {
+        if let Some(path) = &bun
+            && !path.is_absolute()
+        {
+            return Err(BridgeError::InvalidOptions(format!(
+                "bun {} is not an absolute path",
+                path.display()
+            )));
+        }
+        if self.inner.closed.is_cancelled() {
+            return Err(BridgeError::ShutDown);
+        }
+        self.inner.bun.set(bun);
+        let root = self.inner.refresh_bun().await;
+        let mut scoped = Ok(());
+        for scope in self.inner.live_scopes() {
+            match scope.refresh_bun().await {
+                Ok(()) | Err(BridgeError::ShutDown) => {}
+                Err(error) => {
+                    if scoped.is_ok() {
+                        scoped = Err(error);
+                    }
+                }
+            }
+        }
+        root.and(scoped)
+    }
+
     /// Installs the dependencies of enabled authored extension `id` now (the path when
     /// `ExtensionOptions::auto_install` is off), then reloads it. Runs Bun even after a failed
     /// install of the same files.
@@ -587,19 +685,26 @@ impl Extensions {
     /// and an `sdk`) into the store: copies it without `node_modules` or `.git`, runs
     /// `bun install --frozen-lockfile` when it declares dependencies (a `bun.lock` is then
     /// required), and switches to it only on success, keeping the replaced version for
-    /// `rollback`. An update must come from the recorded `origin` unless `replace_origin`.
-    /// An enabled extension is reloaded at once: its in-flight calls, and its group peers',
-    /// fail. Installing does not enable it.
+    /// `rollback`. An update must come from the recorded `origin` unless `replace_origin`;
+    /// `revision` is the host's label for this copy, recorded in [`InstalledCopy::revision`]
+    /// and never compared. An enabled extension is reloaded at once: its in-flight calls, and
+    /// its group peers', fail. Installing does not enable it.
     pub async fn install(
         &self,
         source: &Path,
         origin: &str,
+        revision: Option<&str>,
         replace_origin: bool,
     ) -> Result<InstalledExtension, InstallError> {
         let inner = Arc::clone(&self.inner);
-        run(inner.install(source.to_owned(), origin.to_owned(), replace_origin))
-            .await
-            .unwrap_or(Err(InstallError::ShutDown))
+        run(inner.install(
+            source.to_owned(),
+            origin.to_owned(),
+            revision.map(str::to_owned),
+            replace_origin,
+        ))
+        .await
+        .unwrap_or(Err(InstallError::ShutDown))
     }
 
     /// Swaps installed `id`'s current and previous versions (a second rollback goes forward
@@ -623,6 +728,18 @@ impl Extensions {
     /// Every extension in the store, sorted by ID; unreadable records are skipped.
     pub async fn installed(&self) -> Result<Vec<InstalledExtension>, InstallError> {
         self.inner.installed().await
+    }
+
+    /// Reads `id`'s package as it is on disk now, enabled or not: an authored ID from the
+    /// roots, a `publisher/name` ID from the store. For an enabled extension this can differ
+    /// from what is running after a failed rescan.
+    pub async fn inspect(&self, id: &str) -> Result<ExtensionPackage, ExtensionProblem> {
+        manifest::inspect(id, &self.inner.options).await
+    }
+
+    /// The IDs of every authored package under the roots, sorted.
+    pub async fn authored(&self) -> Vec<String> {
+        manifest::authored(&self.inner.options.roots).await
     }
 
     /// One entry per runner that is currently alive, in the enabled order of its first
@@ -697,6 +814,22 @@ impl ExtensionScope {
         runner_memory_for(&self.guard.0).await
     }
 
+    /// The providers this scope currently publishes; see [`Extensions::providers`].
+    pub fn providers(&self) -> Vec<ExtensionProvider> {
+        self.guard.0.providers()
+    }
+
+    /// Reads `id`'s package from this scope's roots as it is on disk now, enabled or not.
+    /// Scopes have no store: a `publisher/name` ID is a [`ProblemKind::Setup`] problem.
+    pub async fn inspect(&self, id: &str) -> Result<ExtensionPackage, ExtensionProblem> {
+        manifest::inspect(id, &self.guard.0.options).await
+    }
+
+    /// The IDs of every authored package under this scope's roots, sorted.
+    pub async fn authored(&self) -> Vec<String> {
+        manifest::authored(&self.guard.0.options.roots).await
+    }
+
     /// Closes this scope, removes its providers from [`ExtensionScope::models`], restores
     /// attached sessions to the parent manager's host-wide extensions, and reaps this scope's
     /// runners. Idempotent.
@@ -765,12 +898,12 @@ async fn install_dependencies_for(inner: Arc<Inner>, id: String) -> Result<(), B
         }
         let (package, _) = manifest::locate(&id, &inner.options)
             .await
-            .map_err(BridgeError::DependencyInstall)?;
+            .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
         inner.forget_install_failure(&id);
         inner
             .ensure_dependencies(&id, &package, admission)
             .await
-            .map_err(BridgeError::DependencyInstall)?;
+            .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
         inner
             .reconcile(
                 None,
@@ -891,6 +1024,27 @@ impl Inner {
             .unwrap_or(Err(BridgeError::ShutDown))
     }
 
+    /// Rescans, then re-arms every extension whose problem is [`ProblemKind::Bun`], so a
+    /// placement or dependency install that failed on Bun runs again. The first error wins.
+    async fn refresh_bun(self: &Arc<Self>) -> Result<(), BridgeError> {
+        run(Arc::clone(self).reconcile(None, None))
+            .await
+            .unwrap_or(Err(BridgeError::ShutDown))?;
+        let mut result = Ok(());
+        for status in self.snapshot() {
+            if status
+                .problem
+                .is_some_and(|problem| problem.kind == ProblemKind::Bun)
+            {
+                let rearmed = self.rearm(&status.id, Rearm::Retry).await;
+                if result.is_ok() {
+                    result = rearmed;
+                }
+            }
+        }
+        result
+    }
+
     pub(crate) fn effective_contributions(
         self: &Arc<Self>,
     ) -> Vec<(Weak<Self>, Arc<Contribution>)> {
@@ -923,6 +1077,17 @@ impl Inner {
 
     fn snapshot(&self) -> Vec<ExtensionStatus> {
         self.lock().statuses()
+    }
+
+    fn providers(&self) -> Vec<ExtensionProvider> {
+        self.lock()
+            .bindings
+            .iter()
+            .map(|(provider, binding)| ExtensionProvider {
+                provider: provider.clone(),
+                extension: binding.ext.clone(),
+            })
+            .collect()
     }
 
     fn mark(&self, id: &str, package: &Path, admission: u64, change: impl FnOnce(&mut State)) {
@@ -970,13 +1135,13 @@ impl Inner {
         id: &str,
         package: &Path,
         admission: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, ExtensionProblem> {
         let started = || {
             self.mark(id, package, admission, |state| {
                 state.installing.insert(id.to_owned());
             })
         };
-        let finished = |result: &Result<bool, String>| {
+        let finished = |result: &Result<bool, ExtensionProblem>| {
             self.mark(id, package, admission, |state| {
                 state.installing.remove(id);
                 match result {
@@ -987,7 +1152,7 @@ impl Inner {
         };
         tokio::select! {
             result = self.deps.ensure(id, admission, package, started, finished) => result,
-            () = self.closed.cancelled() => Err(BridgeError::ShutDown.to_string()),
+            () = self.closed.cancelled() => Err(problem(ProblemKind::Setup, BridgeError::ShutDown.to_string())),
         }
     }
 
@@ -999,7 +1164,10 @@ impl Inner {
             let inner = inner.clone();
             Box::pin(async move {
                 let Some(inner) = inner.upgrade() else {
-                    return Err(BridgeError::ShutDown.to_string());
+                    return Err(problem(
+                        ProblemKind::Setup,
+                        BridgeError::ShutDown.to_string(),
+                    ));
                 };
                 if member.id.contains('/') || !inner.options.auto_install {
                     return Ok(());
@@ -1011,7 +1179,10 @@ impl Inner {
                         .get(&member.id)
                         .is_none_or(|(s, _)| *s != serial)
                     {
-                        return Err(format!("extension {} was replaced", member.id));
+                        return Err(problem(
+                            ProblemKind::Setup,
+                            format!("extension {} was replaced", member.id),
+                        ));
                     }
                     state.admissions[&member.id]
                 };
@@ -1034,8 +1205,10 @@ impl Inner {
         running: Option<u64>,
     ) {
         tokio::spawn(async move {
-            if self.ensure_dependencies(&id, &package, admission).await == Ok(true)
-                && let Some(serial) = running
+            if matches!(
+                self.ensure_dependencies(&id, &package, admission).await,
+                Ok(true)
+            ) && let Some(serial) = running
             {
                 let _ = self
                     .reconcile(
@@ -1132,7 +1305,7 @@ impl Inner {
         // Discovery: read-only, so nothing is lost if it fails midway.
         let options = &self.options;
         let (bun, found) = tokio::join!(
-            async { process::usable_bun(options.bun.as_deref()).await.err() },
+            async { self.bun.usable().await.err() },
             join_all(
                 enabled
                     .iter()
@@ -1153,7 +1326,7 @@ impl Inner {
         let mut overrides = HashMap::new();
         let mut diagnostics = Vec::new();
         // Admitted extensions: declarations, and why they cannot run (if they cannot).
-        let mut usable: HashMap<&str, (Member, Option<String>)> = HashMap::new();
+        let mut usable: HashMap<&str, (Member, Option<ExtensionProblem>)> = HashMap::new();
         let mut contributions = Vec::new();
         // Admitted authored extensions whose dependencies need installing.
         let mut stale = Vec::new();
@@ -1167,13 +1340,29 @@ impl Inner {
                             message,
                         }
                     }));
+                    let origin = ExtensionOrigin {
+                        id: &ext.id,
+                        scope: self.scope.as_ref().map(|meta| meta.key.as_str()),
+                    }
+                    .to_string();
+                    let mut definitions = found.definitions;
+                    for skill in &mut definitions.skills {
+                        skill.origin = Some(origin.clone());
+                    }
+                    for mode in &mut definitions.modes {
+                        mode.origin = Some(origin.clone());
+                    }
                     let contribution = Arc::new(Contribution {
                         ext: ext.id.clone(),
+                        origin,
                         decl: found.member.session.clone(),
                         sections: found.sections,
-                        definitions: found.definitions,
+                        definitions,
                     });
-                    (found.member, contribution, found.entry_error)
+                    let entry_error = found
+                        .entry_error
+                        .map(|error| problem(ProblemKind::Invalid, error));
+                    (found.member, contribution, entry_error)
                 }
                 // A failed rescan keeps the last accepted claims and contribution, unavailable.
                 Err(error) => match accepted.get(&ext.id) {
@@ -1190,10 +1379,18 @@ impl Inner {
             if let Some(stale_check) = stale_check {
                 let id = &ext.id;
                 match stale_check {
-                    Err(error) => problem = Some(format!("extension {id}: {error}")),
+                    Err(error) => {
+                        problem = Some(crate::problem(
+                            ProblemKind::Invalid,
+                            format!("extension {id}: {error}"),
+                        ));
+                    }
                     Ok(true) if !options.auto_install => {
-                        problem = Some(format!(
-                            "extension {id}: dependencies are not installed; call Extensions::install_dependencies"
+                        problem = Some(crate::problem(
+                            ProblemKind::DependenciesMissing,
+                            format!(
+                                "extension {id}: dependencies are not installed; call Extensions::install_dependencies"
+                            ),
                         ));
                     }
                     Ok(true) => stale.push((id.clone(), member.package.clone())),
@@ -1261,6 +1458,7 @@ impl Inner {
                 group.clone(),
                 self.options.clone(),
                 Arc::clone(&self.supervisor),
+                self.bun.clone(),
                 reporter(Arc::downgrade(&self), serial),
                 self.preparer(serial),
                 Arc::clone(&self.sessions) as Arc<dyn Actions>,
@@ -1309,7 +1507,7 @@ impl Inner {
             .collect();
 
         // Winners: the last enabled claimant of each provider ID.
-        let mut claims: BTreeMap<&str, Vec<(&EnabledExtension, &Descriptor)>> = BTreeMap::new();
+        let mut claims: BTreeMap<&str, Vec<(&EnabledExtension, &ProviderDecl)>> = BTreeMap::new();
         for ext in &enabled {
             if let Some((member, _)) = usable.get(ext.id.as_str()) {
                 for descriptor in &member.providers {
@@ -1341,8 +1539,8 @@ impl Inner {
             }
             let problem = usable[ext.id.as_str()]
                 .1
-                .as_deref()
-                .map(|problem| named(&ext.id, ext.group.as_deref(), problem));
+                .as_ref()
+                .map(|problem| named(&ext.id, ext.group.as_deref(), &problem.message));
             let placed = member_of.get(&ext.id);
             let serial = placed.map(|(serial, _)| *serial);
             let reused = old_bindings.get(*provider).filter(|old| {
@@ -1584,7 +1782,10 @@ fn gate(status: &ExtensionStatus) -> Option<String> {
         ExtensionPhase::Unavailable => "unavailable",
         _ => return None,
     };
-    let reason = status.reason.as_deref().unwrap_or(fallback);
+    let reason = status
+        .problem
+        .as_ref()
+        .map_or(fallback, |problem| problem.message.as_str());
     Some(named(&status.id, status.group.as_deref(), reason))
 }
 
@@ -1595,13 +1796,13 @@ fn named(id: &str, group: Option<&str>, reason: &str) -> String {
     }
 }
 
-fn unavailable(ext: &EnabledExtension, reason: String) -> ExtensionStatus {
+fn unavailable(ext: &EnabledExtension, problem: ExtensionProblem) -> ExtensionStatus {
     ExtensionStatus {
         id: ext.id.clone(),
         group: ext.group.clone(),
         generation: 0,
         phase: ExtensionPhase::Unavailable,
-        reason: Some(reason),
+        problem: Some(problem),
     }
 }
 
@@ -1655,7 +1856,7 @@ fn validate_options(options: &ExtensionOptions) -> Result<(), BridgeError> {
 
 /// A winner that cannot run keeps its declared login capability in `Models::providers`;
 /// the registry gate rejects before this is reached, and it fails the same way if it is.
-fn unready(descriptor: &Descriptor, reason: String) -> Provider {
+fn unready(descriptor: &ProviderDecl, reason: String) -> Provider {
     let mut provider = descriptor.provider();
     if descriptor.login {
         provider.login = Some(Arc::new(Unready {

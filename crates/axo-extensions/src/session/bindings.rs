@@ -229,6 +229,8 @@ async fn unless_canceled<T>(
 /// unless its extension was removed from a live manager ([`Failure::Removed`]).
 pub(super) struct RemotePolicy {
     pub remote: Remote,
+    /// The extension's [`crate::ExtensionOrigin`] label, attached to the calls it blocks.
+    pub origin: String,
     /// Whether the handler defines `before`; an undeclared hook allows without a call.
     pub before: bool,
     /// Whether the handler defines `after`; an undeclared hook keeps the result without a call.
@@ -310,6 +312,7 @@ impl ToolPolicy for RemotePolicy {
         let block = |reason: String| ToolCallDecision::Block {
             reason: Some(reason),
             terminate: false,
+            origin: None,
         };
         Ok(match unless_canceled(cancel, ext, reply).await? {
             Err(Failure::Removed(_)) => ToolCallDecision::Allow,
@@ -325,6 +328,7 @@ impl ToolPolicy for RemotePolicy {
                 })) => ToolCallDecision::Block {
                     reason,
                     terminate: terminate.unwrap_or(false),
+                    origin: None,
                 },
                 Err(_) => block(format!(
                     "extension {ext}: tool policy returned an invalid decision"
@@ -379,6 +383,10 @@ impl ToolPolicy for RemotePolicy {
             is_error: reply.is_error,
             terminate: reply.terminate,
         }))
+    }
+
+    fn origin(&self) -> Option<&str> {
+        Some(&self.origin)
     }
 }
 

@@ -300,7 +300,9 @@ async fn crash_counts_once_and_the_third_disables_the_group_until_retry() {
     kill(*host.pids().last().unwrap());
     for id in ["alpha", "beta"] {
         let status = wait_phase(&extensions, id, ExtensionPhase::Disabled).await;
-        let reason = status.reason.unwrap();
+        let problem = status.problem.unwrap();
+        assert_eq!(problem.kind, axo_extensions::ProblemKind::Crash);
+        let reason = problem.message;
         assert!(reason.contains("group g"), "{reason}");
     }
     // No third restart.
@@ -360,10 +362,12 @@ async fn load_rejection_spares_its_sibling_and_retry_reloads_it() {
     assert_eq!(http.requests().len(), 1);
     let alpha = phase(&extensions, "alpha");
     assert_eq!(alpha.phase, ExtensionPhase::Disabled, "{alpha:?}");
-    assert!(alpha.reason.unwrap().contains("alpha"));
+    let problem = alpha.problem.unwrap();
+    assert_eq!(problem.kind, axo_extensions::ProblemKind::Load);
+    assert!(problem.message.contains("alpha"));
     let beta = phase(&extensions, "beta");
     assert_eq!(beta.phase, ExtensionPhase::Ready, "{beta:?}");
-    assert!(beta.reason.is_none());
+    assert!(beta.problem.is_none());
 
     assert_eq!(base_url(&host.models, "pa").unwrap(), http.url);
     assert_unavailable(&request(&host, "pa").await, "alpha");

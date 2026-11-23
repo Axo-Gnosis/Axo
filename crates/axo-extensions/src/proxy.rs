@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::manifest::Descriptor;
+use crate::manifest::ProviderDecl;
 use crate::peer::{BridgeCode, Callbacks, Refusal};
 use crate::placement::Placement;
 use crate::remote::{self, CALL_DEADLINE, Failure};
@@ -23,7 +23,7 @@ use crate::wire_value::{decode_credential, decode_request, encode_request};
 /// The provider `desc` declares, owned by extension `ext` in `placement`. Once `retired`
 /// is canceled every call fails at once and a reply still in flight is discarded.
 pub fn bind(
-    desc: &Descriptor,
+    desc: &ProviderDecl,
     ext: &str,
     placement: Arc<Placement>,
     retired: CancellationToken,

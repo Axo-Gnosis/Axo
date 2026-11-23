@@ -4,8 +4,8 @@
 
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axo::{
     ProcessSupervisor,
@@ -16,8 +16,8 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::ExtensionOptions;
 use crate::peer::{Actions, HANDSHAKE, Peer};
+use crate::{ExtensionOptions, ExtensionProblem, ProblemKind, problem};
 
 const RUNNER: &str = include_str!("runner.ts");
 /// Disables Bun's implicit package installation for anything the runner imports.
@@ -30,8 +30,8 @@ const MAX_SOCKET_PATH: usize = 107;
 pub enum StartError {
     /// Host inputs or the filesystem prevent starting at all; retrying cannot help
     /// until the host corrects them.
-    #[error("{0}")]
-    Setup(String),
+    #[error("{}", .0.message)]
+    Setup(ExtensionProblem),
     /// The runner died, hung or failed its handshake; counts against the placement.
     #[error("{0}")]
     Crash(String),
@@ -58,15 +58,14 @@ impl Generation {
     /// `members` names. Cancelling the future leaves nothing behind.
     pub async fn start(
         options: &ExtensionOptions,
+        bun: &BunPath,
         supervisor: &ProcessSupervisor,
         generation: u64,
         stop: &CancellationToken,
         actions: &Arc<dyn Actions>,
         members: &Arc<[String]>,
     ) -> Result<Generation, StartError> {
-        let bun = usable_bun(options.bun.as_deref())
-            .await
-            .map_err(StartError::Setup)?;
+        let bun = bun.usable().await.map_err(StartError::Setup)?;
         let runtime_dir = options.runtime_dir.clone();
         let dir = tokio::select! {
             biased;
@@ -76,20 +75,20 @@ impl Generation {
                 write(&dir.path().join("runner.ts"), RUNNER)?;
                 write(&dir.path().join("bunfig.toml"), BUNFIG)?;
                 Ok::<_, StartError>(dir)
-            }) => result.map_err(|error| StartError::Setup(format!("cannot prepare extension runner directory: {error}")))??,
+            }) => result.map_err(|error| setup(format!("cannot prepare extension runner directory: {error}")))??,
         };
         let runner = dir.path().join("runner.ts");
 
         let socket = dir.path().join("rpc");
         if socket.as_os_str().len() > MAX_SOCKET_PATH {
-            return Err(StartError::Setup(format!(
+            return Err(setup(format!(
                 "extension socket path {} is {} bytes, longer than the Unix limit of {MAX_SOCKET_PATH}; choose a shorter runtime_dir",
                 socket.display(),
                 socket.as_os_str().len()
             )));
         }
         let listener = UnixListener::bind(&socket).map_err(|err| {
-            StartError::Setup(format!(
+            setup(format!(
                 "cannot bind extension socket {}: {err}",
                 socket.display()
             ))
@@ -107,14 +106,14 @@ impl Generation {
             generation.to_string().into(),
         );
         let spec = ExecSpec {
-            program: bun.to_owned(),
+            program: bun,
             args: vec![OsString::from("run"), runner.into()],
             cwd: dir.path().to_owned(),
             env,
             sandbox: None,
         };
         let mut process = tokio::select! {
-            spawned = supervisor.spawn(spec) => spawned.map_err(StartError::Setup)?,
+            spawned = supervisor.spawn(spec) => spawned.map_err(setup)?,
             () = stop.cancelled() => return Err(StartError::Stopped),
         };
         let (mut output, readers) = process.capture_output();
@@ -228,18 +227,41 @@ async fn reap(process: Process, mut drain: Drain) {
     drain.join().await;
 }
 
-/// The host's Bun executable, or why it cannot run. Checked on every `configure`,
-/// `retry`, `reload` and generation start.
-pub async fn usable_bun(bun: Option<&Path>) -> Result<&Path, String> {
-    let bun = bun.ok_or_else(|| "no Bun executable configured".to_owned())?;
-    match tokio::fs::metadata(bun).await {
-        Ok(meta) if meta.is_file() && meta.mode() & 0o111 != 0 => Ok(bun),
-        Ok(_) => Err(format!(
-            "Bun at {} is not an executable file",
-            bun.display()
-        )),
-        Err(error) => Err(format!("Bun at {}: {error}", bun.display())),
+/// The host's Bun executable, shared by a manager, its scopes, placements and installs.
+#[derive(Clone, Default)]
+pub struct BunPath(Arc<Mutex<Option<PathBuf>>>);
+
+impl BunPath {
+    pub fn new(bun: Option<PathBuf>) -> Self {
+        Self(Arc::new(Mutex::new(bun)))
     }
+
+    pub fn set(&self, bun: Option<PathBuf>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = bun;
+    }
+
+    /// The executable, or why it cannot run. Checked on every reconcile and generation start.
+    pub async fn usable(&self) -> Result<PathBuf, ExtensionProblem> {
+        let bun = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let unusable = |message: String| problem(ProblemKind::Bun, message);
+        let bun = bun.ok_or_else(|| unusable("no Bun executable configured".to_owned()))?;
+        match tokio::fs::metadata(&bun).await {
+            Ok(meta) if meta.is_file() && meta.mode() & 0o111 != 0 => Ok(bun),
+            Ok(_) => Err(unusable(format!(
+                "Bun at {} is not an executable file",
+                bun.display()
+            ))),
+            Err(error) => Err(unusable(format!("Bun at {}: {error}", bun.display()))),
+        }
+    }
+}
+
+fn setup(message: String) -> StartError {
+    StartError::Setup(problem(ProblemKind::Setup, message))
 }
 
 /// A fresh `0700` directory under the host's runtime directory.
@@ -252,7 +274,7 @@ fn private_dir(runtime_dir: &Path) -> Result<TempDir, StartError> {
                 .tempdir_in(runtime_dir)
         })
         .map_err(|err| {
-            StartError::Setup(format!(
+            setup(format!(
                 "cannot create a private directory in {}: {err}",
                 runtime_dir.display()
             ))
@@ -261,5 +283,5 @@ fn private_dir(runtime_dir: &Path) -> Result<TempDir, StartError> {
 
 fn write(path: &Path, contents: &str) -> Result<(), StartError> {
     std::fs::write(path, contents)
-        .map_err(|err| StartError::Setup(format!("cannot write {}: {err}", path.display())))
+        .map_err(|err| setup(format!("cannot write {}: {err}", path.display())))
 }

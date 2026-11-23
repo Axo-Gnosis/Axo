@@ -14,12 +14,14 @@ use axo::{
     SchemeUrl, Session, SessionEvent, SessionOptions, SpawnContext, SpawnDecision, SpawnOrigin,
     StaticEnv, ToolLimits, ToolPolicy, ToolScope,
 };
-use axo_agent::{AgentEvent, AgentMessage, BeforeToolCallContext, ToolCallDecision, ToolError};
+use axo_agent::{
+    AgentEvent, AgentMessage, BeforeToolCallContext, Blocked, ToolCallDecision, ToolError,
+};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ThinkingLevel, UserBlock};
 use axo_extensions::{
-    ExtensionPhase, ExtensionScope, Extensions, Failure, Forked, Lifecycle, LifecycleSession,
-    ScopeOptions, SessionRequest,
+    ExtensionOrigin, ExtensionPhase, ExtensionScope, Extensions, Failure, Forked, Lifecycle,
+    LifecycleSession, ScopeOptions, SessionRequest,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -143,7 +145,12 @@ async fn live_package_definitions() {
             .iter()
             .any(|d| matches!(d, AgentDef::Team(t) if t.name == "crew"))
     );
-    assert!(session.skills().iter().any(|s| s.name == "review"));
+    assert!(
+        session
+            .skills()
+            .iter()
+            .any(|s| s.name == "review" && s.origin.as_deref() == Some("extension lab"))
+    );
     extensions.attach(&session).await;
 
     write_agent("Helps with reviews");
@@ -198,6 +205,23 @@ async fn result(session: &Session, ids: &[&str]) -> (bool, String) {
         .unwrap_or_else(|| panic!("missing result for {ids:?}"))
 }
 
+/// The `Blocked` marker of `id`'s result, if it has one.
+async fn blocked(session: &Session, id: &str) -> Option<Blocked> {
+    session
+        .attach(None)
+        .await
+        .missed
+        .into_iter()
+        .find_map(|seq| match seq.entry {
+            Entry::Message {
+                message: AgentMessage::Llm(Message::ToolResult(result)),
+                ..
+            } if result.tool_call_id == id => Some(Blocked::of(result.details.as_ref())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing result for {id}"))
+}
+
 async fn tools_policy_state_command_and_events() {
     let turns = read("read")
         .into_iter()
@@ -227,6 +251,24 @@ async fn tools_policy_state_command_and_events() {
             .iter()
             .any(|tool| tool.name == "read" && tool.origin.as_deref() == Some("extension lab"))
     );
+    assert!(session.commands().iter().any(
+        |command| command.name == "hello" && command.origin.as_deref() == Some("extension lab")
+    ));
+    assert_eq!(
+        ExtensionOrigin::parse("extension lab (scope ws1)"),
+        Some(ExtensionOrigin {
+            id: "lab",
+            scope: Some("ws1")
+        })
+    );
+    assert_eq!(
+        ExtensionOrigin::parse("extension lab"),
+        Some(ExtensionOrigin {
+            id: "lab",
+            scope: None
+        })
+    );
+    assert_eq!(ExtensionOrigin::parse("a host label"), None);
     assert!(
         extensions
             .session_diagnostics(session.id())
@@ -278,6 +320,12 @@ async fn tools_policy_state_command_and_events() {
     session.prompt("block it").await.unwrap();
     let (error, text) = result(&session, &["blocked"]).await;
     assert!(error && text.contains("no"), "{text}");
+    assert_eq!(
+        blocked(&session, "blocked").await,
+        Some(Blocked {
+            origin: Some("extension lab".into())
+        })
+    );
 
     host.script(LAB, "policyBefore", "ok");
     host.script(LAB, "tool", "resolve");
@@ -960,6 +1008,12 @@ async fn unavailable_policy_fails_closed() {
         error && text.contains("extension lab: tool policy unavailable"),
         "{text}"
     );
+    assert_eq!(
+        blocked(&session, "offline").await,
+        Some(Blocked {
+            origin: Some("extension lab".into())
+        })
+    );
     assert!(session.commands().iter().any(|info| info.name == "hello"));
     session.shutdown().await;
     extensions.shutdown().await;
@@ -1053,7 +1107,7 @@ async fn dropped_manager_fences_hooks_and_restores_layer() {
         let policy = &retained.tool_policies[0];
         assert!(
             matches!(policy.before_tool_call(&scope, before, &cancel).await.unwrap(),
-            ToolCallDecision::Block { reason: Some(reason), terminate: false } if reason.contains(closed))
+            ToolCallDecision::Block { reason: Some(reason), terminate: false, .. } if reason.contains(closed))
         );
         assert_eq!(
             policy
@@ -1473,6 +1527,19 @@ async fn extension_scopes_isolate_same_id_packages_providers_and_lifecycle() {
     assert!(has_tool(&session_a, "host_tool"));
     assert!(has_tool(&session_a, "tool_a"));
     assert!(!has_tool(&session_a, "tool_b"));
+    let origin_a = session_a
+        .tools()
+        .into_iter()
+        .find(|t| t.name == "tool_a")
+        .and_then(|t| t.origin)
+        .unwrap();
+    assert_eq!(
+        ExtensionOrigin::parse(&origin_a),
+        Some(ExtensionOrigin {
+            id: "proj",
+            scope: Some("folder-a")
+        })
+    );
 
     assert!(has_tool(&session_b, "host_tool"));
     assert!(!has_tool(&session_b, "tool_a"));

@@ -15,8 +15,8 @@ pub use cancel::CancelReason;
 pub use error::Error;
 pub use event::{AgentEvent, MessageOrigin, Persist, PersistError};
 pub use hooks::{
-    AfterToolCallContext, AfterToolCallResult, AgentContext, BeforeToolCallContext, HookError,
-    LoopHooks, NoHooks, ToolCallDecision, ToolHooks, TurnContext, TurnFinish,
+    AfterToolCallContext, AfterToolCallResult, AgentContext, BeforeToolCallContext, Blocked,
+    HookError, LoopHooks, NoHooks, ToolCallDecision, ToolHooks, TurnContext, TurnFinish,
 };
 pub use message::{AgentMessage, CustomMessage, QueuedMessage, Unanswered, unanswered_calls};
 pub use run::{Routed, route};

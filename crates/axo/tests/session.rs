@@ -1386,6 +1386,7 @@ async fn tool_policies_block_bash_in_sessions_and_forks_before_later_policies() 
                 ToolCallDecision::Block {
                     reason: Some("no bash".into()),
                     terminate: false,
+                    origin: None,
                 }
             } else {
                 ToolCallDecision::Allow

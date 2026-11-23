@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
+use axo::EnabledExtension;
 use axo::context::agents::{AgentDef, load_agents};
 use axo::context::keywords::load_keywords;
 use axo::context::modes::load_modes;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::{ExtensionOptions, SDK_VERSION, store};
+use crate::{ExtensionOptions, ExtensionProblem, ProblemKind, SDK_VERSION, problem, store};
 
 pub const MANIFEST: &str = "extension.json";
 
@@ -32,15 +33,15 @@ pub struct Member {
     /// Inside the package when its entry check passed; otherwise the declared path, kept
     /// only for comparison across rescans.
     pub entry: PathBuf,
-    pub providers: Vec<Descriptor>,
+    pub providers: Vec<ProviderDecl>,
     /// What the runner binds handlers for; sent with `activate`.
     pub session: SessionDecl,
 }
 
-/// One provider an extension declares.
+/// One provider an extension declares in its `extension.json`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Descriptor {
+pub struct ProviderDecl {
     pub id: String,
     #[serde(default)]
     pub models: Vec<Model>,
@@ -58,7 +59,7 @@ fn yes() -> bool {
     true
 }
 
-impl Descriptor {
+impl ProviderDecl {
     /// The catalog metadata alone, without callbacks.
     pub fn provider(&self) -> Provider {
         Provider {
@@ -155,7 +156,7 @@ struct Manifest {
     sdk: Option<String>,
     entry: String,
     #[serde(default)]
-    providers: Vec<Descriptor>,
+    providers: Vec<ProviderDecl>,
     #[serde(default)]
     tools: Vec<ToolDecl>,
     #[serde(default)]
@@ -179,6 +180,8 @@ struct Manifest {
 #[derive(Debug)]
 pub struct Discovered {
     pub member: Member,
+    /// The `sdk` the manifest declares.
+    pub sdk: Option<String>,
     /// Why the entry cannot load; the declarations stay usable.
     pub entry_error: Option<String>,
     /// Ignored duplicate manifests in later roots and definition-loader findings.
@@ -188,12 +191,121 @@ pub struct Discovered {
     pub definitions: Definitions,
 }
 
+/// What a package declares, read from disk without running it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionPackage {
+    pub id: String,
+    /// The `sdk` the manifest declares.
+    pub sdk: Option<String>,
+    /// The package directory.
+    pub package: PathBuf,
+    pub providers: Vec<ProviderDecl>,
+    pub session: SessionDecl,
+    /// `(name, body)` in declaration order.
+    pub sections: Vec<(String, String)>,
+    pub definitions: Definitions,
+    /// Why the entry cannot load; the declarations are still valid.
+    pub entry_error: Option<String>,
+    /// Ignored duplicate manifests in later roots and definition-loader findings.
+    pub diagnostics: Vec<String>,
+}
+
+impl From<Discovered> for ExtensionPackage {
+    fn from(found: Discovered) -> Self {
+        let Member {
+            id,
+            package,
+            providers,
+            session,
+            ..
+        } = found.member;
+        Self {
+            id,
+            sdk: found.sdk,
+            package,
+            providers,
+            session,
+            sections: found.sections,
+            definitions: found.definitions,
+            entry_error: found.entry_error,
+            diagnostics: found.diagnostics,
+        }
+    }
+}
+
+/// Rejects what [`EnabledExtension::validate_all`] rejects, so joining `id` under a root or
+/// the store stays inside it.
+pub fn validate_id(id: &str) -> Result<(), String> {
+    let candidate = EnabledExtension {
+        id: id.to_owned(),
+        group: None,
+    };
+    EnabledExtension::validate_all(&[candidate]).map_err(|error| error.to_string())
+}
+
+/// `id`'s package as it is on disk now; see `Extensions::inspect`.
+pub async fn inspect(
+    id: &str,
+    options: &ExtensionOptions,
+) -> Result<ExtensionPackage, ExtensionProblem> {
+    validate_id(id).map_err(|error| problem(ProblemKind::Invalid, error))?;
+    crate::validate_options(options)
+        .map_err(|error| problem(ProblemKind::Setup, error.to_string()))?;
+    discover(id, options).await.map(Into::into)
+}
+
+/// The IDs of every authored package under `roots`, sorted. A directory counts when its
+/// `extension.json` is present at all, the same rule [`locate`] applies; unreadable roots
+/// are skipped.
+pub async fn authored(roots: &[PathBuf]) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for root in roots {
+        let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if found.contains(&id) || validate_id(&id).is_err() {
+                continue;
+            }
+            match tokio::fs::metadata(entry.path().join(MANIFEST)).await {
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                _ => {
+                    found.insert(id);
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Reads the package folder `source` before it is installed; see `inspect_package`.
+pub async fn inspect_package(source: &Path) -> Result<ExtensionPackage, ExtensionProblem> {
+    let invalid = |message: String| problem(ProblemKind::Invalid, message);
+    if !source.is_absolute() {
+        return Err(invalid(format!(
+            "source {} is not an absolute path",
+            source.display()
+        )));
+    }
+    let Head { id, .. } = head(source)
+        .await
+        .map_err(|what| invalid(format!("{}: {what}", source.join(MANIFEST).display())))?;
+    validate_id(&id).map_err(invalid)?;
+    load(&id, source).await.map(Into::into)
+}
+
 /// Locates and loads `id`'s package; see [`locate`] and [`load`].
 ///
 /// `Err` means the package is not admitted (not found, unreadable or invalid declarations,
 /// an incompatible SDK, unreadable section files or definition directories). `id` must
 /// already be a valid extension ID.
-pub async fn discover(id: &str, options: &ExtensionOptions) -> Result<Discovered, String> {
+pub async fn discover(
+    id: &str,
+    options: &ExtensionOptions,
+) -> Result<Discovered, ExtensionProblem> {
     let (package, diagnostics) = locate(id, options).await?;
     let mut found = load(id, &package).await?;
     found.diagnostics.splice(0..0, diagnostics);
@@ -206,17 +318,25 @@ pub async fn discover(id: &str, options: &ExtensionOptions) -> Result<Discovered
 pub async fn locate(
     id: &str,
     options: &ExtensionOptions,
-) -> Result<(PathBuf, Vec<String>), String> {
+) -> Result<(PathBuf, Vec<String>), ExtensionProblem> {
     if id.contains('/') {
-        let store = options
-            .store
-            .as_deref()
-            .ok_or_else(|| format!("extension {id}: no extension store configured"))?;
+        let store = options.store.as_deref().ok_or_else(|| {
+            problem(
+                ProblemKind::Setup,
+                format!("extension {id}: no extension store configured"),
+            )
+        })?;
         let dir = store.join(id);
         return match store::read_record(&dir).await {
-            Ok(Some(record)) => Ok((dir.join(record.current), Vec::new())),
-            Ok(None) => Err(format!("extension {id}: not installed")),
-            Err(error) => Err(format!("extension {id}: {error}")),
+            Ok(Some(record)) => Ok((dir.join(record.current.folder), Vec::new())),
+            Ok(None) => Err(problem(
+                ProblemKind::NotFound,
+                format!("extension {id}: not installed"),
+            )),
+            Err(error) => Err(problem(
+                ProblemKind::Invalid,
+                format!("extension {id}: {error}"),
+            )),
         };
     }
     let mut chosen: Option<PathBuf> = None;
@@ -239,8 +359,9 @@ pub async fn locate(
         }
     }
     let Some(path) = chosen else {
-        return Err(format!(
-            "extension {id}: no {MANIFEST} in any extension root"
+        return Err(problem(
+            ProblemKind::NotFound,
+            format!("extension {id}: no {MANIFEST} in any extension root"),
         ));
     };
     let package = path.parent().expect("manifest has a directory").to_owned();
@@ -248,10 +369,15 @@ pub async fn locate(
 }
 
 /// Reads and validates `<package>/extension.json` for `id`.
-pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
+pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProblem> {
     let path = package.join(MANIFEST);
     let mut diagnostics = Vec::new();
-    let fail = |what: String| format!("extension {id}: {}: {what}", path.display());
+    let fail = |what: String| {
+        problem(
+            ProblemKind::Invalid,
+            format!("extension {id}: {}: {what}", path.display()),
+        )
+    };
     let mut text = String::new();
     open_regular(&path)
         .await
@@ -364,6 +490,7 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
         ),
     };
     Ok(Discovered {
+        sdk: manifest.sdk,
         member: Member {
             id: manifest.id,
             package: package.to_owned(),
@@ -383,6 +510,23 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, String> {
         sections,
         definitions,
     })
+}
+
+/// The part of a package's manifest read before validating the rest.
+#[derive(Deserialize)]
+pub struct Head {
+    pub id: String,
+    pub sdk: Option<String>,
+}
+
+/// Reads `<package>/extension.json` as far as its `id` and `sdk`.
+pub async fn head(package: &Path) -> Result<Head, String> {
+    let mut file = open_regular(&package.join(MANIFEST)).await?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .await
+        .map_err(|error| format!("cannot read: {error}"))?;
+    serde_json::from_str(&text).map_err(|error| format!("invalid: {error}"))
 }
 
 /// Both SDKs must be `major.minor.patch`. `provided` must be at least `declared`
@@ -529,7 +673,7 @@ mod tests {
             store: None,
             auto_install: false,
         };
-        super::discover(id, &options).await
+        super::discover(id, &options).await.map_err(|p| p.message)
     }
 
     #[test]
@@ -579,7 +723,7 @@ mod tests {
         );
         // An installed package must declare its SDK.
         let package = with_sdk("lab/pkg", None);
-        let error = load("lab/pkg", &package).await.unwrap_err();
+        let error = load("lab/pkg", &package).await.unwrap_err().message;
         assert!(error.contains("must declare \"sdk\""), "{error}");
     }
 
@@ -641,7 +785,7 @@ mod tests {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .build()
                     .unwrap();
-                let _ = tx.send(runtime.block_on(load("lab", &package)).unwrap_err());
+                let _ = tx.send(runtime.block_on(load("lab", &package)).unwrap_err().message);
             });
             let error = rx
                 .recv_timeout(Duration::from_secs(5))

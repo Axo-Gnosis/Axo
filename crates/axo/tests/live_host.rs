@@ -15,7 +15,7 @@ use axo::{
     ToolFactory, ToolPolicy, ToolScope,
 };
 use axo_agent::{
-    AfterToolCallContext, AfterToolCallResult, AgentMessage, BeforeToolCallContext, Tool,
+    AfterToolCallContext, AfterToolCallResult, AgentMessage, BeforeToolCallContext, Blocked, Tool,
     ToolCallDecision, ToolContext, ToolError, ToolOutput,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
@@ -189,6 +189,7 @@ impl ToolPolicy for Blocker {
         Ok(ToolCallDecision::Block {
             reason: Some("blocked by the live policy".into()),
             terminate: false,
+            origin: None,
         })
     }
 }
@@ -238,6 +239,19 @@ async fn tool_policies_swap_between_calls() {
     assert_eq!(
         result(&session, "c1").await,
         (true, "blocked by the live policy".into())
+    );
+    let entries = session.attach(None).await.missed;
+    let details = entries.iter().find_map(|seq| match &seq.entry {
+        Entry::Message {
+            message: AgentMessage::Llm(Message::ToolResult(result)),
+            ..
+        } if result.tool_call_id == "c1" => Some(result.details.clone()),
+        _ => None,
+    });
+    // An unlabeled host policy still marks the call blocked, without an origin.
+    assert_eq!(
+        Blocked::of(details.flatten().as_ref()),
+        Some(Blocked { origin: None })
     );
 
     session.set_tool_policies(vec![]).unwrap();

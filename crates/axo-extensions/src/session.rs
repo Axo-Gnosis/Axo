@@ -57,6 +57,8 @@ pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
 /// What one admitted extension contributes to sessions, runnable or not.
 pub(crate) struct Contribution {
     pub ext: String,
+    /// [`crate::ExtensionOrigin`] label stamped on everything this contribution registers.
+    pub origin: String,
     pub decl: SessionDecl,
     /// `(name, body)` in declaration order.
     pub sections: Vec<(String, String)>,
@@ -237,7 +239,6 @@ fn layer(contributions: &[(Weak<Inner>, Arc<Contribution>)]) -> Registrations {
             inner: inner.clone(),
             ext: c.ext.clone(),
         };
-        let origin = format!("extension {}", c.ext);
         for decl in &c.decl.tools {
             let exposure = decl.exposure;
             let (remote, decl) = (remote.clone(), Arc::new(decl.clone()));
@@ -255,13 +256,14 @@ fn layer(contributions: &[(Weak<Inner>, Arc<Contribution>)]) -> Registrations {
                     exposure,
                     origin: None,
                 }
-                .with_origin(origin.clone()),
+                .with_origin(c.origin.clone()),
             );
         }
         let hooks = &c.decl.tool_policy;
         if !hooks.is_empty() {
             parts.tool_policies.push(Arc::new(RemotePolicy {
                 remote: remote.clone(),
+                origin: c.origin.clone(),
                 before: hooks.contains(&PolicyHook::Before),
                 after: hooks.contains(&PolicyHook::After),
             }));
@@ -285,7 +287,7 @@ fn layer(contributions: &[(Weak<Inner>, Arc<Contribution>)]) -> Registrations {
                 name: decl.name.clone(),
                 description: decl.description.clone(),
                 argument_hint: decl.argument_hint.clone(),
-                origin: Some(origin.clone()),
+                origin: Some(c.origin.clone()),
                 handler: Arc::new(RemoteCommand {
                     remote: remote.clone(),
                     decl: decl.clone(),

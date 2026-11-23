@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use axo_extensions::{BridgeError, ExtensionPhase, InstallError, InstalledExtension};
+use axo_extensions::{BridgeError, ExtensionPhase, InstallError, ProblemKind};
 use serde_json::json;
 
 use super::{
@@ -113,7 +113,9 @@ async fn authored_failure_is_visible_and_retryable() {
     let list = enabled(&[(AUTHORED, None)]);
     extensions.configure(&list).await.unwrap();
     let status = wait_phase(&extensions, AUTHORED, ExtensionPhase::Disabled).await;
-    let reason = status.reason.unwrap();
+    let problem = status.problem.unwrap();
+    assert_eq!(problem.kind, ProblemKind::DependencyInstall);
+    let reason = problem.message;
     assert!(
         reason.contains("bun install failed") && reason.contains("boom"),
         "{reason}"
@@ -204,14 +206,16 @@ async fn ready_install_failure_gates_static_provider() {
     };
     assert_eq!(disabled, phase(&extensions, AUTHORED));
     assert_eq!(disabled.generation, ready.generation);
-    assert!(disabled.reason.as_deref().unwrap().contains("boom"));
+    let problem = disabled.problem.as_ref().unwrap();
+    assert_eq!(problem.kind, ProblemKind::DependencyInstall);
+    assert!(problem.message.contains("boom"));
     let plain = find(&host.models, "plain").unwrap();
     for rescan in [false, true] {
         if rescan {
             extensions.configure(&list).await.unwrap();
         }
         let event = stream(&host.models, &plain).await;
-        assert!(super::error_text(&event).contains(disabled.reason.as_deref().unwrap()));
+        assert!(super::error_text(&event).contains(&problem.message));
         assert_eq!(http.requests().len(), 1);
     }
     std::fs::remove_file(host.path("ctl").join("install")).unwrap();
@@ -237,8 +241,9 @@ async fn auto_install_off() {
     assert_eq!(status.phase, ExtensionPhase::Unavailable);
     assert!(
         status
-            .reason
+            .problem
             .unwrap()
+            .message
             .contains("dependencies are not installed"),
         "{:?}",
         phase(&extensions, AUTHORED)
@@ -277,22 +282,18 @@ async fn mixed_stale_results_keep_enabled_order() {
         status.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         ids
     );
+    let problem = |index: usize| status[index].problem.clone().unwrap();
+    assert_eq!(problem(0).kind, ProblemKind::DependenciesMissing);
     assert!(
-        status[0]
-            .reason
-            .as_deref()
-            .unwrap()
+        problem(0)
+            .message
             .contains("dependencies are not installed")
     );
-    assert!(status[1].reason.as_deref().unwrap().contains("index.ts"));
+    assert_eq!(problem(1).kind, ProblemKind::Invalid);
+    assert!(problem(1).message.contains("index.ts"));
     assert_eq!(status[2].phase, ExtensionPhase::Cold);
-    assert!(
-        status[3]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("package.json")
-    );
+    assert_eq!(problem(3).kind, ProblemKind::Invalid);
+    assert!(problem(3).message.contains("package.json"));
 }
 
 /// A source folder for installed extension `lab/pkg` declaring SDK `sdk`, a dependency, and
@@ -340,14 +341,20 @@ async fn install_update_rollback_uninstall() {
     let http = Http::start();
     let extensions = host.manager();
     let src = source(&host, &http, "0.0.0", true);
-    let first = extensions.install(&src, "git:a", false).await.unwrap();
-    let listed = InstalledExtension {
-        id: INSTALLED.into(),
-        origin: "git:a".into(),
-        has_previous: false,
-    };
-    assert_eq!(first, listed);
-    assert_eq!(extensions.installed().await.unwrap(), [listed]);
+    let first = extensions
+        .install(&src, "git:a", Some("rev-a"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.id.as_str(), first.origin.as_str()),
+        (INSTALLED, "git:a")
+    );
+    assert_eq!(first.current.revision.as_deref(), Some("rev-a"));
+    assert!(first.previous.is_none());
+    assert_eq!(
+        extensions.installed().await.unwrap(),
+        std::slice::from_ref(&first)
+    );
     let line = installs(&host).pop().unwrap();
     assert!(line.ends_with(" install --frozen-lockfile"), "{line}");
     assert!(line.contains(&host.path("store").join(INSTALLED).display().to_string()));
@@ -376,14 +383,24 @@ async fn install_update_rollback_uninstall() {
 
     // An update reloads the enabled extension onto the new version folder.
     std::fs::write(src.join("index.ts"), "export default () => ({ v: 2 });\n").unwrap();
-    let second = extensions.install(&src, "git:a", false).await.unwrap();
-    assert!(second.has_previous);
+    let second = extensions
+        .install(&src, "git:a", Some("rev-b"), false)
+        .await
+        .unwrap();
+    assert_eq!(second.current.revision.as_deref(), Some("rev-b"));
+    assert_eq!(second.previous.as_ref(), Some(&first.current));
     call_lab(&host, &http).await;
     let v2 = activated(&host);
     assert_ne!(v1, v2);
     assert_eq!(versions(&host), 2);
 
-    extensions.rollback(INSTALLED).await.unwrap();
+    // Each copy keeps its own revision and install time.
+    let rolled = extensions.rollback(INSTALLED).await.unwrap();
+    assert_eq!(
+        (Some(&rolled.current), rolled.previous.as_ref()),
+        (second.previous.as_ref(), Some(&second.current))
+    );
+    assert_eq!(extensions.installed().await.unwrap(), [rolled]);
     call_lab(&host, &http).await;
     assert_eq!(activated(&host), v1);
 
@@ -414,9 +431,15 @@ async fn install_refusals() {
     let http = Http::start();
     let extensions = host.manager();
     let src = source(&host, &http, "0.0.0", true);
-    extensions.install(&src, "git:a", false).await.unwrap();
+    extensions
+        .install(&src, "git:a", None, false)
+        .await
+        .unwrap();
 
-    let moved = extensions.install(&src, "git:b", false).await.unwrap_err();
+    let moved = extensions
+        .install(&src, "git:b", None, false)
+        .await
+        .unwrap_err();
     assert_eq!(
         moved,
         InstallError::OriginChanged {
@@ -425,12 +448,12 @@ async fn install_refusals() {
             offered: "git:b".into(),
         }
     );
-    let replaced = extensions.install(&src, "git:b", true).await.unwrap();
+    let replaced = extensions.install(&src, "git:b", None, true).await.unwrap();
     assert_eq!(replaced.origin, "git:b");
 
     let future = source(&host, &http, "9.9.9", true);
     let mismatch = extensions
-        .install(&future, "git:b", false)
+        .install(&future, "git:b", None, false)
         .await
         .unwrap_err();
     assert_eq!(
@@ -454,7 +477,7 @@ async fn install_refusals() {
     )
     .unwrap();
     assert_eq!(
-        extensions.install(&unlocked, "git:b", false).await,
+        extensions.install(&unlocked, "git:b", None, false).await,
         Err(InstallError::MissingLockfile(INSTALLED.into()))
     );
 
@@ -462,7 +485,7 @@ async fn install_refusals() {
     let before = record(&host);
     let src = source(&host, &http, "0.0.0", true);
     std::fs::write(host.path("ctl").join("install"), "fail:boom").unwrap();
-    match extensions.install(&src, "git:b", false).await {
+    match extensions.install(&src, "git:b", None, false).await {
         Err(InstallError::InstallFailed { id, output }) => {
             assert_eq!(id, INSTALLED);
             assert!(output.contains("boom"), "{output}");
@@ -477,7 +500,9 @@ async fn install_refusals() {
     );
 
     assert_eq!(
-        extensions.install(Path::new("src"), "git:b", false).await,
+        extensions
+            .install(Path::new("src"), "git:b", None, false)
+            .await,
         Err(InstallError::InvalidPackage(
             "source src is not an absolute path".into()
         ))
@@ -524,7 +549,7 @@ async fn install_refusals() {
         }
         false
     });
-    let result = extensions.install(&src, "git:b", false).await;
+    let result = extensions.install(&src, "git:b", None, false).await;
     drop(finish);
     assert!(
         !watchdog.join().unwrap(),
@@ -541,7 +566,7 @@ fn current_version(store: &Path) -> PathBuf {
     let package = store.join(INSTALLED);
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(package.join("install.json")).unwrap()).unwrap();
-    package.join(record["current"].as_str().unwrap())
+    package.join(record["current"]["folder"].as_str().unwrap())
 }
 
 async fn shared_store_writers_are_exclusive() {
@@ -560,7 +585,10 @@ async fn shared_store_writers_are_exclusive() {
                 .unwrap(),
         );
         let busy = InstallError::Busy(INSTALLED.into());
-        assert_eq!(b.install(&src, "git:b", false).await.unwrap_err(), busy);
+        assert_eq!(
+            b.install(&src, "git:b", None, false).await.unwrap_err(),
+            busy
+        );
         assert_eq!(b.rollback(INSTALLED).await.unwrap_err(), busy);
         assert_eq!(b.uninstall(INSTALLED, true).await.unwrap_err(), busy);
         assert!(b.installed().await.unwrap().is_empty());
@@ -571,7 +599,7 @@ async fn shared_store_writers_are_exclusive() {
         std::fs::write(ctl.join("install-release"), "").unwrap();
         stage.to_owned()
     };
-    let (result, stage) = tokio::join!(a.install(&src, "git:a", false), contend);
+    let (result, stage) = tokio::join!(a.install(&src, "git:a", None, false), contend);
     assert_eq!(b.installed().await.unwrap(), [result.unwrap()]);
     assert_eq!(current_version(&host.path("store")), stage);
     assert!(stage.join("index.ts").is_file() && stamp(&stage).is_file());
@@ -584,7 +612,10 @@ async fn shutdown_closes_store_admission() {
     let src = source(&host, &http, "0.0.0", true);
     std::fs::remove_file(src.join("package.json")).unwrap();
     let extensions = host.manager();
-    let initial = extensions.install(&src, "git:a", false).await.unwrap();
+    let initial = extensions
+        .install(&src, "git:a", None, false)
+        .await
+        .unwrap();
     let before = record(&host);
     let data = host.path("data/@installed").join(INSTALLED);
     std::fs::create_dir_all(&data).unwrap();
@@ -597,10 +628,10 @@ async fn shutdown_closes_store_admission() {
         extensions.shutdown().await;
         assert_eq!(versions(&host), 1, "shutdown did not drain the update");
     };
-    let (update, ()) = tokio::join!(extensions.install(&src, "git:a", false), shutdown);
+    let (update, ()) = tokio::join!(extensions.install(&src, "git:a", None, false), shutdown);
     assert_eq!(update, Err(InstallError::ShutDown));
     assert_eq!(
-        extensions.install(&src, "git:b", true).await,
+        extensions.install(&src, "git:b", None, true).await,
         Err(InstallError::ShutDown)
     );
     assert_eq!(
@@ -622,7 +653,10 @@ async fn uninstall_data_cleanup_can_be_retried() {
     let http = Http::start();
     let extensions = host.manager();
     let src = source(&host, &http, "0.0.0", true);
-    extensions.install(&src, "git:a", false).await.unwrap();
+    extensions
+        .install(&src, "git:a", None, false)
+        .await
+        .unwrap();
     let data = host.path("data/@installed").join(INSTALLED);
     std::fs::create_dir_all(data.parent().unwrap()).unwrap();
     std::fs::write(&data, "not a directory").unwrap();
@@ -636,7 +670,7 @@ async fn uninstall_data_cleanup_can_be_retried() {
     assert!(!live.exists() && pending.is_dir() && data.is_file());
     assert!(extensions.installed().await.unwrap().is_empty());
     assert_eq!(
-        extensions.install(&src, "git:a", false).await,
+        extensions.install(&src, "git:a", None, false).await,
         Err(InstallError::Io(format!(
             "extension {INSTALLED}: uninstall cleanup is pending; retry uninstall"
         )))
@@ -663,7 +697,10 @@ async fn nested_store_is_not_copied() {
     let mut options = host.options();
     options.store = Some(store.clone());
     let extensions = host.manager_with(options);
-    extensions.install(&alias, "git:a", false).await.unwrap();
+    extensions
+        .install(&alias, "git:a", None, false)
+        .await
+        .unwrap();
     let current = current_version(&store);
     assert_eq!(
         std::fs::read(current.join("index.ts")).unwrap(),

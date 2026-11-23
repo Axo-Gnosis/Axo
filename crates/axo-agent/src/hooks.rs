@@ -65,11 +65,28 @@ pub enum ToolCallDecision {
     #[default]
     Allow,
     /// Skip execution; the call gets an error result with `reason` (or pi's default
-    /// blocked text). `terminate` joins the batch early-termination rule.
+    /// blocked text) and [`Blocked`] in its `details`. `terminate` joins the batch
+    /// early-termination rule.
     Block {
         reason: Option<String>,
         terminate: bool,
+        /// Who blocked it; recorded in the result's `details.blocked.origin`.
+        origin: Option<String>,
     },
+}
+
+/// `details.blocked` of a tool result produced by [`ToolCallDecision::Block`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Blocked {
+    /// Who blocked the call; `None` for the harness itself or an unlabeled hook.
+    pub origin: Option<String>,
+}
+
+impl Blocked {
+    /// The marker in a tool result's `details`, if the call was blocked.
+    pub fn of(details: Option<&Value>) -> Option<Blocked> {
+        serde_json::from_value(details?.get("blocked")?.clone()).ok()
+    }
 }
 
 /// Context passed to `after_tool_call`; `result.is_error` is the current error flag.

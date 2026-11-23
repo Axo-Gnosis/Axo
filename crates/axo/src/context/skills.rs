@@ -25,6 +25,8 @@ pub struct Skill {
     pub disable_model_invocation: bool,
     /// `argument-hint`: placeholder text shown after `/name` until arguments are typed.
     pub argument_hint: Option<String>,
+    /// Who supplied it in code; `None` for a skill read from a definition root.
+    pub origin: Option<String>,
 }
 
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
@@ -198,6 +200,7 @@ fn load_skill_file(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) 
             .map(str::trim)
             .filter(|hint| !hint.is_empty())
             .map(str::to_owned),
+        origin: None,
     })
 }
 
@@ -490,6 +493,7 @@ mod tests {
                 path,
                 disable_model_invocation: false,
                 argument_hint: None,
+                origin: None,
             }
         };
         let skills = [

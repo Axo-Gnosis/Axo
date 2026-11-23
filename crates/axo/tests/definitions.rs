@@ -61,6 +61,7 @@ fn definitions(dir: &Path) -> Definitions {
             path,
             argument_hint: None,
             disable_model_invocation: false,
+            origin: None,
         }],
     }
 }

@@ -19,10 +19,11 @@ use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ExtensionOptions, ExtensionPhase, ExtensionStatus,
+    ExtensionOptions, ExtensionPhase, ExtensionProblem, ExtensionStatus, ProblemKind,
     manifest::{Member, check_entry},
     peer::{Actions, CallError, Peer},
-    process::{Generation, StartError},
+    problem,
+    process::{BunPath, Generation, StartError},
 };
 
 mod budget;
@@ -34,13 +35,15 @@ const ACTIVATE_DEADLINE: Duration = Duration::from_secs(15);
 
 type Report = Arc<dyn Fn(ExtensionStatus) + Send + Sync>;
 /// Readies one member before a generation starts (installs its dependencies); `Err` disables
-/// that member with the reason.
-pub type Prepare = Arc<dyn Fn(Member) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+/// that member with the problem.
+pub type Prepare =
+    Arc<dyn Fn(Member) -> BoxFuture<'static, Result<(), ExtensionProblem>> + Send + Sync>;
 
 pub struct Placement {
     shared: Arc<Shared>,
     options: ExtensionOptions,
     supervisor: Arc<ProcessSupervisor>,
+    bun: BunPath,
     stop: CancellationToken,
 }
 
@@ -60,8 +63,8 @@ struct Shared {
 struct State {
     phase: Phase,
     generation: u64,
-    /// Members disabled by their own load failure, with the reason; never activated again here.
-    load: HashMap<String, String>,
+    /// Members disabled by their own load failure, with the problem; never activated again here.
+    load: HashMap<String, ExtensionProblem>,
     /// Activation order as indices into `Shared::members`; read when a generation activates.
     order: Vec<usize>,
     /// Operations waiting for a first start; all settled on its first outcome.
@@ -77,17 +80,17 @@ enum Phase {
     #[default]
     Cold,
     Starting,
-    Restarting(String),
+    Restarting(ExtensionProblem),
     Ready(Arc<Peer>),
-    Disabled(String),
-    Unavailable(String),
+    Disabled(ExtensionProblem),
+    Unavailable(ExtensionProblem),
 }
 
 /// How one generation ended.
 enum Exit {
     Stopped,
     /// Host inputs prevent starting; no retry until the host rebuilds the placement.
-    Setup(String),
+    Setup(ExtensionProblem),
     /// Every member is load-disabled; nothing left to run.
     Idle,
     /// Counts once against the placement budget.
@@ -104,17 +107,19 @@ enum Check {
 }
 
 enum Activation {
-    Member(String),
+    Member(ExtensionProblem),
     Placement(String),
 }
 
 impl Placement {
     /// Cold: no I/O, no task and no report until the first [`Placement::peer`].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         members: Vec<Member>,
         group: Option<String>,
         options: ExtensionOptions,
         supervisor: Arc<ProcessSupervisor>,
+        bun: BunPath,
         report: Report,
         prepare: Prepare,
         actions: Arc<dyn Actions>,
@@ -135,6 +140,7 @@ impl Placement {
             }),
             options,
             supervisor,
+            bun,
             stop: CancellationToken::new(),
         })
     }
@@ -143,7 +149,7 @@ impl Placement {
     /// `retried`'s, so an explicit retry or reload revives only what it names. `None` carries
     /// every load failure over.
     pub fn inherit(&self, old: &Placement, retried: Option<&str>) {
-        let failures: Vec<(String, String)> = old
+        let failures: Vec<(String, ExtensionProblem)> = old
             .shared
             .lock()
             .load
@@ -213,6 +219,7 @@ impl Placement {
                     self.shared.clone(),
                     self.options.clone(),
                     self.supervisor.clone(),
+                    self.bun.clone(),
                     self.stop.clone(),
                 )));
             }
@@ -289,15 +296,17 @@ impl Shared {
         if state.closed {
             return Err(format!("{label} is shut down"));
         }
-        if let Some(reason) = state.load.get(ext) {
-            return Err(reason.clone());
+        if let Some(problem) = state.load.get(ext) {
+            return Err(problem.message.clone());
         }
         match &state.phase {
             Phase::Cold => Ok(Check::Cold),
             Phase::Ready(peer) => Ok(Check::Ready(peer.clone())),
             Phase::Starting => Ok(Check::Starting),
-            Phase::Restarting(reason) => Err(format!("{label} is restarting after: {reason}")),
-            Phase::Disabled(reason) | Phase::Unavailable(reason) => Err(reason.clone()),
+            Phase::Restarting(problem) => {
+                Err(format!("{label} is restarting after: {}", problem.message))
+            }
+            Phase::Disabled(problem) | Phase::Unavailable(problem) => Err(problem.message.clone()),
         }
     }
 
@@ -305,19 +314,19 @@ impl Shared {
         self.members
             .iter()
             .map(|member| {
-                let (phase, reason) = match (state.load.get(&member.id), &state.phase) {
-                    (Some(reason), _) => (ExtensionPhase::Disabled, Some(reason.clone())),
+                let (phase, problem) = match (state.load.get(&member.id), &state.phase) {
+                    (Some(problem), _) => (ExtensionPhase::Disabled, Some(problem.clone())),
                     (None, Phase::Cold) => (ExtensionPhase::Cold, None),
                     (None, Phase::Starting) => (ExtensionPhase::Starting, None),
-                    (None, Phase::Restarting(reason)) => {
-                        (ExtensionPhase::Restarting, Some(reason.clone()))
+                    (None, Phase::Restarting(problem)) => {
+                        (ExtensionPhase::Restarting, Some(problem.clone()))
                     }
                     (None, Phase::Ready(_)) => (ExtensionPhase::Ready, None),
-                    (None, Phase::Disabled(reason)) => {
-                        (ExtensionPhase::Disabled, Some(reason.clone()))
+                    (None, Phase::Disabled(problem)) => {
+                        (ExtensionPhase::Disabled, Some(problem.clone()))
                     }
-                    (None, Phase::Unavailable(reason)) => {
-                        (ExtensionPhase::Unavailable, Some(reason.clone()))
+                    (None, Phase::Unavailable(problem)) => {
+                        (ExtensionPhase::Unavailable, Some(problem.clone()))
                     }
                 };
                 ExtensionStatus {
@@ -325,7 +334,7 @@ impl Shared {
                     group: self.group.clone(),
                     generation: state.generation,
                     phase,
-                    reason,
+                    problem,
                 }
             })
             .collect()
@@ -342,9 +351,9 @@ impl Shared {
             let outcome = match &phase {
                 Phase::Starting => None,
                 Phase::Cold | Phase::Ready(_) => Some(Ok(())),
-                Phase::Restarting(reason)
-                | Phase::Disabled(reason)
-                | Phase::Unavailable(reason) => Some(Err(reason.clone())),
+                Phase::Restarting(problem)
+                | Phase::Disabled(problem)
+                | Phase::Unavailable(problem) => Some(Err(problem.message.clone())),
             };
             if let Some(outcome) = outcome {
                 for waiter in state.waiters.drain(..) {
@@ -365,6 +374,7 @@ impl Shared {
     async fn run(
         &self,
         options: &ExtensionOptions,
+        bun: &BunPath,
         supervisor: &ProcessSupervisor,
         generation: u64,
         stop: &CancellationToken,
@@ -381,8 +391,8 @@ impl Shared {
                 prepared = (self.prepare)(member) => prepared,
                 () = stop.cancelled() => return Exit::Stopped,
             };
-            if let Err(reason) = prepared {
-                self.lock().load.insert(id, reason);
+            if let Err(problem) = prepared {
+                self.lock().load.insert(id, problem);
             }
         }
         if self
@@ -394,6 +404,7 @@ impl Shared {
         }
         let start = Generation::start(
             options,
+            bun,
             supervisor,
             generation,
             stop,
@@ -403,8 +414,11 @@ impl Shared {
         let mut process = match start.await {
             Ok(process) => process,
             Err(StartError::Stopped) => return Exit::Stopped,
-            Err(StartError::Setup(reason)) => {
-                return Exit::Setup(format!("{}: {reason}", self.who()));
+            Err(StartError::Setup(setup)) => {
+                return Exit::Setup(problem(
+                    setup.kind,
+                    format!("{}: {}", self.who(), setup.message),
+                ));
             }
             Err(StartError::Crash(reason)) => {
                 return Exit::Crash(format!("{} failed to start: {reason}", self.who()));
@@ -434,8 +448,8 @@ impl Shared {
             }
             match self.activate(peer, member, options).await {
                 Ok(()) => active = true,
-                Err(Activation::Member(reason)) => {
-                    self.lock().load.insert(member.id.clone(), reason);
+                Err(Activation::Member(problem)) => {
+                    self.lock().load.insert(member.id.clone(), problem);
                 }
                 Err(Activation::Placement(reason)) => return Exit::Crash(reason),
             }
@@ -457,7 +471,7 @@ impl Shared {
         // Member-local: a changed, nonregular or unreadable entry never reaches the shared runner.
         check_entry(&member.entry)
             .await
-            .map_err(|err| Activation::Member(format!("{label} entry {err}")))?;
+            .map_err(|err| rejected(ProblemKind::Invalid, format!("{label} entry {err}")))?;
         let data = options.data_dir(&member.id);
         tokio::fs::DirBuilder::new()
             .recursive(true)
@@ -465,12 +479,16 @@ impl Shared {
             .create(&data)
             .await
             .map_err(|err| {
-                Activation::Member(format!("{label} cannot create its data directory: {err}"))
+                rejected(
+                    ProblemKind::Setup,
+                    format!("{label} cannot create its data directory: {err}"),
+                )
             })?;
         let (Some(entry), Some(data_dir)) = (member.entry.to_str(), data.to_str()) else {
-            return Err(Activation::Member(format!(
-                "{label} has a non-UTF-8 entry or data path"
-            )));
+            return Err(rejected(
+                ProblemKind::Setup,
+                format!("{label} has a non-UTF-8 entry or data path"),
+            ));
         };
         let providers: Vec<_> = member
             .providers
@@ -491,12 +509,14 @@ impl Shared {
         .await
         {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(CallError::Method(message))) => Err(Activation::Member(format!(
-                "{label} failed to load: {message}"
-            ))),
-            Ok(Err(CallError::Invalid)) => Err(Activation::Member(format!(
-                "{label} activation request exceeds the protocol limits"
-            ))),
+            Ok(Err(CallError::Method(message))) => Err(rejected(
+                ProblemKind::Load,
+                format!("{label} failed to load: {message}"),
+            )),
+            Ok(Err(CallError::Invalid)) => Err(rejected(
+                ProblemKind::Load,
+                format!("{label} activation request exceeds the protocol limits"),
+            )),
             Ok(Err(CallError::Unavailable)) => Err(Activation::Placement(format!(
                 "{} runner stopped while activating {}",
                 self.who(),
@@ -516,6 +536,7 @@ async fn drive(
     shared: Arc<Shared>,
     options: ExtensionOptions,
     supervisor: Arc<ProcessSupervisor>,
+    bun: BunPath,
     stop: CancellationToken,
 ) {
     let mut budget = Budget::default();
@@ -526,10 +547,13 @@ async fn drive(
         if !shared.commit(generation, phase) {
             return;
         }
-        let failure = match shared.run(&options, &supervisor, generation, &stop).await {
+        let failure = match shared
+            .run(&options, &bun, &supervisor, generation, &stop)
+            .await
+        {
             Exit::Stopped => return,
-            Exit::Setup(reason) => {
-                shared.commit(generation, Phase::Unavailable(reason));
+            Exit::Setup(problem) => {
+                shared.commit(generation, Phase::Unavailable(problem));
                 return;
             }
             Exit::Idle => {
@@ -544,9 +568,17 @@ async fn drive(
                 shared.who(),
                 WINDOW.as_secs()
             );
-            shared.commit(generation, Phase::Disabled(reason));
+            shared.commit(
+                generation,
+                Phase::Disabled(problem(ProblemKind::Crash, reason)),
+            );
             return;
         }
-        phase = Phase::Restarting(failure);
+        phase = Phase::Restarting(problem(ProblemKind::Crash, failure));
     }
+}
+
+/// A member-local activation failure.
+fn rejected(kind: ProblemKind, message: String) -> Activation {
+    Activation::Member(problem(kind, message))
 }

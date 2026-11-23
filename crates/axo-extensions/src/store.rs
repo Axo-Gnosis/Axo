@@ -14,12 +14,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axo::EnabledExtension;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 
 use crate::manifest::{self, MANIFEST};
-use crate::process::usable_bun;
 use crate::{BridgeError, Inner, Rearm, SDK_VERSION, deps};
 
 pub const RECORD: &str = "install.json";
@@ -30,9 +27,22 @@ pub const RECORD: &str = "install.json";
 pub struct Record {
     /// The origin string the host passed to the install that wrote this record.
     pub origin: String,
-    pub current: String,
+    pub current: InstalledCopy,
     /// Kept for `rollback`.
-    pub previous: Option<String>,
+    pub previous: Option<InstalledCopy>,
+}
+
+/// One installed copy of an extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledCopy {
+    /// The version folder name.
+    pub(crate) folder: String,
+    /// The host's label for this copy (e.g. a Git commit and ref), as passed to
+    /// `Extensions::install`.
+    pub revision: Option<String>,
+    /// Unix milliseconds when this copy was installed.
+    pub installed_at: i64,
 }
 
 /// One installed extension, as its record describes it.
@@ -40,8 +50,20 @@ pub struct Record {
 pub struct InstalledExtension {
     pub id: String,
     pub origin: String,
-    /// Whether `Extensions::rollback` has a version to switch to.
-    pub has_previous: bool,
+    pub current: InstalledCopy,
+    /// The copy `Extensions::rollback` switches to.
+    pub previous: Option<InstalledCopy>,
+}
+
+impl InstalledExtension {
+    fn new(id: String, record: Record) -> Self {
+        Self {
+            id,
+            origin: record.origin,
+            current: record.current,
+            previous: record.previous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -86,13 +108,6 @@ pub enum InstallError {
     ShutDown,
 }
 
-/// The part of a candidate package's manifest read before copying it.
-#[derive(Deserialize)]
-struct Head {
-    id: String,
-    sdk: Option<String>,
-}
-
 /// A version folder name this store creates; anything else in a record is corruption.
 fn version_name(name: &str) -> bool {
     name.starts_with("v-") && !name.contains('/')
@@ -100,11 +115,7 @@ fn version_name(name: &str) -> bool {
 
 /// A valid `publisher/name` ID, so joining it under the store stays inside it.
 fn installed_id(id: &str) -> bool {
-    let candidate = EnabledExtension {
-        id: id.to_owned(),
-        group: None,
-    };
-    id.contains('/') && EnabledExtension::validate_all(&[candidate]).is_ok()
+    id.contains('/') && manifest::validate_id(id).is_ok()
 }
 
 /// `<dir>/install.json`, or `None` when the extension is not installed.
@@ -117,8 +128,11 @@ pub async fn read_record(dir: &Path) -> Result<Option<Record>, String> {
     };
     let record: Record = serde_json::from_str(&text)
         .map_err(|error| format!("{}: invalid: {error}", path.display()))?;
-    if !version_name(&record.current)
-        || record.previous.as_deref().is_some_and(|p| !version_name(p))
+    if !version_name(&record.current.folder)
+        || record
+            .previous
+            .as_ref()
+            .is_some_and(|p| !version_name(&p.folder))
     {
         return Err(format!(
             "{}: names an invalid version folder",
@@ -228,7 +242,10 @@ fn stage(
         let name = name.to_string_lossy();
         if version_name(&name)
             && !record.is_some_and(|r| {
-                r.current.as_str() == name.as_ref() || r.previous.as_deref() == Some(name.as_ref())
+                r.current.folder == name.as_ref()
+                    || r.previous
+                        .as_ref()
+                        .is_some_and(|p| p.folder == name.as_ref())
             })
         {
             std::fs::remove_dir_all(entry.path())
@@ -336,6 +353,7 @@ impl Inner {
         self: Arc<Self>,
         source: PathBuf,
         origin: String,
+        revision: Option<String>,
         replace_origin: bool,
     ) -> Result<InstalledExtension, InstallError> {
         let _work = self.deps.store_work.read().await;
@@ -347,20 +365,15 @@ impl Inner {
                 source.display()
             )));
         }
-        let bun = usable_bun(self.options.bun.as_deref())
+        let bun = self
+            .bun
+            .usable()
             .await
-            .map_err(InstallError::Bun)?;
+            .map_err(|unusable| InstallError::Bun(unusable.message))?;
         let path = source.join(MANIFEST);
         let invalid =
             |what: String| InstallError::InvalidPackage(format!("{}: {what}", path.display()));
-        let Head { id, sdk } = {
-            let mut file = manifest::open_regular(&path).await.map_err(invalid)?;
-            let mut text = String::new();
-            file.read_to_string(&mut text)
-                .await
-                .map_err(|e| invalid(format!("cannot read: {e}")))?;
-            serde_json::from_str(&text).map_err(|e| invalid(format!("invalid: {e}")))?
-        };
+        let manifest::Head { id, sdk } = manifest::head(&source).await.map_err(invalid)?;
         if !installed_id(&id) {
             return Err(invalid(format!("id {id:?} is not publisher/name")));
         }
@@ -407,7 +420,7 @@ impl Inner {
         .await?;
         let result = async {
             self.check_open()?;
-            let found = manifest::load(&id, &version).await.map_err(InstallError::InvalidPackage)?;
+            let found = manifest::load(&id, &version).await.map_err(|p| InstallError::InvalidPackage(p.message))?;
             if let Some(error) = found.entry_error {
                 return Err(InstallError::InvalidPackage(error));
             }
@@ -420,14 +433,15 @@ impl Inner {
                 tokio::select! {
                     biased;
                     () = self.closed.cancelled() => return Err(InstallError::ShutDown),
-                    result = deps::install(bun, &self.options.env, &self.supervisor, &version, true) => {
+                    result = deps::install(&bun, &self.options.env, &self.supervisor, &version, true) => {
                         result.map_err(|output| InstallError::InstallFailed { id: id.clone(), output })?;
                     }
                 }
             }
-            let current = version.file_name().expect("a version folder has a name").to_string_lossy().into_owned();
+            let folder = version.file_name().expect("a version folder has a name").to_string_lossy().into_owned();
             self.publish(&dir, Record {
-                origin, current,
+                origin,
+                current: InstalledCopy { folder, revision, installed_at: axo_ai::now_ms() },
                 previous: record.as_ref().map(|r| r.current.clone()),
             }).await
         }.await;
@@ -440,16 +454,11 @@ impl Inner {
                 return Err(error);
             }
         };
-        let has_previous = record.is_some();
         if let Some(stale) = record.and_then(|record| record.previous) {
-            let _ = tokio::fs::remove_dir_all(dir.join(stale)).await;
+            let _ = tokio::fs::remove_dir_all(dir.join(stale.folder)).await;
         }
         self.reload_installed(&id).await?;
-        Ok(InstalledExtension {
-            id,
-            origin: next.origin,
-            has_previous,
-        })
+        Ok(InstalledExtension::new(id, next))
     }
 
     pub(crate) async fn rollback(
@@ -480,11 +489,7 @@ impl Inner {
             )
             .await?;
         self.reload_installed(&id).await?;
-        Ok(InstalledExtension {
-            id,
-            origin: next.origin,
-            has_previous: true,
-        })
+        Ok(InstalledExtension::new(id, next))
     }
 
     pub(crate) async fn uninstall(
@@ -515,7 +520,7 @@ impl Inner {
                 }
                 delete_data
             } else {
-                if read_record(&dir).await.map_err(InstallError::Io)?.is_none() {
+                if let Ok(None) = read_record(&dir).await {
                     return Err(InstallError::NotInstalled(id));
                 }
                 let tomb = if delete_data { &purge } else { &remove };
@@ -585,11 +590,7 @@ impl Inner {
                     name_part.to_string_lossy()
                 );
                 if let Ok(Some(record)) = read_record(&name.path()).await {
-                    found.push(InstalledExtension {
-                        id,
-                        origin: record.origin,
-                        has_previous: record.previous.is_some(),
-                    });
+                    found.push(InstalledExtension::new(id, record));
                 }
             }
         }

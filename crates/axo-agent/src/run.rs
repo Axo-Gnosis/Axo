@@ -24,7 +24,8 @@ use crate::cancel::CancelReason;
 use crate::error::Error;
 use crate::event::{AgentEvent, MessageOrigin};
 use crate::hooks::{
-    AfterToolCallContext, AgentContext, BeforeToolCallContext, ToolCallDecision, TurnContext,
+    AfterToolCallContext, AgentContext, BeforeToolCallContext, Blocked, ToolCallDecision,
+    TurnContext,
 };
 use crate::message::{AgentMessage, QueuedMessage, last_non_system, unanswered_calls};
 use crate::tool::{
@@ -664,10 +665,15 @@ impl Run<'_> {
                 Ok(_) if self.cancel.is_cancelled() => {
                     return Prepared::Immediate(error_output("Operation aborted"));
                 }
-                Ok(ToolCallDecision::Block { reason, terminate }) => {
+                Ok(ToolCallDecision::Block {
+                    reason,
+                    terminate,
+                    origin,
+                }) => {
                     let mut output =
                         error_output(reason.unwrap_or_else(|| "Tool execution was blocked".into()));
                     output.terminate = terminate;
+                    output.details = Some(serde_json::json!({ "blocked": Blocked { origin } }));
                     return Prepared::Immediate(output);
                 }
                 Ok(ToolCallDecision::Allow) => {}

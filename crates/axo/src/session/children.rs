@@ -412,6 +412,7 @@ impl ToolHooks for TurnBudget {
             ToolCallDecision::Block {
                 reason: Some("turn budget exhausted".into()),
                 terminate: requests > self.limit,
+                origin: None,
             }
         } else {
             ToolCallDecision::Allow

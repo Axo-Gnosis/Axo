@@ -72,7 +72,7 @@ pub struct RegisteredCommand {
     pub name: String,
     pub description: String,
     pub argument_hint: Option<String>,
-    /// Who registered it, for diagnostics.
+    /// Who registered it, for diagnostics and [`CommandInfo::origin`].
     pub origin: Option<String>,
     pub handler: Arc<dyn CommandHandler>,
 }
@@ -114,6 +114,10 @@ pub struct CommandInfo {
     pub name: String,
     pub description: String,
     pub policy: CommandPolicy,
+    /// Who registered it ([`RegisteredCommand::origin`], [`Skill::origin`],
+    /// [`ModeSpec::origin`]); `None` for built-ins, definition files and unlabeled
+    /// registrations.
+    pub origin: Option<String>,
     #[serde(flatten)]
     pub kind: CommandKind,
 }
@@ -411,6 +415,7 @@ pub fn catalog(
         name: builtin.name.to_owned(),
         description: builtin.description.to_owned(),
         policy: builtin.policy,
+        origin: None,
         kind: CommandKind::Builtin {
             parameters: Value::clone(&builtin.parameters),
         },
@@ -426,6 +431,7 @@ pub fn catalog(
             name: skill.name.clone(),
             description: skill.description.clone(),
             policy: CommandPolicy::Queued,
+            origin: skill.origin.clone(),
             kind: CommandKind::Skill {
                 argument_hint: skill.argument_hint.clone(),
             },
@@ -434,6 +440,7 @@ pub fn catalog(
         name: mode.name.clone(),
         description: mode.description.clone(),
         policy: CommandPolicy::Alongside,
+        origin: mode.origin.clone(),
         kind: CommandKind::Mode {
             argument_hint: mode.argument_hint.clone(),
         },
@@ -442,6 +449,7 @@ pub fn catalog(
         name: command.name.clone(),
         description: command.description.clone(),
         policy: CommandPolicy::Alongside,
+        origin: command.origin.clone(),
         kind: CommandKind::Registered {
             argument_hint: command.argument_hint.clone(),
         },
@@ -609,6 +617,7 @@ mod tests {
             path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
             disable_model_invocation: false,
             argument_hint: argument_hint.map(str::to_owned),
+            origin: None,
         }
     }
 
@@ -829,6 +838,7 @@ mod tests {
                 "name": "review",
                 "description": "review skill",
                 "policy": "queued",
+                "origin": null,
                 "kind": "skill",
                 "argumentHint": "<file>",
             })

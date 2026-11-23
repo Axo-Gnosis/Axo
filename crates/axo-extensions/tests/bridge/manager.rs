@@ -1,9 +1,12 @@
 //! Configuration, discovery and winner publication through the public `Extensions` API.
 //! Nothing here needs a runner to start; most cases run with Bun absent.
 
+use std::path::Path;
+
 use axo_ai::{Error, Models};
 use axo_extensions::{
-    BridgeError, ExtensionEvent, ExtensionPhase, Hidden, ProviderCollision, ProviderOrigin,
+    BridgeError, ExtensionEvent, ExtensionPhase, ExtensionProvider, Hidden, ProblemKind,
+    ProviderCollision, ProviderOrigin, inspect_package,
 };
 
 use super::{
@@ -58,10 +61,9 @@ async fn absent_bun_keeps_claims_names_the_extension_and_spares_natives() {
         extensions.configure(&list).await.unwrap();
         let status = phase(&extensions, "lab-provider");
         assert_eq!(status.phase, ExtensionPhase::Unavailable, "{status:?}");
-        assert!(
-            status.reason.as_deref().unwrap().contains("Bun"),
-            "{status:?}"
-        );
+        let problem = status.problem.as_ref().unwrap();
+        assert_eq!(problem.kind, ProblemKind::Bun, "{status:?}");
+        assert!(problem.message.contains("Bun"), "{status:?}");
 
         // The declared override is listed and wins over the native registration...
         assert_eq!(base_url(&host.models, "lab").unwrap(), http.url);
@@ -100,6 +102,23 @@ async fn absent_bun_keeps_claims_names_the_extension_and_spares_natives() {
         extensions.shutdown().await;
         assert_eq!(base_url(&host.models, "lab").unwrap(), native.url);
     }
+
+    // A live manager picks up Bun once the host supplies it, without being rebuilt.
+    let extensions = host.manager_with(host.options_with(None));
+    extensions.configure(&list).await.unwrap();
+    let status = phase(&extensions, "lab-provider");
+    assert_eq!(status.problem.map(|p| p.kind), Some(ProblemKind::Bun));
+    assert!(matches!(
+        extensions.set_bun(Some("relative".into())).await,
+        Err(BridgeError::InvalidOptions(_))
+    ));
+    extensions
+        .set_bun(Some(std::env::current_exe().unwrap()))
+        .await
+        .unwrap();
+    let status = phase(&extensions, "lab-provider");
+    assert_eq!((status.phase, status.problem), (ExtensionPhase::Cold, None));
+    extensions.shutdown().await;
     assert!(host.pids().is_empty(), "no runner may start without Bun");
 }
 
@@ -183,6 +202,19 @@ async fn last_enabled_wins_and_collisions_are_reported() {
     // The shadowed extension is still reported, in enabled order.
     let ids: Vec<_> = extensions.status().into_iter().map(|s| s.id).collect();
     assert_eq!(ids, ["alpha", "beta"]);
+    assert_eq!(
+        extensions.providers(),
+        [
+            ExtensionProvider {
+                provider: "pa".into(),
+                extension: "alpha".into()
+            },
+            ExtensionProvider {
+                provider: "shared".into(),
+                extension: "beta".into()
+            },
+        ]
+    );
     let mut shadowed = Vec::new();
     while let Ok(event) = events.try_recv() {
         if let ExtensionEvent::Shadowed {
@@ -254,8 +286,61 @@ async fn unadmitted_and_duplicate_packages_are_diagnosed() {
             .to_string(),
     );
     host.package("root", "good", &[("pg", &one.url, false, false)]);
+    host.write_package(
+        "root2",
+        "decl",
+        &serde_json::json!({
+            "id": "decl", "entry": "index.ts",
+            "tools": [{"name": "probe", "description": "Probe", "parameters": {"type": "object"}}],
+            "commands": [{"name": "hello", "description": "Say hello"}],
+            "sections": [{"name": "rules", "file": "rules.md"}],
+        })
+        .to_string(),
+    );
+    std::fs::write(host.path("root2/decl/rules.md"), "Rules.").unwrap();
 
     let extensions = host.manager_with(host.options_with(None));
+    // Packages are readable from disk before anything is enabled or run.
+    assert_eq!(
+        extensions.authored().await,
+        ["broken", "decl", "dup", "escape", "good", "mismatch"]
+    );
+    let decl = extensions.inspect("decl").await.unwrap();
+    assert_eq!(decl.entry_error, None);
+    assert_eq!(decl.session.tools[0].name, "probe");
+    assert_eq!(decl.session.commands[0].name, "hello");
+    assert_eq!(decl.sections, [("rules".into(), "Rules.".into())]);
+    let dup = extensions.inspect("dup").await.unwrap();
+    assert_eq!(dup.package, host.path("root/dup"));
+    assert_eq!(dup.providers[0].id, "pd");
+    assert!(!dup.diagnostics.is_empty());
+    assert!(
+        extensions
+            .inspect("escape")
+            .await
+            .unwrap()
+            .entry_error
+            .is_some()
+    );
+    for (id, kind) in [
+        ("ghost", ProblemKind::NotFound),
+        ("broken", ProblemKind::Invalid),
+        ("../dup", ProblemKind::Invalid),
+    ] {
+        assert_eq!(extensions.inspect(id).await.unwrap_err().kind, kind, "{id}");
+    }
+    let package = inspect_package(&host.path("root2/decl")).await.unwrap();
+    assert_eq!(
+        (package.id, package.package),
+        ("decl".into(), host.path("root2/decl"))
+    );
+    assert_eq!(
+        inspect_package(Path::new("root2/decl"))
+            .await
+            .unwrap_err()
+            .kind,
+        ProblemKind::Invalid
+    );
     let mut events = extensions.subscribe();
     let list = enabled(&[
         ("dup", None),
@@ -282,7 +367,13 @@ async fn unadmitted_and_duplicate_packages_are_diagnosed() {
     for id in ["ghost", "broken", "mismatch", "escape"] {
         let status = phase(&extensions, id);
         assert_eq!(status.phase, ExtensionPhase::Unavailable, "{status:?}");
-        assert!(status.reason.is_some(), "{id}");
+        let kind = status.problem.map(|problem| problem.kind);
+        let expected = if id == "ghost" {
+            ProblemKind::NotFound
+        } else {
+            ProblemKind::Invalid
+        };
+        assert_eq!(kind, Some(expected), "{id}");
     }
     // Siblings stay admitted; the native provider stays visible.
     assert!(find(&host.models, "pg").is_some());

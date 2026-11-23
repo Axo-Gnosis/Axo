@@ -135,7 +135,7 @@ async fn group_budget(bun: &Path, mode: Supervision) {
     for id in [LAB, TWO] {
         let status = host.wait_phase(id, ExtensionPhase::Disabled).await;
         assert_eq!(status.group.as_deref(), Some("personal"));
-        let reason = status.reason.unwrap();
+        let reason = status.problem.unwrap().message;
         assert!(
             reason.contains("group personal") && reason.contains("3 runner failures"),
             "{reason}"
@@ -202,11 +202,11 @@ async fn load_failures_and_watchdog(bun: &Path, mode: Supervision) {
     assert_reply(&host.stream(CancellationToken::new()).await);
 
     let lab = host.status(LAB);
-    assert_eq!((lab.phase, lab.reason), (ExtensionPhase::Ready, None));
+    assert_eq!((lab.phase, lab.problem), (ExtensionPhase::Ready, None));
     for id in [THROWING, MISSING] {
         let status = host.status(id);
         assert_eq!(status.phase, ExtensionPhase::Disabled, "{status:?}");
-        let reason = status.reason.unwrap();
+        let reason = status.problem.unwrap().message;
         assert!(
             reason.contains(id) && reason.contains("failed to load"),
             "{reason}"

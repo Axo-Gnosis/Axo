@@ -37,6 +37,8 @@ pub struct ModeSpec {
     /// The instructions (trimmed).
     pub body: String,
     pub path: Option<PathBuf>,
+    /// Who supplied it in code; `None` for a mode read from a definition root.
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, specta::Type)]
@@ -261,6 +263,7 @@ fn parse_markdown(
         extra: frontmatter.extra,
         body,
         path: path.map(Path::to_path_buf),
+        origin: None,
     };
     validate(&spec, warn).then_some(spec)
 }
@@ -335,6 +338,7 @@ mod tests {
                 extra: Map::from_iter([("custom".into(), json!(1))]),
                 body: "Make a plan.".into(),
                 path: Some(path),
+                origin: None,
             }]
         );
         assert_eq!(diagnostics.len(), 2);

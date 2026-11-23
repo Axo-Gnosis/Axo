@@ -50,6 +50,8 @@ pub struct ProviderInfo {
     pub requires_key: bool,
     /// The provider supports `Models::login`.
     pub login: bool,
+    /// The winning contributor of this id.
+    pub origin: ProviderOrigin,
 }
 
 /// Where a provider's credential comes from, without resolving or validating it.
@@ -100,8 +102,9 @@ pub struct ProviderLayer {
     ordinal: u64,
 }
 
-/// What a layer's provider hides (or would hide): see `ProviderLayer::hidden`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Where a provider comes from: see [`ProviderInfo::origin`] and [`ProviderLayer::hidden`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub enum ProviderOrigin {
     /// An older `ProviderLayer`.
     Layer,
@@ -247,34 +250,39 @@ struct State {
 
 fn build_snapshot(
     loaded: &Loaded,
-    winners: &BTreeMap<&str, &Registered>,
+    winners: &BTreeMap<&str, (&Registered, ProviderOrigin)>,
 ) -> (Arc<[Arc<Model>]>, Vec<usize>, Vec<ProviderInfo>) {
     let snapshot: Arc<[Arc<Model>]> = loaded
         .models
         .iter()
         .filter(|model| !winners.contains_key(model.provider.as_str()))
-        .chain(winners.values().flat_map(|registered| &registered.models))
+        .chain(
+            winners
+                .values()
+                .flat_map(|(registered, _)| &registered.models),
+        )
         .cloned()
         .collect();
     let mut by_id: Vec<usize> = (0..snapshot.len()).collect();
     by_id.sort_unstable_by_key(|&i| (&snapshot[i].provider, &snapshot[i].id, i));
-    let mut providers: BTreeMap<&str, &ProviderAuth> = loaded
+    let mut providers: BTreeMap<&str, (&ProviderAuth, ProviderOrigin)> = loaded
         .providers
         .iter()
-        .map(|(id, info)| (id.as_str(), info.as_ref()))
+        .map(|(id, info)| (id.as_str(), (info.as_ref(), ProviderOrigin::Loaded)))
         .collect();
     providers.extend(
         winners
             .iter()
-            .map(|(&id, registered)| (id, registered.auth.as_ref())),
+            .map(|(&id, (registered, origin))| (id, (registered.auth.as_ref(), *origin))),
     );
     let providers = providers
         .into_values()
-        .map(|info| ProviderInfo {
+        .map(|(info, origin)| ProviderInfo {
             id: info.id.clone(),
             env: info.env.clone(),
             requires_key: info.requires_key,
             login: info.login.is_some(),
+            origin,
         })
         .collect();
     (snapshot, by_id, providers)
@@ -339,17 +347,17 @@ impl State {
 
     /// Each replaced provider id's winning registration: the newest layer containing it,
     /// else the runtime registration.
-    fn winners(&self) -> BTreeMap<&str, &Registered> {
-        let mut winners: BTreeMap<&str, &Registered> = self
+    fn winners(&self) -> BTreeMap<&str, (&Registered, ProviderOrigin)> {
+        let mut winners: BTreeMap<&str, (&Registered, ProviderOrigin)> = self
             .registered
             .iter()
-            .map(|(id, registered)| (id.as_str(), registered))
+            .map(|(id, registered)| (id.as_str(), (registered, ProviderOrigin::Registered)))
             .collect();
         for layer in self.layers.values() {
             winners.extend(
                 layer
                     .iter()
-                    .map(|(id, layered)| (id.as_str(), &layered.provider)),
+                    .map(|(id, layered)| (id.as_str(), (&layered.provider, ProviderOrigin::Layer))),
             );
         }
         winners
@@ -380,13 +388,13 @@ impl ScopeState {
         winners.extend(
             self.registered
                 .iter()
-                .map(|(id, registered)| (id.as_str(), registered)),
+                .map(|(id, registered)| (id.as_str(), (registered, ProviderOrigin::Registered))),
         );
         for layer in self.layers.values() {
             winners.extend(
                 layer
                     .iter()
-                    .map(|(id, layered)| (id.as_str(), &layered.provider)),
+                    .map(|(id, layered)| (id.as_str(), (&layered.provider, ProviderOrigin::Layer))),
             );
         }
         let (snapshot, by_id, providers) = build_snapshot(&base.loaded, &winners);
