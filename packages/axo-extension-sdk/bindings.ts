@@ -210,24 +210,30 @@ export type AgentSpec_Serialize = {
 /**  The client's answer to one question. */
 export type Answer = Answer_Serialize | Answer_Deserialize;
 
+export type AnswerValue = string | number | string[];
+
 /**  The client's answer to one question. */
 export type Answer_Deserialize = {
 	/**  The question's `id`. */
 	id: string,
-	/**  Selected option labels. */
-	selected: string[],
-	/**  Free-text input. */
-	custom?: string | null,
+	/**  Option value (single `choice`), option values (multi `choice`), text, or number. */
+	value?: AnswerValue | null,
+	/**  Free-text answer to a `choice`. */
+	other?: string | null,
+	/**  Remark on a `choice` or `number` answer. */
+	note?: string | null,
 };
 
 /**  The client's answer to one question. */
 export type Answer_Serialize = {
 	/**  The question's `id`. */
 	id: string,
-	/**  Selected option labels. */
-	selected: string[],
-	/**  Free-text input. */
-	custom?: string,
+	/**  Option value (single `choice`), option values (multi `choice`), text, or number. */
+	value?: AnswerValue,
+	/**  Free-text answer to a `choice`. */
+	other?: string,
+	/**  Remark on a `choice` or `number` answer. */
+	note?: string,
 };
 
 /**  The wire API a model is served through. */
@@ -238,6 +244,31 @@ export type ArtifactSlot = {
 	id: number,
 	path: string,
 };
+
+/**  One block of an `ask` document, in reading order. */
+export type AskBlock = AskBlock_Serialize | AskBlock_Deserialize;
+
+/**  One block of an `ask` document, in reading order. */
+export type AskBlock_Deserialize = {
+	type: "markdown",
+} & MarkdownBlock | {
+	type: "choice",
+} & ChoiceQuestion_Deserialize | {
+	type: "text",
+} & TextQuestion_Deserialize | {
+	type: "number",
+} & NumberQuestion_Deserialize;
+
+/**  One block of an `ask` document, in reading order. */
+export type AskBlock_Serialize = {
+	type: "markdown",
+} & MarkdownBlock | {
+	type: "choice",
+} & ChoiceQuestion_Serialize | {
+	type: "text",
+} & TextQuestion_Serialize | {
+	type: "number",
+} & NumberQuestion_Serialize;
 
 export type AskSettings = AskSettings_Serialize | AskSettings_Deserialize;
 
@@ -494,6 +525,31 @@ export type ChildProgress_Serialize = {
 	usage: Usage_Serialize,
 	/**  Tools executing now, in start order; parallel calls list each. */
 	tools: string[],
+};
+
+/**  Pick one option, or several with `multi`; the host always offers a free-text `other`. */
+export type ChoiceQuestion = ChoiceQuestion_Serialize | ChoiceQuestion_Deserialize;
+
+/**  Pick one option, or several with `multi`; the host always offers a free-text `other`. */
+export type ChoiceQuestion_Deserialize = {
+	id: string,
+	question: string,
+	/**  May be left unanswered. */
+	optional?: boolean,
+	options: QuestionOption_Deserialize[],
+	/**  Several options may be picked. */
+	multi?: boolean,
+};
+
+/**  Pick one option, or several with `multi`; the host always offers a free-text `other`. */
+export type ChoiceQuestion_Serialize = {
+	id: string,
+	question: string,
+	/**  May be left unanswered. */
+	optional?: boolean,
+	options: QuestionOption_Serialize[],
+	/**  Several options may be picked. */
+	multi?: boolean,
 };
 
 /**  A built-in session operation, mode or registered command, decoded and validated. */
@@ -2116,7 +2172,7 @@ export type LiveSnapshot_Deserialize = {
 	 *  Unanswered `ask` calls by tool-call id. A question raised while attaching can
 	 *  also arrive as a `QuestionPending` event (duplicated, never missed).
 	 */
-	pendingQuestions: ([string, Question_Deserialize[]])[],
+	pendingQuestions: ([string, AskBlock_Deserialize[]])[],
 	/**  Mode results currently waiting for host review. */
 	pendingResults: PendingResult[],
 	/**  The background jobs, as [`Session::jobs`] returns them. */
@@ -2150,7 +2206,7 @@ export type LiveSnapshot_Serialize = {
 	 *  Unanswered `ask` calls by tool-call id. A question raised while attaching can
 	 *  also arrive as a `QuestionPending` event (duplicated, never missed).
 	 */
-	pendingQuestions: ([string, Question_Serialize[]])[],
+	pendingQuestions: ([string, AskBlock_Serialize[]])[],
 	/**  Mode results currently waiting for host review. */
 	pendingResults: PendingResult[],
 	/**  The background jobs, as [`Session::jobs`] returns them. */
@@ -2213,6 +2269,11 @@ export type LoginSelect = {
 };
 
 export type MaintenanceKind = "compact" | "shake" | "branchSummary";
+
+/**  Model-written Markdown, passed to the host unparsed. */
+export type MarkdownBlock = {
+	text: string,
+};
 
 export type MaxTokensField = "max_completion_tokens" | "max_tokens";
 
@@ -2486,6 +2547,34 @@ export type NavigateOptions_Serialize = {
 	summarize: boolean,
 	/**  What the branch summary should prioritize (trimmed; blank counts as none); requires `summarize`. */
 	focus: string | null,
+};
+
+export type NumberQuestion = NumberQuestion_Serialize | NumberQuestion_Deserialize;
+
+export type NumberQuestion_Deserialize = {
+	id: string,
+	question: string,
+	/**  May be left unanswered. */
+	optional?: boolean,
+	/**  Whole numbers only. */
+	integer?: boolean,
+	min?: number | null,
+	max?: number | null,
+	/**  Starting value; submitted on timeout. */
+	default?: number | null,
+};
+
+export type NumberQuestion_Serialize = {
+	id: string,
+	question: string,
+	/**  May be left unanswered. */
+	optional?: boolean,
+	/**  Whole numbers only. */
+	integer?: boolean,
+	min?: number,
+	max?: number,
+	/**  Starting value; submitted on timeout. */
+	default?: number,
 };
 
 /**  Why a blob was not stored. */
@@ -2814,42 +2903,22 @@ export type ProviderInfo = {
 	login: boolean,
 };
 
-export type Question = Question_Serialize | Question_Deserialize;
-
 export type QuestionOption = QuestionOption_Serialize | QuestionOption_Deserialize;
 
 export type QuestionOption_Deserialize = {
+	/**  Returned when picked. */
+	value: string,
 	label: string,
 	description?: string | null,
-	preview?: string | null,
+	recommended?: boolean,
 };
 
 export type QuestionOption_Serialize = {
+	/**  Returned when picked. */
+	value: string,
 	label: string,
 	description?: string,
-	preview?: string,
-};
-
-export type Question_Deserialize = {
-	id: string,
-	question: string,
-	header?: string | null,
-	options: QuestionOption_Deserialize[],
-	/**  Several options may be selected. */
-	multi?: boolean,
-	/**  0-based index of the default option. */
-	recommended?: number | null,
-};
-
-export type Question_Serialize = {
-	id: string,
-	question: string,
-	header?: string,
-	options: QuestionOption_Serialize[],
-	/**  Several options may be selected. */
-	multi?: boolean,
-	/**  0-based index of the default option. */
-	recommended?: number,
+	recommended?: boolean,
 };
 
 /**  How many queued messages one drain point takes. */
@@ -3209,7 +3278,7 @@ export type SessionEvent_Deserialize = { type: "agent"; value: AgentEvent_Deseri
 /**  An `ask` call is waiting for `Session::answer` or `Session::dismiss`. */
 { type: "questionPending"; value: {
 	callId: string,
-	questions: Question_Deserialize[],
+	blocks: AskBlock_Deserialize[],
 } } | { type: "questionResolved"; value: {
 	callId: string,
 } } | { type: "maintenanceStart"; value: {
@@ -3272,7 +3341,7 @@ export type SessionEvent_Serialize = { type: "agent"; value: AgentEvent_Serializ
 /**  An `ask` call is waiting for `Session::answer` or `Session::dismiss`. */
 { type: "questionPending"; value: {
 	callId: string,
-	questions: Question_Serialize[],
+	blocks: AskBlock_Serialize[],
 } } | { type: "questionResolved"; value: {
 	callId: string,
 } } | { type: "maintenanceStart"; value: {
@@ -4366,6 +4435,30 @@ export type TeamSpec_Serialize = {
 	path: string | null,
 };
 
+export type TextQuestion = TextQuestion_Serialize | TextQuestion_Deserialize;
+
+export type TextQuestion_Deserialize = {
+	id: string,
+	question: string,
+	/**  May be left unanswered. */
+	optional?: boolean,
+	multiline?: boolean,
+	placeholder?: string | null,
+	/**  Starting value the user edits; submitted on timeout. */
+	prefill?: string | null,
+};
+
+export type TextQuestion_Serialize = {
+	id: string,
+	question: string,
+	/**  May be left unanswered. */
+	optional?: boolean,
+	multiline?: boolean,
+	placeholder?: string,
+	/**  Starting value the user edits; submitted on timeout. */
+	prefill?: string,
+};
+
 /**  Format of reasoning/thinking request parameters on OpenAI-compatible servers. */
 export type ThinkingFormat = "openai" | "openrouter" | "deepseek" | "together" | "baseten" | "zai" | "qwen" | "chat-template" | "qwen-chat-template" | "string-thinking" | "ant-ling";
 
@@ -5028,7 +5121,8 @@ export interface Session {
    */
   setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
   /**
-   * Settles the pending question of tool call `call_id`.
+   * Settles the pending question of tool call `call_id`. A submission that does not fit
+   * the document returns `Error::InvalidInput` and leaves the question pending.
    */
   answer(callId: SessionAnswerArgs_Deserialize["callId"], answers: SessionAnswerArgs_Deserialize["answers"], signal?: AbortSignal): Promise<void>;
   /**

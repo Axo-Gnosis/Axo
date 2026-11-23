@@ -30,16 +30,27 @@ impl<P, O> Pending<P, O> {
 
     /// Returns whether the entry existed, even if its receiver already closed.
     pub(crate) fn settle(&self, call_id: &str, outcome: O) -> bool {
-        let entry = self
-            .entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(call_id);
-        let Some((_, tx)) = entry else {
-            return false;
+        self.settle_with(call_id, |_| Ok::<_, std::convert::Infallible>(outcome))
+            .is_some()
+    }
+
+    /// Settles the entry with the outcome `outcome` computes from its payload. `None`: no
+    /// such entry. `Some(Err(_))`: `outcome` refused and the entry stays registered.
+    pub(crate) fn settle_with<E>(
+        &self,
+        call_id: &str,
+        outcome: impl FnOnce(&P) -> Result<O, E>,
+    ) -> Option<Result<(), E>> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let (payload, _) = entries.get(call_id)?;
+        let outcome = match outcome(payload) {
+            Ok(outcome) => outcome,
+            Err(err) => return Some(Err(err)),
         };
+        let (_, tx) = entries.remove(call_id)?;
+        drop(entries);
         let _ = tx.send(outcome);
-        true
+        Some(Ok(()))
     }
 
     /// Removes only closed registrations, preserving a live replacement receiver.

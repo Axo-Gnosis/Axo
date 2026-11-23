@@ -48,7 +48,10 @@ use crate::schemes::{SchemeUrl, Schemes, Target};
 use crate::session::team::TeamSeat;
 use ask::AskTool;
 pub(crate) use ask::PendingQuestions;
-pub use ask::{Answer, Question, QuestionOption};
+pub use ask::{
+    Answer, AnswerValue, AskBlock, ChoiceQuestion, MarkdownBlock, NumberQuestion, QuestionOption,
+    TextQuestion,
+};
 use bash::BashTool;
 use edit::EditTool;
 use find::FindTool;

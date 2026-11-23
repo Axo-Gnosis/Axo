@@ -36,7 +36,7 @@ Extensions are trusted code; nothing here is a sandbox.
 | setAgent | name? | Switches the root persona from the next request, applying its model selector when present. Changing the system prompt and tools is cache-heavy on models without mid-conversation system-message and tool changes. |
 | setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
 | setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
-| answer | callId, answers | Settles the pending question of tool call call_id. |
+| answer | callId, answers | Settles the pending question of tool call call_id. A submission that does not fit the document returns Error::InvalidInput and leaves the question pending. |
 | dismiss | callId | Dismisses a pending question or mode result; the run is cancelled. |
 | contextUsage |  | The current estimated context size and effective compaction limits. |
 | isRunning |  | Whether a run, maintenance or navigation currently owns the session. Observing idle does not reserve it against future submissions or background wakes. |

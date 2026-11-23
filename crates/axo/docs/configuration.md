@@ -332,7 +332,7 @@ Both keys apply only to root sessions; children never match keywords. Disabled k
 
 | Key | Rust field | Default | Meaning |
 | :--- | :--- | :--- | :--- |
-| `ask.timeoutMs` | `timeout_ms` | `None` | Optional timeout in milliseconds for `ask` tool calls. When it elapses, each question auto-selects its `recommended` option (or the first option if none is valid), and the answer is marked `(auto-selected after timeout)` |
+| `ask.timeoutMs` | `timeout_ms` | `None` | Optional timeout in milliseconds for `ask` tool calls. When it elapses, only the model's `recommended` option(s), `prefill` and `default` values are submitted, with `null` for every question without one; the first option is never guessed. The result is not an error and its `details` carry `"timedOut": true`. See [Ask documents for hosts](extending.md#ask-documents-for-hosts) |
 
 A queued steer settles a pending question instead of waiting behind it: `ask` returns a non-error result, "The user did not answer. They sent a message instead; it follows this result.", with `details.outcome == "steered"`, and the steer is delivered right after. See [Queued input for hosts](extending.md#queued-input-for-hosts).
 

@@ -114,9 +114,9 @@ let session = axo
 let mut attach = session.attach(None).await;
 tokio::spawn(async move {
     while let Ok(event) = attach.events.recv().await {
-        if let SessionEvent::QuestionPending { call_id, questions } = &*event {
-            // Answer or dismiss pending `ask` questions from the client UI.
-            let _ = (call_id, questions);
+        if let SessionEvent::QuestionPending { call_id, blocks } = &*event {
+            // Render the `ask` document, then `answer` or `dismiss` it from the client UI.
+            let _ = (call_id, blocks);
         }
     }
 });
@@ -181,7 +181,7 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `name` | `fn name(&self) -> Option<String>` | Returns the latest session name in file order, globally rather than scoped to the current branch |
 | `append_custom` | `async fn append_custom(&self, custom_type: &str, data: Option<Value>) -> Result<SeqEntry, Error>` | Appends `Entry::Custom` at the current position. May run at any time; adds no model-context messages. Rejects an empty `custom_type` with `Error::InvalidInput` |
 | `custom` | `fn custom(&self, custom_type: &str) -> Option<Value>` | Returns the latest data of that type on the current root-to-leaf path (branch-scoped), or `None` if absent or the latest entry has no data |
-| `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles a pending question. `dismiss` settles a pending question or mode result and stops the run like `abort` (`CancelReason::User`), leaving the selected mode active. Both return `Error::NoPendingQuestion` for an id absent from their supported pending registries, including a question a steer already settled |
+| `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles a pending question; a submission that does not fit the document returns `Error::InvalidInput` and leaves the question pending (see [Ask documents for hosts](#ask-documents-for-hosts)). `dismiss` settles a pending question or mode result and stops the run like `abort` (`CancelReason::User`), leaving the selected mode active. Both return `Error::NoPendingQuestion` for an id absent from their supported pending registries, including a question a steer already settled |
 | `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot` (including `jobs`, the same list as `Session::jobs`), and a live `broadcast::Receiver<Arc<SessionEvent>>` |
 | `subscribe` | `fn subscribe(&self) -> broadcast::Receiver<Arc<SessionEvent>>` | Events from now on, without the journal and live snapshot `attach` takes; for consumers that need no catch-up |
 | `compact` | `async fn compact(&self, focus: Option<String>) -> Result<(), Error>` | Runs a standalone compaction summary checkpoint in a session-owned task; `focus` tells the summary what to prioritize and is recorded on the `Entry::Compaction`; blank focus counts as none |
@@ -359,6 +359,48 @@ Every queued steer or follow-up is delivered, held visibly with a way to send it
 
 A steer already queued when `ask` or a reviewed `yield` starts returns the same result without announcing the question or review. Follow-ups, mail, and `Quiet` messages never settle either.
 
+### Ask documents for hosts
+
+The `ask` tool (registered when `SessionOptions::ask_enabled` is `true`) sends one document: `blocks` in reading order, each Markdown or a typed question. `SessionEvent::QuestionPending { call_id, blocks }` and `LiveSnapshot::pending_questions` carry it as `Vec<AskBlock>`. Render the blocks in order, then settle the call with `Session::answer(call_id, answers)` or cancel it with `Session::dismiss(call_id)`.
+
+| Block `type` | Rust type | Fields |
+| :--- | :--- | :--- |
+| `markdown` | `MarkdownBlock` | `text` |
+| `choice` | `ChoiceQuestion` | `id`, `question`, `optional`, `options` (each a `QuestionOption`: `value`, `label`, `description`, `recommended`), `multi` |
+| `text` | `TextQuestion` | `id`, `question`, `optional`, `multiline`, `placeholder`, `prefill` |
+| `number` | `NumberQuestion` | `id`, `question`, `optional`, `integer`, `min`, `max`, `default` |
+
+Axo checks the model's call before announcing it and returns each failure to the model as a tool error, so a host never sees an invalid document: at least one question; question ids non-blank and unique; a `choice` has at least two options with non-blank, unique values, and a single-select one recommends at most one; a `number` has `min` ≤ `max`, a `default` inside them, and when `integer` is set a whole `default` and at least one whole number between `min` and `max`.
+
+**Rendering.** Axo passes Markdown through unparsed; the host renders it with whatever it has. The tool description only asks the model for Markdown, so a host may tell the model what it can render however it likes; host prompt sections (`SessionOptions::sections`, `Session::set_section`) are one way, and Axo prescribes no section name. The host always supplies a free-text "Other" answer on every `choice` (the model is told never to add one) and may offer one note per question. `recommended`, `prefill` and `default` are the model's pick, natural starting values for the controls.
+
+**Submission.** Send one `Answer { id, value, other, note }` per answered question; `value` is an `AnswerValue` (`Text`, `Number` or `Many`, serialized untagged as a string, number or string array). Blank means empty after trimming: blank `other`, `note` and `Text` values count as absent. A question is skipped when it has no answer, or its answer has neither a `value` (absent, blank text or an empty list) nor `other`.
+
+| Question | Accepted |
+| :--- | :--- |
+| any | each answer names a question of the document, at most once; a skipped question must be `optional` and carry no `note` (a note is only valid with an answer) |
+| single `choice` | `value` is one option `value` (`Text`), or `other` is set; not both; optional `note` |
+| multi `choice` | `value` is a list (`Many`) of distinct option values, optionally with `other`; optional `note` |
+| `text` | `value` is `Text`; no `other`, no `note` |
+| `number` | `value` is a `Number` within `min`/`max`, whole when `integer`; no `other`; optional `note` |
+
+A submission that breaks a rule returns `Error::InvalidInput` naming the question; the question stays pending and no `QuestionResolved` is sent, so the host can show the error and let the user fix the answer.
+
+**Result.** The model receives `User answers:` followed by one pretty-printed JSON object keyed by question `id` in document order; the tool result `details` carries the same object under `answers`, so a host can rebuild a settled card from the call and its result alone. A skipped question is `null`; otherwise the entry holds `value` (the option `value`, never a label; a list for multi-select, always present there; the text; or the number), plus `other` and `note` when given. On a single-select, `other` replaces the pick.
+
+```json
+{
+  "store":    { "value": "sqlite", "note": "keep the schema portable to Postgres" },
+  "features": { "value": ["ci"], "other": "terraform" },
+  "ttl_days": { "value": 30 },
+  "comment":  null
+}
+```
+
+**Timeout.** With `ask.timeoutMs` set (see [configuration](configuration.md#question-tool-ask--axoasksettings)), an unanswered call settles with only what the model marked: the `recommended` option(s), a non-blank `prefill`, or the `default`, each as `{ "value": … }`, and `null` for any question without one, required or not. The first option is never guessed. The text says the user did not answer in time, and `details` also has `"timedOut": true`; the result is not an error.
+
+`dismiss` makes the call an error result ("Ask tool was cancelled by the user") and stops the run; an empty submission is not a cancellation. A queued steer settles the call as described in [Queued input for hosts](#queued-input-for-hosts).
+
 ### Context usage
 
 `ContextUsage { tokens: u64, window: u64, trigger: u64, reserve: u64 }` describes current context, not historical spend: `tokens` uses the compaction estimator over the current projection, `window` is the effective model context window, `reserve` is the configured compaction headroom, and `trigger` is `window - reserve`. Limits reflect the current model and compaction settings. `Session::context_usage()` and `LiveSnapshot::context` return `None` when those limits cannot be resolved.
@@ -374,7 +416,7 @@ Emitted by `attach().events` (`broadcast::Receiver<Arc<SessionEvent>>`; every re
 | `Agent(AgentEvent)` | `AgentEvent` | Passthrough of stateful turn loop events (model streaming, tool call execution, message completions) |
 | `Activity` | `Activity { running: bool, maintenance: Option<MaintenanceKind> }` | Authoritative session ownership state (run, maintenance, or navigation), synchronized with attach; not an idle reservation |
 | `Entry(SeqEntry)` | `SeqEntry` | New entry persisted to the session store |
-| `QuestionPending` | `call_id: String`, `questions: Vec<Question>` | An `ask` tool call needs user input |
+| `QuestionPending` | `call_id: String`, `blocks: Vec<AskBlock>` | An `ask` tool call needs user input; see [Ask documents for hosts](#ask-documents-for-hosts) |
 | `QuestionResolved` | `call_id: String` | A pending question was answered, dismissed, timed out, or settled by a queued steer |
 | `MaintenanceStart` | `kind: MaintenanceKind` | Compaction, `/shake`, or branch summary started |
 | `MaintenanceEnd` | `kind: MaintenanceKind`, `error: Option<String>`, `aborted: bool` | Maintenance task finished |

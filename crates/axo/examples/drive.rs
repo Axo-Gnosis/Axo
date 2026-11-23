@@ -28,8 +28,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axo::{
-    Answer, Command, NavigateOptions, PromptInput, PromptPart, PromptRequest, PromptResult,
-    Session, SessionEvent, SessionOptions, Supervision,
+    Answer, AnswerValue, AskBlock, Command, NavigateOptions, PromptInput, PromptPart,
+    PromptRequest, PromptResult, Session, SessionEvent, SessionOptions, Supervision,
 };
 use axo::{Entry, EntryId, SeqEntry};
 use axo_agent::AgentEvent;
@@ -389,40 +389,25 @@ async fn print_events(
                     .collect();
                 println!("[tool-end] {name} {} {text}", result.is_error);
             }
-            SessionEvent::QuestionPending { call_id, questions } => {
-                let mut answers = Vec::new();
-                for question in questions {
-                    let labels: Vec<&str> = question
-                        .options
-                        .iter()
-                        .map(|option| option.label.as_str())
-                        .collect();
-                    println!(
-                        "[question] {}: {} [{}]",
-                        question.id,
-                        question.question,
-                        labels.join(" | ")
-                    );
-                    let pick = if first {
-                        0
-                    } else {
-                        question.recommended.unwrap_or(0)
-                    };
-                    answers.push(Answer {
-                        id: question.id.clone(),
-                        selected: labels
-                            .get(pick)
-                            .map(|label| (*label).to_owned())
-                            .into_iter()
-                            .collect(),
-                        custom: None,
-                    });
+            SessionEvent::QuestionPending { call_id, blocks } => {
+                for block in blocks {
+                    match block {
+                        AskBlock::Markdown(markdown) => println!("[ask] {}", markdown.text),
+                        AskBlock::Choice(q) => println!("[question] {}: {}", q.id, q.question),
+                        AskBlock::Text(q) => println!("[question] {}: {}", q.id, q.question),
+                        AskBlock::Number(q) => println!("[question] {}: {}", q.id, q.question),
+                    }
                 }
+                let answers: Vec<Answer> = blocks
+                    .iter()
+                    .filter_map(|block| auto_answer(block, first))
+                    .collect();
                 let _ = stdout.flush();
                 let printed: Vec<String> = answers
                     .iter()
                     .map(|answer| {
-                        format!("[answered] {}: {}", answer.id, answer.selected.join(", "))
+                        let value = serde_json::to_string(&answer.value).unwrap_or_default();
+                        format!("[answered] {}: {value}", answer.id)
                     })
                     .collect();
                 match session.answer(call_id, answers) {
@@ -438,6 +423,69 @@ async fn print_events(
         }
         let _ = stdout.flush();
     }
+}
+
+/// Answers one question without a user: the model's marked pick (`recommended`,
+/// `prefill`, `default`), or with `first` (or no mark) the first option, `prefill` or
+/// `"ok"`, and `default` or `0` clamped into `min`/`max` (rounded inward when `integer`),
+/// so a required question never stalls the run.
+fn auto_answer(block: &AskBlock, first: bool) -> Option<Answer> {
+    let (id, value) = match block {
+        AskBlock::Markdown(_) => return None,
+        AskBlock::Choice(q) => {
+            let mut picks: Vec<String> = q
+                .options
+                .iter()
+                .filter(|option| !first && option.recommended)
+                .map(|option| option.value.clone())
+                .collect();
+            if picks.is_empty() {
+                picks.extend(q.options.first().map(|option| option.value.clone()));
+            }
+            let value = if q.multi {
+                AnswerValue::Many(picks)
+            } else {
+                AnswerValue::Text(picks.into_iter().next()?)
+            };
+            (&q.id, value)
+        }
+        AskBlock::Text(q) => {
+            let prefill = q.prefill.clone().filter(|text| !text.trim().is_empty());
+            (
+                &q.id,
+                AnswerValue::Text(prefill.unwrap_or_else(|| "ok".into())),
+            )
+        }
+        AskBlock::Number(q) => {
+            let number = q.default.clone().unwrap_or_else(|| {
+                let bound = |bound: &Option<serde_json::Number>, open: f64| {
+                    bound
+                        .as_ref()
+                        .and_then(serde_json::Number::as_f64)
+                        .unwrap_or(open)
+                };
+                let mut low = bound(&q.min, f64::NEG_INFINITY);
+                let mut high = bound(&q.max, f64::INFINITY);
+                if q.integer {
+                    (low, high) = (low.ceil(), high.floor());
+                }
+                // `ask` rejects a document whose bounds hold no answer, so `low <= high`.
+                let pick = 0f64.clamp(low, high);
+                if pick.fract() == 0.0 && pick.abs() < 9.0e15 {
+                    (pick as i64).into()
+                } else {
+                    serde_json::Number::from_f64(pick).expect("a clamped bound is finite")
+                }
+            });
+            (&q.id, AnswerValue::Number(number))
+        }
+    };
+    Some(Answer {
+        id: id.clone(),
+        value: Some(value),
+        other: None,
+        note: None,
+    })
 }
 
 fn print_maintenance(event: &SessionEvent) {

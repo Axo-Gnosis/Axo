@@ -73,9 +73,10 @@ pub use store::{
     TIMESTAMP_FORMAT, TeamLink, TeamRef, project,
 };
 pub use tools::{
-    Answer, ArtifactSlot, BashRequest, CommandRequest, Exposure, FileAccess, FileChange, FileRead,
-    FileRecord, FileWrite, HostTool, LedgerRecord, LineDiff, MAX_SNAPSHOT_BYTES, Omitted, Question,
-    QuestionOption, SessionTools, SnapshotBlob, SnapshotStore, SquashedChange, ToolAccess,
+    Answer, AnswerValue, ArtifactSlot, AskBlock, BashRequest, ChoiceQuestion, CommandRequest,
+    Exposure, FileAccess, FileChange, FileRead, FileRecord, FileWrite, HostTool, LedgerRecord,
+    LineDiff, MAX_SNAPSHOT_BYTES, MarkdownBlock, NumberQuestion, Omitted, QuestionOption,
+    SessionTools, SnapshotBlob, SnapshotStore, SquashedChange, TextQuestion, ToolAccess,
     ToolFactory, WriteRoot, WriteScope, Written, file_changes, file_details, file_records, squash,
     valid_tool_name,
 };

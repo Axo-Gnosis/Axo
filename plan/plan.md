@@ -8,7 +8,7 @@ This is the live planning document for unbuilt work and active design discussion
 
 ## Overview of tracks
 
-M1–M5 plus Tracks 2, 3 and 4 are complete. Track 5 has shipped providers, logins, session contributions, extension API parity and packaging through `axo-extensions`. Extensions do not wait for codemode; `axo-acp` is deferred.
+M1–M5 plus Tracks 2, 3, 4 and 7 are complete. Track 5 has shipped providers, logins, session contributions, extension API parity and packaging through `axo-extensions`. Extensions do not wait for codemode; `axo-acp` is deferred.
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ flowchart LR
 | **1. Codemode & script extensions** | Embedded JS sandbox (QuickJS/Boa engine evaluation), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and script hooks on spawned specs (rungs 2–5) | Rungs 0–1 scoped; rungs 2+ in discussion. Not the current implementation priority |
 | **5. Extensions (Bun runtime), MCP & `ast_edit`** | Trusted TS/JS contributions through shared Rust APIs | **Phases 1–4 and extension API parity plans A and B implemented.** MCP and `ast_edit` are deferred |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
-| **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | Designed 2026-11-21; not started |
+| **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | **Shipped.** See [Shipped tracks](#shipped-tracks) |
 | **Tool surface & session modes** | Deferred tools, action tools, scoped host policy, cache-safe root mode overlays and completion | **Shipped (A–H).** See [Shipped tracks](#shipped-tracks) |
 
 ---
@@ -292,6 +292,7 @@ Key risks to design around when building step 3 (script hooks):
 - **Keyword replay and write scopes:** Landed in code: `Entry::Submission::keywords` records the keywords that fired, and reopen requeues from those recorded names instead of matching again; frontmatter `writes` on modes and agents scopes `write`/`edit` (`ModeSpec::writes`, `AgentSpec::writes`, `ToolScope::writes`, `SessionTools::check_write`) and persists onto children as the `SpawnLink::writes` ceiling.
 - **File-change snapshots:** File tools report accesses in `details.files`, with a `FileChange` for each mutation (before/after `SnapshotBlob`s and a `LineDiff` for diffable text). Raw snapshots are content-addressed, never-pruned blobs under `<session>/snapshots/`; `edit` refuses non-UTF-8 files. Hosts read blobs (`Session::read_snapshot`, lock-free `Axo::read_snapshot`) and squash ranges (`squash`, `squash_changes`); forks link only the blobs their path references. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#file-changes-for-hosts).
 - **Queue control:** Landed in code: input sent after a Stop is delivered when the stopped run settles (a Stop latches when pressed, a failed run when it settles); `Session::resume_wakes` also sends held steers and follow-ups; `steeringMode` defaults to `"all"`; `Session::withdraw` takes queued input back, recorded as `Entry::SubmissionWithdrawn` so reopening never requeues it; `LiveSnapshot::queued` lists `QueuedInput` with submission ids; a queued steer settles a pending `ask` question or reviewed `yield` (`ResultResolution::Steered`) instead of waiting behind it. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#queued-input-for-hosts).
+- **Track 7 (Ask documents):** Landed in code: `ask` takes one document of Markdown and typed `choice`/`text`/`number` blocks (`AskBlock`), validates the call and the host's submission against it (an invalid `Session::answer` returns `Error::InvalidInput` and stays pending), and returns one answer object keyed by question id; a timeout submits only `recommended`/`prefill`/`default` values. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#ask-documents-for-hosts).
 ---
 
 ## Track 5: Extensions (Bun host), MCP & `ast_edit`
@@ -472,127 +473,9 @@ Decisions when resumed:
 
 ## Track 7: Ask documents
 
-Notes from the design discussion of 2026-11-21. Items marked **Decided** are settled; items marked **Proposed** came up while planning the code and still need a yes.
+Shipped; the contract lives in [Ask documents for hosts](../crates/axo/docs/extending.md#ask-documents-for-hosts). Axome and Sworm adopt it on their next axo bump.
 
-### Why
-
-Today `ask` (`crates/axo/src/tools/ask.rs`) sends `questions[]`: each question is one sentence plus options with a short description. The user has to decide without the context the model had. omp solved this in 18.18.3 by replacing its question list with one HTML `<form>` that mixes prose, tables and controls. The result is good, but it makes the model write HTML and makes the harness or host own a form language and parser. We take the idea and drop the HTML.
-
-### Where we landed
-
-- **Decided:** `ask` takes one document: an ordered list of blocks, each either Markdown or a typed question. Order is reading order, so the model builds context first and places each question where it belongs.
-- **Decided:** axo never parses the Markdown. It is passed through to the host, which renders it with whatever it has.
-- **Decided:** questions are typed data, never syntax inside the Markdown. A question sits between blocks, not inside a table cell or sentence.
-- **Decided:** the tool keeps the name `ask` and has one schema. Clean cutover: the old `questions[]` shape, its types and its result formatting are deleted, with no translation of old calls.
-- **Decided:** three question kinds: `choice`, `text`, `number`. No disabled options, date/email/url formats, sliders, hidden values, length limits or regex patterns. A ruled-out option belongs in the prose.
-- **Decided:** every `choice` gets a host-supplied free-text "Other" answer; the model never adds its own.
-- **Decided:** one note per question ("anything else to say"), accompanying the answer rather than replacing it. No per-option notes.
-- **Decided:** timeout stays off by default (`ask.timeoutMs`). When it elapses, only the model's recommended and default values are submitted; if a required question has neither, the result says no answer was given. The first option is never guessed.
-- **Decided:** axo validates a host's submission against the document before settling. An invalid submission is rejected and the question stays pending.
-- **Decided:** the tool description says only "write Markdown", with no judgement on how rich or plain. How a host tells the model what it can render is the host's business; the docs say so and name host prompt sections (`SessionOptions::sections`, `Session::set_section`) as one way, without prescribing a section name.
-- **Proposed:** `recommended` is a flag on the option, not a value named on the question. It reads the same for single and multi-select and cannot name a missing option.
-- **Proposed:** a skipped optional question is `null` in the result, so every question `id` is always present.
-- **Proposed:** event names stay `QuestionPending` / `QuestionResolved`; only the payload changes.
-- **Proposed:** this track changes axo only. Axome and Sworm adopt it when they bump their axo revision, since each needs its own UI for the document.
-
-### Model contract
-
-```json
-{
-  "blocks": [
-    { "type": "markdown", "text": "## Session store\nSessions live in memory and die on restart.\n\n| | SQLite | Redis |\n|---|---|---|\n| New service | no | yes |" },
-    { "type": "choice", "id": "store", "question": "Which store?",
-      "options": [
-        { "value": "sqlite", "label": "SQLite", "recommended": true },
-        { "value": "redis", "label": "Redis", "description": "shared across instances" }
-      ] },
-    { "type": "markdown", "text": "Lifetime decides how often people get logged out." },
-    { "type": "number", "id": "ttl_days", "question": "Session lifetime (days)", "default": 30, "min": 1 }
-  ]
-}
-```
-
-| Block | Fields |
-|---|---|
-| `markdown` | `text` |
-| `choice` | `id`, `question`, `optional`, `options[]` (`value`, `label`, `description`, `recommended`), `multi` |
-| `text` | `id`, `question`, `optional`, `multiline`, `placeholder`, `default` |
-| `number` | `id`, `question`, `optional`, `min`, `max`, `default` |
-
-Checks axo makes on the call, each returned as a tool error the model can fix:
-
-- at least one question block;
-- question ids non-empty and unique;
-- a `choice` has at least two options with unique, non-empty values;
-- a single-select `choice` has at most one `recommended` option;
-- a `number` has `min` ≤ `max` and a `default` inside that range.
-
-Yes/no is a two-option `choice`. The description keeps today's guidance on when to ask (only when a decision the user must make blocks progress) and adds: put what the user needs to decide in Markdown blocks, place each question after its context, mark the pick with `recommended` or `default`, never add "Other".
-
-### Result
-
-The model receives `User answers:` followed by one JSON object keyed by question `id`; `details` carries the same object under `answers` (plus `timedOut` when set), so a host can rebuild a settled card from the tool call and its result alone.
-
-```json
-{
-  "store":    { "value": "sqlite", "note": "keep the schema portable to Postgres" },
-  "features": { "value": ["ci"], "other": "terraform" },
-  "ttl_days": { "value": 30 },
-  "comment":  null
-}
-```
-
-- `value`: the chosen option `value` (never a display label), an array for `multi`, the typed text, or the number.
-- `other`: the user's own answer. On a single-select it replaces the pick; on a multi-select it is one more entry beside the picks.
-- `note`: a remark alongside the answer.
-- Dismissal, cancellation and the steered result (`details.outcome == "steered"`) keep today's behavior and text.
-
-### Host contract
-
-Public types in `crates/axo/src/tools/ask.rs`, exported from `axo` (names are a sketch):
-
-```rust
-pub enum AskBlock { Markdown { text: String }, Choice(ChoiceQuestion), Text(TextQuestion), Number(NumberQuestion) }
-pub struct QuestionOption { pub value: String, pub label: String, pub description: Option<String>, pub recommended: bool }
-pub struct Answer { pub id: String, pub value: Option<AnswerValue>, pub other: Option<String>, pub note: Option<String> }
-pub enum AnswerValue { Text(String), Number(serde_json::Number), Many(Vec<String>) }
-```
-
-- `SessionEvent::QuestionPending { call_id, blocks: Vec<AskBlock> }` and `LiveSnapshot::pending_questions: Vec<(String, Vec<AskBlock>)>` replace the `Vec<Question>` payloads.
-- `Session::answer(call_id, Vec<Answer>)` keeps its signature. It returns `Error::NoPendingQuestion` as today and `Error::InvalidInput` for a submission that does not fit the document; in the second case the question stays pending and no `QuestionResolved` is sent.
-- `Session::dismiss` is unchanged.
-
-Rules for a submission:
-
-| Question | Accepted |
-|---|---|
-| any | each answer names a question id once; a required question has an answer; blank `other` and `note` count as absent |
-| single `choice` | `value` is one option value, or `other` is set; not both |
-| multi `choice` | `value` is a list of distinct option values, optionally with `other`; a required one needs at least one of them |
-| `text` | `value` is non-blank text; no `other`, no `note` |
-| `number` | `value` is a number within `min`/`max`; no `other` |
-
-### What does not change
-
-- The pending registry, late attachment, `Replay::Safe` re-execution after restart, and withdrawal on cancel.
-- A queued steer settling the question with a non-error result.
-- `SessionOptions::ask_enabled`, agent allowlists, and children never getting `ask`.
-
-### Implementation plan
-
-1. **`tools/pending.rs`:** add a settle that computes the outcome from the stored payload under the lock and leaves the entry in place on error; `settle` becomes the infallible case of it. Mode results (`modes::ResultOutcome`) keep using `settle`.
-2. **`tools/ask.rs`:** replace `Question`/`Answer`/`QuestionResult` and both text formatters with the block types, one `check` for the model's call, and one function that turns `(&[AskBlock], Vec<Answer>)` into the result object or an error. Validation and result building are the same pass, so nothing unvalidated can reach the model. `PendingQuestions::answer` runs that function through the new settle. A second function builds the timeout result from `recommended`/`default`. Add an explicit timed-out outcome instead of reusing `Dismissed` for it.
-3. **Schema:** one flat block object (`type` enum plus every field optional, `additionalProperties: false`); per-kind requirements are enforced by deserializing into `AskBlock` with unknown fields denied. No tool in the workspace uses `anyOf`/`oneOf` today, and serde's errors ("missing field `options`") read better to a model than a failed union.
-4. **`session/mod.rs`, `tools/mod.rs`, `lib.rs`:** payload type and exports. `tools/edit.rs` only constructs `PendingQuestions` in a test and needs no change.
-5. **`examples/drive.rs`:** print Markdown blocks, answer each question from its `recommended`/`default`.
-6. **Tests (`crates/axo/tests/ask.rs`):** update the steer test to the new call shape. Add two that guard the contract: an invalid submission is rejected and the question is still pending and answerable; a timeout submits recommended/default values and reports no answer when a required question has none.
-7. **Docs, same change:** `README.md` tool table; `crates/axo/docs/extending.md` (example, `answer` row, `QuestionPending` row, a new "Ask documents for hosts" section with the block types, submission rules, result shape and the rendering note); `crates/axo/docs/configuration.md` (`ask.timeoutMs` meaning); `plan/design.md` `ask` bullet.
-
-### Open
-
-- **`default` typing in the flat schema.** `text` wants a string and `number` wants a number under the same key. A two-type `type` array may not be accepted by every provider; the alternatives are an untyped `default` or separate keys. Check the adapters in `axo-ai` before choosing.
-- **A note on a skipped optional question.** Keep it as `{ "note": … }` or drop it. Keeping it loses nothing the user typed.
-- **Later, not in this track:** pasted images on notes, and re-answering a settled question on a sibling branch (both exist in omp).
+Later, not in this track: pasted images on notes, and re-answering a settled question on a sibling branch (both exist in omp).
 
 ---
 

@@ -91,7 +91,7 @@ use crate::store::{
     SessionWriter, SubmissionKind, project,
 };
 use crate::tools::output::{MAX_YIELD_FAILURES, YIELD, YIELD_NUDGE, YieldState, YieldTool};
-use crate::tools::{self, Answer, Exposure, HostTool, PendingQuestions, Question, SessionTools};
+use crate::tools::{self, Answer, AskBlock, Exposure, HostTool, PendingQuestions, SessionTools};
 
 pub struct SessionOptions {
     /// Ignored by `Axo::open_session`, which uses the cwd in the session header.
@@ -266,7 +266,7 @@ pub enum SessionEvent {
     /// An `ask` call is waiting for `Session::answer` or `Session::dismiss`.
     QuestionPending {
         call_id: String,
-        questions: Vec<Question>,
+        blocks: Vec<AskBlock>,
     },
     QuestionResolved {
         call_id: String,
@@ -496,7 +496,7 @@ pub struct LiveSnapshot {
     pub messages: Vec<AgentMessage>,
     /// Unanswered `ask` calls by tool-call id. A question raised while attaching can
     /// also arrive as a `QuestionPending` event (duplicated, never missed).
-    pub pending_questions: Vec<(String, Vec<Question>)>,
+    pub pending_questions: Vec<(String, Vec<AskBlock>)>,
     /// Mode results currently waiting for host review.
     pub pending_results: Vec<PendingResult>,
     /// The background jobs, as [`Session::jobs`] returns them.
@@ -3158,7 +3158,8 @@ impl Session {
         .await
     }
 
-    /// Settles the pending question of tool call `call_id`.
+    /// Settles the pending question of tool call `call_id`. A submission that does not fit
+    /// the document returns `Error::InvalidInput` and leaves the question pending.
     #[ext]
     pub fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error> {
         self.hooks.questions.answer(call_id, answers)
