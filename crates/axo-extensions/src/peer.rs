@@ -8,7 +8,7 @@
 //! sent call queues a cancel in a separately bounded slot behind its call frame.
 //! A runner call naming a `parent` belongs to that host call and runs inside its future
 //! through the [`Callbacks`] it was given; one without a parent is a session action, run
-//! on its own task through the connection's [`Actions`] with the [`Origin`] it arrived on.
+//! on its own task through the connection's [`Actions`] with the [`RunnerRef`] it arrived on.
 //! The peer knows no method names.
 //! Any protocol violation, EOF, write failure or missed heartbeat closes the peer and fails
 //! every pending call with [`CallError::Unavailable`].
@@ -142,7 +142,7 @@ pub trait Callbacks: Send + Sync {
 pub trait Actions: Send + Sync {
     fn call(
         &self,
-        origin: Origin,
+        runner: RunnerRef,
         ext: String,
         method: String,
         args: Value,
@@ -152,12 +152,12 @@ pub trait Actions: Send + Sync {
 /// The connection a session action arrived on. Calls reach that generation only, never a
 /// replacement.
 #[derive(Clone)]
-pub struct Origin {
+pub struct RunnerRef {
     inner: Weak<Inner>,
     closed: CancellationToken,
 }
 
-impl Origin {
+impl RunnerRef {
     /// Calls a runner method for `ext` on this connection; `CallError::Unavailable` once it
     /// is gone. Dropping the future withdraws the call.
     pub async fn call(&self, ext: &str, method: &str, args: Value) -> Result<Value, CallError> {
@@ -703,14 +703,14 @@ impl Inner {
             }
             None => {
                 let inner = Arc::clone(self);
-                let origin = Origin {
+                let runner = RunnerRef {
                     inner: Arc::downgrade(self),
                     closed: self.closed.clone(),
                 };
                 tokio::spawn(async move {
                     let answer = tokio::select! {
                         _ = cancel.cancelled() => return,
-                        answer = async { inner.actions.call(origin, ext, method, args).await } => answer,
+                        answer = async { inner.actions.call(runner, ext, method, args).await } => answer,
                     };
                     inner.answer(id, answer).await;
                 });
@@ -773,9 +773,13 @@ async fn read_loop(inner: Arc<Inner>, mut reader: BufReader<OwnedReadHalf>) {
             _ = inner.closed.cancelled() => return,
             frame = read_frame(&mut reader) => frame,
         };
-        // Any violation's reason is for the reader alone; the lifecycle sees a closed peer.
-        let Ok(Some(frame)) = frame else { break };
-        if inner.dispatch(frame).is_err() {
+        let violation = match frame {
+            Ok(Some(frame)) => inner.dispatch(frame).err(),
+            Ok(None) => break,
+            Err(reason) => Some(reason),
+        };
+        if let Some(reason) = violation {
+            tracing::warn!(reason = reason, "extension runner protocol violation");
             break;
         }
     }
@@ -888,7 +892,7 @@ mod tests {
     impl Actions for TestActions {
         fn call(
             &self,
-            _origin: Origin,
+            _runner: RunnerRef,
             ext: String,
             method: String,
             args: Value,

@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook, RemoteTool};
 use crate::manifest::{PolicyHook, SessionDecl};
-use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Origin, Refusal, decode};
+use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Refusal, RunnerRef, decode};
 use crate::remote::{self, CALL_DEADLINE, Failure};
 use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionScope, Extensions, Inner, gate};
 
@@ -444,7 +444,7 @@ async fn pump(
 /// event and no delivery deadline; slow listeners learn of any resulting broadcast lag
 /// before they see the next available event.
 async fn stream(
-    origin: Origin,
+    runner: RunnerRef,
     ext: String,
     id: String,
     mut events: broadcast::Receiver<Arc<SessionEvent>>,
@@ -455,7 +455,7 @@ async fn stream(
     loop {
         let args = tokio::select! {
             biased;
-            () = origin.closed() => return,
+            () = runner.closed() => return,
             () = stop.cancelled() => break,
             received = events.recv() => match received {
                 Ok(event) => {
@@ -475,25 +475,25 @@ async fn stream(
             }
         };
         let deliver = async {
-            match origin.call(&ext, "stream", args).await {
+            match runner.call(&ext, "stream", args).await {
                 // Too large to frame: the listener learns it missed one.
-                Err(CallError::Invalid) => origin.call(&ext, "stream", lagged(1)).await,
+                Err(CallError::Invalid) => runner.call(&ext, "stream", lagged(1)).await,
                 result => result,
             }
         };
         tokio::select! {
             biased;
-            () = origin.closed() => return,
+            () = runner.closed() => return,
             () = stop.cancelled() => break,
             delivered = deliver => if delivered.is_err() { return; },
         }
     }
-    let close = origin.call(&ext, "stream", json!({ "sub": id, "closed": true }));
+    let close = runner.call(&ext, "stream", json!({ "sub": id, "closed": true }));
     let _ = tokio::time::timeout(CALL_DEADLINE, close).await;
 }
 
 async fn completion_stream(
-    origin: Origin,
+    runner: RunnerRef,
     ext: String,
     id: String,
     mut events: BoxStream<'static, AssistantEvent>,
@@ -501,7 +501,7 @@ async fn completion_stream(
     let deliver = async {
         while let Some(event) = events.next().await {
             let terminal = event.is_terminal();
-            match origin
+            match runner
                 .call(&ext, "stream", json!({ "sub": id, "event": event }))
                 .await
             {
@@ -513,13 +513,13 @@ async fn completion_stream(
                 break;
             }
         }
-        let _ = origin
+        let _ = runner
             .call(&ext, "stream", json!({ "sub": id, "closed": true }))
             .await;
     };
     tokio::select! {
         biased;
-        () = origin.closed() => {}
+        () = runner.closed() => {}
         () = deliver => {}
     }
 }
@@ -732,7 +732,7 @@ impl Registry {
     async fn subscribe(
         &self,
         inner: &Inner,
-        origin: Origin,
+        runner: RunnerRef,
         ext: String,
         request: Subscribe,
     ) -> Result<Value, Refusal> {
@@ -748,7 +748,7 @@ impl Registry {
                 return Ok(
                     self.install(&mut self.subs(), ext, None, stop, |ext, id| async move {
                         let _guard = guard;
-                        completion_stream(origin, ext, id, events).await;
+                        completion_stream(runner, ext, id, events).await;
                     }),
                 );
             }
@@ -783,7 +783,7 @@ impl Registry {
         };
         Ok(
             self.install(&mut subs, ext, Some(name), stop.clone(), |ext, id| {
-                stream(origin, ext, id, events, kinds, stop)
+                stream(runner, ext, id, events, kinds, stop)
             }),
         )
     }
@@ -886,7 +886,7 @@ fn child_error(missing: InvokeError, error: axo::Error) -> InvokeError {
 impl Actions for Registry {
     fn call(
         &self,
-        origin: Origin,
+        runner: RunnerRef,
         ext: String,
         method: String,
         args: Value,
@@ -898,7 +898,7 @@ impl Actions for Registry {
                 "subscribe" => {
                     return inner
                         .sessions
-                        .subscribe(&inner, origin, ext, decode(args)?)
+                        .subscribe(&inner, runner, ext, decode(args)?)
                         .await;
                 }
                 "unsubscribe" => return inner.sessions.unsubscribe(&ext, decode(args)?),
