@@ -347,16 +347,17 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
     if let Some(refusal) = sdk_refusal(id, manifest.sdk.as_deref()) {
         return Err(fail(refusal.to_string()));
     }
-    let mut seen = HashSet::with_capacity(manifest.providers.len());
-    for descriptor in &manifest.providers {
-        if !seen.insert(descriptor.id.as_str()) {
-            return Err(fail(format!("duplicate provider {:?}", descriptor.id)));
-        }
-        descriptor
-            .provider()
-            .validate()
-            .map_err(|error| fail(error.to_string()))?;
-    }
+    validate_names(
+        "provider",
+        &manifest.providers,
+        |decl| decl.id.as_str(),
+        |decl| {
+            decl.provider()
+                .validate()
+                .map_err(|error| error.to_string())
+        },
+    )
+    .map_err(fail)?;
     validate_session(&manifest).map_err(fail)?;
 
     let mut sections = Vec::with_capacity(manifest.sections.len());
@@ -520,59 +521,76 @@ fn compatible(declared: &str, provided: &str) -> bool {
         }
 }
 
+/// Checks each name and declaration in order.
+fn validate_names<'a, T>(
+    kind: &str,
+    entries: &'a [T],
+    name: impl Fn(&'a T) -> &'a str,
+    validate: impl Fn(&T) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut seen = HashSet::with_capacity(entries.len());
+    for decl in entries {
+        let name = name(decl);
+        if !seen.insert(name) {
+            return Err(format!("duplicate {kind} {name:?}"));
+        }
+        validate(decl)?;
+    }
+    Ok(())
+}
+
 /// Names and shapes the session declarations must have to be admitted.
 fn validate_session(manifest: &Manifest) -> Result<(), String> {
-    fn unique<'a>(kind: &str, names: impl Iterator<Item = &'a str>) -> Result<(), String> {
-        let mut seen = HashSet::new();
-        for name in names {
-            if !seen.insert(name) {
-                return Err(format!("duplicate {kind} {name:?}"));
+    validate_names(
+        "tool",
+        &manifest.tools,
+        |tool| tool.name.as_str(),
+        |tool| {
+            let name = &tool.name;
+            if !axo::valid_tool_name(name) {
+                return Err(format!("tool name {name:?} is invalid"));
             }
-        }
-        Ok(())
-    }
-    unique("tool", manifest.tools.iter().map(|t| t.name.as_str()))?;
-    unique("scheme", manifest.schemes.iter().map(|s| s.name.as_str()))?;
-    unique("command", manifest.commands.iter().map(|c| c.name.as_str()))?;
-    unique("section", manifest.sections.iter().map(|s| s.name.as_str()))?;
+            if tool.parameters.get("type").and_then(Value::as_str) != Some("object") {
+                return Err(format!(
+                    "tool \"{name}\" parameters must be an object schema with \"type\": \"object\""
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    validate_names(
+        "scheme",
+        &manifest.schemes,
+        |scheme| scheme.name.as_str(),
+        |scheme| {
+            axo::valid_scheme_name(&scheme.name)
+                .then_some(())
+                .ok_or_else(|| format!("scheme name {:?} is invalid or reserved", scheme.name))
+        },
+    )?;
+    validate_names(
+        "command",
+        &manifest.commands,
+        |command| command.name.as_str(),
+        |command| {
+            axo::valid_command_name(&command.name)
+                .then_some(())
+                .ok_or_else(|| format!("command name {:?} is invalid", command.name))
+        },
+    )?;
+    validate_names(
+        "section",
+        &manifest.sections,
+        |section| section.name.as_str(),
+        |section| {
+            axo::valid_section_name(&section.name)
+                .then_some(())
+                .ok_or_else(|| format!("section name {:?} is invalid", section.name))
+        },
+    )?;
     let hooks = &manifest.tool_policy;
     if (1..hooks.len()).any(|i| hooks[..i].contains(&hooks[i])) {
         return Err("duplicate toolPolicy hook".into());
-    }
-    for tool in &manifest.tools {
-        let name = &tool.name;
-        if !axo::valid_tool_name(name) {
-            return Err(format!("tool name {name:?} is invalid"));
-        }
-        if tool.parameters.get("type").and_then(Value::as_str) != Some("object") {
-            return Err(format!(
-                "tool \"{name}\" parameters must be an object schema with \"type\": \"object\""
-            ));
-        }
-    }
-    if let Some(scheme) = manifest
-        .schemes
-        .iter()
-        .find(|scheme| !axo::valid_scheme_name(&scheme.name))
-    {
-        return Err(format!(
-            "scheme name {:?} is invalid or reserved",
-            scheme.name
-        ));
-    }
-    if let Some(command) = manifest
-        .commands
-        .iter()
-        .find(|command| !axo::valid_command_name(&command.name))
-    {
-        return Err(format!("command name {:?} is invalid", command.name));
-    }
-    if let Some(section) = manifest
-        .sections
-        .iter()
-        .find(|section| !axo::valid_section_name(&section.name))
-    {
-        return Err(format!("section name {:?} is invalid", section.name));
     }
     Ok(())
 }
@@ -1087,10 +1105,21 @@ mod tests {
         let tool = |name: &str| json!({ "name": name, "description": "d", "parameters": { "type": "object" } });
         not_admitted(
             "bad-name",
-            json!({ "tools": [tool("bad/name")] }),
+            json!({ "tools": [tool("bad/name"), tool("dup"), tool("dup")] }),
             "tool name \"bad/name\" is invalid",
         )
         .await;
+        not_admitted(
+            "reserved-scheme",
+            json!({ "schemes": [{ "name": "file" }] }),
+            r#"scheme name "file" is invalid or reserved"#,
+        )
+        .await;
+        not_admitted(
+            "non-object-tool",
+            json!({ "tools": [{ "name": "probe", "description": "d", "parameters": { "type": "string" } }] }),
+            r#"tool "probe" parameters must be an object schema with "type": "object""#,
+        ).await;
         not_admitted(
             "dup-command",
             json!({ "commands": [{ "name": "hi", "description": "a" }, { "name": "hi", "description": "b" }] }),
