@@ -31,7 +31,7 @@ for (const cancel of [false, true]) {
       await once(server, "listening");
       const connected = once(server, "connection", { signal: AbortSignal.timeout(5000) });
       child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/runner.ts")], {
-        env: { ...process.env, AXO_EXTENSION_SOCKET: path, AXO_EXTENSION_NONCE: "nonce", AXO_EXTENSION_GENERATION: "1" },
+        env: { ...process.env, AXO_EXTENSION_SOCKET: path, AXO_EXTENSION_NONCE: "nonce" },
         stderr: "inherit",
       });
       const [connection] = await connected;
@@ -44,7 +44,7 @@ for (const cancel of [false, true]) {
         return value;
       };
       const send = (frame: object) => {
-        const body = Buffer.from(JSON.stringify({ ...frame, generation: "1" }));
+        const body = Buffer.from(JSON.stringify(frame));
         const prefix = Buffer.alloc(4);
         prefix.writeUInt32BE(body.length);
         peer.write(Buffer.concat([prefix, body]));
@@ -63,7 +63,7 @@ for (const cancel of [false, true]) {
         methods: { host: ["ready", "wait"] },
       });
       const command = (ext: string, command: string) => call(ext, "command", { session: "s", command, args: "" });
-      expect(await next()).toMatchObject({ type: "hello", nonce: "nonce" });
+      expect(await next()).toEqual({ type: "hello", nonce: "nonce" });
       writeFileSync(join(dir, "good.ts"), `export default cx => ({ commands: {
         ping() {},
         async probe() { try { await globalThis.old.subscribe(() => {}); } catch { return; } throw Error('stale handle accepted'); },

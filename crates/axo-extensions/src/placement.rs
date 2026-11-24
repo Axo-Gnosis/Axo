@@ -402,15 +402,7 @@ impl Shared {
         {
             return Exit::Idle;
         }
-        let start = Generation::start(
-            options,
-            bun,
-            supervisor,
-            generation,
-            stop,
-            &self.actions,
-            &self.ids,
-        );
+        let start = Generation::start(options, bun, supervisor, stop, &self.actions, &self.ids);
         let mut process = match start.await {
             Ok(process) => process,
             Err(StartError::Stopped) => return Exit::Stopped,

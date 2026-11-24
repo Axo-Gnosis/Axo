@@ -549,7 +549,6 @@ mod fake {
 
     struct Runner {
         control: PathBuf,
-        generation: String,
         out: mpsc::UnboundedSender<Value>,
         calls: Mutex<HashMap<String, (String, String, CancellationToken)>>,
         pending: Mutex<HashMap<String, oneshot::Sender<Reply>>>,
@@ -641,7 +640,6 @@ mod fake {
         let control = PathBuf::from(env(CONTROL));
         let socket = env("AXO_EXTENSION_SOCKET");
         let mut nonce = env("AXO_EXTENSION_NONCE");
-        let generation = env("AXO_EXTENSION_GENERATION");
         append(&control.join("pids"), &std::process::id().to_string());
         let startup = control.join("startup");
         let script = std::fs::read_to_string(&startup).ok();
@@ -658,9 +656,7 @@ mod fake {
         let stream = UnixStream::connect(&socket).await.expect("connect");
         let (mut reader, mut writer) = stream.into_split();
         let (out, mut queue) = mpsc::unbounded_channel::<Value>();
-        let hello =
-            json!({"type": "hello", "protocol": 2, "nonce": nonce, "generation": generation});
-        write_frame(&mut writer, &hello).await;
+        write_frame(&mut writer, &json!({"type": "hello", "nonce": nonce})).await;
         tokio::spawn(async move {
             while let Some(frame) = queue.recv().await {
                 write_frame(&mut writer, &frame).await;
@@ -668,7 +664,6 @@ mod fake {
         });
         let runner = Arc::new(Runner {
             control,
-            generation,
             out,
             calls: Mutex::default(),
             pending: Mutex::default(),
@@ -676,11 +671,6 @@ mod fake {
         });
         // EOF: the host closed the connection; exit like the real runner.
         while let Some(frame) = read_frame(&mut reader).await {
-            assert_eq!(
-                frame["generation"],
-                runner.generation.as_str(),
-                "wrong generation"
-            );
             let id = frame["id"].as_str().unwrap().to_owned();
             match frame["type"].as_str().unwrap() {
                 "ping" => runner.send(json!({"type": "pong", "id": id})),
@@ -743,8 +733,7 @@ mod fake {
     }
 
     impl Runner {
-        fn send(&self, mut frame: Value) {
-            frame["generation"] = self.generation.clone().into();
+        fn send(&self, frame: Value) {
             let _ = self.out.send(frame);
         }
 

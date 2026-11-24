@@ -33,7 +33,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 use tokio_util::sync::CancellationToken;
 
-pub const PROTOCOL: u64 = 2;
 /// Largest frame body either side may send or accept.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Bytes of data frames queued ahead of the socket before senders wait for room.
@@ -198,8 +197,6 @@ pub struct Peer {
 }
 
 struct Inner {
-    /// The generation as the wire's opaque decimal string.
-    tag: String,
     closed: CancellationToken,
     state: Mutex<State>,
     control: mpsc::Sender<Vec<u8>>,
@@ -244,16 +241,14 @@ struct Callback {
 
 impl Peer {
     /// Authenticates the runner's hello on `stream` and starts the reader, writer and
-    /// heartbeat for `generation`; `actions` serves the session actions of `members`, the
+    /// heartbeat on this connection; `actions` serves the session actions of `members`, the
     /// extensions this runner hosts.
     pub async fn connect(
         stream: UnixStream,
-        generation: u64,
         nonce: &str,
         members: Arc<[String]>,
         actions: Arc<dyn Actions>,
     ) -> Result<Arc<Peer>, String> {
-        let tag = generation.to_string();
         let (read, write) = stream.into_split();
         let mut reader = BufReader::new(read);
         let hello = match timeout(HANDSHAKE, read_frame(&mut reader)).await {
@@ -265,8 +260,6 @@ impl Peer {
             Ok(Err(reason)) => return Err(format!("extension runner handshake failed: {reason}")),
         };
         let valid = hello.get("type").and_then(Value::as_str) == Some("hello")
-            && hello.get("protocol").and_then(Value::as_u64) == Some(PROTOCOL)
-            && hello.get("generation").and_then(Value::as_str) == Some(&tag)
             && hello
                 .get("nonce")
                 .and_then(Value::as_str)
@@ -278,7 +271,6 @@ impl Peer {
         let (control, control_rx) = mpsc::channel(CONTROL_SLOTS);
         let (data, data_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
-            tag,
             closed: CancellationToken::new(),
             state: Mutex::new(State {
                 next: 0,
@@ -459,14 +451,8 @@ impl Inner {
         drop(calls);
     }
 
-    fn tagged(&self, mut value: Value) -> Value {
-        value["generation"] = Value::String(self.tag.clone());
-        value
-    }
-
-    /// Counts the tagged body, reserving its exact framed size before encoding.
+    /// Counts the body, reserving its exact framed size before encoding.
     async fn enqueue(&self, value: Value) -> Result<(), CallError> {
-        let value = self.tagged(value);
         let mut length = BodyLength::default();
         serde_json::to_writer(&mut length, &value).map_err(|_| CallError::Invalid)?;
         let frame_len = 4 + length.0;
@@ -487,7 +473,7 @@ impl Inner {
 
     /// Only locally generated pings and cancels bypass the byte budget.
     fn small_frame(&self, kind: &str, id: u64) -> Vec<u8> {
-        let value = self.tagged(json!({"type": kind, "id": format!("h:{id}")}));
+        let value = json!({"type": kind, "id": format!("h:{id}")});
         let mut frame = vec![0; 4];
         serde_json::to_writer(&mut frame, &value).expect("fixed control frame");
         let len = (frame.len() - 4) as u32;
@@ -518,9 +504,6 @@ impl Inner {
         let Value::Object(mut frame) = frame else {
             return Err("frame is not an object");
         };
-        if frame.get("generation").and_then(Value::as_str) != Some(&self.tag) {
-            return Err("wrong generation");
-        }
         let Some(Value::String(id)) = frame.remove("id") else {
             return Err("frame without string id");
         };
@@ -868,7 +851,6 @@ mod tests {
     }
 
     const NONCE: &str = "4e6f6e6365";
-    const GENERATION: u64 = 7;
 
     /// The runner's end of the connection.
     struct Raw {
@@ -877,9 +859,7 @@ mod tests {
     }
 
     impl Raw {
-        /// Sends `frame` with this connection's generation.
-        async fn send(&mut self, mut frame: Value) {
-            frame["generation"] = GENERATION.to_string().into();
+        async fn send(&mut self, frame: Value) {
             self.writer.write_all(&bytes(&frame)).await.unwrap();
         }
 
@@ -887,7 +867,6 @@ mod tests {
         async fn next(&mut self) -> Option<Value> {
             loop {
                 let frame = next_frame(&mut self.reader).await?;
-                assert_eq!(frame["generation"], GENERATION.to_string(), "{frame}");
                 if frame["type"] != "ping" {
                     return Some(frame);
                 }
@@ -933,7 +912,7 @@ mod tests {
     }
 
     fn hello() -> Value {
-        json!({"type": "hello", "protocol": 2, "nonce": NONCE, "generation": GENERATION.to_string()})
+        json!({"type": "hello", "nonce": NONCE})
     }
 
     /// A connected peer and the runner end.
@@ -942,7 +921,7 @@ mod tests {
         let (reader, writer) = runner.into_split();
         let mut raw = Raw { reader, writer };
         let (peer, ()) = tokio::join!(
-            Peer::connect(host, GENERATION, NONCE, members(), actions()),
+            Peer::connect(host, NONCE, members(), actions()),
             async {
                 raw.writer.write_all(&bytes(&hello())).await.unwrap();
             }
@@ -1043,7 +1022,7 @@ mod tests {
         let (host, runner) = UnixStream::pair().unwrap();
         let (reader, mut writer) = runner.into_split();
         let (peer, ()) = tokio::join!(
-            Peer::connect(host, GENERATION, NONCE, members(), actions()),
+            Peer::connect(host, NONCE, members(), actions()),
             async {
                 for byte in bytes(&hello()) {
                     writer.write_all(&[byte]).await.unwrap();
@@ -1067,9 +1046,7 @@ mod tests {
                 assert_eq!((ext.as_str(), method.as_str()), ("a", "refresh"));
                 assert!(id.starts_with("h:"), "{id}");
                 assert_eq!(frame["args"]["credential"]["access"], "old");
-                let reply = bytes(
-                    &json!({"type": "ok", "id": id, "value": credential("new"), "generation": "7"}),
-                );
+                let reply = bytes(&ok(&id, credential("new")));
                 let (head, tail) = reply.split_at(3);
                 raw.writer.write_all(head).await.unwrap();
                 tokio::task::yield_now().await;
@@ -1080,24 +1057,36 @@ mod tests {
         peer.close();
         peer.join().await;
 
-        // Wrong nonce, wrong protocol, missing generation or a non-hello first frame fail.
         let bad = [
-            json!({"type": "hello", "protocol": 2, "nonce": "wrong", "generation": "7"}),
-            json!({"type": "hello", "protocol": 1, "nonce": NONCE, "generation": "7"}),
-            json!({"type": "hello", "protocol": 2, "nonce": NONCE, "generation": "8"}),
-            json!({"type": "hello", "protocol": 2, "nonce": NONCE}),
-            json!({"type": "pong", "id": "h:0", "generation": "7"}),
+            json!({"type": "hello", "nonce": "wrong"}),
+            json!({"type": "hello"}),
+            json!({"type": "pong", "id": "h:0"}),
         ];
         for frame in bad {
             let (host, mut runner) = UnixStream::pair().unwrap();
             let (peer, ()) = tokio::join!(
-                Peer::connect(host, GENERATION, NONCE, members(), actions()),
+                Peer::connect(host, NONCE, members(), actions()),
                 async {
                     runner.write_all(&bytes(&frame)).await.unwrap();
                 }
             );
             assert!(peer.is_err(), "accepted {frame}");
         }
+    }
+
+    #[tokio::test]
+    async fn retired_nonce_does_not_authenticate_a_foreign_connection() {
+        let (retired, mut old_socket) = pair().await;
+        retired.close();
+        old_socket.expect_eof().await;
+        retired.join().await;
+
+        let (host, mut foreign) = UnixStream::pair().unwrap();
+        // Even a complete hello replayed from the previous runner cannot bind a new peer.
+        foreign.write_all(&bytes(&hello())).await.unwrap();
+        let result = Peer::connect(host, "new nonce", members(), actions()).await;
+        assert!(matches!(result, Err(reason) if reason == "extension runner sent an invalid hello"));
+        assert!(next_frame(&mut foreign).await.is_none());
     }
 
     #[tokio::test]
@@ -1129,9 +1118,9 @@ mod tests {
                 assert_eq!(rewrite.1, "b");
                 // Both replies in one write, in the opposite order of the calls.
                 let mut both = bytes(
-                    &json!({"type": "error", "id": rewrite.0, "code": "failed", "message": "extension b provider p rewrite failed", "generation": "7"}),
+                    &json!({"type": "error", "id": rewrite.0, "code": "failed", "message": "extension b provider p rewrite failed"}),
                 );
-                both.extend(bytes(&json!({"type": "ok", "id": refresh.0, "value": credential("new"), "generation": "7"})));
+                both.extend(bytes(&ok(&refresh.0, credential("new"))));
                 raw.writer.write_all(&both).await.unwrap();
             }
         );
@@ -1192,7 +1181,7 @@ mod tests {
                     }
                 }
                 let (login, refresh) = (login.unwrap(), refresh.unwrap());
-                let callback = |id: &str, method: &str, args: Value| json!({"type": "call", "id": id, "ext": "a", "method": method, "args": args, "parent": login, "generation": "7"});
+                let callback = |id: &str, method: &str, args: Value| json!({"type": "call", "id": id, "ext": "a", "method": method, "args": args, "parent": login});
                 // A burst in one write: a display call, a prompt that never answers, another
                 // prompt and a device code.
                 let mut burst = bytes(&callback(
@@ -1276,10 +1265,7 @@ mod tests {
         };
         // `pending` was dropped by the select above.
         let cancel = raw.next().await.unwrap();
-        assert_eq!(
-            cancel,
-            json!({"type": "cancel", "id": id, "generation": "7"})
-        );
+        assert_eq!(cancel, json!({"type": "cancel", "id": id}));
         // A late reply to the withdrawn call is dropped; the connection stays healthy.
         raw.send(ok(&id, credential("late"))).await;
         let (result, ()) = tokio::join!(
@@ -1487,32 +1473,28 @@ mod tests {
             }),
             ("not an object", bytes(&json!([1, 2]))),
             (
-                "wrong generation",
-                bytes(&json!({"type": "pong", "id": "h:0", "generation": "8"})),
-            ),
-            (
                 "unknown type",
-                bytes(&json!({"type": "shout", "id": "r:0", "generation": "7"})),
+                bytes(&json!({"type": "shout", "id": "r:0"})),
             ),
             (
                 "parent takes no callbacks",
                 bytes(
-                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {"message": "x"}, "parent": "h:0", "generation": "7"}),
+                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {"message": "x"}, "parent": "h:0"}),
                 ),
             ),
             (
                 "parent never issued",
                 bytes(
-                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {}, "parent": "h:99", "generation": "7"}),
+                    &json!({"type": "call", "id": "r:0", "ext": "a", "method": "progress", "args": {}, "parent": "h:99"}),
                 ),
             ),
             (
                 "cancel of a host call",
-                bytes(&json!({"type": "cancel", "id": "h:0", "generation": "7"})),
+                bytes(&json!({"type": "cancel", "id": "h:0"})),
             ),
             (
                 "reply to unknown host id",
-                bytes(&json!({"type": "ok", "id": "h:99", "value": null, "generation": "7"})),
+                bytes(&ok("h:99", Value::Null)),
             ),
         ];
         for (name, frame) in violations {
@@ -1671,13 +1653,13 @@ mod tests {
                 raw.send(prompt("r:0", "oversized")).await;
                 assert_eq!(
                     raw.next().await.unwrap(),
-                    json!({"generation": "7", "type": "error", "id": "r:0",
+                    json!({"type": "error", "id": "r:0",
                         "code": "too_large", "message": "host reply exceeds 64 MiB"})
                 );
                 raw.send(prompt("r:1", "next")).await;
                 assert_eq!(
                     raw.next().await.unwrap(),
-                    json!({"generation": "7", "type": "ok", "id": "r:1", "value": "answer-next"})
+                    ok("r:1", json!("answer-next"))
                 );
                 raw.send(ok(&parent, credential("fresh"))).await;
             }

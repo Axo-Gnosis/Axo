@@ -1,14 +1,13 @@
 // axo extension runner: the Bun-side peer of the bridge in this crate. The bridge embeds this
 // file, writes it into a private per-generation directory and starts `bun run <file>`.
 //
-// Environment: AXO_EXTENSION_SOCKET (Unix socket path), AXO_EXTENSION_NONCE,
-// AXO_EXTENSION_GENERATION (decimal string). They are removed from `process.env` before
-// any extension code loads.
+// Environment: AXO_EXTENSION_SOCKET (Unix socket path) and AXO_EXTENSION_NONCE.
+// They are removed from `process.env` before any extension code loads.
 //
 // Wire: each frame is a 4-byte unsigned big-endian length followed by that many bytes of
 // UTF-8 JSON, at most 64 MiB in either direction. The runner connects and sends
-//   {type:"hello",protocol:2,nonce,generation}
-// Every frame after that, both ways, carries `generation` (the same opaque string).
+//   {type:"hello",nonce}
+// The private socket and nonce bind both peers to this runner instance.
 //   {type:"call",id,ext,method,args,parent?}  id "h:<n>" from Rust, "r:<n>" from the runner
 //   {type:"ok",id,value} | {type:"error",id,code,message,details?}  terminal reply (details only from Rust)
 //   {type:"cancel",id}                         withdraw a call the sender made
@@ -49,7 +48,7 @@
 // "unsupported" (no such handler or method), "too_large" (the reply would exceed the frame
 // bound). Messages are fixed runner labels: never author exceptions, payloads or IDs; Rust
 // names the owner from the call. A canceled call gets no reply.
-// Protocol violations (bad length or JSON, wrong generation, unknown frame type,
+// Protocol violations (bad length or JSON, unknown frame type,
 // duplicate live ID, wrong-direction method) end the process with status 1; Rust sees EOF.
 // The runner exits with status 0 when Rust closes the socket.
 
@@ -84,18 +83,15 @@ import type {
   ToolScope,
 } from "../../../packages/axo-extension-sdk/index.ts";
 
-const PROTOCOL = 2;
 const MAX_FRAME = 64 * 1024 * 1024;
 // Bytes held ahead of the socket before replies and callbacks wait for their turn.
 const QUEUE_LIMIT = MAX_FRAME;
 
 const socketPath = process.env.AXO_EXTENSION_SOCKET;
 const nonce = process.env.AXO_EXTENSION_NONCE;
-const generation = process.env.AXO_EXTENSION_GENERATION;
 delete process.env.AXO_EXTENSION_SOCKET;
 delete process.env.AXO_EXTENSION_NONCE;
-delete process.env.AXO_EXTENSION_GENERATION;
-if (!socketPath || !nonce || !generation || !/^\d+$/.test(generation)) {
+if (!socketPath || !nonce) {
   console.error("axo runner: missing or invalid AXO_EXTENSION_* environment");
   process.exit(2);
 }
@@ -150,7 +146,7 @@ let blocked = false;
 function encode(frame: Frame): Buffer | "too_large" | "invalid" {
   let json: string;
   try {
-    json = JSON.stringify({ ...frame, generation });
+    json = JSON.stringify(frame);
   } catch {
     return "invalid";
   }
@@ -291,7 +287,7 @@ socket.on("data", (chunk: Buffer) => {
   }
 });
 
-socket.on("connect", () => sendControl({ type: "hello", protocol: PROTOCOL, nonce }));
+socket.on("connect", () => sendControl({ type: "hello", nonce }));
 socket.on("close", () => process.exit(0));
 socket.on("error", () => {
   console.error("axo runner: socket error");
@@ -357,7 +353,6 @@ function resetStallTimer(): void {
 }
 
 function onFrame(frame: Frame): void {
-  if (frame.generation !== generation) violation("wrong generation");
   const id = frame.id;
   if (typeof id !== "string") violation("frame without string id");
   switch (frame.type) {

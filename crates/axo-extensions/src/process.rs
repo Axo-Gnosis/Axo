@@ -53,14 +53,13 @@ pub struct Generation {
 }
 
 impl Generation {
-    /// Spawns the runner for `generation` and completes its hello within the
+    /// Spawns the runner and completes its hello within the
     /// handshake deadline; `actions` serves the runner's session actions for the extensions
     /// `members` names. Cancelling the future leaves nothing behind.
     pub async fn start(
         options: &ExtensionOptions,
         bun: &BunPath,
         supervisor: &ProcessSupervisor,
-        generation: u64,
         stop: &CancellationToken,
         actions: &Arc<dyn Actions>,
         members: &Arc<[String]>,
@@ -101,10 +100,6 @@ impl Generation {
         let mut env = (*options.env).clone();
         env.insert("AXO_EXTENSION_SOCKET".into(), socket.clone().into());
         env.insert("AXO_EXTENSION_NONCE".into(), nonce.clone().into());
-        env.insert(
-            "AXO_EXTENSION_GENERATION".into(),
-            generation.to_string().into(),
-        );
         let spec = ExecSpec {
             program: bun,
             args: vec![OsString::from("run"), runner.into()],
@@ -128,7 +123,7 @@ impl Generation {
                 .accept()
                 .await
                 .map_err(|err| format!("extension socket accept failed: {err}"))?;
-            Peer::connect(stream, generation, &nonce, members.clone(), actions.clone()).await
+            Peer::connect(stream, &nonce, members.clone(), actions.clone()).await
         };
         let outcome = tokio::select! {
             outcome = tokio::time::timeout(HANDSHAKE, handshake) => match outcome {
