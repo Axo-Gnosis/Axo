@@ -15,7 +15,8 @@ use axo_agent::{
 use axo_ai::testing::{reply_text, reply_tool_calls, scripted_model};
 use axo_ai::{
     AssistantBlock, AssistantEvent, AssistantMessage, JsonMap, Message, Model, ScriptedApi,
-    ScriptedTurn, StopReason, ToolCall, ToolResultMessage, UserBlock, UserMessage, now_ms,
+    ScriptedTurn, ServiceTier, StopReason, ThinkingLevel, ToolCall, ToolResultMessage, UserBlock,
+    UserMessage, now_ms,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -280,7 +281,11 @@ impl Persist for Recorder {
                                 if self.switch_model {
                                     let mut next = scripted_model();
                                     next.id = "next-model".into();
-                                    self.agent.get().unwrap().upgrade().unwrap().set_model(next);
+                                    self.agent.get().unwrap().upgrade().unwrap().set_selection(
+                                        Some(next),
+                                        ThinkingLevel::Off,
+                                        ServiceTier::Standard,
+                                    );
                                 }
                             }
                             Message::System(_) | Message::User(_) => {}

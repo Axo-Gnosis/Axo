@@ -304,6 +304,78 @@ async fn mode_model_override_restores_only_its_own_selection() {
     session.shutdown().await;
 }
 
+#[tokio::test]
+async fn explicit_same_model_clears_mode_restore_after_reopen() {
+    for via_persona in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(
+            dir.path(),
+            json!([{"id":"m"}, {"id":"planner"}]),
+            json!({}),
+            vec![ScriptedTurn::Reply(reply_text("started"))],
+        )
+        .await;
+        let mode_options = || {
+            let mut opts = mode_options(dir.path());
+            opts.host.definitions.modes[0].model = Some("test/planner".into());
+            opts.host.definitions.agents = vec![axo::AgentSpec {
+                name: "planner".into(),
+                model: Some("test/planner".into()),
+                run_as: axo::RunAs::Root,
+                ..Default::default()
+            }];
+            opts
+        };
+        let session = host.axo.create_session(mode_options()).await.unwrap();
+        within(session.prompt("start")).await.unwrap();
+        assert_eq!(session.model().id, "m");
+        session.set_mode(Some("plan")).await.unwrap();
+        assert_eq!(session.model().id, "planner");
+        let before = session.attach(None).await.missed.len();
+
+        if via_persona {
+            session.set_agent(Some("planner")).await.unwrap();
+        } else {
+            let command = session
+                .parse_command("/model test/planner")
+                .unwrap()
+                .unwrap();
+            session.run_command(command).await.unwrap();
+        }
+        let entries = session.attach(None).await.missed;
+        let mut changes = entries[before..].iter().map(|seq| &seq.entry);
+        if via_persona {
+            assert!(
+                matches!(changes.next(), Some(Entry::AgentChange { agent: Some(name), .. }) if name == "planner")
+            );
+        }
+        assert!(matches!(
+            changes.next(),
+            Some(Entry::ModelChange { provider, model_id, .. })
+                if provider == "test" && model_id == "planner"
+        ));
+
+        let path = session.path().to_path_buf();
+        session.shutdown().await;
+        drop(session);
+        let reopened = host
+            .axo
+            .open_session(
+                &path,
+                SessionOptions {
+                    model: None,
+                    ..mode_options()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.mode().unwrap().name, "plan");
+        reopened.set_mode(None).await.unwrap();
+        assert_eq!(reopened.model().id, "planner");
+        reopened.shutdown().await;
+    }
+}
+
 async fn planner_session(dir: &Path) -> (common::Host, axo::Session) {
     let host = host(
         dir,

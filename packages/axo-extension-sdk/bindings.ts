@@ -5042,22 +5042,6 @@ export interface Session {
    */
   agent(signal?: AbortSignal): Promise<SessionAgentResult_Serialize>;
   /**
-   * The currently selected model.
-   */
-  model(signal?: AbortSignal): Promise<SessionModelResult_Serialize>;
-  /**
-   * The thinking level applied to the current model.
-   */
-  thinking(signal?: AbortSignal): Promise<SessionThinkingResult>;
-  /**
-   * The chosen service tier; it applies only on models that support it.
-   */
-  serviceTier(signal?: AbortSignal): Promise<SessionServiceTierResult>;
-  /**
-   * The tier requests are sent with on the current model.
-   */
-  effectiveServiceTier(signal?: AbortSignal): Promise<SessionEffectiveServiceTierResult>;
-  /**
    * The effective configuration for this session.
    */
   config(signal?: AbortSignal): Promise<SessionConfigResult_Serialize>;
@@ -5143,10 +5127,6 @@ export interface Session {
   abort(signal?: AbortSignal): Promise<void>;
   // withheld: shutdown — lifecycle belongs to the host
   /**
-   * Switches the model from the next request; the thinking level is clamped to it.
-   */
-  setModel(model: SessionSetModelArgs_Deserialize["model"], signal?: AbortSignal): Promise<void>;
-  /**
    * Switches the root persona from the next request, applying its model selector when
    * present. Changing the system prompt and tools is cache-heavy on models without
    * mid-conversation system-message and tool changes.
@@ -5160,15 +5140,6 @@ export interface Session {
   // withheld: setTools — replaces the host's own registrations; extensions register through their manifest
   // withheld: setDefinitions — replaces the host's own registrations; extensions register through their manifest
   // withheld: setLayer — replaces the host's own registrations; extensions register through their manifest
-  /**
-   * Sets the thinking level from the next request, clamped to the model; returns the
-   * level applied.
-   */
-  setThinking(level: SessionSetThinkingArgs["level"], signal?: AbortSignal): Promise<SessionSetThinkingResult>;
-  /**
-   * Chooses the service tier from the next request; returns the tier the current model applies.
-   */
-  setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
   /**
    * Settles the pending question of tool call `call_id`. A submission that does not fit
    * the document returns `Error::InvalidInput` and leaves the question pending.
@@ -5195,6 +5166,35 @@ export interface Session {
   // withheld: subscribe — live receiver; the bridge serves session.subscribe
   // withheld: attach — returns a live receiver; use entries, live and subscribe
   // withheld: fork — lifecycle belongs to the host
+  /**
+   * The currently selected model.
+   */
+  model(signal?: AbortSignal): Promise<SessionModelResult_Serialize>;
+  /**
+   * The thinking level applied to the current model.
+   */
+  thinking(signal?: AbortSignal): Promise<SessionThinkingResult>;
+  /**
+   * The chosen service tier; it applies only on models that support it.
+   */
+  serviceTier(signal?: AbortSignal): Promise<SessionServiceTierResult>;
+  /**
+   * The tier requests are sent with on the current model.
+   */
+  effectiveServiceTier(signal?: AbortSignal): Promise<SessionEffectiveServiceTierResult>;
+  /**
+   * Switches the model from the next request; the thinking level is clamped to it.
+   */
+  setModel(model: SessionSetModelArgs_Deserialize["model"], signal?: AbortSignal): Promise<void>;
+  /**
+   * Sets the thinking level from the next request, clamped to the model; returns the
+   * level applied.
+   */
+  setThinking(level: SessionSetThinkingArgs["level"], signal?: AbortSignal): Promise<SessionSetThinkingResult>;
+  /**
+   * Chooses the service tier from the next request; returns the tier the current model applies.
+   */
+  setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
   // withheld: prompt — records caller provenance; see the wire method
   // withheld: promptWith — records caller provenance; see the wire method
   // withheld: steer — records caller provenance; see the wire method

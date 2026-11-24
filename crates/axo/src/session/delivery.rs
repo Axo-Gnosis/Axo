@@ -297,12 +297,7 @@ impl SessionHooks {
         matched
             .iter()
             .find_map(|keyword| keyword.model.as_deref())
-            .map(|selector| {
-                self.inherited
-                    .config
-                    .settings
-                    .resolve_model(&self.inherited.models, selector)
-            })
+            .map(|selector| self.resolve_model(selector))
             .transpose()
     }
 }

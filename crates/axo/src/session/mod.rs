@@ -9,6 +9,7 @@ pub(crate) mod modes;
 mod policy;
 pub(crate) mod prompt;
 mod resume;
+pub(crate) mod selection;
 mod side_files;
 pub(crate) mod spawn;
 mod surface;
@@ -27,7 +28,6 @@ use axo_agent::{
     Persist, PersistError, QueuedMessage, Replay, RunOutcome, Tool, ToolHooks, TurnContext,
     TurnFinish,
 };
-use axo_ai::thinking::clamp_level;
 use axo_ai::{
     Accumulator, AssistantMessage, Message, Model, Models, ServiceTier, StopReason, Streamer,
     ThinkingLevel, ToolCall, ToolResultMessage, Usage, UserBlock,
@@ -53,6 +53,7 @@ pub use self::policy::{ToolPolicy, ToolScope};
 pub use self::prompt::{ContextFilesInspection, PromptInspection};
 use self::prompt::{PromptState, SessionPrompt, ShapeBase, ToolBase, shape};
 use self::resume::Resumption;
+use self::selection::Selection;
 use self::side_files::{ARTIFACTS_DIR, LOCAL_DIR, copy_for_fork};
 use self::spawn::SpawnTool;
 pub use self::spawn::{
@@ -63,7 +64,7 @@ pub(crate) use self::surface::TOOL_CATALOG;
 use self::team::TeamSeat;
 use crate::commands::{self, Command, CommandInfo, RegisteredCommand};
 use crate::compaction::{self, Limits};
-use crate::config::{EffectiveConfig, ModelChoice, ProjectAccess};
+use crate::config::{EffectiveConfig, ProjectAccess};
 use crate::context::agents::{AgentDef, AgentSpec, RunAs};
 use crate::context::definitions::{
     Definitions, FileDefinitions, LiveDefinitions, ResolvedDefinitions, merge,
@@ -716,14 +717,6 @@ struct LiveRun {
     usage: Usage,
 }
 
-/// The live request selection, journaled in the order changes take effect.
-#[derive(Clone)]
-struct Selection {
-    model: Model,
-    thinking: ThinkingLevel,
-    tier: ServiceTier,
-}
-
 /// How `run_to_settle` starts its run.
 #[allow(clippy::large_enum_variant)] // One owned startup value; boxing would add an allocation.
 enum RunRequest {
@@ -961,14 +954,6 @@ impl SessionHooks {
         }
     }
 
-    fn selection(&self) -> Selection {
-        self.selection.borrow().clone()
-    }
-
-    fn model(&self) -> Model {
-        self.selection.borrow().model.clone()
-    }
-
     /// Appends `entries` as one journal batch (see [`Journal::append`]), queued before
     /// this returns.
     fn append(
@@ -1194,272 +1179,6 @@ impl SessionHooks {
         self.release_or_deliver();
         closed?;
         result.map_err(Error::Agent)
-    }
-
-    /// Records differences between the current branch and the live selection
-    /// (pi `_recordSelection`), so reopening restores what is live.
-    async fn record_selection(
-        &self,
-        model: Option<&str>,
-        thinking: Option<ThinkingLevel>,
-        tier: Option<ServiceTier>,
-        agent: Option<&str>,
-    ) -> Result<(), Error> {
-        let _order = self.selection_order.lock().await;
-        let selection = self.selection();
-        let mut entries = Vec::new();
-        if model != Some(format!("{}/{}", selection.model.provider, selection.model.id).as_str()) {
-            entries.push(Entry::ModelChange {
-                base: journal::base(),
-                provider: selection.model.provider.clone(),
-                model_id: selection.model.id.clone(),
-            });
-        }
-        if thinking != Some(selection.thinking) {
-            entries.push(Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: selection.thinking,
-                automatic: false,
-                service_tier: None,
-            });
-        }
-        if tier.unwrap_or_default() != selection.tier {
-            entries.push(Entry::ServiceTierChange {
-                base: journal::base(),
-                service_tier: selection.tier,
-            });
-        }
-        // A child's persona is its SpawnLink spec; agent_change names only root catalog personas.
-        if self.child.is_none() {
-            let live_agent = self
-                .agent_spec
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-                .map(|spec| spec.name.clone());
-            if agent != live_agent.as_deref() {
-                entries.push(Entry::AgentChange {
-                    base: journal::base(),
-                    agent: live_agent,
-                });
-            }
-        }
-        if !entries.is_empty() {
-            self.append(entries).await?;
-        }
-        Ok(())
-    }
-
-    /// Records the model, thinking level and tier, then applies them once written.
-    async fn select_model(
-        &self,
-        agent: &Agent,
-        model: Model,
-        thinking: Option<ThinkingLevel>,
-        tier: Option<ServiceTier>,
-    ) -> Result<(), Error> {
-        let _order = self.selection_order.lock().await;
-        let current = self.selection();
-        let (entries, level, tier) = self.model_entries(&current, &model, thinking, tier);
-        self.append(entries).await?;
-        let definition = self.registry_definition(&model);
-        self.apply_selection(agent, model, level, tier, definition);
-        Ok(())
-    }
-
-    /// The chosen tier after moving from `current` to `model`: a tier named by the selector
-    /// wins; otherwise it survives only on the same model or under `serviceTier.onModelChange: "keep"`.
-    fn next_tier(
-        &self,
-        current: &Selection,
-        model: &Model,
-        explicit: Option<ServiceTier>,
-    ) -> ServiceTier {
-        self.inherited
-            .config
-            .settings
-            .service_tier
-            .on_model_change
-            .select_tier(
-                Some((&current.model.provider, &current.model.id)),
-                model,
-                current.tier,
-                explicit,
-            )
-    }
-
-    fn model_entries(
-        &self,
-        current: &Selection,
-        model: &Model,
-        thinking: Option<ThinkingLevel>,
-        tier: Option<ServiceTier>,
-    ) -> (Vec<Entry>, ThinkingLevel, ServiceTier) {
-        let level = clamp_level(model, thinking.unwrap_or(current.thinking));
-        let tier = self.next_tier(current, model, tier);
-        let mut entries = vec![Entry::ModelChange {
-            base: journal::base(),
-            provider: model.provider.clone(),
-            model_id: model.id.clone(),
-        }];
-        if level != current.thinking {
-            entries.push(Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: level,
-                automatic: false,
-                service_tier: None,
-            });
-        }
-        if tier != current.tier {
-            entries.push(Entry::ServiceTierChange {
-                base: journal::base(),
-                service_tier: tier,
-            });
-        }
-        (entries, level, tier)
-    }
-
-    fn apply_selection(
-        &self,
-        agent: &Agent,
-        model: Model,
-        level: ThinkingLevel,
-        tier: ServiceTier,
-        definition: Option<Arc<Model>>,
-    ) {
-        agent.set_selection(Some(model.clone()), level, tier);
-        *self
-            .registry_model
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = definition;
-        self.selection.send_replace(Selection {
-            model,
-            thinking: level,
-            tier,
-        });
-        self.emit_context();
-    }
-
-    fn registry_definition(&self, model: &Model) -> Option<Arc<Model>> {
-        self.inherited.models.lookup(&model.provider, &model.id)
-    }
-
-    /// Adopts the registry's definition of the selected model when it changed since this session
-    /// last applied one, so limits, prices and thinking levels from a reload or refresh apply
-    /// from the next request. A copy the host set stays while the registry is unchanged, and so
-    /// does a model the registry no longer has (its request then fails with `UnknownModel`).
-    async fn follow_registry(&self) -> Result<(), Error> {
-        let _order = self.selection_order.lock().await;
-        let (now, thinking, tier) = {
-            let current = self.selection.borrow();
-            let Some(now) = self.registry_definition(&current.model) else {
-                return Ok(());
-            };
-            (now, current.thinking, current.tier)
-        };
-        let applied = self
-            .registry_model
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|old| Arc::ptr_eq(old, &now) || old == &now);
-        if applied {
-            return Ok(());
-        }
-        let Some(agent) = self.agent.get().and_then(Weak::upgrade) else {
-            return Ok(());
-        };
-        // Provider and id are unchanged, so only a clamped thinking level is journaled.
-        let level = clamp_level(&now, thinking);
-        if level != thinking {
-            self.append(vec![Entry::ThinkingLevelChange {
-                base: journal::base(),
-                thinking_level: level,
-                automatic: true,
-                service_tier: None,
-            }])
-            .await?;
-        }
-        self.apply_selection(&agent, (*now).clone(), level, tier, Some(now));
-        Ok(())
-    }
-
-    /// Journal and publish the two suffixes as one selection, or leave both untouched.
-    async fn select_suffixes(
-        &self,
-        agent: &Agent,
-        thinking: Option<ThinkingLevel>,
-        tier: Option<ServiceTier>,
-    ) -> Result<(ThinkingLevel, ServiceTier), Error> {
-        let _order = self.selection_order.lock().await;
-        let (level, chosen, effective, entry) = {
-            let current = self.selection.borrow();
-            let level =
-                thinking.map_or(current.thinking, |level| clamp_level(&current.model, level));
-            let chosen = tier.unwrap_or(current.tier);
-            let effective = current.model.effective_tier(chosen);
-            let entry = if level != current.thinking {
-                Entry::ThinkingLevelChange {
-                    base: journal::base(),
-                    thinking_level: level,
-                    automatic: false,
-                    service_tier: (chosen != current.tier).then_some(chosen),
-                }
-            } else if chosen != current.tier {
-                Entry::ServiceTierChange {
-                    base: journal::base(),
-                    service_tier: chosen,
-                }
-            } else {
-                return Ok((level, effective));
-            };
-            (level, chosen, effective, entry)
-        };
-        self.append(vec![entry]).await?;
-        self.apply_suffixes(agent, level, chosen);
-        Ok((level, effective))
-    }
-
-    fn apply_suffixes(&self, agent: &Agent, level: ThinkingLevel, tier: ServiceTier) {
-        agent.set_selection(None, level, tier);
-        self.selection.send_modify(|selection| {
-            selection.thinking = level;
-            selection.tier = tier;
-        });
-    }
-
-    /// Applies a resolved `/model` selector and any thinking or tier suffixes.
-    pub(super) async fn select_choice(
-        &self,
-        agent: &Agent,
-        choice: ModelChoice,
-    ) -> Result<(), Error> {
-        match choice.model {
-            Some(model) => {
-                self.select_model(agent, model, choice.thinking, choice.tier)
-                    .await
-            }
-            None => {
-                self.select_suffixes(agent, choice.thinking, choice.tier)
-                    .await?;
-                Ok(())
-            }
-        }
-    }
-
-    /// [`SessionHooks::record_selection`] against the current position.
-    async fn record_current_selection(&self) -> Result<(), Error> {
-        let (model, thinking, tier, agent) = {
-            let view = self.journal.view();
-            (
-                view.projection.model.clone(),
-                view.projection.thinking,
-                view.projection.tier,
-                view.projection.agent.clone(),
-            )
-        };
-        self.record_selection(model.as_deref(), thinking, tier, agent.as_deref())
-            .await
     }
 
     fn yield_nudge(&self) -> bool {
@@ -2162,7 +1881,7 @@ impl Session {
             warn!("{diagnostic}");
         }
 
-        let journal = Journal::start(writer, entries, projection.clone(), events.clone());
+        let journal = Journal::start(writer, entries, projection, events.clone());
         let child = link.map(|link| ChildState {
             budget: Arc::new(TurnBudget::new(
                 link.spec.max_turns.unwrap_or(settings.subagents.max_turns),
@@ -2308,15 +2027,7 @@ impl Session {
         session.hooks.prompt.take_pending();
 
         // Nothing else runs on the session yet: these writes go in order.
-        session
-            .hooks
-            .record_selection(
-                projection.model.as_deref(),
-                projection.thinking,
-                projection.tier,
-                projection.agent.as_deref(),
-            )
-            .await?;
+        session.hooks.record_current_selection().await?;
         session.hooks.sync_sections().await?;
         if recovery.is_some() {
             session.reconcile_jobs(unfinished).await?;
@@ -2425,31 +2136,6 @@ impl Session {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    /// The currently selected model.
-    #[ext]
-    pub fn model(&self) -> Model {
-        self.hooks.model()
-    }
-
-    /// The thinking level applied to the current model.
-    #[ext]
-    pub fn thinking(&self) -> ThinkingLevel {
-        self.hooks.selection().thinking
-    }
-
-    /// The chosen service tier; it applies only on models that support it.
-    #[ext]
-    pub fn service_tier(&self) -> ServiceTier {
-        self.hooks.selection.borrow().tier
-    }
-
-    /// The tier requests are sent with on the current model.
-    #[ext]
-    pub fn effective_service_tier(&self) -> ServiceTier {
-        let selection = self.hooks.selection.borrow();
-        selection.model.effective_tier(selection.tier)
     }
 
     /// The effective configuration for this session.
@@ -2733,11 +2419,7 @@ impl Session {
             Command::Compact { focus } => self.compact(focus).await,
             Command::Shake { mode } => self.shake(mode).await,
             Command::Model { model } => {
-                let choice = self
-                    .inherited
-                    .config
-                    .settings
-                    .resolve_model(&self.inherited.models, &model)?;
+                let choice = self.hooks.resolve_model(&model)?;
                 let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
                 detached(async move { hooks.select_choice(&agent, choice).await }).await
             }
@@ -2803,13 +2485,6 @@ impl Session {
         self.hooks.tools.runner.jobs.shutdown().await;
     }
 
-    /// Switches the model from the next request; the thinking level is clamped to it.
-    #[ext]
-    pub async fn set_model(&self, model: Model) -> Result<(), Error> {
-        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-        detached(async move { hooks.select_model(&agent, model, None, None).await }).await
-    }
-
     /// Switches the root persona from the next request, applying its model selector when
     /// present. Changing the system prompt and tools is cache-heavy on models without
     /// mid-conversation system-message and tool changes.
@@ -2841,13 +2516,7 @@ impl Session {
             let choice = spec
                 .as_ref()
                 .and_then(|spec| spec.model.as_deref())
-                .map(|selector| {
-                    hooks
-                        .inherited
-                        .config
-                        .settings
-                        .resolve_model(&hooks.inherited.models, selector)
-                })
+                .map(|selector| hooks.resolve_model(selector))
                 .transpose()?;
             let mut entries = vec![Entry::AgentChange {
                 base: journal::base(),
@@ -2856,15 +2525,19 @@ impl Session {
             let selection = choice.map(|choice| {
                 let current = hooks.selection();
                 let model = choice.model.unwrap_or_else(|| current.model.clone());
-                let (model_entries, level, tier) =
-                    hooks.model_entries(&current, &model, choice.thinking, choice.tier);
-                entries.extend(model_entries);
-                (model, level, tier)
+                let target = hooks.target_selection(&current, model, choice.thinking, choice.tier);
+                entries.extend(target.entries_from(&current, true));
+                target
             });
             hooks.append(entries).await?;
-            if let Some((model, level, tier)) = selection {
-                let definition = hooks.registry_definition(&model);
-                hooks.apply_selection(&agent, model, level, tier, definition);
+            if let Some(target) = selection {
+                let definition = hooks.registry_definition(&target.model);
+                hooks.apply_selection(
+                    &agent,
+                    Some((target.model, definition)),
+                    target.thinking,
+                    target.tier,
+                );
             }
             let (new_shape, nested) = hooks.reshape(spec.clone()).await;
             *hooks
@@ -3101,33 +2774,6 @@ impl Session {
             diagnostics.extend(definition_diagnostics);
             diagnostics.extend(command_diagnostics);
             Ok::<_, Error>(diagnostics)
-        })
-        .await
-    }
-
-    /// Sets the thinking level from the next request, clamped to the model; returns the
-    /// level applied.
-    #[ext]
-    pub async fn set_thinking(&self, level: ThinkingLevel) -> Result<ThinkingLevel, Error> {
-        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-        detached(async move {
-            hooks
-                .select_suffixes(&agent, Some(level), None)
-                .await
-                .map(|s| s.0)
-        })
-        .await
-    }
-
-    /// Chooses the service tier from the next request; returns the tier the current model applies.
-    #[ext]
-    pub async fn set_service_tier(&self, tier: ServiceTier) -> Result<ServiceTier, Error> {
-        let (hooks, agent) = (self.hooks.clone(), self.agent.clone());
-        detached(async move {
-            hooks
-                .select_suffixes(&agent, None, Some(tier))
-                .await
-                .map(|s| s.1)
         })
         .await
     }

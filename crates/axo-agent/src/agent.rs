@@ -408,21 +408,6 @@ impl Agent {
         self.lock().messages = m;
     }
 
-    /// Takes effect from the next provider request.
-    pub fn set_model(&self, m: Model) {
-        self.lock().model = m;
-    }
-
-    /// Takes effect from the next provider request.
-    pub fn set_thinking(&self, t: ThinkingLevel) {
-        self.lock().thinking = t;
-    }
-
-    /// Takes effect from the next provider request.
-    pub fn set_service_tier(&self, t: ServiceTier) {
-        self.lock().service_tier = t;
-    }
-
     /// Installs the next request's selection under the same lock used to sample it.
     pub fn set_selection(&self, model: Option<Model>, thinking: ThinkingLevel, tier: ServiceTier) {
         let mut state = self.lock();

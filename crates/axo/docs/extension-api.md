@@ -13,10 +13,6 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | path |  | The session file. With lazy creation it exists only after the first submission. |
 | spawnLink |  | The spawn link of a child session; None for root sessions and forks. |
 | agent |  | The current root persona or the definition this child was spawned with. |
-| model |  | The currently selected model. |
-| thinking |  | The thinking level applied to the current model. |
-| serviceTier |  | The chosen service tier; it applies only on models that support it. |
-| effectiveServiceTier |  | The tier requests are sent with on the current model. |
 | config |  | The effective configuration for this session. |
 | setName | name? | Sets the file-wide session name; newlines become spaces and blank names clear it. May be called while a run is active; this entry contributes no context message. |
 | name |  | The latest session name in file order, independent of the selected branch. |
@@ -34,15 +30,19 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | keywordMatches | text | The keywords that would fire in text typed as a message right now, as byte ranges into text. A leading /command token is skipped, as on submission. |
 | runCommand | command | Runs a command under its policy: model/thinking/tier, modes and registered commands alongside a turn, compact/shake/navigate only when idle (Error::Busy otherwise). |
 | abort |  | Stops the active run (CancelReason::User). Stopping an active run holds queued input and job results until the user's next input or resume_wakes; input sent after the Stop starts the next run once this one settles. An idle Stop changes nothing. |
-| setModel | model | Switches the model from the next request; the thinking level is clamped to it. |
 | setAgent | name? | Switches the root persona from the next request, applying its model selector when present. Changing the system prompt and tools is cache-heavy on models without mid-conversation system-message and tool changes. |
-| setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
-| setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
 | answer | callId, answers | Settles the pending question of tool call call_id. A submission that does not fit the document returns Error::InvalidInput and leaves the question pending. |
 | dismiss | callId | Dismisses a pending question or mode result; the run is cancelled. |
 | contextUsage |  | The current estimated context size and effective compaction limits. |
 | isRunning |  | Whether a run, maintenance or navigation currently owns the session. Observing idle does not reserve it against future submissions or background wakes. |
 | treeUsage |  | This session's own recorded spend plus every descendant's, maintenance included; SessionEvent::TreeUsage reports changes. |
+| model |  | The currently selected model. |
+| thinking |  | The thinking level applied to the current model. |
+| serviceTier |  | The chosen service tier; it applies only on models that support it. |
+| effectiveServiceTier |  | The tier requests are sent with on the current model. |
+| setModel | model | Switches the model from the next request; the thinking level is clamped to it. |
+| setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
+| setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
 | withdraw | submissionId | Takes a queued steer or follow-up back before it is delivered and returns it for the host to edit and resubmit. Error::NotQueued once it was delivered or withdrawn. |
 | resumeWakes |  | Lifts the pause a Stop or a failed run left and, on an idle session, starts a run with the held steers or follow-ups, else with pending job results and mail. |
 | prompt | input | Expands a /skill args invocation, saves the submission with caller provenance, and runs the prompt; returns when the run settles. |
