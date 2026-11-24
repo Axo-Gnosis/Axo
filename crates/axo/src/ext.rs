@@ -103,7 +103,6 @@ pub enum InvokeErrorCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchCode {
-    UnknownObject,
     UnknownMethod,
     InvalidArguments,
     Encode,
@@ -113,8 +112,6 @@ pub enum DispatchCode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InvokeError {
-    #[error("Unknown object: {0}")]
-    UnknownObject(String),
     #[error("Unknown method: {0}")]
     UnknownMethod(String),
     #[error("{0}")]
@@ -138,7 +135,6 @@ impl InvokeError {
     #[ext(skip = "errors cross as { code, message, details? }")]
     pub fn code(&self) -> InvokeErrorCode {
         match self {
-            Self::UnknownObject(_) => InvokeErrorCode::Dispatch(DispatchCode::UnknownObject),
             Self::UnknownMethod(_) => InvokeErrorCode::Dispatch(DispatchCode::UnknownMethod),
             Self::InvalidArguments(_) => InvokeErrorCode::Dispatch(DispatchCode::InvalidArguments),
             Self::Encode(_) => InvokeErrorCode::Dispatch(DispatchCode::Encode),

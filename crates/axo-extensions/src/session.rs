@@ -977,10 +977,7 @@ impl Actions for Registry {
                             .await
                             .unwrap_or_else(|| Err(unavailable()));
                     }
-                    inner
-                        .axo
-                        .invoke("host", &invoke.method, invoke.args, &caller)
-                        .await
+                    inner.axo.invoke(&invoke.method, invoke.args, &caller).await
                 }
                 "models" => {
                     if invoke.target.is_some() {

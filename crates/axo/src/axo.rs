@@ -197,23 +197,15 @@ impl Axo {
         &self.models
     }
 
-    /// Calls an extension-accessible host or model method with positional JSON arguments.
+    /// Calls an extension-accessible host method with positional JSON arguments.
     #[ext(skip = "the dispatcher itself")]
     pub async fn invoke(
         &self,
-        object: &str,
         method: &str,
         args: Vec<Value>,
         caller: &Caller,
     ) -> Result<Value, InvokeError> {
-        match object {
-            "host" => HOST.invoke(self, method, args, caller).await,
-            "models" => {
-                self.invoke_models(self.models.clone(), method, args, caller)
-                    .await
-            }
-            _ => Err(InvokeError::UnknownObject(object.to_owned())),
-        }
+        HOST.invoke(self, method, args, caller).await
     }
 
     /// Calls an extension-accessible `models` method against `models` (for example a scoped

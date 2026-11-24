@@ -189,7 +189,7 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
 
     let caller = Caller::default();
     let sessions = axo
-        .invoke("host", "listSessions", vec![cwd], &caller)
+        .invoke("listSessions", vec![cwd], &caller)
         .await
         .unwrap();
     assert_eq!(sessions[0]["id"], session.id());
@@ -202,7 +202,6 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
     loop {
         let page = axo
             .invoke(
-                "host",
                 "readSession",
                 vec![json!(session.path()), after, json!(1)],
                 &caller,
@@ -222,8 +221,12 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
     }
     assert_eq!(json!(entries), json!(expected));
     assert!(matches!(
-        axo.invoke("nope", "listSessions", vec![], &caller).await,
-        Err(InvokeError::UnknownObject(name)) if name == "nope"
+        axo.invoke("nope", vec![], &caller).await,
+        Err(InvokeError::UnknownMethod(name)) if name == "nope"
+    ));
+    assert!(matches!(
+        axo.invoke("readSession", vec![], &caller).await,
+        Err(InvokeError::InvalidArguments(_))
     ));
 }
 
@@ -246,7 +249,12 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
     let caller = Caller::default();
     let reply = host
         .axo
-        .invoke("models", "complete", vec![request.clone()], &caller)
+        .invoke_models(
+            host.axo.models().clone(),
+            "complete",
+            vec![request.clone()],
+            &caller,
+        )
         .await
         .unwrap();
     assert_eq!(reply["content"][0]["text"], "hello");
@@ -255,7 +263,7 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
     assert_eq!(json!(requests[0].transcript.messages()), messages);
     let error = host
         .axo
-        .invoke("models", "complete", vec![request], &caller)
+        .invoke_models(host.axo.models().clone(), "complete", vec![request], &caller)
         .await
         .unwrap_err();
     assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
@@ -285,8 +293,8 @@ async fn completion_error(event: fn(&Model) -> AssistantEvent) -> InvokeError {
         Arc::new(SingleEvent(event)),
     )
     .await;
-    axo.invoke(
-        "models",
+    axo.invoke_models(
+        axo.models().clone(),
         "complete",
         vec![json!({"model": "test/m", "messages": []})],
         &Caller::default(),
@@ -369,7 +377,7 @@ async fn models_complete_resolves_model_roles_like_model_selectors() {
         json!({"model": "@fast", "messages": messages, "thinking": "low"}),
     ] {
         host.axo
-            .invoke("models", "complete", vec![request], &caller)
+            .invoke_models(host.axo.models().clone(), "complete", vec![request], &caller)
             .await
             .unwrap();
     }
@@ -379,8 +387,8 @@ async fn models_complete_resolves_model_roles_like_model_selectors() {
     assert_eq!(requests[1].options.thinking, ThinkingLevel::Low);
     let error = host
         .axo
-        .invoke(
-            "models",
+        .invoke_models(
+            host.axo.models().clone(),
             "complete",
             vec![json!({"model": "@slow", "messages": messages})],
             &caller,
@@ -422,7 +430,7 @@ async fn models_exposes_credential_sources_not_credentials() {
     let caller = Caller::default();
     let providers = host
         .axo
-        .invoke("models", "providers", vec![], &caller)
+        .invoke_models(host.axo.models().clone(), "providers", vec![], &caller)
         .await
         .unwrap();
     assert!(
@@ -435,7 +443,12 @@ async fn models_exposes_credential_sources_not_credentials() {
     assert_public(&providers);
     let source = host
         .axo
-        .invoke("models", "credentialSource", vec![json!("test")], &caller)
+        .invoke_models(
+            host.axo.models().clone(),
+            "credentialSource",
+            vec![json!("test")],
+            &caller,
+        )
         .await
         .unwrap();
     assert_public(&source);
@@ -853,7 +866,7 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
     assert_eq!(session.model().provider, "folder-a");
     assert_eq!(session.model().id, "local-1");
 
-    // invoke_models sees the scoped provider while Axo::invoke("models", ..) does not.
+    // The scoped registry sees the provider; the base registry does not.
     let caller = Caller::default();
     let found = axo
         .invoke_models(
@@ -866,7 +879,12 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
         .unwrap();
     assert_eq!(found["id"], "local-1");
     let missing = axo
-        .invoke("models", "find", vec![json!("folder-a/local-1")], &caller)
+        .invoke_models(
+            axo.models().clone(),
+            "find",
+            vec![json!("folder-a/local-1")],
+            &caller,
+        )
         .await
         .unwrap();
     assert!(missing.is_null());

@@ -980,7 +980,7 @@ export type Diagnostic_Serialize = {
 	message: string,
 };
 
-export type DispatchCode = "unknown_object" | "unknown_method" | "invalid_arguments" | "encode" | "tool" | "no_session";
+export type DispatchCode = "unknown_method" | "invalid_arguments" | "encode" | "tool" | "no_session";
 
 /**  What one session runs with. */
 export type EffectiveConfig = EffectiveConfig_Serialize | EffectiveConfig_Deserialize;
