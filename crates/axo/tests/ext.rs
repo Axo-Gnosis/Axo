@@ -772,7 +772,6 @@ async fn extension_submissions_record_provenance_live_and_in_journal() {
         .create_session(common::options(dir.path()))
         .await
         .unwrap();
-    let mut events = session.subscribe();
 
     // Direct user prompt has provenance: None.
     common::within(session.prompt("from user")).await.unwrap();
@@ -801,9 +800,7 @@ async fn extension_submissions_record_provenance_live_and_in_journal() {
         .unwrap();
 
     // Wait for follow-up run to settle.
-    while session.is_running() {
-        let _ = events.recv().await;
-    }
+    common::until(|| !session.is_running()).await;
 
     let entries: Vec<_> = common::journal(&session)
         .into_iter()

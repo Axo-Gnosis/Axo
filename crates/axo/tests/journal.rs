@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use axo::{Axo, Command, Entry, JobStatus, JsonlStore, Session, SessionEvent, SessionStore};
+use axo::{Axo, Command, Entry, JobStatus, JsonlStore, Session, SessionStore};
 use axo_agent::RunOutcome;
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{
@@ -20,7 +20,7 @@ use axo_ai::{
 use common::{WriteGate, bash_options, journal, only, within};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// Streams from `api`, holding request number `at` (0-based) until released.
@@ -160,23 +160,6 @@ async fn await_file(path: &Path) {
     within(async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-}
-
-/// Waits for an appended entry matching `pred`.
-async fn await_entry(
-    events: &mut broadcast::Receiver<Arc<SessionEvent>>,
-    pred: fn(&Entry) -> bool,
-) {
-    within(async {
-        loop {
-            match events.recv().await.as_deref() {
-                Ok(SessionEvent::Entry(seq)) if pred(&seq.entry) => return,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => panic!("session closed"),
-            }
         }
     })
     .await;
@@ -450,7 +433,6 @@ async fn compaction_commit_fails_when_a_job_end_lands_after_prepare() {
     let (session, api, entered, release, go) =
         compaction_with_running_job(dir.path(), ["Summary one.", "Summary two."]).await;
     let session = Arc::new(session);
-    let mut events = session.attach(None).await.events;
     let compact = tokio::spawn({
         let session = session.clone();
         async move { session.compact(None).await }
@@ -459,7 +441,7 @@ async fn compaction_commit_fails_when_a_job_end_lands_after_prepare() {
     // Prepared and summarizing; the job ends meanwhile, which moves the revision.
     within(entered.notified()).await;
     std::fs::write(&go, "").unwrap();
-    await_entry(&mut events, |entry| matches!(entry, Entry::JobEnd { .. })).await;
+    common::entry(&session, |entry| matches!(entry, Entry::JobEnd { .. })).await;
     release.notify_one();
     within(compact).await.unwrap().unwrap();
 
