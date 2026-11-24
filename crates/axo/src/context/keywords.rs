@@ -1,7 +1,7 @@
 //! Keyword definitions: standalone prose words in user-typed text that inject a body
 //! (inline, like a `/skill` expansion) and optionally select a model.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -9,8 +9,8 @@ use axo_macros::expose;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::context::Diagnostic;
 use crate::context::markdown::{self, name_problems, split_frontmatter};
-use crate::context::{Diagnostic, DiagnosticOrigin};
 
 /// A keyword. Built from a definition file or passed in code.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
@@ -72,39 +72,12 @@ struct Frontmatter {
 /// Blocking filesystem I/O; never fails (problems become diagnostics). The first
 /// definition of a name wins.
 pub fn load_keywords(roots: &[PathBuf]) -> (Vec<KeywordSpec>, Vec<Diagnostic>) {
-    let mut definitions = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut names = HashSet::new();
-    let mut real_paths = HashSet::new();
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        for entry in markdown::walk(root, |_| true).flatten() {
-            let path = entry.path();
-            if !path.is_file() || path.extension().is_none_or(|extension| extension != "md") {
-                continue;
-            }
-            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            if !real_paths.insert(real) {
-                continue;
-            }
-            let mut warn = |message| {
-                diagnostics.push(Diagnostic {
-                    origin: Some(DiagnosticOrigin::Path(path.to_path_buf())),
-                    message,
-                });
-            };
-            if let Some(spec) = load_file(path, &mut warn) {
-                if names.insert(spec.name.clone()) {
-                    definitions.push(spec);
-                } else {
-                    warn(format!("name \"{}\" collision", spec.name));
-                }
-            }
-        }
-    }
-    (definitions, diagnostics)
+    markdown::load_roots(
+        roots,
+        |spec| &spec.name,
+        |_, path| markdown::stem(path),
+        parse_markdown,
+    )
 }
 
 pub(crate) fn merge_keywords(
@@ -142,22 +115,6 @@ impl KeywordSpec {
     }
 }
 
-fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<KeywordSpec> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => {
-            let stem = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            parse_markdown(&raw, stem, Some(path), warn)
-        }
-        Err(error) => {
-            warn(error.to_string());
-            None
-        }
-    }
-}
-
 /// Files without frontmatter are skipped silently (they are not definitions) and treat an
 /// empty `name` as absent; path-less markdown was handed over as a definition, so both are
 /// problems.
@@ -165,7 +122,7 @@ fn parse_markdown(
     raw: &str,
     fallback_name: String,
     path: Option<&Path>,
-    warn: &mut impl FnMut(String),
+    warn: &mut dyn FnMut(String),
 ) -> Option<KeywordSpec> {
     let (yaml, body) = split_frontmatter(raw);
     let Some(yaml) = yaml else {

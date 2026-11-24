@@ -238,39 +238,12 @@ struct RawMember {
 /// Reads agent and team files. Team members are checked after merging registrations.
 /// Blocking filesystem I/O; never fails (problems become diagnostics).
 pub fn load_agents(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<Diagnostic>) {
-    let mut definitions = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut names = HashSet::new();
-    let mut real_paths = HashSet::new();
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        for entry in markdown::walk(root, |_| true).flatten() {
-            let path = entry.path();
-            if !path.is_file() || path.extension().is_none_or(|extension| extension != "md") {
-                continue;
-            }
-            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            if !real_paths.insert(real) {
-                continue;
-            }
-            let mut warn = |message| {
-                diagnostics.push(Diagnostic {
-                    origin: Some(DiagnosticOrigin::Path(path.to_path_buf())),
-                    message,
-                });
-            };
-            if let Some(definition) = load_file(path, &mut warn) {
-                if names.insert(definition.name().to_owned()) {
-                    definitions.push(definition);
-                } else {
-                    warn(format!("name \"{}\" collision", definition.name()));
-                }
-            }
-        }
-    }
-    (definitions, diagnostics)
+    markdown::load_roots(
+        roots,
+        AgentDef::name,
+        |_, path| markdown::stem(path),
+        parse_markdown,
+    )
 }
 
 pub(crate) fn merge_agents(
@@ -360,28 +333,13 @@ impl AgentSpec {
     }
 }
 
-fn load_file(path: &Path, warn: &mut impl FnMut(String)) -> Option<AgentDef> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            warn(error.to_string());
-            return None;
-        }
-    };
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    parse_markdown(&raw, stem, Some(path), warn)
-}
-
 /// Shared by root files and [`AgentSpec::parse`]; `fallback_name` applies when the frontmatter has no
 /// `name` (root files also treat an empty `name` as absent; host markdown must not).
 fn parse_markdown(
     raw: &str,
     fallback_name: String,
     path: Option<&Path>,
-    warn: &mut impl FnMut(String),
+    warn: &mut dyn FnMut(String),
 ) -> Option<AgentDef> {
     let (yaml, body) = split_frontmatter(raw);
     let Some(yaml) = yaml else {
@@ -493,7 +451,7 @@ fn parse_markdown(
     validate_agent(&mut spec, warn).then_some(AgentDef::Agent(spec))
 }
 
-fn valid_name(name: &str, warn: &mut impl FnMut(String)) -> bool {
+fn valid_name(name: &str, warn: &mut dyn FnMut(String)) -> bool {
     let problems = name_problems(name);
     let valid = problems.is_empty();
     for problem in problems {
@@ -502,7 +460,7 @@ fn valid_name(name: &str, warn: &mut impl FnMut(String)) -> bool {
     valid
 }
 
-fn validate_agent(spec: &mut AgentSpec, warn: &mut impl FnMut(String)) -> bool {
+fn validate_agent(spec: &mut AgentSpec, warn: &mut dyn FnMut(String)) -> bool {
     spec.sections.retain(|key, _| {
         if valid_section_name(key) {
             true
