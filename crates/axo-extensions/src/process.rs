@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use axo::{
     ProcessSupervisor,
@@ -16,7 +17,7 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::peer::{Actions, HANDSHAKE, Peer};
+use crate::peer::{Actions, Peer};
 use crate::{ExtensionOptions, ExtensionProblem, ProblemKind, problem};
 
 const RUNNER: &str = include_str!("runner.ts");
@@ -24,6 +25,7 @@ const RUNNER: &str = include_str!("runner.ts");
 const BUNFIG: &str = "[install]\nauto = \"disable\"\n";
 /// `sun_path` holds 108 bytes including the terminating NUL.
 const MAX_SOCKET_PATH: usize = 107;
+const HANDSHAKE: Duration = Duration::from_secs(15);
 
 /// Why a generation did not start.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

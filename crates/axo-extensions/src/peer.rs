@@ -30,7 +30,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 
 /// Largest frame body either side may send or accept.
@@ -43,7 +43,6 @@ const CONTROL_SLOTS: usize = 64;
 const CANCEL_SLOTS: usize = 256;
 /// Live runner calls (parented and session actions) across one connection.
 const MAX_CALLBACKS: usize = 256;
-pub const HANDSHAKE: Duration = Duration::from_secs(15);
 pub const PING_EVERY: Duration = Duration::from_secs(2);
 pub const PONG_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -251,13 +250,12 @@ impl Peer {
     ) -> Result<Arc<Peer>, String> {
         let (read, write) = stream.into_split();
         let mut reader = BufReader::new(read);
-        let hello = match timeout(HANDSHAKE, read_frame(&mut reader)).await {
-            Err(_) => return Err("extension runner handshake timed out".into()),
-            Ok(Ok(Some(hello))) => hello,
-            Ok(Ok(None)) => {
+        let hello = match read_frame(&mut reader).await {
+            Ok(Some(hello)) => hello,
+            Ok(None) => {
                 return Err("extension runner closed the connection before its hello".into());
             }
-            Ok(Err(reason)) => return Err(format!("extension runner handshake failed: {reason}")),
+            Err(reason) => return Err(format!("extension runner handshake failed: {reason}")),
         };
         let valid = hello.get("type").and_then(Value::as_str) == Some("hello")
             && hello

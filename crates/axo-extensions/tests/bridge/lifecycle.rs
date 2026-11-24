@@ -22,6 +22,7 @@ pub const CASES: &[Case] = &[
     case!(crash_counts_once_and_the_third_disables_the_group_until_retry),
     case!(load_rejection_spares_its_sibling_and_retry_reloads_it),
     case!(startup_death_fails_the_waiter_then_restarts),
+    case!(connected_runner_without_hello_times_out_and_is_reaped),
     case!(configure_and_shutdown_during_startup_fail_the_waiter),
     case!(removal_and_shutdown_end_a_waiting_login),
     case!(displaced_call_is_canceled_and_its_stale_reply_dropped),
@@ -403,6 +404,35 @@ async fn startup_death_fails_the_waiter_then_restarts() {
     // Generation 1 died in startup; its replacement must come up on its own.
     wait_ready_after(&extensions, "lab-provider", 1).await;
     assert_eq!(host.pids().len(), 2);
+    request(&host, "lab").await;
+    assert_eq!(http.requests().len(), 1);
+    extensions.shutdown().await;
+}
+
+async fn connected_runner_without_hello_times_out_and_is_reaped() {
+    let host = Host::new().await;
+    let http = Http::start();
+    host.package("root", "lab-provider", &[("lab", &http.url, false, true)]);
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[("lab-provider", None)]))
+        .await
+        .unwrap();
+    host.script_startup("no-hello");
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(25), request(&host, "lab"))
+        .await
+        .expect("the runner handshake had no deadline");
+    assert_unavailable(&first, "runner did not complete its handshake within 15 s");
+    assert!(http.requests().is_empty());
+    let pid = std::fs::read_to_string(host.path("ctl/connected-no-hello"))
+        .expect("the runner never connected")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!alive(pid), "the silent runner was not reaped");
+
+    wait_ready_after(&extensions, "lab-provider", 1).await;
     request(&host, "lab").await;
     assert_eq!(http.requests().len(), 1);
     extensions.shutdown().await;

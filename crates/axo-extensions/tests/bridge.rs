@@ -274,7 +274,7 @@ impl Host {
         std::fs::write(dir.join(method), behavior).unwrap();
     }
 
-    /// The next runner start behaves as `behavior` ("exit" or "hang") before its hello.
+    /// Scripts startup before hello: "exit", "hang", "bad-nonce" or "no-hello".
     pub fn script_startup(&self, behavior: &str) {
         std::fs::write(self.path("ctl").join("startup"), behavior).unwrap();
     }
@@ -557,7 +557,7 @@ mod fake {
 
     /// Script files (one-line behaviors; default "ok"):
     /// - `ctl/startup` (consumed): `exit` before connecting, `hang` never connecting,
-    ///   `bad-nonce` sends a wrong nonce.
+    ///   `bad-nonce` sends a wrong nonce, `no-hello` connects without sending anything.
     /// - `ctl/<ext>/activate`: `ok` | `reject` (code "activation") | `hang` | `exit`.
     /// - `ctl/<ext>/login`: `ok` (openUrl, progress, prompt "code", returns an OAuth
     ///   credential whose access token is `access-<answer>`) | `hang` | `exit`.
@@ -654,6 +654,12 @@ mod fake {
         }
 
         let stream = UnixStream::connect(&socket).await.expect("connect");
+        if script.as_deref().map(str::trim) == Some("no-hello") {
+            append(&control.join("connected-no-hello"), &std::process::id().to_string());
+            std::future::pending::<()>().await;
+            drop(stream);
+            return;
+        }
         let (mut reader, mut writer) = stream.into_split();
         let (out, mut queue) = mpsc::unbounded_channel::<Value>();
         write_frame(&mut writer, &json!({"type": "hello", "nonce": nonce})).await;
