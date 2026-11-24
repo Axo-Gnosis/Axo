@@ -16,10 +16,10 @@ use axo_ai::{
     AssistantBlock, AssistantEvent, Credential, CredentialStore, Model, Provider, StopReason,
 };
 use axo_extensions::{ExtensionEvent, ExtensionPhase, Hidden, ProviderCollision, ProviderOrigin};
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::host::{Host, LAB, alive, enabled, kill, wait_dead, wait_for};
+use crate::common::{alive, model_json};
+use crate::host::{Host, LAB, enabled, kill, wait_dead, wait_for};
 use crate::oauth;
 use crate::server::{NATIVE, TEXT_HEAD, TEXT_TAIL, TOOL};
 
@@ -354,19 +354,7 @@ fn native_url(host: &Host) -> String {
 /// Registers a keyless native runtime provider `<provider>/m` on the server's native path
 /// and returns its model.
 fn register_native(host: &Host, provider: &str) -> Model {
-    let model: Model = serde_json::from_value(json!({
-        "id": "m",
-        "name": "m",
-        "api": "openai-completions",
-        "provider": provider,
-        "baseUrl": native_url(host),
-        "reasoning": false,
-        "input": ["text"],
-        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
-        "contextWindow": 200000,
-        "maxTokens": 4096,
-    }))
-    .unwrap();
+    let model: Model = serde_json::from_value(model_json(provider, &native_url(host))).unwrap();
     host.models
         .register(
             "host",

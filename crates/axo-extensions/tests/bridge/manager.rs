@@ -9,8 +9,10 @@ use axo_extensions::{
     ProblemKind, ProviderCollision, ProviderOrigin, inspect_package,
 };
 
+use crate::common::{alive, phase};
+
 use super::{
-    Case, Host, Http, assert_unavailable, base_url, enabled, find, phase, register_native, stream,
+    Case, Host, Http, assert_unavailable, base_url, enabled, find, register_native, stream,
 };
 
 pub const CASES: &[Case] = &[
@@ -449,11 +451,11 @@ async fn shutdown_removes_the_layer_and_closes_admission() {
     let model = find(&host.models, "lab").unwrap();
     stream(&host.models, &model).await;
     let pid = host.pids()[0];
-    assert!(super::alive(pid));
+    assert!(alive(pid));
 
     extensions.shutdown().await;
     // Reaped before `shutdown` returned, and the native provider is back.
-    assert!(!super::alive(pid), "shutdown left the runner running");
+    assert!(!alive(pid), "shutdown left the runner running");
     assert_eq!(base_url(&host.models, "lab").unwrap(), native.url);
     // New requests go to the revealed native winner.
     stream(&host.models, &find(&host.models, "lab").unwrap()).await;

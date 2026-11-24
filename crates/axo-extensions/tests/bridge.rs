@@ -15,6 +15,7 @@ macro_rules! case {
     };
 }
 
+mod common;
 #[path = "bridge/install.rs"]
 mod install;
 #[path = "bridge/lifecycle.rs"]
@@ -41,6 +42,8 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+
+use crate::common::{model_json, phase};
 
 /// The control directory a fake runner reads its script from (part of the host `env`).
 const CONTROL: &str = "AXO_FAKE_CONTROL";
@@ -313,21 +316,6 @@ fn lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-pub fn model_json(provider: &str, base_url: &str) -> Value {
-    json!({
-        "id": "m",
-        "name": "m",
-        "api": "openai-completions",
-        "provider": provider,
-        "baseUrl": base_url,
-        "reasoning": false,
-        "input": ["text"],
-        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
-        "contextWindow": 200000,
-        "maxTokens": 4096,
-    })
-}
-
 pub fn enabled(list: &[(&str, Option<&str>)]) -> Vec<EnabledExtension> {
     list.iter()
         .map(|(id, group)| EnabledExtension {
@@ -335,14 +323,6 @@ pub fn enabled(list: &[(&str, Option<&str>)]) -> Vec<EnabledExtension> {
             group: group.map(Into::into),
         })
         .collect()
-}
-
-pub fn phase(extensions: &Extensions, id: &str) -> ExtensionStatus {
-    extensions
-        .status()
-        .into_iter()
-        .find(|status| status.id == id)
-        .unwrap_or_else(|| panic!("no status for {id}"))
 }
 
 pub async fn wait_phase(
@@ -516,11 +496,6 @@ pub fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         .filter_map(|line| line.split_once(':'))
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.trim())
-}
-
-/// Whether `pid` exists; an unreaped zombie still counts, so `!alive` means reaped.
-pub fn alive(pid: i32) -> bool {
-    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
 }
 
 pub fn kill(pid: i32) {

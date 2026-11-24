@@ -26,7 +26,8 @@ use axo_extensions::{
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Case, Host, enabled, lines, phase, wait_for, wait_ready_after};
+use crate::common::phase;
+use crate::{Case, Host, enabled, lines, wait_for, wait_ready_after};
 
 pub const CASES: &[Case] = &[
     case!(tools_policy_state_command_and_events),
