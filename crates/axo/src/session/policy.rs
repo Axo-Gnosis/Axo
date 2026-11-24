@@ -13,6 +13,7 @@ use crate::commands::RegisteredCommand;
 use crate::context::agents::AgentSpec;
 use crate::context::modes::{BashAccess, ModeSpec};
 use crate::schemes::Scheme;
+use crate::store::SpawnLink;
 use crate::tools::output::YIELD;
 use crate::tools::{SessionTools, WriteScope, writes};
 
@@ -33,8 +34,51 @@ pub struct ToolScope {
     pub writes: Option<WriteScope>,
 }
 
+impl ToolScope {
+    pub(super) fn assemble(
+        tools: &SessionTools,
+        agent: Option<AgentSpec>,
+        mode: Option<Arc<ModeSpec>>,
+        link: Option<&SpawnLink>,
+    ) -> Self {
+        let agent = agent.or_else(|| link.map(|link| link.spec.clone()));
+        let (bash, writes) = restrictions(tools, agent.as_ref(), mode.as_deref(), link);
+        Self {
+            session_id: tools.session_id().to_owned(),
+            depth: link.map_or(0, |link| link.depth),
+            agent,
+            mode,
+            bash,
+            writes,
+        }
+    }
+
+    pub(super) fn install_tool_limits(&self, tools: &SessionTools) {
+        tools
+            .read_only_bash
+            .store(!self.bash.is_full(), Ordering::Release);
+        *tools.writes.lock().unwrap_or_else(PoisonError::into_inner) = self.writes.clone();
+    }
+}
+
+fn restrictions(
+    tools: &SessionTools,
+    agent: Option<&AgentSpec>,
+    mode: Option<&ModeSpec>,
+    link: Option<&SpawnLink>,
+) -> (BashAccess, Option<WriteScope>) {
+    let bash = effective_bash(agent, mode, link.map_or(BashAccess::Full, |link| link.bash));
+    let writes = effective_writes(
+        tools,
+        agent,
+        mode,
+        link.and_then(|link| link.writes.as_ref()),
+    );
+    (bash, writes)
+}
+
 /// `ReadOnly` when any of the agent, the mode, or the inherited ceiling is.
-pub(super) fn effective_bash(
+fn effective_bash(
     agent: Option<&AgentSpec>,
     mode: Option<&ModeSpec>,
     ceiling: BashAccess,
@@ -50,7 +94,7 @@ pub(super) fn effective_bash(
 }
 
 /// Normalized layers in enforcement order; `None` when no layer restricts.
-pub(super) fn effective_writes(
+fn effective_writes(
     tools: &SessionTools,
     agent: Option<&AgentSpec>,
     mode: Option<&ModeSpec>,
@@ -205,62 +249,35 @@ impl ToolHooks for ModeGate {
 }
 
 impl SessionHooks {
-    /// This session's effective bash access; children spawned now inherit it as their ceiling.
-    pub(super) fn bash_with(&self, mode: Option<&ModeSpec>) -> BashAccess {
-        let child = self.child.as_ref().map(|child| &child.link);
+    /// Effective bash and write ceilings for children spawned with this mode.
+    pub(super) fn restrictions_with(
+        &self,
+        mode: Option<&ModeSpec>,
+    ) -> (BashAccess, Option<WriteScope>) {
+        let link = self.child.as_ref().map(|child| &child.link);
         let agent = self
             .agent_spec
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        effective_bash(
-            agent.as_ref().or(child.map(|link| &link.spec)),
-            mode,
-            child.map_or(BashAccess::Full, |link| link.bash),
-        )
-    }
-
-    /// This session's effective write scope; children spawned now inherit it as their ceiling.
-    pub(super) fn writes_with(&self, mode: Option<&ModeSpec>) -> Option<WriteScope> {
-        let child = self.child.as_ref().map(|child| &child.link);
-        let agent = self
-            .agent_spec
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        effective_writes(
+        restrictions(
             &self.tools,
-            agent.as_ref().or(child.map(|link| &link.spec)),
+            agent.as_ref().or(link.map(|link| &link.spec)),
             mode,
-            child.and_then(|link| link.writes.as_ref()),
+            link,
         )
     }
 
     pub(super) fn rescope(&self) {
         let link = self.child.as_ref().map(|child| &child.link);
         let mode = self.effective_mode();
-        let bash = self.bash_with(mode.as_deref());
-        let writes = self.writes_with(mode.as_deref());
-        let scope = ToolScope {
-            session_id: self.session_id.clone(),
-            depth: link.map_or(0, |link| link.depth),
-            agent: self
-                .agent_spec
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-                .or_else(|| link.map(|link| link.spec.clone())),
-            mode,
-            bash,
-            writes: writes.clone(),
-        };
-        let mut current = self.scope.lock().unwrap_or_else(PoisonError::into_inner);
-        self.tools
-            .read_only_bash
-            .store(!bash.is_full(), Ordering::Release);
-        *self
-            .tools
-            .writes
+        let agent = self
+            .agent_spec
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = writes;
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let scope = ToolScope::assemble(&self.tools, agent, mode, link);
+        let mut current = self.scope.lock().unwrap_or_else(PoisonError::into_inner);
+        scope.install_tool_limits(&self.tools);
         *current = Arc::new(scope);
     }
 

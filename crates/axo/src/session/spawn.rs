@@ -400,8 +400,7 @@ impl SessionHooks {
                 .map(|mode| mode.tools.clone())
                 .unwrap_or_default(),
         };
-        let bash = self.bash_with(mode.as_deref());
-        let writes = self.writes_with(mode.as_deref());
+        let (bash, writes) = self.restrictions_with(mode.as_deref());
         normalize(&mut spec, &settings.subagents);
         let select = |spec: &AgentSpec| -> Result<_, Error> {
             let cascade = settings.first_model(

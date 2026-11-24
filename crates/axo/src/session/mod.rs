@@ -48,7 +48,7 @@ use self::journal::Journal;
 use self::maintenance::Maintenance;
 pub(crate) use self::modes::MODE_NOTICE;
 pub use self::modes::{AcceptResultOptions, PendingResult};
-use self::policy::{ModeGate, ScopeCell, effective_bash, effective_writes, tool_hooks};
+use self::policy::{ModeGate, ScopeCell, tool_hooks};
 pub use self::policy::{ToolPolicy, ToolScope};
 pub use self::prompt::{ContextFilesInspection, PromptInspection};
 use self::prompt::{PromptState, SessionPrompt, ShapeBase, ToolBase, shape};
@@ -70,7 +70,7 @@ use crate::context::definitions::{
 };
 use crate::context::files::NestedContext;
 use crate::context::keywords::{KeywordMatch, KeywordSpec};
-use crate::context::modes::{BashAccess, ModeSpec};
+use crate::context::modes::ModeSpec;
 use crate::context::prompt::PromptSources;
 use crate::context::skills::Skill;
 use crate::context::{Diagnostic, DiagnosticOrigin};
@@ -2018,7 +2018,18 @@ impl Session {
             ci: settings.bash.ci,
             promote_after: Duration::from_millis(settings.bash.promote_after_ms),
         };
-        let session_tools = Arc::new(SessionTools::new(
+        let selected_mode = if link.is_none() {
+            projection.mode.as_ref().and_then(|name| {
+                resolved
+                    .modes
+                    .iter()
+                    .find(|spec| &spec.name == name)
+                    .cloned()
+            })
+        } else {
+            None
+        };
+        let session_tools = SessionTools::new(
             cwd.clone(),
             exec.clone(),
             NestedContext::disabled(),
@@ -2026,7 +2037,17 @@ impl Session {
             runner,
             deferred,
             crate::tools::SnapshotStore::for_session(&path),
-        ));
+        );
+        let scope = ToolScope::assemble(
+            &session_tools,
+            root_agent.cloned(),
+            selected_mode.clone(),
+            link.as_ref(),
+        );
+        scope.install_tool_limits(&session_tools);
+        let depth = scope.depth;
+        let scope = Arc::new(Mutex::new(Arc::new(scope)));
+        let session_tools = Arc::new(session_tools);
         let yield_state = link
             .as_ref()
             .and_then(|link| link.spec.output.as_ref())
@@ -2038,7 +2059,6 @@ impl Session {
         });
         let (host, host_deferred) = tools::instantiate(&joined_tools, &session_tools);
         let spawn_tool = Arc::new(SpawnTool::new(&resolved.agents, &settings.model_roles));
-        let depth = link.as_ref().map_or(0, |link| link.depth);
         let routes = AgentRoutes {
             session_id: session_id.clone(),
             parent: link.as_ref().map(|link| link.parent_session_id.clone()),
@@ -2108,17 +2128,6 @@ impl Session {
             .context
             .reset(nested.root, nested.names, &nested.startup);
         let tools = prompt_shape.tools.clone();
-        let selected_mode = if link.is_none() {
-            projection.mode.as_ref().and_then(|name| {
-                resolved
-                    .modes
-                    .iter()
-                    .find(|spec| &spec.name == name)
-                    .cloned()
-            })
-        } else {
-            None
-        };
         let mode_diagnostic = projection
             .mode
             .as_ref()
@@ -2163,37 +2172,6 @@ impl Session {
             first_slot: Mutex::new(None),
             link,
         });
-        let scope_agent = root_agent
-            .cloned()
-            .or_else(|| child.as_ref().map(|child| child.link.spec.clone()));
-        let bash = effective_bash(
-            scope_agent.as_ref(),
-            selected_mode.as_deref(),
-            child
-                .as_ref()
-                .map_or(BashAccess::Full, |child| child.link.bash),
-        );
-        session_tools
-            .read_only_bash
-            .store(!bash.is_full(), Ordering::Release);
-        let writes = effective_writes(
-            &session_tools,
-            scope_agent.as_ref(),
-            selected_mode.as_deref(),
-            child.as_ref().and_then(|child| child.link.writes.as_ref()),
-        );
-        *session_tools
-            .writes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = writes.clone();
-        let scope = Arc::new(Mutex::new(Arc::new(ToolScope {
-            session_id: session_id.clone(),
-            depth,
-            agent: scope_agent,
-            mode: selected_mode.clone(),
-            bash,
-            writes,
-        })));
         let mut fixed_hooks: Vec<Arc<dyn ToolHooks>> = Vec::new();
         if let Some(child) = &child {
             fixed_hooks.push(child.budget.clone());

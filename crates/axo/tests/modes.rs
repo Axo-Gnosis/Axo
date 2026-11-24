@@ -71,6 +71,54 @@ fn declarations(request: &RecordedRequest) -> Value {
 }
 
 #[tokio::test]
+async fn restored_mode_restricts_tools_before_factory_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        json!([{"id":"m"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ready"))],
+    )
+    .await;
+    let mut opts = mode_options(dir.path());
+    let plan = &mut opts.host.definitions.modes[0];
+    plan.bash = BashAccess::ReadOnly;
+    plan.writes = Some(vec![]);
+    let definitions = opts.host.definitions.clone();
+    let session = host.axo.create_session(opts).await.unwrap();
+    within(session.prompt("Start the journal.")).await.unwrap();
+    session.set_mode(Some("plan")).await.unwrap();
+    let path = session.path().to_owned();
+    session.shutdown().await;
+    drop(session);
+
+    let observed = Arc::new(Mutex::new(None));
+    let mut opts = options(dir.path());
+    opts.host.definitions = definitions;
+    opts.host.tools.push(HostTool::direct(Arc::new({
+        let observed = observed.clone();
+        move |tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
+            *observed.lock().unwrap() =
+                Some((tools.bash_access(), tools.write_scope(), tools.clone()));
+            Arc::new(common::Hang)
+        }
+    })));
+    let session = host.axo.open_session(&path, opts).await.unwrap();
+    let (bash, writes, tools) = observed.lock().unwrap().take().unwrap();
+    assert_eq!(bash, BashAccess::ReadOnly);
+    assert_eq!(
+        writes,
+        Some(axo::WriteScope {
+            layers: vec![vec![]]
+        })
+    );
+    let target = tools.locate("guarded.txt").await.unwrap();
+    let error = tools.check_write(&target).await.unwrap_err();
+    assert!(error.0.contains("no writes allowed"), "{error}");
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn mode_blocks_write_without_changing_the_cached_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(

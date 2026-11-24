@@ -1,6 +1,6 @@
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axo::{
     AgentSpec, BashAccess, Definitions, Entry, HostTool, ModeSpec, RecoveryPolicy, SessionOptions,
@@ -680,6 +680,7 @@ async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
     );
 
     let captured_tools = Arc::new(Mutex::new(None));
+    let parent_id = Arc::new(OnceLock::new());
     let opts = SessionOptions {
         host: axo::Registrations {
             definitions: Definitions {
@@ -691,6 +692,7 @@ async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
                 modes: vec![ModeSpec {
                     name: "plan".into(),
                     description: "Write only in plans.".into(),
+                    bash: BashAccess::ReadOnly,
                     writes: Some(vec!["plans".into()]),
                     ..Default::default()
                 }],
@@ -698,7 +700,23 @@ async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
             },
             tools: vec![HostTool::direct(Arc::new({
                 let captured_tools = captured_tools.clone();
+                let parent_id = parent_id.clone();
                 move |tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
+                    if parent_id.get().is_some_and(|id| id != tools.session_id()) {
+                        assert_eq!(tools.bash_access(), BashAccess::ReadOnly);
+                        assert_eq!(
+                            tools.write_scope(),
+                            Some(WriteScope {
+                                layers: vec![
+                                    vec![
+                                        WriteRoot::Path(tools.cwd.join("plans/ok.md")),
+                                        WriteRoot::Path(tools.cwd.join("plans/linked")),
+                                    ],
+                                    vec![WriteRoot::Path(tools.cwd.join("plans"))],
+                                ],
+                            })
+                        );
+                    }
                     *captured_tools.lock().unwrap() = Some(tools.clone());
                     Arc::new(Hang)
                 }
@@ -714,6 +732,7 @@ async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
     std::os::unix::fs::symlink("plans/ok.md", cwd.join("ok-alias.md")).unwrap();
 
     let parent = host.axo.create_session(opts).await.unwrap();
+    parent_id.set(parent.id().to_owned()).unwrap();
     assert!(captured_tools.lock().unwrap().take().is_some());
     parent.set_mode(Some("plan")).await.unwrap();
     let child = within(parent.spawn(SpawnRequest {
@@ -723,6 +742,7 @@ async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
     .await
     .unwrap();
     let tools = captured_tools.lock().unwrap().take().unwrap();
+    assert_eq!(tools.session_id(), child.session.id());
 
     // Each denied target is allowed by just one layer. Check policy without writing.
     for path in ["plans/unlisted.md", "plans/linked/unlisted.md"] {
