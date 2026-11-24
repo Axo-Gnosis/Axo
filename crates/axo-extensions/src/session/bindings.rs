@@ -74,7 +74,6 @@ pub(crate) struct ToolResult {
 pub(super) struct RemoteTool {
     pub remote: Remote,
     pub decl: Arc<ToolDecl>,
-    pub session: String,
     pub tools: Weak<SessionTools>,
 }
 
@@ -113,7 +112,7 @@ impl Tool for RemoteTool {
         let access = ToolAccess::new(tools, cx.clone());
         let args = serde_json::to_value(ToolRunArgs {
             tool: name,
-            session: &self.session,
+            session: access.tools.session_id(),
             call: &cx.call,
             invocation: cx.invocation,
         })

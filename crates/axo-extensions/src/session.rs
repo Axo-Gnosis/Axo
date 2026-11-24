@@ -54,6 +54,7 @@ pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
 }
 
 /// What one admitted extension contributes to sessions, runnable or not.
+#[derive(PartialEq)]
 pub(crate) struct Contribution {
     pub ext: String,
     /// [`crate::ExtensionOrigin`] label stamped on everything this contribution registers.
@@ -235,7 +236,6 @@ impl Inner {
                     Arc::new(RemoteTool {
                         remote: remote.clone(),
                         decl: Arc::clone(&decl),
-                        session: tools.session_id().to_owned(),
                         tools: Arc::downgrade(tools),
                     }) as Arc<dyn axo_agent::Tool>
                 });
@@ -300,18 +300,6 @@ impl Inner {
         }
         parts
     }
-}
-
-/// Whether two compositions install the same layer: the same extensions in the same order
-/// with the same declarations, sections and definitions.
-pub(crate) fn same_layer(a: &[Arc<Contribution>], b: &[Arc<Contribution>]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| {
-            a.ext == b.ext
-                && a.decl == b.decl
-                && a.sections == b.sections
-                && a.definitions == b.definitions
-        })
 }
 
 /// Applies the current composition as `id`'s layer under the manager's config gate.

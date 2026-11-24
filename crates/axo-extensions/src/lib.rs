@@ -1661,7 +1661,7 @@ impl Inner {
             state.placements = placements;
             state.member_of = member_of;
             state.bindings = bindings;
-            let unchanged = session::same_layer(&state.contributions, &contributions);
+            let unchanged = state.contributions == contributions;
             state.contributions = contributions;
             let old_collisions = std::mem::replace(&mut state.collisions, collisions);
             let old_diagnostics = std::mem::replace(&mut state.diagnostics, diagnostics);
