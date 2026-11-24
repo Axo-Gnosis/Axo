@@ -10,14 +10,56 @@ use tokio_util::sync::CancellationToken;
 use super::SessionEvent;
 use super::delivery::Claim;
 use super::journal::{self, View};
-use super::{
-    MaintenanceKind, NavigateOptions, Selection, Session, SessionHooks, ShakeMode, detached,
-    normalize_focus,
-};
+use super::{Selection, Session, SessionHooks, detached};
 use crate::compaction::{self, Limits};
 use crate::config::{CompactionSettings, SummaryRequest};
 use crate::error::Error;
 use crate::store::{CompactionReason, Entry, EntryId, SeqEntry, project};
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    specta::Type,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ShakeMode {
+    #[default]
+    Elide,
+    Images,
+    Thinking,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct NavigateOptions {
+    pub summarize: bool,
+    /// What the branch summary should prioritize (trimmed; blank counts as none); requires `summarize`.
+    pub focus: Option<String>,
+}
+
+/// Trims a user's summary focus in place; blank counts as none.
+pub(crate) fn normalize_focus(focus: Option<String>) -> Option<String> {
+    let mut text = focus?;
+    text.truncate(text.trim_end().len());
+    let start = text.len() - text.trim_start().len();
+    text.drain(..start);
+    (!text.is_empty()).then_some(text)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum MaintenanceKind {
+    Compact,
+    Shake,
+    BranchSummary,
+}
 
 const SUMMARY_ATTEMPTS: u32 = 3;
 enum MaintenanceOperation {

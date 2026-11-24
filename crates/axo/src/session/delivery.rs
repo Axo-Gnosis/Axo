@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, Weak};
@@ -11,8 +12,7 @@ use uuid::Uuid;
 
 use super::journal::{self, View};
 use super::{
-    HostDelivery, HostMessage, MaintenanceKind, PromptRequest, PromptResult, QueuedInput,
-    RunRequest, Session, SessionEvent, SessionHooks, detached, run_to_settle,
+    MaintenanceKind, RunRequest, Session, SessionEvent, SessionHooks, detached, run_to_settle,
 };
 use crate::config::ModelChoice;
 use crate::context::keywords::{self, KeywordSpec};
@@ -23,9 +23,118 @@ use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, rende
 use crate::jobs::child::TURN_BUDGET;
 use crate::jobs::{JOB_RESULT, JobHost};
 use crate::store::{
-    BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, Entry, SeqEntry, SubmissionKind, SubmittedCustom,
+    self, BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, Entry, SeqEntry, SubmissionKind,
+    SubmittedCustom,
 };
 use crate::tools::output::YIELD_NUDGE;
+
+/// A prompt with an optional client id that makes resubmission idempotent.
+#[derive(Debug, Clone, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PromptRequest {
+    pub input: PromptInput,
+    pub request_id: Option<String>,
+}
+
+/// What `Session::prompt_with` did.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PromptResult {
+    /// The prompt was submitted and its run has settled.
+    Settled {
+        submission: SeqEntry,
+        outcome: RunOutcome,
+    },
+    /// The `request_id` was already submitted: the earlier `submission` entry. No run
+    /// was started.
+    Duplicate(SeqEntry),
+}
+/// A durable host instruction, delivered without changing the prompt's system sections.
+#[derive(Debug, Clone, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostMessage {
+    pub custom_type: String,
+    pub text: String,
+    pub display: bool,
+    pub delivery: HostDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum HostDelivery {
+    /// The next turn boundary; starts a run when idle.
+    Steer,
+    /// When the active run would end; starts a run when idle.
+    FollowUp,
+    /// The next turn boundary or run start; never starts a run.
+    Quiet,
+}
+
+/// One steer or follow-up waiting in the agent's queues.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedInput {
+    pub submission_id: String,
+    /// `Prompt` (input requeued when the session reopened) is delivered like `Steer`.
+    pub kind: SubmissionKind,
+    pub parts: Vec<PromptPart>,
+    /// Who sent the input when it did not come from the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::coordination::SubmissionProvenance>,
+    /// `Some` for a host `post` message; resubmit it with `Session::post`, not `steer`.
+    pub custom: Option<store::SubmittedCustom>,
+}
+
+impl QueuedInput {
+    fn from_submission(entry: &Entry) -> Option<Self> {
+        let Entry::Submission {
+            submission_id,
+            kind,
+            parts,
+            provenance,
+            custom,
+            ..
+        } = entry
+        else {
+            return None;
+        };
+        Some(Self {
+            submission_id: submission_id.clone(),
+            kind: *kind,
+            parts: parts.clone(),
+            provenance: provenance.clone(),
+            custom: custom.clone(),
+        })
+    }
+}
+
+pub(super) fn queued_inputs(entries: &[SeqEntry], ids: Vec<String>) -> Vec<QueuedInput> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut positions: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    let mut slots = vec![None; ids.len()];
+    for seq in entries.iter().rev() {
+        if let Entry::Submission { submission_id, .. } = &seq.entry
+            && let Some(index) = positions.remove(submission_id.as_str())
+        {
+            slots[index] = QueuedInput::from_submission(&seq.entry);
+            if positions.is_empty() {
+                break;
+            }
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
 
 /// Custom types the engine writes or reads with special meaning; a host message
 /// using one would be mistaken for the engine's own.

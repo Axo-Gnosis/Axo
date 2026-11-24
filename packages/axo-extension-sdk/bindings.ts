@@ -5094,7 +5094,6 @@ export interface Session {
    * skills.
    */
   commands(signal?: AbortSignal): Promise<SessionCommandsResult_Serialize>;
-  // withheld: setCommands — replaces the host's own registrations; extensions register through their manifest
   /**
    * The mode definitions in force now; empty for children.
    */
@@ -5128,14 +5127,6 @@ export interface Session {
    * mid-conversation system-message and tool changes.
    */
   setAgent(name?: SessionSetAgentArgs_Deserialize["name"], signal?: AbortSignal): Promise<void>;
-  // withheld: setSection — edits the host's own registrations; extensions register through their manifest
-  // withheld: setSections — replaces the host's own registrations; extensions register through their manifest
-  // withheld: setToolPolicies — replaces the host's own registrations; extensions register through their manifest
-  // withheld: setSpawnHooks — replaces the host's own registrations; extensions register through their manifest
-  // withheld: setSchemes — replaces the host's own registrations; extensions register through their manifest
-  // withheld: setTools — replaces the host's own registrations; extensions register through their manifest
-  // withheld: setDefinitions — replaces the host's own registrations; extensions register through their manifest
-  // withheld: setLayer — replaces the host's own registrations; extensions register through their manifest
   /**
    * Settles the pending question of tool call `call_id`. A submission that does not fit
    * the document returns `Error::InvalidInput` and leaves the question pending.
@@ -5145,23 +5136,6 @@ export interface Session {
    * Dismisses a pending question or mode result; the run is cancelled.
    */
   dismiss(callId: SessionDismissArgs["callId"], signal?: AbortSignal): Promise<void>;
-  /**
-   * The current estimated context size and effective compaction limits.
-   */
-  contextUsage(signal?: AbortSignal): Promise<SessionContextUsageResult_Serialize>;
-  /**
-   * Whether a run, maintenance or navigation currently owns the session.
-   * Observing idle does not reserve it against future submissions or background wakes.
-   */
-  isRunning(signal?: AbortSignal): Promise<SessionIsRunningResult>;
-  /**
-   * This session's own recorded spend plus every descendant's, maintenance included;
-   * `SessionEvent::TreeUsage` reports changes.
-   */
-  treeUsage(signal?: AbortSignal): Promise<SessionTreeUsageResult_Serialize>;
-  // withheld: subscribe — live receiver; the bridge serves session.subscribe
-  // withheld: attach — returns a live receiver; use entries, live and subscribe
-  // withheld: fork — lifecycle belongs to the host
   /**
    * The currently selected model.
    */
@@ -5191,6 +5165,32 @@ export interface Session {
    * Chooses the service tier from the next request; returns the tier the current model applies.
    */
   setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
+  /**
+   * The current estimated context size and effective compaction limits.
+   */
+  contextUsage(signal?: AbortSignal): Promise<SessionContextUsageResult_Serialize>;
+  /**
+   * Whether a run, maintenance or navigation currently owns the session.
+   * Observing idle does not reserve it against future submissions or background wakes.
+   */
+  isRunning(signal?: AbortSignal): Promise<SessionIsRunningResult>;
+  /**
+   * This session's own recorded spend plus every descendant's, maintenance included;
+   * `SessionEvent::TreeUsage` reports changes.
+   */
+  treeUsage(signal?: AbortSignal): Promise<SessionTreeUsageResult_Serialize>;
+  // withheld: subscribe — live receiver; the bridge serves session.subscribe
+  // withheld: attach — returns a live receiver; use entries, live and subscribe
+  // withheld: setCommands — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setSection — edits the host's own registrations; extensions register through their manifest
+  // withheld: setSections — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setToolPolicies — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setSpawnHooks — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setSchemes — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setTools — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setDefinitions — replaces the host's own registrations; extensions register through their manifest
+  // withheld: setLayer — replaces the host's own registrations; extensions register through their manifest
+  // withheld: fork — lifecycle belongs to the host
   // withheld: prompt — records caller provenance; see the wire method
   // withheld: promptWith — records caller provenance; see the wire method
   // withheld: steer — records caller provenance; see the wire method

@@ -1,14 +1,184 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::tools::SnapshotStore;
+use axo_agent::{AgentMessage, Replay};
+use axo_ai::{Message, UserBlock};
+use axo_macros::expose;
+
+use super::{ARTIFACTS_DIR, LOCAL_DIR, Selection, Session, SessionSetup};
+use crate::error::Error;
+use crate::input::PromptPart;
+use crate::recovery::{RecoveryPlan, plan_recovery};
+use crate::store::{self, Entry, EntryBase, EntryId, Header, SeqEntry, project};
 use crate::tools::snapshots::SNAPSHOTS_DIR;
+use crate::tools::{self, SnapshotStore};
 
-/// Session side folders, relative to `<session_dir>` (the session file path without `.jsonl`).
-pub(super) const ARTIFACTS_DIR: &str = "artifacts";
-pub(super) const LOCAL_DIR: &str = "local";
+/// A new session copied from a point of another.
+pub struct Fork {
+    pub session: Session,
+    /// The parts of the user message forked at, for the client to edit and resubmit.
+    pub editable: Option<Vec<PromptPart>>,
+}
+
+#[expose(block = SESSION_FORK, object = "session")]
+impl Session {
+    /// Copies the root→`entry_id` path into a new session file that records this one as
+    /// its parent. The fork runs with this session's resolved configuration. Forking at a
+    /// user message copies the path to its parent and returns the message's parts to edit
+    /// and resubmit. A live fork shares this session's child-run slots; a fork of a child
+    /// also keeps its inherited host sections (with `ask` disabled). Reopening the fork with
+    /// `Axo::open_session` resolves it as an independent root.
+    #[ext(skip = "lifecycle belongs to the host")]
+    pub async fn fork(&self, entry_id: &EntryId) -> Result<Fork, Error> {
+        let Selection {
+            model,
+            thinking,
+            tier,
+        } = self.hooks.selection();
+        let (path, editable) = {
+            let log = self.hooks.journal.view();
+            let index: HashMap<&str, &SeqEntry> = log
+                .entries
+                .iter()
+                .filter_map(|seq| seq.entry.id().map(|id| (id, seq)))
+                .collect();
+            let target = index
+                .get(entry_id.as_str())
+                .ok_or_else(|| Error::EntryNotFound(entry_id.to_string()))?;
+            let (next, editable) = match &target.entry {
+                Entry::Message {
+                    message: AgentMessage::Llm(Message::User(user)),
+                    base,
+                    submission_id,
+                    ..
+                } => {
+                    let submitted = submission_id.as_deref().and_then(|wanted| {
+                        log.entries.iter().find_map(|seq| match &seq.entry {
+                            Entry::Submission {
+                                submission_id,
+                                parts,
+                                ..
+                            } if submission_id == wanted => Some(parts.clone()),
+                            _ => None,
+                        })
+                    });
+                    // Messages without a submission (older sessions) offer their text.
+                    let parts = submitted.unwrap_or_else(|| {
+                        vec![PromptPart::Text {
+                            text: user.content.iter().filter_map(UserBlock::as_text).collect(),
+                        }]
+                    });
+                    (base.parent_id.as_ref().map(EntryId::as_str), Some(parts))
+                }
+                entry => (entry.id(), None),
+            };
+            let path = next.map_or_else(Vec::new, |id| {
+                store::path_to(&log.entries, id)
+                    .into_iter()
+                    .map(|index| log.entries[index].entry.clone())
+                    .collect()
+            });
+            (path, editable)
+        };
+
+        let header = Header::new(
+            self.hooks.inherited.cwd.clone(),
+            Some(self.hooks.path.clone()),
+            Some(entry_id.clone()),
+        );
+        let session_id = header.id.clone();
+        let mut writer = self.inherited.store.create(header).await?;
+        let parent_dir = self.hooks.path.with_extension("");
+        let child_dir = writer.path().with_extension("");
+        // The blobs the fork's path references: its file changes stay reviewable.
+        let snapshots = path
+            .iter()
+            .flat_map(|entry| match entry {
+                Entry::Message {
+                    message: AgentMessage::Llm(Message::ToolResult(result)),
+                    ..
+                } => tools::file_changes(result),
+                _ => Vec::new(),
+            })
+            .flat_map(|change| change.before.into_iter().chain([change.after]))
+            .filter(|blob| blob.omitted.is_none())
+            .map(|blob| blob.sha256)
+            .collect();
+        copy_for_fork(
+            &parent_dir,
+            &child_dir,
+            self.hooks.tools.schemes.artifacts().live(),
+            snapshots,
+        )
+        .await;
+        let mut entries = Vec::with_capacity(path.len() + 1);
+        for entry in path {
+            entries.push(writer.append(entry).await?);
+        }
+        // A run open at the fork point continues nowhere: close it so opening the fork
+        // does not try to recover it.
+        let fork_projection = project(&entries, None);
+        let open = match plan_recovery(&entries, &fork_projection, &model, &|_| Replay::Never) {
+            RecoveryPlan::None | RecoveryPlan::Requeue { .. } => None,
+            RecoveryPlan::Finish {
+                run_id,
+                outcome,
+                reason,
+                ..
+            } => Some((run_id, outcome, reason)),
+            RecoveryPlan::Park { run_id, .. }
+            | RecoveryPlan::Resume { run_id, .. }
+            | RecoveryPlan::RecoverResponse { run_id, .. } => Some((
+                run_id,
+                store::RunOutcome::Interrupted,
+                Some("fork".to_owned()),
+            )),
+        };
+        if let Some((run_id, outcome, reason)) = open {
+            let parent = entries
+                .last()
+                .and_then(|last| last.entry.id())
+                .map(|id| EntryId(id.to_owned()));
+            let id = EntryId::generate(|id| entries.iter().any(|seq| seq.entry.id() == Some(id)));
+            entries.push(
+                writer
+                    .append(Entry::RunEnd {
+                        base: EntryBase::new(id, parent),
+                        usage: Some(store::run_usage(&entries, &run_id)),
+                        run_id,
+                        outcome,
+                        reason,
+                        queued: Vec::new(),
+                    })
+                    .await?,
+            );
+        }
+
+        let projection = project(&entries, None);
+        let mut inherited = (*self.inherited).clone();
+        inherited.agent = self.agent();
+        let layers = self.hooks.registrations().clone();
+        let session = Session::start(SessionSetup {
+            inherited: Arc::new(inherited),
+            layers,
+            merged: None,
+            model,
+            thinking,
+            tier,
+            session_id,
+            writer,
+            entries,
+            projection,
+            recovery: None,
+            link: None,
+        })
+        .await?;
+        Ok(Fork { session, editable })
+    }
+}
 
 /// Copies a session's side files into its fork. Finished artifacts are made read-only and
 /// hard-linked (copy fallback); `live` spools, still being written by running jobs, are
@@ -17,7 +187,7 @@ pub(super) const LOCAL_DIR: &str = "local";
 /// the per-file lock `write`/`edit` hold, so a concurrent tool write is never copied half-done.
 /// Best effort: an entry that cannot be carried over is logged and skipped, so one bad file
 /// never costs the fork the rest.
-pub(super) async fn copy_for_fork(
+async fn copy_for_fork(
     parent_dir: &Path,
     child_dir: &Path,
     live: HashSet<PathBuf>,

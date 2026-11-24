@@ -172,6 +172,9 @@ pub struct Base64(#[serde(with = "crate::input::base64_bytes")] pub Vec<u8>);
 pub(crate) const SESSION_BLOCKS: &[&Block<Session>] = &[
     &crate::session::SESSION_CORE,
     &crate::session::selection::SESSION_SELECTION,
+    &crate::session::events::SESSION_EVENTS,
+    &crate::session::registrations::SESSION_REGISTRATIONS,
+    &crate::session::fork::SESSION_FORK,
     &crate::session::delivery::SESSION_DELIVERY,
     &crate::session::wire::SESSION_WIRE,
     &crate::session::maintenance::SESSION_MAINTENANCE,

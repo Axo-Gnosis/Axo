@@ -33,9 +33,6 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | setAgent | name? | Switches the root persona from the next request, applying its model selector when present. Changing the system prompt and tools is cache-heavy on models without mid-conversation system-message and tool changes. |
 | answer | callId, answers | Settles the pending question of tool call call_id. A submission that does not fit the document returns Error::InvalidInput and leaves the question pending. |
 | dismiss | callId | Dismisses a pending question or mode result; the run is cancelled. |
-| contextUsage |  | The current estimated context size and effective compaction limits. |
-| isRunning |  | Whether a run, maintenance or navigation currently owns the session. Observing idle does not reserve it against future submissions or background wakes. |
-| treeUsage |  | This session's own recorded spend plus every descendant's, maintenance included; SessionEvent::TreeUsage reports changes. |
 | model |  | The currently selected model. |
 | thinking |  | The thinking level applied to the current model. |
 | serviceTier |  | The chosen service tier; it applies only on models that support it. |
@@ -43,6 +40,9 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | setModel | model | Switches the model from the next request; the thinking level is clamped to it. |
 | setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
 | setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
+| contextUsage |  | The current estimated context size and effective compaction limits. |
+| isRunning |  | Whether a run, maintenance or navigation currently owns the session. Observing idle does not reserve it against future submissions or background wakes. |
+| treeUsage |  | This session's own recorded spend plus every descendant's, maintenance included; SessionEvent::TreeUsage reports changes. |
 | withdraw | submissionId | Takes a queued steer or follow-up back before it is delivered and returns it for the host to edit and resubmit. Error::NotQueued once it was delivered or withdrawn. |
 | resumeWakes |  | Lifts the pause a Stop or a failed run left and, on an idle session, starts a run with the held steers or follow-ups, else with pending job results and mail. |
 | prompt | input | Expands a /skill args invocation, saves the submission with caller provenance, and runs the prompt; returns when the run settles. |
@@ -88,20 +88,20 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | SESSION_CORE::command_output | live reader; the wire method reads one page |
 | SESSION_CORE::job_output | live reader; the wire method reads one page |
 | SESSION_CORE::schemes | live registry; scheme operations are on tools (e.g. parseUrl, exactUrl, locate, readFile) |
-| SESSION_CORE::set_commands | replaces the host's own registrations; extensions register through their manifest |
 | SESSION_CORE::parse_command | nested result; the wire method flattens it |
 | SESSION_CORE::shutdown | lifecycle belongs to the host |
-| SESSION_CORE::set_section | edits the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_sections | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_tool_policies | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_spawn_hooks | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_schemes | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_tools | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_definitions | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::set_layer | replaces the host's own registrations; extensions register through their manifest |
-| SESSION_CORE::subscribe | live receiver; the bridge serves session.subscribe |
-| SESSION_CORE::attach | returns a live receiver; use entries, live and subscribe |
-| SESSION_CORE::fork | lifecycle belongs to the host |
+| SESSION_EVENTS::subscribe | live receiver; the bridge serves session.subscribe |
+| SESSION_EVENTS::attach | returns a live receiver; use entries, live and subscribe |
+| SESSION_REGISTRATIONS::set_commands | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_section | edits the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_sections | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_tool_policies | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_spawn_hooks | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_schemes | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_tools | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_definitions | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_REGISTRATIONS::set_layer | replaces the host's own registrations; extensions register through their manifest |
+| SESSION_FORK::fork | lifecycle belongs to the host |
 | SESSION_DELIVERY::prompt | records caller provenance; see the wire method |
 | SESSION_DELIVERY::prompt_with | records caller provenance; see the wire method |
 | SESSION_DELIVERY::steer | records caller provenance; see the wire method |
