@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::error::Error;
-use crate::model::{ApiKind, CostTier, InputKind, Model, ThinkingLevelMap};
+use crate::model::{
+    ApiKind, CostTier, InputKind, Model, STANDARD_TIER_MULTIPLIER_ERROR, ThinkingLevelMap,
+};
 use crate::types::ServiceTier;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -162,23 +164,17 @@ impl ModelPatch {
             }
         }
         if let Some(tiers) = &self.service_tiers {
+            if tiers.contains_key(&ServiceTier::Standard) {
+                return Err(Error::Config(STANDARD_TIER_MULTIPLIER_ERROR.into()));
+            }
             for (&tier, &factor) in tiers {
-                if tier.is_standard() {
-                    return Err(Error::Config(
-                        "serviceTiers: \"standard\" has no multiplier".into(),
-                    ));
-                }
                 if let Some(factor) = factor {
-                    if !factor.is_finite() || factor <= 0.0 {
-                        return Err(Error::Config(
-                            "serviceTiers: multipliers must be positive numbers".into(),
-                        ));
-                    }
                     model.service_tiers.insert(tier, factor);
                 } else {
                     model.service_tiers.remove(&tier);
                 }
             }
+            model.validate_service_tiers()?;
         }
         if let Some(context_window) = self.context_window {
             model.context_window = context_window;

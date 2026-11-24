@@ -890,6 +890,7 @@ mod tests {
                 error.contains(id) && error.contains(what),
                 "{error} lacks {what}"
             );
+            error
         };
         not_admitted("absent", None, "no extension.json").await;
         not_admitted(
@@ -918,6 +919,29 @@ mod tests {
             "belongs to provider q",
         )
         .await;
+        let what = "serviceTiers: multipliers must be positive numbers";
+        for factor in [0, -1] {
+            let id = format!("invalid-factor-{factor}");
+            let mut row = model("p", "m");
+            row["serviceTiers"] = json!({"fast": factor});
+            let error = not_admitted(
+                &id,
+                Some(declare(
+                    &id,
+                    "index.ts",
+                    json!([{ "id": "p", "models": [row] }]),
+                )),
+                what,
+            )
+            .await;
+            assert_eq!(
+                error,
+                format!(
+                    "extension {id}: {}: {what}",
+                    first.join(&id).join(MANIFEST).display()
+                )
+            );
+        }
         not_admitted(
             "slash",
             Some(declare("slash", "index.ts", json!([{ "id": "a/b" }]))),

@@ -13,6 +13,7 @@ use crate::auth::codex;
 use crate::auth::resolve::resolve_config_value;
 use crate::model::{
     ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap, tier_wire,
+    valid_tier_multiplier,
 };
 use crate::types::{ServiceTier, ThinkingLevel};
 
@@ -437,8 +438,7 @@ fn catalog_tiers(cost: &DevCost, api: ApiKind, today: &str) -> BTreeMap<ServiceT
             && let Some(factor) = entry["factor"]
                 .as_f64()
                 .or_else(|| entry["factor"]["text"].as_f64())
-            && factor.is_finite()
-            && factor > 0.0
+            && valid_tier_multiplier(factor)
         {
             tiers.entry(tier).or_insert(factor);
         }
@@ -450,7 +450,10 @@ fn catalog_tiers(cost: &DevCost, api: ApiKind, today: &str) -> BTreeMap<ServiceT
                 && let Some(price) = entry["price"].as_f64()
             {
                 // ponytail: input-price ratio stands in for the whole table; store per-tier rates if cost display for these gateways matters
-                tiers.entry(tier).or_insert_with(|| price / base);
+                let factor = price / base;
+                if valid_tier_multiplier(factor) {
+                    tiers.entry(tier).or_insert(factor);
+                }
             }
         }
     }
@@ -613,6 +616,21 @@ mod tests {
         ]}}}));
         assert_eq!(
             catalog_tiers(&prices, chat, today),
+            BTreeMap::from([(ServiceTier::Fast, 2.5)])
+        );
+
+        for (price, base) in [(0.0, 4.0), (-1.0, 4.0), (1e308, 1e-308)] {
+            let prices = cost(json!({"text": {"input": {"price": base, "overrides": [
+                {"when": {"service_tier": {"equals": "priority"}}, "price": price}
+            ]}}}));
+            assert!(catalog_tiers(&prices, chat, today).is_empty());
+        }
+        let recovered = cost(json!({"text": {"input": {"price": 4, "overrides": [
+            {"when": {"service_tier": {"equals": "priority"}}, "price": 0},
+            {"when": {"service_tier": {"equals": "priority"}}, "price": 10}
+        ]}}}));
+        assert_eq!(
+            catalog_tiers(&recovered, chat, today),
             BTreeMap::from([(ServiceTier::Fast, 2.5)])
         );
     }

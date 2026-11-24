@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::Error;
 use crate::transcript::TranscriptToolSupport;
 use crate::types::{ServiceTier, ThinkingLevel};
 
@@ -134,6 +135,29 @@ impl Model {
             ServiceTier::Standard
         }
     }
+
+    pub(crate) fn validate_service_tiers(&self) -> Result<(), Error> {
+        if self.service_tiers.contains_key(&ServiceTier::Standard) {
+            return Err(Error::Config(STANDARD_TIER_MULTIPLIER_ERROR.into()));
+        }
+        if self
+            .service_tiers
+            .values()
+            .any(|&factor| !valid_tier_multiplier(factor))
+        {
+            return Err(Error::Config(
+                "serviceTiers: multipliers must be positive numbers".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) const STANDARD_TIER_MULTIPLIER_ERROR: &str =
+    "serviceTiers: \"standard\" has no multiplier";
+
+pub(crate) fn valid_tier_multiplier(factor: f64) -> bool {
+    factor.is_finite() && factor > 0.0
 }
 
 /// Compatibility quirks: the union of the compat fields pi's Anthropic Messages, OpenAI

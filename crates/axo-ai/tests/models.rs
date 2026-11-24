@@ -1005,6 +1005,14 @@ async fn unknown_vs_free_cost_in_catalog_and_usage() {
         Err(Error::Config(message)) => assert!(message.contains("needs both"), "{message}"),
         other => panic!("expected a config error, got {:?}", other.err()),
     }
+    let invalid = serde_json::from_value(json!({
+        "refreshInterval": 0,
+        "providers": {"p": {"modelOverrides": {"unpriced": {"serviceTiers": {"standard": null}}}}}
+    }))
+    .unwrap();
+    assert!(matches!(Models::load(options(invalid)).await,
+        Err(Error::Config(message)) if message == r#"serviceTiers: "standard" has no multiplier"#
+    ));
     let priced = Models::load(options(patched(json!({"input": 3, "output": 9}))))
         .await
         .unwrap();

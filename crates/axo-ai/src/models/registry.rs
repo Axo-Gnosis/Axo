@@ -13,7 +13,6 @@ use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{CredentialSource, ModelAuth};
 use crate::error::Error;
 use crate::model::Model;
-use crate::types::ServiceTier;
 
 use super::build::Loaded;
 use super::{Models, ProviderInfo, ProviderLayer, ProviderOrigin, Shared};
@@ -321,7 +320,8 @@ struct Layered {
 
 impl Provider {
     /// Checks what `Models::register` and `ProviderLayer::replace` require: a non-empty id
-    /// without `/`, and models belonging to it with distinct ids and no Standard-tier multiplier.
+    /// without `/`, and models belonging to it with distinct ids and positive finite multipliers
+    /// for non-Standard tiers.
     pub fn validate(&self) -> Result<(), Error> {
         let id = &self.id;
         if id.is_empty() || id.contains('/') {
@@ -329,11 +329,7 @@ impl Provider {
         }
         let mut seen = HashSet::new();
         for model in &self.models {
-            if model.service_tiers.contains_key(&ServiceTier::Standard) {
-                return Err(Error::Config(
-                    "serviceTiers: \"standard\" has no multiplier".into(),
-                ));
-            }
+            model.validate_service_tiers()?;
             if &model.provider != id {
                 return Err(Error::Config(format!(
                     "provider {id}: model {} belongs to provider {}",

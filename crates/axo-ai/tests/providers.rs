@@ -544,6 +544,18 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     models
         .register("host", provider("lab", vec![native]))
         .unwrap();
+    const BAD_FACTORS: [f64; 4] = [0.0, -1.0, f64::NAN, f64::INFINITY];
+    const DIAGNOSTIC: &str = "serviceTiers: multipliers must be positive numbers";
+    let native = models.find("lab/native").unwrap();
+    for factor in BAD_FACTORS {
+        let mut bad = native.clone();
+        bad.service_tiers.insert(ServiceTier::Fast, factor);
+        assert!(
+            matches!(models.register("host", provider("lab", vec![bad])),
+            Err(Error::Config(message)) if message == DIAGNOSTIC)
+        );
+        assert_eq!(models.find("lab/native").as_ref(), Some(&native));
+    }
     let a_model = model("lab", "a", ApiKind::OpenAiCompletions, "http://127.0.0.1:9");
     let b_model = model("lab", "b", ApiKind::AnthropicMessages, "http://127.0.0.1:9");
 
@@ -655,6 +667,16 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
             result,
             Err(Error::Config(message)) if message == r#"serviceTiers: "standard" has no multiplier"#
         ));
+    }
+    for factor in BAD_FACTORS {
+        let mut bad = b_model.clone();
+        bad.service_tiers.insert(ServiceTier::Fast, factor);
+        assert!(matches!(b.replace(vec![
+            ("a".into(), provider("fresh", Vec::new()), None),
+            ("b".into(), provider("lab", vec![bad]), None),
+        ]), Err(Error::Config(message)) if message == DIAGNOSTIC));
+        assert_eq!(models.find("lab/b").as_ref(), Some(&b_model));
+        assert!(!models.providers().iter().any(|info| info.id == "fresh"));
     }
     assert_eq!(models.find("lab/b"), Some(b_model));
     assert!(!models.providers().iter().any(|info| info.id == "fresh"));
