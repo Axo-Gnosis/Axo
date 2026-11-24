@@ -228,7 +228,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if parts.is_empty() {
-        print_system_sections(&session).await;
+        print_system_sections(&session);
         return Ok(());
     }
 
@@ -250,7 +250,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = stop.send(());
     }
     printer.await?;
-    print_system_sections(&session).await;
+    print_system_sections(&session);
     match result {
         Ok(PromptResult::Settled { outcome, .. }) => {
             println!("[run] {outcome:?}");
@@ -507,23 +507,9 @@ fn print_maintenance(event: &SessionEvent) {
     }
 }
 
-async fn print_system_sections(session: &Session) {
-    let attached = session.attach(None).await;
-    let messages: Vec<_> = attached
-        .live
-        .messages
-        .into_iter()
-        .filter_map(|message| match message {
-            axo_agent::AgentMessage::Llm(message) => Some(message),
-            _ => None,
-        })
-        .collect();
-    if let Some(system) = axo_ai::transcript::current_system_message(&messages) {
-        let names = system
-            .sections
-            .unwrap_or_default()
-            .into_keys()
-            .collect::<Vec<_>>();
+fn print_system_sections(session: &Session) {
+    if let Some(sections) = session.inspect_prompt().recorded {
+        let names = sections.keys().map(String::as_str).collect::<Vec<_>>();
         println!("[system-sections] {}", names.join(", "));
     }
 }

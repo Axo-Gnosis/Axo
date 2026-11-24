@@ -21,11 +21,7 @@ fn layer(origin: &str, settings: Option<&str>) -> ConfigLayer {
     ConfigLayer {
         origin: origin.to_owned(),
         settings: settings.map(|text| serde_json::from_str(text).unwrap()),
-        prompts: IndexMap::new(),
-        skill_roots: Vec::new(),
-        agent_roots: Vec::new(),
-        mode_roots: Vec::new(),
-        keyword_roots: Vec::new(),
+        ..Default::default()
     }
 }
 

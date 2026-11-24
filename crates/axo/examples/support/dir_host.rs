@@ -45,9 +45,7 @@ impl ConfigSource for DirConfig {
                 settings,
                 prompts,
                 skill_roots: vec![self.root.join("skills")],
-                agent_roots: Vec::new(),
-                mode_roots: Vec::new(),
-                keyword_roots: Vec::new(),
+                ..Default::default()
             },
             context_files: vec![self.root.join("AGENTS.md")],
         })
