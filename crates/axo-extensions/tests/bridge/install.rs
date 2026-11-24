@@ -7,9 +7,9 @@ use std::time::Duration;
 use axo_extensions::{BridgeError, ExtensionPhase, Extensions, InstallError, ProblemKind};
 use serde_json::json;
 
-use super::{
-    Case, Host, Http, enabled, find, lines, model_json, phase, stream, wait_for, wait_phase,
-};
+use crate::common::{model_json, phase};
+
+use super::{Case, Host, Http, enabled, find, lines, stream, wait_for, wait_phase};
 
 pub const CASES: &[Case] = &[
     case!(authored_installs_once),

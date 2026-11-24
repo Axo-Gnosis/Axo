@@ -11,9 +11,11 @@ use axo_ai::{
 };
 use axo_extensions::{BridgeError, ExtensionEvent, ExtensionPhase};
 
+use crate::common::{alive, phase};
+
 use super::{
-    Case, Host, Http, alive, assert_unavailable, base_url, enabled, find, header, kill, phase,
-    register_native, stream, wait_for, wait_phase, wait_ready_after,
+    Case, Host, Http, assert_unavailable, base_url, enabled, find, header, kill, register_native,
+    stream, wait_for, wait_phase, wait_ready_after,
 };
 
 pub const CASES: &[Case] = &[

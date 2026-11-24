@@ -34,7 +34,6 @@ axo-ai = { path = "../axo-ai", features = ["testing"] }
 rustix.workspace = true
 specta-serde.workspace = true
 specta-util.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]

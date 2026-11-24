@@ -8,6 +8,7 @@
 //! cgroup v2) reruns them under `Supervision::Cgroup` with this binary as supervisor, routed
 //! through its `axo-supervisor` command line. Harness-less: libtest flags are ignored.
 
+mod common;
 #[path = "bun_provider/host.rs"]
 mod host;
 #[path = "bun_provider/install.rs"]

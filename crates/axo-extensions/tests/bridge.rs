@@ -15,6 +15,7 @@ macro_rules! case {
     };
 }
 
+mod common;
 #[path = "bridge/install.rs"]
 mod install;
 #[path = "bridge/lifecycle.rs"]
@@ -41,6 +42,8 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+
+use crate::common::{model_json, phase};
 
 /// The control directory a fake runner reads its script from (part of the host `env`).
 const CONTROL: &str = "AXO_FAKE_CONTROL";
@@ -101,7 +104,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Runs one case on a fresh current-thread runtime (so `tokio::time::pause` is allowed),
+/// Runs one case on a fresh current-thread runtime,
 /// failing the process if it panics or exceeds [`CASE_LIMIT`].
 fn run_case(name: &str, case: fn() -> CaseFuture) {
     let (done, finished) = std::sync::mpsc::channel::<()>();
@@ -195,9 +198,7 @@ impl Host {
             .await
             .unwrap(),
         );
-        if !turns.is_empty() {
-            register_native(&models, "test", "http://127.0.0.1:9/v1");
-        }
+        register_native(&models, "test", "http://127.0.0.1:9/v1");
         let axo = Axo::builder(
             models.clone(),
             Arc::new(JsonlStore::new(dir.path().join("sessions"))),
@@ -274,7 +275,7 @@ impl Host {
         std::fs::write(dir.join(method), behavior).unwrap();
     }
 
-    /// Scripts startup before hello: "exit", "hang", "bad-nonce" or "no-hello".
+    /// Scripts the next runner start with "exit" or "no-hello" before its hello.
     pub fn script_startup(&self, behavior: &str) {
         std::fs::write(self.path("ctl").join("startup"), behavior).unwrap();
     }
@@ -313,21 +314,6 @@ fn lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-pub fn model_json(provider: &str, base_url: &str) -> Value {
-    json!({
-        "id": "m",
-        "name": "m",
-        "api": "openai-completions",
-        "provider": provider,
-        "baseUrl": base_url,
-        "reasoning": false,
-        "input": ["text"],
-        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
-        "contextWindow": 200000,
-        "maxTokens": 4096,
-    })
-}
-
 pub fn enabled(list: &[(&str, Option<&str>)]) -> Vec<EnabledExtension> {
     list.iter()
         .map(|(id, group)| EnabledExtension {
@@ -335,14 +321,6 @@ pub fn enabled(list: &[(&str, Option<&str>)]) -> Vec<EnabledExtension> {
             group: group.map(Into::into),
         })
         .collect()
-}
-
-pub fn phase(extensions: &Extensions, id: &str) -> ExtensionStatus {
-    extensions
-        .status()
-        .into_iter()
-        .find(|status| status.id == id)
-        .unwrap_or_else(|| panic!("no status for {id}"))
 }
 
 pub async fn wait_phase(
@@ -518,11 +496,6 @@ pub fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.trim())
 }
 
-/// Whether `pid` exists; an unreaped zombie still counts, so `!alive` means reaped.
-pub fn alive(pid: i32) -> bool {
-    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
-}
-
 pub fn kill(pid: i32) {
     let _ = rustix::process::kill_process(
         rustix::process::Pid::from_raw(pid).unwrap(),
@@ -556,8 +529,8 @@ mod fake {
     }
 
     /// Script files (one-line behaviors; default "ok"):
-    /// - `ctl/startup` (consumed): `exit` before connecting, `hang` never connecting,
-    ///   `bad-nonce` sends a wrong nonce, `no-hello` connects without sending anything.
+    /// - `ctl/startup` (consumed): `exit` before connecting,
+    ///   `no-hello` connects without sending anything.
     /// - `ctl/<ext>/activate`: `ok` | `reject` (code "activation") | `hang` | `exit`.
     /// - `ctl/<ext>/login`: `ok` (openUrl, progress, prompt "code", returns an OAuth
     ///   credential whose access token is `access-<answer>`) | `hang` | `exit`.
@@ -639,18 +612,15 @@ mod fake {
         let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} missing"));
         let control = PathBuf::from(env(CONTROL));
         let socket = env("AXO_EXTENSION_SOCKET");
-        let mut nonce = env("AXO_EXTENSION_NONCE");
+        let nonce = env("AXO_EXTENSION_NONCE");
         append(&control.join("pids"), &std::process::id().to_string());
         let startup = control.join("startup");
         let script = std::fs::read_to_string(&startup).ok();
         if script.is_some() {
             let _ = std::fs::remove_file(&startup);
         }
-        match script.as_deref().map(str::trim) {
-            Some("exit") => std::process::exit(3),
-            Some("hang") => std::future::pending::<()>().await,
-            Some("bad-nonce") => nonce = "0".repeat(64),
-            _ => {}
+        if script.as_deref().map(str::trim) == Some("exit") {
+            std::process::exit(3);
         }
 
         let stream = UnixStream::connect(&socket).await.expect("connect");

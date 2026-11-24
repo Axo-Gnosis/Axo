@@ -26,6 +26,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::common::alive;
 use crate::server::Server;
 
 /// The checked-in fixture packages.
@@ -414,7 +415,7 @@ impl Host {
     }
 
     pub fn status(&self, id: &str) -> ExtensionStatus {
-        status(&self.extensions, id)
+        crate::common::phase(&self.extensions, id)
     }
 
     /// Waits for `id` to reach `phase`.
@@ -502,14 +503,6 @@ pub fn enabled(id: &str, group: Option<&str>) -> EnabledExtension {
     }
 }
 
-pub fn status(extensions: &Extensions, id: &str) -> ExtensionStatus {
-    extensions
-        .status()
-        .into_iter()
-        .find(|status| status.id == id)
-        .unwrap_or_else(|| panic!("no status for {id}"))
-}
-
 /// Polls `check` on the wall clock until it holds, failing after [`WAIT_LIMIT`].
 pub async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
     let start = std::time::Instant::now();
@@ -517,11 +510,6 @@ pub async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
         assert!(start.elapsed() < WAIT_LIMIT, "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-/// Whether `pid` exists; an unreaped zombie still counts.
-pub fn alive(pid: i32) -> bool {
-    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
 }
 
 /// Waits until `pid` no longer exists.

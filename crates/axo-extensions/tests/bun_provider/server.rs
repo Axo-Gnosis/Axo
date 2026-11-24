@@ -26,6 +26,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axo_ai::testing::read_http_request_parts;
+use axo_ai::{AssistantBlock, AssistantEvent, StopReason};
 use serde_json::{Value, json};
 
 /// How long a held route waits for its release before failing the connection.
@@ -36,6 +37,34 @@ pub const NATIVE: &str = "/native/chat/completions";
 pub const TEXT_HEAD: &str = "hello ";
 pub const TEXT_TAIL: &str = "lab";
 pub const TOOL: &str = "keep_name";
+
+/// A normal completion: Rust parsed the lab text and the unchanged tool name.
+pub fn assert_reply(events: &[AssistantEvent]) {
+    let Some(AssistantEvent::Done { reason, message }) = events.last() else {
+        panic!("not a completed reply: {:?}", events.last());
+    };
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert_eq!(*reason, StopReason::ToolUse, "{message:?}");
+    let text: String = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, format!("{TEXT_HEAD}{TEXT_TAIL}"));
+    let tools: Vec<&str> = message
+        .tool_calls()
+        .map(|call| call.name.as_str())
+        .collect();
+    assert_eq!(tools, [TOOL], "{message:?}");
+}
 
 /// A validated request: its head (request line and headers) and JSON body.
 #[derive(Debug, Clone)]
