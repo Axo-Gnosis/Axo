@@ -104,7 +104,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Runs one case on a fresh current-thread runtime (so `tokio::time::pause` is allowed),
+/// Runs one case on a fresh current-thread runtime,
 /// failing the process if it panics or exceeds [`CASE_LIMIT`].
 fn run_case(name: &str, case: fn() -> CaseFuture) {
     let (done, finished) = std::sync::mpsc::channel::<()>();
@@ -198,9 +198,7 @@ impl Host {
             .await
             .unwrap(),
         );
-        if !turns.is_empty() {
-            register_native(&models, "test", "http://127.0.0.1:9/v1");
-        }
+        register_native(&models, "test", "http://127.0.0.1:9/v1");
         let axo = Axo::builder(
             models.clone(),
             Arc::new(JsonlStore::new(dir.path().join("sessions"))),
@@ -277,7 +275,7 @@ impl Host {
         std::fs::write(dir.join(method), behavior).unwrap();
     }
 
-    /// Scripts startup before hello: "exit", "hang", "bad-nonce" or "no-hello".
+    /// Scripts the next runner start with "exit" or "no-hello" before its hello.
     pub fn script_startup(&self, behavior: &str) {
         std::fs::write(self.path("ctl").join("startup"), behavior).unwrap();
     }
@@ -531,8 +529,8 @@ mod fake {
     }
 
     /// Script files (one-line behaviors; default "ok"):
-    /// - `ctl/startup` (consumed): `exit` before connecting, `hang` never connecting,
-    ///   `bad-nonce` sends a wrong nonce, `no-hello` connects without sending anything.
+    /// - `ctl/startup` (consumed): `exit` before connecting,
+    ///   `no-hello` connects without sending anything.
     /// - `ctl/<ext>/activate`: `ok` | `reject` (code "activation") | `hang` | `exit`.
     /// - `ctl/<ext>/login`: `ok` (openUrl, progress, prompt "code", returns an OAuth
     ///   credential whose access token is `access-<answer>`) | `hang` | `exit`.
@@ -614,18 +612,15 @@ mod fake {
         let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} missing"));
         let control = PathBuf::from(env(CONTROL));
         let socket = env("AXO_EXTENSION_SOCKET");
-        let mut nonce = env("AXO_EXTENSION_NONCE");
+        let nonce = env("AXO_EXTENSION_NONCE");
         append(&control.join("pids"), &std::process::id().to_string());
         let startup = control.join("startup");
         let script = std::fs::read_to_string(&startup).ok();
         if script.is_some() {
             let _ = std::fs::remove_file(&startup);
         }
-        match script.as_deref().map(str::trim) {
-            Some("exit") => std::process::exit(3),
-            Some("hang") => std::future::pending::<()>().await,
-            Some("bad-nonce") => nonce = "0".repeat(64),
-            _ => {}
+        if script.as_deref().map(str::trim) == Some("exit") {
+            std::process::exit(3);
         }
 
         let stream = UnixStream::connect(&socket).await.expect("connect");

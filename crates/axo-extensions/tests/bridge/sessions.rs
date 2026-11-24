@@ -104,7 +104,6 @@ async fn attach(host: &Host, extensions: &Extensions) -> Arc<Session> {
 
 async fn live_package_definitions() {
     let host = Host::new().await;
-    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
     host.write_package(
         "root",
         LAB,
@@ -635,7 +634,6 @@ async fn host_lifecycle_and_child_lookup() {
 
 async fn command_reentry_is_refused() {
     let host = Host::new().await;
-    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
     package(&host, false);
     host.script(LAB, "command", "reenter");
     let extensions = host.manager();
@@ -839,7 +837,6 @@ async fn completion_stream_and_unsubscribe() {
 /// A configured `lab` whose `/hello` subscribes to entries, with one subscription made; returns
 /// its id.
 async fn subscribed(host: &Host) -> (Extensions, Arc<Session>, String) {
-    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
     package(host, false);
     host.script(LAB, "command", "subscribe");
     let extensions = host.manager();
@@ -914,7 +911,6 @@ async fn child_observation_ends_on_park() {
 
 async fn deferred_extension_tool_does_not_retain_session_tools() {
     let host = Host::new().await;
-    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
     package(&host, false);
     let extensions = host.manager();
     extensions
@@ -1195,7 +1191,7 @@ async fn held_dependency_retry_clears_the_previous_failure() {
 
 async fn dropped_manager_fences_hooks_and_restores_layer() {
     for outside in [true, false] {
-        let host = Host::scripted(read("unused").into()).await;
+        let host = Host::new().await;
         package(&host, false);
         let extensions = host.manager();
         extensions
@@ -1453,8 +1449,7 @@ async fn concurrent_cold_calls_restart_and_disable() {
 /// that cannot cross the wire as UTF-8 fail the scheme call or block the spawn, sending
 /// nothing.
 async fn failures_reach_the_host_typed() {
-    // Scripted turns register the `test/m` model the spawn context needs.
-    let host = Host::scripted(read("unused").into()).await;
+    let host = Host::new().await;
     package(&host, false);
     let extensions = host.manager();
     extensions
@@ -1523,7 +1518,6 @@ async fn failures_reach_the_host_typed() {
 
 async fn tool_reservations_follow_session_modes() {
     let host = Host::new().await;
-    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
     host.write_package("root", LAB, &json!({
         "id": LAB, "entry": "index.ts",
         "tools": [
@@ -1581,7 +1575,6 @@ async fn tool_reservations_follow_session_modes() {
 
 async fn extension_scopes_isolate_same_id_packages_providers_and_lifecycle() {
     let host = Host::new().await;
-    crate::register_native(&host.models, "test", "http://127.0.0.1:9/v1");
     host.script("proj", "command", "invoke");
 
     // Host-wide extension.
