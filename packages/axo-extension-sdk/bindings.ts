@@ -1249,8 +1249,6 @@ export type Entry_Deserialize =
 	/**  Names of the keywords that fired for this submission, deduplicated, in first-occurrence order. */
 	keywords?: string[],
 	requestId?: string | null,
-	/**  The teammate that submitted this input, if any. */
-	sender?: string | null,
 	/**  Originating session and routing mode for inter-agent submissions. */
 	provenance?: SubmissionProvenance_Deserialize | null,
 	custom?: SubmittedCustom | null,
@@ -1485,8 +1483,6 @@ export type Entry_Serialize =
 	/**  Names of the keywords that fired for this submission, deduplicated, in first-occurrence order. */
 	keywords?: string[],
 	requestId?: string,
-	/**  The teammate that submitted this input, if any. */
-	sender?: string,
 	/**  Originating session and routing mode for inter-agent submissions. */
 	provenance?: SubmissionProvenance_Serialize,
 	custom?: SubmittedCustom,

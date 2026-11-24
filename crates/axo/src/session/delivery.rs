@@ -358,7 +358,6 @@ impl Session {
             parts,
             content,
             request.request_id.clone(),
-            None,
             provenance,
             &keywords,
         );
@@ -471,7 +470,7 @@ impl Session {
     /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
     #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::Steer, input.into(), None, None)
+        self.queue(SubmissionKind::Steer, input.into(), None)
             .await
             .map(drop)
     }
@@ -480,7 +479,7 @@ impl Session {
     /// on an idle session it starts a run.
     #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::FollowUp, input.into(), None, None)
+        self.queue(SubmissionKind::FollowUp, input.into(), None)
             .await
             .map(drop)
     }
@@ -564,7 +563,6 @@ impl Session {
             }],
             keywords: Vec::new(),
             request_id: None,
-            sender: None,
             provenance,
             custom: Some(SubmittedCustom {
                 custom_type: message.custom_type.clone(),
@@ -604,13 +602,8 @@ impl Session {
             "Message from {sender} (reply with send to \"{sender}\"):\n\n{}",
             escape_wrappers(content)
         );
-        self.queue(
-            SubmissionKind::Mail,
-            text.into(),
-            Some(sender.to_owned()),
-            Some(provenance),
-        )
-        .await
+        self.queue(SubmissionKind::Mail, text.into(), Some(provenance))
+            .await
     }
 
     /// Saves the submission and hands its message to the queue for `kind`.
@@ -620,7 +613,6 @@ impl Session {
         &self,
         kind: SubmissionKind,
         input: PromptInput,
-        sender: Option<String>,
         provenance: Option<SubmissionProvenance>,
     ) -> Result<String, Error> {
         let keywords = if matches!(kind, SubmissionKind::Steer | SubmissionKind::FollowUp) {
@@ -630,8 +622,7 @@ impl Session {
         };
         let choice = self.hooks.keyword_choice(&keywords)?;
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &keywords).await?;
-        let (entry, message) =
-            submission(kind, parts, content, None, sender, provenance, &keywords);
+        let (entry, message) = submission(kind, parts, content, None, provenance, &keywords);
         let id = message.id.clone().expect("submission id");
         self.queue_message(kind, entry, message, Some(saved), choice)
             .await?;
@@ -683,15 +674,7 @@ impl Session {
     /// Validates and renders a new child's task; writes nothing.
     pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &[]).await?;
-        let (entry, message) = submission(
-            SubmissionKind::Prompt,
-            parts,
-            content,
-            None,
-            None,
-            None,
-            &[],
-        );
+        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None, &[]);
         Ok(FirstPrompt {
             entry,
             message,
@@ -800,7 +783,6 @@ fn submission(
     parts: Vec<PromptPart>,
     content: Vec<UserBlock>,
     request_id: Option<String>,
-    sender: Option<String>,
     provenance: Option<crate::coordination::SubmissionProvenance>,
     keywords: &[Arc<KeywordSpec>],
 ) -> (Entry, QueuedMessage) {
@@ -815,7 +797,6 @@ fn submission(
             .map(|keyword| keyword.name.clone())
             .collect(),
         request_id,
-        sender,
         provenance,
         custom: None,
     };

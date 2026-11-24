@@ -1105,7 +1105,6 @@ async fn steer_right_after_spawn_keeps_the_task_first() {
     });
     assert_eq!(lines[submitted]["provenance"]["sessionId"], parent.id());
     assert_eq!(lines[submitted]["provenance"]["route"], "steer");
-    assert!(lines[submitted].get("sender").is_none());
     delivered(&parent, "agent_1").await;
     let requests = host.api.requests();
     let first = requests
@@ -1122,7 +1121,6 @@ async fn steer_right_after_spawn_keeps_the_task_first() {
     let submitted = only(&lines, "routed follow-up", |v| v["submissionId"] == id);
     assert_eq!(lines[submitted]["provenance"]["sessionId"], parent.id());
     assert_eq!(lines[submitted]["provenance"]["route"], "followUp");
-    assert!(lines[submitted].get("sender").is_none());
     let sent = handle
         .session
         .send("parent", "a note", false)

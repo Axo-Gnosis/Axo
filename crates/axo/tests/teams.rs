@@ -202,7 +202,6 @@ async fn team_members_message_each_other_and_the_parent() {
                 .unwrap_or(false)
         );
     }
-    assert_eq!(b_lines[mail]["sender"], "a");
     assert_eq!(
         b_lines[mail]["provenance"],
         json!({

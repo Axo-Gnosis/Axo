@@ -113,7 +113,6 @@ pub(crate) async fn send(
             .queue(
                 submission_kind,
                 content.to_owned().into(),
-                None,
                 Some(provenance(kind)),
             )
             .await?;
