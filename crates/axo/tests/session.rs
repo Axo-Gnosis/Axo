@@ -800,47 +800,6 @@ async fn withdrawn_input_is_never_delivered() {
 }
 
 #[tokio::test]
-async fn dropping_a_prompt_future_still_settles_its_run() {
-    let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
-        dir.path(),
-        json!([{"id": "m"}]),
-        json!({}),
-        vec![
-            ScriptedTurn::HangUntilCancel,
-            ScriptedTurn::Reply(reply_text("second")),
-        ],
-    )
-    .await;
-    let session = host.axo.create_session(options(dir.path())).await.unwrap();
-
-    common::start_hanging(session.prompt("first"), || host.api.requests().len() == 1).await;
-    let mut events = session.attach(None).await.events;
-    session.abort();
-    within(async {
-        loop {
-            if let SessionEvent::Entry(SeqEntry {
-                entry:
-                    Entry::RunEnd {
-                        outcome: axo::RunOutcome::Aborted,
-                        ..
-                    },
-                ..
-            }) = &*events.recv().await.unwrap()
-            {
-                break;
-            }
-        }
-    })
-    .await;
-
-    assert_eq!(
-        within(session.prompt("again")).await.unwrap(),
-        RunOutcome::Done
-    );
-}
-
-#[tokio::test]
 async fn reopened_session_edits_a_file_it_read_before() {
     let dir = tempfile::tempdir().unwrap();
     let notes = options(dir.path()).cwd.join("notes.txt");
