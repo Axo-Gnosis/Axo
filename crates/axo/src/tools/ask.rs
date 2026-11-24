@@ -242,7 +242,7 @@ impl Drop for Withdraw<'_> {
     }
 }
 
-const DESCRIPTION: &str = "Ask the user when a decision only they can make blocks you. Default: act using the code, config, docs, history and conventions; when several choices are viable, pick the conservative one, proceed, and say which you picked.
+const DESCRIPTION: &str = "Ask the user when a decision only they can make blocks you.
 Send one document: `blocks` in reading order, each either `markdown` (`text`) or a question (`choice`, `text`, `number`).
 - Write what the user needs to decide in Markdown blocks and place each question after its context.
 - Mark your pick: `recommended` on options, `prefill` on text, `default` on number.
