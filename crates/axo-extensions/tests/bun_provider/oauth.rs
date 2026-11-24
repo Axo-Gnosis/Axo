@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use axo::Supervision;
 use axo_ai::{
-    AssistantBlock, AssistantEvent, Credential, CredentialStore, DeviceCode, Error,
-    LoginInteraction, LoginPrompt, LoginSelect, StopReason, now_ms,
+    AssistantEvent, Credential, CredentialStore, DeviceCode, Error, LoginInteraction, LoginPrompt,
+    LoginSelect, StopReason, now_ms,
 };
 use axo_extensions::ExtensionPhase;
 use tokio_util::sync::CancellationToken;
 
 use crate::host::{Host, LAB, wait_for};
-use crate::server::{TEXT_HEAD, TEXT_TAIL, TOOL};
+use crate::server::assert_reply;
 
 /// axo refreshes OAuth credentials expiring within this margin.
 const REFRESH_MARGIN_MS: i64 = 5 * 60_000;
@@ -181,7 +181,7 @@ async fn shared_refresh(host: &Host) {
         other => panic!("canceled waiter ended with {other:?}"),
     }
     for events in [first, second] {
-        assert_parsed(&events);
+        assert_reply(&events);
     }
 
     assert_eq!(server.count("/refresh"), 1, "exactly one locked refresh");
@@ -212,26 +212,4 @@ async fn shared_refresh(host: &Host) {
         }
         other => panic!("refresh stored {other:?}"),
     }
-}
-
-/// Rust parsed the lab SSE: the streamed text and the tool name as the server sent them.
-fn assert_parsed(events: &[AssistantEvent]) {
-    let Some(AssistantEvent::Done { reason, message }) = events.last() else {
-        panic!("lab request did not finish: {:?}", events.last());
-    };
-    assert_eq!(*reason, StopReason::ToolUse);
-    let text: String = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            AssistantBlock::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text, format!("{TEXT_HEAD}{TEXT_TAIL}"));
-    let tools: Vec<&str> = message
-        .tool_calls()
-        .map(|call| call.name.as_str())
-        .collect();
-    assert_eq!(tools, [TOOL]);
 }

@@ -12,16 +12,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axo::Supervision;
-use axo_ai::{
-    AssistantBlock, AssistantEvent, Credential, CredentialStore, Model, Provider, StopReason,
-};
+use axo_ai::{AssistantEvent, Credential, CredentialStore, Model, Provider};
 use axo_extensions::{ExtensionEvent, ExtensionPhase, Hidden, ProviderCollision, ProviderOrigin};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{alive, model_json};
 use crate::host::{Host, LAB, enabled, kill, wait_dead, wait_for};
 use crate::oauth;
-use crate::server::{NATIVE, TEXT_HEAD, TEXT_TAIL, TOOL};
+use crate::server::{NATIVE, assert_reply};
 
 const INFERENCE: &str = "/inference";
 
@@ -373,36 +371,6 @@ fn register_native(host: &Host, provider: &str) -> Model {
 
 fn touch(path: &Path) {
     std::fs::write(path, "").unwrap();
-}
-
-/// A normal completion: Rust parsed the lab text and the unchanged tool name.
-fn assert_reply(events: &[AssistantEvent]) {
-    let Some(AssistantEvent::Done { reason, message }) = events.last() else {
-        panic!("not a completed reply: {:?}", events.last());
-    };
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AssistantEvent::Error { .. })),
-        "{events:?}"
-    );
-    assert_eq!(*reason, StopReason::ToolUse, "{message:?}");
-    let text: String = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            AssistantBlock::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text, format!("{TEXT_HEAD}{TEXT_TAIL}"));
-    assert!(
-        message
-            .content
-            .iter()
-            .any(|block| matches!(block, AssistantBlock::ToolCall(call) if call.name == TOOL)),
-        "{message:?}"
-    );
 }
 
 /// Exactly one terminal, nonretryable `provider_unavailable` failure naming `needle`.
