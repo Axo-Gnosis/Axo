@@ -226,12 +226,6 @@ impl Axo {
         MODELS.invoke(&target, method, args, caller).await
     }
 
-    pub(crate) fn streamer_for(&self, models: &Arc<Models>) -> Arc<dyn Streamer> {
-        self.custom_streamer
-            .clone()
-            .unwrap_or_else(|| models.clone())
-    }
-
     /// The supervisor every local command runs under, for hosts that run other
     /// processes (such as extension runners) in the same containers.
     #[ext(skip = "live process handles; commands go through tools.runBash")]
@@ -473,7 +467,7 @@ impl Axo {
             recovery: _,
         } = options;
         let models = models.unwrap_or_else(|| self.models.clone());
-        let streamer = self.streamer_for(&models);
+        let streamer = crate::models::streamer_for(&models, self.custom_streamer.as_ref());
 
         let config = Arc::new(EffectiveConfig::resolve(
             &*self.config,

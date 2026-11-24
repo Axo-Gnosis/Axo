@@ -263,7 +263,12 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
     assert_eq!(json!(requests[0].transcript.messages()), messages);
     let error = host
         .axo
-        .invoke_models(host.axo.models().clone(), "complete", vec![request], &caller)
+        .invoke_models(
+            host.axo.models().clone(),
+            "complete",
+            vec![request],
+            &caller,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
@@ -377,7 +382,12 @@ async fn models_complete_resolves_model_roles_like_model_selectors() {
         json!({"model": "@fast", "messages": messages, "thinking": "low"}),
     ] {
         host.axo
-            .invoke_models(host.axo.models().clone(), "complete", vec![request], &caller)
+            .invoke_models(
+                host.axo.models().clone(),
+                "complete",
+                vec![request],
+                &caller,
+            )
             .await
             .unwrap();
     }
@@ -846,7 +856,7 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
                     compat: Default::default(),
                 }],
                 env: Vec::new(),
-                requires_key: false,
+                requires_key: true,
                 login: None,
                 rewrite: None,
             },
@@ -888,4 +898,26 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
         .await
         .unwrap();
     assert!(missing.is_null());
+
+    let default_streamer = axo::Axo::builder(
+        axo.models().clone(),
+        Arc::new(axo::JsonlStore::new(
+            dir.path().join("default-streamer-sessions"),
+        )),
+    )
+    .build();
+    let error = default_streamer
+        .invoke_models(
+            scoped,
+            "complete",
+            vec![json!({"model":"folder-a/local-1","messages":[]})],
+            &caller,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
+    assert_eq!(
+        error.to_string(),
+        "Completion failed: No API key for provider: folder-a"
+    );
 }
