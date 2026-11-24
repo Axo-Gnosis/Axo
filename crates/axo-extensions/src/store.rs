@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{self, MANIFEST};
+use crate::manifest::{self, SdkRefusal};
 use crate::{BridgeError, Inner, Rearm, Role, SDK_VERSION, deps};
 
 pub const RECORD: &str = "install.json";
@@ -364,38 +364,32 @@ impl Inner {
         let _work = self.store_work().read().await;
         self.check_open()?;
         let store = self.store()?;
-        if !source.is_absolute() {
-            return Err(InstallError::InvalidPackage(format!(
-                "source {} is not an absolute path",
-                source.display()
-            )));
-        }
+        let path = manifest::source_manifest(&source).map_err(InstallError::InvalidPackage)?;
         let bun = self
             .bun
             .usable()
             .await
             .map_err(|unusable| InstallError::Bun(unusable.message))?;
-        let path = source.join(MANIFEST);
-        let invalid =
-            |what: String| InstallError::InvalidPackage(format!("{}: {what}", path.display()));
-        let manifest::Head { id, sdk } = manifest::head(&source).await.map_err(invalid)?;
+        let manifest::Head { id, sdk } = manifest::read_head(&path)
+            .await
+            .map_err(InstallError::InvalidPackage)?;
         if !installed_id(&id) {
-            return Err(invalid(format!("id {id:?} is not publisher/name")));
+            return Err(InstallError::InvalidPackage(format!(
+                "{}: id {id:?} is not publisher/name",
+                path.display()
+            )));
         }
-        match sdk {
-            None => {
-                return Err(InstallError::InvalidPackage(format!(
-                    "extension {id}: an installed extension must declare \"sdk\""
-                )));
-            }
-            Some(declared) if !manifest::compatible(&declared, SDK_VERSION) => {
-                return Err(InstallError::SdkMismatch {
+        if let Some(refusal) = manifest::sdk_refusal(&id, sdk.as_deref()) {
+            return Err(match refusal {
+                SdkRefusal::Missing => {
+                    InstallError::InvalidPackage(format!("extension {id}: {refusal}"))
+                }
+                SdkRefusal::Incompatible(declared) => InstallError::SdkMismatch {
                     id,
-                    declared,
+                    declared: declared.to_owned(),
                     provided: SDK_VERSION.into(),
-                });
-            }
-            Some(_) => {}
+                },
+            });
         }
         let _claim = self.claim(store, &id).await?;
         let dir = store.join(&id);

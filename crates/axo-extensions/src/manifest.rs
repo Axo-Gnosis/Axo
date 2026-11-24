@@ -248,15 +248,8 @@ pub async fn authored(roots: &[PathBuf]) -> Vec<String> {
 /// Reads the package folder `source` before it is installed; see `inspect_package`.
 pub async fn inspect_package(source: &Path) -> Result<ExtensionPackage, ExtensionProblem> {
     let invalid = |message: String| problem(ProblemKind::Invalid, message);
-    if !source.is_absolute() {
-        return Err(invalid(format!(
-            "source {} is not an absolute path",
-            source.display()
-        )));
-    }
-    let Head { id, .. } = head(source)
-        .await
-        .map_err(|what| invalid(format!("{}: {what}", source.join(MANIFEST).display())))?;
+    let path = source_manifest(source).map_err(invalid)?;
+    let Head { id, .. } = read_head(&path).await.map_err(invalid)?;
     validate_id(&id).map_err(invalid)?;
     load(&id, source).await.map(|found| found.metadata)
 }
@@ -342,13 +335,7 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
             format!("extension {id}: {}: {what}", path.display()),
         )
     };
-    let mut text = String::new();
-    open_regular(&path)
-        .await
-        .map_err(fail)?
-        .read_to_string(&mut text)
-        .await
-        .map_err(|error| fail(format!("cannot read: {error}")))?;
+    let text = read_regular(&path, "cannot read").await.map_err(fail)?;
     let manifest: Manifest =
         serde_json::from_str(&text).map_err(|error| fail(format!("invalid: {error}")))?;
     if manifest.id != id {
@@ -357,16 +344,8 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
             manifest.id
         )));
     }
-    match &manifest.sdk {
-        Some(declared) if !compatible(declared, SDK_VERSION) => {
-            return Err(fail(format!(
-                "built for extension SDK {declared}, but this axo provides {SDK_VERSION}"
-            )));
-        }
-        None if id.contains('/') => {
-            return Err(fail("an installed extension must declare \"sdk\"".into()));
-        }
-        _ => {}
+    if let Some(refusal) = sdk_refusal(id, manifest.sdk.as_deref()) {
+        return Err(fail(refusal.to_string()));
     }
     let mut seen = HashSet::with_capacity(manifest.providers.len());
     for descriptor in &manifest.providers {
@@ -389,13 +368,7 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
             ))
         };
         let file = resolve_inside(package, &section.file).await.map_err(what)?;
-        let mut body = String::new();
-        open_regular(&file)
-            .await
-            .map_err(what)?
-            .read_to_string(&mut body)
-            .await
-            .map_err(|error| what(format!("cannot be read: {error}")))?;
+        let body = read_regular(&file, "cannot be read").await.map_err(what)?;
         sections.push((section.name.clone(), body));
     }
     let dirs = &manifest.definitions;
@@ -483,20 +456,54 @@ pub struct Head {
     pub sdk: Option<String>,
 }
 
-/// Reads `<package>/extension.json` as far as its `id` and `sdk`.
-pub async fn head(package: &Path) -> Result<Head, String> {
-    let mut file = open_regular(&package.join(MANIFEST)).await?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .await
-        .map_err(|error| format!("cannot read: {error}"))?;
-    serde_json::from_str(&text).map_err(|error| format!("invalid: {error}"))
+pub(super) fn source_manifest(source: &Path) -> Result<PathBuf, String> {
+    if !source.is_absolute() {
+        return Err(format!(
+            "source {} is not an absolute path",
+            source.display()
+        ));
+    }
+    Ok(source.join(MANIFEST))
+}
+
+/// Reads a manifest as far as its ID and SDK, giving errors their path context.
+pub(super) async fn read_head(path: &Path) -> Result<Head, String> {
+    let context = |what| format!("{}: {what}", path.display());
+    let text = read_regular(path, "cannot read").await.map_err(context)?;
+    serde_json::from_str(&text).map_err(|error| context(format!("invalid: {error}")))
+}
+
+pub(super) enum SdkRefusal<'a> {
+    Missing,
+    Incompatible(&'a str),
+}
+
+pub(super) fn sdk_refusal<'a>(id: &str, sdk: Option<&'a str>) -> Option<SdkRefusal<'a>> {
+    match sdk {
+        None if id.contains('/') => Some(SdkRefusal::Missing),
+        Some(declared) if !compatible(declared, SDK_VERSION) => {
+            Some(SdkRefusal::Incompatible(declared))
+        }
+        _ => None,
+    }
+}
+
+impl std::fmt::Display for SdkRefusal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("an installed extension must declare \"sdk\""),
+            Self::Incompatible(declared) => write!(
+                f,
+                "built for extension SDK {declared}, but this axo provides {SDK_VERSION}"
+            ),
+        }
+    }
 }
 
 /// Both SDKs must be `major.minor.patch`. `provided` must be at least `declared`
 /// and share its major if nonzero, its major and minor for `0.y.z` with nonzero
 /// `y`, or its exact version for `0.0.z`.
-pub fn compatible(declared: &str, provided: &str) -> bool {
+fn compatible(declared: &str, provided: &str) -> bool {
     fn parse(version: &str) -> Option<[u64; 3]> {
         let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
         let version = [parts.next()??, parts.next()??, parts.next()??];
@@ -605,6 +612,15 @@ async fn resolve_entry(package: &Path, entry: &str) -> Result<PathBuf, String> {
 /// changed since the last scan.
 pub async fn check_entry(entry: &Path) -> Result<(), String> {
     open_regular(entry).await.map(drop)
+}
+
+async fn read_regular(path: &Path, read_error: &str) -> Result<String, String> {
+    let mut file = open_regular(path).await?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .await
+        .map_err(|error| format!("{read_error}: {error}"))?;
+    Ok(text)
 }
 
 pub(crate) async fn open_regular(path: &Path) -> Result<tokio::fs::File, String> {

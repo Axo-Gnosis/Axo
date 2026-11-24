@@ -470,6 +470,21 @@ async fn install_refusals() {
         "{message}"
     );
 
+    let missing = source(&host, &http, "0.0.0", false);
+    let path = missing.join("extension.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest.as_object_mut().unwrap().remove("sdk");
+    std::fs::write(path, manifest.to_string()).unwrap();
+    let before = versions(&host);
+    assert_eq!(
+        extensions.install(&missing, "git:b", None, false).await,
+        Err(InstallError::InvalidPackage(
+            "extension lab/pkg: an installed extension must declare \"sdk\"".into()
+        )),
+    );
+    assert_eq!(versions(&host), before);
+
     let unlocked = source(&host, &http, "0.0.0", false);
     std::fs::write(
         unlocked.join("package.json"),
