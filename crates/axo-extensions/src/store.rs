@@ -426,7 +426,7 @@ impl Inner {
         let result = async {
             self.check_open()?;
             let found = manifest::load(&id, &version).await.map_err(|p| InstallError::InvalidPackage(p.message))?;
-            if let Some(error) = found.entry_error {
+            if let Some(error) = found.metadata.entry_error {
                 return Err(InstallError::InvalidPackage(error));
             }
             let fingerprint = deps::fingerprint(&version).await

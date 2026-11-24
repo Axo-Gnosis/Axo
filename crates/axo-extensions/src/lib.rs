@@ -1287,8 +1287,8 @@ impl Inner {
         let bun_usable = bun.is_none();
         let stale_checks = join_all(enabled.iter().zip(&found).map(|(ext, result)| async move {
             let found = result.as_ref().ok()?;
-            if bun_usable && found.entry_error.is_none() && !ext.id.contains('/') {
-                Some(deps::stale(&found.member.package).await)
+            if bun_usable && found.metadata.entry_error.is_none() && !ext.id.contains('/') {
+                Some(deps::stale(&found.metadata.package).await)
             } else {
                 None
             }
@@ -1305,8 +1305,26 @@ impl Inner {
         let mut current = HashSet::new();
         for ((ext, result), stale_check) in enabled.iter().zip(found).zip(stale_checks) {
             let (member, contribution, problem) = match result {
-                Ok(found) => {
-                    diagnostics.extend(found.diagnostics.into_iter().map(|message| {
+                Ok(manifest::Discovered { metadata, entry }) => {
+                    let ExtensionPackage {
+                        id,
+                        package,
+                        providers,
+                        session,
+                        sections,
+                        mut definitions,
+                        entry_error,
+                        diagnostics: found_diagnostics,
+                        sdk: _,
+                    } = metadata;
+                    let member = Member {
+                        id,
+                        package,
+                        entry,
+                        providers,
+                        session,
+                    };
+                    diagnostics.extend(found_diagnostics.into_iter().map(|message| {
                         ExtensionDiagnostic {
                             id: ext.id.clone(),
                             message,
@@ -1317,7 +1335,6 @@ impl Inner {
                         scope: self.scope_key(),
                     }
                     .to_string();
-                    let mut definitions = found.definitions;
                     for skill in &mut definitions.skills {
                         skill.origin = Some(origin.clone());
                     }
@@ -1327,14 +1344,12 @@ impl Inner {
                     let contribution = Arc::new(Contribution {
                         ext: ext.id.clone(),
                         origin,
-                        decl: found.member.session.clone(),
-                        sections: found.sections,
+                        decl: member.session.clone(),
+                        sections,
                         definitions,
                     });
-                    let entry_error = found
-                        .entry_error
-                        .map(|error| problem(ProblemKind::Invalid, error));
-                    (found.member, contribution, entry_error)
+                    let entry_error = entry_error.map(|error| problem(ProblemKind::Invalid, error));
+                    (member, contribution, entry_error)
                 }
                 // A failed rescan keeps the last accepted claims and contribution, unavailable.
                 Err(error) => match accepted.get(&ext.id) {

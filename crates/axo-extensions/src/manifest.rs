@@ -178,17 +178,9 @@ struct Manifest {
 /// An admitted package. Sections and definitions never reach the runner, so they stay
 /// outside [`Member`].
 #[derive(Debug)]
-pub struct Discovered {
-    pub member: Member,
-    /// The `sdk` the manifest declares.
-    pub sdk: Option<String>,
-    /// Why the entry cannot load; the declarations stay usable.
-    pub entry_error: Option<String>,
-    /// Ignored duplicate manifests in later roots and definition-loader findings.
-    pub diagnostics: Vec<String>,
-    /// `(name, body)` in declaration order.
-    pub sections: Vec<(String, String)>,
-    pub definitions: Definitions,
+pub(super) struct Discovered {
+    pub(super) metadata: ExtensionPackage,
+    pub(super) entry: PathBuf,
 }
 
 /// What a package declares, read from disk without running it.
@@ -210,29 +202,6 @@ pub struct ExtensionPackage {
     pub diagnostics: Vec<String>,
 }
 
-impl From<Discovered> for ExtensionPackage {
-    fn from(found: Discovered) -> Self {
-        let Member {
-            id,
-            package,
-            providers,
-            session,
-            ..
-        } = found.member;
-        Self {
-            id,
-            sdk: found.sdk,
-            package,
-            providers,
-            session,
-            sections: found.sections,
-            definitions: found.definitions,
-            entry_error: found.entry_error,
-            diagnostics: found.diagnostics,
-        }
-    }
-}
-
 /// Rejects what [`EnabledExtension::validate_all`] rejects, so joining `id` under a root or
 /// the store stays inside it.
 pub fn validate_id(id: &str) -> Result<(), String> {
@@ -249,7 +218,7 @@ pub async fn inspect(
     options: &ExtensionOptions,
 ) -> Result<ExtensionPackage, ExtensionProblem> {
     validate_id(id).map_err(|error| problem(ProblemKind::Invalid, error))?;
-    discover(id, options).await.map(Into::into)
+    discover(id, options).await.map(|found| found.metadata)
 }
 
 /// The IDs of every authored package under `roots`, sorted. A directory counts when its
@@ -292,7 +261,7 @@ pub async fn inspect_package(source: &Path) -> Result<ExtensionPackage, Extensio
         .await
         .map_err(|what| invalid(format!("{}: {what}", source.join(MANIFEST).display())))?;
     validate_id(&id).map_err(invalid)?;
-    load(&id, source).await.map(Into::into)
+    load(&id, source).await.map(|found| found.metadata)
 }
 
 /// Locates and loads `id`'s package; see [`locate`] and [`load`].
@@ -306,7 +275,7 @@ pub async fn discover(
 ) -> Result<Discovered, ExtensionProblem> {
     let (package, diagnostics) = locate(id, options).await?;
     let mut found = load(id, &package).await?;
-    found.diagnostics.splice(0..0, diagnostics);
+    found.metadata.diagnostics.splice(0..0, diagnostics);
     Ok(found)
 }
 
@@ -488,11 +457,11 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
         ),
     };
     Ok(Discovered {
-        sdk: manifest.sdk,
-        member: Member {
+        entry,
+        metadata: ExtensionPackage {
+            sdk: manifest.sdk,
             id: manifest.id,
             package: package.to_owned(),
-            entry,
             providers: manifest.providers,
             session: SessionDecl {
                 tools: manifest.tools,
@@ -502,11 +471,11 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
                 spawn_hook: manifest.spawn_hook,
                 events: manifest.events,
             },
+            entry_error,
+            diagnostics,
+            sections,
+            definitions,
         },
-        entry_error,
-        diagnostics,
-        sections,
-        definitions,
     })
 }
 
@@ -830,21 +799,23 @@ mod tests {
             &declare("lab-provider", "other.ts", json!([])),
             Some("other.ts"),
         );
-        let Discovered {
-            member,
+        let Discovered { metadata, entry } = discover("lab-provider", &roots).await.unwrap();
+        let ExtensionPackage {
+            id,
             entry_error,
             diagnostics,
+            providers,
             ..
-        } = discover("lab-provider", &roots).await.unwrap();
-        assert_eq!(member.id, "lab-provider");
-        assert_eq!(member.entry, dir.join("index.ts"));
+        } = metadata;
+        assert_eq!(id, "lab-provider");
+        assert_eq!(entry, dir.join("index.ts"));
         assert_eq!(entry_error, None);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(
             diagnostics[0].contains(&second.display().to_string()),
             "{diagnostics:?}"
         );
-        let [descriptor] = member.providers.as_slice() else {
+        let [descriptor] = providers.as_slice() else {
             panic!("one provider")
         };
         assert_eq!(
@@ -862,18 +833,14 @@ mod tests {
 
         let defaults = declare("plain", "index.ts", json!([{ "id": "plain" }]));
         package(&second, "plain", &defaults, Some("index.ts"));
-        let Discovered {
-            member,
-            diagnostics,
-            ..
-        } = discover("plain", &roots).await.unwrap();
-        assert_eq!(member.session, SessionDecl::default());
-        assert!(diagnostics.is_empty());
+        let metadata = discover("plain", &roots).await.unwrap().metadata;
+        assert_eq!(metadata.session, SessionDecl::default());
+        assert!(metadata.diagnostics.is_empty());
         assert_eq!(
             (
-                member.providers[0].login,
-                member.providers[0].rewrite,
-                member.providers[0].requires_key
+                metadata.providers[0].login,
+                metadata.providers[0].rewrite,
+                metadata.providers[0].requires_key
             ),
             (false, false, true)
         );
@@ -962,13 +929,11 @@ mod tests {
         // Admitted with an entry error: the catalog stays usable.
         let entry_error = async |id: &str, entry: &str, what: &str| {
             package(&first, id, &declare(id, entry, json!([{ "id": id }])), None);
-            let Discovered {
-                member,
-                entry_error: error,
-                ..
-            } = discover(id, &roots).await.unwrap();
-            assert_eq!(member.providers.len(), 1);
-            let error = error.unwrap_or_else(|| panic!("{id}: entry accepted"));
+            let metadata = discover(id, &roots).await.unwrap().metadata;
+            assert_eq!(metadata.providers.len(), 1);
+            let error = metadata
+                .entry_error
+                .unwrap_or_else(|| panic!("{id}: entry accepted"));
             assert!(error.contains(what), "{error} lacks {what}");
         };
         entry_error("missing-entry", "index.ts", "cannot be resolved").await;
@@ -992,13 +957,9 @@ mod tests {
             Some("index.ts"),
         );
         std::os::unix::fs::symlink(&target, first.join("linked")).unwrap();
-        let Discovered {
-            member,
-            entry_error: error,
-            ..
-        } = discover("linked", &roots).await.unwrap();
-        assert_eq!(error, None);
-        assert_eq!(member.entry, target.join("index.ts"));
+        let Discovered { metadata, entry } = discover("linked", &roots).await.unwrap();
+        assert_eq!(metadata.entry_error, None);
+        assert_eq!(entry, target.join("index.ts"));
     }
 
     #[tokio::test]
@@ -1048,9 +1009,9 @@ mod tests {
             "---\ndescription: Reviews changes\n---\nReview the diff.\n",
         )
         .unwrap();
-        let found = discover("lab", &roots).await.unwrap();
-        assert_eq!(found.entry_error, None);
-        let session = &found.member.session;
+        let metadata = discover("lab", &roots).await.unwrap().metadata;
+        assert_eq!(metadata.entry_error, None);
+        let session = &metadata.session;
         let [direct, deferred] = session.tools.as_slice() else {
             panic!("two tools")
         };
@@ -1075,15 +1036,19 @@ mod tests {
         assert_eq!(session.tool_policy, [PolicyHook::Before, PolicyHook::After]);
         assert!(session.spawn_hook && session.events);
         assert_eq!(
-            found.sections,
+            metadata.sections,
             [("lab_rules".to_owned(), "Be careful.".to_owned())]
         );
-        let definitions = found.definitions;
+        let definitions = metadata.definitions;
         assert_eq!(definitions.agents[0].name, "helper");
         assert_eq!(definitions.teams[0].name, "crew");
         assert_eq!(definitions.skills[0].name, "review");
         assert!(definitions.modes.is_empty() && definitions.keywords.is_empty());
-        assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
+        assert!(
+            metadata.diagnostics.is_empty(),
+            "{:?}",
+            metadata.diagnostics
+        );
         // The activation wire shape: camelCase, every declaration whole.
         let wire = serde_json::to_value(session).unwrap();
         assert_eq!(wire["tools"][0]["exposure"], "direct");
