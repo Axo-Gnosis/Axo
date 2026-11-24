@@ -1,5 +1,5 @@
-//! Anthropic Messages adapter for API keys, header-owned auth and the built-in
-//! Claude subscription provider. Subscription shaping stays on the wire.
+//! Anthropic Messages adapter for API keys and header-owned auth, with optional
+//! tool-name prefixing (`compat.toolNamePrefix`).
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -37,9 +37,6 @@ mod tool_names;
 
 use tool_names::{PLACEHOLDER, ToolNames, wire_name};
 
-const SUBSCRIPTION_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-const OAUTH_BETA: &str = "oauth-2025-04-20";
-
 const API_VERSION: &str = "2023-06-01";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
@@ -62,22 +59,11 @@ const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Streams Anthropic Messages responses (`POST {base}/v1/messages`).
 pub struct AnthropicApi {
     http: reqwest::Client,
-    subscription: bool,
 }
 
 impl AnthropicApi {
     pub fn new(http: reqwest::Client) -> Self {
-        Self {
-            http,
-            subscription: false,
-        }
-    }
-
-    pub(crate) fn subscription(http: reqwest::Client) -> Self {
-        Self {
-            http,
-            subscription: true,
-        }
+        Self { http }
     }
 }
 
@@ -90,24 +76,10 @@ impl Api for AnthropicApi {
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         let http = self.http.clone();
-        let subscription = self.subscription;
         let owned_model = model.clone();
-        let tier = if subscription {
-            ServiceTier::Standard
-        } else {
-            model.effective_tier(opts.simple.service_tier)
-        };
+        let tier = model.effective_tier(opts.simple.service_tier);
         respond(model, tier, cancel, move |mut reply, cancel| async move {
-            let result = run(
-                &http,
-                &owned_model,
-                &transcript,
-                &opts,
-                &cancel,
-                &mut reply,
-                subscription,
-            )
-            .await;
+            let result = run(&http, &owned_model, &transcript, &opts, &cancel, &mut reply).await;
             (reply, result)
         })
     }
@@ -230,29 +202,10 @@ fn prepare_request(
     transcript: &Transcript,
     opts: &StreamOptions,
     tier: ServiceTier,
-    subscription: bool,
 ) -> Result<PreparedRequest, String> {
-    // Reject overrides before constructing any credential-bearing header.
-    if subscription
-        && (model.base_url != crate::auth::claude_subscription::BASE_URL
-            || opts.auth.base_url.is_some()
-            || !opts.auth.headers.is_empty()
-            || !opts.simple.headers.is_empty()
-            || opts.rewrite.is_some())
-    {
-        return Err(
-            "Claude subscription does not permit destination, header or request overrides"
-                .to_owned(),
-        );
-    }
     let api_key = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
 
     let compat = AnthropicCompat::of(model);
-    let tier = if subscription {
-        ServiceTier::Standard
-    } else {
-        tier
-    };
     let options = request_options(model, transcript, &opts.simple, tier);
     let names = model
         .compat
@@ -261,20 +214,8 @@ fn prepare_request(
         .map(|prefix| ToolNames::new(transcript, prefix))
         .transpose()?;
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
-    let mut built = build_params(model, &resolved, &compat, &options, names.as_ref());
-    if subscription {
-        let system = built
-            .params
-            .as_object_mut()
-            .expect("request object")
-            .entry("system")
-            .or_insert_with(|| json!([]));
-        system
-            .as_array_mut()
-            .expect("system blocks")
-            .insert(0, json!({ "type": "text", "text": SUBSCRIPTION_IDENTITY }));
-    }
-    let mut betas = beta_features(
+    let built = build_params(model, &resolved, &compat, &options, names.as_ref());
+    let betas = beta_features(
         model,
         &resolved,
         &compat,
@@ -282,32 +223,10 @@ fn prepare_request(
         &options,
         built.native_tool_changes,
     );
-    if subscription && !betas.iter().any(|beta| beta == OAUTH_BETA) {
-        betas.push(OAUTH_BETA.to_owned());
-    }
-    let mut headers = request_headers(
-        opts,
-        &compat,
-        if subscription { None } else { api_key },
-        &betas,
-    )?;
-    if subscription {
-        let token = api_key
-            .filter(|token| !token.trim().is_empty())
-            .ok_or_else(|| "Log in to anthropic-subscription".to_owned())?;
-        let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| "Invalid Claude subscription access token".to_owned())?;
-        bearer.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, bearer);
-    }
-    let base = if subscription {
-        crate::auth::claude_subscription::BASE_URL
-    } else {
-        opts.base_url(model)
-    };
+    let headers = request_headers(opts, &compat, api_key, &betas)?;
     Ok(PreparedRequest {
         request: ProviderRequest {
-            url: format!("{base}/v1/messages?beta=true"),
+            url: format!("{}/v1/messages?beta=true", opts.base_url(model)),
             headers,
             body: built.params,
         },
@@ -324,15 +243,8 @@ async fn run(
     opts: &StreamOptions,
     cancel: &CancellationToken,
     reply: &mut Reply,
-    subscription: bool,
 ) -> Result<StopReason, String> {
-    let prepared = prepare_request(
-        model,
-        transcript,
-        opts,
-        reply.message.service_tier,
-        subscription,
-    )?;
+    let prepared = prepare_request(model, transcript, opts, reply.message.service_tier)?;
     reply.message.provider_thinking_level = prepared.provider_thinking_level;
     let response = dispatch(
         http,

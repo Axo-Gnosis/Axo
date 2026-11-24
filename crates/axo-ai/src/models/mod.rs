@@ -1,8 +1,8 @@
-//! The model registry: models.dev catalog + Codex models + `models.jsonc`, plus providers a
-//! host registers at runtime, with auth resolution and dispatch to the wire APIs.
+//! The model registry: models.dev catalog + `models.jsonc`, plus providers a host registers
+//! at runtime (with their runtime model lists), with auth resolution and dispatch to the wire
+//! APIs.
 
 pub mod catalog;
-pub mod codex;
 pub mod config;
 pub mod discover;
 pub mod rules;
@@ -21,10 +21,9 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use crate::api::anthropic::AnthropicApi;
-use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
+use crate::api::openai_responses::ResponsesApi;
 use crate::auth::CredentialStore;
-use crate::auth::claude_subscription::ClaudeSubscriptionLogin;
 
 use self::config::ModelsConfig;
 use self::feeds::Inputs;
@@ -49,27 +48,26 @@ pub struct ModelsOptions {
     /// Where the models.dev catalog is cached; `None` runs without the catalog, does no
     /// catalog I/O, and never refreshes on a timer.
     pub cache_dir: Option<PathBuf>,
-    /// Run catalog and built-in models at their full window even past a context price tier.
+    /// Run catalog models at their full window even past a context price tier; passed to
+    /// runtime model listings.
     pub extended_context: bool,
     pub config: ModelsConfig,
     pub credentials: Arc<dyn CredentialStore>,
-    /// Client shared by catalog, discovery, and ordinary provider requests.
-    /// Claude subscription uses a dedicated no-redirect client for login and inference.
+    /// Client shared by catalog, discovery, and provider requests.
     pub http_client: Option<reqwest::Client>,
 }
 
 /// The model registry. One instance serves the host's lifetime: `reload` rebuilds the loaded
 /// catalog in place from new configuration, `refresh` (also run on a timer, see
-/// `ModelsConfig::refresh_interval`) from fresh catalog and Codex model data, and
+/// `ModelsConfig::refresh_interval`) from fresh catalog data, and
 /// `register`/`unregister` add and remove runtime providers. Owned `ProviderLayer`s
 /// (`provider_layer`) sit above runtime registrations. Each request resolves the current
 /// model and provider by provider/id; a missing model fails with `Error::UnknownModel`.
 pub struct Models {
     view: View,
     anthropic: Arc<AnthropicApi>,
-    anthropic_subscription: Arc<AnthropicApi>,
     completions: Arc<CompletionsApi>,
-    codex: Arc<CodexApi>,
+    responses: Arc<ResponsesApi>,
 }
 
 /// An owned set of providers above the runtime registrations, created by
@@ -90,7 +88,7 @@ pub enum ProviderOrigin {
     Layer,
     /// A `Models::register` registration.
     Registered,
-    /// The loaded catalog (models.dev, Codex, `models.jsonc`).
+    /// The loaded catalog (models.dev and `models.jsonc`).
     Loaded,
 }
 
@@ -104,7 +102,6 @@ struct Shared {
     cache_dir: Option<PathBuf>,
     credentials: Arc<dyn CredentialStore>,
     http: reqwest::Client,
-    claude_subscription: Arc<ClaudeSubscriptionLogin>,
     /// The next `ProviderLayer` ordinal.
     next_layer: AtomicU64,
     /// Generation counter bumped whenever the base published snapshot or provider list changes.

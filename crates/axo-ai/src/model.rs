@@ -17,20 +17,20 @@ pub enum ApiKind {
     AnthropicMessages,
     #[serde(rename = "openai-completions")]
     OpenAiCompletions,
-    #[serde(rename = "openai-codex-responses")]
-    OpenAiCodexResponses,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
 }
 
 pub(crate) fn tier_wire(api: ApiKind, tier: ServiceTier) -> Option<&'static str> {
-    use ApiKind::{AnthropicMessages, OpenAiCodexResponses, OpenAiCompletions};
+    use ApiKind::{AnthropicMessages, OpenAiCompletions, OpenAiResponses};
     use ServiceTier::{Fast, Flex, Standard, Ultrafast};
 
     match (api, tier) {
         (_, Standard) | (AnthropicMessages, Flex | Ultrafast) => None,
         (AnthropicMessages, Fast) => Some("fast"),
-        (OpenAiCompletions | OpenAiCodexResponses, Flex) => Some("flex"),
-        (OpenAiCompletions | OpenAiCodexResponses, Fast) => Some("priority"),
-        (OpenAiCompletions | OpenAiCodexResponses, Ultrafast) => Some("ultrafast"),
+        (OpenAiCompletions | OpenAiResponses, Flex) => Some("flex"),
+        (OpenAiCompletions | OpenAiResponses, Fast) => Some("priority"),
+        (OpenAiCompletions | OpenAiResponses, Ultrafast) => Some("ultrafast"),
     }
 }
 
@@ -107,13 +107,13 @@ impl Model {
             {
                 TranscriptToolSupport::Changes
             }
-            ApiKind::OpenAiCodexResponses
+            ApiKind::OpenAiResponses
                 if on(compat.supports_mid_convo_system_messages)
                     && on(compat.supports_additional_tools) =>
             {
                 TranscriptToolSupport::Changes
             }
-            ApiKind::OpenAiCodexResponses if on(compat.supports_tool_search) => {
+            ApiKind::OpenAiResponses if on(compat.supports_tool_search) => {
                 TranscriptToolSupport::Additions
             }
             ApiKind::OpenAiCompletions

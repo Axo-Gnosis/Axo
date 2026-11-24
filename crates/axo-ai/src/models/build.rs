@@ -2,14 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::auth::CredentialStore;
-use crate::auth::claude_subscription::{self, ClaudeSubscriptionLogin};
-use crate::auth::codex::{self as codex_auth, CodexLogin};
-use crate::auth::provider::ProviderLogin;
 use crate::auth::resolve::ProviderAuth;
 use crate::error::Error;
 use crate::model::{ApiKind, Compat, InputKind, Model};
 
-use super::codex::CodexModel;
 use super::config::{self, ModelsConfig, merge_compat};
 use super::{discover, rules};
 
@@ -17,7 +13,6 @@ pub(super) struct Candidate<'a> {
     pub(super) config: &'a ModelsConfig,
     pub(super) extended_context: bool,
     pub(super) catalog: Option<&'a rules::CatalogModels>,
-    pub(super) codex: Option<&'a [CodexModel]>,
 }
 
 /// What `Models::load` and `Models::reload` build from the catalog and `models.jsonc`.
@@ -30,68 +25,42 @@ pub(super) struct Loaded {
     pub(super) config_base_urls: HashSet<(String, String)>,
 }
 
-/// How a catalog or Codex provider authenticates: its env vars, the `models.jsonc` key, and
-/// the built-in login for `openai-codex`.
-pub(super) fn catalog_provider_auth(
-    id: String,
-    env: Vec<String>,
-    config: &ModelsConfig,
-    http: &reqwest::Client,
-) -> ProviderAuth {
+/// How a catalog provider authenticates: its env vars and the `models.jsonc` key.
+fn catalog_provider_auth(id: String, env: Vec<String>, config: &ModelsConfig) -> ProviderAuth {
     ProviderAuth {
         config_api_key: config.providers.get(&id).and_then(|p| p.api_key.clone()),
         env,
         requires_key: true,
         oauth_only: false,
-        login: (id == codex_auth::PROVIDER)
-            .then(|| Arc::new(CodexLogin::new(http.clone())) as Arc<dyn ProviderLogin>),
+        login: None,
         slot: format!("loaded/{id}"),
         id,
     }
 }
 
-/// Builds the loaded catalog from candidate models.dev and Codex feeds, patched and extended
+/// Builds the loaded catalog from the candidate models.dev feed, patched and extended
 /// by `models.jsonc`, with discovered models of `openai-completions` config providers. A
 /// provider whose discovery fails keeps the ids `previous` returns for it.
 pub(super) async fn build(
     candidate: Candidate<'_>,
     credentials: &Arc<dyn CredentialStore>,
     http: &reqwest::Client,
-    subscription_login: &Arc<ClaudeSubscriptionLogin>,
     previous: &(dyn Fn(&str) -> Vec<String> + Sync),
     visible: &(dyn Fn(&str) -> bool + Sync),
     attempted: Option<&mut HashSet<String>>,
 ) -> Result<Loaded, Error> {
     let config = candidate.config;
-    if config.providers.contains_key(claude_subscription::PROVIDER) {
-        return Err(Error::Config(format!(
-            "models.jsonc: provider {} is reserved",
-            claude_subscription::PROVIDER
-        )));
-    }
-    let (mut models, envs) = rules::build(candidate.catalog, candidate.codex);
+    let (mut models, envs) = rules::build(candidate.catalog);
     if !candidate.extended_context {
         models.iter_mut().for_each(rules::cap_at_price_tier);
     }
     let mut providers: HashMap<String, Arc<ProviderAuth>> = envs
         .into_iter()
         .map(|(id, env)| {
-            let info = catalog_provider_auth(id.clone(), env, config, http);
+            let info = catalog_provider_auth(id.clone(), env, config);
             (id, Arc::new(info))
         })
         .collect();
-    providers.insert(
-        claude_subscription::PROVIDER.to_owned(),
-        Arc::new(ProviderAuth {
-            id: claude_subscription::PROVIDER.to_owned(),
-            slot: format!("loaded/{}", claude_subscription::PROVIDER),
-            config_api_key: None,
-            env: Vec::new(),
-            requires_key: true,
-            oauth_only: true,
-            login: Some(subscription_login.clone()),
-        }),
-    );
 
     let discoverable = |(id, provider): &(&String, &config::ProviderConfig)| {
         provider.api == Some(ApiKind::OpenAiCompletions)
@@ -365,20 +334,15 @@ mod tests {
             dir.path().join("auth.json"),
         ));
         let http = crate::api::http::client();
-        let subscription_login = Arc::new(ClaudeSubscriptionLogin::new(
-            claude_subscription::client().unwrap(),
-        ));
         let load = async |config: &ModelsConfig| {
             build(
                 Candidate {
                     config,
                     extended_context: true,
                     catalog: Some(&catalog),
-                    codex: None,
                 },
                 &credentials,
                 &http,
-                &subscription_login,
                 &|_| Vec::new(),
                 &|_| false,
                 None,

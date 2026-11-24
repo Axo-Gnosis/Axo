@@ -219,7 +219,7 @@ fn normalize_tool_call_id(id: &str, model: &Model, source: &AssistantMessage) ->
             None if model.provider == "openai" => id.chars().take(40).collect(),
             None => id.to_owned(),
         },
-        ApiKind::OpenAiCodexResponses => {
+        ApiKind::OpenAiResponses => {
             let normalize_part = |part: &str| -> String {
                 let sanitized: String = sanitize(part).chars().take(64).collect();
                 sanitized.trim_end_matches('_').to_owned()

@@ -1,5 +1,5 @@
 //! The runtime provider seam: a host-registered provider logs in, refreshes and rewrites
-//! requests on all three wire APIs; registration replaces and restores built-in providers;
+//! requests on all three wire APIs; registration replaces and restores loaded providers;
 //! `reload` keeps registrations; owned provider layers stack over runtime registrations and
 //! reserve unavailable providers without running them.
 
@@ -275,7 +275,7 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
     let apis = [
         ("anthropic", ApiKind::AnthropicMessages),
         ("completions", ApiKind::OpenAiCompletions),
-        ("codex", ApiKind::OpenAiCodexResponses),
+        ("responses", ApiKind::OpenAiResponses),
     ];
     models
         .register(
@@ -350,9 +350,6 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
                 "{id}"
             );
         }
-        if api == ApiKind::OpenAiCodexResponses {
-            assert_eq!(http_header_values(head, "chatgpt-account-id").next(), None);
-        }
     }
     assert_eq!(login.refreshes.load(Ordering::SeqCst), 1);
 
@@ -375,35 +372,48 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
         "unexpected events: {events:?}"
     );
 
-    // 5. A registration replaces a built-in provider of the same id; unregister restores it.
-    let codex = |models: &Models| {
+    // 5. A registration replaces a loaded provider of the same id; unregister restores it.
+    models
+        .reload(
+            serde_json::from_value(json!({"providers": {"loaded": {
+                "api": "openai-completions", "baseUrl": "http://127.0.0.1:9",
+                "models": [{"id": "catalog"}]
+            }}}))
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    let origin = |models: &Models| {
         models
             .providers()
             .into_iter()
-            .find(|info| info.id == "openai-codex")
+            .find(|info| info.id == "loaded")
             .unwrap()
+            .origin
     };
+    assert_eq!(origin(&models), ProviderOrigin::Loaded);
     models
         .register(
             "host",
             provider(
-                "openai-codex",
+                "loaded",
                 vec![model(
-                    "openai-codex",
+                    "loaded",
                     "only",
-                    ApiKind::OpenAiCodexResponses,
+                    ApiKind::OpenAiResponses,
                     "http://127.0.0.1:9",
                 )],
             ),
         )
         .unwrap();
-    assert!(models.find("openai-codex/gpt-6-sol").is_none());
-    assert!(models.find("openai-codex/only").is_some());
-    assert!(!codex(&models).login);
-    assert!(models.unregister("openai-codex"));
-    assert!(models.find("openai-codex/gpt-6-sol").is_some());
-    assert!(models.find("openai-codex/only").is_none());
-    assert!(codex(&models).login);
+    assert!(models.find("loaded/catalog").is_none());
+    assert!(models.find("loaded/only").is_some());
+    assert_eq!(origin(&models), ProviderOrigin::Registered);
+    assert!(models.unregister("loaded"));
+    assert!(models.find("loaded/catalog").is_some());
+    assert!(models.find("loaded/only").is_none());
+    assert_eq!(origin(&models), ProviderOrigin::Loaded);
 }
 
 #[tokio::test]
@@ -570,6 +580,17 @@ fn assert_unavailable(event: AssistantEvent, reason: &str) {
 async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     let dir = tempfile::tempdir().unwrap();
     let (models, _) = load(&dir).await;
+    models
+        .reload(
+            serde_json::from_value(json!({"providers": {"loaded": {
+                "api": "openai-completions", "baseUrl": "http://127.0.0.1:9",
+                "models": [{"id": "catalog"}]
+            }}}))
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
     let native = model(
         "lab",
         "native",
@@ -618,7 +639,7 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
         models
             .providers()
             .iter()
-            .find(|info| info.id == "openai-codex")
+            .find(|info| info.id == "loaded")
             .unwrap()
             .origin,
         ProviderOrigin::Loaded
@@ -629,7 +650,7 @@ async fn provider_layers_stack_over_native_registrations_and_reveal_them() {
     let before = models.all();
     let unchanged = before
         .iter()
-        .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-sol")
+        .find(|model| model.provider == "loaded" && model.id == "catalog")
         .unwrap();
     b.replace(vec![(
         "b".into(),
@@ -1001,7 +1022,7 @@ impl ProviderLogin for ApiKeyLogin {
 }
 
 #[tokio::test]
-async fn claude_subscription_policy_follows_winning_provider_not_wire_api() {
+async fn oauth_only_policy_follows_the_winning_provider() {
     let dir = tempfile::tempdir().unwrap();
     let (models, store) = load(&dir).await;
     let (url, server) = server(1);
@@ -1099,9 +1120,9 @@ async fn claude_subscription_policy_follows_winning_provider_not_wire_api() {
 }
 
 #[tokio::test]
-async fn keyless_codex_rewrite_reaches_http() {
+async fn keyless_responses_rewrite_reaches_http() {
     let (url, server) = server(1);
-    let model = model("lab", "only", ApiKind::OpenAiCodexResponses, &url);
+    let model = model("lab", "only", ApiKind::OpenAiResponses, &url);
     let dir = tempfile::tempdir().unwrap();
     let (models, store) = load(&dir).await;
     models
@@ -1122,7 +1143,6 @@ async fn keyless_codex_rewrite_reaches_http() {
     assert!(head.starts_with("POST /rewritten "), "{head}");
     assert_eq!(http_header_values(head, "x-rewritten").next(), Some("yes"));
     assert_eq!(http_header_values(head, "authorization").next(), None);
-    assert_eq!(http_header_values(head, "chatgpt-account-id").next(), None);
 
     // A required but missing/empty key must fail at setup, before even invoking the rewrite.
     models
@@ -1216,7 +1236,7 @@ async fn transport_owns_the_exchange() {
     let wires = [
         ("anthropic", ApiKind::AnthropicMessages, ANTHROPIC),
         ("completions", ApiKind::OpenAiCompletions, COMPLETIONS),
-        ("responses", ApiKind::OpenAiCodexResponses, RESPONSES),
+        ("responses", ApiKind::OpenAiResponses, RESPONSES),
     ];
     models
         .register(

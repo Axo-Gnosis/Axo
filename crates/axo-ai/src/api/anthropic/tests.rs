@@ -1,20 +1,19 @@
 use super::*;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use futures::StreamExt;
 
+use crate::api::ToolChoice;
 use crate::api::sse::SseDecoder;
-use crate::api::{RequestRewrite, ToolChoice};
 use crate::model::{Compat, InputKind};
 use crate::types::{SystemMessage, TextBlock};
 
 fn model() -> Model {
     Model {
         id: "claude-sonnet-4-5".into(),
-        name: "Subscription fixture".into(),
+        name: "Prefix fixture".into(),
         api: ApiKind::AnthropicMessages,
-        provider: "anthropic-subscription".into(),
+        provider: "lab".into(),
         base_url: "https://api.anthropic.com".into(),
         reasoning: false,
         thinking_level_map: None,
@@ -35,7 +34,7 @@ fn model() -> Model {
 
 fn options() -> StreamOptions {
     let mut opts = StreamOptions::default();
-    opts.auth.api_key = Some("synthetic-subscription-access".into());
+    opts.auth.api_key = Some("synthetic-access".into());
     opts
 }
 
@@ -67,7 +66,7 @@ fn transcript(names: &[&str]) -> Transcript {
 }
 
 fn prepare(model: &Model, transcript: &Transcript) -> PreparedRequest {
-    prepare_request(model, transcript, &options(), ServiceTier::Standard, true).unwrap()
+    prepare_request(model, transcript, &options(), ServiceTier::Standard).unwrap()
 }
 
 // Exercise the production parser and mapper within the same terminal-event owner as HTTP.
@@ -159,7 +158,7 @@ fn wire_blocks(body: &Value) -> impl Iterator<Item = &Value> {
 }
 
 #[tokio::test]
-async fn claude_subscription_read_round_trip_and_api_key_control() {
+async fn tool_name_prefix_round_trips_through_history() {
     let model = model();
     let original = transcript(&["read", "bash"]);
     let saved = original.clone();
@@ -169,37 +168,8 @@ async fn claude_subscription_read_round_trip_and_api_key_control() {
         request.url,
         "https://api.anthropic.com/v1/messages?beta=true"
     );
-    assert_eq!(
-        request.headers["authorization"],
-        concat!("Bearer ", "synthetic-subscription-access")
-    );
-    assert!(!request.headers.contains_key("x-api-key"));
-    let beta = request.headers["anthropic-beta"]
-        .to_str()
-        .unwrap()
-        .split(',')
-        .collect::<Vec<_>>();
-    assert_eq!(
-        beta.len(),
-        beta.iter().copied().collect::<HashSet<_>>().len()
-    );
-    for feature in [
-        "oauth-2025-04-20",
-        "inline-tools-2026-09-15",
-        "fine-grained-tool-streaming-2025-05-14",
-    ] {
-        assert!(beta.contains(&feature), "Missing beta {feature}: {beta:?}");
-    }
-    assert!(!beta.contains(&"fast-mode-2026-02-01"));
-    assert!(!beta.iter().any(|value| value.contains("context-1m")));
+    assert_eq!(request.headers["x-api-key"], "synthetic-access");
     let body = &request.body;
-    assert_eq!(
-        body["system"],
-        json!([
-            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
-            {"type": "text", "text": "Host instructions.\nKeep the trust boundary.", "cache_control": {"type": "ephemeral"}}
-        ])
-    );
     assert_eq!(body["tools"][0]["name"], "_read");
     assert_eq!(body["tools"][1]["name"], "_bash");
     assert_eq!(body["tools"][0]["input_schema"], tool("read").parameters);
@@ -207,13 +177,7 @@ async fn claude_subscription_read_round_trip_and_api_key_control() {
         body["tools"][1]["cache_control"],
         json!({"type": "ephemeral"})
     );
-    for key in ["speed", "service_tier", "metadata", "fallback_models"] {
-        assert!(
-            body.get(key).is_none(),
-            "Unexpected subscription field {key}"
-        );
-    }
-    assert_eq!(original, saved, "Wire identity must not modify history");
+    assert_eq!(original, saved, "Wire names must not modify history");
     let assistant = terminal_call(&decode(&model, prepared, "_read").await, "read");
     let mut messages = original.clone().into_messages();
     messages.push(Message::Assistant(assistant));
@@ -249,54 +213,23 @@ async fn claude_subscription_read_round_trip_and_api_key_control() {
     );
     assert!(!inactive.tool_names.as_ref().unwrap().contains_key("_read"));
 
-    // Without a prefix, names stay canonical; a subscription-looking token changes nothing.
+    // Without a prefix, names stay canonical.
     let mut model = model.clone();
     model.compat.tool_name_prefix = None;
-    let plain =
-        prepare_request(&model, &original, &options(), ServiceTier::Standard, false).unwrap();
+    let plain = prepare(&model, &original);
     assert!(plain.tool_names.is_none());
-    assert_eq!(
-        plain.request.headers["x-api-key"],
-        "synthetic-subscription-access"
-    );
-    assert!(!plain.request.headers.contains_key("authorization"));
-    assert!(
-        !plain.request.headers["anthropic-beta"]
-            .to_str()
-            .unwrap()
-            .contains("oauth-")
-    );
-    assert_eq!(plain.request.body["system"].as_array().unwrap().len(), 1);
     assert_eq!(plain.request.body["tools"][0]["name"], "read");
     terminal_call(&decode(&model, plain, "read").await, "read");
     for choice in [ToolChoice::Auto, ToolChoice::None] {
         let mut opts = options();
         opts.simple.tool_choice = Some(choice);
-        let request =
-            prepare_request(&model, &original, &opts, ServiceTier::Standard, true).unwrap();
+        let request = prepare_request(&model, &original, &opts, ServiceTier::Standard).unwrap();
         assert_eq!(request.request.body["tool_choice"]["type"], choice.as_str());
     }
-    let mut fast = options();
-    fast.simple.service_tier = ServiceTier::Fast;
-    let unpaid = prepare_request(
-        &model,
-        &original,
-        &fast,
-        model.effective_tier(fast.simple.service_tier),
-        true,
-    )
-    .unwrap();
-    assert!(unpaid.request.body.get("speed").is_none());
-    assert!(
-        !unpaid.request.headers["anthropic-beta"]
-            .to_str()
-            .unwrap()
-            .contains("fast-mode")
-    );
 }
 
 #[tokio::test]
-async fn claude_subscription_inline_changes_and_inactive_tools() {
+async fn tool_name_prefix_inline_changes_and_inactive_tools() {
     let model = model();
     let mut messages = transcript(&["read", "_read", "Read"]).into_messages();
     messages.push(Message::System(SystemMessage {
@@ -358,7 +291,7 @@ async fn claude_subscription_inline_changes_and_inactive_tools() {
 }
 
 #[tokio::test]
-async fn claude_subscription_long_names_and_protocol_placeholder_are_distinct() {
+async fn tool_name_prefix_long_names_and_protocol_placeholder_are_distinct() {
     let model = model();
     let long = "a".repeat(64);
     let boundary = "a".repeat(63);
@@ -390,7 +323,7 @@ async fn claude_subscription_long_names_and_protocol_placeholder_are_distinct() 
         let mut invalid = model.clone();
         invalid.compat.tool_name_prefix = Some(prefix.into());
         assert_eq!(
-            prepare_request(&invalid, &original, &options(), ServiceTier::Standard, true)
+            prepare_request(&invalid, &original, &options(), ServiceTier::Standard)
                 .err()
                 .as_deref(),
             Some("Invalid toolNamePrefix")
@@ -411,76 +344,5 @@ async fn claude_subscription_long_names_and_protocol_placeholder_are_distinct() 
             &decode(&model, prepare(&model, &original), wire).await,
             canonical,
         );
-    }
-}
-
-struct ForbiddenRewrite;
-
-#[async_trait::async_trait]
-impl RequestRewrite for ForbiddenRewrite {
-    async fn rewrite(
-        &self,
-        _: &Model,
-        _: ProviderRequest,
-    ) -> Result<ProviderRequest, crate::Error> {
-        panic!("Subscription request preparation must reject, not invoke, a rewrite");
-    }
-}
-
-#[test]
-fn claude_subscription_request_overrides_are_rejected_before_transport() {
-    let model = model();
-    let original = transcript(&["read"]);
-    for destination in [
-        "https://attacker.invalid",
-        "http://api.anthropic.com",
-        "https://api.anthropic.com.attacker.invalid",
-        "https://api.anthropic.com:444",
-        "https://user@api.anthropic.com",
-        "https://api.anthropic.com/other",
-        "https://api.anthropic.com?redirect=evil",
-        "https://api.anthropic.com#fragment",
-    ] {
-        let mut altered = model.clone();
-        altered.base_url = destination.into();
-        assert!(
-            prepare_request(&altered, &original, &options(), ServiceTier::Standard, true).is_err(),
-            "Allowed {destination}"
-        );
-    }
-    for destination in ["https://attacker.invalid", "https://api.anthropic.com"] {
-        let mut opts = options();
-        opts.auth.base_url = Some(destination.into());
-        assert!(prepare_request(&model, &original, &opts, ServiceTier::Standard, true).is_err());
-    }
-    for name in [
-        "Authorization",
-        "X-Api-Key",
-        "Host",
-        "anthropic-beta",
-        "x-custom",
-    ] {
-        let mut opts = options();
-        opts.auth.headers.insert(name.into(), "injected".into());
-        assert!(
-            prepare_request(&model, &original, &opts, ServiceTier::Standard, true).is_err(),
-            "Allowed credential header {name}"
-        );
-        for value in [Some("injected".into()), None] {
-            let mut opts = options();
-            opts.simple.headers.insert(name.into(), value);
-            assert!(
-                prepare_request(&model, &original, &opts, ServiceTier::Standard, true).is_err(),
-                "Allowed request header {name}"
-            );
-        }
-    }
-    let mut opts = options();
-    opts.rewrite = Some(Arc::new(ForbiddenRewrite));
-    assert!(prepare_request(&model, &original, &opts, ServiceTier::Standard, true).is_err());
-    for token in [None, Some(String::new()), Some(" \t".into())] {
-        let mut opts = options();
-        opts.auth.api_key = token;
-        assert!(prepare_request(&model, &original, &opts, ServiceTier::Standard, true).is_err());
     }
 }

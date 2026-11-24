@@ -2,9 +2,9 @@
 //! agent loop calls.
 
 pub mod anthropic;
-pub mod codex;
 pub mod completions;
 pub mod http;
+pub mod openai_responses;
 pub(crate) mod responses;
 pub(crate) mod sse;
 

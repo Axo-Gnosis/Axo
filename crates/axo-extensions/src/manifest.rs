@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_subscription_manifest_credential_policy() {
+    async fn oauth_only_manifest_credential_policy() {
         let temp = tempfile::tempdir().unwrap();
         for (provider, admitted) in [
             (json!({ "id": "ordinary" }), true),

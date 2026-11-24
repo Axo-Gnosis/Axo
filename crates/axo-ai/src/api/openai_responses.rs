@@ -1,7 +1,7 @@
-//! OpenAI Codex (ChatGPT subscription) Responses API over SSE. Port of pi
-//! `api/openai-codex-responses.ts`: `buildRequestBody`, `mapCodexEvents`,
-//! `parseErrorResponse` and the SSE headers. Not ported: the WebSocket transport, zstd
-//! request compression and `previous_response_id` continuation.
+//! OpenAI Responses API over SSE (`POST {base}/responses`), authenticated with a bearer API
+//! key. Port of pi `api/openai-responses.ts` with the event mapping of
+//! `openai-codex-responses.ts`, so providers that rename the terminal events (Codex) decode
+//! too. Not ported: the WebSocket transport and `previous_response_id` continuation.
 
 use std::ops::ControlFlow;
 
@@ -14,12 +14,11 @@ use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, c
 use crate::api::{
     Api, ProviderRequest, ProviderResponse, Reply, StreamOptions, header_map, respond,
 };
-use crate::auth::codex::{BASE_URL, account_id};
 use crate::event::AssistantEvent;
 use crate::model::{ApiKind, Model, tier_wire};
 use crate::thinking::clamp_level;
 use crate::transcript::{Transcript, resolve_transcript_tools, system_message_text};
-use crate::types::{ServiceTier, StopReason, ThinkingLevel, now_ms};
+use crate::types::{ServiceTier, StopReason, ThinkingLevel};
 
 /// pi `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH`.
 const PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
@@ -33,18 +32,18 @@ const RESPONSE_STATUSES: [&str; 6] = [
     "in_progress",
 ];
 
-/// The Codex Responses endpoint, authenticated with a ChatGPT OAuth access token.
-pub struct CodexApi {
+/// Streams OpenAI Responses replies.
+pub struct ResponsesApi {
     http: reqwest::Client,
 }
 
-impl CodexApi {
+impl ResponsesApi {
     pub fn new(http: reqwest::Client) -> Self {
         Self { http }
     }
 }
 
-impl Api for CodexApi {
+impl Api for ResponsesApi {
     fn stream(
         &self,
         model: &Model,
@@ -65,7 +64,7 @@ impl Api for CodexApi {
                     request?,
                     &cancel,
                     &mut reply,
-                    parse_error_response,
+                    describe,
                 )
                 .await?;
                 drive(&owned_model, response, &cancel, &mut reply).await
@@ -89,54 +88,25 @@ fn build_request(
         .as_deref()
         .map(|id| id.chars().take(PROMPT_CACHE_KEY_MAX_CHARS).collect());
     let body = build_request_body(model, transcript, opts, session_id.as_deref(), tier);
-
-    // Defaults first so auth and caller headers can override them; the auth and
-    // protocol headers always win. The account id derived from a ChatGPT token is only a
-    // default: a credential's `chatgpt-account-id` header replaces it, and other tokens
-    // send none.
-    let mut protocol_headers = vec![
-        (
-            "OpenAI-Beta".to_owned(),
-            Some("responses=experimental".to_owned()),
-        ),
-        ("accept".to_owned(), Some("text/event-stream".to_owned())),
-        (
-            "content-type".to_owned(),
-            Some("application/json".to_owned()),
-        ),
-    ];
-    if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
-        protocol_headers.extend([
-            ("session-id".to_owned(), Some(session_id.clone())),
-            ("x-client-request-id".to_owned(), Some(session_id)),
-        ]);
-    }
-    let headers = header_map([[("originator".to_owned(), Some("axo".to_owned()))]
-        .into_iter()
-        .chain(
-            token
-                .and_then(account_id)
-                .map(|id| ("chatgpt-account-id".to_owned(), Some(id))),
-        )
-        .chain(opts.configured_headers())
-        .chain(token.map(|token| ("Authorization".to_owned(), Some(format!("Bearer {token}")))))
-        .chain(protocol_headers)])?;
-
-    let base_url = opts.base_url(model);
-    let base_url = if base_url.trim().is_empty() {
-        BASE_URL.trim_end_matches('/')
-    } else {
-        base_url
-    };
-    let url = if base_url.ends_with("/codex/responses") {
-        base_url.to_owned()
-    } else if base_url.ends_with("/codex") {
-        format!("{base_url}/responses")
-    } else {
-        format!("{base_url}/codex/responses")
-    };
-
-    Ok(ProviderRequest { url, headers, body })
+    let headers = header_map([
+        vec![
+            ("accept".to_owned(), Some("text/event-stream".to_owned())),
+            (
+                "content-type".to_owned(),
+                Some("application/json".to_owned()),
+            ),
+        ],
+        opts.configured_headers().into_iter().collect(),
+        token
+            .map(|token| ("authorization".to_owned(), Some(format!("Bearer {token}"))))
+            .into_iter()
+            .collect(),
+    ])?;
+    Ok(ProviderRequest {
+        url: format!("{}/responses", opts.base_url(model)),
+        headers,
+        body,
+    })
 }
 
 /// pi `buildRequestBody`, with `streamSimple`'s thinking-level handling.
@@ -159,20 +129,23 @@ fn build_request_body(
     let request_tools = resolve_transcript_tools(&resolved, support).request_tools;
     let input = convert_messages(model, &resolved, &options);
 
-    let instructions = resolved
-        .initial_system_message()
-        .map(system_message_text)
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "You are a helpful assistant.".to_owned());
     let mut body = json!({
         "model": model.id,
         "store": false,
         "stream": true,
-        "instructions": instructions,
         "input": input,
-        "text": { "verbosity": "low" },
         "include": ["reasoning.encrypted_content"],
     });
+    if let Some(instructions) = resolved
+        .initial_system_message()
+        .map(system_message_text)
+        .filter(|text| !text.is_empty())
+    {
+        body["instructions"] = json!(instructions);
+    }
+    if let Some(max_tokens) = opts.simple.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
     if let Some(key) = prompt_cache_key {
         body["prompt_cache_key"] = json!(key);
     }
@@ -185,7 +158,7 @@ fn build_request_body(
     if let Some(temperature) = opts.simple.temperature {
         body["temperature"] = json!(temperature);
     }
-    if let Some(name) = tier_wire(ApiKind::OpenAiCodexResponses, tier) {
+    if let Some(name) = tier_wire(ApiKind::OpenAiResponses, tier) {
         body["service_tier"] = json!(name);
     }
     if !request_tools.is_empty() {
@@ -229,17 +202,17 @@ async fn drive(
     reply.start();
     let mut stream = ResponsesStream::new(model);
     read_sse(response, cancel, |sse| {
-        map_codex_event(&mut stream, &sse.data, reply)
+        map_event(&mut stream, &sse.data, reply)
     })
     .await?;
     stream.finish(reply)?;
     Ok(reply.message.stop_reason)
 }
 
-/// pi `mapCodexEvents`: Codex errors fail the response, and its terminal events
+/// pi `mapCodexEvents`: errors fail the response, and the terminal events
 /// (`response.done`, `response.completed`, `response.incomplete`) become a
 /// `response.completed` with a normalized status. Returns whether the event was terminal.
-fn map_codex_event(
+fn map_event(
     stream: &mut ResponsesStream<'_>,
     data: &str,
     reply: &mut Reply,
@@ -248,8 +221,8 @@ fn map_codex_event(
     if data.is_empty() || data == "[DONE]" {
         return Ok(ControlFlow::Continue(()));
     }
-    let mut event: Value =
-        serde_json::from_str(data).map_err(|error| format!("Invalid Codex SSE JSON: {error}"))?;
+    let mut event: Value = serde_json::from_str(data)
+        .map_err(|error| format!("Invalid Responses SSE JSON: {error}"))?;
     let Some(kind) = event.get("type").and_then(Value::as_str) else {
         return Ok(ControlFlow::Continue(()));
     };
@@ -266,7 +239,7 @@ fn map_codex_event(
             let detail = field("message")
                 .or_else(|| field("code"))
                 .map_or_else(|| event.to_string(), str::to_owned);
-            Err(format!("Codex error: {detail}"))
+            Err(format!("Responses error: {detail}"))
         }
         "response.failed" => {
             super::http::record_failure(&mut reply.message, &event);
@@ -274,7 +247,7 @@ fn map_codex_event(
                 .pointer("/response/error/message")
                 .and_then(Value::as_str)
                 .filter(|message| !message.is_empty())
-                .unwrap_or("Codex response failed")
+                .unwrap_or("Responses request failed")
                 .to_owned())
         }
         "response.done" | "response.completed" | "response.incomplete" => {
@@ -296,68 +269,22 @@ fn map_codex_event(
     }
 }
 
-/// pi `parseErrorResponse`: the provider's error message, or a friendly usage-limit
-/// message.
-fn parse_error_response(status: u16, raw: &str, body: Option<&Value>) -> String {
-    let mut message = if raw.is_empty() {
-        reqwest::StatusCode::from_u16(status)
-            .ok()
-            .and_then(|status| status.canonical_reason())
-            .unwrap_or("Request failed")
-            .to_owned()
-    } else {
-        raw.to_owned()
-    };
-    let mut friendly = None;
-    if let Some(error) = body
-        .and_then(|body| body.get("error"))
-        .filter(|error| error.is_object())
+/// The HTTP failure message: the body's `error.message`, else the raw body, else the
+/// status's reason.
+fn describe(status: u16, raw: &str, body: Option<&Value>) -> String {
+    if let Some(message) = body
+        .and_then(|body| body.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
     {
-        let field = |key: &str| {
-            error
-                .get(key)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-        };
-        let code = field("code")
-            .or_else(|| field("type"))
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if [
-            "usage_limit_reached",
-            "usage_not_included",
-            "rate_limit_exceeded",
-        ]
-        .iter()
-        .any(|pattern| code.contains(pattern))
-            || status == 429
-        {
-            let plan = field("plan_type")
-                .map(|plan| format!(" ({} plan)", plan.to_lowercase()))
-                .unwrap_or_default();
-            let when = error
-                .get("resets_at")
-                .and_then(Value::as_f64)
-                .filter(|resets_at| *resets_at != 0.0)
-                .map(|resets_at| {
-                    // Math.round: halves round up.
-                    let minutes = ((resets_at * 1000.0 - now_ms() as f64) / 60_000.0 + 0.5).floor();
-                    format!(" Try again in ~{} min.", minutes.max(0.0) as i64)
-                })
-                .unwrap_or_default();
-            friendly = Some(
-                format!("You have hit your ChatGPT usage limit{plan}.{when}")
-                    .trim()
-                    .to_owned(),
-            );
-        }
-        message = field("message")
-            .map(str::to_owned)
-            .or_else(|| friendly.clone())
-            .unwrap_or(message);
+        return message.to_owned();
     }
-    match friendly {
-        Some(friendly) => format!("{friendly}\n{raw}"),
-        None => message,
+    if !raw.is_empty() {
+        return raw.to_owned();
     }
+    reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("Request failed")
+        .to_owned()
 }

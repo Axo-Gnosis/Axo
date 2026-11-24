@@ -5,11 +5,10 @@ use std::thread::JoinHandle;
 
 use axo_ai::testing::{fixture_model, http_header_values, read_http_request_parts, serve_http};
 use axo_ai::{
-    AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, CompletionsApi,
-    Message, Model, ModelAuth, ServiceTier, SimpleStreamOptions, StreamOptions, SystemMessage,
+    AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CompletionsApi, Message, Model,
+    ModelAuth, ResponsesApi, ServiceTier, SimpleStreamOptions, StreamOptions, SystemMessage,
     TextBlock, ToolChoice, ToolSpec, Transcript,
 };
-use base64::Engine;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -48,10 +47,8 @@ async fn request_with(
     let adapter: Box<dyn Api> = match model.api {
         ApiKind::AnthropicMessages => Box::new(AnthropicApi::new(client)),
         ApiKind::OpenAiCompletions => Box::new(CompletionsApi::new(client)),
-        ApiKind::OpenAiCodexResponses => Box::new(CodexApi::new(client)),
+        ApiKind::OpenAiResponses => Box::new(ResponsesApi::new(client)),
     };
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test"}}"#);
     let events: Vec<_> = adapter
         .stream(
             &model,
@@ -72,7 +69,7 @@ async fn request_with(
                     ..simple
                 },
                 auth: ModelAuth {
-                    api_key: Some(format!("header.{payload}.signature")),
+                    api_key: Some("synthetic-key".into()),
                     headers,
                     ..Default::default()
                 },
@@ -94,7 +91,7 @@ async fn tool_disabling_keeps_definitions_and_supported_wire_fields() {
     for api in [
         ApiKind::AnthropicMessages,
         ApiKind::OpenAiCompletions,
-        ApiKind::OpenAiCodexResponses,
+        ApiKind::OpenAiResponses,
     ] {
         for choice in [None, Some(ToolChoice::None), Some(ToolChoice::Auto)] {
             let (url, server) = server(
@@ -108,7 +105,7 @@ async fn tool_disabling_keeps_definitions_and_supported_wire_fields() {
             let expected = match choice {
                 Some(ToolChoice::None) => Some("none"),
                 Some(ToolChoice::Auto) => Some("auto"),
-                None if api == ApiKind::OpenAiCodexResponses => Some("auto"),
+                None if api == ApiKind::OpenAiResponses => Some("auto"),
                 None => None,
             };
             let actual = if api == ApiKind::AnthropicMessages {
@@ -117,8 +114,8 @@ async fn tool_disabling_keeps_definitions_and_supported_wire_fields() {
                 body["tool_choice"].as_str()
             };
             assert_eq!(actual, expected);
-            if api == ApiKind::OpenAiCodexResponses {
-                assert!(body.get("max_output_tokens").is_none());
+            if api == ApiKind::OpenAiResponses {
+                assert_eq!(body["max_output_tokens"], 42);
                 assert!(body.get("max_tokens").is_none());
                 assert_eq!(body["parallel_tool_calls"], true);
             }
@@ -131,7 +128,7 @@ async fn final_http_metadata_survives_body_consumption_and_friendly_errors() {
     for api in [
         ApiKind::AnthropicMessages,
         ApiKind::OpenAiCompletions,
-        ApiKind::OpenAiCodexResponses,
+        ApiKind::OpenAiResponses,
     ] {
         let (url, server) = server(
             429,
@@ -180,7 +177,7 @@ async fn over_cap_retry_after_returns_the_original_http_failure() {
 }
 
 #[tokio::test]
-async fn sse_errors_preserve_codes_including_codex_interception() {
+async fn sse_errors_preserve_codes() {
     for (api, event) in [
         (
             ApiKind::AnthropicMessages,
@@ -191,11 +188,11 @@ async fn sse_errors_preserve_codes_including_codex_interception() {
             "data: {\"error\":{\"code\":\"upstream_stream_read_error\",\"message\":\"busy\"}}\n\n",
         ),
         (
-            ApiKind::OpenAiCodexResponses,
+            ApiKind::OpenAiResponses,
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"upstream_stream_read_error\",\"message\":\"busy\"}}}\n\n",
         ),
         (
-            ApiKind::OpenAiCodexResponses,
+            ApiKind::OpenAiResponses,
             "data: {\"type\":\"error\",\"code\":\"upstream_stream_read_error\",\"message\":\"busy\"}\n\n",
         ),
     ] {
@@ -208,13 +205,13 @@ async fn sse_errors_preserve_codes_including_codex_interception() {
 }
 
 #[tokio::test]
-async fn codex_preserves_context_overflow_failure() {
+async fn responses_preserve_context_overflow_failure() {
     let (url, server) = server(
         200,
         "Content-Type: text/event-stream\r\n",
         "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too large\"}}}\n\n",
     );
-    let output = request(ApiKind::OpenAiCodexResponses, url, None).await;
+    let output = request(ApiKind::OpenAiResponses, url, None).await;
     server.join().unwrap();
     assert_eq!(output.stop_reason, axo_ai::StopReason::Error);
     assert_eq!(
@@ -225,36 +222,11 @@ async fn codex_preserves_context_overflow_failure() {
 }
 
 #[tokio::test]
-async fn codex_account_id_header_comes_from_the_credential_else_the_token() {
-    for (headers, expected) in [
-        (
-            BTreeMap::from([(
-                "chatgpt-account-id".to_owned(),
-                "from-credential".to_owned(),
-            )]),
-            "from-credential",
-        ),
-        (BTreeMap::new(), "test"),
-    ] {
-        let (url, server) = server(400, "", r#"{"error":{"message":"stop"}}"#);
-        request_with(
-            model(ApiKind::OpenAiCodexResponses, url),
-            SimpleStreamOptions::default(),
-            headers,
-        )
-        .await;
-        let (head, _) = server.join().unwrap().pop().unwrap();
-        let values: Vec<_> = http_header_values(&head, "chatgpt-account-id").collect();
-        assert_eq!(values, [expected]);
-    }
-}
-
-#[tokio::test]
 async fn service_tiers_reach_the_wire_and_the_bill() {
     use ServiceTier::{Fast, Flex, Standard, Ultrafast};
 
     for api in [
-        ApiKind::OpenAiCodexResponses,
+        ApiKind::OpenAiResponses,
         ApiKind::OpenAiCompletions,
         ApiKind::AnthropicMessages,
     ] {
@@ -287,7 +259,7 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
                 "default"
             };
             let response = match api {
-                ApiKind::OpenAiCodexResponses => {
+                ApiKind::OpenAiResponses => {
                     let mut event = json!({"type": "response.completed", "response": {
                         "status": "completed", "usage": {"input_tokens": 4}
                     }});

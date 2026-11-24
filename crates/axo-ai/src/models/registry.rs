@@ -7,8 +7,6 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Wea
 use tokio::sync::watch;
 
 use crate::api::{ProviderTransport, RequestRewrite};
-use crate::auth::claude_subscription;
-use crate::auth::codex as codex_auth;
 use crate::auth::provider::{LoginInteraction, Provider, ProviderModels};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{Credential, CredentialSource, ModelAuth};
@@ -377,7 +375,6 @@ impl Registered {
             rewrite: self.rewrite.clone(),
             transport: self.transport.clone(),
             config_base_url: false,
-            anthropic_subscription: false,
         }
     }
 }
@@ -395,9 +392,6 @@ impl Provider {
         let id = &self.id;
         if id.is_empty() || id.contains('/') {
             return Err(Error::Config(format!("invalid provider id: {id:?}")));
-        }
-        if id == claude_subscription::PROVIDER {
-            return Err(Error::Config(format!("provider {id} is reserved")));
         }
         if self.oauth_only && (!self.requires_key || !self.env.is_empty()) {
             return Err(Error::Config(format!(
@@ -443,7 +437,6 @@ pub(super) struct Request {
     pub(super) rewrite: Option<Arc<dyn RequestRewrite>>,
     pub(super) transport: Option<Arc<dyn ProviderTransport>>,
     pub(super) config_base_url: bool,
-    pub(super) anthropic_subscription: bool,
 }
 
 impl Models {
@@ -481,15 +474,14 @@ impl Models {
                 scope: Some(scope),
             },
             anthropic: Arc::clone(&self.anthropic),
-            anthropic_subscription: Arc::clone(&self.anthropic_subscription),
             completions: Arc::clone(&self.completions),
-            codex: Arc::clone(&self.codex),
+            responses: Arc::clone(&self.responses),
         }
     }
 
     /// Subscribes to changes in the published model list or provider metadata. The generation
     /// number increases whenever `all()` or `providers()` actually changes (from `reload`,
-    /// `refresh`, timer refreshes, Codex discovery, `register`/`unregister`, `ProviderLayer`,
+    /// `refresh`, timer refreshes, runtime model listings, `register`/`unregister`, `ProviderLayer`,
     /// or `logout`). An unchanged refresh does not bump the counter.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         match &self.view.scope {
@@ -500,7 +492,7 @@ impl Models {
 
     /// Adds `provider` and its models, replacing an earlier registration of the same id. While
     /// registered it fully replaces a loaded provider of that id: the loaded models, env vars,
-    /// `models.jsonc` key, headers and overrides, and built-in login are unused until
+    /// `models.jsonc` key, headers and overrides are unused until
     /// `unregister`. A `ProviderLayer` provider of the same id hides it. `owner` is the
     /// host-assigned stable identity of the contributor whose credentials this registration uses.
     pub fn register(&self, owner: &str, provider: Provider) -> Result<(), Error> {
@@ -616,28 +608,7 @@ impl Models {
             .set(&info.slot, credential)
             .await?;
         self.view.spawn_listing(provider, false);
-        // Only a login for this still-visible loaded Codex record should refresh the account list.
-        if provider == codex_auth::PROVIDER && self.is_visible_loaded(provider, &info) {
-            let shared = Arc::clone(&self.view.shared);
-            tokio::spawn(async move {
-                if let Err(error) = shared.refresh_codex().await {
-                    tracing::warn!("model refresh failed: {error}");
-                }
-            });
-        }
         Ok(())
-    }
-
-    /// Whether `info` is the currently visible loaded provider record for `id` in this view.
-    pub(super) fn is_visible_loaded(&self, id: &str, info: &Arc<ProviderAuth>) -> bool {
-        self.view.with_registry(|base, scope| {
-            View::runtime(base, scope, id).is_none()
-                && base
-                    .loaded
-                    .providers
-                    .get(id)
-                    .is_some_and(|current| Arc::ptr_eq(current, info))
-        })
     }
 
     /// Resolve the key, headers and base-URL override for a request to `model`.
@@ -697,7 +668,6 @@ impl Models {
             let key = (model.provider.clone(), model.id.clone());
             Ok(Request {
                 model: model.clone(),
-                anthropic_subscription: auth.id == claude_subscription::PROVIDER,
                 auth,
                 headers: base
                     .loaded
@@ -881,7 +851,10 @@ mod tests {
         let base = Models::load(ModelsOptions {
             cache_dir: None,
             extended_context: false,
-            config: Default::default(),
+            config: crate::ModelsConfig::parse_jsonc(
+                r#"{"providers":{"base":{"api":"openai-completions","baseUrl":"http://127.0.0.1:9","models":[{"id":"m"}]}}}"#,
+            )
+            .unwrap(),
             credentials: Arc::new(crate::FileCredentialStore::new(
                 dir.path().join("auth.json"),
             )),

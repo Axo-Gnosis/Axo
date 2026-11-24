@@ -21,8 +21,8 @@ mod types;
 pub mod testing;
 
 pub use api::anthropic::AnthropicApi;
-pub use api::codex::CodexApi;
 pub use api::completions::CompletionsApi;
+pub use api::openai_responses::ResponsesApi;
 pub use api::{
     Api, ProviderRequest, ProviderResponse, ProviderTransport, RequestContext, RequestRewrite,
     SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,

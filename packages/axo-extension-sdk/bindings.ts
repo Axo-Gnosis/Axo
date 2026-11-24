@@ -237,7 +237,7 @@ export type Answer_Serialize = {
 };
 
 /**  The wire API a model is served through. */
-export type ApiKind = "anthropic-messages" | "openai-completions" | "openai-codex-responses";
+export type ApiKind = "anthropic-messages" | "openai-completions" | "openai-responses";
 
 /**  The reserved numeric id and path for a session artifact. */
 export type ArtifactSlot = {
@@ -2947,7 +2947,7 @@ export type ProviderOrigin =
 "layer" | 
 /**  A `Models::register` registration. */
 "registered" | 
-/**  The loaded catalog (models.dev, Codex, `models.jsonc`). */
+/**  The loaded catalog (models.dev and `models.jsonc`). */
 "loaded";
 
 export type QuestionOption = QuestionOption_Serialize | QuestionOption_Deserialize;

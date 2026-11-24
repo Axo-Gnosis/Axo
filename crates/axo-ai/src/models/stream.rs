@@ -29,12 +29,9 @@ impl Streamer for Models {
         };
         let transcript = transform_messages(transcript, &request.model);
         let api: Arc<dyn Api> = match request.model.api {
-            ApiKind::AnthropicMessages if request.anthropic_subscription => {
-                self.anthropic_subscription.clone()
-            }
             ApiKind::AnthropicMessages => self.anthropic.clone(),
             ApiKind::OpenAiCompletions => self.completions.clone(),
-            ApiKind::OpenAiCodexResponses => self.codex.clone(),
+            ApiKind::OpenAiResponses => self.responses.clone(),
         };
         let auth = resolve_auth(
             request.auth,

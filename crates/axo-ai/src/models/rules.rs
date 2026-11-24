@@ -1,4 +1,4 @@
-//! How models.dev v2 rows and Codex models become [`Model`]s. Every per-model difference
+//! How models.dev v2 rows become [`Model`]s. Every per-model difference
 //! comes from feed data; never add a rule keyed on a model id or name. A model that needs
 //! different metadata is fixed in the mapping below, by a host `models.jsonc` override, or
 //! upstream in models.dev.
@@ -10,7 +10,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::resolve::resolve_config_value;
-use crate::auth::{claude_subscription, codex};
 use crate::model::{
     ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap, tier_wire,
     valid_tier_multiplier,
@@ -18,81 +17,6 @@ use crate::model::{
 use crate::types::{ServiceTier, ThinkingLevel};
 
 use super::catalog::{Catalog, DevApi, DevCost, DevModel, DevOverride};
-use super::codex::CodexModel;
-
-const CODEX_MAX_TOKENS: u64 = 128_000;
-const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD: u64 = 272_000;
-/// Efforts of the Codex floor rows, which have no account list to read them from.
-const CODEX_FLOOR_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
-struct FloorRow {
-    id: &'static str,
-    name: &'static str,
-    context_window: u64,
-    // Input, output, cache read, cache write.
-    prices: [f64; 4],
-    // Whether reasoning effort "none" (thinking Off) is accepted.
-    off: bool,
-}
-
-/// Offline floor only; never add rows. New models arrive through Codex discovery.
-const CODEX_FLOOR: [FloorRow; 7] = [
-    FloorRow {
-        id: "gpt-6.1-sol",
-        name: "GPT-6.1 Sol",
-        context_window: 500_000,
-        prices: [2.0, 10.0, 0.1, 2.5],
-        off: false,
-    },
-    FloorRow {
-        id: "gpt-6-astra",
-        name: "GPT-6 Astra",
-        context_window: 272_000,
-        prices: [10.0, 50.0, 1.0, 12.5],
-        off: false,
-    },
-    FloorRow {
-        id: "gpt-6-sol",
-        name: "GPT-6 Sol",
-        context_window: 272_000,
-        prices: [2.0, 10.0, 0.2, 2.5],
-        off: true,
-    },
-    FloorRow {
-        id: "gpt-6-luna",
-        name: "GPT-6 Luna",
-        context_window: 272_000,
-        prices: [0.1, 0.5, 0.01, 0.125],
-        off: true,
-    },
-    FloorRow {
-        id: "gpt-5.6-luna",
-        name: "GPT-5.6 Luna",
-        context_window: 272_000,
-        prices: [0.2, 1.2, 0.02, 0.25],
-        off: true,
-    },
-    FloorRow {
-        id: "gpt-5.6-sol",
-        name: "GPT-5.6 Sol",
-        context_window: 272_000,
-        prices: [4.0, 20.0, 0.4, 5.0],
-        off: true,
-    },
-    FloorRow {
-        id: "gpt-5.6-terra",
-        name: "GPT-5.6 Terra",
-        context_window: 272_000,
-        prices: [2.0, 12.0, 0.2, 2.5],
-        off: true,
-    },
-];
-
-struct OpenAiPricing {
-    cost: Option<Cost>,
-    off: bool,
-    tiers: BTreeMap<ServiceTier, f64>,
-}
 
 /// One catalog fetch, mapped: what a rebuild needs from the feed without keeping the feed.
 pub(crate) struct CatalogModels {
@@ -100,22 +24,15 @@ pub(crate) struct CatalogModels {
     pub models: Arc<[Arc<Model>]>,
     /// API-key environment variables of each provider that contributed a model.
     pub envs: HashMap<String, Vec<String>>,
-    /// Prices, Off support (effort `"none"` listed), and service-tier multipliers of the
-    /// `openai` rows, which Codex models of the same id take.
-    openai: HashMap<String, OpenAiPricing>,
 }
 
-/// Maps every catalog row axo can serve, plus the `openai` prices Codex models take.
+/// Maps every catalog row axo can serve.
 pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
     let mut models = Vec::new();
     let mut envs = HashMap::new();
-    let mut openai = HashMap::new();
     let today = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
 
     for (provider_id, provider) in catalog {
-        if provider_id == codex::PROVIDER || provider_id == claude_subscription::PROVIDER {
-            continue;
-        }
         let before = models.len();
         for (model_id, raw) in &provider.models {
             let dev = match DevModel::deserialize(raw) {
@@ -127,21 +44,6 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
                     continue;
                 }
             };
-            if provider_id == "openai" {
-                openai.insert(
-                    model_id.clone(),
-                    OpenAiPricing {
-                        cost: catalog_cost(&dev.cost),
-                        off: dev
-                            .capabilities
-                            .reasoning
-                            .effort
-                            .iter()
-                            .any(|e| e == "none"),
-                        tiers: catalog_tiers(&dev.cost, ApiKind::OpenAiCodexResponses, &today),
-                    },
-                );
-            }
             if let Some(model) = catalog_model(provider_id, model_id, dev, &today) {
                 models.push(Arc::new(model));
             }
@@ -153,72 +55,16 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
     CatalogModels {
         models: models.into(),
         envs,
-        openai,
     }
 }
 
-/// Every catalog and Codex model, plus each contributing provider's API-key environment
-/// variables. `discovered` is the account's Codex list; without one the floor stands in.
+/// Every catalog model, plus each contributing provider's API-key environment variables.
 pub(crate) fn build(
     catalog: Option<&CatalogModels>,
-    discovered: Option<&[CodexModel]>,
 ) -> (Vec<Arc<Model>>, HashMap<String, Vec<String>>) {
-    let (mut models, mut envs) = catalog
+    catalog
         .map(|catalog| (catalog.models.to_vec(), catalog.envs.clone()))
-        .unwrap_or_default();
-
-    // Derive from the unpatched feed on every rebuild, never from a published snapshot.
-    if let Some(catalog) = catalog {
-        models.extend(
-            catalog
-                .models
-                .iter()
-                .filter(|model| {
-                    model.provider == "anthropic"
-                        && model.api == ApiKind::AnthropicMessages
-                        && model.base_url == claude_subscription::BASE_URL
-                })
-                .map(|model| {
-                    let mut model = Arc::new(model.as_ref().clone());
-                    cap_at_price_tier(&mut model);
-                    let subscription = Arc::get_mut(&mut model).expect("fresh subscription model");
-                    subscription.provider = claude_subscription::PROVIDER.to_owned();
-                    subscription.cost = None;
-                    subscription.service_tiers.clear();
-                    model
-                }),
-        );
-    }
-    envs.insert(codex::PROVIDER.to_owned(), Vec::new());
-    match discovered {
-        Some(list) => models.extend(list.iter().map(|model| {
-            codex_model(
-                CodexRow {
-                    id: &model.id,
-                    name: &model.name,
-                    context_window: model.context_window,
-                    image: model.image,
-                    thinking: thinking_map(&model.efforts, false),
-                    tiers: &model.tiers,
-                },
-                catalog,
-            )
-        })),
-        None => models.extend(CODEX_FLOOR.iter().map(|row| {
-            codex_model(
-                CodexRow {
-                    id: row.id,
-                    name: row.name,
-                    context_window: row.context_window,
-                    image: true,
-                    thinking: thinking_map(&CODEX_FLOOR_EFFORTS, false),
-                    tiers: &[],
-                },
-                catalog,
-            )
-        })),
-    }
-    (models, envs)
+        .unwrap_or_default()
 }
 
 /// Without extended context, stop at the lowest context price tier's threshold.
@@ -235,8 +81,9 @@ pub(crate) fn cap_at_price_tier(model: &mut Arc<Model>) {
 
 /// `api` keys axo serves, in the order tried when the recommended entry is not servable:
 /// a model's native wire before the OpenAI-compatible shim.
-const WIRES: [(&str, ApiKind); 2] = [
+const WIRES: [(&str, ApiKind); 3] = [
     ("messages", ApiKind::AnthropicMessages),
+    ("responses", ApiKind::OpenAiResponses),
     ("chat-completions", ApiKind::OpenAiCompletions),
 ];
 
@@ -550,90 +397,6 @@ fn context_threshold(when: &Value) -> Option<u64> {
     }
 }
 
-struct CodexRow<'a> {
-    id: &'a str,
-    name: &'a str,
-    context_window: u64,
-    image: bool,
-    thinking: ThinkingLevelMap,
-    tiers: &'a [String],
-}
-
-/// A Codex model, floor or discovered. Prices come from the catalog's `openai` row with the
-/// same id, else the floor; limits never do (the catalog lists the API's window, not the
-/// one Codex serves).
-fn codex_model(row: CodexRow<'_>, catalog: Option<&CatalogModels>) -> Arc<Model> {
-    let CodexRow {
-        id,
-        name,
-        context_window,
-        image,
-        mut thinking,
-        tiers,
-    } = row;
-    let openai = catalog.and_then(|catalog| catalog.openai.get(id));
-    let floor = CODEX_FLOOR.iter().find(|row| row.id == id);
-    let (cost, off) = match (openai, floor) {
-        (Some(pricing), _) => (pricing.cost.clone(), pricing.off),
-        (None, Some(row)) => (Some(floor_cost(row.prices)), row.off),
-        (None, None) => (None, false),
-    };
-    if off {
-        thinking
-            .entry(ThinkingLevel::Off)
-            .or_default()
-            .get_or_insert_with(|| "none".to_owned());
-    }
-    // A list with no effort axo knows and no Off is a plain model, not a reasoning one with
-    // nothing to select.
-    let reasoning = thinking.values().any(Option::is_some);
-    Arc::new(Model {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        api: ApiKind::OpenAiCodexResponses,
-        provider: codex::PROVIDER.to_owned(),
-        base_url: codex::BASE_URL.to_owned(),
-        reasoning,
-        thinking_level_map: reasoning.then_some(thinking),
-        input: if image {
-            vec![InputKind::Text, InputKind::Image]
-        } else {
-            vec![InputKind::Text]
-        },
-        cost,
-        service_tiers: tiers
-            .iter()
-            .filter_map(|id| tier_named(ApiKind::OpenAiCodexResponses, id))
-            .map(|tier| {
-                let factor = openai.and_then(|pricing| pricing.tiers.get(&tier)).copied();
-                (tier, factor.unwrap_or(1.0))
-            })
-            .collect(),
-        context_window,
-        max_tokens: CODEX_MAX_TOKENS,
-        compat: Compat::default(),
-    })
-}
-
-/// A floor row's prices with OpenAI's long-context tier (double input and cache, 1.5×
-/// output above 272K).
-fn floor_cost([input, output, cache_read, cache_write]: [f64; 4]) -> Cost {
-    let round = |value: f64| (value * 1e6).round() / 1e6;
-    Cost {
-        input,
-        output,
-        cache_read,
-        cache_write,
-        tiers: vec![CostTier {
-            input_tokens_above: OPENAI_LONG_CONTEXT_INPUT_THRESHOLD,
-            input: round(input * 2.0),
-            output: round(output * 1.5),
-            cache_read: round(cache_read * 2.0),
-            cache_write: round(cache_write * 2.0),
-        }],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,53 +460,6 @@ mod tests {
             catalog_tiers(&recovered, chat, today),
             BTreeMap::from([(ServiceTier::Fast, 2.5)])
         );
-    }
-
-    #[test]
-    fn unservable_openai_row_still_prices_codex() {
-        let catalog: Catalog = serde_json::from_value(serde_json::json!({
-            "openai": {"env": ["OPENAI_API_KEY"], "models": {
-                "offline-priced": {
-                    "type": "chat",
-                    "recommended_api": "chat-completions",
-                    "api": {"chat-completions": {
-                        "base_url": "https://example.invalid",
-                        "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
-                    }},
-                    "capabilities": {"tools": {"supported": false}, "reasoning": {"effort": ["none"]}},
-                    "cost": {
-                        "text": {"input": {"price": 4}, "output": {"price": 8}},
-                        "multipliers": [{"when": {"service_tier": {"equals": "priority"}}, "factor": 2}]
-                    }
-                },
-                "malformed": false
-            }}
-        }))
-        .unwrap();
-        let catalog = map_catalog(&catalog);
-        let (models, envs) = build(
-            Some(&catalog),
-            Some(&[CodexModel {
-                id: "offline-priced".into(),
-                name: "Priced".into(),
-                context_window: 4096,
-                image: false,
-                efforts: vec!["low".into()],
-                tiers: vec!["priority".into()],
-            }]),
-        );
-        assert!(!envs.contains_key("openai"));
-        let [model] = models.as_slice() else {
-            panic!("expected only the Codex model: {models:?}")
-        };
-        assert_eq!(model.provider, codex::PROVIDER);
-        let cost = model.cost.as_ref().unwrap();
-        assert_eq!((cost.input, cost.output), (4.0, 8.0));
-        assert_eq!(
-            model.thinking_level_map.as_ref().unwrap()[&ThinkingLevel::Off].as_deref(),
-            Some("none")
-        );
-        assert_eq!(model.service_tiers[&ServiceTier::Fast], 2.0);
     }
 
     #[test]
@@ -821,7 +537,7 @@ mod tests {
                 }
             }))
             .unwrap();
-            let (models, envs) = build(Some(&map_catalog(&catalog)), None);
+            let (models, envs) = build(Some(&map_catalog(&catalog)));
             assert!(
                 models
                     .iter()

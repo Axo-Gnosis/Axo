@@ -303,7 +303,6 @@ async fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::codex;
     use crate::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 
     fn oauth_only_info() -> ProviderAuth {
@@ -350,7 +349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_subscription_rejects_config_env_and_wrong_store_credentials() {
+    async fn oauth_only_rejects_config_env_and_wrong_store_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn CredentialStore> =
             Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
@@ -420,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_subscription_rejects_wrong_kind_callback_before_write() {
+    async fn oauth_only_rejects_wrong_kind_callback_before_write() {
         let dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn CredentialStore> =
             Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
@@ -490,7 +489,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_subscription_rechecks_credential_after_locked_refresh() {
+    async fn oauth_only_rechecks_credential_after_locked_refresh() {
         let dir = tempfile::tempdir().unwrap();
         let info = Arc::new(oauth_only_info());
         for replacement in [
@@ -613,15 +612,6 @@ mod tests {
         assert!(custom.env.is_empty());
         assert!(!custom.requires_key);
         assert!(!custom.login);
-        assert!(
-            providers
-                .iter()
-                .any(|info| info.id == codex::PROVIDER && info.login)
-        );
-        assert!(providers.iter().all(|info| info.login
-            == matches!(
-                info.id.as_str(),
-                codex::PROVIDER | super::super::claude_subscription::PROVIDER
-            )));
+        assert!(providers.iter().all(|info| !info.login));
     }
 }

@@ -236,9 +236,11 @@ async fn catalog_rows_map_from_feed_data() {
         models.find("p/groq").unwrap().api,
         ApiKind::OpenAiCompletions
     );
-    for absent in ["p/responses", "p/image"] {
-        assert!(models.find(absent).is_none(), "{absent}");
-    }
+    assert_eq!(
+        models.find("p/responses").unwrap().api,
+        ApiKind::OpenAiResponses
+    );
+    assert!(models.find("p/image").is_none());
 
     let cost = models.find("p/priced").unwrap().cost.unwrap();
     assert_eq!(cost.cache_write, 2.5);
@@ -377,242 +379,128 @@ async fn hidden_discovery_keeps_loaded_ids_without_contacting_the_endpoint() {
     let feed = Feed::start();
     feed.set("/api.json", 200, &catalog_of(&["a"]));
     feed.set("/v1/models", 200, &json!({"data": [{"id": "old"}]}));
-    feed.set(
-        "/codex/models",
-        200,
-        &json!({"models": [{"slug": "account", "context_window": 4096}]}),
-    );
-    std::fs::write(
-        dir.path().join("auth.json"),
-        r#"{"loaded/openai-codex":{"type":"api_key","key":"token"}}"#,
-    )
-    .unwrap();
     let config = json!({
         "refreshInterval": 0,
         "catalogUrl": format!("{}/api.json", feed.url),
         "providers": {
-            "local": {"api": "openai-completions", "baseUrl": format!("{}/v1", feed.url)},
-            "openai-codex": {"baseUrl": feed.url}
+            "local": {"api": "openai-completions", "baseUrl": format!("{}/v1", feed.url)}
         }
     });
     let models = Arc::new(load(dir.path(), config.clone(), false).await);
-    let request_counts = || {
-        let heads = feed.requests.lock().unwrap();
-        ["GET /v1/models ", "GET /codex/models?"]
-            .map(|prefix| heads.iter().filter(|head| head.starts_with(prefix)).count())
-    };
-    assert_eq!(request_counts(), [1, 1]);
+    assert_eq!(feed.gets("/v1/models"), 1);
     let old = models.find("local/old").unwrap();
-    let account = models.find("openai-codex/account").unwrap();
     feed.set("/v1/models", 200, &json!({"data": [{"id": "new"}]}));
     feed.set("/api.json", 200, &catalog_of(&["b"]));
 
     for gated in [false, true] {
         let layer = models.provider_layer();
-        let replacements = [&old, &account].map(|model| {
-            let mut winner = model.clone();
-            winner.id = "winner".into();
-            Provider {
-                id: winner.provider.clone(),
-                models: vec![winner],
-                env: Vec::new(),
-                requires_key: false,
-                oauth_only: false,
-                login: None,
-                rewrite: None,
-                transport: None,
-                list_models: None,
-            }
-        });
+        let mut winner = old.clone();
+        winner.id = "winner".into();
+        let replacement = Provider {
+            id: winner.provider.clone(),
+            models: vec![winner],
+            env: Vec::new(),
+            requires_key: false,
+            oauth_only: false,
+            login: None,
+            rewrite: None,
+            transport: None,
+            list_models: None,
+        };
         if gated {
             layer
-                .replace(
-                    replacements
-                        .map(|p| ("package".into(), p, Some("not ready".into())))
-                        .into(),
-                )
+                .replace(vec![(
+                    "package".into(),
+                    replacement,
+                    Some("not ready".into()),
+                )])
                 .unwrap();
         } else {
-            for provider in replacements {
-                models.register("host", provider).unwrap();
-            }
+            models.register("host", replacement).unwrap();
         }
         models
             .reload(serde_json::from_value(config.clone()).unwrap(), false)
             .await
             .unwrap();
         models.refresh().await.unwrap();
-        assert_eq!(request_counts(), [1, 1]);
+        assert_eq!(feed.gets("/v1/models"), 1);
         assert!(models.find("p/b").is_some());
         drop(layer);
         if !gated {
             assert!(models.unregister("local"));
-            assert!(models.unregister("openai-codex"));
         }
         assert_eq!(models.find("local/old").as_ref(), Some(&old));
-        assert_eq!(models.find("openai-codex/account").as_ref(), Some(&account));
         assert!(models.find("local/winner").is_none());
         assert!(models.find("local/new").is_none());
     }
     models.refresh().await.unwrap();
-    assert_eq!(request_counts(), [2, 2]);
+    assert_eq!(feed.gets("/v1/models"), 2);
     assert!(models.find("local/new").is_some());
     assert!(models.find("local/old").is_none());
 }
 
-#[tokio::test]
-async fn codex_models_come_from_the_account_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let feed = Feed::start();
-    let row = |slug: &str, visibility: &str| {
+/// Caches a catalog whose provider `p` has a 500K-window model `big` priced higher above
+/// 272K input tokens, and a plain model `other`.
+fn cache_tiered_catalog(dir: &Path) {
+    let big = dev_row(
+        "chat-completions",
+        "@ai-sdk/openai-compatible",
         json!({
-            "slug": slug, "display_name": "GPT New", "context_window": 500000,
-            "max_output_tokens": null, "input_modalities": ["text", "image"],
-            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "ultra"}],
-            "visibility": visibility
-        })
-    };
-    let mut bare = row("gpt-bare", "list");
-    bare["supported_reasoning_levels"] = json!([{"effort": "ultra"}]);
-    let mut switchable = row("gpt-switchable", "list");
-    switchable["supported_reasoning_levels"] = json!([{"effort": "none"}, {"effort": "low"}]);
-    feed.set(
-        "/codex/models",
-        200,
-        &json!({"models": [row("gpt-new", "list"), row("gpt-hidden", "hide"), bare, switchable]}),
+            "limit": {"context": 500000},
+            "cost": {"text": {"input": {"price": 1, "overrides": [
+                {"when": {"context": {"gt": 272000}}, "price": 2}
+            ]}}}
+        }),
     );
-    let mut catalog = catalog_of(&["a"]);
-    catalog["openai-codex"] = catalog_of(&["gpt-new", "impostor"])["p"].clone();
-    catalog["openai"] = json!({"models": {"gpt-new": {
-        "capabilities": {"reasoning": {"supported": true, "effort": ["none", "low", "high"]}},
-        "cost": {"text": {"input": {"price": 3}, "output": {"price": 9}}}
-    }}});
-    feed.set("/api.json", 200, &catalog);
-    let config = |url: &str| {
-        json!({
-            "refreshInterval": 0,
-            "catalogUrl": format!("{url}/api.json"),
-            "providers": {"openai-codex": {"baseUrl": url, "apiKey": "token"}}
-        })
-    };
-    let models = load(dir.path(), config(&feed.url), true).await;
-
-    let model = models.find("openai-codex/gpt-new").unwrap();
-    assert_eq!(model.api, ApiKind::OpenAiCodexResponses);
-    assert_eq!(
-        models
-            .all()
-            .iter()
-            .filter(|row| row.provider == "openai-codex" && row.id == "gpt-new")
-            .count(),
-        1
-    );
-    assert!(models.find("openai-codex/impostor").is_none());
-    let cost = model.cost.as_ref().unwrap();
-    assert_eq!((cost.input, cost.output), (3.0, 9.0));
-    assert_eq!(
-        supported_levels(&model),
-        [ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
-    );
-    assert_eq!(model.context_window, 500_000);
-    assert!(models.find("openai-codex/gpt-hidden").is_none());
-    assert!(models.find("openai-codex/gpt-6-sol").is_none());
-    let bare = models.find("openai-codex/gpt-bare").unwrap();
-    assert!(!bare.reasoning);
-    assert_eq!(supported_levels(&bare), [ThinkingLevel::Off]);
-    let switchable = models.find("openai-codex/gpt-switchable").unwrap();
-    assert_eq!(
-        supported_levels(&switchable),
-        [ThinkingLevel::Off, ThinkingLevel::Low]
-    );
-    assert_eq!(
-        switchable.thinking_level_map.unwrap()[&ThinkingLevel::Off].as_deref(),
-        Some("none")
-    );
-    let requests = feed.requests.lock().unwrap().clone();
-    let listed = requests
-        .iter()
-        .find(|head| head.contains("/codex/models"))
-        .unwrap();
-    assert!(listed.contains("client_version=999.0.0"), "{listed}");
-
-    feed.set("/codex/models", 500, &json!({}));
-    models.refresh().await.unwrap();
-    assert!(models.find("openai-codex/gpt-new").is_some());
-
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
-    let reopened = load(dir.path(), config(&closed), true).await;
-    assert!(reopened.find("openai-codex/gpt-new").is_some());
+    let other = dev_row("chat-completions", "@ai-sdk/openai-compatible", json!({}));
+    std::fs::write(
+        dir.join("models.dev.v2.json"),
+        serde_json::to_vec(&json!({"p": {"models": {"big": big, "other": other}}})).unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
 async fn built_in_windows_stop_before_expensive_context_unless_enabled() {
     let dir = tempfile::tempdir().unwrap();
+    cache_tiered_catalog(dir.path());
     for (extended_context, expected) in [(false, 272_000), (true, 500_000)] {
-        let models = Models::load(ModelsOptions {
-            cache_dir: None,
-            extended_context,
-            config: ModelsConfig::default(),
-            credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
-            http_client: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            models
-                .find("openai-codex/gpt-6.1-sol")
-                .unwrap()
-                .context_window,
-            expected,
-        );
+        let models = load(dir.path(), json!({"refreshInterval": 0}), extended_context).await;
+        assert_eq!(models.find("p/big").unwrap().context_window, expected);
     }
 }
 
 #[tokio::test]
 async fn explicit_windows_and_custom_models_bypass_price_caps() {
     let dir = tempfile::tempdir().unwrap();
-    let config = ModelsConfig::parse_jsonc(
-        r#"{
-            "providers": {
-                "openai-codex": {
-                    "modelOverrides": {
-                        "gpt-6.1-sol": { "contextWindow": 400000 }
-                    },
-                    "models": [
-                        { "id": "gpt-6-sol", "contextWindow": 450000 },
-                        {
-                            "id": "custom",
-                            "api": "openai-codex-responses",
-                            "baseUrl": "https://example.invalid",
-                            "contextWindow": 600000,
-                            "cost": { "input": 1, "output": 2, "tiers": [{
-                                "inputTokensAbove": 100000,
-                                "input": 2, "output": 4,
-                                "cacheRead": 0, "cacheWrite": 0
-                            }] }
-                        }
-                    ]
-                }
+    cache_tiered_catalog(dir.path());
+    let config = json!({
+        "refreshInterval": 0,
+        "providers": {
+            "p": {
+                "modelOverrides": {"big": {"contextWindow": 400000}},
+                "models": [
+                    {"id": "other", "contextWindow": 450000},
+                    {
+                        "id": "custom",
+                        "api": "openai-responses",
+                        "baseUrl": "https://example.invalid",
+                        "contextWindow": 600000,
+                        "cost": {"input": 1, "output": 2, "tiers": [{
+                            "inputTokensAbove": 100000,
+                            "input": 2, "output": 4,
+                            "cacheRead": 0, "cacheWrite": 0
+                        }]}
+                    }
+                ]
             }
-        }"#,
-    )
-    .unwrap();
-    let models = Models::load(ModelsOptions {
-        cache_dir: None,
-        extended_context: false,
-        config,
-        credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
-        http_client: None,
-    })
-    .await
-    .unwrap();
+        }
+    });
+    let models = load(dir.path(), config, false).await;
     for (id, expected) in [
-        ("openai-codex/gpt-6.1-sol", 400_000),
-        ("openai-codex/gpt-6-sol", 450_000),
-        ("openai-codex/custom", 600_000),
+        ("p/big", 400_000),
+        ("p/other", 450_000),
+        ("p/custom", 600_000),
     ] {
         assert_eq!(models.find(id).unwrap().context_window, expected, "{id}");
     }
@@ -699,18 +587,11 @@ async fn catalog_windows_respect_input_limits_and_lowest_price_threshold() {
 #[tokio::test]
 async fn command_api_keys_are_configuration_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let models = Models::load(ModelsOptions {
-        cache_dir: None,
-        extended_context: false,
-        config: ModelsConfig::parse_jsonc(r#"{"providers":{"openai-codex":{"apiKey":"!echo k"}}}"#)
-            .unwrap(),
-        credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
-        http_client: None,
-    })
-    .await
-    .unwrap();
+    cache_tiered_catalog(dir.path());
+    let config = json!({"refreshInterval": 0, "providers": {"p": {"apiKey": "!echo k"}}});
+    let models = load(dir.path(), config, false).await;
     assert!(matches!(
-        models.auth(&models.find("openai-codex/gpt-6-sol").unwrap()).await,
+        models.auth(&models.find("p/other").unwrap()).await,
         Err(Error::Config(message)) if message.contains("command config values")
     ));
 }
@@ -869,105 +750,6 @@ async fn subscribe_and_scoped_views_isolate_and_propagate() {
     check_snapshot();
     assert!(scope_a.auth(&model).await.is_ok());
 }
-
-#[tokio::test]
-async fn logout_removes_credential_and_clears_codex_cache() {
-    use axo_ai::CredentialStore;
-    let dir = tempfile::tempdir().unwrap();
-    let credentials = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
-    tokio::fs::write(
-        dir.path().join("codex-models.json"),
-        serde_json::to_vec(&serde_json::json!([
-            {
-                "id": "account-only",
-                "name": "Account Only",
-                "contextWindow": 8192,
-                "image": false,
-                "efforts": []
-            }
-        ]))
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let models = Models::load(ModelsOptions {
-        cache_dir: Some(dir.path().to_path_buf()),
-        extended_context: false,
-        config: ModelsConfig::parse_jsonc(r#"{"refreshInterval":0}"#).unwrap(),
-        credentials: credentials.clone(),
-        http_client: None,
-    })
-    .await
-    .unwrap();
-    let mut sub = models.subscribe();
-    let slot = models.credential_slot("openai-codex").unwrap();
-    credentials
-        .set(
-            &slot,
-            axo_ai::Credential::ApiKey {
-                key: "secret".into(),
-            },
-        )
-        .await
-        .unwrap();
-    assert!(models.find("openai-codex/account-only").is_some());
-    // Unknown Codex account model has unknown cost (None), distinct from $0.
-    assert_eq!(models.find("openai-codex/account-only").unwrap().cost, None);
-
-    // Unknown provider fails with Error::Config.
-    assert!(matches!(
-        models.logout("no-such-provider").await,
-        Err(Error::Config(_))
-    ));
-
-    // Logout removes credential, deletes codex-models.json, rebuilds from floor, and bumps S.
-    models.logout("openai-codex").await.unwrap();
-    assert!(credentials.get(&slot).await.unwrap().is_none());
-    assert!(!dir.path().join("codex-models.json").exists());
-    assert!(models.find("openai-codex/account-only").is_none());
-    assert!(models.find("openai-codex/gpt-6-sol").is_some());
-    assert!(sub.has_changed().unwrap());
-
-    // Second logout with no stored credential is a no-op Ok(()).
-    let _ = *sub.borrow_and_update();
-    models.logout("openai-codex").await.unwrap();
-    assert!(!sub.has_changed().unwrap());
-}
-
-#[tokio::test]
-async fn logout_reports_cache_removal_failure() {
-    use axo_ai::CredentialStore;
-    let dir = tempfile::tempdir().unwrap();
-    // A directory in the cache file's place makes its deletion fail.
-    std::fs::create_dir(dir.path().join("codex-models.json")).unwrap();
-    let credentials = Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
-    let models = Models::load(ModelsOptions {
-        cache_dir: Some(dir.path().to_path_buf()),
-        extended_context: false,
-        config: ModelsConfig::parse_jsonc(r#"{"refreshInterval":0}"#).unwrap(),
-        credentials: credentials.clone(),
-        http_client: None,
-    })
-    .await
-    .unwrap();
-    let slot = models.credential_slot("openai-codex").unwrap();
-    credentials
-        .set(
-            &slot,
-            axo_ai::Credential::ApiKey {
-                key: "secret".into(),
-            },
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        models.logout("openai-codex").await,
-        Err(Error::Io(_))
-    ));
-    assert!(credentials.get(&slot).await.unwrap().is_none());
-}
-
 #[tokio::test]
 async fn unknown_vs_free_cost_in_catalog_and_usage() {
     let dir = tempfile::tempdir().unwrap();
@@ -1062,185 +844,4 @@ async fn unknown_vs_free_cost_in_catalog_and_usage() {
     };
     total += &unpriced;
     assert_eq!(total.cost, None);
-}
-
-#[tokio::test]
-async fn claude_subscription_uses_only_unpatched_first_party_messages() {
-    let dir = tempfile::tempdir().unwrap();
-    let row = dev_row(
-        "messages",
-        "@ai-sdk/anthropic",
-        json!({
-            "name": "Canonical",
-            "api": {"messages": {
-                "base_url": "https://api.anthropic.com/v1",
-                "capabilities": {"system_updates": true}
-            }},
-            "modalities": {"input": ["text", "image"]},
-            "capabilities": {"reasoning": {"effort": ["low", "high"], "toggle": true}},
-            "limit": {"context": 1000000, "input": 900000, "output": 64000},
-            "cost": {
-                "text": {"input": {"price": 3, "overrides": [
-                    {"when": {"context": {"gt": 200000}}, "price": 6}
-                ]}, "output": {"price": 15}},
-                "multipliers": [{"when": {"service_tier": {"equals": "fast"}}, "factor": 2}]
-            }
-        }),
-    );
-    let gateway = dev_row("messages", "@ai-sdk/anthropic", json!({}));
-    let completions = dev_row(
-        "chat-completions",
-        "@ai-sdk/openai-compatible",
-        json!({
-            "api": {"chat-completions": {"base_url": "https://api.anthropic.com"}}
-        }),
-    );
-    let feed = json!({
-        "anthropic": {"env": ["ANTHROPIC_API_KEY"], "models": {
-            "canonical": row, "gateway": gateway, "completions": completions
-        }},
-        "other": {"models": {"not-anthropic": row}},
-        "anthropic-subscription": {"env": ["EVIL_KEY"], "models": {"injected": row}}
-    });
-    std::fs::write(
-        dir.path().join("models.dev.v2.json"),
-        serde_json::to_vec(&feed).unwrap(),
-    )
-    .unwrap();
-    let config = json!({"refreshInterval": 0, "providers": {"anthropic": {
-        "baseUrl": "https://custom.invalid",
-        "apiKey": "synthetic-key",
-        "headers": {"x-custom": "not-subscription"},
-        "models": [{"id": "alias", "api": "anthropic-messages"}],
-        "modelOverrides": {"canonical": {
-            "name": "Patched", "contextWindow": 42, "maxTokens": 7, "reasoning": false
-        }}
-    }}});
-    let baseline = load(dir.path(), json!({"refreshInterval": 0}), true).await;
-    let mut expected = baseline.find("anthropic/canonical").unwrap();
-    assert_eq!(expected.context_window, 900000);
-    assert!(!expected.service_tiers.is_empty());
-    expected.provider = "anthropic-subscription".into();
-    expected.context_window = 200000;
-    expected.cost = None;
-    expected.service_tiers.clear();
-    for extended in [false, true] {
-        let models = load(dir.path(), config.clone(), extended).await;
-        assert_eq!(
-            models.find("anthropic-subscription/canonical").unwrap(),
-            expected
-        );
-        assert_eq!(models.find("anthropic/canonical").unwrap().name, "Patched");
-        let rows = models.all();
-        let subscription: Vec<_> = rows
-            .iter()
-            .filter(|model| model.provider == "anthropic-subscription")
-            .collect();
-        assert_eq!(subscription.len(), 1);
-        assert_eq!(subscription[0].id, "canonical");
-        assert!(matches!(
-            models.auth(subscription[0]).await,
-            Err(Error::LoginRequired { provider }) if provider == "anthropic-subscription"
-        ));
-    }
-}
-
-#[tokio::test]
-async fn claude_subscription_rebuild_drops_deleted_source_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let feed = Feed::start();
-    let row = dev_row(
-        "messages",
-        "@ai-sdk/anthropic",
-        json!({
-            "api": {"messages": {"base_url": "https://api.anthropic.com/v1"}}
-        }),
-    );
-    let mut catalog = catalog_of(&["survivor"]);
-    catalog["anthropic"] = json!({"models": {"removed": row}});
-    feed.set("/api.json", 200, &catalog);
-    let config = json!({"refreshInterval": 0, "catalogUrl": format!("{}/api.json", feed.url)});
-    let models = load(dir.path(), config.clone(), true).await;
-    assert!(models.find("anthropic-subscription/removed").is_some());
-    feed.set("/api.json", 200, &catalog_of(&["survivor"]));
-    models.refresh().await.unwrap();
-    models
-        .reload(serde_json::from_value(config.clone()).unwrap(), true)
-        .await
-        .unwrap();
-    assert!(models.find("anthropic-subscription/removed").is_none());
-    assert!(models.find("p/survivor").is_some());
-    assert!(
-        models
-            .providers()
-            .iter()
-            .any(|p| p.id == "anthropic-subscription" && p.login)
-    );
-    drop(models);
-    let reopened = load(dir.path(), config, true).await;
-    assert!(reopened.find("anthropic-subscription/removed").is_none());
-}
-
-#[tokio::test]
-async fn claude_subscription_reserved_with_empty_catalog() {
-    let dir = tempfile::tempdir().unwrap();
-    let options = |config| ModelsOptions {
-        cache_dir: None,
-        extended_context: true,
-        config,
-        credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
-        http_client: None,
-    };
-    let models = Models::load(options(ModelsConfig::default()))
-        .await
-        .unwrap();
-    let id = "anthropic-subscription";
-    let info = models.providers().into_iter().find(|p| p.id == id).unwrap();
-    assert!(info.env.is_empty());
-    assert!(info.requires_key && info.oauth_only && info.login);
-    assert_eq!(info.origin, axo_ai::ProviderOrigin::Loaded);
-    assert!(!models.all().iter().any(|m| m.provider == id));
-    assert_eq!(
-        models.credential_slot(id).unwrap(),
-        "loaded/anthropic-subscription"
-    );
-    assert_eq!(
-        models.credential_source(id).await.unwrap(),
-        axo_ai::CredentialSource::None
-    );
-    let declaration = || Provider {
-        id: id.into(),
-        models: Vec::new(),
-        env: Vec::new(),
-        requires_key: false,
-        oauth_only: false,
-        login: None,
-        rewrite: None,
-        transport: None,
-        list_models: None,
-    };
-    // Manifest admission uses this same callback-free validation.
-    assert!(matches!(declaration().validate(), Err(Error::Config(e)) if e.contains("reserved")));
-    for view in [&models, &models.scoped()] {
-        assert!(
-            matches!(view.register("host", declaration()), Err(Error::Config(e)) if e.contains("reserved"))
-        );
-        assert!(matches!(
-            view.provider_layer().replace(vec![("extension".into(), declaration(), None)]),
-            Err(Error::Config(e)) if e.contains("reserved")
-        ));
-    }
-    let config = || serde_json::from_value(json!({"providers": {id: {}}})).unwrap();
-    assert!(
-        matches!(models.reload(config(), false).await, Err(Error::Config(e)) if e.contains("reserved"))
-    );
-    assert!(
-        matches!(Models::load(options(config())).await, Err(Error::Config(e)) if e.contains("reserved"))
-    );
-    assert!(
-        models
-            .providers()
-            .iter()
-            .any(|p| p.id == id && p.oauth_only && p.login)
-    );
 }

@@ -21,7 +21,7 @@ use super::{
 pub const CASES: &[Case] = &[
     case!(cold_until_a_callback_is_needed_then_rewrites_reach_http),
     case!(logins_and_refresh_run_through_the_runner),
-    case!(claude_subscription_extension_uses_generic_oauth_only_policy),
+    case!(oauth_only_extension_uses_generic_policy),
     case!(crash_counts_once_and_the_third_disables_the_group_until_retry),
     case!(load_rejection_spares_its_sibling_and_retry_reloads_it),
     case!(startup_death_fails_the_waiter_then_restarts),
@@ -107,7 +107,7 @@ fn expiring() -> Credential {
     }
 }
 
-async fn claude_subscription_extension_uses_generic_oauth_only_policy() {
+async fn oauth_only_extension_uses_generic_policy() {
     let host = Host::new().await;
     let http = Http::start();
     let mut row = crate::common::model_json("lab", &http.url);

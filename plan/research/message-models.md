@@ -103,7 +103,7 @@ The `KnownApi` chat set is defined at `types.ts:62-72`. Providers are from `prov
 | `openai-completions` (`api/openai-completions.ts`) | ant-ling, azure, baseten, cerebras, cloudflare-ai-gateway, cloudflare-workers-ai, deepseek, fireworks, github-copilot, groq, huggingface, kimi-coding, moonshotai, moonshotai-cn, nvidia, opencode, opencode-go, openrouter, qwen-token-plan(-cn, -individual), together, xiaomi, xiaomi-token-plan-{ams,cn,sgp}, zai, zai-coding-cn |
 | `openai-responses` (`api/openai-responses.ts`, shared `openai-responses-shared.ts`) | openai, meta, xai, github-copilot, cloudflare-ai-gateway, opencode, opencode-go |
 | `azure-openai-responses` | azure |
-| `openai-codex-responses` | openai-codex (ChatGPT subscription) |
+| `openai-responses` | openai-codex (ChatGPT subscription) |
 | `anthropic-messages` | anthropic, minimax, minimax-cn, fireworks, github-copilot, cloudflare-ai-gateway, opencode, opencode-go, openrouter, vercel-ai-gateway |
 | `bedrock-converse-stream` | amazon-bedrock |
 | `google-generative-ai` (shared `google-shared.ts`) | google, opencode, opencode-go |

@@ -298,7 +298,7 @@ Key risks to design around when building step 3 (script hooks):
 
 ## Track 5: Extensions (Bun host), MCP & `ast_edit`
 
-General extension-to-host UI requests and provider level 3 (extension-owned HTTP transport, response adaptation and custom streams) remain deferred. Projects declaring managed extension installs are not scheduled.
+General extension-to-host UI requests and provider level 3 is `ProviderTransport` (Rust registrations own the HTTP exchange while axo encodes, retries and decodes); extension-emitted normalized events and custom streams remain deferred. Projects declaring managed extension installs are not scheduled.
 
 ### Background studies
 

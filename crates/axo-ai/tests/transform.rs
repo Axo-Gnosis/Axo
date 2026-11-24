@@ -161,7 +161,7 @@ fn errored_and_aborted_assistant_turns_are_omitted() {
 fn pipe_tool_call_ids_are_normalized_for_anthropic() {
     let target = claude();
     let codex = model(
-        ApiKind::OpenAiCodexResponses,
+        ApiKind::OpenAiResponses,
         "openai-codex",
         "gpt-6-sol",
         vec![InputKind::Text],
