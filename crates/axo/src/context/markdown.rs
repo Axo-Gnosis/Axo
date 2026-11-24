@@ -1,10 +1,12 @@
 //! Shared discovery and validation for markdown definitions.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 use serde::Deserialize;
 
+use crate::context::{Diagnostic, DiagnosticOrigin};
 use crate::tools::files::{normalize_to_lf, split_bom};
 
 const MAX_NAME_LENGTH: usize = 64;
@@ -67,6 +69,97 @@ pub(crate) fn walk(
         .build()
 }
 
+pub(super) fn merge_code<T: Clone>(
+    files: &[T],
+    code: &[T],
+    kind: &str,
+    name: fn(&T) -> &str,
+    path: fn(&T) -> Option<&Path>,
+    body: fn(&mut T) -> &mut String,
+    validate: fn(&T, &mut dyn FnMut(String)) -> bool,
+) -> (Vec<T>, Vec<Diagnostic>) {
+    let mut definitions = files.to_vec();
+    let mut diagnostics = Vec::new();
+    let mut names: HashSet<_> = files.iter().map(name).collect();
+    for spec in code {
+        let spec_name = name(spec);
+        let mut warn = |message| {
+            diagnostics.push(Diagnostic {
+                origin: path(spec).map(|p| DiagnosticOrigin::Path(p.to_path_buf())),
+                message: format!("{kind} \"{spec_name}\": {message}"),
+            });
+        };
+        let mut spec = spec.clone();
+        let text = body(&mut spec);
+        *text = text.trim().to_owned();
+        if !validate(&spec, &mut warn) {
+            continue;
+        }
+        if names.insert(spec_name) {
+            definitions.push(spec);
+        } else {
+            warn(format!("name \"{spec_name}\" collision"));
+        }
+    }
+    (definitions, diagnostics)
+}
+
+type DefinitionParser<T> = fn(&str, String, Option<&Path>, &mut dyn FnMut(String)) -> Option<T>;
+
+pub(super) fn load_roots<T>(
+    roots: &[PathBuf],
+    name: fn(&T) -> &str,
+    fallback_name: fn(&Path, &Path) -> String,
+    parse: DefinitionParser<T>,
+) -> (Vec<T>, Vec<Diagnostic>) {
+    let mut definitions = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut names = HashSet::new();
+    let mut real_paths = HashSet::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in walk(root, |_| true).flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|extension| extension != "md") {
+                continue;
+            }
+            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if !real_paths.insert(real) {
+                continue;
+            }
+            let mut warn = |message| {
+                diagnostics.push(Diagnostic {
+                    origin: Some(DiagnosticOrigin::Path(path.to_path_buf())),
+                    message,
+                });
+            };
+            let raw = match std::fs::read_to_string(path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    warn(error.to_string());
+                    continue;
+                }
+            };
+            if let Some(spec) = parse(&raw, fallback_name(root, path), Some(path), &mut warn) {
+                if names.insert(name(&spec).to_owned()) {
+                    definitions.push(spec);
+                } else {
+                    warn(format!("name \"{}\" collision", name(&spec)));
+                }
+            }
+        }
+    }
+    (definitions, diagnostics)
+}
+
+pub(super) fn stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Lists definition-name violations in their diagnostic order.
 pub(crate) fn name_problems(name: &str) -> Vec<String> {
     let mut problems = length_problem(name).into_iter().collect::<Vec<_>>();
@@ -99,11 +192,6 @@ pub(crate) fn namespaced_name_problems(name: &str) -> Vec<String> {
 /// (`plan/roadmap.md` → `plan:roadmap`). A path outside `root` (or `root` itself) falls
 /// back to the file stem.
 pub(crate) fn derived_name(root: &Path, path: &Path) -> String {
-    let stem = |path: &Path| {
-        path.file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
     let Some(relative) = path
         .strip_prefix(root)
         .ok()
@@ -172,6 +260,107 @@ fn segment_problems(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definition_roots_dedupe_before_parse_in_walk_order() {
+        use super::super::agents::{AgentDef, load_agents};
+        use super::super::keywords::load_keywords;
+        use super::super::modes::load_modes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let alias = dir.path().join("alias");
+        let later = dir.path().join("later");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir(&later).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let bad = root.join("nested/bad.md");
+        let collision = later.join("duplicate.md");
+        std::fs::write(&bad, "---\nname: [\n---\n").unwrap();
+        std::fs::write(
+            root.join("nested/example.md"),
+            "---\nname: \"\"\n---\nexample\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("shared.md"), "---\nname: shared\n---\nfirst\n").unwrap();
+        std::fs::write(&collision, "---\nname: shared\n---\nsecond\n").unwrap();
+        let roots = [root, alias, later];
+        let (modes, mode_diag) = load_modes(&roots);
+        let (keywords, keyword_diag) = load_keywords(&roots);
+        let (agents, agent_diag) = load_agents(&roots);
+        assert_eq!(
+            modes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["nested:example", "shared"]
+        );
+        assert_eq!(
+            keywords.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["example", "shared"]
+        );
+        assert_eq!(
+            agents.iter().map(AgentDef::name).collect::<Vec<_>>(),
+            ["example", "shared"]
+        );
+        assert_eq!(modes[1].body, "first");
+        assert_eq!(keywords[1].body, "first");
+        let AgentDef::Agent(shared) = &agents[1] else {
+            panic!("expected an agent")
+        };
+        assert_eq!(shared.body, "first");
+        for diagnostics in [mode_diag, keyword_diag, agent_diag] {
+            assert_eq!(diagnostics.len(), 2);
+            assert_eq!(
+                diagnostics[0].origin,
+                Some(DiagnosticOrigin::Path(bad.clone()))
+            );
+            assert_eq!(
+                diagnostics[1].origin,
+                Some(DiagnosticOrigin::Path(collision.clone()))
+            );
+            assert_eq!(diagnostics[1].message, "name \"shared\" collision");
+        }
+    }
+
+    #[test]
+    fn mode_and_keyword_code_merge_keeps_precedence_and_warning_order() {
+        use super::super::keywords::{KeywordSpec, merge_keywords};
+        use super::super::modes::{ModeSpec, merge_modes};
+
+        let file = ("same", " file ", None);
+        let code = [
+            ("same", "duplicate", Some("/duplicate.md")),
+            ("new", " code ", None),
+            ("new", "duplicate", Some("/second.md")),
+        ];
+        macro_rules! check {
+            ($spec:ident, $merge:ident, $kind:literal) => {{
+                let spec = |(name, body, path): (&str, &str, Option<&str>)| $spec {
+                    name: name.into(),
+                    body: body.into(),
+                    path: path.map(Into::into),
+                    ..Default::default()
+                };
+                let (definitions, diagnostics) = $merge(&[spec(file)], &code.map(spec));
+                let found: Vec<_> = definitions
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.body.as_str()))
+                    .collect();
+                assert_eq!(found, [("same", " file "), ("new", "code")]);
+                assert_eq!(diagnostics.len(), 2);
+                for (diagnostic, (name, path)) in diagnostics
+                    .iter()
+                    .zip([("same", "/duplicate.md"), ("new", "/second.md")])
+                {
+                    assert_eq!(
+                        diagnostic.message,
+                        format!("{} \"{name}\": name \"{name}\" collision", $kind)
+                    );
+                    assert_eq!(diagnostic.origin, Some(DiagnosticOrigin::Path(path.into())));
+                }
+            }};
+        }
+        check!(ModeSpec, merge_modes, "mode");
+        check!(KeywordSpec, merge_keywords, "keyword");
+    }
 
     #[test]
     fn namespaced_names_need_valid_nonempty_segments() {

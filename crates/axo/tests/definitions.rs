@@ -222,7 +222,7 @@ async fn precedence_files_layer_host() {
     host.config.user.lock().unwrap().layer.agent_roots = vec![root];
     let mut opts = options(dir.path());
     opts.layer.definitions.agents = vec![agent("a", "layer"), agent("b", "layer")];
-    opts.definitions.agents = vec![agent("b", "host"), agent("c", "host")];
+    opts.host.definitions.agents = vec![agent("b", "host"), agent("c", "host")];
     let session = host.axo.create_session(opts).await.unwrap();
     let defs = session.agents();
     let agents: Vec<_> = defs

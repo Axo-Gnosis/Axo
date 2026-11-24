@@ -125,7 +125,7 @@ struct Layer {
     path: Vec<String>,
 }
 
-#[expose(block = DEV_SHELL_ENV_BLOCK, object = "types")]
+#[expose]
 impl DevShellEnv {
     /// `base`: the host snapshot every resolution starts from and falls back to.
     /// `settings`: the effective bash settings after project access filtering;

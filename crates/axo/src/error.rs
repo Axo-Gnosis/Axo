@@ -149,7 +149,7 @@ pub enum ErrorCode {
     EntryNotFound,
 }
 
-#[expose(block = ERROR_BLOCK, object = "types")]
+#[expose]
 impl Error {
     #[ext(skip = "errors cross as { code, message, details? }")]
     pub fn code(&self) -> ErrorCode {

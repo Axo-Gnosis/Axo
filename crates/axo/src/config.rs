@@ -99,7 +99,7 @@ pub enum ExtensionListError {
     Duplicate(String),
 }
 
-#[expose(block = ENABLED_EXTENSION_BLOCK, object = "types")]
+#[expose]
 impl EnabledExtension {
     /// Checks every ID and group name and rejects a repeated ID. Settings run this while
     /// deserializing; hosts passing a typed list run it themselves.
@@ -258,7 +258,7 @@ pub(crate) struct Cascade<'a> {
     pub selector: Option<&'a str>,
 }
 
-#[expose(block = SETTINGS_BLOCK, object = "types")]
+#[expose]
 impl Settings {
     pub(crate) fn first_model<'a>(
         &self,
@@ -459,7 +459,7 @@ pub struct ProjectSettings {
     pub paths: IndexMap<String, ProjectAccess>,
 }
 
-#[expose(block = PROJECT_SETTINGS_BLOCK, object = "types")]
+#[expose]
 impl ProjectSettings {
     #[ext(skip = "derivable from the value in TypeScript")]
     pub fn access_for(&self, root: &Path) -> ProjectAccess {
@@ -656,7 +656,7 @@ pub struct EffectiveConfig {
     pub context_files: Vec<PathBuf>,
 }
 
-#[expose(block = EFFECTIVE_CONFIG_BLOCK, object = "types")]
+#[expose]
 impl EffectiveConfig {
     /// Samples `source.user()`, derives access (`access` overrides the user policy), then,
     /// unless access is `Ignore` or `project.files.config` is false, applies

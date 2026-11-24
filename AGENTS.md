@@ -31,7 +31,7 @@ Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -
 - **`crates/axo-agent`**: Stateful turn loop, tool execution (`Tool`), deferred-tool routing (`route`), host tool-policy hooks (`ToolHooks`), loop-driver contract (`LoopHooks`), immutable event sink (`Persist`), queues, and cancellation.
 - **`crates/axo`**: Coding-agent harness—`Axo` host, `Session`, JSONL tree store & projection, recovery, compaction, context/skills, root session modes, scoped `ToolPolicy`, deferred tools (`call`, `tool://`), `ExecEnv`, command supervision (`ProcessSupervisor`), background jobs, the command catalog, URL `schemes`, and built-in tools.
 - **`crates/axo-extensions`**: Optional extension bridge above `axo`—`Extensions` manager, static `extension.json` discovery, supervised Bun runners (`runner.ts`) and their wire protocol, provider layers, and composition over public session APIs. Nothing below may depend on it.
-- **`crates/axo-macros`**: Procedural macros beside the runtime chain. `axo` and `axo-extensions` use `#[expose]` to generate JSON dispatch and type metadata from Rust method signatures.
+- **`crates/axo-macros`**: Procedural macros beside the runtime chain. `axo` and `axo-extensions` use parameterized `#[expose]` to generate JSON dispatch and type metadata from Rust method signatures, and bare `#[expose]` to validate withheld-only impls.
 
 ## Code Invariants
 
@@ -43,7 +43,7 @@ Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -
 - **File mutation guards**: File-mutating host tools must use `SessionTools::write_file`, which checks the write scope and `FileLedger` freshness and serializes per-path mutations. Put the returned file records in `details.files` using `axo::file_details`. See [Session tools](crates/axo/docs/extending.md#session-tools-and-supervised-subprocesses).
 - **Subprocess containment**: Every local command runs through `ProcessSupervisor` (`SessionTools::supervisor`), placing it in its own container: a process group (`process_group(0)`, group kill) under the default `Supervision::ProcessGroup`, or a cgroup v2 job under `Supervision::Cgroup`, so descendants never leak pipes.
 - **Forward-compatible storage**: Wire/config JSON field names use `camelCase`; enum values and tags retain their declared serde case. JSONL `Entry` tags use `snake_case` and must preserve `Entry::Unknown` fallback deserialization.
-- **Extension surface:** Every plain `pub` method on a guarded type must carry `#[ext]` or `#[ext(skip = "reason")]`. The `#[expose]` macro rejects unmarked methods at compile time. Register each exposed block; the surface gate below catches missing blocks. Generate the TypeScript bindings from Rust, never by hand.
+- **Extension surface:** Every plain `pub` method on a guarded type must carry `#[ext]` or `#[ext(skip = "reason")]`. The `#[expose]` macro rejects unmarked methods at compile time. Register each dispatch block; the surface gate below catches missing registrations. Generate the TypeScript bindings from Rust, never by hand.
 
 ## Development & Testing
 

@@ -488,6 +488,58 @@ async fn abandoned_drain_marks_foreground_capture_partial() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn retained_drain_failure_follows_the_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = axo(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "c1",
+                "bash",
+                json!({"command": "sh -c 'echo $$ > helper.pid; while [ ! -e release ]; do sleep 0.01; done; printf late' & echo root"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("finished")),
+        ],
+    )
+    .await;
+    let options = bash_options(dir.path());
+    let cwd = options.cwd.clone();
+    let session = host.create_session(options).await.unwrap();
+
+    assert_eq!(
+        within(session.prompt("Start the helper.")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let text = tool_text(&session.attach(None).await.missed, "c1");
+    assert!(text.contains("still running as bg_1"), "{text}");
+    assert!(!text.contains("Output capture failed"), "{text}");
+    let output = session.job_output("bg_1").unwrap();
+    let mut progress = output.progress();
+    assert!(!progress.borrow().done);
+    let artifacts = session.schemes().artifacts();
+    assert!(artifacts.live().contains(output.path()));
+
+    let pid_file = cwd.join("helper.pid");
+    until(|| std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n'))).await;
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let pipe = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{}/fd/1", pid.trim()))
+        .unwrap();
+    std::fs::write(cwd.join("release"), []).unwrap();
+    within(async { drop(progress.wait_for(|p| p.done).await.unwrap()) }).await;
+    drop(pipe);
+
+    assert!(progress.borrow().capture_failed);
+    assert_eq!(output.read(0..u64::MAX).await.unwrap(), b"root\nlate");
+    assert!(!artifacts.live().contains(output.path()));
+    let replay = axo::CommandOutput::open("bg_1".into(), output.artifact(), output.path()).unwrap();
+    assert!(replay.progress().borrow().capture_failed);
+    session.shutdown().await;
+}
+
 #[tokio::test]
 async fn async_job_result_is_delivered_once_by_idle_wake() {
     let dir = tempfile::tempdir().unwrap();
@@ -566,7 +618,7 @@ async fn host_command_is_listed_and_delivered_once() {
     let factory: ToolFactory = Arc::new(|tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
         Arc::new(LateTool(tools.clone()))
     });
-    options.tools = vec![axo::HostTool::direct(factory)];
+    options.host.tools = vec![axo::HostTool::direct(factory)];
     let session = axo.create_session(options).await.unwrap();
 
     assert_eq!(
@@ -1125,7 +1177,7 @@ async fn resume_wakes_delivers_results_an_abort_paused() {
     let mut options = bash_options(dir.path());
     let factory: ToolFactory =
         Arc::new(|_: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Hang) });
-    options.tools = vec![axo::HostTool::direct(factory)];
+    options.host.tools = vec![axo::HostTool::direct(factory)];
     let session = axo.create_session(options).await.unwrap();
 
     // Abort while the hang tool runs; the background job is still pending then.

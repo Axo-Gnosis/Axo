@@ -59,8 +59,13 @@ impl Axo {
         request: CompletionRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, AssistantEvent>, Error> {
-        let streamer = self.streamer_for(models);
-        stream_request(&*self.config, models, &*streamer, request, cancel)
+        stream_request(
+            &*self.config,
+            models,
+            self.custom_streamer.as_ref(),
+            request,
+            cancel,
+        )
     }
 
     /// Collects one request's events into the final assistant message.
@@ -76,19 +81,31 @@ impl Axo {
         models: &Arc<Models>,
         request: CompletionRequest,
     ) -> Result<AssistantMessage, Error> {
-        let cancel = CancellationToken::new();
-        let stream = self.stream_with(models, request, cancel.clone())?;
-        collect_completion(stream, cancel).await
+        complete(
+            &*self.config,
+            models,
+            self.custom_streamer.as_ref(),
+            request,
+        )
+        .await
     }
+}
+
+pub(crate) fn streamer_for(
+    models: &Arc<Models>,
+    custom_streamer: Option<&Arc<dyn Streamer>>,
+) -> Arc<dyn Streamer> {
+    custom_streamer.cloned().unwrap_or_else(|| models.clone())
 }
 
 fn stream_request(
     config: &dyn ConfigSource,
-    models: &Models,
-    streamer: &dyn Streamer,
+    models: &Arc<Models>,
+    custom_streamer: Option<&Arc<dyn Streamer>>,
     request: CompletionRequest,
     cancel: CancellationToken,
 ) -> Result<BoxStream<'static, AssistantEvent>, Error> {
+    let streamer = streamer_for(models, custom_streamer);
     // `modelRoles` is user-only, so the project layer (and with it the cwd) never matters.
     let settings =
         EffectiveConfig::resolve(config, Path::new(""), Some(ProjectAccess::Ignore))?.settings;
@@ -110,6 +127,17 @@ fn stream_request(
         },
         cancel,
     ))
+}
+
+async fn complete(
+    config: &dyn ConfigSource,
+    models: &Arc<Models>,
+    custom_streamer: Option<&Arc<dyn Streamer>>,
+    request: CompletionRequest,
+) -> Result<AssistantMessage, Error> {
+    let cancel = CancellationToken::new();
+    let stream = stream_request(config, models, custom_streamer, request, cancel.clone())?;
+    collect_completion(stream, cancel).await
 }
 
 async fn collect_completion(
@@ -205,19 +233,12 @@ impl ModelsWire<'_> {
     /// Sends a one-off request and returns the final assistant message.
     #[ext]
     pub async fn complete(&self, request: CompletionRequest) -> Result<AssistantMessage, Error> {
-        let cancel = CancellationToken::new();
-        let streamer: Arc<dyn Streamer> = self
-            .target
-            .custom_streamer
-            .clone()
-            .unwrap_or_else(|| self.target.models.clone());
-        let stream = stream_request(
+        complete(
             &*self.target.config,
             &self.target.models,
-            &*streamer,
+            self.target.custom_streamer.as_ref(),
             request,
-            cancel.clone(),
-        )?;
-        collect_completion(stream, cancel).await
+        )
+        .await
     }
 }

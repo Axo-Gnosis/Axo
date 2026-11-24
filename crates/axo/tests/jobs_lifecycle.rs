@@ -23,7 +23,7 @@ fn bash_options(dir: &Path) -> SessionOptions {
     let mut options = common::bash_options(dir);
     let factory: ToolFactory =
         Arc::new(|_: &Arc<axo::SessionTools>| -> Arc<dyn Tool> { Arc::new(Hang) });
-    options.tools = vec![axo::HostTool::direct(factory)];
+    options.host.tools = vec![axo::HostTool::direct(factory)];
     options
 }
 

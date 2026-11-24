@@ -262,6 +262,26 @@ fn whole(number: &Number) -> bool {
     number.as_f64().is_some_and(|value| value.fract() == 0.0)
 }
 
+enum NumberFitError {
+    Bounds,
+    Fractional,
+}
+
+impl NumberQuestion {
+    fn fits(&self, value: &Number) -> Result<(), NumberFitError> {
+        let number = value.as_f64();
+        if as_f64(self.min.as_ref()).is_some_and(|min| number < Some(min))
+            || as_f64(self.max.as_ref()).is_some_and(|max| number > Some(max))
+        {
+            return Err(NumberFitError::Bounds);
+        }
+        if self.integer && !whole(value) {
+            return Err(NumberFitError::Fractional);
+        }
+        Ok(())
+    }
+}
+
 /// Rejects a document the host could not render or answer.
 fn check(blocks: &[AskBlock]) -> Result<(), String> {
     let mut ids = HashSet::new();
@@ -299,16 +319,13 @@ fn check(blocks: &[AskBlock]) -> Result<(), String> {
                         return invalid("no whole number lies between min and max".into());
                     }
                 }
-                if let Some(default) = &q.default {
-                    let value = default.as_f64();
-                    if min.is_some_and(|min| value < Some(min))
-                        || max.is_some_and(|max| value > Some(max))
-                    {
-                        return invalid("default is outside min and max".into());
-                    }
-                    if q.integer && !whole(default) {
-                        return invalid("default must be a whole number".into());
-                    }
+                if let Some(default) = &q.default
+                    && let Err(reason) = q.fits(default)
+                {
+                    return invalid(match reason {
+                        NumberFitError::Bounds => "default is outside min and max".into(),
+                        NumberFitError::Fractional => "default must be a whole number".into(),
+                    });
                 }
             }
             AskBlock::Markdown(_) | AskBlock::Text(_) => {}
@@ -334,7 +351,7 @@ fn resolve(blocks: &[AskBlock], answers: Vec<Answer>) -> Result<Map<String, Valu
         let Some(id) = block.id() else { continue };
         let entry = resolve_one(block, by_id.remove(id))
             .map_err(|reason| format!("question `{id}`: {reason}"))?;
-        result.insert(id.to_owned(), entry);
+        result.insert(id.to_owned(), entry.map_or(Value::Null, Picked::into_json));
     }
     if let Some(id) = by_id.into_keys().min() {
         return Err(format!("no question `{id}`"));
@@ -342,7 +359,36 @@ fn resolve(blocks: &[AskBlock], answers: Vec<Answer>) -> Result<Map<String, Valu
     Ok(result)
 }
 
-fn resolve_one(block: &AskBlock, answer: Option<Answer>) -> Result<Value, String> {
+struct Picked {
+    value: Option<AnswerValue>,
+    other: Option<String>,
+    note: Option<String>,
+}
+
+impl Picked {
+    fn into_json(self) -> Value {
+        let mut entry = Map::new();
+        if let Some(value) = self.value {
+            entry.insert(
+                "value".into(),
+                match value {
+                    AnswerValue::Text(text) => Value::String(text),
+                    AnswerValue::Number(number) => Value::Number(number),
+                    AnswerValue::Many(values) => values.into(),
+                },
+            );
+        }
+        if let Some(other) = self.other {
+            entry.insert("other".into(), Value::String(other));
+        }
+        if let Some(note) = self.note {
+            entry.insert("note".into(), Value::String(note));
+        }
+        Value::Object(entry)
+    }
+}
+
+fn resolve_one(block: &AskBlock, answer: Option<Answer>) -> Result<Option<Picked>, String> {
     let (value, other, note) = match answer {
         Some(answer) => (
             answer.value.filter(|value| match value {
@@ -366,29 +412,26 @@ fn resolve_one(block: &AskBlock, answer: Option<Answer>) -> Result<Value, String
             AskBlock::Markdown(_) => unreachable!("markdown blocks hold no question"),
         };
         return if optional {
-            Ok(Value::Null)
+            Ok(None)
         } else {
             Err("needs an answer".into())
         };
     }
 
-    let mut entry = Map::new();
     let is_option = |q: &ChoiceQuestion, value: &str| q.options.iter().any(|o| o.value == value);
-    match block {
-        AskBlock::Choice(q) if !q.multi => match (value, other) {
-            (Some(AnswerValue::Text(value)), None) => {
-                if !is_option(q, &value) {
+    let value = match block {
+        AskBlock::Choice(q) if !q.multi => {
+            match (&value, &other) {
+                (Some(AnswerValue::Text(value)), None) if !is_option(q, value) => {
                     return Err(format!("`{value}` is not an option"));
                 }
-                entry.insert("value".into(), value.into());
+                (Some(AnswerValue::Text(_)), None) | (None, Some(_)) => {}
+                (Some(_), Some(_)) => return Err("answer an option or `other`, not both".into()),
+                (Some(_), None) => return Err("expects one option value".into()),
+                (None, None) => unreachable!("skipped answers returned above"),
             }
-            (None, Some(other)) => {
-                entry.insert("other".into(), other.into());
-            }
-            (Some(_), Some(_)) => return Err("answer an option or `other`, not both".into()),
-            (Some(_), None) => return Err("expects one option value".into()),
-            (None, None) => unreachable!("skipped answers returned above"),
-        },
+            value
+        }
         AskBlock::Choice(q) => {
             let values = match value {
                 None => Vec::new(),
@@ -404,19 +447,16 @@ fn resolve_one(block: &AskBlock, answer: Option<Answer>) -> Result<Value, String
                     return Err(format!("`{value}` is picked twice"));
                 }
             }
-            entry.insert("value".into(), values.into());
-            if let Some(other) = other {
-                entry.insert("other".into(), other.into());
-            }
+            Some(AnswerValue::Many(values))
         }
         AskBlock::Text(_) => {
             if other.is_some() || note.is_some() {
                 return Err("a text answer takes no `other` or `note`".into());
             }
-            let Some(AnswerValue::Text(value)) = value else {
+            if !matches!(&value, Some(AnswerValue::Text(_))) {
                 return Err("expects text".into());
-            };
-            entry.insert("value".into(), value.into());
+            }
+            value
         }
         AskBlock::Number(q) => {
             if other.is_some() {
@@ -425,23 +465,15 @@ fn resolve_one(block: &AskBlock, answer: Option<Answer>) -> Result<Value, String
             let Some(AnswerValue::Number(value)) = value else {
                 return Err("expects a number".into());
             };
-            let number = value.as_f64();
-            if as_f64(q.min.as_ref()).is_some_and(|min| number < Some(min))
-                || as_f64(q.max.as_ref()).is_some_and(|max| number > Some(max))
-            {
-                return Err(format!("{value} is outside min and max"));
-            }
-            if q.integer && !whole(&value) {
-                return Err(format!("{value} is not a whole number"));
-            }
-            entry.insert("value".into(), Value::Number(value));
+            q.fits(&value).map_err(|reason| match reason {
+                NumberFitError::Bounds => format!("{value} is outside min and max"),
+                NumberFitError::Fractional => format!("{value} is not a whole number"),
+            })?;
+            Some(AnswerValue::Number(value))
         }
         AskBlock::Markdown(_) => unreachable!("markdown blocks hold no question"),
-    }
-    if let Some(note) = note {
-        entry.insert("note".into(), note.into());
-    }
-    Ok(Value::Object(entry))
+    };
+    Ok(Some(Picked { value, other, note }))
 }
 
 /// The result submitted on timeout: only what the model marked (`recommended`, `prefill`,
@@ -453,23 +485,34 @@ fn defaults(blocks: &[AskBlock]) -> Map<String, Value> {
             let value = match block {
                 AskBlock::Markdown(_) => return None,
                 AskBlock::Choice(q) if q.multi => {
-                    let picks: Vec<&str> = q
+                    let picks: Vec<String> = q
                         .options
                         .iter()
                         .filter(|o| o.recommended)
-                        .map(|o| o.value.as_str())
+                        .map(|o| o.value.clone())
                         .collect();
-                    (!picks.is_empty()).then(|| json!(picks))
+                    (!picks.is_empty()).then_some(AnswerValue::Many(picks))
                 }
                 AskBlock::Choice(q) => q
                     .options
                     .iter()
                     .find(|o| o.recommended)
-                    .map(|o| json!(o.value)),
-                AskBlock::Text(q) => q.prefill.as_deref().filter(|t| !blank(t)).map(|t| json!(t)),
-                AskBlock::Number(q) => q.default.clone().map(Value::Number),
+                    .map(|o| AnswerValue::Text(o.value.clone())),
+                AskBlock::Text(q) => q
+                    .prefill
+                    .as_ref()
+                    .filter(|t| !blank(t))
+                    .map(|t| AnswerValue::Text(t.clone())),
+                AskBlock::Number(q) => q.default.clone().map(AnswerValue::Number),
             };
-            let entry = value.map_or(Value::Null, |value| json!({ "value": value }));
+            let entry = value.map_or(Value::Null, |value| {
+                Picked {
+                    value: Some(value),
+                    other: None,
+                    note: None,
+                }
+                .into_json()
+            });
             Some((block.id()?.to_owned(), entry))
         })
         .collect()
@@ -694,6 +737,91 @@ mod tests {
         assert_eq!(
             resolve(&blocks, vec![answer("n", 30.0), answer("x", 1.0)]).unwrap_err(),
             "no question `x`"
+        );
+
+        let bounded =
+            |value| number(json!({"integer": true, "min": 1, "max": 3, "default": value}));
+        for value in [1.0, 3.0] {
+            let blocks = bounded(value);
+            check(&blocks).unwrap();
+            assert_eq!(
+                Value::Object(resolve(&blocks, vec![answer("n", value)]).unwrap()),
+                json!({"n": {"value": value}})
+            );
+        }
+        for (value, default_error, answer_error) in [
+            (
+                0.5,
+                "default is outside min and max",
+                "0.5 is outside min and max",
+            ),
+            (
+                1.5,
+                "default must be a whole number",
+                "1.5 is not a whole number",
+            ),
+        ] {
+            assert_eq!(
+                check(&bounded(value)).unwrap_err(),
+                format!("question `n`: {default_error}")
+            );
+            assert_eq!(
+                resolve(&bounded(1.0), vec![answer("n", value)]).unwrap_err(),
+                format!("question `n`: {answer_error}")
+            );
+        }
+    }
+
+    #[test]
+    fn answer_entries_keep_wire_bytes() {
+        let blocks: Vec<AskBlock> = serde_json::from_value(json!([
+            {"type":"choice","id":"z","question":"?","options":[
+                {"value":"a","label":"A","recommended":true},{"value":"b","label":"B"}]},
+            {"type":"choice","id":"m","question":"?","multi":true,"options":[
+                {"value":"a","label":"A","recommended":true},{"value":"b","label":"B","recommended":true}]},
+            {"type":"text","id":"t","question":"?","prefill":"start"},
+            {"type":"number","id":"n","question":"?","default":3},
+            {"type":"text","id":"s","question":"?","optional":true}
+        ])).unwrap();
+        check(&blocks).unwrap();
+        let answers: Vec<Answer> = serde_json::from_value(json!([
+            {"id":"s"}, {"id":"n","value":2,"note":"n"}, {"id":"t","value":"text"},
+            {"id":"m","other":"extra","note":"ok"}, {"id":"z","other":"custom","note":"why"}
+        ]))
+        .unwrap();
+        let settled = r#"{"answers":{"z":{"other":"custom","note":"why"},"m":{"value":[],"other":"extra","note":"ok"},"t":{"value":"text"},"n":{"value":2,"note":"n"},"s":null}}"#;
+        let timed_out = r#"{"answers":{"z":{"value":"a"},"m":{"value":["a","b"]},"t":{"value":"start"},"n":{"value":3},"s":null},"timedOut":true}"#;
+        let timeout_prefix = "The user did not answer in time. Recommended and default values were applied; null means no answer was given.\n";
+        for (output, expected, prefix) in [
+            (
+                answered("", resolve(&blocks, answers.clone()).unwrap(), false),
+                settled,
+                "",
+            ),
+            (
+                answered(timeout_prefix, defaults(&blocks), true),
+                timed_out,
+                timeout_prefix,
+            ),
+        ] {
+            assert_eq!(output.details.unwrap().to_string(), expected);
+            let expected: Value = serde_json::from_str(expected).unwrap();
+            let pretty = serde_json::to_string_pretty(&expected["answers"]).unwrap();
+            assert!(matches!(&output.content[..], [UserBlock::Text { text }]
+                if text == &format!("{prefix}User answers:\n{pretty}")));
+        }
+
+        let mut repeated = answers.clone();
+        repeated.push(answers[3].clone());
+        assert_eq!(
+            resolve(&blocks, repeated).unwrap_err(),
+            "question `m`: answered twice"
+        );
+        let mut repeated = answers;
+        repeated[3].value = Some(AnswerValue::Many(vec!["a".into(), "a".into()]));
+        assert_eq!(
+            resolve(&blocks, repeated).unwrap_err(),
+            "question `m`: `a` is picked twice"
         );
     }
 }

@@ -21,7 +21,7 @@ pub struct ContextFile {
     pub content: String,
 }
 
-#[expose(block = CONTEXT_FILE_BLOCK, object = "types")]
+#[expose]
 impl ContextFile {
     #[ext(skip = "derivable from the value in TypeScript")]
     pub fn render(&self) -> String {
@@ -181,7 +181,7 @@ struct NestedState {
     seen: Arc<Mutex<Seen>>,
 }
 
-#[expose(block = NESTED_CONTEXT_BLOCK, object = "types")]
+#[expose]
 impl NestedContext {
     /// `root`: the project root, or `None` to disable. `startup`: system-prompt files.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]

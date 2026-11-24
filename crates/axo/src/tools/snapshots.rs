@@ -29,7 +29,7 @@ pub struct SnapshotStore {
     dir: PathBuf,
 }
 
-#[expose(block = SNAPSHOT_STORE_BLOCK, object = "types")]
+#[expose]
 impl SnapshotStore {
     pub(crate) fn new(dir: PathBuf) -> Self {
         Self { dir }

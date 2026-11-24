@@ -137,7 +137,8 @@ pub(super) struct CommandRun {
     pub(super) promoted_at: Option<i64>,
     pub(super) ended_at: Option<i64>,
     pub(super) exit: Option<CommandExit>,
-    pub(super) output: Arc<OutputState>,
+    /// `None` for replayed rows. In-process rows retain output state after closing.
+    pub(super) output: Option<Arc<OutputState>>,
     pub(super) artifact: u64,
     pub(super) mode: Mode,
     pub(super) phase: Phase,
@@ -193,7 +194,7 @@ const TAG_FAILED: u8 = 4;
 /// Records per batched index read while scanning for chunks.
 const INDEX_BATCH: u64 = 512;
 
-#[expose(block = COMMAND_OUTPUT_BLOCK, object = "types")]
+#[expose]
 impl CommandOutput {
     pub(super) fn new(
         job: String,
@@ -495,7 +496,7 @@ impl CommandRunner {
             promote: Notify::new(),
         });
         let output = Arc::new(OutputState {
-            path: artifact_path.clone(),
+            path: artifact_path,
             progress: watch::Sender::new(OutputProgress::default()),
         });
         let id = jobs.register(RegisterCommand {
@@ -509,12 +510,11 @@ impl CommandRunner {
             output: output.clone(),
         });
         let (done, mut ended) = oneshot::channel();
+        let mut changes = output.progress.subscribe();
         let shared = Arc::new(CommandShared {
             shaper: Mutex::new(Shaper::default()),
-            output,
             done: Mutex::new(Some(done)),
         });
-        let mut changes = shared.output.progress.subscribe();
         let task = tokio::spawn(
             CommandTask {
                 jobs: jobs.clone(),
@@ -524,9 +524,12 @@ impl CommandRunner {
                 control: control.clone(),
                 shared: shared.clone(),
                 process,
-                spool: Some(spool),
-                index: Some(index),
-                spool_path: artifact_path,
+                capture: Capture {
+                    spool: Some(spool),
+                    index: Some(index),
+                    error: None,
+                    output,
+                },
                 artifact,
                 timeout,
                 started_at,
@@ -640,7 +643,6 @@ struct CommandEnd {
 /// What the command task shares with the foreground waiter.
 struct CommandShared {
     shaper: Mutex<Shaper>,
-    output: Arc<OutputState>,
     /// Taken by the command task when the waiter owns the result.
     done: Mutex<Option<oneshot::Sender<CommandEnd>>>,
 }
@@ -670,9 +672,7 @@ struct CommandTask {
     control: Arc<JobControl>,
     shared: Arc<CommandShared>,
     process: Process,
-    spool: Option<File>,
-    index: Option<File>,
-    spool_path: PathBuf,
+    capture: Capture,
     artifact: u64,
     timeout: Option<Duration>,
     started_at: i64,
@@ -689,9 +689,7 @@ impl CommandTask {
             control,
             shared,
             mut process,
-            mut spool,
-            mut index,
-            spool_path,
+            mut capture,
             artifact,
             timeout,
             started_at,
@@ -699,7 +697,6 @@ impl CommandTask {
         } = self;
         let container = process.container();
         let (mut chunks, readers) = process.capture_output();
-        let mut capture_error = None;
         let mut status = None;
         let mut pipes_open = true;
         let mut drain_at: Option<Instant> = None;
@@ -708,13 +705,11 @@ impl CommandTask {
         loop {
             tokio::select! {
                 chunk = chunks.recv(), if pipes_open => match chunk {
-                    Some(Ok(chunk)) => {
-                        lock(&shared.shaper).push(&chunk.bytes);
-                        write_spool(&mut spool, &mut index, &mut capture_error, &shared.output, &chunk).await;
-                    }
-                    Some(Err(err)) => {
-                        capture_error = Some(err.to_string());
-                        shared.output.progress.send_modify(|p| p.capture_failed = true);
+                    Some(chunk) => {
+                        if let Ok(chunk) = &chunk {
+                            lock(&shared.shaper).push(&chunk.bytes);
+                        }
+                        capture.record(chunk).await;
                     }
                     None => {
                         pipes_open = false;
@@ -757,8 +752,10 @@ impl CommandTask {
         // Stopped jobs were killed; anything left is merely still dying.
         let retained = stop.is_none() && process.has_leftovers();
         if pipes_open && !retained {
-            capture_error.get_or_insert_with(|| "output drain deadline expired".to_owned());
-            shared
+            capture
+                .error
+                .get_or_insert_with(|| "output drain deadline expired".to_owned());
+            capture
                 .output
                 .progress
                 .send_modify(|p| p.capture_failed = true);
@@ -774,14 +771,11 @@ impl CommandTask {
         };
         // The model gets a log URL only for complete captures; retained and promoted rows
         // reference their log through the journal regardless, so partial logs stay readable there.
-        let full_output = (truncated && capture_error.is_none() && !pipes_open)
+        let full_output = (truncated && capture.error.is_none() && !pipes_open)
             .then(|| format!("artifact://{artifact}"));
         let keep = full_output.is_some() || retained || promoted;
         if !keep {
-            spool = None;
-            let _ = tokio::fs::remove_file(&spool_path).await;
-            index = None;
-            let _ = tokio::fs::remove_file(stream_index_path(&spool_path)).await;
+            capture.discard().await;
         }
         let body = lock(&shared.shaper).render(full_output.as_deref());
         let ended_at = axo_ai::now_ms();
@@ -852,7 +846,7 @@ impl CommandTask {
                 true,
             ),
         };
-        if let Some(err) = &capture_error {
+        if let Some(err) = &capture.error {
             text.push_str(&format!(
                 "\n\n[Output capture failed: {err}. Showing partial output only.]"
             ));
@@ -867,7 +861,7 @@ impl CommandTask {
             text.push_str(&format!(
                 "\n\nProcesses started by this command are still running as {name} (read proc://{name}; stop with kill)."
             ));
-            if capture_error.is_none() {
+            if capture.error.is_none() {
                 text.push_str(&format!(
                     " Their output continues in artifact://{artifact}."
                 ));
@@ -899,13 +893,7 @@ impl CommandTask {
                 loop {
                     tokio::select! {
                         chunk = chunks.recv(), if pipes_open => match chunk {
-                            Some(Ok(chunk)) => {
-                                write_spool(&mut spool, &mut index, &mut capture_error, &shared.output, &chunk).await;
-                            }
-                            Some(Err(err)) => {
-                                capture_error = Some(err.to_string());
-                                shared.output.progress.send_modify(|p| p.capture_failed = true);
-                            }
+                            Some(chunk) => capture.record(chunk).await,
                             None => pipes_open = false,
                         },
                         () = &mut empty => break,
@@ -920,23 +908,7 @@ impl CommandTask {
             if pipes_open {
                 loop {
                     match timeout_at(deadline, chunks.recv()).await {
-                        Ok(Some(Ok(chunk))) => {
-                            write_spool(
-                                &mut spool,
-                                &mut index,
-                                &mut capture_error,
-                                &shared.output,
-                                &chunk,
-                            )
-                            .await
-                        }
-                        Ok(Some(Err(err))) => {
-                            capture_error = Some(err.to_string());
-                            shared
-                                .output
-                                .progress
-                                .send_modify(|p| p.capture_failed = true);
-                        }
+                        Ok(Some(chunk)) => capture.record(chunk).await,
                         Ok(None) => {
                             pipes_open = false;
                             break;
@@ -950,17 +922,11 @@ impl CommandTask {
             }
         }
         drop(readers);
-        let mut failed = capture_error.is_some() || pipes_open;
-        if let Some(index) = &mut index {
-            let bytes = shared.output.progress.borrow().bytes;
-            failed |= write_span(index, bytes, if failed { TAG_FAILED } else { TAG_END })
-                .await
-                .is_err();
-        }
-        drop(spool);
+        let failed = capture.finish_index(pipes_open).await;
+        drop(capture.spool.take());
         process.close().await;
         drop(live);
-        shared.output.progress.send_modify(|progress| {
+        capture.output.progress.send_modify(|progress| {
             progress.capture_failed |= failed;
             progress.done = true;
         });
@@ -986,46 +952,77 @@ async fn write_span(index: &mut File, end: u64, tag: u8) -> std::io::Result<()> 
     index.flush().await
 }
 
-/// Failures retain the readable prefix and never invent labels for unindexed bytes.
-async fn write_spool(
-    spool: &mut Option<File>,
-    index: &mut Option<File>,
-    capture_error: &mut Option<String>,
-    output: &OutputState,
-    chunk: &PipeChunk,
-) {
-    let mut written = 0;
-    if let Some(file) = spool {
-        let result = async {
-            file.write_all(&chunk.bytes).await?;
-            file.flush().await?;
-            written = chunk.bytes.len() as u64;
-            if let Some(index) = index {
-                let end = output.progress.borrow().bytes + written;
-                let tag = match chunk.pipe {
-                    Pipe::Stdout => TAG_STDOUT,
-                    Pipe::Stderr => TAG_STDERR,
-                };
-                write_span(index, end, tag).await?;
+struct Capture {
+    spool: Option<File>,
+    index: Option<File>,
+    error: Option<String>,
+    output: Arc<OutputState>,
+}
+
+impl Capture {
+    /// Failures retain the readable prefix and never invent labels for unindexed bytes.
+    async fn record(&mut self, chunk: std::io::Result<PipeChunk>) {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.output
+                    .progress
+                    .send_modify(|p| p.capture_failed = true);
+                return;
             }
-            Ok::<_, std::io::Error>(())
+        };
+        let mut written = 0;
+        if let Some(file) = &mut self.spool {
+            let result = async {
+                file.write_all(&chunk.bytes).await?;
+                file.flush().await?;
+                written = chunk.bytes.len() as u64;
+                if let Some(index) = &mut self.index {
+                    let end = self.output.progress.borrow().bytes + written;
+                    let tag = match chunk.pipe {
+                        Pipe::Stdout => TAG_STDOUT,
+                        Pipe::Stderr => TAG_STDERR,
+                    };
+                    write_span(index, end, tag).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            }
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(path = %self.output.path.display(), %err, "bash output capture failed");
+                // Discard an unflushed partial write so the raw artifact is exactly the
+                // published prefix. A failed index remains a valid labeled prefix.
+                let prefix = self.output.progress.borrow().bytes + written;
+                let _ = file.set_len(prefix).await;
+                self.spool = None;
+                self.index = None;
+                self.error = Some(err.to_string());
+            }
         }
-        .await;
-        if let Err(err) = result {
-            tracing::warn!(path = %output.path.display(), %err, "bash output capture failed");
-            // Discard an unflushed partial write so the raw artifact is exactly the
-            // published prefix. A failed index remains a valid labeled prefix.
-            let prefix = output.progress.borrow().bytes + written;
-            let _ = file.set_len(prefix).await;
-            *spool = None;
-            *index = None;
-            *capture_error = Some(err.to_string());
-        }
+        self.output.progress.send_modify(|progress| {
+            progress.bytes += written;
+            progress.capture_failed = self.error.is_some();
+        });
     }
-    output.progress.send_modify(|progress| {
-        progress.bytes += written;
-        progress.capture_failed = capture_error.is_some();
-    });
+
+    async fn discard(&mut self) {
+        self.spool = None;
+        let _ = tokio::fs::remove_file(&self.output.path).await;
+        self.index = None;
+        let _ = tokio::fs::remove_file(stream_index_path(&self.output.path)).await;
+    }
+
+    async fn finish_index(&mut self, pipes_open: bool) -> bool {
+        let mut failed = self.error.is_some() || pipes_open;
+        if let Some(index) = &mut self.index {
+            let bytes = self.output.progress.borrow().bytes;
+            failed |= write_span(index, bytes, if failed { TAG_FAILED } else { TAG_END })
+                .await
+                .is_err();
+        }
+        failed
+    }
 }
 
 /// Streaming output with bounded memory: the head is kept until it is
@@ -1189,33 +1186,36 @@ mod tests {
     async fn failed_stream_index_preserves_raw_prefix_without_false_labels() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("partial.log");
-        let state = OutputState {
-            path: path.clone(),
-            progress: watch::Sender::new(OutputProgress::default()),
-        };
-        let mut spool = Some(File::create(&path).await.unwrap());
         std::fs::write(stream_index_path(&path), []).unwrap();
-        // A real failing sink exercises index failure after successful raw capture.
-        let mut index = Some(File::options().write(true).open("/dev/full").await.unwrap());
-        let mut error = None;
+        let mut capture = Capture {
+            spool: Some(File::create(&path).await.unwrap()),
+            // A real failing sink exercises index failure after successful raw capture.
+            index: Some(File::options().write(true).open("/dev/full").await.unwrap()),
+            error: None,
+            output: Arc::new(OutputState {
+                path: path.clone(),
+                progress: watch::Sender::new(OutputProgress::default()),
+            }),
+        };
         let chunk = PipeChunk {
             pipe: Pipe::Stderr,
             bytes: vec![0xff, 0, 42],
         };
-        write_spool(&mut spool, &mut index, &mut error, &state, &chunk).await;
-        assert!(error.is_some());
-        assert!(state.progress.borrow().capture_failed);
-        assert_eq!(state.progress.borrow().bytes, 3);
-        assert_eq!(std::fs::read(&path).unwrap(), chunk.bytes);
-        assert!(spool.is_none());
-        assert!(index.is_none());
+        let expected = chunk.bytes.clone();
+        capture.record(Ok(chunk)).await;
+        assert!(capture.error.is_some());
+        assert!(capture.output.progress.borrow().capture_failed);
+        assert_eq!(capture.output.progress.borrow().bytes, 3);
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert!(capture.spool.is_none());
+        assert!(capture.index.is_none());
         let replay = CommandOutput::open("bg_0".into(), 0, &path).unwrap();
         assert!(replay.progress().borrow().capture_failed);
         assert_eq!(
             replay.read_chunks(0..3).await.unwrap(),
             vec![OutputChunk {
                 stream: OutputStream::Merged,
-                bytes: chunk.bytes,
+                bytes: expected,
             }]
         );
     }
@@ -1224,12 +1224,15 @@ mod tests {
     async fn raw_streams_survive_retained_replay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0.bash.streams.log");
-        let state = OutputState {
-            path: path.clone(),
-            progress: watch::Sender::new(OutputProgress::default()),
+        let mut capture = Capture {
+            spool: Some(File::create(&path).await.unwrap()),
+            index: Some(File::create(stream_index_path(&path)).await.unwrap()),
+            error: None,
+            output: Arc::new(OutputState {
+                path: path.clone(),
+                progress: watch::Sender::new(OutputProgress::default()),
+            }),
         };
-        let mut spool = Some(File::create(&path).await.unwrap());
-        let mut index = Some(File::create(stream_index_path(&path)).await.unwrap());
         let supervisor = ProcessSupervisor::new(crate::exec::host::Supervision::ProcessGroup);
         let mut process = supervisor
             .spawn(ExecSpec {
@@ -1245,27 +1248,25 @@ mod tests {
             .await
             .unwrap();
         let (mut chunks, readers) = process.capture_output();
-        let mut error = None;
         let mut captured = Vec::new();
         while let Some(chunk) = chunks.recv().await {
             let chunk = chunk.unwrap();
-            write_spool(&mut spool, &mut index, &mut error, &state, &chunk).await;
             captured.push(OutputChunk {
                 stream: match chunk.pipe {
                     Pipe::Stdout => OutputStream::Stdout,
                     Pipe::Stderr => OutputStream::Stderr,
                 },
-                bytes: chunk.bytes,
+                bytes: chunk.bytes.clone(),
             });
+            capture.record(Ok(chunk)).await;
         }
         assert!(process.wait().await.unwrap().success());
         process.close().await;
         drop(readers);
-        assert!(error.is_none());
-        let bytes = state.progress.borrow().bytes;
-        write_span(index.as_mut().unwrap(), bytes, 3).await.unwrap();
-        drop(spool);
-        drop(index);
+        assert!(capture.error.is_none());
+        let bytes = capture.output.progress.borrow().bytes;
+        assert!(!capture.finish_index(false).await);
+        drop(capture);
 
         // Replay is independent of the original job registry and writers.
         let replay = CommandOutput::open("bg_0".into(), 0, &path).unwrap();

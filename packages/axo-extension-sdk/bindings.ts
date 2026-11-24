@@ -980,7 +980,7 @@ export type Diagnostic_Serialize = {
 	message: string,
 };
 
-export type DispatchCode = "unknown_object" | "unknown_method" | "invalid_arguments" | "encode" | "tool" | "no_session";
+export type DispatchCode = "unknown_method" | "invalid_arguments" | "encode" | "tool" | "no_session";
 
 /**  What one session runs with. */
 export type EffectiveConfig = EffectiveConfig_Serialize | EffectiveConfig_Deserialize;
@@ -1249,8 +1249,6 @@ export type Entry_Deserialize =
 	/**  Names of the keywords that fired for this submission, deduplicated, in first-occurrence order. */
 	keywords?: string[],
 	requestId?: string | null,
-	/**  The teammate that submitted this input, if any. */
-	sender?: string | null,
 	/**  Originating session and routing mode for inter-agent submissions. */
 	provenance?: SubmissionProvenance_Deserialize | null,
 	custom?: SubmittedCustom | null,
@@ -1485,8 +1483,6 @@ export type Entry_Serialize =
 	/**  Names of the keywords that fired for this submission, deduplicated, in first-occurrence order. */
 	keywords?: string[],
 	requestId?: string,
-	/**  The teammate that submitted this input, if any. */
-	sender?: string,
 	/**  Originating session and routing mode for inter-agent submissions. */
 	provenance?: SubmissionProvenance_Serialize,
 	custom?: SubmittedCustom,
@@ -4812,21 +4808,21 @@ export type ToolsRewriteUrlsArgs = {
 
 export type ToolsRewriteUrlsResult = string;
 
-export type ToolsRunCommandArgs = ToolsRunCommandArgs_Serialize | ToolsRunCommandArgs_Deserialize;
+export type ToolsRunBashArgs = ToolsRunBashArgs_Serialize | ToolsRunBashArgs_Deserialize;
 
-export type ToolsRunCommandArgs_Deserialize = {
+export type ToolsRunBashArgs_Deserialize = {
 	request: BashRequest_Deserialize,
 };
 
-export type ToolsRunCommandArgs_Serialize = {
+export type ToolsRunBashArgs_Serialize = {
 	request: BashRequest_Serialize,
 };
 
-export type ToolsRunCommandResult = ToolsRunCommandResult_Serialize | ToolsRunCommandResult_Deserialize;
+export type ToolsRunBashResult = ToolsRunBashResult_Serialize | ToolsRunBashResult_Deserialize;
 
-export type ToolsRunCommandResult_Deserialize = ToolOutput_Deserialize;
+export type ToolsRunBashResult_Deserialize = ToolOutput_Deserialize;
 
-export type ToolsRunCommandResult_Serialize = ToolOutput_Serialize;
+export type ToolsRunBashResult_Serialize = ToolOutput_Serialize;
 
 export type ToolsSchemeContextResult = SchemeContext;
 
@@ -5042,22 +5038,6 @@ export interface Session {
    */
   agent(signal?: AbortSignal): Promise<SessionAgentResult_Serialize>;
   /**
-   * The currently selected model.
-   */
-  model(signal?: AbortSignal): Promise<SessionModelResult_Serialize>;
-  /**
-   * The thinking level applied to the current model.
-   */
-  thinking(signal?: AbortSignal): Promise<SessionThinkingResult>;
-  /**
-   * The chosen service tier; it applies only on models that support it.
-   */
-  serviceTier(signal?: AbortSignal): Promise<SessionServiceTierResult>;
-  /**
-   * The tier requests are sent with on the current model.
-   */
-  effectiveServiceTier(signal?: AbortSignal): Promise<SessionEffectiveServiceTierResult>;
-  /**
    * The effective configuration for this session.
    */
   config(signal?: AbortSignal): Promise<SessionConfigResult_Serialize>;
@@ -5143,10 +5123,6 @@ export interface Session {
   abort(signal?: AbortSignal): Promise<void>;
   // withheld: shutdown — lifecycle belongs to the host
   /**
-   * Switches the model from the next request; the thinking level is clamped to it.
-   */
-  setModel(model: SessionSetModelArgs_Deserialize["model"], signal?: AbortSignal): Promise<void>;
-  /**
    * Switches the root persona from the next request, applying its model selector when
    * present. Changing the system prompt and tools is cache-heavy on models without
    * mid-conversation system-message and tool changes.
@@ -5160,15 +5136,6 @@ export interface Session {
   // withheld: setTools — replaces the host's own registrations; extensions register through their manifest
   // withheld: setDefinitions — replaces the host's own registrations; extensions register through their manifest
   // withheld: setLayer — replaces the host's own registrations; extensions register through their manifest
-  /**
-   * Sets the thinking level from the next request, clamped to the model; returns the
-   * level applied.
-   */
-  setThinking(level: SessionSetThinkingArgs["level"], signal?: AbortSignal): Promise<SessionSetThinkingResult>;
-  /**
-   * Chooses the service tier from the next request; returns the tier the current model applies.
-   */
-  setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
   /**
    * Settles the pending question of tool call `call_id`. A submission that does not fit
    * the document returns `Error::InvalidInput` and leaves the question pending.
@@ -5195,6 +5162,35 @@ export interface Session {
   // withheld: subscribe — live receiver; the bridge serves session.subscribe
   // withheld: attach — returns a live receiver; use entries, live and subscribe
   // withheld: fork — lifecycle belongs to the host
+  /**
+   * The currently selected model.
+   */
+  model(signal?: AbortSignal): Promise<SessionModelResult_Serialize>;
+  /**
+   * The thinking level applied to the current model.
+   */
+  thinking(signal?: AbortSignal): Promise<SessionThinkingResult>;
+  /**
+   * The chosen service tier; it applies only on models that support it.
+   */
+  serviceTier(signal?: AbortSignal): Promise<SessionServiceTierResult>;
+  /**
+   * The tier requests are sent with on the current model.
+   */
+  effectiveServiceTier(signal?: AbortSignal): Promise<SessionEffectiveServiceTierResult>;
+  /**
+   * Switches the model from the next request; the thinking level is clamped to it.
+   */
+  setModel(model: SessionSetModelArgs_Deserialize["model"], signal?: AbortSignal): Promise<void>;
+  /**
+   * Sets the thinking level from the next request, clamped to the model; returns the
+   * level applied.
+   */
+  setThinking(level: SessionSetThinkingArgs["level"], signal?: AbortSignal): Promise<SessionSetThinkingResult>;
+  /**
+   * Chooses the service tier from the next request; returns the tier the current model applies.
+   */
+  setServiceTier(tier: SessionSetServiceTierArgs["tier"], signal?: AbortSignal): Promise<SessionSetServiceTierResult>;
   // withheld: prompt — records caller provenance; see the wire method
   // withheld: promptWith — records caller provenance; see the wire method
   // withheld: steer — records caller provenance; see the wire method
@@ -5381,7 +5377,7 @@ export interface Tools {
   /**
    * Runs a supervised bash command in this invocation's context.
    */
-  runCommand(request: ToolsRunCommandArgs_Deserialize["request"], signal?: AbortSignal): Promise<ToolsRunCommandResult_Serialize>;
+  runBash(request: ToolsRunBashArgs_Deserialize["request"], signal?: AbortSignal): Promise<ToolsRunBashResult_Serialize>;
   /**
    * Rewrites scheme URLs in a command to their filesystem paths.
    */
@@ -5454,7 +5450,7 @@ export interface Tools {
    * The bash access of the session's current scope (agent, mode and child ceiling).
    */
   bashAccess(signal?: AbortSignal): Promise<ToolsBashAccessResult>;
-  // withheld: runCommand — needs the live tool call; tools.runCommand
+  // withheld: runCommand — needs the live tool call; tools.runBash
   /**
    * Cleans and resolves a scheme URL or ordinary filesystem path.
    */
@@ -5489,7 +5485,7 @@ export interface Host {
   // withheld: models — live registry; reached through the models object
   // withheld: invoke — the dispatcher itself
   // withheld: invokeModels — the dispatcher itself
-  // withheld: supervisor — live process handles; commands go through tools.runCommand
+  // withheld: supervisor — live process handles; commands go through tools.runBash
   // withheld: createSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: openSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: session — returns a live session; ctx.session(id) reaches it

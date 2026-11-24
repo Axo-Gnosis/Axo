@@ -188,12 +188,9 @@ pub(crate) async fn prepare(
                     .locate(&path)
                     .await
                     .map_err(|error| Error::InvalidInput(error.0))?
+                    .existing()
                 {
-                    Located::File { path, url, .. } => Some(if url.is_none() {
-                        crate::tools::existing_variant(path)
-                    } else {
-                        path
-                    }),
+                    Located::File { path, .. } => Some(path),
                     Located::Virtual { .. } => None,
                 };
                 if let Some(target) = target

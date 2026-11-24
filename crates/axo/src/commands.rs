@@ -65,7 +65,7 @@ pub trait CommandHandler: Send + Sync {
     async fn run(&self, session: &Session, args: &str) -> Result<(), Error>;
 }
 
-/// A command a host registers through `SessionOptions::commands` or
+/// A command a host registers through `SessionOptions::host.commands` or
 /// `Session::set_commands`.
 #[derive(Clone)]
 pub struct RegisteredCommand {
@@ -377,7 +377,7 @@ impl Builtin {
     }
 }
 
-#[expose(block = COMMAND_BLOCK, object = "types")]
+#[expose]
 impl Command {
     /// Decodes a built-in command from JSON arguments; `null` counts as `{}`.
     #[ext(skip = "no receiver; served by host.decodeCommand")]

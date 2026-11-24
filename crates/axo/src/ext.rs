@@ -103,7 +103,6 @@ pub enum InvokeErrorCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchCode {
-    UnknownObject,
     UnknownMethod,
     InvalidArguments,
     Encode,
@@ -113,8 +112,6 @@ pub enum DispatchCode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InvokeError {
-    #[error("Unknown object: {0}")]
-    UnknownObject(String),
     #[error("Unknown method: {0}")]
     UnknownMethod(String),
     #[error("{0}")]
@@ -133,12 +130,11 @@ pub enum InvokeError {
     },
 }
 
-#[expose(block = INVOKE_ERROR_BLOCK, object = "types")]
+#[expose]
 impl InvokeError {
     #[ext(skip = "errors cross as { code, message, details? }")]
     pub fn code(&self) -> InvokeErrorCode {
         match self {
-            Self::UnknownObject(_) => InvokeErrorCode::Dispatch(DispatchCode::UnknownObject),
             Self::UnknownMethod(_) => InvokeErrorCode::Dispatch(DispatchCode::UnknownMethod),
             Self::InvalidArguments(_) => InvokeErrorCode::Dispatch(DispatchCode::InvalidArguments),
             Self::Encode(_) => InvokeErrorCode::Dispatch(DispatchCode::Encode),
@@ -175,6 +171,7 @@ pub struct Base64(#[serde(with = "crate::input::base64_bytes")] pub Vec<u8>);
 
 pub(crate) const SESSION_BLOCKS: &[&Block<Session>] = &[
     &crate::session::SESSION_CORE,
+    &crate::session::selection::SESSION_SELECTION,
     &crate::session::delivery::SESSION_DELIVERY,
     &crate::session::wire::SESSION_WIRE,
     &crate::session::maintenance::SESSION_MAINTENANCE,
@@ -215,64 +212,9 @@ fn metas<T>(blocks: &[&'static Block<T>]) -> Vec<BlockMeta> {
         .collect()
 }
 
-/// Blocks of data types whose public methods are all withheld.
-fn types() -> Vec<BlockMeta> {
-    let blocks = [
-        metas(&[&crate::axo::AXO_BUILDER_BLOCK]),
-        metas(&[&crate::commands::COMMAND_BLOCK]),
-        metas(&[&crate::config::EFFECTIVE_CONFIG_BLOCK]),
-        metas(&[&crate::config::ENABLED_EXTENSION_BLOCK]),
-        metas(&[&crate::config::PROJECT_SETTINGS_BLOCK]),
-        metas(&[&crate::config::SETTINGS_BLOCK]),
-        metas(&[&crate::context::agents::AGENT_DEF_BLOCK]),
-        metas(&[&crate::context::agents::AGENT_SPEC_BLOCK]),
-        metas(&[&crate::context::agents::RUN_AS_BLOCK]),
-        metas(&[&crate::context::agents::TEAM_MEMBER_BLOCK]),
-        metas(&[&crate::context::files::CONTEXT_FILE_BLOCK]),
-        metas(&[&crate::context::files::NESTED_CONTEXT_BLOCK]),
-        metas(&[&crate::context::keywords::KEYWORD_SPEC_BLOCK]),
-        metas(&[&crate::context::modes::BASH_ACCESS_BLOCK]),
-        metas(&[&crate::context::modes::MODE_SPEC_BLOCK]),
-        metas(&[&crate::context::modes::TOOL_LIMITS_BLOCK]),
-        metas(&[&crate::error::ERROR_BLOCK]),
-        metas(&[&crate::jobs::JOB_STATUS_BLOCK]),
-        metas(&[&crate::jobs::command::COMMAND_OUTPUT_BLOCK]),
-        metas(&[&crate::store::ENTRY_ID_BLOCK]),
-        metas(&[&crate::store::HEADER_BLOCK]),
-        metas(&[&crate::store::ENTRY_BASE_BLOCK]),
-        metas(&[&crate::store::ENTRY_BLOCK]),
-        metas(&[&crate::store::JSONL_STORE_BLOCK]),
-        metas(&[&crate::store::PROJECTION_BLOCK]),
-        metas(&[&crate::session::SESSION_EVENT_BLOCK]),
-        metas(&[&crate::session::spawn::CHILD_HANDLE_BLOCK]),
-        metas(&[&crate::session::spawn::TEAM_HANDLE_BLOCK]),
-        metas(&[&crate::schemes::SCHEMES_BLOCK]),
-        metas(&[&crate::schemes::artifact::ARTIFACTS_BLOCK]),
-        metas(&[&crate::exec::STATIC_ENV_BLOCK]),
-        metas(&[&crate::exec::devshell::DEV_SHELL_ENV_BLOCK]),
-        metas(&[&crate::exec::host::PROCESS_SUPERVISOR_BLOCK]),
-        metas(&[&crate::exec::host::PROCESS_BLOCK]),
-        metas(&[&crate::exec::host::CONTAINER_BLOCK]),
-        metas(&[&INVOKE_ERROR_BLOCK]),
-        metas(&[&crate::tools::HOST_TOOL_BLOCK]),
-        metas(&[&crate::tools::FILE_LEDGER_BLOCK]),
-        metas(&[&crate::tools::snapshots::SNAPSHOT_STORE_BLOCK]),
-        metas(&[&crate::tools::SNAPSHOT_STORE_CHANGES]),
-    ];
-    let blocks: Vec<BlockMeta> = blocks.into_iter().flatten().collect();
-    for block in &blocks {
-        assert!(
-            block.entries.iter().all(|meta| meta.skip.is_some()),
-            "types block {} has a callable method",
-            block.name
-        );
-    }
-    blocks
-}
-
-/// Extension objects and their callable and withheld methods.
+/// Metadata for the four dispatched extension objects.
 pub fn objects() -> &'static [Object] {
-    static OBJECTS: LazyLock<[Object; 5]> = LazyLock::new(|| {
+    static OBJECTS: LazyLock<[Object; 4]> = LazyLock::new(|| {
         let mut tools = metas(crate::tools::TOOLS_BLOCKS);
         tools.extend(metas(crate::tools::TOOLS_BASE_BLOCKS));
         let mut names = HashSet::new();
@@ -303,10 +245,6 @@ pub fn objects() -> &'static [Object] {
             Object {
                 name: "models",
                 blocks: metas(MODEL_BLOCKS),
-            },
-            Object {
-                name: "types",
-                blocks: types(),
             },
         ]
     });

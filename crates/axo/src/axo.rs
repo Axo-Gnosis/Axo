@@ -29,8 +29,7 @@ use crate::ext::{Caller, HOST, InvokeError, MODELS};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::session::children::SessionTable;
 use crate::session::{
-    Inherited, Layers, RecoveryPolicy, Registrations, Session, SessionOptions, SessionSetup,
-    session_schemes,
+    Inherited, Layers, RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes,
 };
 use crate::store::{
     Header, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
@@ -115,7 +114,7 @@ impl ConfigSource for NoConfig {
     }
 }
 
-#[expose(block = AXO_BUILDER_BLOCK, object = "types")]
+#[expose]
 impl AxoBuilder {
     /// Names the harness in model-facing text: the docs scheme (`<name>://`), the `docs`
     /// section, and the bundled `SYSTEM`/`SUMMARY` prompts. Defaults to `axo`.
@@ -198,23 +197,15 @@ impl Axo {
         &self.models
     }
 
-    /// Calls an extension-accessible host or model method with positional JSON arguments.
+    /// Calls an extension-accessible host method with positional JSON arguments.
     #[ext(skip = "the dispatcher itself")]
     pub async fn invoke(
         &self,
-        object: &str,
         method: &str,
         args: Vec<Value>,
         caller: &Caller,
     ) -> Result<Value, InvokeError> {
-        match object {
-            "host" => HOST.invoke(self, method, args, caller).await,
-            "models" => {
-                self.invoke_models(self.models.clone(), method, args, caller)
-                    .await
-            }
-            _ => Err(InvokeError::UnknownObject(object.to_owned())),
-        }
+        HOST.invoke(self, method, args, caller).await
     }
 
     /// Calls an extension-accessible `models` method against `models` (for example a scoped
@@ -235,15 +226,9 @@ impl Axo {
         MODELS.invoke(&target, method, args, caller).await
     }
 
-    pub(crate) fn streamer_for(&self, models: &Arc<Models>) -> Arc<dyn Streamer> {
-        self.custom_streamer
-            .clone()
-            .unwrap_or_else(|| models.clone())
-    }
-
     /// The supervisor every local command runs under, for hosts that run other
     /// processes (such as extension runners) in the same containers.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn supervisor(&self) -> Arc<ProcessSupervisor> {
         self.supervisor.clone()
     }
@@ -472,23 +457,17 @@ impl Axo {
             model,
             models,
             agent,
-            definitions,
             keywords_enabled,
             thinking,
             ask_enabled,
             project_access,
             exec_env,
-            sections,
-            tools: host_tools,
-            tool_policies,
-            spawn_hooks,
-            schemes: host_schemes,
-            commands,
+            host,
             layer,
             recovery: _,
         } = options;
         let models = models.unwrap_or_else(|| self.models.clone());
-        let streamer = self.streamer_for(&models);
+        let streamer = crate::models::streamer_for(&models, self.custom_streamer.as_ref());
 
         let config = Arc::new(EffectiveConfig::resolve(
             &*self.config,
@@ -496,7 +475,7 @@ impl Axo {
             project_access,
         )?);
         let (files, mut definition_diagnostics) = load_files(&config, &cwd, keywords_enabled);
-        let (resolved, merge_diagnostics) = merge(&files, &[&layer.definitions, &definitions]);
+        let (resolved, merge_diagnostics) = merge(&files, &[&layer.definitions, &host.definitions]);
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
@@ -560,16 +539,16 @@ impl Axo {
         );
 
         let mode = settings.bash.dev_shell;
-        let host = || -> Arc<dyn ExecEnv> { Arc::new(StaticEnv(self.base_env.clone())) };
+        let host_exec = || -> Arc<dyn ExecEnv> { Arc::new(StaticEnv(self.base_env.clone())) };
         let exec: Arc<dyn ExecEnv> = match exec_env {
             Some(exec) => exec,
-            None if mode == DevShellMode::Off => host(),
+            None if mode == DevShellMode::Off => host_exec(),
             None if mode == DevShellMode::Nix && self.cache_dir.is_none() => {
                 tracing::warn!(concat!(
                     "bash.devShell \"nix\" needs a cache directory (AxoBuilder::cache_dir); ",
                     "using the host environment"
                 ));
-                host()
+                host_exec()
             }
             None => Arc::new(DevShellEnv::new(
                 self.base_env.clone(),
@@ -601,18 +580,7 @@ impl Axo {
                 run_slots,
                 docs: None,
             }),
-            layers: Layers {
-                host: Registrations {
-                    definitions,
-                    sections,
-                    tools: host_tools,
-                    schemes: host_schemes,
-                    tool_policies,
-                    spawn_hooks,
-                    commands,
-                },
-                layer,
-            },
+            layers: Layers { host, layer },
             merged: Some((resolved, merge_diagnostics)),
             model,
             thinking,

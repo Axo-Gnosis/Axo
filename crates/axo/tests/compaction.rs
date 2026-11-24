@@ -767,7 +767,7 @@ async fn split_turn_is_combined_sequentially_and_carries_whole_users_and_file_li
     let old_user = "Keep cedar unchanged.";
     let turn_user = "Inspect source then continue.";
     let mut opts = options(dir.path());
-    opts.sections.push((
+    opts.host.sections.push((
         "test-section".into(),
         Some("effective current instruction".into()),
     ));

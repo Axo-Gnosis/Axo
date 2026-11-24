@@ -103,7 +103,7 @@ pub struct ChildHandle {
     pub session: Arc<Session>,
 }
 
-#[expose(block = CHILD_HANDLE_BLOCK, object = "types")]
+#[expose]
 impl ChildHandle {
     #[ext(skip = "live child handle; session.spawn returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
@@ -113,7 +113,7 @@ impl ChildHandle {
     }
 }
 
-#[expose(block = TEAM_HANDLE_BLOCK, object = "types")]
+#[expose]
 impl TeamHandle {
     #[ext(skip = "live team handle; session.spawnTeam returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
@@ -400,8 +400,7 @@ impl SessionHooks {
                 .map(|mode| mode.tools.clone())
                 .unwrap_or_default(),
         };
-        let bash = self.bash_with(mode.as_deref());
-        let writes = self.writes_with(mode.as_deref());
+        let (bash, writes) = self.restrictions_with(mode.as_deref());
         normalize(&mut spec, &settings.subagents);
         let select = |spec: &AgentSpec| -> Result<_, Error> {
             let cascade = settings.first_model(

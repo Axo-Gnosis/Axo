@@ -63,11 +63,9 @@ use write::WriteTool;
 
 pub use crate::jobs::command::CommandRequest;
 pub use bash::BashRequest;
-pub(crate) use changes::SNAPSHOT_STORE_CHANGES;
 pub use changes::{
     FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_changes, squash,
 };
-pub(crate) use ledger::FILE_LEDGER_BLOCK;
 pub use ledger::{
     FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
 };
@@ -136,7 +134,7 @@ pub struct HostTool {
     pub origin: Option<String>,
 }
 
-#[expose(block = HOST_TOOL_BLOCK, object = "types")]
+#[expose]
 impl HostTool {
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn direct(factory: ToolFactory) -> Self {
@@ -205,6 +203,23 @@ pub enum Located {
     },
     /// A resource whose handler performs reads and writes; use `Schemes::read`/`Schemes::write`.
     Virtual { url: SchemeUrl },
+}
+
+impl Located {
+    pub(crate) fn existing(self) -> Self {
+        match self {
+            Self::File {
+                url: None,
+                path,
+                writable,
+            } => Self::File {
+                url: None,
+                path: existing_variant(path),
+                writable,
+            },
+            other => other,
+        }
+    }
 }
 
 #[expose(block = SESSION_TOOLS, object = "tools")]
@@ -304,7 +319,7 @@ impl SessionTools {
     }
 
     /// Runs a command with output capture, automatic background promotion and job delivery.
-    #[ext(skip = "needs the live tool call; tools.runCommand")]
+    #[ext(skip = "needs the live tool call; tools.runBash")]
     pub async fn run_command(
         &self,
         cx: ToolContext,
@@ -407,7 +422,7 @@ pub(crate) fn folded(path: &Path) -> PathBuf {
 }
 
 /// Tries macOS screenshot variants for a plain filesystem read path that does not exist.
-pub(crate) fn existing_variant(resolved: PathBuf) -> PathBuf {
+fn existing_variant(resolved: PathBuf) -> PathBuf {
     static AM_PM: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i) (AM|PM)\.").expect("valid regex"));
     if resolved.exists() {

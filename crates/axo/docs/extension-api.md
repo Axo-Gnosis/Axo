@@ -13,10 +13,6 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | path |  | The session file. With lazy creation it exists only after the first submission. |
 | spawnLink |  | The spawn link of a child session; None for root sessions and forks. |
 | agent |  | The current root persona or the definition this child was spawned with. |
-| model |  | The currently selected model. |
-| thinking |  | The thinking level applied to the current model. |
-| serviceTier |  | The chosen service tier; it applies only on models that support it. |
-| effectiveServiceTier |  | The tier requests are sent with on the current model. |
 | config |  | The effective configuration for this session. |
 | setName | name? | Sets the file-wide session name; newlines become spaces and blank names clear it. May be called while a run is active; this entry contributes no context message. |
 | name |  | The latest session name in file order, independent of the selected branch. |
@@ -34,15 +30,19 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | keywordMatches | text | The keywords that would fire in text typed as a message right now, as byte ranges into text. A leading /command token is skipped, as on submission. |
 | runCommand | command | Runs a command under its policy: model/thinking/tier, modes and registered commands alongside a turn, compact/shake/navigate only when idle (Error::Busy otherwise). |
 | abort |  | Stops the active run (CancelReason::User). Stopping an active run holds queued input and job results until the user's next input or resume_wakes; input sent after the Stop starts the next run once this one settles. An idle Stop changes nothing. |
-| setModel | model | Switches the model from the next request; the thinking level is clamped to it. |
 | setAgent | name? | Switches the root persona from the next request, applying its model selector when present. Changing the system prompt and tools is cache-heavy on models without mid-conversation system-message and tool changes. |
-| setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
-| setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
 | answer | callId, answers | Settles the pending question of tool call call_id. A submission that does not fit the document returns Error::InvalidInput and leaves the question pending. |
 | dismiss | callId | Dismisses a pending question or mode result; the run is cancelled. |
 | contextUsage |  | The current estimated context size and effective compaction limits. |
 | isRunning |  | Whether a run, maintenance or navigation currently owns the session. Observing idle does not reserve it against future submissions or background wakes. |
 | treeUsage |  | This session's own recorded spend plus every descendant's, maintenance included; SessionEvent::TreeUsage reports changes. |
+| model |  | The currently selected model. |
+| thinking |  | The thinking level applied to the current model. |
+| serviceTier |  | The chosen service tier; it applies only on models that support it. |
+| effectiveServiceTier |  | The tier requests are sent with on the current model. |
+| setModel | model | Switches the model from the next request; the thinking level is clamped to it. |
+| setThinking | level | Sets the thinking level from the next request, clamped to the model; returns the level applied. |
+| setServiceTier | tier | Chooses the service tier from the next request; returns the tier the current model applies. |
 | withdraw | submissionId | Takes a queued steer or follow-up back before it is delivered and returns it for the host to edit and resubmit. Error::NotQueued once it was delivered or withdrawn. |
 | resumeWakes |  | Lifts the pause a Stop or a failed run left and, on an idle session, starts a run with the held steers or follow-ups, else with pending job results and mail. |
 | prompt | input | Expands a /skill args invocation, saves the submission with caller provenance, and runs the prompt; returns when the run settles. |
@@ -121,7 +121,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | readFileBytes | path | Reads a filesystem or scheme resource as base64 bytes. |
 | writeFile | path, content | Writes text using the session's write scope and freshness guard. |
 | writeFileBytes | path, content | Writes base64 bytes using the session's write scope and freshness guard. |
-| runCommand | request | Runs a supervised bash command in this invocation's context. |
+| runBash | request | Runs a supervised bash command in this invocation's context. |
 | rewriteUrls | command | Rewrites scheme URLs in a command to their filesystem paths. |
 | parseUrl | input | Parses a path as a registered scheme URL. |
 | exactUrl | text | Recognizes an exact registered scheme URL. |
@@ -152,7 +152,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | TOOLS_ACCESS::new | host-side construction and dispatch |
 | TOOLS_ACCESS::invoke | host-side construction and dispatch |
 | TOOLS_ACCESS::finish | host-side construction and dispatch |
-| SESSION_TOOLS::run_command | needs the live tool call; tools.runCommand |
+| SESSION_TOOLS::run_command | needs the live tool call; tools.runBash |
 | SESSION_TOOLS::rewrite_urls | borrowed result; tools.rewriteUrls |
 | SESSION_TOOLS_WRITES::read_file | needs the call's cancellation; see the wire method |
 | SESSION_TOOLS_WRITES::write_file | needs the call's cancellation; see the wire method |
@@ -195,7 +195,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | AXO::models | live registry; reached through the models object |
 | AXO::invoke | the dispatcher itself |
 | AXO::invoke_models | the dispatcher itself |
-| AXO::supervisor | live process handles; commands go through tools.runCommand |
+| AXO::supervisor | live process handles; commands go through tools.runBash |
 | AXO::create_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::open_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::session | returns a live session; ctx.session(id) reaches it |
@@ -227,112 +227,18 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | Rust method | Reason |
 | --- | --- |
 
-## types
+## hostLifecycle
 
-### Withheld
+These are methods of the host handle, typed as `HostLifecycle` in the SDK bindings. Without a lifecycle hook, these calls are refused with `no_lifecycle`.
 
-| Rust method | Reason |
-| --- | --- |
-| AXO_BUILDER_BLOCK::name | host construction |
-| AXO_BUILDER_BLOCK::config | host construction |
-| AXO_BUILDER_BLOCK::cache_dir | host construction |
-| AXO_BUILDER_BLOCK::streamer | host construction |
-| AXO_BUILDER_BLOCK::supervision | host construction |
-| AXO_BUILDER_BLOCK::build | host construction |
-| COMMAND_BLOCK::decode | no receiver; served by host.decodeCommand |
-| COMMAND_BLOCK::parse | no receiver; served by host.parseCommand |
-| EFFECTIVE_CONFIG_BLOCK::resolve | takes the host's config source; host.catalog returns the resolved config |
-| EFFECTIVE_CONFIG_BLOCK::default_model | derivable from the value in TypeScript |
-| ENABLED_EXTENSION_BLOCK::validate_all | no receiver; validates the host's own extension list |
-| PROJECT_SETTINGS_BLOCK::access_for | derivable from the value in TypeScript |
-| SETTINGS_BLOCK::resolve_model | takes the live registry; the model command via session.runCommand and both models.complete and models.stream resolve selectors |
-| AGENT_DEF_BLOCK::name | derivable from the value in TypeScript |
-| AGENT_SPEC_BLOCK::parse | no receiver; served by host.parseAgent |
-| RUN_AS_BLOCK::is_any | derivable from the value in TypeScript |
-| TEAM_MEMBER_BLOCK::roster_name | derivable from the value in TypeScript |
-| CONTEXT_FILE_BLOCK::render | derivable from the value in TypeScript |
-| NESTED_CONTEXT_BLOCK::new | construction or internal state rebuilding with no meaning across the wire |
-| NESTED_CONTEXT_BLOCK::disabled | construction or internal state rebuilding with no meaning across the wire |
-| NESTED_CONTEXT_BLOCK::reset | construction or internal state rebuilding with no meaning across the wire |
-| NESTED_CONTEXT_BLOCK::attach | served by tools.attachContext |
-| NESTED_CONTEXT_BLOCK::restore | construction or internal state rebuilding with no meaning across the wire |
-| KEYWORD_SPEC_BLOCK::parse | no receiver; served by host.parseKeyword |
-| BASH_ACCESS_BLOCK::is_full | derivable from the value in TypeScript |
-| MODE_SPEC_BLOCK::parse | no receiver; served by host.parseMode |
-| TOOL_LIMITS_BLOCK::permits | derivable from the value in TypeScript |
-| TOOL_LIMITS_BLOCK::is_empty | derivable from the value in TypeScript |
-| ERROR_BLOCK::code | errors cross as { code, message, details? } |
-| JOB_STATUS_BLOCK::label | derivable from the value in TypeScript |
-| COMMAND_OUTPUT_BLOCK::path | live reader's local file; session.commandOutput and session.jobOutput return output bytes, not the path |
-| COMMAND_OUTPUT_BLOCK::open | construction or internal state rebuilding with no meaning across the wire |
-| COMMAND_OUTPUT_BLOCK::read_chunks | live reader; session.commandChunks |
-| COMMAND_OUTPUT_BLOCK::job | live reader; session.commandOutput returns them in one page |
-| COMMAND_OUTPUT_BLOCK::artifact | live reader; session.commandOutput returns them in one page |
-| COMMAND_OUTPUT_BLOCK::progress | live reader; session.commandOutput returns them in one page |
-| COMMAND_OUTPUT_BLOCK::read | live reader; session.commandOutput returns them in one page |
-| ENTRY_ID_BLOCK::generate | construction or internal state rebuilding with no meaning across the wire |
-| ENTRY_ID_BLOCK::as_str | derivable from the value in TypeScript |
-| HEADER_BLOCK::new | construction or internal state rebuilding with no meaning across the wire |
-| ENTRY_BASE_BLOCK::new | construction or internal state rebuilding with no meaning across the wire |
-| ENTRY_BASE_BLOCK::timestamp_ms | derivable from the value in TypeScript |
-| ENTRY_BLOCK::usage | derivable from the value in TypeScript |
-| ENTRY_BLOCK::requires_sync | derivable from the value in TypeScript |
-| ENTRY_BLOCK::base | derivable from the value in TypeScript |
-| ENTRY_BLOCK::id | derivable from the value in TypeScript |
-| ENTRY_BLOCK::parent_id | derivable from the value in TypeScript |
-| JSONL_STORE_BLOCK::new | host construction |
-| PROJECTION_BLOCK::path | derivable from the value in TypeScript |
-| PROJECTION_BLOCK::is_omitted | derivable from the value in TypeScript |
-| PROJECTION_BLOCK::apply | construction or internal state rebuilding with no meaning across the wire |
-| SESSION_EVENT_BLOCK::kind | derivable from the value in TypeScript |
-| CHILD_HANDLE_BLOCK::receipt | live child handle; session.spawn returns the receipt |
-| TEAM_HANDLE_BLOCK::receipt | live team handle; session.spawnTeam returns the receipt |
-| SCHEMES_BLOCK::new | construction or internal state rebuilding with no meaning across the wire |
-| SCHEMES_BLOCK::context | served by tools.schemeContext |
-| SCHEMES_BLOCK::artifacts | live handle; tools.allocateArtifact |
-| SCHEMES_BLOCK::prompt_docs | served by tools.promptDocs |
-| SCHEMES_BLOCK::parse | served by tools.parseUrl |
-| SCHEMES_BLOCK::exact | served by tools.exactUrl |
-| SCHEMES_BLOCK::resolve | served by tools.locate, tools.readFile and tools.writeFile |
-| SCHEMES_BLOCK::read | served by tools.locate, tools.readFile and tools.writeFile |
-| SCHEMES_BLOCK::write | served by tools.locate, tools.readFile and tools.writeFile |
-| ARTIFACTS_BLOCK::new | construction or internal state rebuilding with no meaning across the wire |
-| ARTIFACTS_BLOCK::dir | served by tools.artifactDir |
-| ARTIFACTS_BLOCK::allocate | served by tools.allocateArtifact |
-| ARTIFACTS_BLOCK::create | live handle; tools.allocateArtifact |
-| ARTIFACTS_BLOCK::live | served by tools.liveArtifacts |
-| ARTIFACTS_BLOCK::find | served by tools.findArtifact |
-| STATIC_ENV_BLOCK::host | host construction |
-| DEV_SHELL_ENV_BLOCK::new | host construction |
-| PROCESS_SUPERVISOR_BLOCK::new | live process handles; commands go through tools.runCommand |
-| PROCESS_SUPERVISOR_BLOCK::spawn | live process handles; commands go through tools.runCommand |
-| PROCESS_SUPERVISOR_BLOCK::output | live process handles; commands go through tools.runCommand |
-| PROCESS_SUPERVISOR_BLOCK::output_stderr_tail | live process handles; commands go through tools.runCommand |
-| PROCESS_BLOCK::capture_output | live process handles; commands go through tools.runCommand |
-| PROCESS_BLOCK::wait | live process handles; commands go through tools.runCommand |
-| PROCESS_BLOCK::guardian_lost | live process handles; commands go through tools.runCommand |
-| PROCESS_BLOCK::container | live process handles; commands go through tools.runCommand |
-| PROCESS_BLOCK::close | live process handles; commands go through tools.runCommand |
-| CONTAINER_BLOCK::kill | live process handles; commands go through tools.runCommand |
-| CONTAINER_BLOCK::populated | live process handles; commands go through tools.runCommand |
-| CONTAINER_BLOCK::terminate | live process handles; commands go through tools.runCommand |
-| CONTAINER_BLOCK::memory_batch | live process handles; commands go through tools.runCommand |
-| INVOKE_ERROR_BLOCK::code | errors cross as { code, message, details? } |
-| HOST_TOOL_BLOCK::direct | construction or internal state rebuilding with no meaning across the wire |
-| HOST_TOOL_BLOCK::deferred | construction or internal state rebuilding with no meaning across the wire |
-| HOST_TOOL_BLOCK::with_origin | construction or internal state rebuilding with no meaning across the wire |
-| FILE_LEDGER_BLOCK::snapshot | served by tools.ledger |
-| FILE_LEDGER_BLOCK::hash | derivable from the value in TypeScript |
-| FILE_LEDGER_BLOCK::record | recording or checking outside the file lock is unsafe; tools.readFile and tools.writeFile do both |
-| FILE_LEDGER_BLOCK::recorded | served by tools.recorded |
-| FILE_LEDGER_BLOCK::check_fresh | recording or checking outside the file lock is unsafe; tools.readFile and tools.writeFile do both |
-| FILE_LEDGER_BLOCK::restore | construction or internal state rebuilding with no meaning across the wire |
-| SNAPSHOT_STORE_BLOCK::for_session | construction or internal state rebuilding with no meaning across the wire |
-| SNAPSHOT_STORE_BLOCK::read | served by tools.readSnapshot |
-| SNAPSHOT_STORE_CHANGES::squash | served by session.squashChanges and host.squashChanges |
+| Method | Parameters | Summary |
+| --- | --- | --- |
+| createSession | cwd, request? |  |
+| openSession | path, request? |  |
+| forkSession | sessionId, entryId |  |
+| closeSession | sessionId |  |
 
 ## Served by the extension bridge
 
 - session: subscribe.
-- host: `createSession(cwd, request?)`, `openSession(path, request?)`, `forkSession(sessionId, entryId)`, and `closeSession(sessionId)`, typed as `HostLifecycle` in the SDK bindings. Without a lifecycle hook, these calls are refused with `no_lifecycle`.
 - models: stream.

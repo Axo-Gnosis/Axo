@@ -1344,7 +1344,7 @@ async fn tool_reservations_follow_session_modes() {
     for has_modes in [false, true] {
         let mut opts = options(&host);
         if has_modes {
-            opts.definitions.modes.push(axo::ModeSpec {
+            opts.host.definitions.modes.push(axo::ModeSpec {
                 name: "plan".into(),
                 description: "Make a plan".into(),
                 body: "Plan first.".into(),

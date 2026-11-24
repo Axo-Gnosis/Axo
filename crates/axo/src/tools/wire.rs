@@ -283,7 +283,7 @@ impl ToolsWire<'_> {
 
     /// Runs a supervised bash command in this invocation's context.
     #[ext]
-    pub async fn run_command(&self, request: BashRequest) -> Result<ToolOutput, ToolError> {
+    pub async fn run_bash(&self, request: BashRequest) -> Result<ToolOutput, ToolError> {
         self.access
             .tools
             .run_bash(self.access.cx.clone(), request)
@@ -333,15 +333,8 @@ impl ToolsWire<'_> {
     /// Returns the last recorded hash for a file, resolving the path as `readFile` does.
     #[ext]
     pub async fn recorded(&self, path: String) -> Result<Option<String>, ToolError> {
-        match self.access.tools.locate(&path).await? {
-            Located::File { url, path, .. } => {
-                let path = if url.is_none() {
-                    super::existing_variant(path)
-                } else {
-                    path
-                };
-                Ok(self.access.tools.ledger.recorded(&path))
-            }
+        match self.access.tools.locate(&path).await?.existing() {
+            Located::File { path, .. } => Ok(self.access.tools.ledger.recorded(&path)),
             Located::Virtual { .. } => Ok(None),
         }
     }

@@ -245,7 +245,7 @@ pub fn squash<'a>(changes: impl IntoIterator<Item = &'a FileChange>) -> Vec<Squa
     squashed
 }
 
-#[expose(block = SNAPSHOT_STORE_CHANGES, object = "types")]
+#[expose]
 impl SnapshotStore {
     /// `squash`, then for files mutated more than once whose first-before (empty when
     /// created) and last-after are stored text, reads both blobs and fills `diff`.

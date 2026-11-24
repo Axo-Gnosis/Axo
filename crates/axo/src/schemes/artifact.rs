@@ -43,7 +43,7 @@ impl Drop for LiveArtifact {
     }
 }
 
-#[expose(block = ARTIFACTS_BLOCK, object = "types")]
+#[expose]
 impl Artifacts {
     /// Uses `dir` without creating it; numbering is discovered on first allocation.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]

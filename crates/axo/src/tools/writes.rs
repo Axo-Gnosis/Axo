@@ -229,7 +229,8 @@ impl SessionTools {
         convert: impl FnOnce(Vec<u8>, &str) -> Result<T, ToolError> + Send,
     ) -> Result<FileRead<T>, ToolError> {
         let read = async {
-            match self.locate_handler(request).await? {
+            let (located, handler) = self.locate_handler(request).await?;
+            match (located.existing(), handler) {
                 (Located::Virtual { url }, Some(handler)) => {
                     let text = handler.read(&url, self.schemes.context()).await?;
                     if let Some(limit) = limit
@@ -243,11 +244,6 @@ impl SessionTools {
                     Ok(FileRead::Virtual { url, text })
                 }
                 (Located::File { url, path, .. }, None) => {
-                    let path = if url.is_none() {
-                        super::existing_variant(path)
-                    } else {
-                        path
-                    };
                     let label = url.map(|url| url.to_string());
                     let _guard = lock_file(&path).await;
                     let shown = super::shown(&path, label.as_deref());

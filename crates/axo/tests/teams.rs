@@ -14,21 +14,24 @@ use tokio::sync::broadcast;
 
 fn team_options(dir: &Path) -> SessionOptions {
     SessionOptions {
-        definitions: Definitions {
-            agents: vec![
-                AgentSpec {
-                    name: "alpha".into(),
-                    description: "Alpha does A".into(),
-                    model: Some("test/a".into()),
-                    ..Default::default()
-                },
-                AgentSpec {
-                    name: "beta".into(),
-                    description: "Beta does B".into(),
-                    model: Some("test/b".into()),
-                    ..Default::default()
-                },
-            ],
+        host: axo::Registrations {
+            definitions: Definitions {
+                agents: vec![
+                    AgentSpec {
+                        name: "alpha".into(),
+                        description: "Alpha does A".into(),
+                        model: Some("test/a".into()),
+                        ..Default::default()
+                    },
+                    AgentSpec {
+                        name: "beta".into(),
+                        description: "Beta does B".into(),
+                        model: Some("test/b".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..options(dir)
@@ -199,7 +202,6 @@ async fn team_members_message_each_other_and_the_parent() {
                 .unwrap_or(false)
         );
     }
-    assert_eq!(b_lines[mail]["sender"], "a");
     assert_eq!(
         b_lines[mail]["provenance"],
         json!({

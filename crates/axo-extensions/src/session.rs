@@ -35,7 +35,6 @@ pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
     static METHODS: LazyLock<BTreeMap<&str, Vec<&str>>> = LazyLock::new(|| {
         axo::ext::objects()
             .iter()
-            .filter(|object| object.name != "types")
             .map(|object| {
                 let mut names: Vec<_> = object
                     .blocks
@@ -100,7 +99,7 @@ pub(crate) fn collisions(contributions: &[Arc<Contribution>]) -> Vec<ExtensionDi
 
 impl Extensions {
     /// Sets `options.layer` to the enabled extensions, replacing any layer the caller set.
-    /// The host's own `options.definitions` rank after the extensions'. No I/O, starts nothing.
+    /// The host's own `options.host.definitions` rank after the extensions'. No I/O, starts nothing.
     pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
         let contributions = self.inner.effective_contributions();
         options.layer = layer(&contributions);
@@ -978,10 +977,7 @@ impl Actions for Registry {
                             .await
                             .unwrap_or_else(|| Err(unavailable()));
                     }
-                    inner
-                        .axo
-                        .invoke("host", &invoke.method, invoke.args, &caller)
-                        .await
+                    inner.axo.invoke(&invoke.method, invoke.args, &caller).await
                 }
                 "models" => {
                     if invoke.target.is_some() {

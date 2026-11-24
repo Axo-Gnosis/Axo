@@ -17,6 +17,7 @@ use super::{
 use crate::config::ModelChoice;
 use crate::context::keywords::{self, KeywordSpec};
 use crate::context::prompt::escape_wrappers;
+use crate::coordination::SubmissionProvenance;
 use crate::error::Error;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
 use crate::jobs::child::TURN_BUDGET;
@@ -296,12 +297,7 @@ impl SessionHooks {
         matched
             .iter()
             .find_map(|keyword| keyword.model.as_deref())
-            .map(|selector| {
-                self.inherited
-                    .config
-                    .settings
-                    .resolve_model(&self.inherited.models, selector)
-            })
+            .map(|selector| self.resolve_model(selector))
             .transpose()
     }
 }
@@ -362,7 +358,6 @@ impl Session {
             parts,
             content,
             request.request_id.clone(),
-            None,
             provenance,
             &keywords,
         );
@@ -475,7 +470,7 @@ impl Session {
     /// Saves and queues a user message delivered after the current tool calls finish; on an idle session it starts a run.
     #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn steer(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::Steer, input.into(), None, None)
+        self.queue(SubmissionKind::Steer, input.into(), None)
             .await
             .map(drop)
     }
@@ -484,7 +479,7 @@ impl Session {
     /// on an idle session it starts a run.
     #[ext(skip = "records caller provenance; see the wire method")]
     pub async fn follow_up(&self, input: impl Into<PromptInput>) -> Result<(), Error> {
-        self.queue(SubmissionKind::FollowUp, input.into(), None, None)
+        self.queue(SubmissionKind::FollowUp, input.into(), None)
             .await
             .map(drop)
     }
@@ -507,7 +502,7 @@ impl Session {
                 .and_then(|seq| QueuedInput::from_submission(&seq.entry)) else {
                 return Err(Error::NotQueued(id));
             };
-            let Some((message, behind)) = agent.remove_queued(&id) else {
+            let Some(removed) = agent.remove_queued(&id) else {
                 return Err(Error::NotQueued(id));
             };
             let tombstone = Entry::SubmissionWithdrawn {
@@ -517,7 +512,7 @@ impl Session {
             if let Err(error) = hooks.append(vec![tombstone]).await {
                 {
                     let _live = hooks.live();
-                    agent.restore_queued(matches!(input.kind, SubmissionKind::Prompt | SubmissionKind::Steer), behind, message);
+                    agent.restore_queued(removed);
                     let _ = hooks.events.send(Arc::new(SessionEvent::QueueChanged));
                 }
                 drop(order);
@@ -568,7 +563,6 @@ impl Session {
             }],
             keywords: Vec::new(),
             request_id: None,
-            sender: None,
             provenance,
             custom: Some(SubmittedCustom {
                 custom_type: message.custom_type.clone(),
@@ -608,42 +602,18 @@ impl Session {
             "Message from {sender} (reply with send to \"{sender}\"):\n\n{}",
             escape_wrappers(content)
         );
-        self.queue(
-            SubmissionKind::Mail,
-            text.into(),
-            Some(sender.to_owned()),
-            Some(provenance),
-        )
-        .await
-    }
-
-    pub(super) async fn queue_with_provenance(
-        &self,
-        kind: SubmissionKind,
-        input: PromptInput,
-        provenance: Option<crate::coordination::SubmissionProvenance>,
-    ) -> Result<String, Error> {
-        self.queue(kind, input, None, provenance).await
-    }
-
-    pub(super) async fn queue_routed(
-        &self,
-        kind: SubmissionKind,
-        input: PromptInput,
-        provenance: crate::coordination::SubmissionProvenance,
-    ) -> Result<String, Error> {
-        self.queue(kind, input, None, Some(provenance)).await
+        self.queue(SubmissionKind::Mail, text.into(), Some(provenance))
+            .await
     }
 
     /// Saves the submission and hands its message to the queue for `kind`.
     /// `saved` files stay only once the entry is written. Keywords match in steers and
     /// follow-ups, never in mail.
-    async fn queue(
+    pub(super) async fn queue(
         &self,
         kind: SubmissionKind,
         input: PromptInput,
-        sender: Option<String>,
-        provenance: Option<crate::coordination::SubmissionProvenance>,
+        provenance: Option<SubmissionProvenance>,
     ) -> Result<String, Error> {
         let keywords = if matches!(kind, SubmissionKind::Steer | SubmissionKind::FollowUp) {
             self.hooks.matched_keywords(&input.parts)
@@ -652,8 +622,7 @@ impl Session {
         };
         let choice = self.hooks.keyword_choice(&keywords)?;
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &keywords).await?;
-        let (entry, message) =
-            submission(kind, parts, content, None, sender, provenance, &keywords);
+        let (entry, message) = submission(kind, parts, content, None, provenance, &keywords);
         let id = message.id.clone().expect("submission id");
         self.queue_message(kind, entry, message, Some(saved), choice)
             .await?;
@@ -705,15 +674,7 @@ impl Session {
     /// Validates and renders a new child's task; writes nothing.
     pub(super) async fn prepare_first(&self, input: PromptInput) -> Result<FirstPrompt, Error> {
         let (Prepared { parts, saved }, content) = self.prepare(input.parts, &[]).await?;
-        let (entry, message) = submission(
-            SubmissionKind::Prompt,
-            parts,
-            content,
-            None,
-            None,
-            None,
-            &[],
-        );
+        let (entry, message) = submission(SubmissionKind::Prompt, parts, content, None, None, &[]);
         Ok(FirstPrompt {
             entry,
             message,
@@ -822,7 +783,6 @@ fn submission(
     parts: Vec<PromptPart>,
     content: Vec<UserBlock>,
     request_id: Option<String>,
-    sender: Option<String>,
     provenance: Option<crate::coordination::SubmissionProvenance>,
     keywords: &[Arc<KeywordSpec>],
 ) -> (Entry, QueuedMessage) {
@@ -837,7 +797,6 @@ fn submission(
             .map(|keyword| keyword.name.clone())
             .collect(),
         request_id,
-        sender,
         provenance,
         custom: None,
     };

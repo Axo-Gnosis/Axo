@@ -388,7 +388,6 @@ fn submission(id: &str, parent: Option<&str>) -> Entry {
         }],
         keywords: Vec::new(),
         request_id: None,
-        sender: None,
         provenance: None,
         custom: None,
     }
@@ -411,6 +410,16 @@ fn submissions_write_parts_and_read_legacy_content() {
     // Files written before prompt parts store the text-only user blocks as `content`.
     object.insert("content".into(), parts);
     assert_eq!(serde_json::from_value::<Entry>(value).unwrap(), entry);
+
+    let legacy_mail = r#"{"type":"submission","id":"x1","parentId":null,"timestamp":"2026-01-01T00:00:00Z","submissionId":"s1","kind":"mail","parts":[{"type":"text","text":"hi"}],"sender":"a"}"#;
+    assert!(matches!(
+        serde_json::from_str::<Entry>(legacy_mail).unwrap(),
+        Entry::Submission {
+            kind: SubmissionKind::Mail,
+            provenance: None,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

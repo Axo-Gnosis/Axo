@@ -77,7 +77,6 @@ impl Log {
             parts,
             keywords: Vec::new(),
             request_id: None,
-            sender: None,
             provenance: None,
             custom: None,
         })

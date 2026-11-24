@@ -609,6 +609,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plain_read_fallback_does_not_rewrite_prompt_parts() {
+        use crate::input::{PromptPart, prepare};
+
+        let fx = Fixture::new();
+        let plain = "Shot 1 PM.png";
+        let narrow = "Shot 1\u{202f}PM.png";
+        let cancel = CancellationToken::new();
+        let access = ToolAccess::new(fx.session.clone(), Fixture::context("host", json!({})));
+        let caller = Caller::default();
+        let recorded = |path: &str| access.invoke("recorded", vec![json!(path)], &caller);
+        let part = |path: &str| vec![PromptPart::File { path: path.into() }];
+
+        fx.put(narrow, b"fallback");
+        let FileRead::File { bytes, .. } =
+            fx.session.read_file(&cancel, plain, None).await.unwrap()
+        else {
+            panic!("expected a file");
+        };
+        assert_eq!(bytes, b"fallback");
+        let hash = fx.session.ledger.recorded(&fx.path(narrow)).unwrap();
+        assert_eq!(recorded(plain).await.unwrap(), hash);
+        assert_eq!(recorded(narrow).await.unwrap(), hash);
+        let prepared = prepare(part(plain), &fx.session).await.unwrap();
+        assert!(matches!(&prepared.parts[..], [PromptPart::File { path }] if path == plain));
+
+        fx.put(plain, b"exact");
+        let FileRead::File { bytes, .. } =
+            fx.session.read_file(&cancel, plain, None).await.unwrap()
+        else {
+            panic!("expected a file");
+        };
+        assert_eq!(bytes, b"exact");
+
+        std::fs::create_dir(fx.path("local")).unwrap();
+        fx.put(&format!("local/{narrow}"), b"scheme");
+        for path in ["absent.png", "local://Shot 1 PM.png"] {
+            assert!(fx.session.read_file(&cancel, path, None).await.is_err());
+            assert!(prepare(part(path), &fx.session).await.is_err());
+            assert!(recorded(path).await.unwrap().is_null());
+        }
+    }
+
+    #[tokio::test]
     async fn virtual_read_uses_the_resolving_handler() {
         struct Once {
             schemes: Schemes,

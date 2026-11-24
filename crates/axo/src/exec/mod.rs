@@ -58,7 +58,7 @@ impl From<Arc<EnvMap>> for Resolved {
 #[derive(Debug, Clone)]
 pub struct StaticEnv(pub Arc<EnvMap>);
 
-#[expose(block = STATIC_ENV_BLOCK, object = "types")]
+#[expose]
 impl StaticEnv {
     /// Snapshots the host environment from `std::env::vars_os()`.
     #[ext(skip = "host construction")]

@@ -350,7 +350,7 @@ async fn input_after_stop_starts_the_next_run() {
         Arc::new(|_: &Arc<axo::SessionTools>| -> Arc<dyn axo_agent::Tool> {
             Arc::new(StopsSlowly)
         });
-    opts.tools = vec![axo::HostTool::direct(factory)];
+    opts.host.tools = vec![axo::HostTool::direct(factory)];
     let session = Arc::new(host.axo.create_session(opts).await.unwrap());
     let mut events = session.attach(None).await.events;
     let run = tokio::spawn({
@@ -601,7 +601,7 @@ async fn unsuccessful_preparation_wakes_accepted_input() {
             .await;
             let scheme = Arc::new(FailingScheme::default());
             let mut opts = options(dir.path());
-            opts.schemes.push(scheme.clone());
+            opts.host.schemes.push(scheme.clone());
             let session = Arc::new(host.axo.create_session(opts).await.unwrap());
             let preparing = tokio::spawn({
                 let session = session.clone();
@@ -932,7 +932,6 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
                 }],
                 keywords: Vec::new(),
                 request_id: None,
-                sender: None,
                 provenance: None,
                 custom: None,
             })
@@ -1466,7 +1465,7 @@ async fn tool_policies_block_bash_in_sessions_and_forks_before_later_policies() 
     let no_bash = Arc::new(NoBash(Mutex::new(Vec::new())));
     let mut options = common::bash_options(dir.path());
     let cwd = options.cwd.clone();
-    options.tool_policies = vec![no_bash.clone(), later.clone()];
+    options.host.tool_policies = vec![no_bash.clone(), later.clone()];
     let session = host.create_session(options).await.unwrap();
     assert_eq!(
         within(session.prompt("run bash")).await.unwrap(),
@@ -1534,7 +1533,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
     };
     let mut initial = options(dir.path());
     initial.agent = Some("a".into());
-    initial.definitions.agents = vec![a.clone(), b.clone()];
+    initial.host.definitions.agents = vec![a.clone(), b.clone()];
     let session = host.axo.create_session(initial).await.unwrap();
     assert_eq!(session.agent().unwrap().name, "a");
     assert!(session.spawn_link().is_none());
@@ -1545,7 +1544,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
 
     // Reopening without `agent` re-resolves the recorded persona by name.
     let mut reopen_options = options(dir.path());
-    reopen_options.definitions.agents = vec![a.clone(), b];
+    reopen_options.host.definitions.agents = vec![a.clone(), b];
     let reopened = host.axo.open_session(&path, reopen_options).await.unwrap();
     assert_eq!(reopened.agent().unwrap().name, "a");
     reopened
@@ -1628,7 +1627,7 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
         ..Default::default()
     };
     let mut settings = options(dir.path());
-    settings.definitions.agents = vec![root, child.clone()];
+    settings.host.definitions.agents = vec![root, child.clone()];
     let session = host.create_session(settings).await.unwrap();
     assert!(matches!(
         session.set_agent(Some("child-only")).await,
@@ -1675,8 +1674,11 @@ mod keywords {
 
     fn keyword_options(dir: &Path, keyword: KeywordSpec) -> SessionOptions {
         SessionOptions {
-            definitions: Definitions {
-                keywords: vec![keyword],
+            host: axo::Registrations {
+                definitions: Definitions {
+                    keywords: vec![keyword],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..options(dir)

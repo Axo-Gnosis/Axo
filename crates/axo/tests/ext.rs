@@ -86,13 +86,16 @@ async fn extensions_can_select_modes_submit_tasks_and_render_hidden_skills() {
     let session = host
         .axo
         .create_session(axo::SessionOptions {
-            definitions: Definitions {
-                modes: vec![axo::ModeSpec {
-                    name: "plan".into(),
-                    description: "Plan".into(),
-                    body: "Plan first.".into(),
+            host: axo::Registrations {
+                definitions: Definitions {
+                    modes: vec![axo::ModeSpec {
+                        name: "plan".into(),
+                        description: "Plan".into(),
+                        body: "Plan first.".into(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                },
                 ..Default::default()
             },
             ..common::options(dir.path())
@@ -186,7 +189,7 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
 
     let caller = Caller::default();
     let sessions = axo
-        .invoke("host", "listSessions", vec![cwd], &caller)
+        .invoke("listSessions", vec![cwd], &caller)
         .await
         .unwrap();
     assert_eq!(sessions[0]["id"], session.id());
@@ -199,7 +202,6 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
     loop {
         let page = axo
             .invoke(
-                "host",
                 "readSession",
                 vec![json!(session.path()), after, json!(1)],
                 &caller,
@@ -219,8 +221,12 @@ async fn host_lists_sessions_and_pages_their_saved_journals() {
     }
     assert_eq!(json!(entries), json!(expected));
     assert!(matches!(
-        axo.invoke("nope", "listSessions", vec![], &caller).await,
-        Err(InvokeError::UnknownObject(name)) if name == "nope"
+        axo.invoke("nope", vec![], &caller).await,
+        Err(InvokeError::UnknownMethod(name)) if name == "nope"
+    ));
+    assert!(matches!(
+        axo.invoke("readSession", vec![], &caller).await,
+        Err(InvokeError::InvalidArguments(_))
     ));
 }
 
@@ -243,7 +249,12 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
     let caller = Caller::default();
     let reply = host
         .axo
-        .invoke("models", "complete", vec![request.clone()], &caller)
+        .invoke_models(
+            host.axo.models().clone(),
+            "complete",
+            vec![request.clone()],
+            &caller,
+        )
         .await
         .unwrap();
     assert_eq!(reply["content"][0]["text"], "hello");
@@ -252,7 +263,12 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
     assert_eq!(json!(requests[0].transcript.messages()), messages);
     let error = host
         .axo
-        .invoke("models", "complete", vec![request], &caller)
+        .invoke_models(
+            host.axo.models().clone(),
+            "complete",
+            vec![request],
+            &caller,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
@@ -282,8 +298,8 @@ async fn completion_error(event: fn(&Model) -> AssistantEvent) -> InvokeError {
         Arc::new(SingleEvent(event)),
     )
     .await;
-    axo.invoke(
-        "models",
+    axo.invoke_models(
+        axo.models().clone(),
         "complete",
         vec![json!({"model": "test/m", "messages": []})],
         &Caller::default(),
@@ -366,7 +382,12 @@ async fn models_complete_resolves_model_roles_like_model_selectors() {
         json!({"model": "@fast", "messages": messages, "thinking": "low"}),
     ] {
         host.axo
-            .invoke("models", "complete", vec![request], &caller)
+            .invoke_models(
+                host.axo.models().clone(),
+                "complete",
+                vec![request],
+                &caller,
+            )
             .await
             .unwrap();
     }
@@ -376,8 +397,8 @@ async fn models_complete_resolves_model_roles_like_model_selectors() {
     assert_eq!(requests[1].options.thinking, ThinkingLevel::Low);
     let error = host
         .axo
-        .invoke(
-            "models",
+        .invoke_models(
+            host.axo.models().clone(),
             "complete",
             vec![json!({"model": "@slow", "messages": messages})],
             &caller,
@@ -419,7 +440,7 @@ async fn models_exposes_credential_sources_not_credentials() {
     let caller = Caller::default();
     let providers = host
         .axo
-        .invoke("models", "providers", vec![], &caller)
+        .invoke_models(host.axo.models().clone(), "providers", vec![], &caller)
         .await
         .unwrap();
     assert!(
@@ -432,7 +453,12 @@ async fn models_exposes_credential_sources_not_credentials() {
     assert_public(&providers);
     let source = host
         .axo
-        .invoke("models", "credentialSource", vec![json!("test")], &caller)
+        .invoke_models(
+            host.axo.models().clone(),
+            "credentialSource",
+            vec![json!("test")],
+            &caller,
+        )
         .await
         .unwrap();
     assert_public(&source);
@@ -458,7 +484,7 @@ impl Tool for CommandProbe {
         let access = ToolAccess::new(self.0.clone(), cx);
         let caller = Caller::default();
         let run =
-            |command: &str| access.invoke("runCommand", vec![json!({"command": command})], &caller);
+            |command: &str| access.invoke("runBash", vec![json!({"command": command})], &caller);
         let (one, two) = tokio::join!(run("printf one; sleep 0.5"), run("printf two; sleep 0.5"));
         one.unwrap();
         two.unwrap();
@@ -478,7 +504,7 @@ async fn command_output_addresses_each_job_and_defaults_to_the_newest() {
     )
     .await;
     let mut options = common::bash_options(dir.path());
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(CommandProbe(tools.clone()))
     })));
     let session = Arc::new(axo.create_session(options).await.unwrap());
@@ -558,7 +584,7 @@ async fn tool_invocation_records_every_write_and_rejects_stale_files() {
     )
     .await;
     let mut options = common::options(dir.path());
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(WriteProbe(tools.clone()))
     })));
     let session = axo.create_session(options).await.unwrap();
@@ -643,7 +669,7 @@ async fn tool_result_file_records_are_harness_owned() {
     )
     .await;
     let mut options = common::options(dir.path());
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(FileDetailsProbe(tools.clone()))
     })));
     let session = axo.create_session(options).await.unwrap();
@@ -711,7 +737,7 @@ async fn failed_tool_invocation_waits_for_dropped_write_and_journals_it() {
     .await;
     let mut options = common::options(dir.path());
     let file = options.cwd.join("a.txt");
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(DroppedWriteProbe(tools.clone()))
     })));
     let session = axo.create_session(options).await.unwrap();
@@ -830,7 +856,7 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
                     compat: Default::default(),
                 }],
                 env: Vec::new(),
-                requires_key: false,
+                requires_key: true,
                 login: None,
                 rewrite: None,
             },
@@ -850,7 +876,7 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
     assert_eq!(session.model().provider, "folder-a");
     assert_eq!(session.model().id, "local-1");
 
-    // invoke_models sees the scoped provider while Axo::invoke("models", ..) does not.
+    // The scoped registry sees the provider; the base registry does not.
     let caller = Caller::default();
     let found = axo
         .invoke_models(
@@ -863,8 +889,35 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
         .unwrap();
     assert_eq!(found["id"], "local-1");
     let missing = axo
-        .invoke("models", "find", vec![json!("folder-a/local-1")], &caller)
+        .invoke_models(
+            axo.models().clone(),
+            "find",
+            vec![json!("folder-a/local-1")],
+            &caller,
+        )
         .await
         .unwrap();
     assert!(missing.is_null());
+
+    let default_streamer = axo::Axo::builder(
+        axo.models().clone(),
+        Arc::new(axo::JsonlStore::new(
+            dir.path().join("default-streamer-sessions"),
+        )),
+    )
+    .build();
+    let error = default_streamer
+        .invoke_models(
+            scoped,
+            "complete",
+            vec![json!({"model":"folder-a/local-1","messages":[]})],
+            &caller,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), InvokeErrorCode::Native(ErrorCode::Completion));
+    assert_eq!(
+        error.to_string(),
+        "Completion failed: No API key for provider: folder-a"
+    );
 }
