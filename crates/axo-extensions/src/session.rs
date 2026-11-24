@@ -400,9 +400,9 @@ async fn pump(
     loop {
         match events.recv().await {
             Ok(event) => {
-                if !matches!(&*event, SessionEvent::Entry(_)) {
+                let SessionEvent::Entry(entry) = &*event else {
                     continue;
-                }
+                };
                 let Some(strong) = inner.upgrade() else {
                     return;
                 };
@@ -416,12 +416,12 @@ async fn pump(
                 if listeners.is_empty() {
                     continue;
                 }
-                let args = json!({ "sub": "entry", "session": id, "event": &*event });
+                let args = json!({ "session": id, "entry": entry });
                 let frames = std::iter::repeat_n(args, listeners.len());
                 for ((owner, ext), args) in listeners.into_iter().zip(frames) {
                     let remote = Remote { inner: owner, ext };
                     let _ = remote
-                        .call("event", "stream", args, None, Some(CALL_DEADLINE))
+                        .call("entry handler", "entry", args, None, Some(CALL_DEADLINE))
                         .await;
                 }
             }

@@ -29,7 +29,7 @@
 //   spawn {spawn} -> null | {block} | {replace}
 //   schemeResolve {scheme,path,session:{id,dir,cwd}} -> "virtual" | {file,writable}
 //   schemeRead {scheme,path,session} -> string; schemeWrite {scheme,path,session,content} -> string
-//   command {command,session,args} -> null; stream {sub:"entry",session,event} -> null
+//   command {command,session,args} -> null; entry {session,entry} -> null
 //   stream {sub,event} | {sub,lagged} | {sub,closed:true} -> null
 // Runner -> Rust methods with `parent` = a live call of the same `ext`:
 //   under login: openUrl {url,instructions?} -> null; deviceCode {userCode,verificationUrl,
@@ -291,21 +291,6 @@ socket.on("error", () => {
 
 // ---- Dispatch ----
 
-const HOST_METHODS: Record<string, true> = {
-  activate: true,
-  login: true,
-  refresh: true,
-  rewrite: true,
-  tool: true,
-  policyBefore: true,
-  policyAfter: true,
-  spawn: true,
-  schemeResolve: true,
-  schemeRead: true,
-  schemeWrite: true,
-  command: true,
-  stream: true,
-};
 const RUNNER_METHODS: Record<string, true> = {
   openUrl: true,
   deviceCode: true,
@@ -384,7 +369,8 @@ function onCall(id: string, frame: Frame): void {
   if (typeof method !== "string" || typeof ext !== "string") violation("malformed call");
   if (Object.hasOwn(RUNNER_METHODS, method)) violation("host called a runner method");
   if (frame.parent !== undefined) violation("host call with a parent");
-  if (!Object.hasOwn(HOST_METHODS, method)) {
+  const handler = Object.hasOwn(handlers, method) ? handlers[method] : undefined;
+  if (!handler) {
     void send({ type: "error", id, code: "unsupported" });
     return;
   }
@@ -400,7 +386,7 @@ function onCall(id: string, frame: Frame): void {
       await send({ type: "error", id, code: status });
     }
   };
-  run(id, call, frame.args).then(
+  (async () => handler(id, call, record(frame.args)))().then(
     (value) => finish({ type: "ok", id, value: value ?? null }),
     (error) => finish(errorReply(id, error)),
   );
@@ -431,6 +417,92 @@ interface Active {
 const extensions = new Map<string, Active>();
 const activating = new Set<string>();
 
+type Handler = (id: string, call: Call, args: Frame) => Promise<unknown>;
+
+const handlers: Record<string, Handler> = {
+  activate: async (_id, call, args) => activate(call.ext, args, call.controller.signal),
+  login: providerCall,
+  refresh: providerCall,
+  rewrite: providerCall,
+  async tool(id, call, args) {
+    const handler = extensions.get(call.ext)?.tools.get(text(args.tool));
+    if (!handler) throw new Fail("unsupported");
+    return tool(id, call, handler, args);
+  },
+  async policyBefore(_id, call, args) {
+    const before = extensions.get(call.ext)?.toolPolicy?.before;
+    if (!before) throw new Fail("unsupported");
+    const scope = freeze(record(args.scope)) as unknown as ToolScope;
+    const cx = record(args.cx) as unknown as BeforeToolCall;
+    const value = await before(scope, cx, call.controller.signal);
+    return decision(value, { block: "true", reason: "string?", terminate: "boolean?" });
+  },
+  async policyAfter(_id, call, args) {
+    const after = extensions.get(call.ext)?.toolPolicy?.after;
+    if (!after) throw new Fail("unsupported");
+    const scope = freeze(record(args.scope)) as unknown as ToolScope;
+    const cx = record(args.cx) as unknown as AfterToolCall;
+    const value = await after(scope, cx, call.controller.signal);
+    return decision(value, {
+      content: "array?",
+      details: "any?",
+      isError: "boolean?",
+      terminate: "boolean?",
+    });
+  },
+  async spawn(_id, call, args) {
+    const spawn = extensions.get(call.ext)?.spawnHook;
+    if (!spawn) throw new Fail("unsupported");
+    const request = record(args.spawn) as unknown as SpawnContext;
+    const value = await spawn(request, call.controller.signal);
+    if (isRecord(value) && Object.hasOwn(value, "replace")) return decision(value, { replace: "object" });
+    return decision(value, { block: "string" });
+  },
+  schemeResolve: schemeCall,
+  schemeRead: schemeCall,
+  schemeWrite: schemeCall,
+  async command(_id, call, args) {
+    const handler = extensions.get(call.ext)?.commands.get(text(args.command));
+    if (!handler) throw new Fail("unsupported");
+    await handler(text(args.args), handle(call.ext, text(args.session)), call.controller.signal);
+    return null;
+  },
+  async entry(_id, call, args) {
+    const onEntry = extensions.get(call.ext)?.onEntry;
+    if (!onEntry) throw new Fail("unsupported");
+    await onEntry(freeze(record(args.entry)) as unknown as SeqEntry, handle(call.ext, text(args.session)));
+    return null;
+  },
+  async stream(_id, { ext }, args) {
+    const sub = text(args.sub);
+    // A stream can emit before Rust's subscribe reply reaches the socket.
+    while (!subscriptions.has(sub)) {
+      const replies = [];
+      for (const [reply, owner] of registering) if (owner === ext) replies.push(reply);
+      if (!replies.length) break;
+      await Promise.race(replies).catch(() => {});
+    }
+    const subscription = subscriptions.get(sub);
+    if (subscription?.ext !== ext) throw new Fail("unsupported");
+    let event: StreamEvent;
+    if (args.closed === true) {
+      subscription.remove();
+      event = { type: "closed", value: null };
+    } else if (typeof args.lagged === "number") {
+      event = { type: "lagged", value: { skipped: args.lagged } };
+    } else {
+      event = record(args.event) as unknown as StreamEvent;
+    }
+    const { listener } = subscription;
+    try {
+      await listener(event);
+    } catch {
+      // One listener error must not end the subscription.
+    }
+    return null;
+  },
+};
+
 function isRecord(value: unknown): value is Frame {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -445,128 +517,40 @@ function text(value: unknown): string {
   return value;
 }
 
-async function run(id: string, call: Call, rawArgs: unknown): Promise<unknown> {
-  const { ext, method, controller } = call;
+async function schemeCall(_id: string, { ext, method, controller }: Call, args: Frame): Promise<unknown> {
   const signal = controller.signal;
-  const args = record(rawArgs);
-  if (method === "activate") return activate(ext, args, signal);
-  const active = extensions.get(ext);
-  switch (method) {
-    case "login":
-    case "refresh":
-    case "rewrite":
-      return provider(id, call, active, args);
-    case "tool": {
-      const handler = active?.tools.get(text(args.tool));
-      if (!handler) throw new Fail("unsupported");
-      return tool(id, call, handler, args);
-    }
-    case "policyBefore": {
-      const before = active?.toolPolicy?.before;
-      if (!before) throw new Fail("unsupported");
-      const scope = freeze(record(args.scope)) as unknown as ToolScope;
-      const cx = record(args.cx) as unknown as BeforeToolCall;
-      const value = await before(scope, cx, signal);
-      return decision(value, { block: "true", reason: "string?", terminate: "boolean?" });
-    }
-    case "policyAfter": {
-      const after = active?.toolPolicy?.after;
-      if (!after) throw new Fail("unsupported");
-      const scope = freeze(record(args.scope)) as unknown as ToolScope;
-      const cx = record(args.cx) as unknown as AfterToolCall;
-      const value = await after(scope, cx, signal);
-      return decision(value, {
-        content: "array?",
-        details: "any?",
-        isError: "boolean?",
-        terminate: "boolean?",
-      });
-    }
-    case "spawn": {
-      if (!active?.spawnHook) throw new Fail("unsupported");
-      const request = record(args.spawn) as unknown as SpawnContext;
-      const value = await active.spawnHook(request, signal);
-      if (isRecord(value) && Object.hasOwn(value, "replace")) return decision(value, { replace: "object" });
-      return decision(value, { block: "string" });
-    }
-    case "schemeResolve":
-    case "schemeRead":
-    case "schemeWrite": {
-      const name = text(args.scheme);
-      const scheme = active?.schemes.get(name);
-      if (!scheme) throw new Fail("unsupported");
-      const path = text(args.path);
-      const session = record(args.session);
-      const cx: SchemeHandlerContext = freeze({
-        scheme: name,
-        session: {
-          id: text(session.id),
-          dir: text(session.dir),
-          cwd: text(session.cwd),
-        },
-      });
-      if (method === "schemeResolve") {
-        const target = await scheme.resolve(path, cx, signal);
-        if (target === "virtual") return target;
-        return decision(target, { file: "string", writable: "boolean" }) ?? invalidReply();
-      }
-      if (method === "schemeRead") {
-        if (!scheme.read) throw new Fail("unsupported");
-        return text(await scheme.read(path, cx, signal));
-      }
-      if (!scheme.write) throw new Fail("unsupported");
-      const content = text(args.content);
-      return text(await scheme.write(path, content, cx, signal));
-    }
-    case "command": {
-      const handler = active?.commands.get(text(args.command));
-      if (!handler) throw new Fail("unsupported");
-      await handler(text(args.args), handle(ext, text(args.session)), signal);
-      return null;
-    }
-    case "stream": {
-      const sub = text(args.sub);
-      if (sub === "entry") {
-        if (!active?.onEntry) throw new Fail("unsupported");
-        const event = record(args.event);
-        const entry = freeze(record(event.value)) as unknown as SeqEntry;
-        await active.onEntry(entry, handle(ext, text(args.session)));
-        return null;
-      }
-      // A stream can emit before Rust's subscribe reply reaches the socket.
-      while (!subscriptions.has(sub)) {
-        const replies = [];
-        for (const [reply, owner] of registering) if (owner === ext) replies.push(reply);
-        if (!replies.length) break;
-        await Promise.race(replies).catch(() => {});
-      }
-      const subscription = subscriptions.get(sub);
-      if (subscription?.ext !== ext) throw new Fail("unsupported");
-      let event: StreamEvent;
-      if (args.closed === true) {
-        subscription.remove();
-        event = { type: "closed", value: null };
-      } else if (typeof args.lagged === "number") {
-        event = { type: "lagged", value: { skipped: args.lagged } };
-      } else {
-        event = record(args.event) as unknown as StreamEvent;
-      }
-      const { listener } = subscription;
-      try {
-        await listener(event);
-      } catch {
-        // One listener error must not end the subscription.
-      }
-      return null;
-    }
+  const name = text(args.scheme);
+  const scheme = extensions.get(ext)?.schemes.get(name);
+  if (!scheme) throw new Fail("unsupported");
+  const path = text(args.path);
+  const session = record(args.session);
+  const cx: SchemeHandlerContext = freeze({
+    scheme: name,
+    session: {
+      id: text(session.id),
+      dir: text(session.dir),
+      cwd: text(session.cwd),
+    },
+  });
+  if (method === "schemeResolve") {
+    const target = await scheme.resolve(path, cx, signal);
+    if (target === "virtual") return target;
+    return decision(target, { file: "string", writable: "boolean" }) ?? invalidReply();
   }
+  if (method === "schemeRead") {
+    if (!scheme.read) throw new Fail("unsupported");
+    return text(await scheme.read(path, cx, signal));
+  }
+  if (!scheme.write) throw new Fail("unsupported");
+  const content = text(args.content);
+  return text(await scheme.write(path, content, cx, signal));
 }
 
-async function provider(id: string, call: Call, active: Active | undefined, args: Frame): Promise<unknown> {
+async function providerCall(id: string, call: Call, args: Frame): Promise<unknown> {
   const { ext, method, controller } = call;
   const signal = controller.signal;
   if (typeof args.provider !== "string") throw new Fail("invalid");
-  const handlers = active?.providers.get(args.provider);
+  const handlers = extensions.get(ext)?.providers.get(args.provider);
   switch (method) {
     case "login": {
       if (!handlers?.login) throw new Fail("unsupported");

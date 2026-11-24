@@ -195,8 +195,17 @@ const activate: Extension = ({ dataDir, host, models, session: getSession }) => 
       read: async (path) => `read:${path}`,
     },
   },
-  onEntry({ entry }) {
+  async onEntry({ entry }) {
     appendFileSync(join(dataDir, "entries"), `${entry.type}\n`);
+    if (entry.type !== "custom") return;
+    const order = join(dataDir, "entry-order");
+    if (entry.customType === "entry-hold") {
+      appendFileSync(order, "start\n");
+      while (!existsSync(join(dataDir, "entry-release"))) await Bun.sleep(5);
+      appendFileSync(order, "reject\n");
+      throw new Error("test entry rejection");
+    }
+    if (entry.customType === "entry-after") appendFileSync(order, "after\n");
   },
 });
 

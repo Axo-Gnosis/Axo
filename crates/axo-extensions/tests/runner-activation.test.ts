@@ -126,6 +126,13 @@ for (const cancel of [false, true]) {
         const id = command(ext, name);
         expect(await next()).toMatchObject({ type: "ok", id });
       }
+      if (!cancel) {
+        const unsupported = call("good", "constructor", {});
+        expect(await next()).toEqual({ type: "error", id: unsupported, code: "unsupported" });
+        call("good", "invoke", {});
+        expect((await messages.next()).done).toBe(true);
+        expect(await child.exited).toBe(1);
+      }
     } finally {
       socket?.destroy();
       if (child) { child.kill(); await child.exited; }

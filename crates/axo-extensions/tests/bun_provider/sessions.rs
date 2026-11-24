@@ -254,6 +254,34 @@ pub async fn run(bun: &Path, mode: Supervision) {
         "an event had no entry type:\n{seen}"
     );
 
+    // A held entry handler must settle before the next entry is delivered.
+    let order = data.join("entry-order");
+    bounded(session.append_custom("entry-hold", None))
+        .await
+        .unwrap();
+    wait_for("held entry handler", || {
+        std::fs::read_to_string(&order).is_ok_and(|seen| seen == "start\n")
+    })
+    .await;
+    bounded(session.append_custom("entry-after", None))
+        .await
+        .unwrap();
+    let barrier = session
+        .parse_command("/hello order-barrier")
+        .unwrap()
+        .unwrap();
+    bounded(session.run_command(barrier)).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&order).unwrap(), "start\n");
+    std::fs::write(data.join("entry-release"), "").unwrap();
+    wait_for("delivery after rejected entry handler", || {
+        std::fs::read_to_string(&order).is_ok_and(|seen| seen.contains("after\n"))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(order).unwrap(),
+        "start\nreject\nafter\n"
+    );
+
     // A host abort cancels the hanging probe; the handler sees its signal abort.
     api.lane(
         "m",

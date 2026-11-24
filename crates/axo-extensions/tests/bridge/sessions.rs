@@ -382,6 +382,9 @@ async fn tools_policy_state_command_and_events() {
     let path = host.path("ctl/lab/entries");
     wait_for("all journal events", || lines(&path).len() >= types.len()).await;
     assert_eq!(lines(&path), types);
+    let calls = host.calls(LAB);
+    assert!(calls.iter().any(|call| call == "entry"));
+    assert!(!calls.iter().any(|call| call == "stream"));
 
     let leaf = journal
         .iter()

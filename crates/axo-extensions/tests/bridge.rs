@@ -572,8 +572,8 @@ mod fake {
     ///   `spawn` also records its args in `blocked-spawn`). `policyAfter`: `record` logs `after`.
     /// - `ctl/<ext>/command`: `ok` (posts a quiet `lab` message) | `subscribe` (records the
     ///   id in `subs`) | `unsubscribe` | `reenter` (runs itself, expects a refusal) | `prompt`
-    ///   (prompts `go`) | `compact` (expects `busy`). `stream` records journal entry types in
-    ///   `entries` for `sub: "entry"` and other subscriptions' frames in `streams`.
+    ///   (prompts `go`) | `compact` (expects `busy`). `entry` records journal entry types in
+    ///   `entries`; `stream` records subscription frames in `streams`.
     ///   `schemeResolve` and `schemeRead` serve a virtual resource.
     /// - Any method: `late` waits for `ctl/<ext>/release`, then replies as `ok` even if the
     ///   host canceled the call meanwhile.
@@ -947,11 +947,10 @@ mod fake {
                         other => Err(fail(format!("expected no_subscription, got {other:?}"))),
                     }
                 }
-                "stream" if args["sub"] == "entry" => {
-                    assert_eq!(args["event"]["type"], "entry");
+                "entry" => {
                     append(
                         &self.control.join(ext).join("entries"),
-                        args["event"]["value"]["entry"]["type"].as_str().unwrap(),
+                        args["entry"]["entry"]["type"].as_str().unwrap(),
                     );
                     Ok(Value::Null)
                 }
