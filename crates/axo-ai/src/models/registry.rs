@@ -1,15 +1,15 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use tokio::sync::watch;
 
-use crate::api::RequestRewrite;
+use crate::api::{ProviderTransport, RequestRewrite};
 use crate::auth::claude_subscription;
 use crate::auth::codex as codex_auth;
-use crate::auth::provider::{LoginInteraction, Provider};
+use crate::auth::provider::{LoginInteraction, Provider, ProviderModels};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{Credential, CredentialSource, ModelAuth};
 use crate::error::Error;
@@ -41,19 +41,27 @@ impl Scope {
     }
 }
 
+/// Runtime model lists by credential slot, as `ProviderModels::list` last returned them.
+pub(super) type Listed = HashMap<String, Vec<Arc<Model>>>;
+
 pub(super) struct State {
     loaded: Loaded,
+    pub(super) listed: Listed,
     overlay: Overlay,
 }
 
 impl State {
-    pub(super) fn new(loaded: Loaded) -> Self {
-        let overlay = Overlay::new(&loaded, None);
-        Self { loaded, overlay }
+    pub(super) fn new(loaded: Loaded, listed: Listed) -> Self {
+        let overlay = Overlay::new(&loaded, &listed, None);
+        Self {
+            loaded,
+            listed,
+            overlay,
+        }
     }
 
     fn rebuild(&mut self) -> bool {
-        self.overlay.rebuild(&self.loaded, None)
+        self.overlay.rebuild(&self.loaded, &self.listed, None)
     }
 }
 
@@ -74,16 +82,22 @@ struct Published {
 }
 
 impl Published {
-    fn build(loaded: &Loaded, winners: &BTreeMap<&str, (&Registered, ProviderOrigin)>) -> Self {
+    fn build(
+        loaded: &Loaded,
+        listed: &Listed,
+        winners: &BTreeMap<&str, (&Registered, ProviderOrigin)>,
+    ) -> Self {
         let snapshot: Arc<[Arc<Model>]> = loaded
             .models
             .iter()
             .filter(|model| !winners.contains_key(model.provider.as_str()))
-            .chain(
-                winners
-                    .values()
-                    .flat_map(|(registered, _)| &registered.models),
-            )
+            .chain(winners.values().flat_map(|(registered, _)| {
+                registered
+                    .list_models
+                    .as_ref()
+                    .and_then(|_| listed.get(&registered.auth.slot))
+                    .unwrap_or(&registered.models)
+            }))
             .cloned()
             .collect();
         let mut by_id: Vec<usize> = (0..snapshot.len()).collect();
@@ -127,13 +141,13 @@ impl Published {
 }
 
 impl Overlay {
-    fn new(loaded: &Loaded, lower: Option<&Overlay>) -> Self {
+    fn new(loaded: &Loaded, listed: &Listed, lower: Option<&Overlay>) -> Self {
         let mut overlay = Self {
             registered: BTreeMap::new(),
             layers: BTreeMap::new(),
             published: Published::default(),
         };
-        overlay.rebuild(loaded, lower);
+        overlay.rebuild(loaded, listed, lower);
         overlay
     }
 
@@ -152,13 +166,21 @@ impl Overlay {
         }
     }
 
-    fn rebuild(&mut self, loaded: &Loaded, lower: Option<&Overlay>) -> bool {
+    /// Every provider that wins its id in this overlay over `lower`.
+    fn winners<'a>(
+        &'a self,
+        lower: Option<&'a Overlay>,
+    ) -> BTreeMap<&'a str, (&'a Registered, ProviderOrigin)> {
         let mut winners = BTreeMap::new();
         if let Some(lower) = lower {
             lower.extend_winners(&mut winners);
         }
         self.extend_winners(&mut winners);
-        let published = Published::build(loaded, &winners);
+        winners
+    }
+
+    fn rebuild(&mut self, loaded: &Loaded, listed: &Listed, lower: Option<&Overlay>) -> bool {
+        let published = Published::build(loaded, listed, &self.winners(lower));
         let changed = self.published.snapshot != published.snapshot
             || self.published.providers != published.providers;
         self.published = published;
@@ -224,9 +246,9 @@ impl View {
             let mut overlay = scope.write();
             let (result, touched) = edit(&mut overlay);
             let changed = touched
-                && base
-                    .as_ref()
-                    .is_some_and(|base| overlay.rebuild(&base.loaded, Some(&base.overlay)));
+                && base.as_ref().is_some_and(|base| {
+                    overlay.rebuild(&base.loaded, &base.listed, Some(&base.overlay))
+                });
             drop(overlay);
             drop(base);
             scope.notify(changed);
@@ -263,12 +285,44 @@ impl View {
             .and_then(|scope| scope.runtime(id))
             .or_else(|| base.overlay.runtime(id))
     }
+
+    /// `id`'s winning runtime provider in this view, when it is available and lists models.
+    pub(super) fn lister(&self, id: &str) -> Option<Lister> {
+        self.with_registry(|base, scope| lister(Self::runtime(base, scope, id)?))
+    }
+
+    /// Every available winning runtime provider of this view that lists models.
+    pub(super) fn listers(&self) -> Vec<Lister> {
+        self.with_registry(|base, scope| {
+            let winners = match scope {
+                Some(scope) => scope.winners(Some(&base.overlay)),
+                None => base.overlay.winners(None),
+            };
+            winners
+                .keys()
+                .filter_map(|id| lister(Self::runtime(base, scope, id)?))
+                .collect()
+        })
+    }
+}
+
+/// A winning provider whose models axo lists: its auth (and so its slot) and its listing.
+pub(super) type Lister = (Arc<ProviderAuth>, Arc<dyn ProviderModels>);
+
+fn lister((registered, unavailable): (&Registered, Option<&str>)) -> Option<Lister> {
+    let list = registered
+        .list_models
+        .clone()
+        .filter(|_| unavailable.is_none())?;
+    Some((Arc::clone(&registered.auth), list))
 }
 
 struct Registered {
     auth: Arc<ProviderAuth>,
     models: Vec<Arc<Model>>,
     rewrite: Option<Arc<dyn RequestRewrite>>,
+    transport: Option<Arc<dyn ProviderTransport>>,
+    list_models: Option<Arc<dyn ProviderModels>>,
 }
 
 impl Registered {
@@ -291,6 +345,8 @@ impl Registered {
             oauth_only,
             login,
             rewrite,
+            transport,
+            list_models,
         } = provider;
         let auth = Arc::new(ProviderAuth {
             id: id.clone(),
@@ -307,6 +363,8 @@ impl Registered {
                 auth,
                 models: models.into_iter().map(Arc::new).collect(),
                 rewrite,
+                transport,
+                list_models,
             },
         ))
     }
@@ -317,6 +375,7 @@ impl Registered {
             auth: Arc::clone(&self.auth),
             headers: BTreeMap::new(),
             rewrite: self.rewrite.clone(),
+            transport: self.transport.clone(),
             config_base_url: false,
             anthropic_subscription: false,
         }
@@ -345,24 +404,29 @@ impl Provider {
                 "provider {id}: OAuth-only requires a credential and cannot use environment variables"
             )));
         }
-        let mut seen = HashSet::new();
-        for model in &self.models {
-            model.validate_service_tiers()?;
-            if &model.provider != id {
-                return Err(Error::Config(format!(
-                    "provider {id}: model {} belongs to provider {}",
-                    model.id, model.provider
-                )));
-            }
-            if !seen.insert(model.id.as_str()) {
-                return Err(Error::Config(format!(
-                    "provider {id}: duplicate model {}",
-                    model.id
-                )));
-            }
-        }
-        Ok(())
+        validate_models(id, &self.models)
     }
+}
+
+/// Every model names provider `id`, has a unique id, and has valid service tiers.
+pub(super) fn validate_models(id: &str, models: &[Model]) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    for model in models {
+        model.validate_service_tiers()?;
+        if model.provider != id {
+            return Err(Error::Config(format!(
+                "provider {id}: model {} belongs to provider {}",
+                model.id, model.provider
+            )));
+        }
+        if !seen.insert(model.id.as_str()) {
+            return Err(Error::Config(format!(
+                "provider {id}: duplicate model {}",
+                model.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn unavailable(provider: &str, reason: &str) -> Error {
@@ -377,6 +441,7 @@ pub(super) struct Request {
     pub(super) auth: Arc<ProviderAuth>,
     pub(super) headers: BTreeMap<String, String>,
     pub(super) rewrite: Option<Arc<dyn RequestRewrite>>,
+    pub(super) transport: Option<Arc<dyn ProviderTransport>>,
     pub(super) config_base_url: bool,
     pub(super) anthropic_subscription: bool,
 }
@@ -392,7 +457,11 @@ impl Models {
         // land between building its state and `notify_base_changed` seeing it.
         let base = self.view.shared.read();
         let scope = Arc::new(Scope {
-            state: RwLock::new(Overlay::new(&base.loaded, Some(&base.overlay))),
+            state: RwLock::new(Overlay::new(
+                &base.loaded,
+                &base.listed,
+                Some(&base.overlay),
+            )),
             changes: watch::Sender::new(0),
         });
         {
@@ -437,9 +506,10 @@ impl Models {
     pub fn register(&self, owner: &str, provider: Provider) -> Result<(), Error> {
         let (id, registered) = Registered::new(provider, "registered", owner)?;
         self.view.edit(true, |overlay| {
-            overlay.registered.insert(id, registered);
+            overlay.registered.insert(id.clone(), registered);
             ((), true)
         });
+        self.view.spawn_listing(&id, true);
         Ok(())
     }
 
@@ -520,7 +590,9 @@ impl Models {
             .shared
             .credentials
             .set(&info.slot, Credential::ApiKey { key })
-            .await
+            .await?;
+        self.view.spawn_listing(provider, false);
+        Ok(())
     }
 
     /// Runs `provider`'s login through `interaction` and stores the credential. Drop the
@@ -543,6 +615,7 @@ impl Models {
             .credentials
             .set(&info.slot, credential)
             .await?;
+        self.view.spawn_listing(provider, false);
         // Only a login for this still-visible loaded Codex record should refresh the account list.
         if provider == codex_auth::PROVIDER && self.is_visible_loaded(provider, &info) {
             let shared = Arc::clone(&self.view.shared);
@@ -633,13 +706,14 @@ impl Models {
                     .cloned()
                     .unwrap_or_default(),
                 rewrite: None,
+                transport: None,
                 config_base_url: base.loaded.config_base_urls.contains(&key),
             })
         })
     }
 }
 impl Shared {
-    fn read(&self) -> RwLockReadGuard<'_, State> {
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, State> {
         self.state.read().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -660,6 +734,20 @@ impl Shared {
         self.notify_base_changed(changed);
     }
 
+    /// Changes the runtime model lists, then rebuilds the base and every live scope, since a
+    /// listed slot can win in a scope without winning in the base.
+    pub(super) fn edit_listed(&self, edit: impl FnOnce(&mut Listed)) {
+        let changed = {
+            let mut state = self.write();
+            edit(&mut state.listed);
+            state.rebuild()
+        };
+        if changed {
+            self.changes.send_modify(|g| *g += 1);
+        }
+        self.rebuild_scopes();
+    }
+
     fn notify_base_changed(&self, base_changed: bool) {
         // A scope's snapshot and providers derive from the base's published ones plus its own
         // overlays, so an unchanged base leaves every scope unchanged.
@@ -667,16 +755,27 @@ impl Shared {
             return;
         }
         self.changes.send_modify(|g| *g += 1);
-        let mut live: Vec<Arc<Scope>> = {
-            let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
-            scopes.retain(|weak| weak.strong_count() > 0);
-            scopes.iter().filter_map(Weak::upgrade).collect()
-        };
+        self.rebuild_scopes();
+    }
+
+    /// Live scoped views, pruning dropped ones.
+    pub(super) fn live_scopes(&self) -> Vec<Arc<Scope>> {
+        let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
+        scopes.retain(|weak| weak.strong_count() > 0);
+        scopes.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    fn rebuild_scopes(&self) {
+        let mut live = self.live_scopes();
         if live.is_empty() {
             return;
         }
         let base = self.read();
-        live.retain(|scope| scope.write().rebuild(&base.loaded, Some(&base.overlay)));
+        live.retain(|scope| {
+            scope
+                .write()
+                .rebuild(&base.loaded, &base.listed, Some(&base.overlay))
+        });
         drop(base);
         for scope in live {
             scope.notify(true);
@@ -719,9 +818,13 @@ impl ProviderLayer {
                 }
             }
         }
+        let ids: Vec<String> = layer.keys().cloned().collect();
         self.view.edit(true, |overlay| {
             ((), overlay.replace_layer(self.ordinal, layer))
         });
+        for id in ids {
+            self.view.spawn_listing(&id, true);
+        }
         Ok(())
     }
 
@@ -823,6 +926,8 @@ mod tests {
                             oauth_only: false,
                             login: None,
                             rewrite: None,
+                            transport: None,
+                            list_models: None,
                         },
                     )
                     .unwrap();

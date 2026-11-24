@@ -245,6 +245,10 @@ pub struct Compat {
     pub allow_empty_signature: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_mid_convo_tool_changes: Option<bool>,
+    /// Anthropic Messages: send each tool as `<prefix><name>` and map names in the response
+    /// back. A wire name longer than 64 characters is sent as `t-<hash>` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]

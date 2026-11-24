@@ -57,6 +57,7 @@ impl Streamer for Models {
                         simple: opts,
                         auth,
                         rewrite: request.rewrite,
+                        transport: request.transport,
                     },
                     cancel,
                 )),

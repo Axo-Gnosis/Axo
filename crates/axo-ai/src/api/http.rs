@@ -9,11 +9,13 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use reqwest::header::HeaderMap;
-use reqwest::{RequestBuilder, Response};
 use tokio_util::sync::CancellationToken;
 
 use super::sse::{SseDecoder, SseEvent};
-use super::{ABORTED, ProviderRequest, Reply, RequestRewrite};
+use super::{
+    ABORTED, ProviderRequest, ProviderResponse, ProviderTransport, Reply, RequestContext,
+    StreamOptions,
+};
 use crate::model::Model;
 
 /// The shared client: rustls, HTTP/2, no global timeout (streams can run long), idle
@@ -29,49 +31,115 @@ pub fn client() -> reqwest::Client {
 const MAX_REQUEST_RETRIES: u32 = 2;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(60);
 
-/// Send the request built by `request`, retrying connection failures and retryable
-/// statuses (`x-should-retry`, else 408, 409, 429 and ≥500) with the SDKs' backoff or
-/// the server's `retry-after-ms`/`retry-after`. The backoff sleep is cancellable.
+/// Where one request's attempts go: the provider's transport, else axo's client.
+enum Sender<'a> {
+    Http {
+        http: &'a reqwest::Client,
+        request: &'a ProviderRequest,
+        body: bytes::Bytes,
+    },
+    Transport {
+        transport: &'a dyn ProviderTransport,
+        model: &'a Model,
+        request: &'a ProviderRequest,
+        session_id: Option<String>,
+    },
+}
+
+/// An attempt that produced no response.
+struct Unsent {
+    message: String,
+    retryable: bool,
+    failure: Option<crate::ProviderFailure>,
+}
+
+impl Sender<'_> {
+    /// One attempt. Connection failures of axo's client are retryable; a transport `Err` is not.
+    async fn send(&self, attempt: u32) -> Result<ProviderResponse, Unsent> {
+        match self {
+            Self::Http {
+                http,
+                request,
+                body,
+            } => http
+                .post(&request.url)
+                .headers(request.headers.clone())
+                .body(body.clone())
+                .send()
+                .await
+                .map(ProviderResponse::from)
+                .map_err(|error| Unsent {
+                    retryable: error.is_connect() || error.is_timeout() || error.is_request(),
+                    message: error.to_string(),
+                    failure: None,
+                }),
+            Self::Transport {
+                transport,
+                model,
+                request,
+                session_id,
+            } => {
+                let context = RequestContext {
+                    session_id: session_id.clone(),
+                    attempt,
+                };
+                transport
+                    .send(model, request, &context)
+                    .await
+                    .map_err(|error| Unsent {
+                        message: error.to_string(),
+                        retryable: false,
+                        failure: error.provider_failure(),
+                    })
+            }
+        }
+    }
+}
+
+/// Send `sender`'s attempts, retrying retryable unsent attempts and retryable statuses
+/// (`x-should-retry`, else 408, 409, 429 and ≥500) with the SDKs' backoff or the server's
+/// `retry-after-ms`/`retry-after`. The backoff sleep is cancellable.
 ///
 /// Returns the last response whatever its status, so the adapter can turn an error
-/// status and body into its own error message. Connection errors after the last retry
-/// are returned as strings; cancellation as `ABORTED`. A server-requested
-/// delay above 60 seconds returns the response without sleeping, preserving its failure metadata.
+/// status and body into its own error message, or the last unsent attempt; cancellation is
+/// `ABORTED`. A server-requested delay above 60 seconds returns the response without
+/// sleeping, preserving its failure metadata.
 async fn send_with_retry(
-    request: impl Fn() -> RequestBuilder,
+    sender: &Sender<'_>,
     cancel: &CancellationToken,
-) -> Result<Response, String> {
+) -> Result<ProviderResponse, Unsent> {
+    let aborted = || Unsent {
+        message: ABORTED.to_owned(),
+        retryable: false,
+        failure: None,
+    };
     let mut retry_index = 0;
     loop {
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
-            result = request().send() => result,
+            _ = cancel.cancelled() => return Err(aborted()),
+            result = sender.send(retry_index) => result,
         };
         let retryable = match &result {
-            Ok(response) if response.status().is_success() => false,
-            Ok(response) => {
-                let status = response.status();
-                should_retry(response.headers()).unwrap_or_else(|| {
-                    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
-                })
-            }
-            Err(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+            Ok(response) if (200..300).contains(&response.status) => false,
+            Ok(response) => should_retry(&response.headers)
+                .unwrap_or(matches!(response.status, 408 | 409 | 429) || response.status >= 500),
+            Err(unsent) => unsent.retryable,
         };
         if !retryable || retry_index >= MAX_REQUEST_RETRIES {
-            return result.map_err(|error| error.to_string());
+            return result;
         }
 
         let delay = match result {
-            Ok(response) => match server_delay(response.headers()) {
+            Ok(response) => match server_delay(&response.headers) {
                 Some(seconds) if seconds > MAX_SERVER_DELAY.as_secs_f64() => {
                     return Ok(response);
                 }
                 Some(seconds) => Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX),
                 None => backoff(retry_index),
             },
-            Err(error) => {
-                tracing::debug!(%error, retry_index, "retrying provider request");
+            Err(unsent) => {
+                tracing::debug!(error = %unsent.message, retry_index, "retrying provider request");
                 backoff(retry_index)
             }
         };
@@ -79,24 +147,25 @@ async fn send_with_retry(
         retry_index += 1;
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(ABORTED.to_owned()),
+            _ = cancel.cancelled() => return Err(aborted()),
             _ = tokio::time::sleep(delay) => {}
         }
     }
 }
 
-/// Rewrite once, send with transport retry, and capture failure metadata before
-/// formatting an unsuccessful response. A failed or cancelled rewrite sends nothing.
+/// Rewrite once, send each attempt through the provider's transport or axo's client with
+/// transport retry, and capture failure metadata before formatting an unsuccessful response.
+/// A failed or cancelled rewrite sends nothing; a transport `Err` is never retried.
 pub(crate) async fn dispatch(
     http: &reqwest::Client,
-    rewrite: Option<&dyn RequestRewrite>,
+    opts: &StreamOptions,
     model: &Model,
     request: ProviderRequest,
     cancel: &CancellationToken,
     reply: &mut Reply,
     describe: impl FnOnce(u16, &str, Option<&serde_json::Value>) -> String,
-) -> Result<Response, String> {
-    let request = match rewrite {
+) -> Result<ProviderResponse, String> {
+    let request = match &opts.rewrite {
         None => request,
         Some(rewrite) => tokio::select! {
             biased;
@@ -109,17 +178,29 @@ pub(crate) async fn dispatch(
             })?,
         },
     };
-    let ProviderRequest { url, headers, body } = request;
-    let body: bytes::Bytes = body.to_string().into();
-    let response = send_with_retry(
-        || http.post(&url).headers(headers.clone()).body(body.clone()),
-        cancel,
-    )
-    .await?;
-    if response.status().is_success() {
+    let sender = match &opts.transport {
+        Some(transport) => Sender::Transport {
+            transport: transport.as_ref(),
+            model,
+            request: &request,
+            session_id: opts.simple.session_id.clone(),
+        },
+        None => Sender::Http {
+            http,
+            request: &request,
+            body: request.body.to_string().into(),
+        },
+    };
+    let response = send_with_retry(&sender, cancel).await.map_err(|unsent| {
+        if unsent.failure.is_some() {
+            reply.message.failure = unsent.failure;
+        }
+        unsent.message
+    })?;
+    if (200..300).contains(&response.status) {
         return Ok(response);
     }
-    let status = response.status().as_u16();
+    let status = response.status;
     reply.message.failure = Some(response_failure(&response));
     let text = error_body(response, cancel)
         .await
@@ -133,11 +214,11 @@ pub(crate) async fn dispatch(
 
 /// Decode through EOF, unless the protocol explicitly terminates first.
 pub(crate) async fn read_sse(
-    response: Response,
+    response: ProviderResponse,
     cancel: &CancellationToken,
     mut on_event: impl FnMut(&SseEvent) -> Result<ControlFlow<()>, String>,
 ) -> Result<(), String> {
-    let mut body = std::pin::pin!(response.bytes_stream());
+    let mut body = response.body;
     let mut decoder = SseDecoder::new();
     loop {
         let chunk = tokio::select! {
@@ -153,7 +234,7 @@ pub(crate) async fn read_sse(
                     }
                 }
             }
-            Some(Err(error)) => return Err(error.to_string()),
+            Some(Err(error)) => return Err(error),
             None => {
                 if let Some(event) = decoder.finish() {
                     let _ = on_event(&event)?;
@@ -166,11 +247,19 @@ pub(crate) async fn read_sse(
 
 /// The body of an unsuccessful response, or `None` when `cancel` fires first: the shared
 /// client has no global timeout, so an error body that never finishes must not pin a request.
-async fn error_body(response: Response, cancel: &CancellationToken) -> Option<String> {
+async fn error_body(response: ProviderResponse, cancel: &CancellationToken) -> Option<String> {
+    let collect = async {
+        let mut bytes = Vec::new();
+        let mut body = response.body;
+        while let Some(Ok(chunk)) = body.next().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
     tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
-        text = response.text() => Some(text.unwrap_or_default()),
+        text = collect => Some(text),
     }
 }
 
@@ -206,13 +295,13 @@ fn should_retry(headers: &HeaderMap) -> Option<bool> {
 }
 
 /// Capture only classification metadata, never authentication or request headers.
-fn response_failure(response: &Response) -> crate::ProviderFailure {
+fn response_failure(response: &ProviderResponse) -> crate::ProviderFailure {
     crate::ProviderFailure {
-        status: Some(response.status().as_u16()),
+        status: Some(response.status),
         code: None,
-        retry_after_ms: server_delay(response.headers())
+        retry_after_ms: server_delay(&response.headers)
             .map(|seconds| (seconds * 1000.0).ceil() as u64),
-        should_retry: should_retry(response.headers()),
+        should_retry: should_retry(&response.headers),
     }
 }
 
@@ -289,7 +378,7 @@ mod tests {
         .unwrap();
         assert_eq!(response.status().as_u16(), 400);
         let cancel = CancellationToken::new();
-        let mut body = pin!(error_body(response, &cancel));
+        let mut body = pin!(error_body(response.into(), &cancel));
         assert!(futures::poll!(body.as_mut()).is_pending());
         cancel.cancel();
         assert_eq!(

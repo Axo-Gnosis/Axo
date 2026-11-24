@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use crate::api::RequestRewrite;
-use crate::auth::Credential;
+use crate::api::{ProviderTransport, RequestRewrite};
+use crate::auth::{Credential, ModelAuth};
 use crate::error::Error;
 use crate::model::Model;
 
@@ -26,6 +26,30 @@ pub struct Provider {
     pub oauth_only: bool,
     pub login: Option<Arc<dyn ProviderLogin>>,
     pub rewrite: Option<Arc<dyn RequestRewrite>>,
+    /// Sends this provider's requests instead of axo's HTTP client. Runs after `rewrite`.
+    pub transport: Option<Arc<dyn ProviderTransport>>,
+    /// Supplies the provider's models at runtime; `models` is then the list used until the
+    /// first successful listing and after logout.
+    pub list_models: Option<Arc<dyn ProviderModels>>,
+}
+
+/// What a provider's model listing receives.
+#[derive(Debug, Clone)]
+pub struct ModelsRequest {
+    /// The provider's resolved credential; `None` when it has none.
+    pub auth: Option<ModelAuth>,
+    /// Every model the models.dev catalog maps, before `models.jsonc` and context caps.
+    pub catalog: Arc<[Arc<Model>]>,
+    /// `ModelsOptions::extended_context`; a provider that caps windows honours it itself.
+    pub extended_context: bool,
+}
+
+/// A provider's runtime model list.
+#[async_trait]
+pub trait ProviderModels: Send + Sync {
+    /// The provider's current models, each with `provider` equal to the provider id. An
+    /// `Err` keeps the list axo already has.
+    async fn list(&self, request: ModelsRequest) -> Result<Vec<Model>, Error>;
 }
 
 /// Login and refresh for one provider. axo stores the credential, decides when to

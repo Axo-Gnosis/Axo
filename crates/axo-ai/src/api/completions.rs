@@ -1157,7 +1157,7 @@ impl Response {
         };
         let response = dispatch(
             http,
-            opts.rewrite.as_deref(),
+            opts,
             &self.model,
             request,
             cancel,

@@ -15,25 +15,33 @@ pub(super) struct ToolNames {
 }
 
 impl ToolNames {
-    pub(super) fn new(transcript: &Transcript) -> Result<Self, String> {
+    /// Wire names `<prefix><name>`, or `t-<hash>` when that is longer than 64 characters or
+    /// is the protocol placeholder.
+    pub(super) fn new(transcript: &Transcript, prefix: &str) -> Result<Self, String> {
+        if prefix.is_empty()
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err("Invalid toolNamePrefix".to_owned());
+        }
         let mut emitted = HashMap::new();
         let mut reverse = HashMap::new();
         let mut add = |name: &str| -> Result<(), String> {
             if emitted.contains_key(name) {
                 return Ok(());
             }
-            let wire = if name.len() >= 64 || name == &PLACEHOLDER[1..] {
-                format!(
+            let mut wire = format!("{prefix}{name}");
+            if wire.len() > 64 || wire == PLACEHOLDER {
+                wire = format!(
                     "t-{}",
                     URL_SAFE_NO_PAD.encode(Sha256::digest(name.as_bytes()))
-                )
-            } else {
-                format!("_{name}")
-            };
+                );
+            }
             if let Some(other) = reverse.insert(wire.clone(), name.to_owned())
                 && other != name
             {
-                return Err("Subscription tool names collide on the wire".to_owned());
+                return Err("Tool names collide on the wire".to_owned());
             }
             emitted.insert(name.to_owned(), wire);
             Ok(())

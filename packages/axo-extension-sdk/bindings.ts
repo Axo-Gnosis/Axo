@@ -711,6 +711,11 @@ export type Compat_Deserialize = {
 	forceAdaptiveThinking?: boolean | null,
 	allowEmptySignature?: boolean | null,
 	supportsMidConvoToolChanges?: boolean | null,
+	/**
+	 *  Anthropic Messages: send each tool as `<prefix><name>` and map names in the response
+	 *  back. A wire name longer than 64 characters is sent as `t-<hash>` instead.
+	 */
+	toolNamePrefix?: string | null,
 };
 
 /**
@@ -757,6 +762,11 @@ export type Compat_Serialize = {
 	forceAdaptiveThinking?: boolean,
 	allowEmptySignature?: boolean,
 	supportsMidConvoToolChanges?: boolean,
+	/**
+	 *  Anthropic Messages: send each tool as `<prefix><name>` and map names in the response
+	 *  back. A wire name longer than 64 characters is sent as `t-<hash>` instead.
+	 */
+	toolNamePrefix?: string,
 };
 
 /**  Data reported by a terminal completion error, including any billed usage. */

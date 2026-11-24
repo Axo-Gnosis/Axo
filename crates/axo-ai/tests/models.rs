@@ -420,6 +420,8 @@ async fn hidden_discovery_keeps_loaded_ids_without_contacting_the_endpoint() {
                 oauth_only: false,
                 login: None,
                 rewrite: None,
+                transport: None,
+                list_models: None,
             }
         });
         if gated {
@@ -765,6 +767,8 @@ async fn subscribe_and_scoped_views_isolate_and_propagate() {
         oauth_only: false,
         login: None,
         rewrite: None,
+        transport: None,
+        list_models: None,
     };
     layer_a
         .replace(vec![(
@@ -1212,6 +1216,8 @@ async fn claude_subscription_reserved_with_empty_catalog() {
         oauth_only: false,
         login: None,
         rewrite: None,
+        transport: None,
+        list_models: None,
     };
     // Manifest admission uses this same callback-free validation.
     assert!(matches!(declaration().validate(), Err(Error::Config(e)) if e.contains("reserved")));

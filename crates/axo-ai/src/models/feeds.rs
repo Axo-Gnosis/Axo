@@ -19,7 +19,7 @@ use super::build::{Candidate, build, catalog_provider_auth};
 use super::codex::CodexModel;
 use super::config::ModelsConfig;
 use super::registry::{State, View};
-use super::{Models, ModelsOptions, Shared, catalog, codex, rules};
+use super::{Models, ModelsOptions, Shared, catalog, codex, listing, rules};
 
 /// Seconds between automatic refreshes unless `ModelsConfig::refresh_interval` says otherwise.
 const DEFAULT_REFRESH_INTERVAL: u64 = 2 * 60 * 60;
@@ -36,6 +36,17 @@ pub(super) struct Inputs {
 }
 
 impl Inputs {
+    /// Every model the catalog maps, before `models.jsonc` and context caps.
+    pub(super) fn catalog_models(&self) -> Arc<[Arc<crate::Model>]> {
+        self.catalog
+            .as_ref()
+            .map_or_else(|| Arc::from([]), |catalog| Arc::clone(&catalog.models))
+    }
+
+    pub(super) fn extended_context(&self) -> bool {
+        self.extended_context
+    }
+
     fn candidate(&self) -> Candidate<'_> {
         Candidate {
             config: &self.config,
@@ -117,7 +128,9 @@ impl Models {
             catalog: Ok(None),
             codex: None,
         };
+        let mut listed = Default::default();
         if let Some(dir) = opts.cache_dir.as_deref() {
+            listed = listing::read(dir).await;
             inputs.codex = codex::read(dir).await;
             match catalog::read(dir).await {
                 Some((cached, cached_age)) => {
@@ -164,8 +177,9 @@ impl Models {
         let models = Models {
             view: View {
                 shared: Arc::new(Shared {
-                    state: RwLock::new(State::new(loaded)),
+                    state: RwLock::new(State::new(loaded, listed)),
                     inputs: tokio::sync::Mutex::new(inputs),
+                    listed_cache: tokio::sync::Mutex::new(()),
                     cache_dir: opts.cache_dir,
                     credentials: opts.credentials,
                     http: http.clone(),
@@ -213,16 +227,22 @@ impl Models {
         let age = inputs
             .catalog_fetched
             .map_or(Duration::MAX, |at| at.elapsed());
+        let relist = inputs.extended_context != extended_context;
         inputs.config = config;
         inputs.extended_context = extended_context;
         shared.replace(loaded);
+        drop(inputs);
         self.start_timer(interval, age, None);
+        if relist {
+            shared.list_all().await;
+        }
         Ok(())
     }
 
-    /// Fetches the catalog, re-runs model discovery, and rebuilds in place. On a catalog
-    /// failure the previous catalog stays and the error is returned; a provider whose
-    /// discovery fails keeps its previous models. Registrations are kept.
+    /// Fetches the catalog, re-runs model discovery, rebuilds in place, then re-lists every
+    /// runtime provider that lists its models. On a catalog failure the previous catalog stays
+    /// and the error is returned; a provider whose discovery or listing fails keeps its
+    /// previous models. Registrations are kept.
     pub async fn refresh(&self) -> Result<(), Error> {
         self.view.shared.refresh(None).await
     }
@@ -264,6 +284,9 @@ impl Models {
     pub async fn logout(&self, provider: &str) -> Result<(), Error> {
         let info = self.provider(provider, false)?;
         self.view.shared.credentials.remove(&info.slot).await?;
+        // A listed set belongs to the credential's principal; re-list without it.
+        self.view.shared.forget_listed(&info.slot).await;
+        self.view.spawn_listing(provider, false);
         if provider == codex_auth::PROVIDER && self.is_visible_loaded(provider, &info) {
             let mut inputs = self.view.shared.inputs.lock().await;
             let removed = match self.view.shared.cache_dir.as_deref() {
@@ -310,7 +333,7 @@ impl Drop for Models {
 }
 
 impl Shared {
-    async fn refresh(&self, skip: Option<&HashSet<String>>) -> Result<(), Error> {
+    async fn refresh(self: &Arc<Self>, skip: Option<&HashSet<String>>) -> Result<(), Error> {
         let mut inputs = self.inputs.lock().await;
         let visible = |id: &str| self.is_base_visible(id);
         let pending = gather(
@@ -321,10 +344,14 @@ impl Shared {
             &inputs.config,
         )
         .await;
-        self.publish(&mut inputs, pending, &|id| {
-            !skip.is_some_and(|set| set.contains(id)) && visible(id)
-        })
-        .await
+        let published = self
+            .publish(&mut inputs, pending, &|id| {
+                !skip.is_some_and(|set| set.contains(id)) && visible(id)
+            })
+            .await;
+        drop(inputs);
+        self.list_all().await;
+        published
     }
 
     pub(super) async fn refresh_codex(&self) -> Result<(), Error> {

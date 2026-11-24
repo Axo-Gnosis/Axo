@@ -27,6 +27,7 @@ fn model() -> Model {
             supports_mid_convo_system_messages: Some(true),
             supports_mid_convo_tool_changes: Some(true),
             supports_eager_tool_input_streaming: Some(false),
+            tool_name_prefix: Some("_".into()),
             ..Default::default()
         },
     }
@@ -248,7 +249,9 @@ async fn claude_subscription_read_round_trip_and_api_key_control() {
     );
     assert!(!inactive.tool_names.as_ref().unwrap().contains_key("_read"));
 
-    // Even a subscription-looking model/token does not select subscription shaping.
+    // Without a prefix, names stay canonical; a subscription-looking token changes nothing.
+    let mut model = model.clone();
+    model.compat.tool_name_prefix = None;
     let plain =
         prepare_request(&model, &original, &options(), ServiceTier::Standard, false).unwrap();
     assert!(plain.tool_names.is_none());
@@ -383,6 +386,16 @@ async fn claude_subscription_long_names_and_protocol_placeholder_are_distinct() 
         ]
     );
     assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+    for prefix in ["", "a b", "a."] {
+        let mut invalid = model.clone();
+        invalid.compat.tool_name_prefix = Some(prefix.into());
+        assert_eq!(
+            prepare_request(&invalid, &original, &options(), ServiceTier::Standard, true)
+                .err()
+                .as_deref(),
+            Some("Invalid toolNamePrefix")
+        );
+    }
     assert!(names.iter().all(|name| name.len() <= 64));
     assert_eq!(prepared.request.body["tools"][4]["defer_loading"], true);
     let active = prepared.tool_names.as_ref().unwrap();

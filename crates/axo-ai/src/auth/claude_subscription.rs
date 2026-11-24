@@ -464,7 +464,7 @@ mod tests {
         let server = async {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = [0; 4096];
-            socket.read(&mut buf).await.unwrap();
+            let _ = socket.read(&mut buf).await.unwrap();
             socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {url}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         };
         // Exercise the production pool's policy without adding any endpoint injection seam.

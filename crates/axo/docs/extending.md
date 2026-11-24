@@ -562,6 +562,8 @@ Model `kill`, `send`, `wait`, and `spawn` results serialize the same public serd
 | `ProviderLogin` | `axo_ai::ProviderLogin` | Host login and refresh callbacks; see [Runtime providers, login, and reload](configuration.md#runtime-providers-login-and-reload) |
 | `LoginInteraction` | `axo_ai::LoginInteraction` | Host interface for login UI; see [Runtime providers, login, and reload](configuration.md#runtime-providers-login-and-reload) |
 | `RequestRewrite` | `axo_ai::RequestRewrite` | Host request rewrite hook; see [Runtime providers, login, and reload](configuration.md#runtime-providers-login-and-reload) |
+| `ProviderTransport` | `axo_ai::ProviderTransport` | A provider's own HTTP exchange: sends one attempt of the request axo built and returns a `ProviderResponse` axo decodes, so a provider can reach an endpoint or protocol variant without forking an adapter. Unlike `AxoBuilder::streamer`, which replaces the whole model call, axo keeps encoding, retries, decoding and usage. Set on `Provider::transport`; see [Runtime providers, login, and reload](configuration.md#runtime-providers-login-and-reload) |
+| `ProviderModels` | `axo_ai::ProviderModels` | A provider's runtime model list (for example the models an account may use), listed and cached by axo. Set on `Provider::list_models`; see [Runtime providers, login, and reload](configuration.md#runtime-providers-login-and-reload) |
 
 Every `ToolCallDecision::Block` produces an error result with `details = {"blocked":{"origin":null}}` or a string origin in place of `null`. Read the marker with `axo_agent::Blocked::of(details.as_ref())`; a tool's own error is not a block marker. Mode-gate, turn-budget, and unlabeled hook blocks carry `origin: None`. Blocked calls skip execution and after-call hooks.
 

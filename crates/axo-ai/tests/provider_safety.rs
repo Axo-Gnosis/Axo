@@ -77,6 +77,7 @@ async fn request_with(
                     ..Default::default()
                 },
                 rewrite: None,
+                transport: None,
             },
             CancellationToken::new(),
         )

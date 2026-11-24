@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::http::{dispatch, read_sse};
 use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
-use crate::api::{Api, ProviderRequest, Reply, StreamOptions, header_map, respond};
+use crate::api::{
+    Api, ProviderRequest, ProviderResponse, Reply, StreamOptions, header_map, respond,
+};
 use crate::auth::codex::{BASE_URL, account_id};
 use crate::event::AssistantEvent;
 use crate::model::{ApiKind, Model, tier_wire};
@@ -52,14 +54,13 @@ impl Api for CodexApi {
     ) -> BoxStream<'static, AssistantEvent> {
         let tier = model.effective_tier(opts.simple.service_tier);
         let request = build_request(model, &transcript, &opts, tier);
-        let rewrite = opts.rewrite;
         let http = self.http.clone();
         let owned_model = model.clone();
         respond(model, tier, cancel, move |mut reply, cancel| async move {
             let result = async {
                 let response = dispatch(
                     &http,
-                    rewrite.as_deref(),
+                    &opts,
                     &owned_model,
                     request?,
                     &cancel,
@@ -221,7 +222,7 @@ fn build_request_body(
 
 async fn drive(
     model: &Model,
-    response: reqwest::Response,
+    response: ProviderResponse,
     cancel: &CancellationToken,
     reply: &mut Reply,
 ) -> Result<StopReason, String> {

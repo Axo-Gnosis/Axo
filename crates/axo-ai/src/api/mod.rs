@@ -100,6 +100,8 @@ pub struct StreamOptions {
     pub auth: ModelAuth,
     /// The provider's level-2 request rewrite, run once per request before sending.
     pub rewrite: Option<Arc<dyn RequestRewrite>>,
+    /// The provider's transport, sending each attempt instead of axo's HTTP client.
+    pub transport: Option<Arc<dyn ProviderTransport>>,
 }
 
 impl std::fmt::Debug for StreamOptions {
@@ -108,6 +110,7 @@ impl std::fmt::Debug for StreamOptions {
             .field("simple", &self.simple)
             .field("auth", &self.auth)
             .field("rewrite", &self.rewrite.is_some())
+            .field("transport", &self.transport.is_some())
             .finish()
     }
 }
@@ -155,6 +158,60 @@ pub trait RequestRewrite: Send + Sync {
         model: &Model,
         request: ProviderRequest,
     ) -> Result<ProviderRequest, Error>;
+}
+
+/// What axo knows about a request beyond the request itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestContext {
+    /// `SimpleStreamOptions::session_id`.
+    pub session_id: Option<String>,
+    /// 0 for the first attempt; axo's transport retry increments it.
+    pub attempt: u32,
+}
+
+/// One HTTP response as a transport returns it. axo treats it exactly as its own client's:
+/// a retryable status is retried, another error status becomes the failure, a success
+/// body is decoded as the model's wire.
+pub struct ProviderResponse {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub body: BoxStream<'static, Result<bytes::Bytes, String>>,
+}
+
+impl From<reqwest::Response> for ProviderResponse {
+    fn from(response: reqwest::Response) -> Self {
+        Self {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            body: response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|error| error.to_string()))
+                .boxed(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owns the HTTP exchange for a provider's requests: axo builds the request in the model's
+/// wire and decodes the response; the transport sends one attempt and returns the response.
+/// It may change the request, call other endpoints first, or synthesize the response.
+/// Dropping the returned future or body cancels the attempt.
+#[async_trait::async_trait]
+pub trait ProviderTransport: Send + Sync {
+    async fn send(
+        &self,
+        model: &Model,
+        request: &ProviderRequest,
+        context: &RequestContext,
+    ) -> Result<ProviderResponse, Error>;
 }
 
 pub(crate) fn header_map(

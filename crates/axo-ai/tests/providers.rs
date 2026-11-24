@@ -12,11 +12,12 @@ use std::thread::JoinHandle;
 use async_trait::async_trait;
 use axo_ai::testing::{fixture_model, http_header_values, serve_http};
 use axo_ai::{
-    ApiKind, AssistantEvent, Credential, CredentialSource, CredentialStore, DeviceCode, Error,
-    FileCredentialStore, LoginInteraction, LoginPrompt, LoginSelect, Message, Model, Models,
-    ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderOrigin, ProviderRequest,
-    RequestRewrite, ServiceTier, SimpleStreamOptions, Streamer, SystemMessage, TextBlock,
-    Transcript, is_retryable_error, now_ms,
+    ApiKind, AssistantBlock, AssistantEvent, Credential, CredentialSource, CredentialStore,
+    DeviceCode, Error, FileCredentialStore, LoginInteraction, LoginPrompt, LoginSelect, Message,
+    Model, Models, ModelsConfig, ModelsOptions, ModelsRequest, Provider, ProviderLogin,
+    ProviderModels, ProviderOrigin, ProviderRequest, ProviderResponse, ProviderTransport,
+    RequestContext, RequestRewrite, ServiceTier, SimpleStreamOptions, Streamer, SystemMessage,
+    TextBlock, Transcript, is_retryable_error, now_ms,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -55,6 +56,8 @@ fn provider(id: &str, models: Vec<Model>) -> Provider {
         oauth_only: false,
         login: None,
         rewrite: None,
+        transport: None,
+        list_models: None,
     }
 }
 
@@ -1147,4 +1150,286 @@ async fn keyless_codex_rewrite_reaches_http() {
             "{events:?}"
         );
     }
+}
+
+/// What a scripted transport does with one attempt.
+enum Attempt {
+    Status(u16),
+    Sse(&'static str),
+    Fail,
+    /// Never answers; the sender drops when axo drops the attempt.
+    Hang(tokio::sync::oneshot::Sender<()>),
+}
+
+#[derive(Default)]
+struct ScriptedTransport {
+    attempts: Mutex<std::collections::VecDeque<Attempt>>,
+    seen: Mutex<Vec<(String, RequestContext)>>,
+}
+
+#[async_trait]
+impl ProviderTransport for ScriptedTransport {
+    async fn send(
+        &self,
+        _model: &Model,
+        request: &ProviderRequest,
+        context: &RequestContext,
+    ) -> Result<ProviderResponse, Error> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.url.clone(), context.clone()));
+        let attempt = self.attempts.lock().unwrap().pop_front().unwrap();
+        let (status, body) = match attempt {
+            Attempt::Status(status) => (status, ""),
+            Attempt::Sse(body) => (200, body),
+            Attempt::Fail => return Err(Error::Auth("transport refused".into())),
+            Attempt::Hang(_dropped_on_cancel) => futures::future::pending().await,
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "0".parse().unwrap());
+        Ok(ProviderResponse {
+            status,
+            headers,
+            body: futures::stream::once(async move { Ok(bytes::Bytes::from(body)) }).boxed(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn transport_owns_the_exchange() {
+    const ANTHROPIC: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n\
+        event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+        event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+        event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+        event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+        event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const COMPLETIONS: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    const RESPONSES: &str = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"content\":[]}}\n\n\
+        data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"ok\"}\n\n\
+        data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n\
+        data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4}}}\n\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    let (models, _) = load(&dir).await;
+    let transport = Arc::new(ScriptedTransport::default());
+    let wires = [
+        ("anthropic", ApiKind::AnthropicMessages, ANTHROPIC),
+        ("completions", ApiKind::OpenAiCompletions, COMPLETIONS),
+        ("responses", ApiKind::OpenAiCodexResponses, RESPONSES),
+    ];
+    models
+        .register(
+            "host",
+            Provider {
+                transport: Some(transport.clone()),
+                ..provider(
+                    "carried",
+                    wires
+                        .iter()
+                        .map(|(id, api, _)| {
+                            model("carried", id, *api, "http://unreachable.invalid")
+                        })
+                        .collect(),
+                )
+            },
+        )
+        .unwrap();
+    let session = SimpleStreamOptions {
+        session_id: Some("session-1".into()),
+        ..Default::default()
+    };
+    let run = async |id: &str, cancel: CancellationToken| {
+        let transcript = Transcript::new(vec![Message::System(SystemMessage {
+            content: vec![TextBlock { text: "t".into() }],
+            ..Default::default()
+        })]);
+        let model = models.find(&format!("carried/{id}")).unwrap();
+        Streamer::stream(&models, &model, transcript, session.clone(), cancel)
+            .collect::<Vec<_>>()
+            .await
+            .pop()
+            .unwrap()
+    };
+
+    // Each wire decodes the transport's body; a retryable status is retried as the next attempt.
+    for (id, _, body) in wires {
+        transport
+            .attempts
+            .lock()
+            .unwrap()
+            .extend([Attempt::Status(503), Attempt::Sse(body)]);
+        let event = run(id, CancellationToken::new()).await;
+        let AssistantEvent::Done { message, .. } = event else {
+            panic!("{id}: {event:?}");
+        };
+        assert!(
+            matches!(message.content.as_slice(), [AssistantBlock::Text { text, .. }] if text == "ok"),
+            "{id}: {message:?}"
+        );
+        let seen = std::mem::take(&mut *transport.seen.lock().unwrap());
+        let attempts: Vec<_> = seen.iter().map(|(_, context)| context.attempt).collect();
+        assert_eq!(attempts, [0, 1], "{id}");
+        assert!(seen.iter().all(|(url, context)| {
+            url.starts_with("http://unreachable.invalid")
+                && context.session_id.as_deref() == Some("session-1")
+        }));
+    }
+
+    // A transport `Err` ends the stream at once.
+    transport.attempts.lock().unwrap().push_back(Attempt::Fail);
+    let event = run("completions", CancellationToken::new()).await;
+    assert!(
+        matches!(&event, AssistantEvent::Error { message, .. }
+            if message.error_message.as_deref().is_some_and(|text| text.contains("transport refused"))),
+        "{event:?}"
+    );
+    assert_eq!(transport.seen.lock().unwrap().drain(..).count(), 1);
+
+    // Cancelling drops the pending attempt.
+    let (hold, dropped) = tokio::sync::oneshot::channel();
+    transport
+        .attempts
+        .lock()
+        .unwrap()
+        .push_back(Attempt::Hang(hold));
+    let cancel = CancellationToken::new();
+    let stopper = cancel.clone();
+    let (event, _) = tokio::join!(run("anthropic", cancel), async {
+        while transport.seen.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        stopper.cancel();
+    });
+    assert!(matches!(event, AssistantEvent::Error { .. }), "{event:?}");
+    assert!(dropped.await.is_err(), "the attempt must be dropped");
+}
+
+/// Lists two models, or fails, or returns a list naming another provider.
+struct ScriptedModels {
+    mode: Mutex<&'static str>,
+    calls: Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl ProviderModels for ScriptedModels {
+    async fn list(&self, request: ModelsRequest) -> Result<Vec<Model>, Error> {
+        self.calls.lock().unwrap().push(request.auth.is_some());
+        let listed = |provider: &str| {
+            ["a", "b"]
+                .map(|id| {
+                    model(
+                        provider,
+                        id,
+                        ApiKind::OpenAiCompletions,
+                        "http://127.0.0.1:9",
+                    )
+                })
+                .to_vec()
+        };
+        match *self.mode.lock().unwrap() {
+            "fail" => Err(Error::Auth("listing refused".into())),
+            "invalid" => Ok(listed("other")),
+            _ => Ok(listed("lister")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn listed_models_replace_the_static_list() {
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // An empty cached catalog keeps the load offline.
+    std::fs::write(dir.path().join("models.dev.v2.json"), "{}").unwrap();
+    let load = async || {
+        Models::load(ModelsOptions {
+            cache_dir: Some(dir.path().to_owned()),
+            extended_context: false,
+            config: serde_json::from_value(json!({
+                "refreshInterval": 0, "catalogUrl": "http://127.0.0.1:9/api.json"
+            }))
+            .unwrap(),
+            credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+            http_client: None,
+        })
+        .await
+        .unwrap()
+    };
+    let lister = |listing: Arc<ScriptedModels>| Provider {
+        requires_key: true,
+        login: Some(Arc::new(ScriptedLogin {
+            base_url: "http://127.0.0.1:9".into(),
+            refreshes: AtomicUsize::new(0),
+        })),
+        list_models: Some(listing),
+        ..provider(
+            "lister",
+            vec![model(
+                "lister",
+                "static",
+                ApiKind::OpenAiCompletions,
+                "http://127.0.0.1:9",
+            )],
+        )
+    };
+    let ids = |models: &Models| -> Vec<String> {
+        models
+            .all()
+            .iter()
+            .filter(|model| model.provider == "lister")
+            .map(|model| model.id.clone())
+            .collect()
+    };
+
+    let models = load().await;
+    let listing = Arc::new(ScriptedModels {
+        mode: Mutex::new("list"),
+        calls: Mutex::default(),
+    });
+    models.register("host", lister(listing.clone())).unwrap();
+    assert_eq!(ids(&models), ["static"]);
+    until("the first listing", || ids(&models) == ["a", "b"]).await;
+    assert_eq!(*listing.calls.lock().unwrap(), [false]);
+
+    models
+        .login("lister", &ScriptedInteraction::default())
+        .await
+        .unwrap();
+    until("the listing after login", || {
+        listing.calls.lock().unwrap().len() == 2
+    })
+    .await;
+    assert!(listing.calls.lock().unwrap()[1]);
+
+    models.logout("lister").await.unwrap();
+    assert_eq!(ids(&models), ["static"]);
+    until("the listing after logout", || ids(&models) == ["a", "b"]).await;
+    assert!(!listing.calls.lock().unwrap()[2]);
+
+    for mode in ["fail", "invalid"] {
+        *listing.mode.lock().unwrap() = mode;
+        let calls = listing.calls.lock().unwrap().len();
+        let _ = models.refresh().await;
+        assert_eq!(listing.calls.lock().unwrap().len(), calls + 1, "{mode}");
+        assert_eq!(ids(&models), ["a", "b"], "{mode}");
+    }
+    drop(models);
+
+    let restarted = load().await;
+    let idle = Arc::new(ScriptedModels {
+        mode: Mutex::new("list"),
+        calls: Mutex::default(),
+    });
+    restarted.register("host", lister(idle.clone())).unwrap();
+    assert_eq!(ids(&restarted), ["a", "b"]);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(idle.calls.lock().unwrap().is_empty());
 }

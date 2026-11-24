@@ -364,6 +364,8 @@ fn register_native(host: &Host, provider: &str) -> Model {
                 oauth_only: false,
                 login: None,
                 rewrite: None,
+                transport: None,
+                list_models: None,
             },
         )
         .unwrap();

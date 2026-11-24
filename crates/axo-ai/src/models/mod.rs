@@ -9,6 +9,7 @@ pub mod rules;
 
 mod build;
 mod feeds;
+mod listing;
 mod registry;
 mod stream;
 
@@ -98,6 +99,8 @@ struct Shared {
     state: RwLock<State>,
     /// Serializes `reload` and `refresh`, and holds what the next rebuild starts from.
     inputs: tokio::sync::Mutex<Inputs>,
+    /// Serializes rewrites of `<cache_dir>/provider-models.json`.
+    listed_cache: tokio::sync::Mutex<()>,
     cache_dir: Option<PathBuf>,
     credentials: Arc<dyn CredentialStore>,
     http: reqwest::Client,

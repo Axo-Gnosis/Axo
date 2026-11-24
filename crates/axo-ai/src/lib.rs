@@ -24,10 +24,12 @@ pub use api::anthropic::AnthropicApi;
 pub use api::codex::CodexApi;
 pub use api::completions::CompletionsApi;
 pub use api::{
-    Api, ProviderRequest, RequestRewrite, SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,
+    Api, ProviderRequest, ProviderResponse, ProviderTransport, RequestContext, RequestRewrite,
+    SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,
 };
 pub use auth::provider::{
-    DeviceCode, LoginInteraction, LoginOption, LoginPrompt, LoginSelect, Provider, ProviderLogin,
+    DeviceCode, LoginInteraction, LoginOption, LoginPrompt, LoginSelect, ModelsRequest, Provider,
+    ProviderLogin, ProviderModels,
 };
 pub use auth::resolve::resolve_config_value;
 pub use auth::store::FileCredentialStore;

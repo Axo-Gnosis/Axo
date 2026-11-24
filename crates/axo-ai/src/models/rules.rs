@@ -97,7 +97,7 @@ struct OpenAiPricing {
 /// One catalog fetch, mapped: what a rebuild needs from the feed without keeping the feed.
 pub(crate) struct CatalogModels {
     /// Every row axo can serve, in feed order.
-    pub models: Vec<Arc<Model>>,
+    pub models: Arc<[Arc<Model>]>,
     /// API-key environment variables of each provider that contributed a model.
     pub envs: HashMap<String, Vec<String>>,
     /// Prices, Off support (effort `"none"` listed), and service-tier multipliers of the
@@ -151,7 +151,7 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
         }
     }
     CatalogModels {
-        models,
+        models: models.into(),
         envs,
         openai,
     }
@@ -164,7 +164,7 @@ pub(crate) fn build(
     discovered: Option<&[CodexModel]>,
 ) -> (Vec<Arc<Model>>, HashMap<String, Vec<String>>) {
     let (mut models, mut envs) = catalog
-        .map(|catalog| (catalog.models.clone(), catalog.envs.clone()))
+        .map(|catalog| (catalog.models.to_vec(), catalog.envs.clone()))
         .unwrap_or_default();
 
     // Derive from the unpatched feed on every rebuild, never from a published snapshot.

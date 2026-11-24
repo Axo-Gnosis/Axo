@@ -254,8 +254,11 @@ fn prepare_request(
         tier
     };
     let options = request_options(model, transcript, &opts.simple, tier);
-    let names = subscription
-        .then(|| ToolNames::new(transcript))
+    let names = model
+        .compat
+        .tool_name_prefix
+        .as_deref()
+        .map(|prefix| ToolNames::new(transcript, prefix))
         .transpose()?;
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
     let mut built = build_params(model, &resolved, &compat, &options, names.as_ref());
@@ -333,7 +336,7 @@ async fn run(
     reply.message.provider_thinking_level = prepared.provider_thinking_level;
     let response = dispatch(
         http,
-        opts.rewrite.as_deref(),
+        opts,
         model,
         prepared.request,
         cancel,
@@ -384,7 +387,7 @@ fn error_response_message(status: u16, text: &str, body: Option<&Value>) -> Stri
 /// Maps Anthropic's block indices onto `output.content` positions while streaming.
 #[derive(Default)]
 struct BlockMapper {
-    /// Only active subscription tools may enter the canonical event stream.
+    /// With a tool-name prefix, only active tools may enter the canonical event stream.
     tool_names: Option<HashMap<String, String>>,
     /// Anthropic `index` of each content block; `None` once the block stopped.
     index: Vec<Option<u64>>,
@@ -540,7 +543,7 @@ impl BlockMapper {
                     id: text("id").to_owned(),
                     name: match &self.tool_names {
                         Some(names) => names.get(text("name")).cloned().ok_or_else(|| {
-                            "Anthropic returned an unknown or inactive subscription tool".to_owned()
+                            "Anthropic returned an unknown or inactive tool".to_owned()
                         })?,
                         None => text("name").to_owned(),
                     },

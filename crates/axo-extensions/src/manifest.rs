@@ -72,6 +72,8 @@ impl ProviderDecl {
             oauth_only: self.oauth_only,
             login: None,
             rewrite: None,
+            transport: None,
+            list_models: None,
         }
     }
 }

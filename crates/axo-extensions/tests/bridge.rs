@@ -404,6 +404,8 @@ pub fn register_native(models: &Models, provider: &str, url: &str) {
                 oauth_only: false,
                 login: None,
                 rewrite: None,
+                transport: None,
+                list_models: None,
             },
         )
         .unwrap();
