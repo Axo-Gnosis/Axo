@@ -1,6 +1,6 @@
 //! The JSON shapes callback values take on the wire, and the checks a runner's reply passes
 //! before Rust accepts it. Errors name the owner and method (the caller's `label`) and the
-//! offending field, never a value: credentials and requests carry secrets.
+//! failing check, never an author-supplied name or value: credentials and requests carry secrets.
 
 use axo_ai::{Credential, ProviderRequest};
 use base64::Engine;
@@ -49,11 +49,11 @@ pub(crate) fn decode_request(value: Value, label: &str) -> Result<ProviderReques
     let Value::Object(mut fields) = value else {
         return Err(bad("not an object"));
     };
-    if let Some(key) = fields
+    if fields
         .keys()
-        .find(|key| !matches!(key.as_str(), "url" | "headers" | "body"))
+        .any(|key| !matches!(key.as_str(), "url" | "headers" | "body"))
     {
-        return Err(bad(&format!("unknown field {key:?}")));
+        return Err(bad("unknown field"));
     }
     let Some(Value::String(url)) = fields.remove("url") else {
         return Err(bad("url"));
@@ -105,11 +105,11 @@ pub(crate) fn decode_credential(value: Value, label: &str) -> Result<Credential,
     match fields.get("type").and_then(Value::as_str) {
         Some("api_key") => {
             string("key", true)?;
-            if let Some(key) = fields
+            if fields
                 .keys()
-                .find(|key| !matches!(key.as_str(), "type" | "key"))
+                .any(|key| !matches!(key.as_str(), "type" | "key"))
             {
-                return Err(bad(&format!("unknown field {key:?}")));
+                return Err(bad("unknown field"));
             }
         }
         Some("oauth") => {
@@ -126,17 +126,15 @@ pub(crate) fn decode_credential(value: Value, label: &str) -> Result<Credential,
                 Some(_) => return Err(bad("baseUrl")),
             }
             if let Some(headers) = fields.get("headers") {
-                check_credential_headers(headers).map_err(|what| bad(&what))?;
+                check_credential_headers(headers).map_err(bad)?;
             }
-            if let Some(key) = fields.keys().find(|key| {
+            if fields.keys().any(|key| {
                 !matches!(
                     key.as_str(),
                     "type" | "access" | "refresh" | "expires" | "headers" | "baseUrl"
                 ) && CREDENTIAL_FIELDS.contains(&normalize(key).as_str())
             }) {
-                return Err(bad(&format!(
-                    "field {key:?} collides with a reserved field"
-                )));
+                return Err(bad("field collides with a reserved field"));
             }
         }
         _ => return Err(bad("type")),
@@ -146,20 +144,19 @@ pub(crate) fn decode_credential(value: Value, label: &str) -> Result<Credential,
 
 /// The credential `headers` object: valid, case-insensitively distinct header names with
 /// valid values, since auth turns them into request headers.
-fn check_credential_headers(headers: &Value) -> Result<(), String> {
+fn check_credential_headers(headers: &Value) -> Result<(), &'static str> {
     let Value::Object(headers) = headers else {
-        return Err("headers".into());
+        return Err("headers");
     };
     let mut seen = header_map(headers.len())?;
     for (name, value) in headers {
-        let parsed =
-            HeaderName::from_bytes(name.as_bytes()).map_err(|_| "header name".to_owned())?;
+        let parsed = HeaderName::from_bytes(name.as_bytes()).map_err(|_| "header name")?;
         let Value::String(value) = value else {
-            return Err(format!("header {parsed} value"));
+            return Err("header value");
         };
-        let value = HeaderValue::from_str(value).map_err(|_| format!("header {parsed} value"))?;
-        if seen.insert(parsed.clone(), value).is_some() {
-            return Err(format!("duplicate header {parsed}"));
+        let value = HeaderValue::from_str(value).map_err(|_| "header value")?;
+        if seen.insert(parsed, value).is_some() {
+            return Err("duplicate header");
         }
     }
     Ok(())
@@ -263,9 +260,7 @@ mod tests {
         };
         let reject = |value: Value, what: &str| {
             let error = decode_request(value, LABEL).unwrap_err();
-            assert!(error.starts_with(LABEL), "{error}");
-            assert!(error.contains(what), "{error} lacks {what}");
-            assert!(!error.contains(secret), "{error} leaks");
+            assert_eq!(error, format!("{LABEL}: invalid request ({what})"));
         };
         decode_request(ok(), LABEL).unwrap();
         let with = |key: &str, value: Value| {
@@ -277,7 +272,7 @@ mod tests {
         reject(with("url", json!("file:///etc/passwd")), "url scheme");
         reject(with("url", json!("ftp://example.test/")), "url scheme");
         reject(with("url", json!(format!("not a url {secret}"))), "url");
-        reject(with("extra", json!(secret)), "unknown field");
+        reject(with("secret-marker", json!(secret)), "unknown field");
         reject(with("headers", json!({ "a": "b" })), "headers");
         // Any valid header passes; restrictions belong to the native transport.
         decode_request(
@@ -296,7 +291,7 @@ mod tests {
         );
         reject(
             with("headers", json!([["x", { "base64": "!!" }]])),
-            "base64",
+            "header 0 base64 value",
         );
         reject(
             with("headers", json!([["x", { "base64": "YQ==", "x": 1 }]])),
@@ -340,9 +335,7 @@ mod tests {
 
         let reject = |value: Value, what: &str| {
             let error = decode_credential(value, label).unwrap_err();
-            assert!(error.starts_with(label), "{error}");
-            assert!(error.contains(what), "{error} lacks {what}");
-            assert!(!error.contains(secret), "{error} leaks");
+            assert_eq!(error, format!("{label}: invalid credential ({what})"));
         };
         let with = |key: &str, value: Value| {
             let mut credential = oauth();
@@ -362,20 +355,34 @@ mod tests {
             "baseUrl url scheme",
         );
         reject(with("headers", json!([secret])), "headers");
-        reject(with("headers", json!({ "x": 1 })), "header x value");
+        reject(
+            with("headers", json!({ "secret-marker": 1 })),
+            "header value",
+        );
+        reject(
+            with("headers", json!({ "secret-marker": format!("{secret}\n") })),
+            "header value",
+        );
         reject(
             with("headers", json!({ "bad name": secret })),
             "header name",
         );
         reject(
-            with("headers", json!({ "X-A": "1", "x-a": "2" })),
-            "duplicate header x-a",
+            with(
+                "headers",
+                json!({ "Secret-Marker": "1", "secret-marker": "2" }),
+            ),
+            "duplicate header",
         );
-        reject(with("base_url", json!(secret)), "reserved field");
-        reject(with("Access", json!(secret)), "reserved field");
+        for alias in ["base_url", "Access"] {
+            reject(
+                with(alias, json!(secret)),
+                "field collides with a reserved field",
+            );
+        }
         reject(json!({ "type": "api_key", "key": "" }), "key");
         reject(
-            json!({ "type": "api_key", "key": secret, "extra": secret }),
+            json!({ "type": "api_key", "key": secret, "secret-marker": secret }),
             "unknown field",
         );
     }

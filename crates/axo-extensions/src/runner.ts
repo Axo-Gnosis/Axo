@@ -15,7 +15,7 @@
 //   {type:"ping",id} -> {type:"pong",id}       Rust pings; the runner answers from its event loop.
 //                                              While the socket is blocked an unsent pong is
 //                                              replaced by the newest one; any pong proves liveness.
-// Rust -> runner methods:
+// Rust -> runner methods (arguments supplied by the same-build parent):
 //   activate {entry,dataDir,providers:[{id,login,rewrite}],
 //             session:{tools:[{name,..}],schemes:[{name,..}],commands:[{name,..}],
 //                      toolPolicy:["before"|"after"],spawnHook,events},
@@ -75,11 +75,11 @@ import type {
   SessionStreamEvent,
   SpawnContext,
   SpawnHook,
-  ToolCall,
   ToolHandler,
   ToolPolicy,
   ToolResultInput,
   ToolRun,
+  ToolRunArgs,
   ToolScope,
 } from "../../../packages/axo-extension-sdk/index.ts";
 
@@ -386,7 +386,7 @@ function onCall(id: string, frame: Frame): void {
       await send({ type: "error", id, code: status });
     }
   };
-  (async () => handler(id, call, record(frame.args)))().then(
+  handler(id, call, frame.args).then(
     (value) => finish({ type: "ok", id, value: value ?? null }),
     (error) => finish(errorReply(id, error)),
   );
@@ -417,32 +417,32 @@ interface Active {
 const extensions = new Map<string, Active>();
 const activating = new Set<string>();
 
-type Handler = (id: string, call: Call, args: Frame) => Promise<unknown>;
+// The authenticated same-build parent supplies each handler's argument shape.
+type Handler = (id: string, call: Call, args: unknown) => Promise<unknown>;
 
 const handlers: Record<string, Handler> = {
-  activate: async (_id, call, args) => activate(call.ext, args, call.controller.signal),
+  activate: async (_id, call, args) => activate(call.ext, args as ActivateArgs, call.controller.signal),
   login: providerCall,
   refresh: providerCall,
   rewrite: providerCall,
-  async tool(id, call, args) {
-    const handler = extensions.get(call.ext)?.tools.get(text(args.tool));
+  async tool(id, call, raw) {
+    const args = raw as ToolRunArgs;
+    const handler = extensions.get(call.ext)?.tools.get(args.tool);
     if (!handler) throw new Fail("unsupported");
     return tool(id, call, handler, args);
   },
   async policyBefore(_id, call, args) {
     const before = extensions.get(call.ext)?.toolPolicy?.before;
     if (!before) throw new Fail("unsupported");
-    const scope = freeze(record(args.scope)) as unknown as ToolScope;
-    const cx = record(args.cx) as unknown as BeforeToolCall;
-    const value = await before(scope, cx, call.controller.signal);
+    const { scope, cx } = args as { scope: ToolScope; cx: BeforeToolCall };
+    const value = await before(freeze(scope), cx, call.controller.signal);
     return decision(value, { block: "true", reason: "string?", terminate: "boolean?" });
   },
   async policyAfter(_id, call, args) {
     const after = extensions.get(call.ext)?.toolPolicy?.after;
     if (!after) throw new Fail("unsupported");
-    const scope = freeze(record(args.scope)) as unknown as ToolScope;
-    const cx = record(args.cx) as unknown as AfterToolCall;
-    const value = await after(scope, cx, call.controller.signal);
+    const { scope, cx } = args as { scope: ToolScope; cx: AfterToolCall };
+    const value = await after(freeze(scope), cx, call.controller.signal);
     return decision(value, {
       content: "array?",
       details: "any?",
@@ -453,28 +453,31 @@ const handlers: Record<string, Handler> = {
   async spawn(_id, call, args) {
     const spawn = extensions.get(call.ext)?.spawnHook;
     if (!spawn) throw new Fail("unsupported");
-    const request = record(args.spawn) as unknown as SpawnContext;
-    const value = await spawn(request, call.controller.signal);
+    const { spawn: context } = args as { spawn: SpawnContext };
+    const value = await spawn(context, call.controller.signal);
     if (isRecord(value) && Object.hasOwn(value, "replace")) return decision(value, { replace: "object" });
     return decision(value, { block: "string" });
   },
   schemeResolve: schemeCall,
   schemeRead: schemeCall,
   schemeWrite: schemeCall,
-  async command(_id, call, args) {
-    const handler = extensions.get(call.ext)?.commands.get(text(args.command));
+  async command(_id, call, raw) {
+    const args = raw as { command: string; session: string; args: string };
+    const handler = extensions.get(call.ext)?.commands.get(args.command);
     if (!handler) throw new Fail("unsupported");
-    await handler(text(args.args), handle(call.ext, text(args.session)), call.controller.signal);
+    await handler(args.args, handle(call.ext, args.session), call.controller.signal);
     return null;
   },
   async entry(_id, call, args) {
     const onEntry = extensions.get(call.ext)?.onEntry;
     if (!onEntry) throw new Fail("unsupported");
-    await onEntry(freeze(record(args.entry)) as unknown as SeqEntry, handle(call.ext, text(args.session)));
+    const { session, entry } = args as { session: string; entry: SeqEntry };
+    await onEntry(freeze(entry), handle(call.ext, session));
     return null;
   },
-  async stream(_id, { ext }, args) {
-    const sub = text(args.sub);
+  async stream(_id, { ext }, raw) {
+    const args = raw as { sub: string; event?: StreamEvent; lagged?: number; closed?: true };
+    const { sub } = args;
     // A stream can emit before Rust's subscribe reply reaches the socket.
     while (!subscriptions.has(sub)) {
       const replies = [];
@@ -488,10 +491,10 @@ const handlers: Record<string, Handler> = {
     if (args.closed === true) {
       subscription.remove();
       event = { type: "closed", value: null };
-    } else if (typeof args.lagged === "number") {
+    } else if (args.lagged !== undefined) {
       event = { type: "lagged", value: { skipped: args.lagged } };
     } else {
-      event = record(args.event) as unknown as StreamEvent;
+      event = args.event!;
     }
     const { listener } = subscription;
     try {
@@ -517,21 +520,13 @@ function text(value: unknown): string {
   return value;
 }
 
-async function schemeCall(_id: string, { ext, method, controller }: Call, args: Frame): Promise<unknown> {
+async function schemeCall(_id: string, { ext, method, controller }: Call, raw: unknown): Promise<unknown> {
   const signal = controller.signal;
-  const name = text(args.scheme);
-  const scheme = extensions.get(ext)?.schemes.get(name);
+  const args = raw as { scheme: string; path: string; session: SchemeHandlerContext["session"]; content: string };
+  const scheme = extensions.get(ext)?.schemes.get(args.scheme);
   if (!scheme) throw new Fail("unsupported");
-  const path = text(args.path);
-  const session = record(args.session);
-  const cx: SchemeHandlerContext = freeze({
-    scheme: name,
-    session: {
-      id: text(session.id),
-      dir: text(session.dir),
-      cwd: text(session.cwd),
-    },
-  });
+  const cx: SchemeHandlerContext = freeze({ scheme: args.scheme, session: args.session });
+  const { path } = args;
   if (method === "schemeResolve") {
     const target = await scheme.resolve(path, cx, signal);
     if (target === "virtual") return target;
@@ -542,14 +537,13 @@ async function schemeCall(_id: string, { ext, method, controller }: Call, args: 
     return text(await scheme.read(path, cx, signal));
   }
   if (!scheme.write) throw new Fail("unsupported");
-  const content = text(args.content);
-  return text(await scheme.write(path, content, cx, signal));
+  return text(await scheme.write(path, args.content, cx, signal));
 }
 
-async function providerCall(id: string, call: Call, args: Frame): Promise<unknown> {
+async function providerCall(id: string, call: Call, raw: unknown): Promise<unknown> {
   const { ext, method, controller } = call;
   const signal = controller.signal;
-  if (typeof args.provider !== "string") throw new Fail("invalid");
+  const args = raw as { provider: string; credential: CredentialOutput; model: Model; request: ProviderRequest };
   const handlers = extensions.get(ext)?.providers.get(args.provider);
   switch (method) {
     case "login": {
@@ -562,29 +556,25 @@ async function providerCall(id: string, call: Call, args: Frame): Promise<unknow
     }
     case "refresh": {
       if (!handlers?.refresh) throw new Fail("unsupported");
-      const input = credential(args.credential) as CredentialOutput;
-      return credential(await handlers.refresh(input, signal));
+      return credential(await handlers.refresh(args.credential, signal));
     }
     default: {
       if (!handlers?.rewrite) throw new Fail("unsupported");
-      const model = freeze(record(args.model)) as unknown as Model;
-      const input = request(args.request);
-      return request(await handlers.rewrite(model, input, signal));
+      return request(await handlers.rewrite(freeze(args.model), args.request, signal));
     }
   }
 }
 
-async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): Promise<ToolResultInput> {
+async function tool(id: string, call: Call, handler: ToolHandler, args: ToolRunArgs): Promise<ToolResultInput> {
   const { ext, controller } = call;
   const signal = controller.signal;
   const parent: Parent = { id, signal };
   // Every update is answered before the result goes out, so none trails it; a refused
   // update is the host's business, not the tool's failure.
   const updates = new Set<Promise<unknown>>();
-  if (typeof args.invocation !== "number") throw new Fail("invalid");
   const run: ToolRun = {
-    call: toolCall(args.call),
-    sessionId: text(args.session),
+    call: args.call,
+    sessionId: args.session,
     invocation: args.invocation,
     tools: object(ext, "tools", {}, undefined, parent) as ToolRun["tools"],
     signal,
@@ -615,14 +605,6 @@ async function tool(id: string, call: Call, handler: ToolHandler, args: Frame): 
     terminate: "boolean?",
   });
   return (result ?? invalidReply()) as unknown as ToolResultInput;
-}
-
-function toolCall(value: unknown): ToolCall {
-  const call = record(value);
-  text(call.id);
-  text(call.name);
-  record(call.arguments);
-  return call as unknown as ToolCall;
 }
 
 type Check = "true" | "string" | "boolean" | "array" | "object" | "any";
@@ -664,51 +646,25 @@ function fail(): never {
 
 const HANDLER_KINDS = ["providers", "tools", "schemes", "commands", "toolPolicy", "spawnHook", "onEntry"];
 
-async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<null> {
-  const entry = text(args.entry);
-  const dataDir = text(args.dataDir);
-  if (!Array.isArray(args.providers)) throw new Fail("invalid");
-  const declared = args.providers.map((raw) => {
-    const p = record(raw);
-    if (typeof p.login !== "boolean" || typeof p.rewrite !== "boolean") {
-      throw new Fail("invalid");
-    }
-    return { id: text(p.id), login: p.login, rewrite: p.rewrite };
-  });
-  const session = record(args.session);
-  const table = args.methods;
-  const entries = table && typeof table === "object" && !Array.isArray(table) ? Object.entries(table) : undefined;
-  if (!entries || !entries.every(([, list]) => Array.isArray(list) && list.every((m) => typeof m === "string"))) {
-    throw new Fail("invalid");
-  }
+type ActivateArgs = {
+  entry: string;
+  dataDir: string;
+  providers: { id: string; login: boolean; rewrite: boolean }[];
+  methods: Record<string, string[]>;
+  session: {
+    tools: { name: string }[];
+    schemes: { name: string }[];
+    commands: { name: string }[];
+    toolPolicy: PolicyHook[];
+    spawnHook: boolean;
+    events: boolean;
+  };
+};
+
+async function activate(ext: string, args: ActivateArgs, signal: AbortSignal): Promise<null> {
+  const { entry, dataDir, session: decl } = args;
   methods.clear();
-  for (const [name, list] of entries) methods.set(name, new Set(list));
-  const names = (key: string): string[] => {
-    const list = session[key];
-    if (!Array.isArray(list)) throw new Fail("invalid");
-    return list.map((raw) => text(record(raw).name));
-  };
-  const flag = (key: string): boolean => {
-    const value = session[key];
-    if (typeof value !== "boolean") throw new Fail("invalid");
-    return value;
-  };
-  const hooks = (): PolicyHook[] => {
-    const list = session.toolPolicy;
-    const valid =
-      Array.isArray(list) &&
-      list.every((hook, i) => (hook === "before" || hook === "after") && list.indexOf(hook) === i);
-    if (!valid) throw new Fail("invalid");
-    return list as PolicyHook[];
-  };
-  const decl = {
-    tools: names("tools"),
-    schemes: names("schemes"),
-    commands: names("commands"),
-    toolPolicy: hooks(),
-    spawnHook: flag("spawnHook"),
-    events: flag("events"),
-  };
+  for (const [name, list] of Object.entries(args.methods)) methods.set(name, new Set(list));
   if (extensions.has(ext) || activating.has(ext)) throw new Fail("invalid");
   activating.add(ext);
   const lifetime = new AbortController();
@@ -747,10 +703,10 @@ async function activate(ext: string, args: Frame, signal: AbortSignal): Promise<
       if (!HANDLER_KINDS.includes(key)) fail();
     }
     const active: Active = {
-      providers: providers(handlers.providers, declared),
-      tools: named<ToolHandler>(handlers.tools, decl.tools, method),
-      schemes: named(handlers.schemes, decl.schemes, schemeHandlers),
-      commands: named<CommandHandler>(handlers.commands, decl.commands, method),
+      providers: providers(handlers.providers, args.providers),
+      tools: named<ToolHandler>(handlers.tools, decl.tools.map(({ name }) => name), method),
+      schemes: named(handlers.schemes, decl.schemes.map(({ name }) => name), schemeHandlers),
+      commands: named<CommandHandler>(handlers.commands, decl.commands.map(({ name }) => name), method),
       toolPolicy: single(handlers.toolPolicy, decl.toolPolicy.length > 0, (h): ToolPolicy | undefined => {
         if (!isRecord(h)) return undefined;
         if (Object.keys(h).some((key) => key !== "before" && key !== "after")) fail();
@@ -1025,7 +981,7 @@ function interaction(ext: string, parent: Parent, notices: { pending: Set<Promis
   };
 }
 
-/** Rejects an author's malformed UI argument locally; nothing reaches Rust. */
+/** Rejects malformed author arguments, including session IDs, before sending to Rust. */
 function local<T>(ok: boolean, what: string, value: T): T {
   if (!ok) throw new TypeError(`axo: invalid ${what}`);
   return value;
