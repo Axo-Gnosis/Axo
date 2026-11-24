@@ -24,7 +24,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -143,6 +143,42 @@ pub enum CallError {
     /// Rejected locally (method/argument shape or frame size); nothing was sent.
     #[error("extension request is invalid or exceeds the 64 MiB frame bound")]
     Invalid,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Out<'a> {
+    Call {
+        id: HostId,
+        ext: &'a str,
+        method: &'a str,
+        args: &'a Value,
+    },
+    Ok {
+        id: &'a str,
+        value: &'a Value,
+    },
+    Error {
+        id: &'a str,
+        code: HostErrorCode,
+        message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<&'a Value>,
+    },
+    Cancel {
+        id: HostId,
+    },
+    Ping {
+        id: HostId,
+    },
+}
+
+struct HostId(u64);
+
+impl Serialize for HostId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("h:{}", self.0))
+    }
 }
 
 /// Counts JSON bytes without storing them or accepting an oversized body.
@@ -382,12 +418,11 @@ impl Inner {
         args: Value,
         callbacks: Option<&dyn Callbacks>,
     ) -> Result<Value, CallError> {
-        let inner = self;
         let (reply, mut result) = oneshot::channel();
         let (route, mut routed) = mpsc::unbounded_channel();
         let id = {
-            let mut state = inner.lock();
-            if inner.closed.is_cancelled() {
+            let mut state = self.lock();
+            if self.closed.is_cancelled() {
                 return Err(CallError::Unavailable);
             }
             let id = state.next;
@@ -403,17 +438,18 @@ impl Inner {
             id
         };
         let mut outstanding = Outstanding {
-            inner,
+            inner: self,
             id,
             sent: false,
         };
-        let mut call = Map::new();
-        call.insert("type".into(), "call".into());
-        call.insert("id".into(), format!("h:{id}").into());
-        call.insert("ext".into(), ext.into());
-        call.insert("method".into(), method.into());
-        call.insert("args".into(), args);
-        inner.enqueue(Value::Object(call)).await?;
+        self.enqueue(&Out::Call {
+            id: HostId(id),
+            ext,
+            method,
+            args: &args,
+        })
+        .await?;
+        drop(args);
         outstanding.sent = true;
 
         let mut served = FuturesUnordered::new();
@@ -423,7 +459,7 @@ impl Inner {
                 done = &mut result => return done.unwrap_or(Err(CallError::Unavailable)),
                 Some(callback) = routed.recv() => {
                     if let Some(callbacks) = callbacks {
-                        served.push(inner.interact(callbacks, callback));
+                        served.push(self.interact(callbacks, callback));
                     }
                 }
                 Some(()) = served.next(), if !served.is_empty() => {}
@@ -448,9 +484,9 @@ impl Inner {
     }
 
     /// Counts the body, reserving its exact framed size before encoding.
-    async fn enqueue(&self, value: Value) -> Result<(), CallError> {
+    async fn enqueue(&self, frame: &Out<'_>) -> Result<(), CallError> {
         let mut length = BodyLength::default();
-        serde_json::to_writer(&mut length, &value).map_err(|_| CallError::Invalid)?;
+        serde_json::to_writer(&mut length, frame).map_err(|_| CallError::Invalid)?;
         let frame_len = 4 + length.0;
         let permit = tokio::select! {
             biased;
@@ -459,29 +495,29 @@ impl Inner {
                 permit.map_err(|_| CallError::Unavailable)?
             }
         };
-        let mut frame = Vec::with_capacity(frame_len);
-        frame.extend_from_slice(&(length.0 as u32).to_be_bytes());
-        serde_json::to_writer(&mut frame, &value).map_err(|_| CallError::Invalid)?;
+        let mut encoded = Vec::with_capacity(frame_len);
+        encoded.extend_from_slice(&(length.0 as u32).to_be_bytes());
+        serde_json::to_writer(&mut encoded, frame).map_err(|_| CallError::Invalid)?;
         self.data
-            .send((frame, permit))
+            .send((encoded, permit))
             .map_err(|_| CallError::Unavailable)
     }
 
     /// Only locally generated pings and cancels bypass the byte budget.
-    fn small_frame(&self, kind: &str, id: u64) -> Vec<u8> {
-        let value = json!({"type": kind, "id": format!("h:{id}")});
-        let mut frame = vec![0; 4];
-        serde_json::to_writer(&mut frame, &value).expect("fixed control frame");
-        let len = (frame.len() - 4) as u32;
-        frame[..4].copy_from_slice(&len.to_be_bytes());
-        frame
+    fn small_frame(frame: &Out<'_>) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(52);
+        encoded.extend_from_slice(&[0; 4]);
+        serde_json::to_writer(&mut encoded, frame).expect("fixed control frame");
+        let len = (encoded.len() - 4) as u32;
+        encoded[..4].copy_from_slice(&len.to_be_bytes());
+        encoded
     }
 
     /// Queues a cancel behind the call it withdraws; tears down rather than block.
     fn cancel(&self, id: u64) {
         let queued = self.cancels.clone().try_acquire_owned().is_ok_and(|slot| {
             self.data
-                .send((self.small_frame("cancel", id), slot))
+                .send((Self::small_frame(&Out::Cancel { id: HostId(id) }), slot))
                 .is_ok()
         });
         if !queued {
@@ -491,7 +527,11 @@ impl Inner {
 
     /// Sends a heartbeat ahead of the data queue without waiting.
     fn ping(&self, id: u64) {
-        if self.control.try_send(self.small_frame("ping", id)).is_err() {
+        if self
+            .control
+            .try_send(Self::small_frame(&Out::Ping { id: HostId(id) }))
+            .is_err()
+        {
             self.close();
         }
     }
@@ -661,28 +701,29 @@ impl Inner {
         if self.lock().callbacks.remove(&id).is_none() {
             return;
         }
-        let mut reply = Map::new();
-        reply.insert("id".into(), id.as_str().into());
-        match answer {
-            Ok(value) => {
-                reply.insert("type".into(), "ok".into());
-                reply.insert("value".into(), value);
-            }
+        let frame = match &answer {
+            Ok(value) => Out::Ok { id: &id, value },
             Err(Refusal {
                 code,
                 message,
                 details,
-            }) => {
-                reply.insert("type".into(), "error".into());
-                reply.insert("code".into(), json!(code));
-                reply.insert("message".into(), message.into());
-                if let Some(details) = details {
-                    reply.insert("details".into(), details);
-                }
-            }
-        }
-        if self.enqueue(Value::Object(reply)).await == Err(CallError::Invalid) {
-            let _ = self.enqueue(json!({"type": "error", "id": id, "code": BridgeCode::TooLarge, "message": "host reply exceeds 64 MiB"})).await;
+            }) => Out::Error {
+                id: &id,
+                code: *code,
+                message,
+                details: details.as_ref(),
+            },
+        };
+        if self.enqueue(&frame).await == Err(CallError::Invalid) {
+            drop(answer);
+            let _ = self
+                .enqueue(&Out::Error {
+                    id: &id,
+                    code: BridgeCode::TooLarge.into(),
+                    message: "host reply exceeds 64 MiB",
+                    details: None,
+                })
+                .await;
         }
     }
 }
@@ -792,6 +833,8 @@ mod tests {
 
     use axo_ai::{DeviceCode, Error, LoginInteraction, LoginPrompt, LoginSelect};
 
+    use serde_json::json;
+
     use super::*;
     use crate::proxy::LoginCallbacks;
 
@@ -869,6 +912,38 @@ mod tests {
 
         async fn expect_eof(&mut self) {
             assert_eq!(self.next().await, None, "expected the peer to close");
+        }
+    }
+
+    #[test]
+    fn outbound_error_details_and_control_ids_keep_their_shapes() {
+        let details = json!({"status": 400});
+        let expected = json!({"type": "error", "id": "r:1", "code": "invalid", "message": "bad"});
+        let mut expected_with_details = expected.clone();
+        expected_with_details["details"] = details.clone();
+        for (details, expected) in [(None, expected), (Some(&details), expected_with_details)] {
+            let frame = Out::Error {
+                id: "r:1",
+                code: BridgeCode::Invalid.into(),
+                message: "bad",
+                details,
+            };
+            assert_eq!(serde_json::to_value(frame).unwrap(), expected);
+        }
+
+        for (frame, kind) in [
+            (Out::Cancel { id: HostId(u64::MAX) }, "cancel"),
+            (Out::Ping { id: HostId(u64::MAX) }, "ping"),
+        ] {
+            let encoded = Inner::small_frame(&frame);
+            assert_eq!(
+                u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize,
+                encoded.len() - 4
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&encoded[4..]).unwrap(),
+                json!({"type": kind, "id": "h:18446744073709551615"})
+            );
         }
     }
 
