@@ -1509,10 +1509,13 @@ impl Inner {
                     hidden: Hidden::Host(origin),
                 });
             }
-            let problem = usable[ext.id.as_str()]
-                .1
-                .as_ref()
-                .map(|problem| named(&ext.id, ext.group.as_deref(), &problem.message));
+            let problem = usable[ext.id.as_str()].1.as_ref().map(|problem| {
+                placement::member_label(
+                    &ext.id,
+                    ext.group.as_deref(),
+                    format_args!(": {}", problem.message),
+                )
+            });
             let placed = member_of.get(&ext.id);
             let serial = placed.map(|(serial, _)| *serial);
             let reused = old_bindings.get(*provider).filter(|old| {
@@ -1762,14 +1765,11 @@ fn gate(status: &ExtensionStatus) -> Option<String> {
         .problem
         .as_ref()
         .map_or(fallback, |problem| problem.message.as_str());
-    Some(named(&status.id, status.group.as_deref(), reason))
-}
-
-fn named(id: &str, group: Option<&str>, reason: &str) -> String {
-    match group {
-        Some(group) => format!("extension {id} (group {group}): {reason}"),
-        None => format!("extension {id}: {reason}"),
-    }
+    Some(placement::member_label(
+        &status.id,
+        status.group.as_deref(),
+        format_args!(": {reason}"),
+    ))
 }
 
 fn unavailable(ext: &EnabledExtension, problem: ExtensionProblem) -> ExtensionStatus {

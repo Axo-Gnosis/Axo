@@ -45,13 +45,13 @@ pub type Prepare = Arc<
 
 pub struct Placement {
     shared: Arc<Shared>,
-    options: ExtensionOptions,
-    supervisor: Arc<ProcessSupervisor>,
-    bun: BunPath,
     stop: CancellationToken,
 }
 
 struct Shared {
+    options: ExtensionOptions,
+    supervisor: Arc<ProcessSupervisor>,
+    bun: BunPath,
     members: Vec<Member>,
     /// Member IDs, built once; every generation's peer refuses session actions naming others.
     ids: Arc<[String]>,
@@ -148,6 +148,9 @@ impl Placement {
         };
         Arc::new(Self {
             shared: Arc::new(Shared {
+                options,
+                supervisor,
+                bun,
                 ids: members.iter().map(|member| member.id.clone()).collect(),
                 members,
                 group,
@@ -156,9 +159,6 @@ impl Placement {
                 actions,
                 state: Mutex::new(state),
             }),
-            options,
-            supervisor,
-            bun,
             stop: CancellationToken::new(),
         })
     }
@@ -241,10 +241,7 @@ impl Placement {
             if let Check::Cold = check {
                 state.phase = Phase::Starting;
                 state.driver = Some(tokio::spawn(drive(
-                    self.shared.clone(),
-                    self.options.clone(),
-                    self.supervisor.clone(),
-                    self.bun.clone(),
+                    Arc::clone(&self.shared),
                     self.stop.clone(),
                 )));
             }
@@ -287,16 +284,24 @@ impl Drop for Placement {
     }
 }
 
+pub(super) fn member_label(
+    id: &str,
+    group: Option<&str>,
+    suffix: impl std::fmt::Display,
+) -> String {
+    match group {
+        Some(group) => format!("extension {id} (group {group}){suffix}"),
+        None => format!("extension {id}{suffix}"),
+    }
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn label(&self, ext: &str) -> String {
-        match &self.group {
-            Some(group) => format!("extension {ext} (group {group})"),
-            None => format!("extension {ext}"),
-        }
+        member_label(ext, self.group.as_deref(), "")
     }
 
     /// Names the whole placement, for failures no single member can be blamed for.
@@ -306,20 +311,16 @@ impl Shared {
                 let ids: Vec<&str> = self.members.iter().map(|m| m.id.as_str()).collect();
                 format!("group {group} ({})", ids.join(", "))
             }
-            None => format!(
-                "extension {}",
-                self.members.first().map_or("", |m| m.id.as_str())
-            ),
+            None => self.label(self.members.first().map_or("", |m| m.id.as_str())),
         }
     }
 
     fn check(&self, state: &State, ext: &str) -> Result<Check, String> {
-        let label = self.label(ext);
         if !self.members.iter().any(|member| member.id == ext) {
-            return Err(format!("{label} is not part of this placement"));
+            return Err(format!("{} is not part of this placement", self.label(ext)));
         }
         if state.closed {
-            return Err(format!("{label} is shut down"));
+            return Err(format!("{} is shut down", self.label(ext)));
         }
         if let Some(problem) = state.load.get(ext) {
             return Err(problem.problem().message.clone());
@@ -328,9 +329,11 @@ impl Shared {
             Phase::Cold => Ok(Check::Cold),
             Phase::Ready(peer) => Ok(Check::Ready(peer.clone())),
             Phase::Starting => Ok(Check::Starting),
-            Phase::Restarting(problem) => {
-                Err(format!("{label} is restarting after: {}", problem.message))
-            }
+            Phase::Restarting(problem) => Err(format!(
+                "{} is restarting after: {}",
+                self.label(ext),
+                problem.message
+            )),
             Phase::Disabled(problem) | Phase::Unavailable(problem) => Err(problem.message.clone()),
         }
     }
@@ -398,14 +401,7 @@ impl Shared {
     }
 
     /// Runs one generation to its end; the process is reaped before this returns.
-    async fn run(
-        &self,
-        options: &ExtensionOptions,
-        bun: &BunPath,
-        supervisor: &ProcessSupervisor,
-        generation: u64,
-        stop: &CancellationToken,
-    ) -> Exit {
+    async fn run(&self, generation: u64, stop: &CancellationToken) -> Exit {
         // A member whose dependencies cannot be installed is disabled alone; calls wait here.
         let pending: Vec<Member> = {
             let state = self.lock();
@@ -431,7 +427,14 @@ impl Shared {
         {
             return Exit::Idle;
         }
-        let start = Generation::start(options, bun, supervisor, stop, &self.actions, &self.ids);
+        let start = Generation::start(
+            &self.options,
+            &self.bun,
+            &self.supervisor,
+            stop,
+            &self.actions,
+            &self.ids,
+        );
         let mut process = match start.await {
             Ok(process) => process,
             Err(StartError::Stopped) => return Exit::Stopped,
@@ -452,7 +455,7 @@ impl Shared {
             biased;
             () = stop.cancelled() => Exit::Stopped,
             () = process.wait() => Exit::Crash(format!("{} runner stopped unexpectedly", self.who())),
-            exit = self.serve(&peer, options, generation) => exit,
+            exit = self.serve(&peer, generation) => exit,
         };
         self.lock().container = None;
         process.shutdown().await;
@@ -460,14 +463,14 @@ impl Shared {
     }
 
     /// Activates members in order, publishes `Ready`, then serves until the generation ends.
-    async fn serve(&self, peer: &Arc<Peer>, options: &ExtensionOptions, generation: u64) -> Exit {
+    async fn serve(&self, peer: &Arc<Peer>, generation: u64) -> Exit {
         let mut active = false;
         let order = self.lock().order.clone();
         for member in order.iter().map(|&index| &self.members[index]) {
             if self.lock().load.contains_key(&member.id) {
                 continue;
             }
-            match self.activate(peer, member, options).await {
+            match self.activate(peer, member).await {
                 Ok(()) => active = true,
                 Err(Activation::Member(problem)) => {
                     self.lock()
@@ -484,18 +487,13 @@ impl Shared {
         std::future::pending().await
     }
 
-    async fn activate(
-        &self,
-        peer: &Peer,
-        member: &Member,
-        options: &ExtensionOptions,
-    ) -> Result<(), Activation> {
+    async fn activate(&self, peer: &Peer, member: &Member) -> Result<(), Activation> {
         let label = self.label(&member.id);
         // Member-local: a changed, nonregular or unreadable entry never reaches the shared runner.
         check_entry(&member.entry)
             .await
             .map_err(|err| rejected(ProblemKind::Invalid, format!("{label} entry {err}")))?;
-        let data = options.data_dir(&member.id);
+        let data = self.options.data_dir(&member.id);
         tokio::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -555,13 +553,7 @@ impl Shared {
 
 /// The placement's single lifecycle owner: restarts immediately after failures 1 and 2 in the
 /// rolling window, disables every non-load-disabled member on the third.
-async fn drive(
-    shared: Arc<Shared>,
-    options: ExtensionOptions,
-    supervisor: Arc<ProcessSupervisor>,
-    bun: BunPath,
-    stop: CancellationToken,
-) {
+async fn drive(shared: Arc<Shared>, stop: CancellationToken) {
     let mut budget = Budget::default();
     let mut generation = 0;
     let mut phase = Phase::Starting;
@@ -570,10 +562,7 @@ async fn drive(
         if !shared.commit(generation, phase) {
             return;
         }
-        let failure = match shared
-            .run(&options, &bun, &supervisor, generation, &stop)
-            .await
-        {
+        let failure = match shared.run(generation, &stop).await {
             Exit::Stopped => return,
             Exit::Setup(problem) => {
                 shared.commit(generation, Phase::Unavailable(problem));
