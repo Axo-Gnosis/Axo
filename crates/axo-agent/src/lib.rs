@@ -10,7 +10,7 @@ pub mod message;
 mod run;
 pub mod tool;
 
-pub use agent::{Agent, AgentConfig, QueueMode, RunOutcome};
+pub use agent::{Agent, AgentConfig, QueueMode, RemovedQueued, RunOutcome};
 pub use cancel::CancelReason;
 pub use error::Error;
 pub use event::{AgentEvent, MessageOrigin, Persist, PersistError};

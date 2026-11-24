@@ -1713,9 +1713,8 @@ async fn removing_the_only_steer_clears_the_signal() {
         id: Some("s1".into()),
     });
     assert!(h.agent.remove_queued("unknown").is_none());
-    let (removed, behind) = h.agent.remove_queued("s1").expect("queued steer");
-    assert_eq!(behind, 0);
-    assert_eq!(removed.id.as_deref(), Some("s1"));
+    let removed = h.agent.remove_queued("s1").expect("queued steer");
+    assert_eq!(removed.message().id.as_deref(), Some("s1"));
     assert!(h.agent.remove_queued("s1").is_none());
 
     assert_eq!(h.prompt("go").await, RunOutcome::Done);
@@ -1741,16 +1740,34 @@ fn rollback_after_prefix_drain_preserves_order() {
                 h.agent.follow_up(message);
             }
         }
-        let (b, behind) = h.agent.remove_queued("B").unwrap();
-        assert_eq!(behind, 2);
+        let b = h.agent.remove_queued("B").unwrap();
+        assert_eq!(b.message().id.as_deref(), Some("B"));
         assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("A"));
-        h.agent.restore_queued(steering, behind, b);
+        h.agent.restore_queued(b);
         assert_eq!(h.agent.queued_ids(), ["B", "C", "D"]);
+        let (steers, follow_ups) = h.agent.queued();
+        let (source, other) = if steering {
+            (steers, follow_ups)
+        } else {
+            (follow_ups, steers)
+        };
+        assert_eq!(
+            source
+                .iter()
+                .map(|message| match message {
+                    AgentMessage::Llm(Message::User(user)) => first_text(&user.content),
+                    other => panic!("expected queued user input, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            ["B", "C", "D"]
+        );
+        assert!(other.is_empty());
 
-        let (b, behind) = h.agent.remove_queued("B").unwrap();
+        let b = h.agent.remove_queued("B").unwrap();
+        assert_eq!(b.message().id.as_deref(), Some("B"));
         assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("C"));
         assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("D"));
-        h.agent.restore_queued(steering, behind, b);
+        h.agent.restore_queued(b);
         assert_eq!(h.agent.take_next_input()[0].id.as_deref(), Some("B"));
         assert!(h.agent.queued_ids().is_empty());
     }

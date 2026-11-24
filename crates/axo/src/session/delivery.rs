@@ -508,7 +508,7 @@ impl Session {
                 .and_then(|seq| QueuedInput::from_submission(&seq.entry)) else {
                 return Err(Error::NotQueued(id));
             };
-            let Some((message, behind)) = agent.remove_queued(&id) else {
+            let Some(removed) = agent.remove_queued(&id) else {
                 return Err(Error::NotQueued(id));
             };
             let tombstone = Entry::SubmissionWithdrawn {
@@ -518,7 +518,7 @@ impl Session {
             if let Err(error) = hooks.append(vec![tombstone]).await {
                 {
                     let _live = hooks.live();
-                    agent.restore_queued(matches!(input.kind, SubmissionKind::Prompt | SubmissionKind::Steer), behind, message);
+                    agent.restore_queued(removed);
                     let _ = hooks.events.send(Arc::new(SessionEvent::QueueChanged));
                 }
                 drop(order);
