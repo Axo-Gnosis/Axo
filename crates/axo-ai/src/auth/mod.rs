@@ -52,6 +52,17 @@ pub enum Credential {
     },
 }
 
+/// Where a provider's credential comes from, without resolving or validating it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
+pub enum CredentialSource {
+    Config,
+    ApiKey,
+    Oauth,
+    Env(String),
+    None,
+}
+
 /// A credential transform run under the store's exclusive lock: `Ok(None)` keeps the current credential.
 pub type CredentialUpdate = Box<
     dyn FnOnce(Option<Credential>) -> BoxFuture<'static, Result<Option<Credential>, Error>> + Send,

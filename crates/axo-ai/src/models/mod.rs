@@ -41,17 +41,6 @@ pub struct ProviderInfo {
     pub origin: ProviderOrigin,
 }
 
-/// Where a provider's credential comes from, without resolving or validating it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
-#[serde(tag = "type", content = "value", rename_all = "camelCase")]
-pub enum CredentialSource {
-    Config,
-    ApiKey,
-    Oauth,
-    Env(String),
-    None,
-}
-
 pub struct ModelsOptions {
     /// Where the models.dev catalog is cached; `None` runs without the catalog, does no
     /// catalog I/O, and never refreshes on a timer.

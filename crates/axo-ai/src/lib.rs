@@ -31,14 +31,12 @@ pub use auth::provider::{
 };
 pub use auth::resolve::resolve_config_value;
 pub use auth::store::FileCredentialStore;
-pub use auth::{Credential, CredentialStore, ModelAuth};
+pub use auth::{Credential, CredentialSource, CredentialStore, ModelAuth};
 pub use error::Error;
 pub use event::{Accumulator, AssistantEvent};
 pub use model::{ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap};
 pub use models::config::ModelsConfig;
-pub use models::{
-    CredentialSource, Models, ModelsOptions, ProviderInfo, ProviderLayer, ProviderOrigin,
-};
+pub use models::{Models, ModelsOptions, ProviderInfo, ProviderLayer, ProviderOrigin};
 pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use retry::{is_fatal_error, is_retryable_error};
 #[cfg(feature = "testing")]

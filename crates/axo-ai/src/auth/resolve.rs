@@ -6,9 +6,8 @@ use std::sync::Arc;
 use futures::FutureExt;
 
 use crate::auth::provider::ProviderLogin;
-use crate::auth::{Credential, CredentialStore, ModelAuth};
+use crate::auth::{Credential, CredentialSource, CredentialStore, ModelAuth};
 use crate::error::Error;
-use crate::models::CredentialSource;
 use crate::types::now_ms;
 
 /// What `resolve_auth` needs to know about one provider.

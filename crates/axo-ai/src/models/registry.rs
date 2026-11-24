@@ -7,16 +7,16 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Wea
 use tokio::sync::watch;
 
 use crate::api::RequestRewrite;
-use crate::auth::ModelAuth;
 use crate::auth::codex as codex_auth;
 use crate::auth::provider::{LoginInteraction, Provider};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
+use crate::auth::{CredentialSource, ModelAuth};
 use crate::error::Error;
 use crate::model::Model;
 use crate::types::ServiceTier;
 
 use super::build::Loaded;
-use super::{CredentialSource, Models, ProviderInfo, ProviderLayer, ProviderOrigin, Shared};
+use super::{Models, ProviderInfo, ProviderLayer, ProviderOrigin, Shared};
 
 /// A scoped overlay above `Shared`'s base state: its own `register`/`ProviderLayer`s win over
 /// base providers for callers using the scoped `Models`, without affecting base or other scopes.
