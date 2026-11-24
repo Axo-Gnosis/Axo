@@ -26,7 +26,7 @@ use crate::auth::CredentialStore;
 
 use self::config::ModelsConfig;
 use self::feeds::Inputs;
-use self::registry::{Scope, State};
+use self::registry::{Scope, State, View};
 
 /// Public provider metadata without credential values.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
@@ -71,8 +71,7 @@ pub struct ModelsOptions {
 /// (`provider_layer`) sit above runtime registrations. Each request resolves the current
 /// model and provider by provider/id; a missing model fails with `Error::UnknownModel`.
 pub struct Models {
-    shared: Arc<Shared>,
-    scope: Option<Arc<Scope>>,
+    view: View,
     anthropic: Arc<AnthropicApi>,
     completions: Arc<CompletionsApi>,
     codex: Arc<CodexApi>,
@@ -83,8 +82,7 @@ pub struct Models {
 /// the `Models::register` registration, then the loaded catalog. Dropping the layer removes
 /// only its providers and reveals whatever they hid.
 pub struct ProviderLayer {
-    shared: Arc<Shared>,
-    scope: Option<Arc<Scope>>,
+    view: View,
     /// Creation order within its registry or scope; newer wins.
     ordinal: u64,
 }

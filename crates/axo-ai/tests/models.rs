@@ -814,6 +814,50 @@ async fn subscribe_and_scoped_views_isolate_and_propagate() {
     assert!(!sub_b.has_changed().unwrap());
     assert!(scope_a.find("acme/a-model").is_none());
     assert!(scope_b.find("acme/b-model").is_some());
+
+    // Scope priority is independent of base layer ordinals.
+    let older_base = base.provider_layer();
+    let local = scope_a.provider_layer();
+    let newer_base = base.provider_layer();
+    newer_base
+        .replace(vec![(
+            "host".into(),
+            make_provider("ordinal", "base"),
+            None,
+        )])
+        .unwrap();
+    assert_eq!(older_base.hidden("ordinal"), None);
+    assert_eq!(local.hidden("ordinal"), Some(axo_ai::ProviderOrigin::Layer));
+    let mut provider = make_provider("ordinal", "local");
+    provider.requires_key = false;
+    local
+        .replace(vec![("scope".into(), provider, None)])
+        .unwrap();
+    let _ = *sub_base.borrow_and_update();
+    let _ = *sub_a.borrow_and_update();
+    let _ = *sub_b.borrow_and_update();
+    let snapshot = scope_a.all();
+    let model = scope_a.find("ordinal/local").unwrap();
+    let mut missing = model.clone();
+    missing.id = "missing".into();
+    let check_snapshot = || {
+        assert!(Arc::ptr_eq(&snapshot, &scope_a.all()));
+        assert!(!sub_base.has_changed().unwrap());
+        assert!(!sub_a.has_changed().unwrap());
+        assert!(!sub_b.has_changed().unwrap());
+    };
+    assert!(local.set_unavailable("ordinal", Some("offline".into())));
+    check_snapshot();
+    assert!(
+        matches!(scope_a.auth(&missing).await, Err(Error::UnknownModel { provider, model }) if provider == "ordinal" && model == "missing")
+    );
+    assert!(
+        matches!(scope_a.auth(&model).await, Err(Error::ProviderUnavailable { provider, reason }) if provider == "ordinal" && reason == "offline")
+    );
+    assert!(base.find("ordinal/base").is_some());
+    assert!(local.set_unavailable("ordinal", None));
+    check_snapshot();
+    assert!(scope_a.auth(&model).await.is_ok());
 }
 
 #[tokio::test]

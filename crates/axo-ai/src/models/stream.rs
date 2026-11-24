@@ -35,7 +35,7 @@ impl Streamer for Models {
         };
         let auth = resolve_auth(
             request.auth,
-            self.shared.credentials.clone(),
+            self.view.shared.credentials.clone(),
             request.headers,
             request.config_base_url,
         );

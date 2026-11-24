@@ -17,7 +17,7 @@ use crate::error::Error;
 use super::build::{Candidate, build, catalog_provider_auth};
 use super::codex::CodexModel;
 use super::config::ModelsConfig;
-use super::registry::State;
+use super::registry::{State, View};
 use super::{Models, ModelsOptions, Shared, catalog, codex, rules};
 
 /// Seconds between automatic refreshes unless `ModelsConfig::refresh_interval` says otherwise.
@@ -144,18 +144,20 @@ impl Models {
             tracing::warn!("models.dev catalog unavailable, continuing without it: {error}");
         }
         let models = Models {
-            shared: Arc::new(Shared {
-                state: RwLock::new(State::new(loaded)),
-                inputs: tokio::sync::Mutex::new(inputs),
-                cache_dir: opts.cache_dir,
-                credentials: opts.credentials,
-                http: http.clone(),
-                next_layer: AtomicU64::new(0),
-                changes: watch::Sender::new(0),
-                scopes: Mutex::new(Vec::new()),
-                timer: Mutex::new(None),
-            }),
-            scope: None,
+            view: View {
+                shared: Arc::new(Shared {
+                    state: RwLock::new(State::new(loaded)),
+                    inputs: tokio::sync::Mutex::new(inputs),
+                    cache_dir: opts.cache_dir,
+                    credentials: opts.credentials,
+                    http: http.clone(),
+                    next_layer: AtomicU64::new(0),
+                    changes: watch::Sender::new(0),
+                    scopes: Mutex::new(Vec::new()),
+                    timer: Mutex::new(None),
+                }),
+                scope: None,
+            },
             anthropic: Arc::new(AnthropicApi::new(http.clone())),
             completions: Arc::new(CompletionsApi::new(http.clone())),
             codex: Arc::new(CodexApi::new(http)),
@@ -169,7 +171,7 @@ impl Models {
     /// reading the cache or fetching, and restarts the refresh timer. Registrations are kept.
     /// On `Err` nothing changes.
     pub async fn reload(&self, config: ModelsConfig, extended_context: bool) -> Result<(), Error> {
-        let shared = &self.shared;
+        let shared = &self.view.shared;
         let mut inputs = shared.inputs.lock().await;
         let candidate = Candidate {
             config: &config,
@@ -182,7 +184,7 @@ impl Models {
             &shared.credentials,
             &shared.http,
             &|id| shared.loaded_ids(id),
-            &|id| shared.read().runtime(id).is_none(),
+            &|id| shared.is_base_visible(id),
             None,
         )
         .await?;
@@ -202,14 +204,14 @@ impl Models {
     /// failure the previous catalog stays and the error is returned; a provider whose
     /// discovery fails keeps its previous models. Registrations are kept.
     pub async fn refresh(&self) -> Result<(), Error> {
-        self.shared.refresh(None).await
+        self.view.shared.refresh(None).await
     }
 
     /// Restarts the refresh timer: the first refresh once the cache is `interval` old, then
     /// every `interval`. No timer without a cache directory or with an interval of 0.
     fn start_timer(&self, interval: Duration, age: Duration, mut skip: Option<HashSet<String>>) {
-        let task = (self.shared.cache_dir.is_some() && !interval.is_zero()).then(|| {
-            let shared = Arc::clone(&self.shared);
+        let task = (self.view.shared.cache_dir.is_some() && !interval.is_zero()).then(|| {
+            let shared = Arc::clone(&self.view.shared);
             tokio::spawn(async move {
                 tokio::time::sleep(interval.saturating_sub(age)).await;
                 loop {
@@ -222,6 +224,7 @@ impl Models {
             .abort_handle()
         });
         let mut timer = self
+            .view
             .shared
             .timer
             .lock()
@@ -240,10 +243,10 @@ impl Models {
     /// error is returned; call again to retry the deletion.
     pub async fn logout(&self, provider: &str) -> Result<(), Error> {
         let info = self.provider(provider, false)?;
-        self.shared.credentials.remove(&info.slot).await?;
+        self.view.shared.credentials.remove(&info.slot).await?;
         if provider == codex_auth::PROVIDER && self.is_visible_loaded(provider, &info) {
-            let mut inputs = self.shared.inputs.lock().await;
-            let removed = match self.shared.cache_dir.as_deref() {
+            let mut inputs = self.view.shared.inputs.lock().await;
+            let removed = match self.view.shared.cache_dir.as_deref() {
                 Some(dir) => codex::remove(dir).await,
                 None => Ok(()),
             };
@@ -256,14 +259,14 @@ impl Models {
                 };
                 let loaded = build(
                     candidate,
-                    &self.shared.credentials,
-                    &self.shared.http,
-                    &|id| self.shared.loaded_ids(id),
+                    &self.view.shared.credentials,
+                    &self.view.shared.http,
+                    &|id| self.view.shared.loaded_ids(id),
                     &|_| false,
                     None,
                 )
                 .await?;
-                self.shared.replace(loaded);
+                self.view.shared.replace(loaded);
             }
             removed?;
         }
@@ -273,8 +276,9 @@ impl Models {
 
 impl Drop for Models {
     fn drop(&mut self) {
-        if self.scope.is_none()
+        if self.view.scope.is_none()
             && let Some(timer) = self
+                .view
                 .shared
                 .timer
                 .lock()
@@ -289,7 +293,7 @@ impl Drop for Models {
 impl Shared {
     async fn refresh(&self, skip: Option<&HashSet<String>>) -> Result<(), Error> {
         let mut inputs = self.inputs.lock().await;
-        let visible = |id: &str| self.read().runtime(id).is_none();
+        let visible = |id: &str| self.is_base_visible(id);
         let pending = gather(
             &self.http,
             self.cache_dir.as_deref(),
@@ -307,7 +311,7 @@ impl Shared {
     pub(super) async fn refresh_codex(&self) -> Result<(), Error> {
         let mut inputs = self.inputs.lock().await;
         let Some(list) = discover_codex(&self.http, &self.credentials, &inputs.config, &|id| {
-            self.read().runtime(id).is_none()
+            self.is_base_visible(id)
         })
         .await
         else {
@@ -502,7 +506,7 @@ mod tests {
             )
             .await
             .unwrap();
-        models.shared.refresh_codex().await.unwrap();
+        models.view.shared.refresh_codex().await.unwrap();
         assert_eq!(requests.try_recv().unwrap(), "/codex/models");
         assert!(requests.try_recv().is_err());
         assert!(models.find("openai-codex/account").is_some());
