@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::fs;
 
-use axo::ext::objects;
+use axo::ext::{Meta, objects};
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/extension-api.md");
 
@@ -16,6 +16,37 @@ fn push_cell(output: &mut String, text: &str) {
     }
 }
 
+fn callable_table(output: &mut String, methods: impl IntoIterator<Item = &'static Meta>) {
+    output.push_str("| Method | Parameters | Summary |\n| --- | --- | --- |\n");
+    for meta in methods {
+        if meta.skip.is_some() {
+            continue;
+        }
+        output.push_str("| ");
+        push_cell(output, meta.name);
+        output.push_str(" | ");
+        for (index, param) in meta.params.iter().enumerate() {
+            if index != 0 {
+                output.push_str(", ");
+            }
+            push_cell(output, param.name);
+            if param.optional {
+                output.push('?');
+            }
+        }
+        output.push_str(" | ");
+        // Doc comments wrap; the first paragraph is the whole summary sentence.
+        let summary = meta
+            .doc
+            .lines()
+            .map(str::trim)
+            .take_while(|line| !line.is_empty());
+        push_cell(output, &summary.collect::<Vec<_>>().join(" "));
+        output.push_str(" |\n");
+    }
+    output.push('\n');
+}
+
 fn reference() -> String {
     let mut output = String::from(
         "# Extension API reference\n\n\
@@ -25,34 +56,14 @@ fn reference() -> String {
     );
     for object in objects() {
         writeln!(output, "\n## {}\n", object.name).unwrap();
-        output.push_str("| Method | Parameters | Summary |\n| --- | --- | --- |\n");
-        for meta in object.blocks.iter().flat_map(|block| &block.entries) {
-            if meta.skip.is_some() {
-                continue;
-            }
-            output.push_str("| ");
-            push_cell(&mut output, meta.name);
-            output.push_str(" | ");
-            for (index, param) in meta.params.iter().enumerate() {
-                if index != 0 {
-                    output.push_str(", ");
-                }
-                push_cell(&mut output, param.name);
-                if param.optional {
-                    output.push('?');
-                }
-            }
-            output.push_str(" | ");
-            // Doc comments wrap; the first paragraph is the whole summary sentence.
-            let summary = meta
-                .doc
-                .lines()
-                .map(str::trim)
-                .take_while(|line| !line.is_empty());
-            push_cell(&mut output, &summary.collect::<Vec<_>>().join(" "));
-            output.push_str(" |\n");
-        }
-        output.push('\n');
+        callable_table(
+            &mut output,
+            object
+                .blocks
+                .iter()
+                .flat_map(|block| &block.entries)
+                .copied(),
+        );
         output.push_str("### Withheld\n\n| Rust method | Reason |\n| --- | --- |\n");
         for block in &object.blocks {
             for meta in &block.entries {
@@ -69,11 +80,14 @@ fn reference() -> String {
         }
     }
     output.push_str(
-        "\n## Served by the extension bridge\n\n\
+        "\n## hostLifecycle\n\n\
+         These are methods of the host handle, typed as `HostLifecycle` in the SDK bindings. \
+         Without a lifecycle hook, these calls are refused with `no_lifecycle`.\n\n",
+    );
+    callable_table(&mut output, axo_extensions::lifecycle_methods());
+    output.push_str(
+        "## Served by the extension bridge\n\n\
          - session: subscribe.\n\
-         - host: `createSession(cwd, request?)`, `openSession(path, request?)`, \
-         `forkSession(sessionId, entryId)`, and `closeSession(sessionId)`, typed as `HostLifecycle` \
-         in the SDK bindings. Without a lifecycle hook, these calls are refused with `no_lifecycle`.\n\
          - models: stream.\n",
     );
     output

@@ -227,8 +227,18 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | Rust method | Reason |
 | --- | --- |
 
+## hostLifecycle
+
+These are methods of the host handle, typed as `HostLifecycle` in the SDK bindings. Without a lifecycle hook, these calls are refused with `no_lifecycle`.
+
+| Method | Parameters | Summary |
+| --- | --- | --- |
+| createSession | cwd, request? |  |
+| openSession | path, request? |  |
+| forkSession | sessionId, entryId |  |
+| closeSession | sessionId |  |
+
 ## Served by the extension bridge
 
 - session: subscribe.
-- host: `createSession(cwd, request?)`, `openSession(path, request?)`, `forkSession(sessionId, entryId)`, and `closeSession(sessionId)`, typed as `HostLifecycle` in the SDK bindings. Without a lifecycle hook, these calls are refused with `no_lifecycle`.
 - models: stream.
