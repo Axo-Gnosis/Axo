@@ -377,7 +377,7 @@ impl Builtin {
     }
 }
 
-#[expose(block = COMMAND_BLOCK, object = "types")]
+#[expose]
 impl Command {
     /// Decodes a built-in command from JSON arguments; `null` counts as `{}`.
     #[ext(skip = "no receiver; served by host.decodeCommand")]

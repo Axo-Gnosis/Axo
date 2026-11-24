@@ -2,6 +2,7 @@
 //! Each public method must opt in with `#[ext]` or give a reason with `#[ext(skip = "...")]`.
 //! The block describes both; callable entries decode positional arguments, call Rust, and
 //! register their owned wire types. `target = T` constructs a caller-specific wrapper over `T`.
+//! Bare `#[expose]` validates and strips markers on withheld-only impls without dispatch metadata.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
@@ -34,39 +35,59 @@ pub fn expose(attr: TokenStream, item: TokenStream) -> TokenStream {
     });
     parse_macro_input!(attr with parser);
     let mut imp = parse_macro_input!(item as ItemImpl);
-    let (Some(block), Some(object)) = (block, object) else {
-        return Error::new(
-            Span::call_site(),
-            "expected `block = NAME, object = \"name\"`",
-        )
-        .into_compile_error()
-        .into();
-    };
     if imp.trait_.is_some() {
         return Error::new_spanned(&imp.self_ty, "expose requires an inherent impl")
             .into_compile_error()
             .into();
     }
-    let self_ty = &imp.self_ty;
-    let receiver = if target.is_some() {
-        let Some(wrapper) = segment(self_ty).map(|s| &s.ident) else {
-            return Error::new_spanned(self_ty, "expected a named wire wrapper")
-                .into_compile_error()
-                .into();
-        };
-        quote!(let receiver = #wrapper::wire(target, _caller);)
-    } else {
-        quote!(let receiver = target;)
+    let dispatch = match (block, object) {
+        (Some(block), Some(object)) => {
+            let self_ty = &imp.self_ty;
+            let receiver = if target.is_some() {
+                let Some(wrapper) = segment(self_ty).map(|s| &s.ident) else {
+                    return Error::new_spanned(self_ty, "expected a named wire wrapper")
+                        .into_compile_error()
+                        .into();
+                };
+                quote!(let receiver = #wrapper::wire(target, _caller);)
+            } else {
+                quote!(let receiver = target;)
+            };
+            Some((
+                block,
+                object.value(),
+                target.as_ref().unwrap_or(self_ty),
+                receiver,
+            ))
+        }
+        (None, None) if target.is_none() => None,
+        _ => {
+            return Error::new(
+                Span::call_site(),
+                "expected `block = NAME, object = \"name\"`",
+            )
+            .into_compile_error()
+            .into();
+        }
     };
-    let target = target.as_ref().unwrap_or(self_ty);
-    let object = object.value();
     let mut defs = Tokens::new();
     let mut entries = Vec::new();
     let mut errors = Tokens::new();
     for item in &mut imp.items {
         let ImplItem::Fn(method) = item else { continue };
         let result = match take_marker(method) {
-            Ok(Some(marker)) => entry(method, marker, &object, target, &receiver, &mut defs),
+            Ok(Some(marker)) => match &dispatch {
+                Some((_, object, target, receiver)) => {
+                    entry(method, marker, object, target, receiver, &mut defs)
+                }
+                None => match marker {
+                    Marker::Skip(_) => continue,
+                    Marker::Call => Err(Error::new(
+                        method.sig.ident.span(),
+                        "withheld-only impl; add a wire method",
+                    )),
+                },
+            },
             Ok(None) => continue,
             Err(e) => Err(e),
         };
@@ -78,6 +99,9 @@ pub fn expose(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !errors.is_empty() {
         return quote!(#imp #errors).into();
     }
+    let Some((block, object, target, _)) = dispatch else {
+        return quote!(#imp).into();
+    };
     quote! {
         #imp
         #defs

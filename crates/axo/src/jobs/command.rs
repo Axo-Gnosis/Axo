@@ -193,7 +193,7 @@ const TAG_FAILED: u8 = 4;
 /// Records per batched index read while scanning for chunks.
 const INDEX_BATCH: u64 = 512;
 
-#[expose(block = COMMAND_OUTPUT_BLOCK, object = "types")]
+#[expose]
 impl CommandOutput {
     pub(super) fn new(
         job: String,

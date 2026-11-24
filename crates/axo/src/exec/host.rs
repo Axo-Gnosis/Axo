@@ -170,7 +170,7 @@ pub struct ProcessSupervisor {
     ready: OnceCell<Result<PathBuf, String>>,
 }
 
-#[expose(block = PROCESS_SUPERVISOR_BLOCK, object = "types")]
+#[expose]
 impl ProcessSupervisor {
     /// Checks nothing yet: hosts that never run commands keep working without a
     /// delegated cgroup.
@@ -599,7 +599,7 @@ impl Watch {
     }
 }
 
-#[expose(block = PROCESS_BLOCK, object = "types")]
+#[expose]
 impl Process {
     /// Takes both pipes and forwards labeled raw chunks in capture order.
     /// Read errors are delivered explicitly; dropping the `JoinSet` stops the readers.
@@ -724,7 +724,7 @@ enum Scope {
     Group(Pid),
 }
 
-#[expose(block = CONTAINER_BLOCK, object = "types")]
+#[expose]
 impl Container {
     /// SIGKILLs everything in the container (`cgroup.kill` or a group kill); errors are
     /// ignored.

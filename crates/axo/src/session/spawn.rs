@@ -103,7 +103,7 @@ pub struct ChildHandle {
     pub session: Arc<Session>,
 }
 
-#[expose(block = CHILD_HANDLE_BLOCK, object = "types")]
+#[expose]
 impl ChildHandle {
     #[ext(skip = "live child handle; session.spawn returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {
@@ -113,7 +113,7 @@ impl ChildHandle {
     }
 }
 
-#[expose(block = TEAM_HANDLE_BLOCK, object = "types")]
+#[expose]
 impl TeamHandle {
     #[ext(skip = "live team handle; session.spawnTeam returns the receipt")]
     pub fn receipt(&self) -> SpawnReceipt {

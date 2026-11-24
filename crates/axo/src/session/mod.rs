@@ -354,7 +354,7 @@ pub enum SessionEventKind {
     TreeUsage,
 }
 
-#[expose(block = SESSION_EVENT_BLOCK, object = "types")]
+#[expose]
 impl SessionEvent {
     /// Returns this event's tag without serializing its payload.
     #[ext(skip = "derivable from the value in TypeScript")]

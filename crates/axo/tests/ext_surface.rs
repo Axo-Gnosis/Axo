@@ -120,27 +120,29 @@ impl<'ast> Visit<'ast> for File<'_> {
                 .is_some_and(|s| s.ident == "expose")
         });
         if let Some(attr) = exposed {
-            attr.parse_nested_meta(|meta| {
-                let value: syn::Expr = meta.value()?.parse()?;
-                if meta.path.is_ident("block") {
-                    let syn::Expr::Path(block) = value else {
-                        return Err(meta.error("expected block name"));
-                    };
-                    let name = block.path.require_ident()?.to_string();
-                    if !axo::ext::objects()
-                        .iter()
-                        .flat_map(|o| &o.blocks)
-                        .any(|b| b.name == name)
-                    {
-                        self.surface.problems.push(format!(
-                            "{}: {name} missing from ext::objects()",
-                            self.at(block)
-                        ));
+            if matches!(attr.meta, Meta::List(_)) {
+                attr.parse_nested_meta(|meta| {
+                    let value: syn::Expr = meta.value()?.parse()?;
+                    if meta.path.is_ident("block") {
+                        let syn::Expr::Path(block) = value else {
+                            return Err(meta.error("expected block name"));
+                        };
+                        let name = block.path.require_ident()?.to_string();
+                        if !axo::ext::objects()
+                            .iter()
+                            .flat_map(|o| &o.blocks)
+                            .any(|b| b.name == name)
+                        {
+                            self.surface.problems.push(format!(
+                                "{}: {name} missing from ext::objects()",
+                                self.at(block)
+                            ));
+                        }
                     }
-                }
-                Ok(())
-            })
-            .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            }
             return;
         }
         if item.trait_.is_some() || !item.items.iter().any(|method| matches!(method, ImplItem::Fn(f) if matches!(f.vis, Visibility::Public(_)))) {

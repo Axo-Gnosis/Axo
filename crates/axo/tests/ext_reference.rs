@@ -25,36 +25,34 @@ fn reference() -> String {
     );
     for object in objects() {
         writeln!(output, "\n## {}\n", object.name).unwrap();
-        if object.name != "types" {
-            output.push_str("| Method | Parameters | Summary |\n| --- | --- | --- |\n");
-            for meta in object.blocks.iter().flat_map(|block| &block.entries) {
-                if meta.skip.is_some() {
-                    continue;
-                }
-                output.push_str("| ");
-                push_cell(&mut output, meta.name);
-                output.push_str(" | ");
-                for (index, param) in meta.params.iter().enumerate() {
-                    if index != 0 {
-                        output.push_str(", ");
-                    }
-                    push_cell(&mut output, param.name);
-                    if param.optional {
-                        output.push('?');
-                    }
-                }
-                output.push_str(" | ");
-                // Doc comments wrap; the first paragraph is the whole summary sentence.
-                let summary = meta
-                    .doc
-                    .lines()
-                    .map(str::trim)
-                    .take_while(|line| !line.is_empty());
-                push_cell(&mut output, &summary.collect::<Vec<_>>().join(" "));
-                output.push_str(" |\n");
+        output.push_str("| Method | Parameters | Summary |\n| --- | --- | --- |\n");
+        for meta in object.blocks.iter().flat_map(|block| &block.entries) {
+            if meta.skip.is_some() {
+                continue;
             }
-            output.push('\n');
+            output.push_str("| ");
+            push_cell(&mut output, meta.name);
+            output.push_str(" | ");
+            for (index, param) in meta.params.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(", ");
+                }
+                push_cell(&mut output, param.name);
+                if param.optional {
+                    output.push('?');
+                }
+            }
+            output.push_str(" | ");
+            // Doc comments wrap; the first paragraph is the whole summary sentence.
+            let summary = meta
+                .doc
+                .lines()
+                .map(str::trim)
+                .take_while(|line| !line.is_empty());
+            push_cell(&mut output, &summary.collect::<Vec<_>>().join(" "));
+            output.push_str(" |\n");
         }
+        output.push('\n');
         output.push_str("### Withheld\n\n| Rust method | Reason |\n| --- | --- |\n");
         for block in &object.blocks {
             for meta in &block.entries {

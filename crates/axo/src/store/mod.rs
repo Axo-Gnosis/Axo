@@ -16,10 +16,8 @@ pub use entry::{
     ModeRestore, RosterEntry, RunOutcome, SeqEntry, SessionInfo, SpawnLink, SubmissionKind,
     SubmittedCustom, TIMESTAMP_FORMAT, TeamLink, TeamRef,
 };
-pub(crate) use entry::{ENTRY_BASE_BLOCK, ENTRY_BLOCK, ENTRY_ID_BLOCK, HEADER_BLOCK};
-pub(crate) use jsonl::JSONL_STORE_BLOCK;
 pub use jsonl::JsonlStore;
-pub(crate) use project::{BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, PROJECTION_BLOCK, path_to};
+pub(crate) use project::{BRANCH_SUMMARY_TYPE, COMPACTION_SUMMARY_TYPE, path_to};
 pub use project::{ProjectedSource, Projection, project};
 
 use crate::error::Error;

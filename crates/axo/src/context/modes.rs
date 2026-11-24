@@ -48,7 +48,7 @@ pub struct ToolLimits {
     pub deny: Vec<String>,
 }
 
-#[expose(block = TOOL_LIMITS_BLOCK, object = "types")]
+#[expose]
 impl ToolLimits {
     /// `allow` (when set) must contain `tool`, and `deny` must not.
     #[ext(skip = "derivable from the value in TypeScript")]
@@ -76,7 +76,7 @@ pub enum BashAccess {
     ReadOnly,
 }
 
-#[expose(block = BASH_ACCESS_BLOCK, object = "types")]
+#[expose]
 impl BashAccess {
     #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_full(&self) -> bool {
@@ -190,7 +190,7 @@ pub(crate) fn merge_modes(
     (definitions, diagnostics)
 }
 
-#[expose(block = MODE_SPEC_BLOCK, object = "types")]
+#[expose]
 impl ModeSpec {
     /// Parses a mode definition (YAML frontmatter plus body), e.g. one a host bundles
     /// with `include_str!` and passes in `SessionOptions::modes`. `default_name` applies only

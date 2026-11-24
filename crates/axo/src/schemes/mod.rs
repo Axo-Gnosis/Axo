@@ -159,7 +159,7 @@ pub struct Schemes {
     entries: Arc<Mutex<SchemeList>>,
 }
 
-#[expose(block = SCHEMES_BLOCK, object = "types")]
+#[expose]
 impl Schemes {
     /// Applies host handlers in order, replacing matching built-ins in place.
     /// `artifact://` is always registered first and backed by `artifacts`;

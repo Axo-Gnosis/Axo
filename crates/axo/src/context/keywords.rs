@@ -136,7 +136,7 @@ pub(crate) fn merge_keywords(
     (definitions, diagnostics)
 }
 
-#[expose(block = KEYWORD_SPEC_BLOCK, object = "types")]
+#[expose]
 impl KeywordSpec {
     /// Parses a keyword definition (YAML frontmatter plus body), e.g. one a host bundles
     /// with `include_str!` and passes in `SessionOptions::keywords`. `default_name` applies

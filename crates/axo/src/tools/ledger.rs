@@ -106,7 +106,7 @@ pub(crate) fn ledger_records(result: &ToolResultMessage) -> Vec<LedgerRecord> {
 #[derive(Debug, Default)]
 pub struct FileLedger(Mutex<HashMap<PathBuf, String>>);
 
-#[expose(block = FILE_LEDGER_BLOCK, object = "types")]
+#[expose]
 impl FileLedger {
     /// Copies the session's recorded hashes without touching disk or changing freshness.
     #[ext(skip = "served by tools.ledger")]

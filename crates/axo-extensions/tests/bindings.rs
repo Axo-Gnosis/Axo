@@ -109,7 +109,7 @@ fn bindings() -> String {
         phase("Credential", "Serialize")
     )
     .unwrap();
-    for object in objects().iter().filter(|object| object.name != "types") {
+    for object in objects() {
         let mut name = object.name.chars();
         let first = name.next().unwrap().to_uppercase();
         writeln!(output, "\nexport interface {first}{} {{", name.as_str()).unwrap();

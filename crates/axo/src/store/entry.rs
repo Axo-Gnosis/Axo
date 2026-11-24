@@ -31,7 +31,7 @@ pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 #[serde(transparent)]
 pub struct EntryId(pub String);
 
-#[expose(block = ENTRY_ID_BLOCK, object = "types")]
+#[expose]
 impl EntryId {
     /// A fresh id for which `taken` returns false (pi `SM:277-284`).
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
@@ -209,7 +209,7 @@ pub struct RosterEntry {
     pub session_id: String,
 }
 
-#[expose(block = HEADER_BLOCK, object = "types")]
+#[expose]
 impl Header {
     /// A header for a new session with a fresh UUIDv7 id, timestamped now.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
@@ -244,7 +244,7 @@ pub struct EntryBase {
     pub timestamp: String,
 }
 
-#[expose(block = ENTRY_BASE_BLOCK, object = "types")]
+#[expose]
 impl EntryBase {
     /// A base timestamped now.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
@@ -567,7 +567,7 @@ pub enum Entry {
     Unknown(#[specta(type = RawEntry)] Value),
 }
 
-#[expose(block = ENTRY_BLOCK, object = "types")]
+#[expose]
 impl Entry {
     /// Usage incurred by this entry, including failed assistant responses.
     ///

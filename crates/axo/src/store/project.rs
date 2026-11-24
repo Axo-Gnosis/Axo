@@ -56,7 +56,7 @@ pub struct Projection {
     omitted: HashSet<String>,
 }
 
-#[expose(block = PROJECTION_BLOCK, object = "types")]
+#[expose]
 impl Projection {
     /// Raw root-to-leaf entry indices, including entries hidden by edits.
     #[ext(skip = "derivable from the value in TypeScript")]

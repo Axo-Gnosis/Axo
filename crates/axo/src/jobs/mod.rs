@@ -149,7 +149,7 @@ pub enum JobStatus {
     Failed,
 }
 
-#[expose(block = JOB_STATUS_BLOCK, object = "types")]
+#[expose]
 impl JobStatus {
     /// The `proc://` label: `"queued"`, `"running"`, `"helpers running"`, `"finished"` or `"failed"`.
     #[ext(skip = "derivable from the value in TypeScript")]

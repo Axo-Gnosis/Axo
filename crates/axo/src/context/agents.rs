@@ -23,7 +23,7 @@ pub enum RunAs {
     Any,
 }
 
-#[expose(block = RUN_AS_BLOCK, object = "types")]
+#[expose]
 impl RunAs {
     #[ext(skip = "derivable from the value in TypeScript")]
     pub fn is_any(&self) -> bool {
@@ -152,7 +152,7 @@ pub struct TeamMember {
     pub brief: Option<String>,
 }
 
-#[expose(block = TEAM_MEMBER_BLOCK, object = "types")]
+#[expose]
 impl TeamMember {
     /// The member's alias, or its agent name when no alias was supplied.
     #[ext(skip = "derivable from the value in TypeScript")]
@@ -177,7 +177,7 @@ pub enum AgentDef {
     Team(TeamSpec),
 }
 
-#[expose(block = AGENT_DEF_BLOCK, object = "types")]
+#[expose]
 impl AgentDef {
     /// The definition's unique catalog name.
     #[ext(skip = "derivable from the value in TypeScript")]
@@ -336,7 +336,7 @@ pub(crate) fn merge_agents(
     (definitions, diagnostics)
 }
 
-#[expose(block = AGENT_SPEC_BLOCK, object = "types")]
+#[expose]
 impl AgentSpec {
     /// Parses a markdown agent definition supplied by the host (for example a bundled `include_str!`).
     /// `default_name` applies only when the frontmatter has no `name` key; an explicit empty `name` is

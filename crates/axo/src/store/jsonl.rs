@@ -52,7 +52,7 @@ pub struct JsonlStore {
     checkpoints: Arc<Mutex<VecDeque<PageCheckpoint>>>,
 }
 
-#[expose(block = JSONL_STORE_BLOCK, object = "types")]
+#[expose]
 impl JsonlStore {
     /// A store rooted at the host-chosen directory `root`.
     #[ext(skip = "host construction")]

@@ -115,7 +115,7 @@ impl ConfigSource for NoConfig {
     }
 }
 
-#[expose(block = AXO_BUILDER_BLOCK, object = "types")]
+#[expose]
 impl AxoBuilder {
     /// Names the harness in model-facing text: the docs scheme (`<name>://`), the `docs`
     /// section, and the bundled `SYSTEM`/`SUMMARY` prompts. Defaults to `axo`.

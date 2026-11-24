@@ -63,11 +63,9 @@ use write::WriteTool;
 
 pub use crate::jobs::command::CommandRequest;
 pub use bash::BashRequest;
-pub(crate) use changes::SNAPSHOT_STORE_CHANGES;
 pub use changes::{
     FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_changes, squash,
 };
-pub(crate) use ledger::FILE_LEDGER_BLOCK;
 pub use ledger::{
     FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
 };
@@ -136,7 +134,7 @@ pub struct HostTool {
     pub origin: Option<String>,
 }
 
-#[expose(block = HOST_TOOL_BLOCK, object = "types")]
+#[expose]
 impl HostTool {
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn direct(factory: ToolFactory) -> Self {

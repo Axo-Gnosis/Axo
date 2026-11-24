@@ -35,7 +35,6 @@ pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
     static METHODS: LazyLock<BTreeMap<&str, Vec<&str>>> = LazyLock::new(|| {
         axo::ext::objects()
             .iter()
-            .filter(|object| object.name != "types")
             .map(|object| {
                 let mut names: Vec<_> = object
                     .blocks
