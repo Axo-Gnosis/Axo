@@ -9,7 +9,7 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{Prepared, prepare, read_sse, send};
+use crate::api::http::{dispatch, read_sse};
 use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
 use crate::api::{Api, ProviderRequest, Reply, StreamOptions, header_map, respond};
 use crate::auth::codex::{BASE_URL, account_id};
@@ -52,20 +52,22 @@ impl Api for CodexApi {
     ) -> BoxStream<'static, AssistantEvent> {
         let tier = model.effective_tier(opts.simple.service_tier);
         let request = build_request(model, &transcript, &opts, tier);
-        let rewrite = opts.rewrite.clone();
+        let rewrite = opts.rewrite;
         let http = self.http.clone();
         let owned_model = model.clone();
         respond(model, tier, cancel, move |mut reply, cancel| async move {
             let result = async {
-                let prepared = prepare(
+                let response = dispatch(
+                    &http,
                     rewrite.as_deref(),
                     &owned_model,
                     request?,
                     &cancel,
                     &mut reply,
+                    parse_error_response,
                 )
                 .await?;
-                drive(&http, &owned_model, prepared, &cancel, &mut reply).await
+                drive(&owned_model, response, &cancel, &mut reply).await
             }
             .await;
             (reply, result)
@@ -218,24 +220,11 @@ fn build_request_body(
 }
 
 async fn drive(
-    http: &reqwest::Client,
     model: &Model,
-    request: Prepared,
+    response: reqwest::Response,
     cancel: &CancellationToken,
     reply: &mut Reply,
 ) -> Result<StopReason, String> {
-    let response = send(
-        || {
-            http.post(&request.url)
-                .headers(request.headers.clone())
-                .body(request.body.clone())
-        },
-        cancel,
-        reply,
-        parse_error_response,
-    )
-    .await?;
-
     reply.start();
     let mut stream = ResponsesStream::new(model);
     read_sse(response, cancel, |sse| {

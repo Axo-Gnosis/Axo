@@ -159,6 +159,26 @@ async fn final_http_metadata_survives_body_consumption_and_friendly_errors() {
 }
 
 #[tokio::test]
+async fn over_cap_retry_after_returns_the_original_http_failure() {
+    let (url, server) = server(
+        429,
+        "Content-Type: application/json\r\nretry-after-ms: 60001\r\nretry-after: 0\r\n",
+        r#"{"error":{"code":"limit","message":"wait"}}"#,
+    );
+    let message = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        request(ApiKind::OpenAiCompletions, url, None),
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+    let failure = message.failure.as_ref().unwrap();
+    assert_eq!(failure.status, Some(429));
+    assert_eq!(failure.retry_after_ms, Some(60001));
+    assert_eq!(failure.code.as_deref(), Some("limit"));
+}
+
+#[tokio::test]
 async fn sse_errors_preserve_codes_including_codex_interception() {
     for (api, event) in [
         (

@@ -37,7 +37,7 @@ const MAX_SERVER_DELAY: Duration = Duration::from_secs(60);
 /// status and body into its own error message. Connection errors after the last retry
 /// are returned as strings; cancellation as `ABORTED`. A server-requested
 /// delay above 60 seconds returns the response without sleeping, preserving its failure metadata.
-pub(crate) async fn send_with_retry(
+async fn send_with_retry(
     request: impl Fn() -> RequestBuilder,
     cancel: &CancellationToken,
 ) -> Result<Response, String> {
@@ -52,15 +52,9 @@ pub(crate) async fn send_with_retry(
             Ok(response) if response.status().is_success() => false,
             Ok(response) => {
                 let status = response.status();
-                let should_retry = response
-                    .headers()
-                    .get("x-should-retry")
-                    .and_then(|value| value.to_str().ok());
-                match should_retry {
-                    Some("true") => true,
-                    Some("false") => false,
-                    _ => matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error(),
-                }
+                should_retry(response.headers()).unwrap_or_else(|| {
+                    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
+                })
             }
             Err(error) => error.is_connect() || error.is_timeout() || error.is_request(),
         };
@@ -91,23 +85,17 @@ pub(crate) async fn send_with_retry(
     }
 }
 
-/// A request ready to send: the provider's rewrite has run and the body is serialized.
-pub(crate) struct Prepared {
-    pub url: String,
-    pub headers: HeaderMap,
-    pub body: bytes::Bytes,
-}
-
-/// Runs the provider's rewrite (once per request, before any retry) and serializes the
-/// body. A failed or cancelled rewrite sends nothing; a failed rewrite's typed failure
-/// (e.g. an unavailable extension provider) lands on `reply` before the error is erased.
-pub(crate) async fn prepare(
+/// Rewrite once, send with transport retry, and capture failure metadata before
+/// formatting an unsuccessful response. A failed or cancelled rewrite sends nothing.
+pub(crate) async fn dispatch(
+    http: &reqwest::Client,
     rewrite: Option<&dyn RequestRewrite>,
     model: &Model,
     request: ProviderRequest,
     cancel: &CancellationToken,
     reply: &mut Reply,
-) -> Result<Prepared, String> {
+    describe: impl FnOnce(u16, &str, Option<&serde_json::Value>) -> String,
+) -> Result<Response, String> {
     let request = match rewrite {
         None => request,
         Some(rewrite) => tokio::select! {
@@ -121,21 +109,13 @@ pub(crate) async fn prepare(
             })?,
         },
     };
-    Ok(Prepared {
-        body: request.body.to_string().into(),
-        url: request.url,
-        headers: request.headers,
-    })
-}
-
-/// Send and capture failure metadata before each adapter formats its own error.
-pub(crate) async fn send(
-    build: impl Fn() -> RequestBuilder,
-    cancel: &CancellationToken,
-    reply: &mut Reply,
-    describe: impl FnOnce(u16, &str, Option<&serde_json::Value>) -> String,
-) -> Result<Response, String> {
-    let response = send_with_retry(build, cancel).await?;
+    let ProviderRequest { url, headers, body } = request;
+    let body: bytes::Bytes = body.to_string().into();
+    let response = send_with_retry(
+        || http.post(&url).headers(headers.clone()).body(body.clone()),
+        cancel,
+    )
+    .await?;
     if response.status().is_success() {
         return Ok(response);
     }
@@ -186,7 +166,7 @@ pub(crate) async fn read_sse(
 
 /// The body of an unsuccessful response, or `None` when `cancel` fires first: the shared
 /// client has no global timeout, so an error body that never finishes must not pin a request.
-pub(crate) async fn error_body(response: Response, cancel: &CancellationToken) -> Option<String> {
+async fn error_body(response: Response, cancel: &CancellationToken) -> Option<String> {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
@@ -196,7 +176,7 @@ pub(crate) async fn error_body(response: Response, cancel: &CancellationToken) -
 
 /// Seconds (≥ 0) from `retry-after-ms`, else `retry-after` as seconds or an HTTP date.
 /// Kept as `f64` so the caller checks the cap before converting to a `Duration`.
-pub(crate) fn server_delay(headers: &HeaderMap) -> Option<f64> {
+fn server_delay(headers: &HeaderMap) -> Option<f64> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     if let Some(ms) = header("retry-after-ms").and_then(|value| value.trim().parse::<f64>().ok())
         && ms.is_finite()
@@ -217,22 +197,22 @@ pub(crate) fn server_delay(headers: &HeaderMap) -> Option<f64> {
     }
 }
 
+fn should_retry(headers: &HeaderMap) -> Option<bool> {
+    match headers.get("x-should-retry")?.to_str().ok()? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Capture only classification metadata, never authentication or request headers.
-pub(crate) fn response_failure(response: &Response) -> crate::ProviderFailure {
+fn response_failure(response: &Response) -> crate::ProviderFailure {
     crate::ProviderFailure {
         status: Some(response.status().as_u16()),
         code: None,
         retry_after_ms: server_delay(response.headers())
             .map(|seconds| (seconds * 1000.0).ceil() as u64),
-        should_retry: response
-            .headers()
-            .get("x-should-retry")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| match value {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            }),
+        should_retry: should_retry(response.headers()),
     }
 }
 
@@ -277,4 +257,48 @@ pub(crate) fn record_failure(output: &mut crate::AssistantMessage, body: &serde_
 fn backoff(retry_index: u32) -> Duration {
     let seconds = (0.5 * 2f64.powi(retry_index.min(16) as i32)).min(8.0);
     Duration::from_secs_f64(seconds * (1.0 - rand::random::<f64>() * 0.25))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::pin::pin;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_incomplete_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            crate::testing::read_http_request_parts(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nx")
+                .unwrap();
+            let _ = hold.blocking_recv();
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client().post(url).json(&serde_json::json!({})).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        let cancel = CancellationToken::new();
+        let mut body = pin!(error_body(response, &cancel));
+        assert!(futures::poll!(body.as_mut()).is_pending());
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), body)
+                .await
+                .unwrap(),
+            None
+        );
+        drop(release);
+        server.join().unwrap();
+    }
 }

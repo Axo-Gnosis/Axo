@@ -19,7 +19,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{prepare, read_sse, send};
+use crate::api::http::{dispatch, read_sse};
 use crate::api::sse::SseEvent;
 use crate::api::{
     ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
@@ -1155,20 +1155,11 @@ impl Response {
             headers,
             body: params,
         };
-        let prepared = prepare(
+        let response = dispatch(
+            http,
             opts.rewrite.as_deref(),
             &self.model,
             request,
-            cancel,
-            &mut self.reply,
-        )
-        .await?;
-        let response = send(
-            || {
-                http.post(&prepared.url)
-                    .headers(prepared.headers.clone())
-                    .body(prepared.body.clone())
-            },
             cancel,
             &mut self.reply,
             http_error_message,

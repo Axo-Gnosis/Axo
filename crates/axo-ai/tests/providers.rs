@@ -170,6 +170,56 @@ impl RequestRewrite for ScriptedRewrite {
     }
 }
 
+#[tokio::test]
+async fn rewrite_runs_once_across_http_retry() {
+    struct CountingRewrite(AtomicUsize);
+
+    #[async_trait]
+    impl RequestRewrite for CountingRewrite {
+        async fn rewrite(
+            &self,
+            model: &Model,
+            request: ProviderRequest,
+        ) -> Result<ProviderRequest, Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ScriptedRewrite.rewrite(model, request).await
+        }
+    }
+
+    let stop = r#"{"error":{"message":"stop"}}"#;
+    let (url, server) = serve_http([
+        "HTTP/1.1 429 Too Many Requests\r\nretry-after-ms: 0\r\nx-should-retry: False\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{stop}", stop.len()),
+    ].into_iter());
+    let dir = tempfile::tempdir().unwrap();
+    let (models, _) = load(&dir).await;
+    let model = model("scripted", "only", ApiKind::OpenAiCompletions, &url);
+    let rewrite = Arc::new(CountingRewrite(AtomicUsize::new(0)));
+    models
+        .register(
+            "host",
+            Provider {
+                rewrite: Some(rewrite.clone()),
+                ..provider("scripted", vec![model.clone()])
+            },
+        )
+        .unwrap();
+
+    assert_server_error("scripted/only", stream(&models, &model).await);
+    assert_eq!(rewrite.0.load(Ordering::SeqCst), 1);
+    let requests = server.join().unwrap();
+    let [(first, body), (second, retried)] = requests.as_slice() else {
+        panic!("expected two captures, got {requests:?}");
+    };
+    assert!(first.starts_with("POST /rewritten "));
+    assert_eq!(first.lines().next(), second.lines().next());
+    for head in [first, second] {
+        assert_eq!(http_header_values(head, "x-rewritten").next(), Some("yes"));
+    }
+    assert_eq!(body["rewritten"], true);
+    assert_eq!(body, retried);
+}
+
 #[derive(Default)]
 struct ScriptedInteraction {
     events: Mutex<Vec<String>>,
@@ -395,7 +445,10 @@ async fn config_base_url_beats_the_credential() {
     );
 }
 
-struct FailingRewrite;
+enum FailingRewrite {
+    Auth,
+    Unavailable,
+}
 
 #[async_trait]
 impl RequestRewrite for FailingRewrite {
@@ -404,7 +457,13 @@ impl RequestRewrite for FailingRewrite {
         _model: &Model,
         _request: ProviderRequest,
     ) -> Result<ProviderRequest, Error> {
-        Err(Error::Auth("extension scripted is unavailable".into()))
+        Err(match self {
+            Self::Auth => Error::Auth("extension scripted is unavailable".into()),
+            Self::Unavailable => Error::ProviderUnavailable {
+                provider: "scripted".into(),
+                reason: "rewrite refused".into(),
+            },
+        })
     }
 }
 
@@ -416,30 +475,39 @@ async fn failed_rewrite_ends_the_stream_without_sending() {
     let dir = tempfile::tempdir().unwrap();
     let (models, _) = load(&dir).await;
     let model = model("scripted", "only", ApiKind::OpenAiCompletions, &url);
-    models
-        .register(
-            "host",
-            Provider {
-                rewrite: Some(Arc::new(FailingRewrite)),
-                ..provider("scripted", vec![model.clone()])
-            },
-        )
-        .unwrap();
+    for rewrite in [FailingRewrite::Auth, FailingRewrite::Unavailable] {
+        let typed = matches!(rewrite, FailingRewrite::Unavailable);
+        models
+            .register(
+                "host",
+                Provider {
+                    rewrite: Some(Arc::new(rewrite)),
+                    ..provider("scripted", vec![model.clone()])
+                },
+            )
+            .unwrap();
 
-    match stream(&models, &model).await {
-        AssistantEvent::Error { message, .. } => assert!(
-            message
-                .error_message
-                .as_deref()
-                .unwrap()
-                .contains("extension scripted is unavailable")
-        ),
-        event => panic!("not an error: {event:?}"),
+        let event = stream(&models, &model).await;
+        if typed {
+            assert_unavailable(event, "rewrite refused");
+        } else {
+            let AssistantEvent::Error { message, .. } = event else {
+                panic!("not an error: {event:?}");
+            };
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("extension scripted is unavailable")
+            );
+            assert!(message.failure.is_none());
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
 }
 
 #[tokio::test]
@@ -712,7 +780,7 @@ async fn unavailable_layer_provider_stays_selectable_and_fails_before_auth() {
             Provider {
                 requires_key: true,
                 login: Some(Arc::new(UnreachableLogin)),
-                rewrite: Some(Arc::new(FailingRewrite)),
+                rewrite: Some(Arc::new(FailingRewrite::Auth)),
                 ..provider("lab", vec![lab.clone()])
             },
             Some(reason.into()),
@@ -945,7 +1013,7 @@ async fn keyless_codex_rewrite_reaches_http() {
             "host",
             Provider {
                 requires_key: true,
-                rewrite: Some(Arc::new(FailingRewrite)),
+                rewrite: Some(Arc::new(FailingRewrite::Auth)),
                 ..provider("lab", vec![model.clone()])
             },
         )
