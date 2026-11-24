@@ -277,12 +277,7 @@ async fn removal_and_shutdown(bun: &Path, mode: Supervision) {
     assert!(host.extensions.collisions().contains(&shadowed));
     let mut announced = false;
     while let Ok(event) = events.try_recv() {
-        announced |= event
-            == ExtensionEvent::Shadowed {
-                provider: shadowed.provider.clone(),
-                winner: shadowed.winner.clone(),
-                hidden: shadowed.hidden.clone(),
-            };
+        announced |= event == ExtensionEvent::Shadowed(shadowed.clone());
     }
     assert!(announced, "no Shadowed event for lab");
     assert_ne!(host.models.find("lab/m").unwrap(), native);

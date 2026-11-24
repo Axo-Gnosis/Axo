@@ -228,13 +228,8 @@ async fn last_enabled_wins_and_collisions_are_reported() {
     );
     let mut shadowed = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let ExtensionEvent::Shadowed {
-            provider,
-            winner,
-            hidden,
-        } = event
-        {
-            shadowed.push(collision(&provider, &winner, hidden));
+        if let ExtensionEvent::Shadowed(collision) = event {
+            shadowed.push(collision);
         }
     }
     assert_eq!(

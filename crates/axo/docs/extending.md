@@ -866,7 +866,7 @@ tokio::spawn(async move {
     loop {
         match events.recv().await {
             Ok(ExtensionEvent::StateChanged(status)) => { /* id, group, generation, phase, problem */ }
-            Ok(ExtensionEvent::Shadowed { provider, winner, hidden }) => {}
+            Ok(ExtensionEvent::Shadowed(collision)) => {}
             Ok(ExtensionEvent::Diagnostic(diagnostic)) => {}
             Ok(ExtensionEvent::SessionDiagnostic { session, message }) => {}
             // Missed events: reread the snapshots, including session_diagnostics(id).
@@ -1107,6 +1107,8 @@ A single file built with `bun build --target=bun --outfile=<package>/index.js <s
 ### Winners, collisions and unavailability
 
 For each provider ID the **last enabled extension declaring it wins**. The manager owns one `ProviderLayer`, newer than any created before it, so a winning extension provider hides a `Models::register` provider and the loaded catalog provider of the same ID (and older layers). Hidden providers are untouched and reappear exactly when the winner goes away: removing the extension from the list, a changed valid declaration, a reorder, or `shutdown`. A failing or crashed winner stays the winner; the hidden provider is never used as a fallback.
+
+When a collision is newly reported, `ExtensionEvent::Shadowed` carries the same `ProviderCollision` record as the collision snapshot.
 
 `ProviderInfo::origin` identifies the winning contributor as `ProviderOrigin::Layer`, `Registered`, or `Loaded`. For a `Layer` provider in a scoped model view, look in the scope’s `providers()` first, then the root manager’s; scope layers win over base layers. A layered provider in neither list belongs to a host-owned `ProviderLayer`.
 

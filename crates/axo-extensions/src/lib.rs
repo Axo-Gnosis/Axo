@@ -218,11 +218,7 @@ pub struct ExtensionDiagnostic {
 pub enum ExtensionEvent {
     StateChanged(ExtensionStatus),
     /// Emitted only by `configure`, `retry` and `reload`; see [`ProviderCollision`].
-    Shadowed {
-        provider: String,
-        winner: String,
-        hidden: Hidden,
-    },
+    Shadowed(ProviderCollision),
     Diagnostic(ExtensionDiagnostic),
     /// A composition finding for one attached session; see `ExtensionSet::session_diagnostics`.
     SessionDiagnostic {
@@ -1674,11 +1670,9 @@ impl Inner {
             }
             for collision in &state.collisions {
                 if !old_collisions.contains(collision) {
-                    let _ = self.events.send(ExtensionEvent::Shadowed {
-                        provider: collision.provider.clone(),
-                        winner: collision.winner.clone(),
-                        hidden: collision.hidden.clone(),
-                    });
+                    let _ = self
+                        .events
+                        .send(ExtensionEvent::Shadowed(collision.clone()));
                 }
             }
             for diagnostic in &state.diagnostics {
