@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use axo_extensions::{BridgeError, ExtensionPhase, InstallError, ProblemKind};
+use axo_extensions::{BridgeError, ExtensionPhase, Extensions, InstallError, ProblemKind};
 use serde_json::json;
 
 use super::{
@@ -515,16 +515,11 @@ async fn install_refusals() {
         } else {
             options.data_root = relative.clone();
         }
-        let manager = host.manager_with(options);
-        let expected = InstallError::InvalidOptions(format!(
-            "invalid extension options: {name} {} is not an absolute path",
-            relative.display()
+        let expected = format!("{name} {} is not an absolute path", relative.display());
+        assert!(matches!(
+            Extensions::new(host.axo.clone(), options),
+            Err(BridgeError::InvalidOptions(message)) if message == expected
         ));
-        assert_eq!(manager.installed().await.unwrap_err(), expected);
-        assert_eq!(
-            manager.uninstall(INSTALLED, true).await.unwrap_err(),
-            expected
-        );
         assert!(!relative.exists());
     }
 

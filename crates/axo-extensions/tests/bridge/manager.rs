@@ -1,12 +1,12 @@
 //! Configuration, discovery and winner publication through the public `Extensions` API.
 //! Nothing here needs a runner to start; most cases run with Bun absent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axo_ai::{Error, Models};
 use axo_extensions::{
-    BridgeError, ExtensionEvent, ExtensionPhase, ExtensionProvider, Hidden, ProblemKind,
-    ProviderCollision, ProviderOrigin, inspect_package,
+    BridgeError, ExtensionEvent, ExtensionPhase, ExtensionProvider, Extensions, Hidden,
+    ProblemKind, ProviderCollision, ProviderOrigin, inspect_package,
 };
 
 use super::{
@@ -108,14 +108,26 @@ async fn absent_bun_keeps_claims_names_the_extension_and_spares_natives() {
     extensions.configure(&list).await.unwrap();
     let status = phase(&extensions, "lab-provider");
     assert_eq!(status.problem.map(|p| p.kind), Some(ProblemKind::Bun));
+    let executable = std::env::current_exe().unwrap();
+    let mut relative = std::env::current_dir()
+        .unwrap()
+        .strip_prefix("/")
+        .unwrap()
+        .components()
+        .map(|_| "..")
+        .collect::<PathBuf>();
+    relative.push(executable.strip_prefix("/").unwrap());
+    assert!(relative.is_relative() && relative.is_file());
+    let expected = format!("bun {} is not an absolute path", relative.display());
     assert!(matches!(
-        extensions.set_bun(Some("relative".into())).await,
-        Err(BridgeError::InvalidOptions(_))
+        Extensions::new(host.axo.clone(), host.options_with(Some(relative.clone()))),
+        Err(BridgeError::InvalidOptions(message)) if message == expected
     ));
-    extensions
-        .set_bun(Some(std::env::current_exe().unwrap()))
-        .await
-        .unwrap();
+    assert!(matches!(
+        extensions.set_bun(Some(relative)).await,
+        Err(BridgeError::InvalidOptions(message)) if message == expected
+    ));
+    extensions.set_bun(Some(executable)).await.unwrap();
     let status = phase(&extensions, "lab-provider");
     assert_eq!((status.phase, status.problem), (ExtensionPhase::Cold, None));
     extensions.shutdown().await;
@@ -158,10 +170,9 @@ async fn invalid_input_changes_nothing() {
     // Relative host paths are invalid options.
     let mut options = host.options_with(None);
     options.roots = vec!["relative".into()];
-    let other = host.manager_with(options);
     assert!(matches!(
-        other.configure(&enabled(&[("beta", None)])).await,
-        Err(BridgeError::InvalidOptions(_))
+        Extensions::new(host.axo.clone(), options),
+        Err(BridgeError::InvalidOptions(message)) if message == "root relative is not an absolute path"
     ));
     assert!(find(&host.models, "pb").is_none());
     assert!(matches!(

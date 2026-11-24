@@ -478,11 +478,12 @@ struct Binding {
 }
 
 impl Extensions {
-    /// Creates the root manager without performing I/O.
-    pub fn new(axo: Arc<Axo>, options: ExtensionOptions) -> Self {
+    /// Validates absolute paths and creates the root manager without performing I/O.
+    pub fn new(axo: Arc<Axo>, mut options: ExtensionOptions) -> Result<Self, BridgeError> {
+        validate_options(&options)?;
         let models = Arc::clone(axo.models());
-        let bun = BunPath::new(options.bun.clone());
-        Self(ExtensionSet {
+        let bun = BunPath::new(options.bun.take());
+        Ok(Self(ExtensionSet {
             inner: Inner::new(
                 axo,
                 models,
@@ -494,7 +495,7 @@ impl Extensions {
                     lifecycle: Mutex::default(),
                 },
             ),
-        })
+        }))
     }
 
     /// Creates an isolated [`ExtensionScope`] backed by this manager (for example, one
@@ -917,7 +918,6 @@ impl Inner {
     /// Validates `enabled` and reconciles this unit to it.
     async fn configure(self: &Arc<Self>, enabled: &[EnabledExtension]) -> Result<(), BridgeError> {
         EnabledExtension::validate_all(enabled)?;
-        validate_options(&self.options)?;
         run(Arc::clone(self).reconcile(Some(enabled.to_vec()), None))
             .await
             .unwrap_or(Err(BridgeError::ShutDown))

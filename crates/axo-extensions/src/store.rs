@@ -70,8 +70,6 @@ impl InstalledExtension {
 pub enum InstallError {
     #[error("no extension store configured")]
     NoStore,
-    #[error("{0}")]
-    InvalidOptions(String),
     /// Bun is missing or not executable.
     #[error("{0}")]
     Bun(String),
@@ -263,8 +261,6 @@ fn stage(
 
 impl Inner {
     fn store(&self) -> Result<&Path, InstallError> {
-        crate::validate_options(&self.options)
-            .map_err(|e| InstallError::InvalidOptions(e.to_string()))?;
         self.options.store.as_deref().ok_or(InstallError::NoStore)
     }
 

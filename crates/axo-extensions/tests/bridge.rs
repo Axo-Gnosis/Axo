@@ -240,7 +240,7 @@ impl Host {
     }
 
     pub fn manager_with(&self, options: ExtensionOptions) -> Extensions {
-        Extensions::new(self.axo.clone(), options)
+        Extensions::new(self.axo.clone(), options).expect("valid test extension options")
     }
 
     /// Writes `<root>/<id>/extension.json` and its entry; `providers` are

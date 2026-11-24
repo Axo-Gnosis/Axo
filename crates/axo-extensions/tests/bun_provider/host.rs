@@ -257,18 +257,21 @@ impl Host {
                 .streamer(streamer);
         }
         let axo = Arc::new(builder.build());
-        let extensions = Arc::new(Extensions::new(
-            axo.clone(),
-            ExtensionOptions {
-                bun: Some(bun.to_path_buf()),
-                roots: vec![temp.path().join("root")],
-                data_root: temp.path().join("data"),
-                runtime_dir: temp.path().join("runtime"),
-                env: Arc::new(runner_env(temp.path(), &server.url, detach)),
-                store: Some(temp.path().join("store")),
-                auto_install: true,
-            },
-        ));
+        let extensions = Arc::new(
+            Extensions::new(
+                axo.clone(),
+                ExtensionOptions {
+                    bun: Some(bun.to_path_buf()),
+                    roots: vec![temp.path().join("root")],
+                    data_root: temp.path().join("data"),
+                    runtime_dir: temp.path().join("runtime"),
+                    env: Arc::new(runner_env(temp.path(), &server.url, detach)),
+                    store: Some(temp.path().join("store")),
+                    auto_install: true,
+                },
+            )
+            .expect("valid test extension options"),
+        );
         let lifecycle = Arc::new(TestLifecycle {
             axo: axo.clone(),
             extensions: Arc::downgrade(&extensions),

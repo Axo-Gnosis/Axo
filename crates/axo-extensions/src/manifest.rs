@@ -249,8 +249,6 @@ pub async fn inspect(
     options: &ExtensionOptions,
 ) -> Result<ExtensionPackage, ExtensionProblem> {
     validate_id(id).map_err(|error| problem(ProblemKind::Invalid, error))?;
-    crate::validate_options(options)
-        .map_err(|error| problem(ProblemKind::Setup, error.to_string()))?;
     discover(id, options).await.map(Into::into)
 }
 

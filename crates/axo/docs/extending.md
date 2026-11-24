@@ -787,7 +787,7 @@ Trusted TypeScript/JavaScript packages can contribute providers, tools, policies
 
 ### Host setup and lifecycle
 
-`Extensions::new(axo, options)` takes the host's `Arc<Axo>` and `ExtensionOptions`. Runners use that host's model registry and process supervisor. Construction does no I/O. This example uses the same `ConfigSource` pattern as the [Rust host example](#building-axo-and-running-a-session).
+`Extensions::new(axo, options)` takes the host's `Arc<Axo>` and `ExtensionOptions`. Runners use that host's model registry and process supervisor. Construction rejects relative paths with `BridgeError::InvalidOptions` and does no I/O. This example uses the same `ConfigSource` pattern as the [Rust host example](#building-axo-and-running-a-session).
 
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -844,7 +844,7 @@ let extensions = Extensions::new(
             (OsString::from("HOME"), state.join("extension-home").into_os_string()),
         ])),
     },
-);
+)?;
 
 // Subscribe first so the initial reconciliation's events are seen.
 let mut events = extensions.subscribe();
@@ -890,7 +890,8 @@ Both `Extensions` and `ExtensionScope` dereference to the same `ExtensionSet` AP
 | Item | Signature | Behavior |
 | :--- | :--- | :--- |
 | `ExtensionOptions` | `bun: Option<PathBuf>`, `roots: Vec<PathBuf>`, `data_root: PathBuf`, `runtime_dir: PathBuf`, `env: Arc<EnvMap>`, `store: Option<PathBuf>`, `auto_install: bool` | Host choices, all absolute paths. Package roots are searched in order for authored extensions; `store` holds installed ones (`None` leaves every `publisher/name` extension `Unavailable` and fails every install call); `ExtensionOptions::data_dir(id)` names each extension's data directory: `<data_root>/<id>` for an authored extension, `<data_root>/@installed/<publisher>/<name>` for an installed one (`@` cannot start an ID, so neither nests inside the other); each runner generation gets a private directory under `runtime_dir`; `env` is the runner's complete environment (plus the bridge's own variables), and also the environment of every `bun install`. `auto_install` lets axo install authored dependencies on its own. Nothing is discovered from the working directory, `PATH`, project layers, or home directories. `bun` is the initial executable; change it with `set_bun`. To change other options, build a new manager and `shutdown` the old one |
-| `ExtensionSet::configure` | `async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError>` | Validates options and the enabled list, rescans packages, replaces the provider layer, and reapplies the session layer to attached root sessions when the declared contributions changed. Does not eagerly start runners. Package failures go to `status`; invalid host inputs return a [`BridgeError`](#bridgeerror) without changing the configuration. Call it after list or manifest changes; use `reload` for code-only changes. Serialized with `retry`, `reload` and `shutdown`, and completed even if the caller's future is dropped |
+| `Extensions::new` | `fn new(axo: Arc<Axo>, options: ExtensionOptions) -> Result<Extensions, BridgeError>` | Validates absolute paths without performing I/O. An absolute but unusable Bun remains a recoverable `ProblemKind::Bun` at runtime |
+| `ExtensionSet::configure` | `async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError>` | Validates the enabled list, rescans packages, replaces the provider layer, and reapplies the session layer to attached root sessions when the declared contributions changed. Does not eagerly start runners. Package failures go to `status`; invalid host inputs return a [`BridgeError`](#bridgeerror) without changing the configuration. Call it after list or manifest changes; use `reload` for code-only changes. Serialized with `retry`, `reload` and `shutdown`, and completed even if the caller's future is dropped |
 | `ExtensionSet::status` | `fn status(&self) -> Vec<ExtensionStatus>` | One `ExtensionStatus { id, group, generation, phase, problem }` per enabled extension, in enabled order, including shadowed ones. `problem: Option<ExtensionProblem>` is set for `Disabled`, `Unavailable`, and `Restarting`; branch on its `kind`, display its human-readable `message` |
 | `ExtensionSet::collisions` | `fn collisions(&self) -> Vec<ProviderCollision>` | Every `ProviderCollision { provider, winner, hidden }`: `winner` is an extension ID; `hidden` is `Hidden::Extension(id)` for a shadowed extension or `Hidden::Host(ProviderOrigin)` for a host contributor: `Layer` (an older provider layer), `Registered` (a `Models::register` provider), or `Loaded` (the loaded catalog). A snapshot from the last `configure`, `retry` or `reload`; later registry changes and newer provider layers are not reflected until the next one |
 | `ExtensionSet::diagnostics` | `fn diagnostics(&self) -> Vec<ExtensionDiagnostic>` | Non-fatal discovery findings and scheme or section collisions between extensions, each with the extension ID and message |
@@ -1077,7 +1078,7 @@ An interrupted uninstall can leave a `.remove-<name>` or `.purge-<name>` tombsto
 | Variant | When |
 | :--- | :--- |
 | `InvalidConfig` | The enabled list is invalid |
-| `InvalidOptions` | A `bun`, root, `store`, `data_root`, or `runtime_dir` path is relative (`invalid extension options: <name> <path> is not an absolute path`) |
+| `InvalidOptions` | Construction receives a relative `bun`, root, `store`, `data_root`, or `runtime_dir` path (`invalid extension options: <name> <path> is not an absolute path`); `scope` rejects invalid or duplicate keys, and `set_bun` rejects a relative path |
 | `ShutDown` | The manager is closed |
 | `UnknownExtension` | The ID is not enabled |
 | `InstalledDependencies` | `install_dependencies` was called for an enabled installed (`publisher/name`) extension; `install` manages its dependencies |
@@ -1089,7 +1090,6 @@ An interrupted uninstall can leave a `.remove-<name>` or `.purge-<name>` tombsto
 | `InstallError` | When |
 | :--- | :--- |
 | `NoStore` | `ExtensionOptions::store` is `None` |
-| `InvalidOptions` | An `ExtensionOptions` path is relative; checked before any store I/O, including for `installed()` |
 | `Bun` | Bun is missing or not executable. Every install needs a usable Bun, even without dependencies; Bun is checked before the manifest |
 | `Busy` | Another install, rollback or uninstall of that extension is running |
 | `InvalidPackage` | Unreadable or invalid manifest, an ID that is not `publisher/name`, no `sdk`, an invalid entry, an unsupported file type, a relative `source`, or a `source` overlapping the store destination |
