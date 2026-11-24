@@ -1,10 +1,11 @@
 //! A deterministic [`Streamer`] that replays scripted turns, for tests.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -21,18 +22,37 @@ use crate::types::{
 
 /// A keyless model with stable limits for deterministic scripted sessions.
 pub fn scripted_model() -> Model {
+    fixture_model(
+        "scripted",
+        "scripted-model",
+        "Scripted",
+        ApiKind::AnthropicMessages,
+        String::new(),
+        100_000,
+    )
+}
+
+/// Shared model defaults for scripted sessions and HTTP adapter fixtures.
+pub fn fixture_model(
+    provider: &str,
+    id: &str,
+    name: &str,
+    api: ApiKind,
+    base_url: String,
+    context_window: u64,
+) -> Model {
     Model {
-        id: "scripted-model".into(),
-        name: "Scripted".into(),
-        api: ApiKind::AnthropicMessages,
-        provider: "scripted".into(),
-        base_url: String::new(),
+        id: id.into(),
+        name: name.into(),
+        api,
+        provider: provider.into(),
+        base_url,
         reasoning: false,
         thinking_level_map: None,
         input: vec![InputKind::Text],
         cost: Some(Cost::default()),
         service_tiers: Default::default(),
-        context_window: 100_000,
+        context_window,
         max_tokens: 4096,
         compat: Compat::default(),
     }
@@ -142,6 +162,54 @@ pub fn read_http_request_parts(stream: &mut TcpStream) -> (String, serde_json::V
         String::from_utf8(bytes[..head_end].to_vec()).unwrap(),
         serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap(),
     )
+}
+
+/// Serve a finite sequence of complete HTTP responses and capture requests in order.
+pub fn serve_http(
+    responses: impl ExactSizeIterator<Item = String> + Send + 'static,
+) -> (String, JoinHandle<Vec<(String, Value)>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = responses.len();
+    let thread = std::thread::spawn(move || {
+        responses
+            .enumerate()
+            .map(|(index, response)| {
+                let ordinal = index + 1;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "timed out waiting for provider request {ordinal}/{count}"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_http_request_parts(&mut stream);
+                stream.write_all(response.as_bytes()).unwrap();
+                request
+            })
+            .collect()
+    });
+    (url, thread)
+}
+
+/// Iterate over the trimmed values of a header in capture order.
+pub fn http_header_values<'a, 'n>(
+    head: &'a str,
+    name: &'n str,
+) -> impl Iterator<Item = &'a str> + use<'a, 'n> {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(move |(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
 }
 
 impl Streamer for ScriptedApi {

@@ -4,21 +4,19 @@
 //! reserve unavailable providers without running them.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use axo_ai::testing::read_http_request_parts;
+use axo_ai::testing::{fixture_model, http_header_values, serve_http};
 use axo_ai::{
-    ApiKind, AssistantEvent, Compat, Cost, Credential, CredentialSource, CredentialStore,
-    DeviceCode, Error, FileCredentialStore, InputKind, LoginInteraction, LoginPrompt, LoginSelect,
-    Message, Model, Models, ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderOrigin,
-    ProviderRequest, RequestRewrite, ServiceTier, SimpleStreamOptions, Streamer, SystemMessage,
-    TextBlock, Transcript, is_retryable_error, now_ms,
+    ApiKind, AssistantEvent, Credential, CredentialSource, CredentialStore, DeviceCode, Error,
+    FileCredentialStore, LoginInteraction, LoginPrompt, LoginSelect, Message, Model, Models,
+    ModelsConfig, ModelsOptions, Provider, ProviderLogin, ProviderOrigin, ProviderRequest,
+    RequestRewrite, ServiceTier, SimpleStreamOptions, Streamer, SystemMessage, TextBlock,
+    Transcript, is_retryable_error, now_ms,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -27,39 +25,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Answers `count` connections in turn with a 400 and returns each request's head and body.
 fn server(count: usize) -> (String, JoinHandle<Vec<(String, Value)>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
     let body = r#"{"error":{"message":"stop"}}"#;
     let response = format!(
         "HTTP/1.1 400 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let thread = std::thread::spawn(move || {
-        (1..=count)
-            .map(|ordinal| {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "timed out waiting for provider request {ordinal}/{count}"
-                            );
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("accept failed: {error}"),
-                    }
-                };
-                stream.set_nonblocking(false).unwrap();
-                let request = read_http_request_parts(&mut stream);
-                stream.write_all(response.as_bytes()).unwrap();
-                request
-            })
-            .collect()
-    });
-    (url, thread)
+    serve_http(std::iter::repeat_n(response, count))
 }
 
 fn assert_server_error(id: &str, event: AssistantEvent) {
@@ -72,21 +43,7 @@ fn assert_server_error(id: &str, event: AssistantEvent) {
 }
 
 fn model(provider: &str, id: &str, api: ApiKind, base_url: &str) -> Model {
-    Model {
-        id: id.into(),
-        name: id.into(),
-        api,
-        provider: provider.into(),
-        base_url: base_url.into(),
-        reasoning: false,
-        thinking_level_map: None,
-        input: vec![InputKind::Text],
-        cost: Some(Cost::default()),
-        service_tiers: Default::default(),
-        context_window: 200_000,
-        max_tokens: 4096,
-        compat: Compat::default(),
-    }
+    fixture_model(provider, id, id, api, base_url.into(), 200_000)
 }
 
 fn provider(id: &str, models: Vec<Model>) -> Provider {
@@ -135,13 +92,6 @@ async fn stream_events(models: &Models, model: &Model) -> Vec<AssistantEvent> {
     )
     .collect()
     .await
-}
-
-fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    head.lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.trim())
 }
 
 fn oauth(access: &str, refresh: &str, expires: i64, tag: &str, base_url: &str) -> Credential {
@@ -316,25 +266,38 @@ async fn scripted_provider_logs_in_refreshes_and_rewrites() {
     let requests = server.join().unwrap();
     for ((head, body), (id, api)) in requests.iter().zip(apis) {
         assert!(head.starts_with("POST /rewritten "), "{id}: {head}");
-        assert_eq!(header(head, "x-rewritten"), Some("yes"), "{id}");
-        assert_eq!(header(head, "x-scripted"), Some("1"), "{id}");
+        assert_eq!(
+            http_header_values(head, "x-rewritten").next(),
+            Some("yes"),
+            "{id}"
+        );
+        assert_eq!(
+            http_header_values(head, "x-scripted").next(),
+            Some("1"),
+            "{id}"
+        );
         assert!(
-            header(head, "x-original-url").is_some_and(|original| original.starts_with(&url)),
+            http_header_values(head, "x-original-url")
+                .next()
+                .is_some_and(|original| original.starts_with(&url)),
             "{id}: {head}"
         );
         assert_eq!(body["rewritten"], true, "{id}");
         assert_eq!(body["model"], id, "{id}");
         if api == ApiKind::AnthropicMessages {
-            assert_eq!(header(head, "x-api-key"), Some("access-1"));
+            assert_eq!(
+                http_header_values(head, "x-api-key").next(),
+                Some("access-1")
+            );
         } else {
             assert_eq!(
-                header(head, "authorization"),
+                http_header_values(head, "authorization").next(),
                 Some("Bearer access-1"),
                 "{id}"
             );
         }
         if api == ApiKind::OpenAiCodexResponses {
-            assert_eq!(header(head, "chatgpt-account-id"), None);
+            assert_eq!(http_header_values(head, "chatgpt-account-id").next(), None);
         }
     }
     assert_eq!(login.refreshes.load(Ordering::SeqCst), 1);
@@ -415,7 +378,7 @@ async fn config_base_url_beats_the_credential() {
     assert_server_error("scripted/only", stream(&models, &model).await);
     let requests = server.join().unwrap();
     assert_eq!(
-        header(&requests[0].0, "authorization"),
+        http_header_values(&requests[0].0, "authorization").next(),
         Some("Bearer access")
     );
 
@@ -972,9 +935,9 @@ async fn keyless_codex_rewrite_reaches_http() {
     let requests = server.join().unwrap();
     let head = &requests[0].0;
     assert!(head.starts_with("POST /rewritten "), "{head}");
-    assert_eq!(header(head, "x-rewritten"), Some("yes"));
-    assert_eq!(header(head, "authorization"), None);
-    assert_eq!(header(head, "chatgpt-account-id"), None);
+    assert_eq!(http_header_values(head, "x-rewritten").next(), Some("yes"));
+    assert_eq!(http_header_values(head, "authorization").next(), None);
+    assert_eq!(http_header_values(head, "chatgpt-account-id").next(), None);
 
     // A required but missing/empty key must fail at setup, before even invoking the rewrite.
     models

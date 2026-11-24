@@ -3,11 +3,11 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::thread::JoinHandle;
 
-use axo_ai::testing::read_http_request_parts;
+use axo_ai::testing::{fixture_model, http_header_values, read_http_request_parts, serve_http};
 use axo_ai::{
-    AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, Compat, CompletionsApi,
-    Cost, InputKind, Message, Model, ModelAuth, ServiceTier, SimpleStreamOptions, StreamOptions,
-    SystemMessage, TextBlock, ToolChoice, ToolSpec, Transcript,
+    AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CodexApi, CompletionsApi,
+    Message, Model, ModelAuth, ServiceTier, SimpleStreamOptions, StreamOptions, SystemMessage,
+    TextBlock, ToolChoice, ToolSpec, Transcript,
 };
 use base64::Engine;
 use futures::StreamExt;
@@ -15,38 +15,16 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 // One finite request: connection-close avoids a server task surviving a failed assertion.
-fn server(status: u16, headers: &str, body: &str) -> (String, JoinHandle<(String, Value)>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+fn server(status: u16, headers: &str, body: &str) -> (String, JoinHandle<Vec<(String, Value)>>) {
     let response = format!(
         "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
         body.len()
     );
-    let thread = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let request = read_http_request_parts(&mut stream);
-        stream.write_all(response.as_bytes()).unwrap();
-        request
-    });
-    (url, thread)
+    serve_http(std::iter::once(response))
 }
 
 fn model(api: ApiKind, base_url: String) -> Model {
-    Model {
-        id: "test".into(),
-        name: "Test".into(),
-        api,
-        provider: "test".into(),
-        base_url,
-        reasoning: false,
-        thinking_level_map: None,
-        input: vec![InputKind::Text],
-        cost: Some(Cost::default()),
-        service_tiers: Default::default(),
-        context_window: 200_000,
-        max_tokens: 4096,
-        compat: Compat::default(),
-    }
+    fixture_model("test", "test", "Test", api, base_url, 200_000)
 }
 
 async fn request(api: ApiKind, url: String, choice: Option<ToolChoice>) -> AssistantMessage {
@@ -124,7 +102,7 @@ async fn tool_disabling_keeps_definitions_and_supported_wire_fields() {
                 r#"{"error":{"message":"unsupported request"}}"#,
             );
             request(api, url, choice).await;
-            let (_, body) = server.join().unwrap();
+            let (_, body) = server.join().unwrap().pop().unwrap();
             assert!(!body["tools"].as_array().unwrap().is_empty());
             let expected = match choice {
                 Some(ToolChoice::None) => Some("none"),
@@ -244,13 +222,8 @@ async fn codex_account_id_header_comes_from_the_credential_else_the_token() {
             headers,
         )
         .await;
-        let (head, _) = server.join().unwrap();
-        let values: Vec<_> = head
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .filter(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
-            .map(|(_, value)| value.trim())
-            .collect();
+        let (head, _) = server.join().unwrap().pop().unwrap();
+        let values: Vec<_> = http_header_values(&head, "chatgpt-account-id").collect();
         assert_eq!(values, [expected]);
     }
 }
@@ -353,23 +326,21 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
                 ..Default::default()
             };
             let message = request_with(model, options, BTreeMap::new()).await;
-            let (head, body) = server.join().unwrap();
+            let (head, body) = server.join().unwrap().pop().unwrap();
             let fast = chosen == Fast && supported;
             let (field, value) = if anthropic {
-                let beta = head
-                    .lines()
-                    .filter_map(|line| line.split_once(':'))
-                    .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
-                    .map(|(_, value)| value.trim());
+                let mut beta = http_header_values(&head, "anthropic-beta");
                 if let Some(configured) = beta_override {
-                    assert_eq!(beta, configured);
+                    assert_eq!(beta.next(), configured);
+                    assert_eq!(beta.next(), None);
+                } else {
+                    assert_eq!(
+                        beta.any(|values| values
+                            .split(',')
+                            .any(|v| v.trim() == "fast-mode-2026-02-01")),
+                        fast
+                    );
                 }
-                assert_eq!(
-                    beta.is_some_and(|value| value
-                        .split(',')
-                        .any(|v| v.trim() == "fast-mode-2026-02-01")),
-                    fast && beta_override.is_none()
-                );
                 ("speed", fast.then_some("fast"))
             } else {
                 (
