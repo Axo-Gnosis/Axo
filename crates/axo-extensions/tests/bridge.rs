@@ -540,6 +540,10 @@ mod fake {
     /// - `ctl/<ext>/refresh`: `ok` (access `refreshed`) | `hang` | `exit`.
     /// - `ctl/<ext>/rewrite`: `ok` (path `/rewritten`, header `x-rewritten: yes`, body
     ///   `rewritten: true`) | `hang` | `exit` | `fail` (code "failed").
+    /// - `ctl/<ext>/send`: `ok` (head, two Chat Completions body chunks) | `mid-exit` (exits
+    ///   after the first chunk) | `mid-hang` (waits after the first chunk) | `fail`.
+    /// - `ctl/<ext>/listModels`: `ok` (records `auth.apiKey` in `listed-auth`, asks
+    ///   `catalog` for `other`, returns `listed` plus that provider's first row) | `fail`.
     /// - `ctl/<ext>/tool`: `ok` (parented partial update, then echo) | `state` (unparented
     ///   appendCustom and custom, then report the stored value) | `reenter` (runs `/hello`,
     ///   returns `refused` once the host refuses it) | `resolve` (resolve a path only when
@@ -833,6 +837,43 @@ mod fake {
                         .push(json!(["x-rewritten", "yes"]));
                     request["body"]["rewritten"] = true.into();
                     Ok(request)
+                }
+                // A Chat Completions reply in two body chunks; `exit` mid-body with
+                // `mid-exit`, or waits for cancel with `mid-hang`.
+                "send" => {
+                    let head = json!({"status": 200, "headers": [["content-type", "text/event-stream"]]});
+                    self.ask(ext, Some(id), "head", head).await?;
+                    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+                    self.ask(ext, Some(id), "body", json!({"text": chunk}))
+                        .await?;
+                    match script.as_str() {
+                        "mid-exit" => std::process::exit(1),
+                        "mid-hang" => std::future::pending().await,
+                        _ => {}
+                    }
+                    let end = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    self.ask(ext, Some(id), "body", json!({"text": end})).await?;
+                    Ok(Value::Null)
+                }
+                // Lists `listed` plus the first catalog row's id; records whether auth came.
+                "listModels" => {
+                    append(
+                        &self.control.join(ext).join("listed-auth"),
+                        args["auth"]["apiKey"].as_str().unwrap_or("none"),
+                    );
+                    let catalog = self
+                        .ask(ext, Some(id), "catalog", json!({"provider": "other"}))
+                        .await?;
+                    let provider = args["provider"].as_str().unwrap();
+                    let mut model = crate::common::model_json(provider, "http://127.0.0.1:9/v1");
+                    model["id"] = "listed".into();
+                    let mut models = vec![model];
+                    if let Some(row) = catalog.as_array().and_then(|rows| rows.first()) {
+                        let mut copy = row.clone();
+                        copy["provider"] = provider.into();
+                        models.push(copy);
+                    }
+                    Ok(Value::Array(models))
                 }
                 "tool" if script == "resolve" => {
                     let request = json!({"object": "tools", "method": "resolvePath", "args": ["x"]});

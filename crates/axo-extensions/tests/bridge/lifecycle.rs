@@ -32,6 +32,8 @@ pub const CASES: &[Case] = &[
     case!(interrupted_callbacks_send_no_http_and_store_nothing),
     case!(setup_failure_recovers_on_the_next_configure),
     case!(reload_replaces_a_warm_runner),
+    case!(extension_transport_streams_the_response),
+    case!(extension_lists_models_after_login),
 ];
 
 /// A login UI answering prompts with `answer`, or never when `answer` is `None`.
@@ -768,5 +770,97 @@ async fn reload_replaces_a_warm_runner() {
         extensions.reload("nope").await,
         Err(BridgeError::UnknownExtension(_))
     ));
+    extensions.shutdown().await;
+}
+
+/// Writes `lab-provider` with one provider `lab` whose flags are `extra`.
+fn flagged_package(host: &Host, extra: serde_json::Value) {
+    let mut provider = serde_json::json!({
+        "id": "lab",
+        "models": [crate::common::model_json("lab", "http://127.0.0.1:9/v1")],
+        "requiresKey": false,
+    });
+    provider
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let manifest = serde_json::json!({
+        "id": "lab-provider", "entry": "index.ts", "providers": [provider],
+    });
+    host.write_package("root", "lab-provider", &manifest.to_string());
+}
+
+async fn extension_transport_streams_the_response() {
+    let host = Host::new().await;
+    flagged_package(&host, serde_json::json!({"transport": true}));
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[("lab-provider", None)]))
+        .await
+        .unwrap();
+
+    // Head and two body chunks decode as the model's wire; the model's URL is never dialed.
+    let event = request(&host, "lab").await;
+    let AssistantEvent::Done { message, .. } = &event else {
+        panic!("{event:?}");
+    };
+    assert!(
+        matches!(message.content.as_slice(), [axo_ai::AssistantBlock::Text { text, .. }] if text == "ok"),
+        "{message:?}"
+    );
+    assert_eq!(host.calls("lab-provider"), ["activate", "send"]);
+
+    // Cancelling the stream withdraws the call.
+    host.script("lab-provider", "send", "mid-hang");
+    let model = find(&host.models, "lab").unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stopper = cancel.clone();
+    let calls = host.calls("lab-provider").len();
+    let (event, _) = tokio::join!(super::stream_with(&host.models, &model, cancel), async {
+        host.wait_calls("lab-provider", calls + 1).await;
+        stopper.cancel();
+    });
+    assert!(matches!(event, AssistantEvent::Error { .. }), "{event:?}");
+    wait_for("cancel frame", || host.canceled("lab-provider") == ["send"]).await;
+
+    // A runner exit mid-body fails the reply.
+    host.script("lab-provider", "send", "mid-exit");
+    let text = super::error_text(&request(&host, "lab").await);
+    assert!(text.contains("provider unavailable"), "{text}");
+    extensions.shutdown().await;
+}
+
+async fn extension_lists_models_after_login() {
+    let host = Host::new().await;
+    flagged_package(
+        &host,
+        serde_json::json!({"login": true, "listModels": true, "requiresKey": true}),
+    );
+    let extensions = host.manager();
+    extensions
+        .configure(&enabled(&[("lab-provider", None)]))
+        .await
+        .unwrap();
+    let listed = || host.models.find("lab/listed").is_some();
+    let auth = || {
+        std::fs::read_to_string(host.path("ctl").join("lab-provider").join("listed-auth"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    // The manifest list stands in until the first listing, which runs without a credential
+    // and is served its `catalog` call.
+    wait_for("the first listing", listed).await;
+    assert!(find(&host.models, "lab").is_none());
+    assert_eq!(auth(), ["none"]);
+
+    host.models
+        .login("lab", &Ui::new(Some("code")))
+        .await
+        .unwrap();
+    wait_for("the listing after login", || auth().len() == 2).await;
+    assert_eq!(auth()[1], "access-code");
     extensions.shutdown().await;
 }

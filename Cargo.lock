@@ -192,6 +192,7 @@ dependencies = [
  "axo-ai",
  "axo-macros",
  "base64",
+ "bytes",
  "futures",
  "rand",
  "reqwest",

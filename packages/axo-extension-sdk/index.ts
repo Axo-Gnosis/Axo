@@ -22,7 +22,8 @@
 // match both ways:
 // - `providers` is keyed by the provider IDs declared there. A provider declared with
 //   `"login": true` must supply both `login` and `refresh`; `"rewrite": true` requires
-//   `rewrite`. A provider with neither flag may omit its handler entry.
+//   `rewrite`, `"transport": true` requires `send`, `"listModels": true` requires
+//   `listModels`. A provider with none of these flags may omit its handler entry.
 // - `tools`, `schemes` and `commands` are keyed by the declared names, one handler each.
 // - `toolPolicy` is present exactly when the manifest's `"toolPolicy"` lists hooks, and defines
 //   exactly the listed hooks (`"before"`, `"after"`). `spawnHook` and `onEntry` are present
@@ -31,7 +32,7 @@
 
 import type {
   AfterToolCall, AssistantEvent, BeforeToolCall, CompletionDetails, CompletionRequest, CredentialInput, CredentialOutput,
-  DeviceCodeInput, Host, HostErrorCode, HostLifecycle, LoginPromptInput, LoginSelectInput, Model, Models,
+  DeviceCodeInput, Host, HostErrorCode, HostLifecycle, LoginPromptInput, LoginSelectInput, Model, ModelAuth, Models,
   PolicyBlockInput, PolicyOverrideInput, SchemeResolutionInput, SeqEntry, Session, SessionEvent,
   SessionEventKind, SpawnContext, SpawnReplyInput, ToolCall, ToolResultInput, ToolScope, Tools,
   UserBlock, Value,
@@ -91,7 +92,37 @@ interface RewriteHandler {
   rewrite?(model: Readonly<Model>, request: ProviderRequest, signal: AbortSignal): Promise<ProviderRequest>;
 }
 
-export type ProviderHandlers = LoginHandlers & RewriteHandler;
+interface TransportHandler {
+  /**
+   * Sends one attempt of the request axo built (after `rewrite`) and returns the HTTP
+   * response; axo retries retryable statuses as new attempts and decodes the body as the
+   * model's wire. The body must be text (SSE or a JSON error); binary bodies are not
+   * supported. `signal` aborts when axo drops the response.
+   */
+  send?(model: Readonly<Model>, request: ProviderRequest, context: RequestContext, signal: AbortSignal): Promise<Response>;
+}
+
+interface ListModelsHandler {
+  /** The provider's current models, each naming this provider; a rejection keeps the list axo has. */
+  listModels?(request: ModelsRequest, signal: AbortSignal): Promise<Model[]>;
+}
+
+/** What axo knows about a request beyond the request itself. */
+export interface RequestContext {
+  sessionId?: string;
+  /** 0 for the first attempt; axo's retry increments it. */
+  attempt: number;
+}
+
+/** What a model listing receives. */
+export interface ModelsRequest {
+  /** The provider's resolved credential; absent without one. */
+  auth?: ModelAuth;
+  /** The models.dev catalog rows axo maps for `provider`, before `models.jsonc`. */
+  catalog(provider: string): Promise<Model[]>;
+}
+
+export type ProviderHandlers = LoginHandlers & RewriteHandler & TransportHandler & ListModelsHandler;
 
 // ---- Sessions ----
 

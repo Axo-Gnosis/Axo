@@ -62,6 +62,36 @@ pub(crate) fn decode_request(value: Value, label: &str) -> Result<ProviderReques
     let Some(Value::Array(pairs)) = fields.remove("headers") else {
         return Err(bad("headers"));
     };
+    let headers = decode_headers(pairs, &bad)?;
+    let body = fields.remove("body").ok_or_else(|| bad("body"))?;
+    Ok(ProviderRequest { url, headers, body })
+}
+
+/// Checks a transport's response head: `{status, headers: [[name, value]...]}`.
+pub(crate) fn decode_head(value: Value, label: &str) -> Result<(u16, HeaderMap), String> {
+    let bad = |what: &str| format!("{label}: invalid response head ({what})");
+    let Value::Object(mut fields) = value else {
+        return Err(bad("not an object"));
+    };
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "status" | "headers"))
+    {
+        return Err(bad("unknown field"));
+    }
+    let status = fields
+        .remove("status")
+        .and_then(|status| status.as_u64())
+        .filter(|status| (100..=599).contains(status))
+        .ok_or_else(|| bad("status"))?;
+    let Some(Value::Array(pairs)) = fields.remove("headers") else {
+        return Err(bad("headers"));
+    };
+    Ok((status as u16, decode_headers(pairs, &bad)?))
+}
+
+/// `[[name, value]...]` pairs, a value a string or `{"base64": ...}`, kept in order.
+fn decode_headers(pairs: Vec<Value>, bad: &dyn Fn(&str) -> String) -> Result<HeaderMap, String> {
     let mut headers = header_map(pairs.len()).map_err(bad)?;
     for (index, pair) in pairs.into_iter().enumerate() {
         let Value::Array(pair) = pair else {
@@ -88,8 +118,7 @@ pub(crate) fn decode_request(value: Value, label: &str) -> Result<ProviderReques
             HeaderValue::from_bytes(&bytes).map_err(|_| bad(&format!("header {index} value")))?;
         headers.append(name, value);
     }
-    let body = fields.remove("body").ok_or_else(|| bad("body"))?;
-    Ok(ProviderRequest { url, headers, body })
+    Ok(headers)
 }
 
 /// Checks a runner's credential before anything stores or uses it.

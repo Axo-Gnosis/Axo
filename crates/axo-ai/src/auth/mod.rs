@@ -16,10 +16,13 @@ use crate::error::Error;
 /// What auth resolution hands to an adapter: the key (if any), extra headers, and a
 /// base URL override. A stored OAuth credential contributes its access token, `headers`
 /// and `base_url`; `models.jsonc` headers and base URL win over the credential's.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelAuth {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
 

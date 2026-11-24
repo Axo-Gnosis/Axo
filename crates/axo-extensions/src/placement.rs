@@ -514,7 +514,12 @@ impl Shared {
         let providers: Vec<_> = member
             .providers
             .iter()
-            .map(|d| json!({ "id": d.id, "login": d.login, "rewrite": d.rewrite }))
+            .map(|d| {
+                json!({
+                    "id": d.id, "login": d.login, "rewrite": d.rewrite,
+                    "transport": d.transport, "listModels": d.list_models,
+                })
+            })
             .collect();
         let args = json!({
             "entry": entry,

@@ -16,12 +16,14 @@
 //                                              While the socket is blocked an unsent pong is
 //                                              replaced by the newest one; any pong proves liveness.
 // Rust -> runner methods (arguments supplied by the same-build parent):
-//   activate {entry,dataDir,providers:[{id,login,rewrite}],
+//   activate {entry,dataDir,providers:[{id,login,rewrite,transport,listModels}],
 //             session:{tools:[{name,..}],schemes:[{name,..}],commands:[{name,..}],
 //                      toolPolicy:["before"|"after"],spawnHook,events},
 //             methods:{<object>:[<invokable method>]}} -> null
 //   login {provider} -> Credential; refresh {provider,credential} -> Credential;
 //   rewrite {provider,model,request} -> ProviderRequest
+//   send {provider,model,request,context:{sessionId,attempt}} -> null once the body is sent
+//   listModels {provider,auth} -> Model[]
 //   tool {tool,session,invocation,call:{id,name,arguments}} -> {content,details?,isError?,terminate?}
 //   policyBefore {scope,cx:{assistantMessage,toolCall}} -> null | {block:true,reason?,terminate?}
 //   policyAfter {scope,cx:{assistantMessage,toolCall,result}}
@@ -36,6 +38,8 @@
 //   expiresInSeconds?} -> null; prompt {message,placeholder?,secret} -> string;
 //   select {message,options:[{id,label}]} -> string; progress {message} -> null.
 //   under tool: update {content,details?} -> null; invoke {object:"tools",method,args} -> method result.
+//   under send: head {status,headers:[[name,value]]} -> null (once, first); body {text} -> null.
+//   under listModels: catalog {provider} -> Model[].
 // A login replies only after every display/progress callback it made was acknowledged; an
 // error reply to one fails the login. A tool replies only after every update it sent was
 // answered; an error reply to an update is ignored.
@@ -65,9 +69,11 @@ import type {
   HostHandle,
   LoginInteraction,
   Model,
+  ModelAuth,
   ModelsHandle,
   ProviderHandlers,
   ProviderRequest,
+  RequestContext,
   SchemeHandlerContext,
   SchemeHandlers,
   SeqEntry,
@@ -425,6 +431,8 @@ const handlers: Record<string, Handler> = {
   login: providerCall,
   refresh: providerCall,
   rewrite: providerCall,
+  send: providerCall,
+  listModels: providerCall,
   async tool(id, call, raw) {
     const args = raw as ToolRunArgs;
     const handler = extensions.get(call.ext)?.tools.get(args.tool);
@@ -543,7 +551,14 @@ async function schemeCall(_id: string, { ext, method, controller }: Call, raw: u
 async function providerCall(id: string, call: Call, raw: unknown): Promise<unknown> {
   const { ext, method, controller } = call;
   const signal = controller.signal;
-  const args = raw as { provider: string; credential: CredentialOutput; model: Model; request: ProviderRequest };
+  const args = raw as {
+    provider: string;
+    credential: CredentialOutput;
+    model: Model;
+    request: ProviderRequest;
+    context: RequestContext;
+    auth: ModelAuth | null;
+  };
   const handlers = extensions.get(ext)?.providers.get(args.provider);
   switch (method) {
     case "login": {
@@ -558,10 +573,48 @@ async function providerCall(id: string, call: Call, raw: unknown): Promise<unkno
       if (!handlers?.refresh) throw new Fail("unsupported");
       return credential(await handlers.refresh(args.credential, signal));
     }
-    default: {
+    case "rewrite": {
       if (!handlers?.rewrite) throw new Fail("unsupported");
       return request(await handlers.rewrite(freeze(args.model), args.request, signal));
     }
+    case "listModels": {
+      if (!handlers?.listModels) throw new Fail("unsupported");
+      const parent: Parent = { id, signal };
+      const models = await handlers.listModels(
+        {
+          ...(args.auth ? { auth: freeze(args.auth) } : {}),
+          catalog: async (provider: string) => (await callHost(ext, "catalog", { provider }, parent)) as Model[],
+        },
+        signal,
+      );
+      if (!Array.isArray(models)) invalidReply();
+      return models;
+    }
+    default: {
+      if (!handlers?.send) throw new Fail("unsupported");
+      const response = await handlers.send(freeze(args.model), args.request, freeze(args.context), signal);
+      if (!(response instanceof Response)) invalidReply();
+      return respond(ext, { id, signal }, response);
+    }
+  }
+}
+
+/** Sends a transport response as parented `head` and `body` calls, each awaited (backpressure). */
+async function respond(ext: string, parent: Parent, response: Response): Promise<null> {
+  const headers: [string, string][] = [...response.headers];
+  await callHost(ext, "head", { status: response.status, headers }, parent);
+  if (!response.body) return null;
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  const abort = () => void reader.cancel(parent.signal.reason).catch(() => {});
+  parent.signal.addEventListener("abort", abort, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return null;
+      if (value) await callHost(ext, "body", { text: value }, parent);
+    }
+  } finally {
+    parent.signal.removeEventListener("abort", abort);
   }
 }
 
@@ -649,7 +702,7 @@ const HANDLER_KINDS = ["providers", "tools", "schemes", "commands", "toolPolicy"
 type ActivateArgs = {
   entry: string;
   dataDir: string;
-  providers: { id: string; login: boolean; rewrite: boolean }[];
+  providers: DeclaredProvider[];
   methods: Record<string, string[]>;
   session: {
     tools: { name: string }[];
@@ -778,7 +831,9 @@ function single<T>(value: unknown, declared: boolean, bind: (handler: unknown) =
   return (value === undefined ? undefined : bind(value)) ?? fail();
 }
 
-function providers(value: unknown, declared: { id: string; login: boolean; rewrite: boolean }[]): Map<string, ProviderHandlers> {
+type DeclaredProvider = { id: string; login: boolean; rewrite: boolean; transport: boolean; listModels: boolean };
+
+function providers(value: unknown, declared: DeclaredProvider[]): Map<string, ProviderHandlers> {
   const returned: Frame =
     value === undefined ? {} : isRecord(value) ? value : fail();
   for (const key of Object.keys(returned)) {
@@ -787,10 +842,16 @@ function providers(value: unknown, declared: { id: string; login: boolean; rewri
   const out = new Map<string, ProviderHandlers>();
   for (const p of declared) {
     const value = Object.hasOwn(returned, p.id) ? returned[p.id] : undefined;
-    if (value === undefined && !p.login && !p.rewrite) continue;
+    if (value === undefined && !p.login && !p.rewrite && !p.transport && !p.listModels) continue;
     if (typeof value !== "object" || value === null) fail();
     const h = value as Record<string, unknown>;
-    const wants: Record<string, boolean> = { login: p.login, refresh: p.login, rewrite: p.rewrite };
+    const wants: Record<string, boolean> = {
+      login: p.login,
+      refresh: p.login,
+      rewrite: p.rewrite,
+      send: p.transport,
+      listModels: p.listModels,
+    };
     for (const key of Object.keys(h)) {
       if (!Object.hasOwn(wants, key)) fail();
     }

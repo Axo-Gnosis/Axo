@@ -2463,6 +2463,35 @@ export type ModeSpec_Serialize = {
 
 export type Model = Model_Serialize | Model_Deserialize;
 
+/**
+ *  What auth resolution hands to an adapter: the key (if any), extra headers, and a
+ *  base URL override. A stored OAuth credential contributes its access token, `headers`
+ *  and `base_url`; `models.jsonc` headers and base URL win over the credential's.
+ */
+export type ModelAuth = ModelAuth_Serialize | ModelAuth_Deserialize;
+
+/**
+ *  What auth resolution hands to an adapter: the key (if any), extra headers, and a
+ *  base URL override. A stored OAuth credential contributes its access token, `headers`
+ *  and `base_url`; `models.jsonc` headers and base URL win over the credential's.
+ */
+export type ModelAuth_Deserialize = {
+	apiKey?: string | null,
+	headers: { [key in string]: string },
+	baseUrl?: string | null,
+};
+
+/**
+ *  What auth resolution hands to an adapter: the key (if any), extra headers, and a
+ *  base URL override. A stored OAuth credential contributes its access token, `headers`
+ *  and `base_url`; `models.jsonc` headers and base URL win over the credential's.
+ */
+export type ModelAuth_Serialize = {
+	apiKey?: string,
+	headers: { [key in string]: string },
+	baseUrl?: string,
+};
+
 export type Model_Deserialize = {
 	id: string,
 	name: string,

@@ -55,6 +55,10 @@ pub struct ProviderDecl {
     pub login: bool,
     #[serde(default)]
     pub rewrite: bool,
+    #[serde(default)]
+    pub transport: bool,
+    #[serde(default)]
+    pub list_models: bool,
 }
 
 fn yes() -> bool {

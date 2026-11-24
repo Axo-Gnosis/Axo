@@ -60,6 +60,7 @@ pub const SDK_VERSION: &str = "0.0.0";
 pub fn wire_types(types: specta::Types) -> specta::Types {
     types
         .register::<Credential>()
+        .register::<axo_ai::ModelAuth>()
         .register::<axo_ai::DeviceCode>()
         .register::<axo_ai::LoginPrompt>()
         .register::<axo_ai::LoginSelect>()

@@ -1,0 +1,26 @@
+{
+  "id": "lab-wire",
+  "entry": "index.ts",
+  "providers": [
+    {
+      "id": "lab-wire",
+      "models": [
+        {
+          "id": "m",
+          "name": "m",
+          "api": "openai-completions",
+          "provider": "lab-wire",
+          "baseUrl": "http://127.0.0.1:9/v1",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 200000,
+          "maxTokens": 4096
+        }
+      ],
+      "requiresKey": false,
+      "transport": true,
+      "listModels": true
+    }
+  ]
+}

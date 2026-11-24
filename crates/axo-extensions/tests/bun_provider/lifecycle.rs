@@ -27,7 +27,8 @@ pub async fn run(bun: &Path, mode: Supervision) {
     kill_points(bun, mode.clone()).await;
     group_budget(bun, mode.clone()).await;
     load_failures_and_watchdog(bun, mode.clone()).await;
-    removal_and_shutdown(bun, mode).await;
+    removal_and_shutdown(bun, mode.clone()).await;
+    wire_hooks(bun, mode).await;
 }
 
 /// Kill point 1, before `rewrite` answers: one named nonretryable failure, no HTTP, the
@@ -452,4 +453,24 @@ fn cgroup_dir(pid: i32) -> PathBuf {
         .find_map(|line| line.strip_prefix("0::"))
         .expect("cgroup v2 entry");
     Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'))
+}
+
+/// A provider declaring `transport` and `listModels`: its runtime list replaces the manifest
+/// list, and its `send` carries the request to the lab server and streams the reply back.
+async fn wire_hooks(bun: &Path, mode: Supervision) {
+    const WIRE: &str = "lab-wire";
+    let host = Host::new(bun, mode).await;
+    host.install(WIRE, WIRE);
+    host.extensions
+        .configure(&[enabled(LAB, None), enabled(WIRE, None)])
+        .await
+        .unwrap();
+    wait_for("the runtime model list", || {
+        host.models.find("lab-wire/listed").is_some()
+    })
+    .await;
+    let native = host.server.count(NATIVE);
+    assert_reply(&stream(&host, WIRE).await);
+    assert_eq!(host.server.count(NATIVE), native + 1);
+    host.close().await;
 }
