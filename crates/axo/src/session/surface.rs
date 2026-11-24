@@ -4,6 +4,7 @@ use axo_agent::{AgentMessage, Tool};
 use axo_ai::{Message, TranscriptToolSupport, UserBlock};
 use serde_json::json;
 
+use super::policy::mode_permits;
 use super::{SessionHooks, SessionToolInfo, journal};
 use crate::error::Error;
 use crate::store::Entry;
@@ -90,8 +91,7 @@ impl SessionHooks {
                     parameters: tool.parameters().clone(),
                     exposure,
                     promoted: promoted.iter().any(|entry| entry == name),
-                    allowed_in_mode: name == YIELD
-                        || mode.as_ref().is_none_or(|mode| mode.tools.permits(name)),
+                    allowed_in_mode: mode_permits(mode.as_deref(), name),
                     origin: origins.get(name).cloned(),
                 }
             })
@@ -100,7 +100,7 @@ impl SessionHooks {
 
     pub(super) fn tool_allowed_in_mode(&self, name: &str) -> bool {
         let mode = self.effective_mode();
-        if name != YIELD && !mode.as_ref().is_none_or(|mode| mode.tools.permits(name)) {
+        if !mode_permits(mode.as_deref(), name) {
             return false;
         }
         if name == YIELD

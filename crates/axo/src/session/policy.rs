@@ -217,6 +217,10 @@ pub(super) fn tool_hooks(
     hooks
 }
 
+pub(super) fn mode_permits(mode: Option<&ModeSpec>, name: &str) -> bool {
+    name == YIELD || mode.is_none_or(|mode| mode.tools.permits(name))
+}
+
 pub(super) struct ModeGate {
     pub scope: Arc<ScopeCell>,
 }
@@ -235,8 +239,7 @@ impl ToolHooks for ModeGate {
             .clone();
         let name = &call.tool_call.name;
         if let Some(mode) = &scope.mode
-            && name != YIELD
-            && !mode.tools.permits(name)
+            && !mode_permits(Some(mode), name)
         {
             return Ok(ToolCallDecision::Block {
                 reason: Some(format!("{name} is unavailable in mode \"{}\".", mode.name)),

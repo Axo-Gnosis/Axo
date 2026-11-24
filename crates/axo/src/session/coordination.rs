@@ -110,7 +110,12 @@ pub(crate) async fn send(
             (SendKind::FollowUp, SubmissionKind::FollowUp)
         };
         let submission_id = child
-            .queue_routed(submission_kind, content.to_owned().into(), provenance(kind))
+            .queue(
+                submission_kind,
+                content.to_owned().into(),
+                None,
+                Some(provenance(kind)),
+            )
             .await?;
         return Ok(receipt(
             kind,

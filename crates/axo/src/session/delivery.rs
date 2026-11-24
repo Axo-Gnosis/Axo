@@ -17,6 +17,7 @@ use super::{
 use crate::config::ModelChoice;
 use crate::context::keywords::{self, KeywordSpec};
 use crate::context::prompt::escape_wrappers;
+use crate::coordination::SubmissionProvenance;
 use crate::error::Error;
 use crate::input::{Prepared, PromptInput, PromptPart, SavedFiles, prepare, render};
 use crate::jobs::child::TURN_BUDGET;
@@ -617,33 +618,15 @@ impl Session {
         .await
     }
 
-    pub(super) async fn queue_with_provenance(
-        &self,
-        kind: SubmissionKind,
-        input: PromptInput,
-        provenance: Option<crate::coordination::SubmissionProvenance>,
-    ) -> Result<String, Error> {
-        self.queue(kind, input, None, provenance).await
-    }
-
-    pub(super) async fn queue_routed(
-        &self,
-        kind: SubmissionKind,
-        input: PromptInput,
-        provenance: crate::coordination::SubmissionProvenance,
-    ) -> Result<String, Error> {
-        self.queue(kind, input, None, Some(provenance)).await
-    }
-
     /// Saves the submission and hands its message to the queue for `kind`.
     /// `saved` files stay only once the entry is written. Keywords match in steers and
     /// follow-ups, never in mail.
-    async fn queue(
+    pub(super) async fn queue(
         &self,
         kind: SubmissionKind,
         input: PromptInput,
         sender: Option<String>,
-        provenance: Option<crate::coordination::SubmissionProvenance>,
+        provenance: Option<SubmissionProvenance>,
     ) -> Result<String, Error> {
         let keywords = if matches!(kind, SubmissionKind::Steer | SubmissionKind::FollowUp) {
             self.hooks.matched_keywords(&input.parts)

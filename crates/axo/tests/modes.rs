@@ -1459,11 +1459,12 @@ async fn unreviewed_yield_without_a_continuation_exits_immediately() {
         )]))],
     )
     .await;
-    let session = host
-        .axo
-        .create_session(result_options(dir.path(), false, None))
-        .await
-        .unwrap();
+    let mut opts = result_options(dir.path(), false, None);
+    opts.host.definitions.modes[0]
+        .tools
+        .deny
+        .push("yield".into());
+    let session = host.axo.create_session(opts).await.unwrap();
     session.set_mode(Some("plan")).await.unwrap();
     let mut events = session.attach(None).await.events;
     within(session.prompt("Plan only.")).await.unwrap();

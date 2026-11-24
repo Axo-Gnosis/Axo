@@ -93,7 +93,7 @@ impl SessionWire<'_> {
     #[ext]
     pub async fn steer(&self, input: PromptInput) -> Result<(), Error> {
         self.session
-            .queue_with_provenance(SubmissionKind::Steer, input, self.provenance())
+            .queue(SubmissionKind::Steer, input, None, self.provenance())
             .await
             .map(drop)
     }
@@ -102,7 +102,7 @@ impl SessionWire<'_> {
     #[ext]
     pub async fn follow_up(&self, input: PromptInput) -> Result<(), Error> {
         self.session
-            .queue_with_provenance(SubmissionKind::FollowUp, input, self.provenance())
+            .queue(SubmissionKind::FollowUp, input, None, self.provenance())
             .await
             .map(drop)
     }

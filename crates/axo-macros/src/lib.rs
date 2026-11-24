@@ -12,8 +12,8 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Error, Expr, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, ItemImpl, Lit,
-    LitStr, Meta, Pat, PathArguments, PathSegment, ReturnType, Type, Visibility,
-    parse_macro_input, parse_quote_spanned,
+    LitStr, Meta, Pat, PathArguments, PathSegment, ReturnType, Type, Visibility, parse_macro_input,
+    parse_quote_spanned,
 };
 
 const CANNOT_CROSS: &str = "this type cannot cross as JSON; withhold the method with #[ext(skip = \"reason\")] and add a wire method";
