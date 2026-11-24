@@ -1228,7 +1228,7 @@ A registered command runs at most once per session at a time: while `/<name>` ru
 
 ### Wire protocol
 
-`runner.ts` and the Rust peer use one private Unix socket per generation. A frame is a 4-byte big-endian length followed by UTF-8 JSON, bounded by `MAX_FRAME` (64 MiB). The runner authenticates the connection with `hello` and its nonce; later frames need no separate generation tag. The embedded runner and host ship together; there is no independent wire compatibility promise. A `call` carries `id`, `ext`, `method` and `args`; its terminal reply is `ok` or `error` (`code`, `message`, optional `details`). There are also `cancel`, `ping`, and `pong` frames.
+`runner.ts` and the Rust peer use one private Unix socket per generation. A frame is a 4-byte big-endian length followed by UTF-8 JSON, bounded by `MAX_FRAME` (64 MiB). The runner authenticates the connection with `hello` and its nonce; later frames need no separate generation tag. The embedded runner and host ship together; there is no independent wire compatibility promise. A `call` carries `id`, `ext`, `method` and `args`; its terminal reply is `ok` or `error`. Runner errors carry only a `code`; the host owns their wording. Host errors also carry a `message` and optional `details`. There are also `cancel`, `ping`, and `pong` frames.
 
 Login UI calls, tool updates and invocations on the `tools` object carry their live host call's `parent`. Other `invoke` calls are unparented: all specify `object`, `method` and positional `args`; only the session object takes a `target` session ID. `activate` carries `methods`, the map of names each object forwards.
 

@@ -104,7 +104,7 @@ for (const cancel of [false, true]) {
       if (!cancel) {
         const other = await next();
         const failure = unsubscribe.type === "error" ? unsubscribe : other;
-        expect(failure).toMatchObject({ id: bad, type: "error", code: "activation" });
+        expect(failure).toEqual({ id: bad, type: "error", code: "activation" });
         if (failure === unsubscribe) unsubscribe = other;
       }
       expect(unsubscribe).toMatchObject({ ext: "bad", method: "unsubscribe", args: { sub: "first" } });
@@ -112,7 +112,7 @@ for (const cancel of [false, true]) {
       // Delivery must not wait for unsubscribe acknowledgement or enter either listener.
       for (const sub of ["first", "late"]) {
         const delivery = call("bad", "stream", { sub, event: { type: "test" } });
-        expect(await next()).toMatchObject({ type: "error", id: delivery, code: "unsupported" });
+        expect(await next()).toEqual({ type: "error", id: delivery, code: "unsupported" });
       }
       ok(unsubscribe.id);
       const late = await next();

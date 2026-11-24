@@ -655,7 +655,10 @@ mod fake {
 
         let stream = UnixStream::connect(&socket).await.expect("connect");
         if script.as_deref().map(str::trim) == Some("no-hello") {
-            append(&control.join("connected-no-hello"), &std::process::id().to_string());
+            append(
+                &control.join("connected-no-hello"),
+                &std::process::id().to_string(),
+            );
             std::future::pending::<()>().await;
             drop(stream);
             return;
@@ -727,9 +730,7 @@ mod fake {
                         }
                         runner.send(match result {
                             Ok(value) => json!({"type": "ok", "id": id, "value": value}),
-                            Err((code, message)) => {
-                                json!({"type": "error", "id": id, "code": code, "message": message})
-                            }
+                            Err((code, _)) => json!({"type": "error", "id": id, "code": code}),
                         });
                     });
                 }

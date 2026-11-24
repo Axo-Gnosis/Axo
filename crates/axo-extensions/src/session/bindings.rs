@@ -303,7 +303,7 @@ impl ToolPolicy for RemotePolicy {
             ))
         })?;
         let reply = self.remote.call(
-            "tool policy",
+            "tool policy before",
             "policyBefore",
             args,
             None,
@@ -316,6 +316,7 @@ impl ToolPolicy for RemotePolicy {
         };
         Ok(match unless_canceled(cancel, ext, reply).await? {
             Err(Failure::Removed(_)) => ToolCallDecision::Allow,
+            Err(Failure::Method(message)) => block(message),
             Err(failure) => block(format!(
                 "extension {ext}: tool policy unavailable: {failure}"
             )),
@@ -361,7 +362,7 @@ impl ToolPolicy for RemotePolicy {
             ))
         })?;
         let reply = self.remote.call(
-            "tool policy",
+            "tool policy after",
             "policyAfter",
             args,
             None,
@@ -422,6 +423,7 @@ impl SpawnHook for RemoteSpawnHook {
             .await;
         match reply {
             Err(Failure::Removed(_)) => SpawnDecision::Allow,
+            Err(Failure::Method(message)) => SpawnDecision::Block(message),
             Err(failure) => SpawnDecision::Block(format!(
                 "extension {ext}: spawn hook unavailable: {failure}"
             )),
@@ -490,6 +492,7 @@ impl RemoteScheme {
     async fn call(
         &self,
         method: &str,
+        operation: &str,
         url: &SchemeUrl,
         cx: &SchemeContext,
         content: Option<&str>,
@@ -510,7 +513,7 @@ impl RemoteScheme {
         }
         self.remote
             .call(
-                &format!("scheme {}", self.decl.name),
+                &format!("scheme {} {operation}", self.decl.name),
                 method,
                 args,
                 None,
@@ -546,7 +549,7 @@ impl Scheme for RemoteScheme {
     }
 
     async fn resolve(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<Target, ToolError> {
-        let value = self.call("schemeResolve", url, cx, None).await?;
+        let value = self.call("schemeResolve", "resolve", url, cx, None).await?;
         // Serde also accepts positional arrays for structs; file targets are objects.
         let object = value.is_object();
         match serde_json::from_value(value) {
@@ -564,7 +567,7 @@ impl Scheme for RemoteScheme {
     }
 
     async fn read(&self, url: &SchemeUrl, cx: &SchemeContext) -> Result<String, ToolError> {
-        let value = self.call("schemeRead", url, cx, None).await?;
+        let value = self.call("schemeRead", "read", url, cx, None).await?;
         self.text("read", value)
     }
 
@@ -574,7 +577,9 @@ impl Scheme for RemoteScheme {
         content: &str,
         cx: &SchemeContext,
     ) -> Result<String, ToolError> {
-        let value = self.call("schemeWrite", url, cx, Some(content)).await?;
+        let value = self
+            .call("schemeWrite", "write", url, cx, Some(content))
+            .await?;
         self.text("write", value)
     }
 

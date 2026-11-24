@@ -501,9 +501,9 @@ impl Shared {
         .await
         {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(CallError::Method(message))) => Err(rejected(
+            Ok(Err(CallError::Method(phrase))) => Err(rejected(
                 ProblemKind::Load,
-                format!("{label} failed to load: {message}"),
+                format!("{label} failed to load: {phrase}"),
             )),
             Ok(Err(CallError::Invalid)) => Err(rejected(
                 ProblemKind::Load,

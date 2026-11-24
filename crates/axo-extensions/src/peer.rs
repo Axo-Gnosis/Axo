@@ -139,7 +139,7 @@ pub enum CallError {
     Unavailable,
     /// The runner answered with an error; the message is safe to show.
     #[error("{0}")]
-    Method(String),
+    Method(&'static str),
     /// Rejected locally (method/argument shape or frame size); nothing was sent.
     #[error("extension request is invalid or exceeds the 64 MiB frame bound")]
     Invalid,
@@ -219,7 +219,6 @@ struct State {
 
 struct Pending {
     ext: String,
-    method: String,
     reply: oneshot::Sender<Result<Value, CallError>>,
     /// Present only for a call given callbacks: routes its runner calls to its future.
     callbacks: Option<mpsc::UnboundedSender<Callback>>,
@@ -397,7 +396,6 @@ impl Inner {
                 id,
                 Pending {
                     ext: ext.to_owned(),
-                    method: method.to_owned(),
                     reply,
                     callbacks: callbacks.is_some().then_some(route),
                 },
@@ -512,9 +510,8 @@ impl Inner {
                 let code = frame
                     .get("code")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                self.settle(&id, Err(code))
+                    .unwrap_or_default();
+                self.settle(&id, Err(method_error(code)))
             }
             Some("call") => self.callback(id, frame),
             Some("cancel") => {
@@ -542,16 +539,14 @@ impl Inner {
     }
 
     /// Delivers a terminal reply; late replies to finished calls are dropped.
-    fn settle(&self, id: &str, result: Result<Value, String>) -> Result<(), &'static str> {
+    fn settle(&self, id: &str, result: Result<Value, &'static str>) -> Result<(), &'static str> {
         let pending = {
             let mut state = self.lock();
             let n = state.issued(id).ok_or("reply to an unissued id")?;
             state.finish(n)
         };
         if let Some(pending) = pending {
-            let result = result
-                .map_err(|code| CallError::Method(label(&pending.ext, &pending.method, &code)));
-            let _ = pending.reply.send(result);
+            let _ = pending.reply.send(result.map_err(CallError::Method));
         }
         Ok(())
     }
@@ -770,15 +765,14 @@ fn is_runner_id(id: &str) -> bool {
     id.strip_prefix("r:").is_some_and(is_counter)
 }
 
-/// A fixed, host-owned label for a runner error code. The runner's message is never shown:
-/// author text (and anything secret in it) may follow any prefix.
-fn label(ext: &str, method: &str, code: &str) -> String {
+/// Runner text never reaches the host, even when a peer sends an unexpected message field.
+fn method_error(code: &str) -> &'static str {
     match code {
-        "activation" => format!("extension {ext}: activation was rejected"),
-        "invalid" => format!("extension {ext}: {method} had an invalid argument or result"),
-        "unsupported" => format!("extension {ext}: {method} is not supported"),
-        "too_large" => format!("extension {ext}: {method} reply exceeds 64 MiB"),
-        _ => format!("extension {ext}: {method} failed"),
+        "activation" => "activation rejected",
+        "invalid" => "invalid argument or result",
+        "unsupported" => "unsupported operation",
+        "too_large" => "reply exceeds 64 MiB",
+        _ => "handler error",
     }
 }
 
@@ -918,12 +912,9 @@ mod tests {
         let (host, runner) = UnixStream::pair().unwrap();
         let (reader, writer) = runner.into_split();
         let mut raw = Raw { reader, writer };
-        let (peer, ()) = tokio::join!(
-            Peer::connect(host, NONCE, members(), actions()),
-            async {
-                raw.writer.write_all(&bytes(&hello())).await.unwrap();
-            }
-        );
+        let (peer, ()) = tokio::join!(Peer::connect(host, NONCE, members(), actions()), async {
+            raw.writer.write_all(&bytes(&hello())).await.unwrap();
+        });
         (peer.unwrap(), raw)
     }
 
@@ -1019,15 +1010,12 @@ mod tests {
         // One byte per write: the reader must reassemble the hello.
         let (host, runner) = UnixStream::pair().unwrap();
         let (reader, mut writer) = runner.into_split();
-        let (peer, ()) = tokio::join!(
-            Peer::connect(host, NONCE, members(), actions()),
-            async {
-                for byte in bytes(&hello()) {
-                    writer.write_all(&[byte]).await.unwrap();
-                    tokio::task::yield_now().await;
-                }
+        let (peer, ()) = tokio::join!(Peer::connect(host, NONCE, members(), actions()), async {
+            for byte in bytes(&hello()) {
+                writer.write_all(&[byte]).await.unwrap();
+                tokio::task::yield_now().await;
             }
-        );
+        });
         let peer = peer.unwrap();
         let mut raw = Raw { reader, writer };
         // And it works: one call round-trips, its reply split across writes too.
@@ -1062,12 +1050,10 @@ mod tests {
         ];
         for frame in bad {
             let (host, mut runner) = UnixStream::pair().unwrap();
-            let (peer, ()) = tokio::join!(
-                Peer::connect(host, NONCE, members(), actions()),
-                async {
+            let (peer, ()) =
+                tokio::join!(Peer::connect(host, NONCE, members(), actions()), async {
                     runner.write_all(&bytes(&frame)).await.unwrap();
-                }
-            );
+                });
             assert!(peer.is_err(), "accepted {frame}");
         }
     }
@@ -1083,7 +1069,9 @@ mod tests {
         // Even a complete hello replayed from the previous runner cannot bind a new peer.
         foreign.write_all(&bytes(&hello())).await.unwrap();
         let result = Peer::connect(host, "new nonce", members(), actions()).await;
-        assert!(matches!(result, Err(reason) if reason == "extension runner sent an invalid hello"));
+        assert!(
+            matches!(result, Err(reason) if reason == "extension runner sent an invalid hello")
+        );
         assert!(next_frame(&mut foreign).await.is_none());
     }
 
@@ -1115,29 +1103,24 @@ mod tests {
                 assert_eq!(refresh.1, "a");
                 assert_eq!(rewrite.1, "b");
                 // Both replies in one write, in the opposite order of the calls.
-                let mut both = bytes(
-                    &json!({"type": "error", "id": rewrite.0, "code": "failed", "message": "extension b provider p rewrite failed"}),
-                );
+                let mut both = bytes(&json!({"type": "error", "id": rewrite.0, "code": "failed"}));
                 both.extend(bytes(&ok(&refresh.0, credential("new"))));
                 raw.writer.write_all(&both).await.unwrap();
             }
         );
         assert_eq!(refresh.unwrap()["access"], "new");
-        assert_eq!(
-            rewrite,
-            Err(CallError::Method("extension b: rewrite failed".into()))
-        );
+        assert_eq!(rewrite, Err(CallError::Method("handler error")));
 
-        // Runner text never reaches the host: each error code maps to a fixed label.
-        for (code, label) in [
-            ("failed", "extension a: refresh failed"),
-            (
-                "invalid",
-                "extension a: refresh had an invalid argument or result",
-            ),
-            ("unsupported", "extension a: refresh is not supported"),
-            ("too_large", "extension a: refresh reply exceeds 64 MiB"),
-            ("activation", "extension a: activation was rejected"),
+        // Runner text never reaches the host, including unrecognized or malformed codes.
+        for (code, phrase) in [
+            (Some(json!("failed")), "handler error"),
+            (Some(json!("invalid")), "invalid argument or result"),
+            (Some(json!("unsupported")), "unsupported operation"),
+            (Some(json!("too_large")), "reply exceeds 64 MiB"),
+            (Some(json!("activation")), "activation rejected"),
+            (Some(json!("secret-marker")), "handler error"),
+            (Some(json!(42)), "handler error"),
+            (None, "handler error"),
         ] {
             let (result, ()) = tokio::join!(
                 peer.call(
@@ -1148,10 +1131,14 @@ mod tests {
                 ),
                 async {
                     let (id, ..) = called(&raw.next().await.unwrap());
-                    raw.send(json!({"type": "error", "id": id, "code": code, "message": "token sk-secret leaked\nstack"})).await;
+                    let mut frame = json!({"type": "error", "id": id, "message": "token sk-secret leaked\nstack"});
+                    if let Some(code) = &code {
+                        frame["code"] = code.clone();
+                    }
+                    raw.send(frame).await;
                 }
             );
-            assert_eq!(result, Err(CallError::Method(label.into())), "{code}");
+            assert_eq!(result, Err(CallError::Method(phrase)), "{code:?}");
         }
     }
 
@@ -1490,10 +1477,7 @@ mod tests {
                 "cancel of a host call",
                 bytes(&json!({"type": "cancel", "id": "h:0"})),
             ),
-            (
-                "reply to unknown host id",
-                bytes(&ok("h:99", Value::Null)),
-            ),
+            ("reply to unknown host id", bytes(&ok("h:99", Value::Null))),
         ];
         for (name, frame) in violations {
             let (peer, mut raw) = pair().await;
@@ -1655,10 +1639,7 @@ mod tests {
                         "code": "too_large", "message": "host reply exceeds 64 MiB"})
                 );
                 raw.send(prompt("r:1", "next")).await;
-                assert_eq!(
-                    raw.next().await.unwrap(),
-                    ok("r:1", json!("answer-next"))
-                );
+                assert_eq!(raw.next().await.unwrap(), ok("r:1", json!("answer-next")));
                 raw.send(ok(&parent, credential("fresh"))).await;
             }
         );

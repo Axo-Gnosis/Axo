@@ -51,7 +51,7 @@ pub async fn call(
                 CallError::Unavailable => {
                     Failure::Unavailable(format!("{label}: interrupted, the runner stopped"))
                 }
-                CallError::Method(message) => Failure::Method(format!("{label} failed: {message}")),
+                CallError::Method(phrase) => Failure::Method(format!("{label}: {phrase}")),
                 CallError::Invalid => Failure::Invalid(format!(
                     "{label}: the request is invalid or too large to send"
                 )),

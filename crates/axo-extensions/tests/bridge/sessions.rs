@@ -1314,9 +1314,11 @@ async fn failures_reach_the_host_typed() {
     host.script(LAB, "command", "fail");
     let command = session.parse_command("/hello hi").unwrap().unwrap();
     match session.run_command(command).await {
-        Err(Error::Host(error)) => assert!(
-            matches!(error.downcast_ref::<Failure>(), Some(Failure::Method(_))),
-            "{error}"
+        Err(Error::Host(error)) => assert_eq!(
+            error.downcast_ref::<Failure>(),
+            Some(&Failure::Method(
+                "extension lab command /hello: handler error".into()
+            ))
         ),
         other => panic!("expected a host failure, got {other:?}"),
     }
