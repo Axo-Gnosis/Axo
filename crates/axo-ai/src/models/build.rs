@@ -133,24 +133,13 @@ pub(super) async fn build(
             .iter_mut()
             .filter(|model| &model.provider == provider_id)
         {
-            if let Some(base_url) = &provider.base_url {
-                Arc::make_mut(model).base_url.clone_from(base_url);
-                config_base_urls.insert((provider_id.clone(), model.id.clone()));
-            }
-            if let Some(api) = provider.api {
-                Arc::make_mut(model).api = api;
-            }
-            if let Some(compat) = &provider.compat
-                && !compat.is_empty()
-            {
-                merge_compat(Arc::make_mut(model), Some(compat))?;
-            }
-            if !provider.headers.is_empty() {
-                config_headers
-                    .entry((model.provider.clone(), model.id.clone()))
-                    .or_default()
-                    .extend(provider.headers.clone());
-            }
+            apply_provider_fields(
+                provider,
+                model,
+                false,
+                &mut config_headers,
+                &mut config_base_urls,
+            )?;
         }
 
         let new_model = |id: &str, api: Option<ApiKind>, base_url: Option<&String>| {
@@ -164,7 +153,7 @@ pub(super) async fn build(
                     "models.jsonc: model {provider_id}/{id} has no \"baseUrl\""
                 ))
             })?;
-            let mut model = Model {
+            Ok::<_, Error>(Arc::new(Model {
                 id: id.to_owned(),
                 name: id.to_owned(),
                 api,
@@ -178,22 +167,20 @@ pub(super) async fn build(
                 context_window: 128_000,
                 max_tokens: 16_384,
                 compat: Compat::default(),
-            };
-            merge_compat(&mut model, provider.compat.as_ref())?;
-            Ok::<_, Error>(model)
+            }))
         };
 
         match &provider.models {
             Some(list) => {
                 for config in list {
-                    let headers = config_headers
-                        .entry((provider_id.clone(), config.id.clone()))
-                        .or_default();
                     match models
                         .iter_mut()
                         .find(|model| &model.provider == provider_id && model.id == config.id)
                     {
                         Some(model) => {
+                            let headers = config_headers
+                                .entry((provider_id.clone(), config.id.clone()))
+                                .or_default();
                             apply_patch(&config.patch, model, headers)?;
                             if config.patch.base_url.is_some() {
                                 config_base_urls.insert((provider_id.clone(), config.id.clone()));
@@ -205,23 +192,33 @@ pub(super) async fn build(
                                 config.patch.api,
                                 config.patch.base_url.as_ref(),
                             )?;
-                            headers.extend(provider.headers.clone());
-                            config.patch.apply(&mut model, headers)?;
-                            config_base_urls.insert((provider_id.clone(), config.id.clone()));
-                            models.push(Arc::new(model));
+                            apply_provider_fields(
+                                provider,
+                                &mut model,
+                                true,
+                                &mut config_headers,
+                                &mut config_base_urls,
+                            )?;
+                            let headers = config_headers
+                                .entry((provider_id.clone(), config.id.clone()))
+                                .or_default();
+                            config.patch.apply(Arc::make_mut(&mut model), headers)?;
+                            models.push(model);
                         }
                     }
                 }
             }
             None => {
                 for id in discovered.get(provider_id.as_str()).into_iter().flatten() {
-                    let model = new_model(id, None, None)?;
-                    if !provider.headers.is_empty() {
-                        config_headers
-                            .insert((provider_id.clone(), id.clone()), provider.headers.clone());
-                    }
-                    config_base_urls.insert((provider_id.clone(), id.clone()));
-                    models.push(Arc::new(model));
+                    let mut model = new_model(id, None, None)?;
+                    apply_provider_fields(
+                        provider,
+                        &mut model,
+                        true,
+                        &mut config_headers,
+                        &mut config_base_urls,
+                    )?;
+                    models.push(model);
                 }
             }
         }
@@ -251,6 +248,43 @@ pub(super) async fn build(
     })
 }
 
+fn apply_provider_fields(
+    provider: &config::ProviderConfig,
+    model: &mut Arc<Model>,
+    new: bool,
+    config_headers: &mut HashMap<(String, String), BTreeMap<String, String>>,
+    config_base_urls: &mut HashSet<(String, String)>,
+) -> Result<(), Error> {
+    if !new {
+        if let Some(base_url) = &provider.base_url {
+            Arc::make_mut(model).base_url.clone_from(base_url);
+        }
+        if let Some(api) = provider.api {
+            Arc::make_mut(model).api = api;
+        }
+    }
+    if let Some(compat) = &provider.compat
+        && (new || !compat.is_empty())
+    {
+        merge_compat(Arc::make_mut(model), Some(compat))?;
+    }
+    if new || provider.base_url.is_some() {
+        config_base_urls.insert((model.provider.clone(), model.id.clone()));
+    }
+    if !provider.headers.is_empty() {
+        config_headers
+            .entry((model.provider.clone(), model.id.clone()))
+            .or_default()
+            .extend(
+                provider
+                    .headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+    }
+    Ok(())
+}
+
 fn apply_patch(
     patch: &config::ModelPatch,
     model: &mut Arc<Model>,
@@ -278,5 +312,99 @@ fn apply_patch(
         Ok(())
     } else {
         patch.apply(Arc::make_mut(model), headers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_config_preserves_patch_order_and_header_only_arcs() {
+        let catalog = rules::map_catalog(
+            &serde_json::from_value(json!({
+                "mapped": {"models": {"row": {
+                    "type": "chat",
+                    "capabilities": {"tools": {"supported": true}},
+                    "recommended_api": "chat-completions",
+                    "api": {"chat-completions": {
+                        "base_url": "https://mapped.invalid",
+                        "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
+                    }}
+                }}}
+            }))
+            .unwrap(),
+        );
+        let original = &catalog.models[0];
+        let dir = tempfile::tempdir().unwrap();
+        let credentials: Arc<dyn CredentialStore> = Arc::new(crate::FileCredentialStore::new(
+            dir.path().join("auth.json"),
+        ));
+        let http = crate::api::http::client();
+        let load = async |config: &ModelsConfig| {
+            build(
+                Candidate {
+                    config,
+                    extended_context: true,
+                    catalog: Some(&catalog),
+                    codex: None,
+                },
+                &credentials,
+                &http,
+                &|_| Vec::new(),
+                &|_| false,
+                None,
+            )
+            .await
+        };
+        let config = serde_json::from_value(json!({"providers": {
+            "mapped": {
+                "headers": {"x-order": "provider"},
+                "models": [{"id": "row", "headers": {"x-order": "entry"}}],
+                "modelOverrides": {"row": {"headers": {"x-order": "override"}}}
+            },
+            "custom": {
+                "models": [
+                    {"id": "one", "api": "openai-completions", "baseUrl": "https://first.invalid"},
+                    {"id": "one", "name": "second", "headers": {"x-order": "entry"}}
+                ],
+                "modelOverrides": {"one": {"headers": {"x-order": "final"}}}
+            }
+        }}))
+        .unwrap();
+        let loaded = load(&config).await.unwrap();
+        assert!(Arc::ptr_eq(original, &loaded.models[0]));
+        assert_eq!(
+            loaded.config_headers[&("mapped".into(), "row".into())]["x-order"],
+            "override"
+        );
+        let mut custom = loaded
+            .models
+            .iter()
+            .filter(|model| model.provider == "custom");
+        let model = custom.next().unwrap();
+        assert!(custom.next().is_none());
+        assert_eq!(model.id, "one");
+        assert_eq!(model.api, ApiKind::OpenAiCompletions);
+        assert_eq!(model.base_url, "https://first.invalid");
+        assert_eq!(model.name, "second");
+        let key = ("custom".into(), "one".into());
+        assert_eq!(loaded.config_headers[&key]["x-order"], "final");
+        assert!(loaded.config_base_urls.contains(&key));
+
+        for (row, field) in [
+            (json!({"id": "one"}), "api"),
+            (json!({"id": "one", "api": "openai-completions"}), "baseUrl"),
+        ] {
+            let config =
+                serde_json::from_value(json!({"providers": {"custom": {"models": [row]}}}))
+                    .unwrap();
+            let expected = format!("models.jsonc: model custom/one has no \"{field}\"");
+            assert!(
+                matches!(load(&config).await, Err(Error::Config(message)) if message == expected)
+            );
+        }
     }
 }
