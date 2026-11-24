@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
@@ -18,7 +18,12 @@ use axo::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{ExtensionProblem, ProblemKind, problem};
+use crate::manifest::Member;
+use crate::placement::Prepare;
+use crate::reconcile::{Rearm, State};
+use crate::{
+    BridgeError, ExtensionProblem, ExtensionSet, Inner, ProblemKind, deps, manifest, problem, run,
+};
 
 /// Relative to the package; written only after a successful install.
 const STAMP: &str = "node_modules/.axo-install";
@@ -221,5 +226,179 @@ impl Deps {
 
     fn failures(&self) -> std::sync::MutexGuard<'_, HashMap<String, InstallFailure>> {
         self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl ExtensionSet {
+    /// Installs the dependencies of enabled authored extension `id` now (the path when
+    /// `ExtensionOptions::auto_install` is off), then reloads it. Runs Bun even after a failed
+    /// install of the same files.
+    pub async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError> {
+        let inner = Arc::clone(&self.inner);
+        let id = id.to_owned();
+        run(async move {
+            if inner.closed.is_cancelled() {
+                return Err(BridgeError::ShutDown);
+            }
+            let Some(admission) = inner.lock().admissions.get(&id).copied() else {
+                return Err(BridgeError::UnknownExtension(id));
+            };
+            if id.contains('/') {
+                return Err(BridgeError::InstalledDependencies(id));
+            }
+            let (package, _) = manifest::locate(&id, &inner.options)
+                .await
+                .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
+            Arc::clone(&inner)
+                .reconcile(
+                    None,
+                    Some(Rearm::DependencyRetry {
+                        id: id.clone(),
+                        admission,
+                        package: package.clone(),
+                    }),
+                )
+                .await?;
+            inner
+                .ensure_dependencies(&id, &package, admission)
+                .await
+                .0
+                .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
+            inner
+                .reconcile(
+                    None,
+                    Some(Rearm::Installed {
+                        id,
+                        admission,
+                        placement: None,
+                    }),
+                )
+                .await
+        })
+        .await
+        .unwrap_or(Err(BridgeError::ShutDown))
+    }
+}
+
+impl Inner {
+    fn mark(&self, id: &str, package: &Path, admission: u64, change: impl FnOnce(&mut State)) {
+        let mut state = self.lock();
+        if state.admissions.get(id) != Some(&admission)
+            || state
+                .accepted
+                .get(id)
+                .is_none_or(|(m, _)| m.package != package)
+        {
+            return;
+        }
+        self.change_status(&mut state, id, change);
+    }
+
+    /// Installs authored `id`'s dependencies unless current, publishing `Installing` while Bun
+    /// runs and `Disabled` with the reason when it fails. `Ok(true)` when an install ran.
+    async fn ensure_dependencies(
+        &self,
+        id: &str,
+        package: &Path,
+        admission: u64,
+    ) -> (Result<bool, ExtensionProblem>, Option<InstallGuard>) {
+        let work = async || {
+            self.mark(id, package, admission, |state| {
+                state.installing.insert(id.to_owned());
+            });
+            let named = |kind, error| problem(kind, format!("extension {id}: {error}"));
+            let bun = self
+                .bun
+                .usable()
+                .await
+                .map_err(|unusable| named(ProblemKind::Bun, unusable.message))?;
+            deps::install(&bun, &self.options.env, &self.supervisor, package, false)
+                .await
+                .map_err(|error| named(ProblemKind::DependencyInstall, error))
+        };
+        let finished = |result: &Result<bool, ExtensionProblem>| {
+            self.mark(id, package, admission, |state| {
+                state.installing.remove(id);
+                match result {
+                    Ok(_) => state.install_failed.remove(id),
+                    Err(reason) => state.install_failed.insert(id.to_owned(), reason.clone()),
+                };
+            })
+        };
+        tokio::select! {
+            (result, guard) = self.deps.ensure(id, admission, package, work, finished) => (result, Some(guard)),
+            () = self.closed.cancelled() => (Err(problem(ProblemKind::Setup, BridgeError::ShutDown.to_string())), None),
+        }
+    }
+
+    /// What a placement runs before starting a generation: an authored member waits for its
+    /// dependencies. Holds the manager weakly, so a placement never keeps it alive.
+    pub(super) fn preparer(self: &Arc<Self>, serial: u64) -> Prepare {
+        let inner = Arc::downgrade(self);
+        Arc::new(move |member: Member| {
+            let inner = inner.clone();
+            Box::pin(async move {
+                let Some(inner) = inner.upgrade() else {
+                    return Err((
+                        problem(ProblemKind::Setup, BridgeError::ShutDown.to_string()),
+                        None,
+                    ));
+                };
+                if member.id.contains('/') || !inner.options.auto_install {
+                    return Ok(());
+                }
+                let admission = {
+                    let state = inner.lock();
+                    if state
+                        .member_of
+                        .get(&member.id)
+                        .is_none_or(|(s, _)| *s != serial)
+                    {
+                        return Err((
+                            problem(
+                                ProblemKind::Setup,
+                                format!("extension {} was replaced", member.id),
+                            ),
+                            None,
+                        ));
+                    }
+                    state.admissions[&member.id]
+                };
+                let (result, guard) = inner
+                    .ensure_dependencies(&member.id, &member.package, admission)
+                    .await;
+                result.map(drop).map_err(|problem| (problem, guard))
+            })
+        })
+    }
+
+    /// Installs `id`'s stale dependencies in the background. A runner that was already live
+    /// is reloaded once they changed (its in-flight calls fail, as for any reload); a cold one
+    /// is not, since a call may be waiting on it.
+    pub(super) fn spawn_install(
+        self: Arc<Self>,
+        id: String,
+        package: PathBuf,
+        admission: u64,
+        running: Option<u64>,
+    ) {
+        tokio::spawn(async move {
+            if matches!(
+                self.ensure_dependencies(&id, &package, admission).await.0,
+                Ok(true)
+            ) && let Some(serial) = running
+            {
+                let _ = self
+                    .reconcile(
+                        None,
+                        Some(Rearm::Installed {
+                            id,
+                            admission,
+                            placement: Some(serial),
+                        }),
+                    )
+                    .await;
+            }
+        });
     }
 }

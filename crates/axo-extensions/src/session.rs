@@ -27,8 +27,9 @@ use tokio_util::sync::CancellationToken;
 use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook, RemoteTool};
 use crate::manifest::{PolicyHook, SessionDecl};
 use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Refusal, RunnerRef, decode};
+use crate::reconcile::gate;
 use crate::remote::{self, CALL_DEADLINE, Failure};
-use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionSet, Inner, Role, gate};
+use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionSet, Inner, Role};
 
 /// The callable wire names for each extension object.
 pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {

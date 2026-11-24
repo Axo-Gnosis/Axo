@@ -17,7 +17,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{self, SdkRefusal};
-use crate::{BridgeError, Inner, Rearm, Role, SDK_VERSION, deps};
+use crate::reconcile::Rearm;
+use crate::{BridgeError, Inner, Role, SDK_VERSION, deps};
 
 pub const RECORD: &str = "install.json";
 
