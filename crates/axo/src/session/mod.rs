@@ -913,6 +913,10 @@ impl SessionHooks {
             .spawn_hooks
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = layers.joined(|r| &r.spawn_hooks);
+        self.install_commands(layers)
+    }
+
+    fn install_commands(&self, layers: &Layers) -> Vec<Diagnostic> {
         let commands = layers.joined(|r| &r.commands);
         let defs = self.definitions.get();
         let diagnostics = commands::registered_diagnostics(&commands, &defs.modes, &defs.skills);
@@ -2656,15 +2660,7 @@ impl Session {
         self.reject_child()?;
         let mut layers = self.hooks.registrations();
         layers.host.commands = commands;
-        let commands = layers.joined(|r| &r.commands);
-        let defs = self.hooks.definitions.get();
-        let diagnostics = commands::registered_diagnostics(&commands, &defs.modes, &defs.skills);
-        *self
-            .hooks
-            .commands
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = commands;
-        Ok(diagnostics)
+        Ok(self.hooks.install_commands(&layers))
     }
 
     /// The mode definitions in force now; empty for children.
