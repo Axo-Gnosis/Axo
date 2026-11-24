@@ -12,7 +12,7 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Error, Expr, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, ItemImpl, Lit,
-    LitStr, Meta, Pat, PathArguments, PathSegment, ReturnType, Type, TypeParamBound, Visibility,
+    LitStr, Meta, Pat, PathArguments, PathSegment, ReturnType, Type, Visibility,
     parse_macro_input, parse_quote_spanned,
 };
 
@@ -208,28 +208,11 @@ fn first_type(seg: &PathSegment) -> Option<&Type> {
     }
 }
 
-fn into_type(ty: &Type) -> Option<&Type> {
-    let Type::ImplTrait(i) = ty else { return None };
-    if i.bounds.len() != 1 {
-        return None;
-    }
-    let TypeParamBound::Trait(t) = i.bounds.first()? else {
-        return None;
-    };
-    let seg = t.path.segments.last()?;
-    if seg.ident == "Into" {
-        first_type(seg)
-    } else {
-        None
-    }
-}
-
 fn validate(ty: &Type) -> syn::Result<()> {
     struct Check(Option<Error>);
     impl<'ast> Visit<'ast> for Check {
         fn visit_type(&mut self, ty: &'ast Type) {
-            if matches!(ty, Type::TraitObject(_))
-                || (matches!(ty, Type::ImplTrait(_)) && into_type(ty).is_none())
+            if matches!(ty, Type::TraitObject(_) | Type::ImplTrait(_))
                 || segment(ty).is_some_and(|s| s.ident == "Result")
             {
                 self.0 = Some(Error::new_spanned(ty, CANNOT_CROSS));
@@ -254,7 +237,6 @@ enum Container {
 enum Step {
     Borrow(Option<Ident>),
     Wrap(Tokens),
-    Into(Tokens),
     Map(Container, Box<Step>),
 }
 
@@ -262,7 +244,7 @@ impl Step {
     fn borrows(&self) -> bool {
         match self {
             Self::Borrow(_) => true,
-            Self::Wrap(_) | Self::Into(_) => false,
+            Self::Wrap(_) => false,
             Self::Map(_, inner) => inner.borrows(),
         }
     }
@@ -273,7 +255,6 @@ impl Step {
             Self::Borrow(None) if !borrowed => quote!(&#value),
             Self::Borrow(None) => quote!(#value),
             Self::Wrap(ptr) => quote!(#ptr::new(#value)),
-            Self::Into(ty) => quote!(::std::convert::Into::<#ty>::into(#value)),
             Self::Map(Container::Option, inner) if matches!(**inner, Self::Borrow(None)) => {
                 quote!(#value.as_ref())
             }
@@ -286,7 +267,6 @@ impl Step {
                 let map = match &**inner {
                     Self::Borrow(None) => Tokens::new(),
                     Self::Wrap(ptr) => quote!(.map(#ptr::new)),
-                    Self::Into(ty) => quote!(.map(::std::convert::Into::<#ty>::into)),
                     _ => {
                         let mapped = inner.apply(&arg, borrows);
                         quote!(.map(|#arg| #mapped))
@@ -313,9 +293,6 @@ impl Step {
 
 fn owned(ty: &Type, steps: &mut Vec<Step>) -> Type {
     let span = ty.span();
-    if let Some(inner) = into_type(ty) {
-        return owned(inner, steps);
-    }
     match ty {
         Type::Paren(p) => return owned(&p.elem, steps),
         Type::Group(g) => return owned(&g.elem, steps),
@@ -373,23 +350,6 @@ fn owned_collection(ty: &Type, c: Container, steps: &mut Vec<Step>) -> Type {
     let ty = owned(ty, &mut inner);
     steps.extend(inner.into_iter().map(|s| Step::Map(c, Box::new(s))));
     ty
-}
-
-// Borrowed and concrete returns serialize in place. Opaque `impl Into<T>` guarantees
-// conversion, not Serialize; materialize only those values before encoding.
-fn into_return(ty: &Type) -> Option<Step> {
-    if let Some(inner) = into_type(ty) {
-        return Some(Step::Into(quote!(#inner)));
-    }
-    let seg = segment(ty)?;
-    let c = if seg.ident == "Option" {
-        Container::Option
-    } else if seg.ident == "Vec" {
-        Container::Vec
-    } else {
-        return None;
-    };
-    Some(Step::Map(c, Box::new(into_return(first_type(seg)?)?)))
 }
 
 fn entry(
@@ -484,7 +444,6 @@ fn entry(
                 decode
             };
             let mut unwrap = Tokens::new();
-            let mut convert = Tokens::new();
             let mut span = ident.span();
             if let ReturnType::Type(_, ty) = &sig.output {
                 let success = if let Some(seg) = segment(ty).filter(|s| s.ident == "Result") {
@@ -503,10 +462,6 @@ fn entry(
                     ty
                 };
                 span = success.span();
-                if let Some(step) = into_return(success) {
-                    let expr = step.apply(&format_ident!("out"), false);
-                    convert = quote_spanned!(span=> let out = #expr;);
-                }
                 let owned = owned(success, &mut Vec::new());
                 if !matches!(&owned, Type::Tuple(t) if t.elems.is_empty()) {
                     let id = format_ident!("{prefix}Result");
@@ -540,7 +495,6 @@ fn entry(
                         #prepare
                         #receiver
                         let out = receiver.#ident(#(#args),*) #await_ #unwrap;
-                        #convert
                         #encode.map_err(|e| crate::ext::InvokeError::Encode(e.to_string()))
                     })
                 }
