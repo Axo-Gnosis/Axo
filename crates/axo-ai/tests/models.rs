@@ -232,7 +232,11 @@ async fn catalog_rows_map_from_feed_data() {
         Some("none")
     );
 
-    for absent in ["p/responses", "p/groq", "p/image"] {
+    assert_eq!(
+        models.find("p/groq").unwrap().api,
+        ApiKind::OpenAiCompletions
+    );
+    for absent in ["p/responses", "p/image"] {
         assert!(models.find(absent).is_none(), "{absent}");
     }
 

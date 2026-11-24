@@ -233,37 +233,79 @@ pub(crate) fn cap_at_price_tier(model: &mut Arc<Model>) {
     }
 }
 
+/// `api` keys axo serves, in the order tried when the recommended entry is not servable:
+/// a model's native wire before the OpenAI-compatible shim.
+const WIRES: [(&str, ApiKind); 2] = [
+    ("messages", ApiKind::AnthropicMessages),
+    ("chat-completions", ApiKind::OpenAiCompletions),
+];
+
+/// SDK packages whose entries are not the wire their key names, or need auth axo lacks.
+const UNSERVED_SDKS: [&str; 7] = [
+    // GitLab API paths, not OpenAI/Anthropic ones.
+    "gitlab-ai-provider",
+    // IBM watsonx paths and IAM tokens.
+    "watsonx-ai-provider",
+    // SAP AI Core deployment URLs and OAuth.
+    "@jerome-benoit/sap-ai-provider-v2",
+    // Google Cloud credentials, not an API key.
+    "@ai-sdk/google-vertex",
+    // rawPredict URLs and Google Cloud credentials.
+    "@ai-sdk/google-vertex/anthropic",
+    // An `api-key` header, not a bearer key.
+    "@ai-sdk/azure",
+    // AWS credentials.
+    "@ai-sdk/amazon-bedrock/mantle",
+];
+
+/// The entry to serve a row through: the recommended one when axo serves it, else the
+/// first servable one in `WIRES` order. Returns the wire, the entry and its resolved URL.
+fn served_entry<'a>(
+    provider_id: &str,
+    model_id: &str,
+    dev: &'a DevModel,
+) -> Option<(ApiKind, &'a DevApi, String)> {
+    let servable = |key: &str| {
+        let &(_, api) = WIRES.iter().find(|(wire, _)| *wire == key)?;
+        let entry = dev.api.get(key)?;
+        if entry
+            .sdk
+            .aisdk
+            .as_deref()
+            .is_some_and(|sdk| UNSERVED_SDKS.contains(&sdk))
+        {
+            return None;
+        }
+        let raw_url = entry.base_url.as_deref()?;
+        // Some rows template the host from the environment, e.g. `https://${AZURE_RESOURCE_NAME}…`.
+        let url = if raw_url.contains('$') || raw_url.starts_with('!') {
+            match resolve_config_value(raw_url) {
+                Ok(url) => url,
+                Err(error) => {
+                    tracing::debug!(
+                        "skipping models.dev entry {provider_id}/{model_id} ({key}): {error}"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            raw_url.to_owned()
+        };
+        Some((api, entry, url))
+    };
+    dev.recommended_api
+        .as_deref()
+        .and_then(servable)
+        .or_else(|| WIRES.iter().find_map(|(key, _)| servable(key)))
+}
+
 /// The model one catalog row describes, or `None` when it is not a tool-calling chat model
-/// served through a wire API axo implements at a resolvable URL.
+/// with an entry on a wire axo serves at a resolvable URL.
 fn catalog_model(provider_id: &str, model_id: &str, dev: DevModel, today: &str) -> Option<Model> {
     if dev.kind.as_deref() != Some("chat") || !dev.capabilities.tools.supported {
         return None;
     }
-    // Only the recommended entry counts: another entry may describe a gateway path the
-    // provider does not recommend for this model.
-    let recommended = dev.recommended_api.as_deref()?;
-    let (api, sdk) = match recommended {
-        "messages" => (ApiKind::AnthropicMessages, "@ai-sdk/anthropic"),
-        "chat-completions" => (ApiKind::OpenAiCompletions, "@ai-sdk/openai-compatible"),
-        _ => return None,
-    };
-    let entry = dev.api.get(recommended)?;
-    if entry.sdk.aisdk.as_deref() != Some(sdk) {
-        return None;
-    }
-    let raw_url = entry.base_url.as_deref()?;
-    // Some rows template the host from the environment, e.g. `https://${AZURE_RESOURCE_NAME}…`.
-    let url = if raw_url.contains('$') || raw_url.starts_with('!') {
-        match resolve_config_value(raw_url) {
-            Ok(url) => url,
-            Err(error) => {
-                tracing::debug!("skipping models.dev model {provider_id}/{model_id}: {error}");
-                return None;
-            }
-        }
-    } else {
-        raw_url.to_owned()
-    };
+    let (api, entry, url) = served_entry(provider_id, model_id, &dev)?;
     let url = url.trim_end_matches('/');
     // `@ai-sdk/anthropic` URLs include `/v1`; the Anthropic adapter appends `/v1/messages`.
     let url = match api {
@@ -702,6 +744,64 @@ mod tests {
             Some("none")
         );
         assert_eq!(model.service_tiers[&ServiceTier::Fast], 2.0);
+    }
+
+    #[test]
+    fn catalog_entry_choice() {
+        use serde_json::json;
+
+        let entry = |url: &str, sdk: &str| json!({"base_url": url, "sdk": {"aisdk": sdk}});
+        let cases = [
+            (
+                "recommended servable",
+                json!({"recommended_api": "messages", "api": {
+                    "messages": entry("https://a.example/v1", "@ai-sdk/anthropic"),
+                    "chat-completions": entry("https://c.example", "@ai-sdk/openai-compatible"),
+                }}),
+                Some((ApiKind::AnthropicMessages, "https://a.example")),
+            ),
+            (
+                "other SDK on a served wire",
+                json!({"recommended_api": "chat-completions", "api": {
+                    "chat-completions": entry("https://o.example/api/v1", "@openrouter/ai-sdk-provider"),
+                }}),
+                Some((ApiKind::OpenAiCompletions, "https://o.example/api/v1")),
+            ),
+            (
+                "unserved recommendation falls back",
+                json!({"recommended_api": "converse", "api": {
+                    "converse": entry("https://b.example", "@ai-sdk/amazon-bedrock"),
+                    "messages": entry("https://m.example", "@ai-sdk/anthropic"),
+                }}),
+                Some((ApiKind::AnthropicMessages, "https://m.example")),
+            ),
+            (
+                "denied SDK only",
+                json!({"recommended_api": "chat-completions", "api": {
+                    "chat-completions": entry("https://g.example", "gitlab-ai-provider"),
+                }}),
+                None,
+            ),
+            (
+                "native wire first",
+                json!({"recommended_api": "unknown", "api": {
+                    "chat-completions": entry("https://c.example", "@ai-sdk/openai-compatible"),
+                    "messages": entry("https://m.example", "@ai-sdk/anthropic"),
+                }}),
+                Some((ApiKind::AnthropicMessages, "https://m.example")),
+            ),
+        ];
+        for (name, mut row, expected) in cases {
+            row["type"] = json!("chat");
+            row["capabilities"] = json!({"tools": {"supported": true}});
+            let dev = DevModel::deserialize(&row).unwrap();
+            let model = catalog_model("p", "m", dev, "2026-11-24");
+            assert_eq!(
+                model.map(|model| (model.api, model.base_url)),
+                expected.map(|(api, url)| (api, url.to_owned())),
+                "{name}"
+            );
+        }
     }
 
     #[test]
