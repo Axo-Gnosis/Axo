@@ -84,16 +84,6 @@ pub struct SimpleStreamOptions {
     pub headers: BTreeMap<String, Option<String>>,
 }
 
-/// The OpenAI-family `service_tier` wire word for `tier`; `None` sends no tier.
-pub(crate) fn openai_service_tier(tier: ServiceTier) -> Option<&'static str> {
-    match tier {
-        ServiceTier::Standard => None,
-        ServiceTier::Flex => Some("flex"),
-        ServiceTier::Fast => Some("priority"),
-        ServiceTier::Ultrafast => Some("ultrafast"),
-    }
-}
-
 /// The tier a provider's echoed tier or speed word means.
 pub(crate) fn served_tier(echo: &str) -> ServiceTier {
     match echo {
@@ -230,6 +220,7 @@ impl Reply {
 /// The returned stream owns the request future, so dropping it cancels the request.
 pub(crate) fn respond<F>(
     model: &Model,
+    tier: ServiceTier,
     cancel: CancellationToken,
     run: impl FnOnce(Reply, CancellationToken) -> F + Send + 'static,
 ) -> BoxStream<'static, AssistantEvent>
@@ -239,7 +230,10 @@ where
     let (tx, rx) = mpsc::unbounded();
     let reply = Reply {
         tx,
-        message: AssistantMessage::empty(model),
+        message: AssistantMessage {
+            service_tier: tier,
+            ..AssistantMessage::empty(model)
+        },
         tool_args: HashMap::new(),
     };
     let producer = stream::once(async move {

@@ -257,7 +257,7 @@ async fn codex_account_id_header_comes_from_the_credential_else_the_token() {
 
 #[tokio::test]
 async fn service_tiers_reach_the_wire_and_the_bill() {
-    use ServiceTier::{Fast, Standard};
+    use ServiceTier::{Fast, Flex, Standard, Ultrafast};
 
     for api in [
         ApiKind::OpenAiCodexResponses,
@@ -268,12 +268,25 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
         // Anthropic need not report a speed on standard requests. OpenAI explicitly
         // reports "default", even when asked for priority.
         let baseline_choice = if anthropic { Standard } else { Fast };
-        for (chosen, supported, served) in [
-            (baseline_choice, true, Standard),
-            (Fast, true, Fast),
-            (Standard, true, Fast),
-            (Fast, false, Standard),
+        for (chosen, supported, served, beta_override) in [
+            (baseline_choice, true, Standard, None),
+            (Fast, true, Fast, None),
+            (Standard, true, Fast, None),
+            (Fast, false, Standard, None),
+            (Flex, true, if anthropic { Standard } else { Flex }, None),
+            (
+                Ultrafast,
+                true,
+                if anthropic { Standard } else { Ultrafast },
+                None,
+            ),
+            (Fast, true, Fast, Some(Some("configured-beta"))),
+            (Fast, true, Fast, Some(None)),
         ] {
+            if beta_override.is_some() && !anthropic {
+                continue;
+            }
+            let omitted = matches!(chosen, Flex | Ultrafast);
             let echo = if served == Fast {
                 "priority"
             } else {
@@ -281,16 +294,21 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
             };
             let response = match api {
                 ApiKind::OpenAiCodexResponses => {
-                    let event = json!({"type": "response.completed", "response": {
-                        "status": "completed", "service_tier": echo, "usage": {"input_tokens": 4}
+                    let mut event = json!({"type": "response.completed", "response": {
+                        "status": "completed", "usage": {"input_tokens": 4}
                     }});
+                    if !omitted {
+                        event["response"]["service_tier"] = json!(echo);
+                    }
                     format!("data: {event}\n\n")
                 }
                 ApiKind::OpenAiCompletions => {
                     let finish =
                         json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
                     let usage = json!({"prompt_tokens": 4});
-                    let billing = if supported && chosen != served {
+                    let billing = if omitted {
+                        format!("data: {}\n\n", json!({"usage": usage}))
+                    } else if supported && chosen != served {
                         let counts = if chosen == Fast {
                             json!({"usage": usage})
                         } else {
@@ -324,31 +342,49 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
             if supported {
                 model.service_tiers.insert(Fast, 2.0);
             }
+            model.service_tiers.extend([(Flex, 3.0), (Ultrafast, 4.0)]);
             let options = SimpleStreamOptions {
                 service_tier: chosen,
+                headers: beta_override
+                    .map(|value| {
+                        BTreeMap::from([("anthropic-beta".into(), value.map(str::to_owned))])
+                    })
+                    .unwrap_or_default(),
                 ..Default::default()
             };
             let message = request_with(model, options, BTreeMap::new()).await;
             let (head, body) = server.join().unwrap();
             let fast = chosen == Fast && supported;
             let (field, value) = if anthropic {
-                let beta =
-                    head.lines()
-                        .filter_map(|line| line.split_once(':'))
-                        .any(|(name, values)| {
-                            name.eq_ignore_ascii_case("anthropic-beta")
-                                && values
-                                    .split(',')
-                                    .any(|v| v.trim() == "fast-mode-2026-02-01")
-                        });
-                assert_eq!(beta, fast);
-                ("speed", "fast")
+                let beta = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+                    .map(|(_, value)| value.trim());
+                if let Some(configured) = beta_override {
+                    assert_eq!(beta, configured);
+                }
+                assert_eq!(
+                    beta.is_some_and(|value| value
+                        .split(',')
+                        .any(|v| v.trim() == "fast-mode-2026-02-01")),
+                    fast && beta_override.is_none()
+                );
+                ("speed", fast.then_some("fast"))
             } else {
-                ("service_tier", "priority")
+                (
+                    "service_tier",
+                    match chosen {
+                        Fast if supported => Some("priority"),
+                        Flex => Some("flex"),
+                        Ultrafast => Some("ultrafast"),
+                        _ => None,
+                    },
+                )
             };
             assert_eq!(
                 body.get(field),
-                fast.then(|| json!(value)).as_ref(),
+                value.map(|word| json!(word)).as_ref(),
                 "{api:?}"
             );
             assert_eq!(message.stop_reason, axo_ai::StopReason::Stop, "{message:?}");
@@ -356,9 +392,96 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
             assert_eq!(message.usage.input, 4, "{api:?}");
             assert_eq!(
                 message.usage.cost.unwrap().total,
-                if served == Fast { 8.0 } else { 4.0 },
+                match served {
+                    Standard => 4.0,
+                    Fast => 8.0,
+                    Flex => 12.0,
+                    Ultrafast => 16.0,
+                },
                 "{api:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_partial_replies_keep_the_served_tier_and_cost() {
+    use axo_ai::StopReason;
+    use tokio::sync::oneshot;
+
+    const START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4,\"speed\":\"fast\"}}}\n\n";
+    const TEXT: &str = concat!(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"
+    );
+
+    for abort in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut model = model(
+            ApiKind::AnthropicMessages,
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        model.service_tiers.insert(ServiceTier::Fast, 2.0);
+        model.cost.as_mut().unwrap().input = 1_000_000.0;
+        let (release, hold) = oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request_parts(&mut stream);
+            let body = if abort {
+                format!("{START}{TEXT}")
+            } else {
+                START.into()
+            };
+            let headers = if abort {
+                String::new()
+            } else {
+                format!("Content-Length: {}\r\n", body.len())
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n{headers}\r\n{body}"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            if abort {
+                let _ = hold.blocking_recv();
+            }
+        });
+        let cancel = CancellationToken::new();
+        let mut stream = AnthropicApi::new(reqwest::Client::new()).stream(
+            &model,
+            Transcript::new(Vec::new()),
+            StreamOptions {
+                auth: ModelAuth {
+                    api_key: Some("test".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    AssistantEvent::TextDelta { .. } if abort => cancel.cancel(),
+                    AssistantEvent::Error { message, .. } => return message,
+                    _ => {}
+                }
+            }
+            panic!("stream ended without an error event");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            message.stop_reason,
+            if abort {
+                StopReason::Aborted
+            } else {
+                StopReason::Error
+            }
+        );
+        assert_eq!(message.service_tier, ServiceTier::Fast, "{message:?}");
+        assert_eq!(message.usage.total_tokens, 4);
+        assert_eq!(message.usage.cost.unwrap().total, 8.0);
+        drop(release);
+        server.join().unwrap();
     }
 }

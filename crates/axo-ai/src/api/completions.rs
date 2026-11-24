@@ -22,24 +22,24 @@ use tokio_util::sync::CancellationToken;
 use crate::api::http::{prepare, read_sse, send};
 use crate::api::sse::SseEvent;
 use crate::api::{
-    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map,
-    openai_service_tier, respond, served_tier,
+    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
+    served_tier,
 };
 use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
 use crate::event::AssistantEvent;
 use crate::json::parse_tool_arguments;
 use crate::model::{
-    CacheControlFormat, ChatTemplateValue, InputKind, MaxTokensField, Model, SessionAffinityFormat,
-    ThinkingFormat, ThinkingTokenBudgetField, ThinkingVar,
+    ApiKind, CacheControlFormat, ChatTemplateValue, InputKind, MaxTokensField, Model,
+    SessionAffinityFormat, ThinkingFormat, ThinkingTokenBudgetField, ThinkingVar, tier_wire,
 };
 use crate::thinking::{MIN_ANSWER_TOKENS, clamp_level, default_thinking_budget, provider_value};
 use crate::transcript::{
     Transcript, render_system_message_update, resolve_transcript_tools, system_message_text,
 };
 use crate::types::{
-    AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, StopReason, ThinkingLevel,
-    ToolCall, ToolSpec, Usage, UserBlock,
+    AssistantBlock, AssistantMessage, JsonMap, Message, ReasoningReplay, ServiceTier, StopReason,
+    ThinkingLevel, ToolCall, ToolSpec, Usage, UserBlock,
 };
 
 /// Delta fields that carry reasoning text, in the order they are read: llama.cpp uses
@@ -72,7 +72,8 @@ impl Api for CompletionsApi {
     ) -> BoxStream<'static, AssistantEvent> {
         let response_model = model.clone();
         let http = self.http.clone();
-        respond(model, cancel, move |reply, cancel| async move {
+        let tier = model.effective_tier(opts.simple.service_tier);
+        respond(model, tier, cancel, move |reply, cancel| async move {
             let mut response = Response::new(response_model, reply);
             let result = response.request(&http, &transcript, &opts, &cancel).await;
             (response.reply, result)
@@ -251,6 +252,7 @@ fn build_params(
     simple: &SimpleStreamOptions,
     compat: &ResolvedCompat,
     base_url: &str,
+    tier: ServiceTier,
 ) -> Value {
     let effort = Some(clamp_level(model, simple.thinking)).filter(|l| *l != ThinkingLevel::Off);
     let resolved = transcript.resolve(compat.supports_mid_convo_system_messages);
@@ -330,7 +332,7 @@ fn build_params(
     if let Some(priority) = model.compat.vllm_priority {
         params.insert("priority".into(), priority.into());
     }
-    if let Some(name) = openai_service_tier(model.effective_tier(simple.service_tier)) {
+    if let Some(name) = tier_wire(ApiKind::OpenAiCompletions, tier) {
         params.insert("service_tier".into(), name.into());
     }
 
@@ -1133,7 +1135,6 @@ impl Response {
         opts: &StreamOptions,
         cancel: &CancellationToken,
     ) -> Result<StopReason, String> {
-        self.reply.message.service_tier = self.model.effective_tier(opts.simple.service_tier);
         let base_url = opts.base_url(&self.model);
         let compat = resolve_compat(&self.model, base_url);
         let mut headers = build_headers(&compat, opts)?;
@@ -1141,7 +1142,14 @@ impl Response {
         headers
             .entry(reqwest::header::CONTENT_TYPE)
             .or_insert(HeaderValue::from_static("application/json"));
-        let params = build_params(&self.model, transcript, &opts.simple, &compat, base_url);
+        let params = build_params(
+            &self.model,
+            transcript,
+            &opts.simple,
+            &compat,
+            base_url,
+            self.reply.message.service_tier,
+        );
         let request = ProviderRequest {
             url: format!("{base_url}/chat/completions"),
             headers,
@@ -1264,7 +1272,7 @@ impl Response {
         let tier_changed = tier != message.service_tier;
         message.service_tier = tier;
         if usage.is_some() || tier_changed {
-            calculate_cost(&self.model, &mut message.usage, tier);
+            calculate_cost(&self.model, message);
         }
         let Some(choice) = choice else { return };
         if let Some(reason) = choice

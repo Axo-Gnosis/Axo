@@ -1,22 +1,18 @@
 //! Response cost from usage and model prices. Port of pi `models.ts` `calculateCost`.
 
 use crate::model::Model;
-use crate::types::{ServiceTier, Usage, UsageCost};
+use crate::types::{AssistantMessage, UsageCost};
 
-/// Compute `usage.cost` from the model's prices, store it, and return it. `None` when the
-/// model's pricing is unknown.
+/// Compute `usage.cost` from the model's prices, or clear it when pricing is unknown.
 ///
 /// The highest pricing tier whose input threshold the request exceeds applies to the
-/// whole request. 1h cache writes cost twice the base input price (Anthropic). `tier` is
-/// the service tier that served the response; its multiplier scales every component.
-pub(crate) fn calculate_cost(
-    model: &Model,
-    usage: &mut Usage,
-    tier: ServiceTier,
-) -> Option<UsageCost> {
+/// whole request. 1h cache writes cost twice the base input price (Anthropic). The
+/// message's recorded service tier scales every component.
+pub(crate) fn calculate_cost(model: &Model, message: &mut AssistantMessage) {
+    let usage = &mut message.usage;
     let Some(cost) = &model.cost else {
         usage.cost = None;
-        return None;
+        return;
     };
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
     let (mut input, mut output, mut cache_read, mut cache_write) =
@@ -34,7 +30,11 @@ pub(crate) fn calculate_cost(
 
     let long_write = usage.cache_write_1h.unwrap_or(0) as f64;
     let short_write = usage.cache_write as f64 - long_write;
-    let multiplier = model.service_tiers.get(&tier).copied().unwrap_or(1.0);
+    let multiplier = model
+        .service_tiers
+        .get(&message.service_tier)
+        .copied()
+        .unwrap_or(1.0);
     let mut result = UsageCost {
         input: input / 1_000_000.0 * usage.input as f64 * multiplier,
         output: output / 1_000_000.0 * usage.output as f64 * multiplier,
@@ -45,5 +45,4 @@ pub(crate) fn calculate_cost(
     };
     result.total = result.input + result.output + result.cache_read + result.cache_write;
     usage.cost = Some(result);
-    Some(result)
 }

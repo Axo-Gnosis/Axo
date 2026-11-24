@@ -11,15 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::http::{Prepared, prepare, read_sse, send};
 use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
-use crate::api::{
-    Api, ProviderRequest, Reply, StreamOptions, header_map, openai_service_tier, respond,
-};
+use crate::api::{Api, ProviderRequest, Reply, StreamOptions, header_map, respond};
 use crate::auth::codex::{BASE_URL, account_id};
 use crate::event::AssistantEvent;
-use crate::model::Model;
+use crate::model::{ApiKind, Model, tier_wire};
 use crate::thinking::clamp_level;
 use crate::transcript::{Transcript, resolve_transcript_tools, system_message_text};
-use crate::types::{StopReason, ThinkingLevel, now_ms};
+use crate::types::{ServiceTier, StopReason, ThinkingLevel, now_ms};
 
 /// pi `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH`.
 const PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
@@ -52,13 +50,12 @@ impl Api for CodexApi {
         opts: StreamOptions,
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
-        let request = build_request(model, &transcript, &opts);
         let tier = model.effective_tier(opts.simple.service_tier);
+        let request = build_request(model, &transcript, &opts, tier);
         let rewrite = opts.rewrite.clone();
         let http = self.http.clone();
         let owned_model = model.clone();
-        respond(model, cancel, move |mut reply, cancel| async move {
-            reply.message.service_tier = tier;
+        respond(model, tier, cancel, move |mut reply, cancel| async move {
             let result = async {
                 let prepared = prepare(
                     rewrite.as_deref(),
@@ -80,6 +77,7 @@ fn build_request(
     model: &Model,
     transcript: &Transcript,
     opts: &StreamOptions,
+    tier: ServiceTier,
 ) -> Result<ProviderRequest, String> {
     let token = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
     let session_id: Option<String> = opts
@@ -87,7 +85,7 @@ fn build_request(
         .session_id
         .as_deref()
         .map(|id| id.chars().take(PROMPT_CACHE_KEY_MAX_CHARS).collect());
-    let body = build_request_body(model, transcript, opts, session_id.as_deref());
+    let body = build_request_body(model, transcript, opts, session_id.as_deref(), tier);
 
     // Defaults first so auth and caller headers can override them; the auth and
     // protocol headers always win. The account id derived from a ChatGPT token is only a
@@ -144,6 +142,7 @@ fn build_request_body(
     transcript: &Transcript,
     opts: &StreamOptions,
     prompt_cache_key: Option<&str>,
+    tier: ServiceTier,
 ) -> Value {
     let compat = &model.compat;
     let options = ConvertOptions {
@@ -183,7 +182,7 @@ fn build_request_body(
     if let Some(temperature) = opts.simple.temperature {
         body["temperature"] = json!(temperature);
     }
-    if let Some(name) = openai_service_tier(model.effective_tier(opts.simple.service_tier)) {
+    if let Some(name) = tier_wire(ApiKind::OpenAiCodexResponses, tier) {
         body["service_tier"] = json!(name);
     }
     if !request_tools.is_empty() {

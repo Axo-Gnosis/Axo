@@ -20,6 +20,19 @@ pub enum ApiKind {
     OpenAiCodexResponses,
 }
 
+pub(crate) fn tier_wire(api: ApiKind, tier: ServiceTier) -> Option<&'static str> {
+    use ApiKind::{AnthropicMessages, OpenAiCodexResponses, OpenAiCompletions};
+    use ServiceTier::{Fast, Flex, Standard, Ultrafast};
+
+    match (api, tier) {
+        (_, Standard) | (AnthropicMessages, Flex | Ultrafast) => None,
+        (AnthropicMessages, Fast) => Some("fast"),
+        (OpenAiCompletions | OpenAiCodexResponses, Flex) => Some("flex"),
+        (OpenAiCompletions | OpenAiCodexResponses, Fast) => Some("priority"),
+        (OpenAiCompletions | OpenAiCodexResponses, Ultrafast) => Some("ultrafast"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum InputKind {
@@ -115,9 +128,7 @@ impl Model {
     /// `tier` when this model can be sent it, else `Standard`. Anthropic Messages has one
     /// speed switch, so only `Fast` is sendable there.
     pub fn effective_tier(&self, tier: ServiceTier) -> ServiceTier {
-        let sendable = self.service_tiers.contains_key(&tier)
-            && (self.api != ApiKind::AnthropicMessages || tier == ServiceTier::Fast);
-        if sendable {
+        if tier_wire(self.api, tier).is_some() && self.service_tiers.contains_key(&tier) {
             tier
         } else {
             ServiceTier::Standard

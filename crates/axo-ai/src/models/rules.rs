@@ -11,7 +11,9 @@ use serde_json::Value;
 
 use crate::auth::codex;
 use crate::auth::resolve::resolve_config_value;
-use crate::model::{ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap};
+use crate::model::{
+    ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap, tier_wire,
+};
 use crate::types::{ServiceTier, ThinkingLevel};
 
 use super::catalog::{Catalog, DevApi, DevCost, DevModel, DevOverride};
@@ -394,15 +396,9 @@ fn catalog_cost(cost: &DevCost) -> Option<Cost> {
 
 /// The tier a catalog `service_tier` name means on `api`, when axo knows its wire form.
 fn tier_named(api: ApiKind, name: &str) -> Option<ServiceTier> {
-    match api {
-        ApiKind::AnthropicMessages => (name == "fast").then_some(ServiceTier::Fast),
-        ApiKind::OpenAiCompletions | ApiKind::OpenAiCodexResponses => match name {
-            "priority" => Some(ServiceTier::Fast),
-            "flex" => Some(ServiceTier::Flex),
-            "ultrafast" => Some(ServiceTier::Ultrafast),
-            _ => None,
-        },
-    }
+    ServiceTier::ALL
+        .into_iter()
+        .find(|&tier| tier_wire(api, tier) == Some(name))
 }
 
 /// Tier multipliers from `cost.multipliers`, else derived from per-tier input prices.

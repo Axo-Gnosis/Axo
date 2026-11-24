@@ -717,8 +717,7 @@ impl<'a> ResponsesStream<'a> {
         if let Some(echo) = response.get("service_tier").and_then(Value::as_str) {
             reply.message.service_tier = served_tier(echo);
         }
-        let tier = reply.message.service_tier;
-        calculate_cost(self.model, &mut reply.message.usage, tier);
+        calculate_cost(self.model, &mut reply.message);
 
         // Incomplete responses keep the provider's reason so max-output truncation and
         // content filtering stay distinct.

@@ -22,7 +22,7 @@ use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
 use crate::event::AssistantEvent;
 use crate::json::{parse_tool_arguments, parse_with_repair};
-use crate::model::{ApiKind, Model, SessionAffinityFormat};
+use crate::model::{ApiKind, Model, SessionAffinityFormat, tier_wire};
 use crate::thinking::{MIN_ANSWER_TOKENS, default_thinking_budget};
 use crate::transcript::{
     Transcript, TranscriptToolSupport, current_tools, render_system_message_update,
@@ -30,8 +30,8 @@ use crate::transcript::{
 };
 use crate::transform::replace_images;
 use crate::types::{
-    AssistantBlock, Message, ReasoningReplay, ServiceTier, StopReason, ThinkingLevel, ToolCall,
-    ToolResultMessage, ToolSpec, Usage, UserBlock,
+    AssistantBlock, AssistantMessage, Message, ReasoningReplay, ServiceTier, StopReason,
+    ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec, UserBlock,
 };
 
 const API_VERSION: &str = "2023-06-01";
@@ -74,7 +74,8 @@ impl Api for AnthropicApi {
     ) -> BoxStream<'static, AssistantEvent> {
         let http = self.http.clone();
         let owned_model = model.clone();
-        respond(model, cancel, move |mut reply, cancel| async move {
+        let tier = model.effective_tier(opts.simple.service_tier);
+        respond(model, tier, cancel, move |mut reply, cancel| async move {
             let result = run(&http, &owned_model, &transcript, &opts, &cancel, &mut reply).await;
             (reply, result)
         })
@@ -117,7 +118,7 @@ impl AnthropicCompat {
 struct RequestOptions {
     max_tokens: u64,
     temperature: Option<f64>,
-    fast: bool,
+    tier: ServiceTier,
     tool_choice: Option<crate::ToolChoice>,
     thinking_enabled: bool,
     thinking_budget_tokens: Option<u64>,
@@ -130,6 +131,7 @@ fn request_options(
     model: &Model,
     transcript: &Transcript,
     simple: &SimpleStreamOptions,
+    tier: ServiceTier,
 ) -> RequestOptions {
     let base = RequestOptions {
         max_tokens: clamp_max_tokens_to_context(
@@ -138,7 +140,7 @@ fn request_options(
             simple.max_tokens.unwrap_or(model.max_tokens),
         ),
         temperature: simple.temperature,
-        fast: model.effective_tier(simple.service_tier) == ServiceTier::Fast,
+        tier,
         tool_choice: simple.tool_choice,
         thinking_enabled: false,
         thinking_budget_tokens: None,
@@ -199,12 +201,7 @@ async fn run(
     let api_key = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
 
     let compat = AnthropicCompat::of(model);
-    let options = request_options(model, transcript, &opts.simple);
-    reply.message.service_tier = if options.fast {
-        ServiceTier::Fast
-    } else {
-        ServiceTier::Standard
-    };
+    let options = request_options(model, transcript, &opts.simple, reply.message.service_tier);
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
     let built = build_params(model, &resolved, &compat, &options);
     if built.provider_thinking_level.is_some() {
@@ -337,8 +334,7 @@ impl BlockMapper {
                         .as_u64()
                         .unwrap_or(0),
                 );
-                let tier = output.service_tier;
-                update_cost(model, &mut output.usage, tier);
+                update_cost(model, output);
             }
             "content_block_start" => self.start_block(&event, reply)?,
             "content_block_delta" => self.delta(&event, reply),
@@ -377,8 +373,7 @@ impl BlockMapper {
                 if let Some(value) = usage["output_tokens_details"]["thinking_tokens"].as_u64() {
                     output.usage.reasoning = Some(value);
                 }
-                let tier = output.service_tier;
-                update_cost(model, &mut output.usage, tier);
+                update_cost(model, output);
             }
             "message_stop" => self.saw_stop = true,
             _ => {}
@@ -537,9 +532,10 @@ fn append_text(reply: &mut Reply, content_index: usize, delta: &str) {
 }
 
 /// Anthropic reports no total; it is the sum of the parts. Priced after every update.
-fn update_cost(model: &Model, usage: &mut Usage, tier: ServiceTier) {
+fn update_cost(model: &Model, output: &mut AssistantMessage) {
+    let usage = &mut output.usage;
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    calculate_cost(model, usage, tier);
+    calculate_cost(model, output);
 }
 
 fn map_stop_reason(
@@ -640,8 +636,8 @@ fn build_params(
     {
         params["temperature"] = json!(temperature);
     }
-    if options.fast {
-        params["speed"] = json!("fast");
+    if let Some(word) = tier_wire(ApiKind::AnthropicMessages, options.tier) {
+        params["speed"] = json!(word);
     }
 
     let tool_cache_control = compat.cache_control_on_tools.then_some(&cache_control);
@@ -746,7 +742,7 @@ fn beta_features(
             if native_tool_changes {
                 add(INLINE_TOOLS_BETA);
             }
-            if options.fast {
+            if options.tier == ServiceTier::Fast {
                 add(FAST_MODE_BETA);
             }
         }
