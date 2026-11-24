@@ -10,6 +10,7 @@ use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
 use crate::auth::CredentialStore;
+use crate::auth::claude_subscription::{self, ClaudeSubscriptionLogin};
 use crate::auth::codex as codex_auth;
 use crate::auth::resolve::resolve_auth;
 use crate::error::Error;
@@ -102,6 +103,8 @@ impl Pending {
 impl Models {
     pub async fn load(opts: ModelsOptions) -> Result<Models, Error> {
         let http = opts.http_client.unwrap_or_else(crate::api::http::client);
+        let subscription_login =
+            Arc::new(ClaudeSubscriptionLogin::new(claude_subscription::client()?));
         let mut inputs = Inputs {
             config: opts.config,
             extended_context: opts.extended_context,
@@ -146,6 +149,7 @@ impl Models {
             pending.candidate(&inputs),
             &opts.credentials,
             &http,
+            &subscription_login,
             &|_| Vec::new(),
             &|_| true,
             attempted.as_mut(),
@@ -154,6 +158,9 @@ impl Models {
         if let Err(error) = pending.commit(&mut inputs, opts.cache_dir.as_deref()).await {
             tracing::warn!("models.dev catalog unavailable, continuing without it: {error}");
         }
+        let anthropic_subscription = Arc::new(AnthropicApi::subscription(
+            subscription_login.http().clone(),
+        ));
         let models = Models {
             view: View {
                 shared: Arc::new(Shared {
@@ -162,6 +169,7 @@ impl Models {
                     cache_dir: opts.cache_dir,
                     credentials: opts.credentials,
                     http: http.clone(),
+                    claude_subscription: subscription_login,
                     next_layer: AtomicU64::new(0),
                     changes: watch::Sender::new(0),
                     scopes: Mutex::new(Vec::new()),
@@ -170,6 +178,7 @@ impl Models {
                 scope: None,
             },
             anthropic: Arc::new(AnthropicApi::new(http.clone())),
+            anthropic_subscription,
             completions: Arc::new(CompletionsApi::new(http.clone())),
             codex: Arc::new(CodexApi::new(http)),
         };
@@ -193,6 +202,7 @@ impl Models {
             candidate,
             &shared.credentials,
             &shared.http,
+            &shared.claude_subscription,
             &|id| shared.loaded_ids(id),
             &|id| shared.is_base_visible(id),
             None,
@@ -269,6 +279,7 @@ impl Models {
                     candidate,
                     &self.view.shared.credentials,
                     &self.view.shared.http,
+                    &self.view.shared.claude_subscription,
                     &|id| self.view.shared.loaded_ids(id),
                     &|_| false,
                     None,
@@ -346,6 +357,7 @@ impl Shared {
             pending.candidate(inputs),
             &self.credentials,
             &self.http,
+            &self.claude_subscription,
             &|id| self.loaded_ids(id),
             discover,
             None,

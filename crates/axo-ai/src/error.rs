@@ -21,6 +21,9 @@ pub enum Error {
     UnknownModel { provider: String, model: String },
     #[error("No API key for provider: {provider}")]
     NoApiKey { provider: String },
+    /// The provider requires a stored OAuth login rather than an API key.
+    #[error("Log in to {provider}")]
+    LoginRequired { provider: String },
     /// Login, token exchange, refresh or credential lookup failed.
     #[error("{0}")]
     Auth(String),

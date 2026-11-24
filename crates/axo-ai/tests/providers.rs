@@ -52,6 +52,7 @@ fn provider(id: &str, models: Vec<Model>) -> Provider {
         models,
         env: Vec::new(),
         requires_key: false,
+        oauth_only: false,
         login: None,
         rewrite: None,
     }
@@ -979,6 +980,119 @@ async fn credential_slots_follow_the_origin_not_the_winner() {
     );
     assert_eq!(store.get(&loaded).await.unwrap(), Some(expired));
     assert_eq!(store.get("lab").await.unwrap(), Some(key("ambiguous")));
+}
+
+struct ApiKeyLogin;
+
+#[async_trait]
+impl ProviderLogin for ApiKeyLogin {
+    async fn login(&self, _interaction: &dyn LoginInteraction) -> Result<Credential, Error> {
+        Ok(Credential::ApiKey {
+            key: "from-login".into(),
+        })
+    }
+
+    async fn refresh(&self, _credential: Credential) -> Result<Credential, Error> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn claude_subscription_policy_follows_winning_provider_not_wire_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let (models, store) = load(&dir).await;
+    let (url, server) = server(1);
+    let lab = model("lab", "only", ApiKind::AnthropicMessages, &url);
+    let interaction = ScriptedInteraction::default();
+    let registration = || Provider {
+        requires_key: true,
+        ..provider("lab", vec![lab.clone()])
+    };
+    models
+        .register(
+            "host",
+            Provider {
+                login: Some(Arc::new(ApiKeyLogin)),
+                ..registration()
+            },
+        )
+        .unwrap();
+    assert!(models.set_api_key("lab", " \t".into()).await.is_err());
+    models.set_api_key("lab", "from-host".into()).await.unwrap();
+    assert_eq!(
+        models.auth(&lab).await.unwrap().api_key.as_deref(),
+        Some("from-host")
+    );
+    models.login("lab", &interaction).await.unwrap();
+    assert_eq!(
+        models.auth(&lab).await.unwrap().api_key.as_deref(),
+        Some("from-login")
+    );
+
+    let oauth_only = || Provider {
+        oauth_only: true,
+        ..registration()
+    };
+    assert!(models.register("invalid", oauth_only()).is_err());
+    let layer = models.provider_layer();
+    let replace = |login: Arc<dyn ProviderLogin>| {
+        layer
+            .replace(vec![(
+                "ext/lab".into(),
+                Provider {
+                    login: Some(login),
+                    ..oauth_only()
+                },
+                None,
+            )])
+            .unwrap();
+    };
+    replace(Arc::new(ApiKeyLogin));
+    let slot = models.credential_slot("lab").unwrap();
+    assert!(
+        models
+            .providers()
+            .iter()
+            .any(|info| info.id == "lab" && info.oauth_only)
+    );
+    assert!(matches!(
+        models.set_api_key("lab", "forbidden".into()).await,
+        Err(Error::LoginRequired { .. })
+    ));
+    assert!(models.login("lab", &interaction).await.is_err());
+    assert_eq!(store.get(&slot).await.unwrap(), None);
+
+    store
+        .set(
+            &slot,
+            Credential::ApiKey {
+                key: "stale".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        models.auth(&lab).await,
+        Err(Error::LoginRequired { .. })
+    ));
+    replace(Arc::new(ScriptedLogin {
+        base_url: url,
+        refreshes: AtomicUsize::new(0),
+    }));
+    models.login("lab", &interaction).await.unwrap();
+    assert_eq!(
+        models.credential_source("lab").await.unwrap(),
+        CredentialSource::Oauth
+    );
+    assert_server_error("lab", stream(&models, &lab).await);
+    let (head, body) = server.join().unwrap().pop().unwrap();
+    assert_eq!(
+        http_header_values(&head, "x-api-key").next(),
+        Some("access-1")
+    );
+    assert_eq!(http_header_values(&head, "x-scripted").next(), Some("1"));
+    assert_eq!(http_header_values(&head, "authorization").next(), None);
+    assert_eq!(body["system"][0]["text"], "test");
 }
 
 #[tokio::test]

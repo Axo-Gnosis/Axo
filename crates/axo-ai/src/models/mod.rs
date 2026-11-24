@@ -23,6 +23,7 @@ use crate::api::anthropic::AnthropicApi;
 use crate::api::codex::CodexApi;
 use crate::api::completions::CompletionsApi;
 use crate::auth::CredentialStore;
+use crate::auth::claude_subscription::ClaudeSubscriptionLogin;
 
 use self::config::ModelsConfig;
 use self::feeds::Inputs;
@@ -35,6 +36,8 @@ pub struct ProviderInfo {
     pub id: String,
     pub env: Vec<String>,
     pub requires_key: bool,
+    /// This provider accepts only stored OAuth credentials.
+    pub oauth_only: bool,
     /// The provider supports `Models::login`.
     pub login: bool,
     /// The winning contributor of this id.
@@ -49,7 +52,8 @@ pub struct ModelsOptions {
     pub extended_context: bool,
     pub config: ModelsConfig,
     pub credentials: Arc<dyn CredentialStore>,
-    /// Client shared by catalog, discovery, streaming and OAuth requests.
+    /// Client shared by catalog, discovery, and ordinary provider requests.
+    /// Claude subscription uses a dedicated no-redirect client for login and inference.
     pub http_client: Option<reqwest::Client>,
 }
 
@@ -62,6 +66,7 @@ pub struct ModelsOptions {
 pub struct Models {
     view: View,
     anthropic: Arc<AnthropicApi>,
+    anthropic_subscription: Arc<AnthropicApi>,
     completions: Arc<CompletionsApi>,
     codex: Arc<CodexApi>,
 }
@@ -96,6 +101,7 @@ struct Shared {
     cache_dir: Option<PathBuf>,
     credentials: Arc<dyn CredentialStore>,
     http: reqwest::Client,
+    claude_subscription: Arc<ClaudeSubscriptionLogin>,
     /// The next `ProviderLayer` ordinal.
     next_layer: AtomicU64,
     /// Generation counter bumped whenever the base published snapshot or provider list changes.

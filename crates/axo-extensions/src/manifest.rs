@@ -50,6 +50,8 @@ pub struct ProviderDecl {
     #[serde(default = "yes")]
     pub requires_key: bool,
     #[serde(default)]
+    pub oauth_only: bool,
+    #[serde(default)]
     pub login: bool,
     #[serde(default)]
     pub rewrite: bool,
@@ -67,6 +69,7 @@ impl ProviderDecl {
             models: self.models.clone(),
             env: self.env.clone(),
             requires_key: self.requires_key,
+            oauth_only: self.oauth_only,
             login: None,
             rewrite: None,
         }
@@ -354,7 +357,14 @@ pub async fn load(id: &str, package: &Path) -> Result<Discovered, ExtensionProbl
         |decl| {
             decl.provider()
                 .validate()
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            if decl.oauth_only && !decl.login {
+                return Err(format!(
+                    "OAuth-only provider {:?} must declare login",
+                    decl.id
+                ));
+            }
+            Ok(())
         },
     )
     .map_err(fail)?;
@@ -748,6 +758,49 @@ mod tests {
             std::fs::write(dir.join(entry), "export default () => ({});").unwrap();
         }
         dir
+    }
+
+    #[tokio::test]
+    async fn claude_subscription_manifest_credential_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        for (provider, admitted) in [
+            (json!({ "id": "ordinary" }), true),
+            (
+                json!({ "id": "oauth", "oauthOnly": true, "login": true }),
+                true,
+            ),
+            (json!({ "id": "missing-login", "oauthOnly": true }), false),
+            (
+                json!({
+                    "id": "keyless", "oauthOnly": true, "login": true, "requiresKey": false
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "id": "environment", "oauthOnly": true, "login": true, "env": ["API_KEY"]
+                }),
+                false,
+            ),
+        ] {
+            let dir = package(
+                temp.path(),
+                "lab",
+                &json!({ "id": "lab", "entry": "index.ts", "providers": [provider.clone()] }),
+                Some("index.ts"),
+            );
+            let result = load("lab", &dir).await;
+            assert_eq!(result.is_ok(), admitted, "{provider}: {result:?}");
+            if let Ok(found) = result {
+                let declaration = &found.metadata.providers[0];
+                let expected = provider["oauthOnly"].as_bool().unwrap_or(false);
+                assert_eq!(declaration.oauth_only, expected);
+                let metadata = declaration.provider();
+                assert_eq!(metadata.oauth_only, expected);
+                // Admission checks declarations without requiring a bound runner callback.
+                assert!(metadata.login.is_none());
+            }
+        }
     }
 
     #[test]

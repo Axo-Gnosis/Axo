@@ -1,5 +1,6 @@
 //! Credentials and the auth seam every provider request goes through.
 
+pub(crate) mod claude_subscription;
 pub mod codex;
 pub mod provider;
 pub mod resolve;

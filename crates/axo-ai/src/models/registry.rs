@@ -7,10 +7,11 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Wea
 use tokio::sync::watch;
 
 use crate::api::RequestRewrite;
+use crate::auth::claude_subscription;
 use crate::auth::codex as codex_auth;
 use crate::auth::provider::{LoginInteraction, Provider};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
-use crate::auth::{CredentialSource, ModelAuth};
+use crate::auth::{Credential, CredentialSource, ModelAuth};
 use crate::error::Error;
 use crate::model::Model;
 
@@ -103,6 +104,7 @@ impl Published {
                 id: info.id.clone(),
                 env: info.env.clone(),
                 requires_key: info.requires_key,
+                oauth_only: info.oauth_only,
                 login: info.login.is_some(),
                 origin,
             })
@@ -275,11 +277,18 @@ impl Registered {
             return Err(Error::Config("credential owner must not be empty".into()));
         }
         provider.validate()?;
+        if provider.oauth_only && provider.login.is_none() {
+            return Err(Error::Config(format!(
+                "provider {}: OAuth-only requires a login handler",
+                provider.id
+            )));
+        }
         let Provider {
             id,
             models,
             env,
             requires_key,
+            oauth_only,
             login,
             rewrite,
         } = provider;
@@ -289,6 +298,7 @@ impl Registered {
             config_api_key: None,
             env,
             requires_key,
+            oauth_only,
             login,
         });
         Ok((
@@ -308,6 +318,7 @@ impl Registered {
             headers: BTreeMap::new(),
             rewrite: self.rewrite.clone(),
             config_base_url: false,
+            anthropic_subscription: false,
         }
     }
 }
@@ -319,13 +330,20 @@ struct Layered {
 }
 
 impl Provider {
-    /// Checks what `Models::register` and `ProviderLayer::replace` require: a non-empty id
-    /// without `/`, and models belonging to it with distinct ids and positive finite multipliers
-    /// for non-Standard tiers.
+    /// Checks registration metadata without requiring a bound login callback, so manifests
+    /// can use it before activation.
     pub fn validate(&self) -> Result<(), Error> {
         let id = &self.id;
         if id.is_empty() || id.contains('/') {
             return Err(Error::Config(format!("invalid provider id: {id:?}")));
+        }
+        if id == claude_subscription::PROVIDER {
+            return Err(Error::Config(format!("provider {id} is reserved")));
+        }
+        if self.oauth_only && (!self.requires_key || !self.env.is_empty()) {
+            return Err(Error::Config(format!(
+                "provider {id}: OAuth-only requires a credential and cannot use environment variables"
+            )));
         }
         let mut seen = HashSet::new();
         for model in &self.models {
@@ -360,6 +378,7 @@ pub(super) struct Request {
     pub(super) headers: BTreeMap<String, String>,
     pub(super) rewrite: Option<Arc<dyn RequestRewrite>>,
     pub(super) config_base_url: bool,
+    pub(super) anthropic_subscription: bool,
 }
 
 impl Models {
@@ -393,6 +412,7 @@ impl Models {
                 scope: Some(scope),
             },
             anthropic: Arc::clone(&self.anthropic),
+            anthropic_subscription: Arc::clone(&self.anthropic_subscription),
             completions: Arc::clone(&self.completions),
             codex: Arc::clone(&self.codex),
         }
@@ -484,6 +504,25 @@ impl Models {
         .await
     }
 
+    /// Stores an API key in the winning provider's slot. OAuth-only providers reject keys
+    /// even when they have no models. Use `login` for those providers.
+    pub async fn set_api_key(&self, provider: &str, key: String) -> Result<(), Error> {
+        let info = self.provider(provider, false)?;
+        if info.oauth_only {
+            return Err(Error::LoginRequired {
+                provider: info.id.clone(),
+            });
+        }
+        if key.trim().is_empty() {
+            return Err(Error::Auth("API key cannot be blank".into()));
+        }
+        self.view
+            .shared
+            .credentials
+            .set(&info.slot, Credential::ApiKey { key })
+            .await
+    }
+
     /// Runs `provider`'s login through `interaction` and stores the credential. Drop the
     /// future to cancel. An unavailable provider fails with `Error::ProviderUnavailable`
     /// before its login starts.
@@ -498,6 +537,7 @@ impl Models {
             .as_ref()
             .ok_or_else(|| Error::Auth(format!("provider {provider} does not support login")))?;
         let credential = login.login(interaction).await?;
+        info.validate_login_credential(&credential)?;
         self.view
             .shared
             .credentials
@@ -584,6 +624,7 @@ impl Models {
             let key = (model.provider.clone(), model.id.clone());
             Ok(Request {
                 model: model.clone(),
+                anthropic_subscription: auth.id == claude_subscription::PROVIDER,
                 auth,
                 headers: base
                     .loaded
@@ -779,6 +820,7 @@ mod tests {
                             models: Vec::new(),
                             env: Vec::new(),
                             requires_key: false,
+                            oauth_only: false,
                             login: None,
                             rewrite: None,
                         },

@@ -22,6 +22,8 @@ pub struct Provider {
     pub env: Vec<String>,
     /// `false` lets the provider run without any key.
     pub requires_key: bool,
+    /// Accepts only stored OAuth credentials. Requires an empty `env` and a login handler.
+    pub oauth_only: bool,
     pub login: Option<Arc<dyn ProviderLogin>>,
     pub rewrite: Option<Arc<dyn RequestRewrite>>,
 }

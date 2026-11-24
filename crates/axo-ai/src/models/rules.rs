@@ -9,8 +9,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::auth::codex;
 use crate::auth::resolve::resolve_config_value;
+use crate::auth::{claude_subscription, codex};
 use crate::model::{
     ApiKind, Compat, Cost, CostTier, InputKind, Model, ThinkingLevelMap, tier_wire,
     valid_tier_multiplier,
@@ -113,7 +113,7 @@ pub(crate) fn map_catalog(catalog: &Catalog) -> CatalogModels {
     let today = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
 
     for (provider_id, provider) in catalog {
-        if provider_id == codex::PROVIDER {
+        if provider_id == codex::PROVIDER || provider_id == claude_subscription::PROVIDER {
             continue;
         }
         let before = models.len();
@@ -167,6 +167,28 @@ pub(crate) fn build(
         .map(|catalog| (catalog.models.clone(), catalog.envs.clone()))
         .unwrap_or_default();
 
+    // Derive from the unpatched feed on every rebuild, never from a published snapshot.
+    if let Some(catalog) = catalog {
+        models.extend(
+            catalog
+                .models
+                .iter()
+                .filter(|model| {
+                    model.provider == "anthropic"
+                        && model.api == ApiKind::AnthropicMessages
+                        && model.base_url == claude_subscription::BASE_URL
+                })
+                .map(|model| {
+                    let mut model = Arc::new(model.as_ref().clone());
+                    cap_at_price_tier(&mut model);
+                    let subscription = Arc::get_mut(&mut model).expect("fresh subscription model");
+                    subscription.provider = claude_subscription::PROVIDER.to_owned();
+                    subscription.cost = None;
+                    subscription.service_tiers.clear();
+                    model
+                }),
+        );
+    }
     envs.insert(codex::PROVIDER.to_owned(), Vec::new());
     match discovered {
         Some(list) => models.extend(list.iter().map(|model| {

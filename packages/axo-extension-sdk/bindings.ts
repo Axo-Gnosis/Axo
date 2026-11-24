@@ -2923,6 +2923,8 @@ export type ProviderInfo = {
 	id: string,
 	env: string[],
 	requiresKey: boolean,
+	/**  This provider accepts only stored OAuth credentials. */
+	oauthOnly: boolean,
 	/**  The provider supports `Models::login`. */
 	login: boolean,
 	/**  The winning contributor of this id. */

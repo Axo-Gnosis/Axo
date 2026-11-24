@@ -413,6 +413,7 @@ async fn hidden_discovery_keeps_loaded_ids_without_contacting_the_endpoint() {
                 models: vec![winner],
                 env: Vec::new(),
                 requires_key: false,
+                oauth_only: false,
                 login: None,
                 rewrite: None,
             }
@@ -757,6 +758,7 @@ async fn subscribe_and_scoped_views_isolate_and_propagate() {
         }],
         env: Vec::new(),
         requires_key: true,
+        oauth_only: false,
         login: None,
         rewrite: None,
     };
@@ -1052,4 +1054,183 @@ async fn unknown_vs_free_cost_in_catalog_and_usage() {
     };
     total += &unpriced;
     assert_eq!(total.cost, None);
+}
+
+#[tokio::test]
+async fn claude_subscription_uses_only_unpatched_first_party_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = dev_row(
+        "messages",
+        "@ai-sdk/anthropic",
+        json!({
+            "name": "Canonical",
+            "api": {"messages": {
+                "base_url": "https://api.anthropic.com/v1",
+                "capabilities": {"system_updates": true}
+            }},
+            "modalities": {"input": ["text", "image"]},
+            "capabilities": {"reasoning": {"effort": ["low", "high"], "toggle": true}},
+            "limit": {"context": 1000000, "input": 900000, "output": 64000},
+            "cost": {
+                "text": {"input": {"price": 3, "overrides": [
+                    {"when": {"context": {"gt": 200000}}, "price": 6}
+                ]}, "output": {"price": 15}},
+                "multipliers": [{"when": {"service_tier": {"equals": "fast"}}, "factor": 2}]
+            }
+        }),
+    );
+    let gateway = dev_row("messages", "@ai-sdk/anthropic", json!({}));
+    let completions = dev_row(
+        "chat-completions",
+        "@ai-sdk/openai-compatible",
+        json!({
+            "api": {"chat-completions": {"base_url": "https://api.anthropic.com"}}
+        }),
+    );
+    let feed = json!({
+        "anthropic": {"env": ["ANTHROPIC_API_KEY"], "models": {
+            "canonical": row, "gateway": gateway, "completions": completions
+        }},
+        "other": {"models": {"not-anthropic": row}},
+        "anthropic-subscription": {"env": ["EVIL_KEY"], "models": {"injected": row}}
+    });
+    std::fs::write(
+        dir.path().join("models.dev.v2.json"),
+        serde_json::to_vec(&feed).unwrap(),
+    )
+    .unwrap();
+    let config = json!({"refreshInterval": 0, "providers": {"anthropic": {
+        "baseUrl": "https://custom.invalid",
+        "apiKey": "synthetic-key",
+        "headers": {"x-custom": "not-subscription"},
+        "models": [{"id": "alias", "api": "anthropic-messages"}],
+        "modelOverrides": {"canonical": {
+            "name": "Patched", "contextWindow": 42, "maxTokens": 7, "reasoning": false
+        }}
+    }}});
+    let baseline = load(dir.path(), json!({"refreshInterval": 0}), true).await;
+    let mut expected = baseline.find("anthropic/canonical").unwrap();
+    assert_eq!(expected.context_window, 900000);
+    assert!(!expected.service_tiers.is_empty());
+    expected.provider = "anthropic-subscription".into();
+    expected.context_window = 200000;
+    expected.cost = None;
+    expected.service_tiers.clear();
+    for extended in [false, true] {
+        let models = load(dir.path(), config.clone(), extended).await;
+        assert_eq!(
+            models.find("anthropic-subscription/canonical").unwrap(),
+            expected
+        );
+        assert_eq!(models.find("anthropic/canonical").unwrap().name, "Patched");
+        let rows = models.all();
+        let subscription: Vec<_> = rows
+            .iter()
+            .filter(|model| model.provider == "anthropic-subscription")
+            .collect();
+        assert_eq!(subscription.len(), 1);
+        assert_eq!(subscription[0].id, "canonical");
+        assert!(matches!(
+            models.auth(subscription[0]).await,
+            Err(Error::LoginRequired { provider }) if provider == "anthropic-subscription"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn claude_subscription_rebuild_drops_deleted_source_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let feed = Feed::start();
+    let row = dev_row(
+        "messages",
+        "@ai-sdk/anthropic",
+        json!({
+            "api": {"messages": {"base_url": "https://api.anthropic.com/v1"}}
+        }),
+    );
+    let mut catalog = catalog_of(&["survivor"]);
+    catalog["anthropic"] = json!({"models": {"removed": row}});
+    feed.set("/api.json", 200, &catalog);
+    let config = json!({"refreshInterval": 0, "catalogUrl": format!("{}/api.json", feed.url)});
+    let models = load(dir.path(), config.clone(), true).await;
+    assert!(models.find("anthropic-subscription/removed").is_some());
+    feed.set("/api.json", 200, &catalog_of(&["survivor"]));
+    models.refresh().await.unwrap();
+    models
+        .reload(serde_json::from_value(config.clone()).unwrap(), true)
+        .await
+        .unwrap();
+    assert!(models.find("anthropic-subscription/removed").is_none());
+    assert!(models.find("p/survivor").is_some());
+    assert!(
+        models
+            .providers()
+            .iter()
+            .any(|p| p.id == "anthropic-subscription" && p.login)
+    );
+    drop(models);
+    let reopened = load(dir.path(), config, true).await;
+    assert!(reopened.find("anthropic-subscription/removed").is_none());
+}
+
+#[tokio::test]
+async fn claude_subscription_reserved_with_empty_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = |config| ModelsOptions {
+        cache_dir: None,
+        extended_context: true,
+        config,
+        credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+        http_client: None,
+    };
+    let models = Models::load(options(ModelsConfig::default()))
+        .await
+        .unwrap();
+    let id = "anthropic-subscription";
+    let info = models.providers().into_iter().find(|p| p.id == id).unwrap();
+    assert!(info.env.is_empty());
+    assert!(info.requires_key && info.oauth_only && info.login);
+    assert_eq!(info.origin, axo_ai::ProviderOrigin::Loaded);
+    assert!(!models.all().iter().any(|m| m.provider == id));
+    assert_eq!(
+        models.credential_slot(id).unwrap(),
+        "loaded/anthropic-subscription"
+    );
+    assert_eq!(
+        models.credential_source(id).await.unwrap(),
+        axo_ai::CredentialSource::None
+    );
+    let declaration = || Provider {
+        id: id.into(),
+        models: Vec::new(),
+        env: Vec::new(),
+        requires_key: false,
+        oauth_only: false,
+        login: None,
+        rewrite: None,
+    };
+    // Manifest admission uses this same callback-free validation.
+    assert!(matches!(declaration().validate(), Err(Error::Config(e)) if e.contains("reserved")));
+    for view in [&models, &models.scoped()] {
+        assert!(
+            matches!(view.register("host", declaration()), Err(Error::Config(e)) if e.contains("reserved"))
+        );
+        assert!(matches!(
+            view.provider_layer().replace(vec![("extension".into(), declaration(), None)]),
+            Err(Error::Config(e)) if e.contains("reserved")
+        ));
+    }
+    let config = || serde_json::from_value(json!({"providers": {id: {}}})).unwrap();
+    assert!(
+        matches!(models.reload(config(), false).await, Err(Error::Config(e)) if e.contains("reserved"))
+    );
+    assert!(
+        matches!(Models::load(options(config())).await, Err(Error::Config(e)) if e.contains("reserved"))
+    );
+    assert!(
+        models
+            .providers()
+            .iter()
+            .any(|p| p.id == id && p.oauth_only && p.login)
+    );
 }

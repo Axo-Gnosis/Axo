@@ -1,8 +1,5 @@
-//! Anthropic Messages adapter. Port of pi `api/anthropic-messages.ts` for direct API keys
-//! and header-owned auth. Not ported: OAuth/subscription tokens (Claude Code identity and
-//! tool renaming), GitHub Copilot, workload identity federation, server-side fallback
-//! models, strict-tool constrained sampling (axo tools carry no sampling config) and the
-//! `long`/`none` cache retentions (axo always uses Anthropic's default 5-minute cache).
+//! Anthropic Messages adapter for API keys, header-owned auth and the built-in
+//! Claude subscription provider. Subscription shaping stays on the wire.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -34,6 +31,15 @@ use crate::types::{
     ThinkingLevel, ToolCall, ToolResultMessage, ToolSpec, UserBlock,
 };
 
+#[cfg(test)]
+mod tests;
+mod tool_names;
+
+use tool_names::{PLACEHOLDER, ToolNames, wire_name};
+
+const SUBSCRIPTION_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
 const API_VERSION: &str = "2023-06-01";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
@@ -56,11 +62,22 @@ const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Streams Anthropic Messages responses (`POST {base}/v1/messages`).
 pub struct AnthropicApi {
     http: reqwest::Client,
+    subscription: bool,
 }
 
 impl AnthropicApi {
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+        Self {
+            http,
+            subscription: false,
+        }
+    }
+
+    pub(crate) fn subscription(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            subscription: true,
+        }
     }
 }
 
@@ -73,10 +90,24 @@ impl Api for AnthropicApi {
         cancel: CancellationToken,
     ) -> BoxStream<'static, AssistantEvent> {
         let http = self.http.clone();
+        let subscription = self.subscription;
         let owned_model = model.clone();
-        let tier = model.effective_tier(opts.simple.service_tier);
+        let tier = if subscription {
+            ServiceTier::Standard
+        } else {
+            model.effective_tier(opts.simple.service_tier)
+        };
         respond(model, tier, cancel, move |mut reply, cancel| async move {
-            let result = run(&http, &owned_model, &transcript, &opts, &cancel, &mut reply).await;
+            let result = run(
+                &http,
+                &owned_model,
+                &transcript,
+                &opts,
+                &cancel,
+                &mut reply,
+                subscription,
+            )
+            .await;
             (reply, result)
         })
     }
@@ -188,26 +219,59 @@ fn request_options(
     }
 }
 
-/// One request, from building the body to the last SSE event. Returns the stop reason
-/// or error message; `reply` keeps the partial content.
-async fn run(
-    http: &reqwest::Client,
+struct PreparedRequest {
+    request: ProviderRequest,
+    tool_names: Option<HashMap<String, String>>,
+    provider_thinking_level: Option<String>,
+}
+
+fn prepare_request(
     model: &Model,
     transcript: &Transcript,
     opts: &StreamOptions,
-    cancel: &CancellationToken,
-    reply: &mut Reply,
-) -> Result<StopReason, String> {
+    tier: ServiceTier,
+    subscription: bool,
+) -> Result<PreparedRequest, String> {
+    // Reject overrides before constructing any credential-bearing header.
+    if subscription
+        && (model.base_url != crate::auth::claude_subscription::BASE_URL
+            || opts.auth.base_url.is_some()
+            || !opts.auth.headers.is_empty()
+            || !opts.simple.headers.is_empty()
+            || opts.rewrite.is_some())
+    {
+        return Err(
+            "Claude subscription does not permit destination, header or request overrides"
+                .to_owned(),
+        );
+    }
     let api_key = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
 
     let compat = AnthropicCompat::of(model);
-    let options = request_options(model, transcript, &opts.simple, reply.message.service_tier);
+    let tier = if subscription {
+        ServiceTier::Standard
+    } else {
+        tier
+    };
+    let options = request_options(model, transcript, &opts.simple, tier);
+    let names = subscription
+        .then(|| ToolNames::new(transcript))
+        .transpose()?;
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
-    let built = build_params(model, &resolved, &compat, &options);
-    if built.provider_thinking_level.is_some() {
-        reply.message.provider_thinking_level = built.provider_thinking_level;
+    let mut built = build_params(model, &resolved, &compat, &options, names.as_ref());
+    if subscription {
+        let system = built
+            .params
+            .as_object_mut()
+            .expect("request object")
+            .entry("system")
+            .or_insert_with(|| json!([]));
+        system
+            .as_array_mut()
+            .expect("system blocks")
+            .insert(0, json!({ "type": "text", "text": SUBSCRIPTION_IDENTITY }));
     }
-    let betas = beta_features(
+    let mut betas = beta_features(
         model,
         &resolved,
         &compat,
@@ -215,18 +279,63 @@ async fn run(
         &options,
         built.native_tool_changes,
     );
-    let headers = request_headers(opts, &compat, api_key, &betas)?;
-    let url = format!("{}/v1/messages?beta=true", opts.base_url(model));
-    let request = ProviderRequest {
-        url,
-        headers,
-        body: built.params,
+    if subscription && !betas.iter().any(|beta| beta == OAUTH_BETA) {
+        betas.push(OAUTH_BETA.to_owned());
+    }
+    let mut headers = request_headers(
+        opts,
+        &compat,
+        if subscription { None } else { api_key },
+        &betas,
+    )?;
+    if subscription {
+        let token = api_key
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| "Log in to anthropic-subscription".to_owned())?;
+        let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "Invalid Claude subscription access token".to_owned())?;
+        bearer.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, bearer);
+    }
+    let base = if subscription {
+        crate::auth::claude_subscription::BASE_URL
+    } else {
+        opts.base_url(model)
     };
+    Ok(PreparedRequest {
+        request: ProviderRequest {
+            url: format!("{base}/v1/messages?beta=true"),
+            headers,
+            body: built.params,
+        },
+        tool_names: names.map(|names| names.active),
+        provider_thinking_level: built.provider_thinking_level,
+    })
+}
+
+/// One request, from building the body to the last SSE event. `reply` keeps partial content.
+async fn run(
+    http: &reqwest::Client,
+    model: &Model,
+    transcript: &Transcript,
+    opts: &StreamOptions,
+    cancel: &CancellationToken,
+    reply: &mut Reply,
+    subscription: bool,
+) -> Result<StopReason, String> {
+    let prepared = prepare_request(
+        model,
+        transcript,
+        opts,
+        reply.message.service_tier,
+        subscription,
+    )?;
+    reply.message.provider_thinking_level = prepared.provider_thinking_level;
     let response = dispatch(
         http,
         opts.rewrite.as_deref(),
         model,
-        request,
+        prepared.request,
         cancel,
         reply,
         error_response_message,
@@ -234,7 +343,10 @@ async fn run(
     .await?;
     reply.start();
 
-    let mut blocks = BlockMapper::default();
+    let mut blocks = BlockMapper {
+        tool_names: prepared.tool_names,
+        ..Default::default()
+    };
     read_sse(response, cancel, |sse| {
         blocks.handle(sse, model, reply)?;
         Ok(ControlFlow::Continue(()))
@@ -272,6 +384,8 @@ fn error_response_message(status: u16, text: &str, body: Option<&Value>) -> Stri
 /// Maps Anthropic's block indices onto `output.content` positions while streaming.
 #[derive(Default)]
 struct BlockMapper {
+    /// Only active subscription tools may enter the canonical event stream.
+    tool_names: Option<HashMap<String, String>>,
     /// Anthropic `index` of each content block; `None` once the block stopped.
     index: Vec<Option<u64>>,
     /// Stop reason from `message_delta`; `None` is pi's `pending`.
@@ -424,7 +538,12 @@ impl BlockMapper {
             "tool_use" => (
                 AssistantBlock::ToolCall(ToolCall {
                     id: text("id").to_owned(),
-                    name: text("name").to_owned(),
+                    name: match &self.tool_names {
+                        Some(names) => names.get(text("name")).cloned().ok_or_else(|| {
+                            "Anthropic returned an unknown or inactive subscription tool".to_owned()
+                        })?,
+                        None => text("name").to_owned(),
+                    },
                     arguments: block["input"].as_object().cloned().unwrap_or_default(),
                     arguments_error: None,
                 }),
@@ -569,13 +688,13 @@ struct BuiltParams {
     provider_thinking_level: Option<String>,
 }
 
-/// Port of pi `buildParams` (without the OAuth identity, metadata, tool choice and
-/// fallback fields).
+/// Port of pi `buildParams`, sharing the encoder between credential modes.
 fn build_params(
     model: &Model,
     transcript: &Transcript,
     compat: &AnthropicCompat,
     options: &RequestOptions,
+    names: Option<&ToolNames>,
 ) -> BuiltParams {
     let cache_control = json!({ "type": "ephemeral" });
     let initial = transcript.initial_system_message();
@@ -604,6 +723,7 @@ fn build_params(
         compat,
         effort_messages.then_some(model.provider.as_str()),
         native_tool_changes,
+        names,
     );
     let active_effort = options.effort.clone().unwrap_or_else(|| "high".to_owned());
     let messages = if effort_messages {
@@ -646,9 +766,10 @@ fn build_params(
             initial_tools,
             compat.eager_tool_input_streaming,
             tool_cache_control,
+            names,
         );
         tools.push(json!({
-            "name": "__deferred_placeholder__",
+            "name": PLACEHOLDER,
             "description": "Reserved placeholder. Never available. Never call this.",
             "input_schema": { "type": "object", "properties": {}, "required": [] },
             "defer_loading": true,
@@ -661,6 +782,7 @@ fn build_params(
                 &tools,
                 compat.eager_tool_input_streaming,
                 tool_cache_control,
+                names,
             ));
         }
     }
@@ -794,12 +916,17 @@ fn request_headers(
 }
 
 /// pi `convertTools` for tools without constrained sampling.
-fn convert_tools(tools: &[ToolSpec], eager: bool, cache_control: Option<&Value>) -> Vec<Value> {
+fn convert_tools(
+    tools: &[ToolSpec],
+    eager: bool,
+    cache_control: Option<&Value>,
+    names: Option<&ToolNames>,
+) -> Vec<Value> {
     tools
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            let mut definition = json!({ "name": tool.name, "description": tool.description });
+            let mut definition = json!({ "name": wire_name(names, &tool.name), "description": tool.description });
             if eager {
                 definition["eager_input_streaming"] = Value::Bool(true);
             }
@@ -893,6 +1020,7 @@ fn convert_messages(
     compat: &AnthropicCompat,
     managed_provider: Option<&str>,
     native_tool_changes: bool,
+    names: Option<&ToolNames>,
 ) -> (Vec<Value>, HashMap<usize, String>) {
     let mut params: Vec<Value> = Vec::with_capacity(messages.len());
     let mut assistant_levels = HashMap::new();
@@ -920,12 +1048,15 @@ fn convert_messages(
                         }
                         blocks.push(json!({
                             "type": "tool_removal",
-                            "tool": { "type": "tool_reference", "name": name },
+                            "tool": { "type": "tool_reference", "name": wire_name(names, name) },
                         }));
                     }
-                    for definition in
-                        convert_tools(&system.tools_added, compat.eager_tool_input_streaming, None)
-                    {
+                    for definition in convert_tools(
+                        &system.tools_added,
+                        compat.eager_tool_input_streaming,
+                        None,
+                        names,
+                    ) {
                         blocks.push(json!({
                             "type": "tool_addition",
                             "tool": { "type": "tool_definition", "definition": definition },
@@ -1001,7 +1132,7 @@ fn convert_messages(
                         AssistantBlock::ToolCall(call) => blocks.push(json!({
                             "type": "tool_use",
                             "id": call.id,
-                            "name": call.name,
+                            "name": wire_name(names, &call.name),
                             "input": call.arguments,
                         })),
                     }

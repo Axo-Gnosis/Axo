@@ -21,8 +21,24 @@ pub(crate) struct ProviderAuth {
     pub env: Vec<String>,
     /// `false` lets the provider run without any key (`api_key: None`).
     pub requires_key: bool,
+    /// Only a stored OAuth credential may authorize this provider.
+    pub oauth_only: bool,
     /// Login and OAuth refresh; without it an expired OAuth credential cannot be refreshed.
     pub login: Option<Arc<dyn ProviderLogin>>,
+}
+
+impl ProviderAuth {
+    /// Reject invalid OAuth-only login or refresh results before they reach storage.
+    pub(crate) fn validate_login_credential(&self, credential: &Credential) -> Result<(), Error> {
+        if self.oauth_only
+            && !matches!(credential, Credential::Oauth { access, .. } if !access.is_empty())
+        {
+            return Err(Error::LoginRequired {
+                provider: self.id.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// OAuth tokens are refreshed when they expire within this window.
@@ -122,6 +138,14 @@ pub(crate) async fn credential_source(
     store: &dyn CredentialStore,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<CredentialSource, Error> {
+    if info.oauth_only {
+        return Ok(match store.get(&info.slot).await? {
+            Some(credential) if info.validate_login_credential(&credential).is_ok() => {
+                CredentialSource::Oauth
+            }
+            _ => CredentialSource::None,
+        });
+    }
     if info.config_api_key.is_some() {
         return Ok(CredentialSource::Config);
     }
@@ -142,15 +166,31 @@ pub(crate) async fn resolve_auth(
     headers: BTreeMap<String, String>,
     config_base_url: bool,
 ) -> Result<ModelAuth, Error> {
-    let mut auth = if info.config_api_key.is_some() || !headers.is_empty() {
+    // Check the winning origin's typed credential before evaluating any config or env key.
+    let oauth_credential = if info.oauth_only {
+        let credential = store
+            .get(&info.slot)
+            .await?
+            .ok_or_else(|| Error::LoginRequired {
+                provider: info.id.clone(),
+            })?;
+        info.validate_login_credential(&credential)?;
+        Some(credential)
+    } else {
+        None
+    };
+    let mut auth = if (!info.oauth_only && info.config_api_key.is_some()) || !headers.is_empty() {
         let info = Arc::clone(&info);
         tokio::task::spawn_blocking(move || {
             Ok::<_, Error>(ModelAuth {
-                api_key: info
-                    .config_api_key
-                    .as_deref()
-                    .map(resolve_config_value)
-                    .transpose()?,
+                api_key: if info.oauth_only {
+                    None
+                } else {
+                    info.config_api_key
+                        .as_deref()
+                        .map(resolve_config_value)
+                        .transpose()?
+                },
                 headers: headers
                     .into_iter()
                     .map(|(name, value)| resolve_config_value(&value).map(|value| (name, value)))
@@ -164,12 +204,22 @@ pub(crate) async fn resolve_auth(
         ModelAuth::default()
     };
     if auth.api_key.is_none() {
-        let stored = match store.get(&info.slot).await? {
+        let stored = match if info.oauth_only {
+            oauth_credential
+        } else {
+            store.get(&info.slot).await?
+        } {
             Some(Credential::Oauth { expires, .. }) if now_ms() + REFRESH_MARGIN_MS >= expires => {
                 refresh(&info, &store).await?
             }
             other => other,
         };
+        if info.oauth_only {
+            let credential = stored.as_ref().ok_or_else(|| Error::LoginRequired {
+                provider: info.id.clone(),
+            })?;
+            info.validate_login_credential(credential)?;
+        }
         match stored {
             Some(Credential::ApiKey { key }) => auth.api_key = Some(key),
             Some(Credential::Oauth {
@@ -211,7 +261,7 @@ pub(crate) async fn resolve_auth(
 /// re-read under the lock, so a refresh another request or process finished is reused (and a
 /// logout is respected). Returns the current credential.
 async fn refresh(
-    info: &ProviderAuth,
+    info: &Arc<ProviderAuth>,
     store: &Arc<dyn CredentialStore>,
 ) -> Result<Option<Credential>, Error> {
     let Some(login) = info.login.clone() else {
@@ -223,6 +273,7 @@ async fn refresh(
     // The lock and the rotated token live together in one spawned update: a cancelled request
     // can neither release the lock mid-refresh nor drop the new credential before it is saved.
     let (store, slot) = (Arc::clone(store), info.slot.clone());
+    let refresh_info = Arc::clone(info);
     tokio::spawn(async move {
         store
             .update(
@@ -233,7 +284,9 @@ async fn refresh(
                             Some(credential @ Credential::Oauth { expires, .. })
                                 if now_ms() + REFRESH_MARGIN_MS >= expires =>
                             {
-                                login.refresh(credential).await.map(Some)
+                                let credential = login.refresh(credential).await?;
+                                refresh_info.validate_login_credential(&credential)?;
+                                Ok(Some(credential))
                             }
                             _ => Ok(None),
                         }
@@ -253,6 +306,217 @@ mod tests {
     use crate::auth::codex;
     use crate::{FileCredentialStore, Models, ModelsConfig, ModelsOptions};
 
+    fn oauth_only_info() -> ProviderAuth {
+        ProviderAuth {
+            id: "custom-oauth".into(),
+            slot: "runtime/custom-oauth".into(),
+            config_api_key: Some("!must not evaluate".into()),
+            env: vec!["PATH".into()],
+            requires_key: true,
+            oauth_only: true,
+            login: Some(Arc::new(KeyLogin)),
+        }
+    }
+
+    fn oauth(access: &str, expires: i64) -> Credential {
+        Credential::Oauth {
+            access: access.into(),
+            refresh: "synthetic-refresh".into(),
+            expires,
+            headers: BTreeMap::from([("X-OAuth".into(), "credential".into())]),
+            base_url: Some("https://custom.example".into()),
+            extra: Default::default(),
+        }
+    }
+
+    struct KeyLogin;
+
+    #[async_trait::async_trait]
+    impl ProviderLogin for KeyLogin {
+        async fn login(
+            &self,
+            _: &dyn crate::auth::provider::LoginInteraction,
+        ) -> Result<Credential, Error> {
+            Ok(Credential::ApiKey {
+                key: "synthetic-key".into(),
+            })
+        }
+
+        async fn refresh(&self, _: Credential) -> Result<Credential, Error> {
+            Ok(Credential::ApiKey {
+                key: "synthetic-key".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_subscription_rejects_config_env_and_wrong_store_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
+        let info = Arc::new(oauth_only_info());
+        // Credentials from another origin must not authorize the winning provider.
+        store
+            .set("loaded/custom-oauth", oauth("other-origin", i64::MAX))
+            .await
+            .unwrap();
+        for credential in [
+            None,
+            Some(Credential::ApiKey {
+                key: "stored-key".into(),
+            }),
+            Some(oauth("", i64::MAX)),
+        ] {
+            if let Some(credential) = credential {
+                store.set(&info.slot, credential).await.unwrap();
+            } else {
+                store.remove(&info.slot).await.unwrap();
+            }
+            assert_eq!(
+                credential_source(&info, store.as_ref(), |_| panic!("must not read env"))
+                    .await
+                    .unwrap(),
+                CredentialSource::None,
+            );
+            let error = resolve_auth(info.clone(), store.clone(), BTreeMap::new(), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, Error::LoginRequired { provider } if provider == &info.id));
+            assert_eq!(error.to_string(), "Log in to custom-oauth");
+        }
+
+        store
+            .set(&info.slot, oauth("synthetic-access", i64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(
+            credential_source(&info, store.as_ref(), |_| panic!("must not read env"))
+                .await
+                .unwrap(),
+            CredentialSource::Oauth,
+        );
+        let auth = resolve_auth(
+            info.clone(),
+            store.clone(),
+            BTreeMap::from([("x-oauth".into(), "config".into())]),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.api_key.as_deref(), Some("synthetic-access"));
+        assert_eq!(auth.base_url.as_deref(), Some("https://custom.example"));
+        assert_eq!(
+            auth.headers,
+            BTreeMap::from([("x-oauth".into(), "config".into())])
+        );
+        let auth = resolve_auth(info, store, BTreeMap::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(auth.base_url, None);
+        assert_eq!(
+            auth.headers.get("X-OAuth").map(String::as_str),
+            Some("credential")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_subscription_rejects_wrong_kind_callback_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(FileCredentialStore::new(dir.path().join("auth.json")));
+        let info = oauth_only_info();
+        let expired = oauth("expired", 0);
+        store.set(&info.slot, expired.clone()).await.unwrap();
+        let key = KeyLogin.refresh(expired.clone()).await.unwrap();
+        assert!(matches!(
+            info.validate_login_credential(&key),
+            Err(Error::LoginRequired { .. })
+        ));
+        assert!(matches!(
+            info.validate_login_credential(&oauth("", i64::MAX)),
+            Err(Error::LoginRequired { .. })
+        ));
+        let info = Arc::new(info);
+        assert!(matches!(
+            resolve_auth(info.clone(), store.clone(), BTreeMap::new(), false).await,
+            Err(Error::LoginRequired { .. })
+        ));
+        assert_eq!(store.get(&info.slot).await.unwrap(), Some(expired));
+
+        // API-key-returning logins and refresh callbacks remain valid for ordinary providers.
+        let mut info = Arc::try_unwrap(info).ok().unwrap();
+        info.oauth_only = false;
+        info.config_api_key = None;
+        info.validate_login_credential(&key).unwrap();
+        let slot = info.slot.clone();
+        let auth = resolve_auth(Arc::new(info), store.clone(), BTreeMap::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(auth.api_key.as_deref(), Some("synthetic-key"));
+        assert_eq!(store.get(&slot).await.unwrap(), Some(key));
+    }
+
+    // Simulate another process replacing the credential between the initial read and lock.
+    struct ReplacedStore {
+        file: FileCredentialStore,
+        replacement: Option<Credential>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for ReplacedStore {
+        async fn get(&self, slot: &str) -> Result<Option<Credential>, Error> {
+            self.file.get(slot).await
+        }
+
+        async fn set(&self, slot: &str, credential: Credential) -> Result<(), Error> {
+            self.file.set(slot, credential).await
+        }
+
+        async fn remove(&self, slot: &str) -> Result<(), Error> {
+            self.file.remove(slot).await
+        }
+
+        async fn update(
+            &self,
+            slot: &str,
+            update: crate::auth::CredentialUpdate,
+        ) -> Result<Option<Credential>, Error> {
+            match &self.replacement {
+                Some(credential) => self.file.set(slot, credential.clone()).await?,
+                None => self.file.remove(slot).await?,
+            }
+            self.file.update(slot, update).await
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_subscription_rechecks_credential_after_locked_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = Arc::new(oauth_only_info());
+        for replacement in [
+            None,
+            Some(Credential::ApiKey {
+                key: "raced-key".into(),
+            }),
+            Some(oauth("", i64::MAX)),
+            Some(oauth("rotated", i64::MAX)),
+        ] {
+            let valid = matches!(&replacement, Some(Credential::Oauth { access, .. }) if !access.is_empty());
+            let store: Arc<dyn CredentialStore> = Arc::new(ReplacedStore {
+                file: FileCredentialStore::new(dir.path().join("auth.json")),
+                replacement: replacement.clone(),
+            });
+            store.set(&info.slot, oauth("expired", 0)).await.unwrap();
+            let result = resolve_auth(info.clone(), store.clone(), BTreeMap::new(), false).await;
+            if valid {
+                assert_eq!(result.unwrap().api_key.as_deref(), Some("rotated"));
+            } else {
+                assert!(matches!(result, Err(Error::LoginRequired { .. })));
+            }
+            assert_eq!(store.get(&info.slot).await.unwrap(), replacement);
+        }
+    }
+
     #[tokio::test]
     async fn credential_sources_follow_auth_order_without_resolving_or_refreshing() {
         let dir = tempfile::tempdir().unwrap();
@@ -263,6 +527,7 @@ mod tests {
             config_api_key: Some("!must not execute".into()),
             env: vec!["EMPTY".into(), "FIRST".into(), "SECOND".into()],
             requires_key: false,
+            oauth_only: false,
             login: None,
         };
         let env = |name: &str| {
@@ -353,10 +618,10 @@ mod tests {
                 .iter()
                 .any(|info| info.id == codex::PROVIDER && info.login)
         );
-        assert!(
-            providers
-                .iter()
-                .all(|info| info.login == (info.id == codex::PROVIDER))
-        );
+        assert!(providers.iter().all(|info| info.login
+            == matches!(
+                info.id.as_str(),
+                codex::PROVIDER | super::super::claude_subscription::PROVIDER
+            )));
     }
 }

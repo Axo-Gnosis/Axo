@@ -361,6 +361,7 @@ fn register_native(host: &Host, provider: &str) -> Model {
                 models: vec![model.clone()],
                 env: Vec::new(),
                 requires_key: false,
+                oauth_only: false,
                 login: None,
                 rewrite: None,
             },

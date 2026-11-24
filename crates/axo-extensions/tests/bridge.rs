@@ -401,6 +401,7 @@ pub fn register_native(models: &Models, provider: &str, url: &str) {
                 models: vec![serde_json::from_value(model_json(provider, url)).unwrap()],
                 env: Vec::new(),
                 requires_key: false,
+                oauth_only: false,
                 login: None,
                 rewrite: None,
             },
