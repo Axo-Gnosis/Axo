@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook, RemoteTool};
 use crate::manifest::{PolicyHook, SessionDecl};
-use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Origin, Refusal};
+use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Origin, Refusal, decode};
 use crate::remote::{self, CALL_DEADLINE, Failure};
 use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionScope, Extensions, Inner, gate};
 
@@ -768,17 +768,17 @@ impl Registry {
         });
         let (events, stop) = match found {
             Some(session) => (session.subscribe(), CancellationToken::new()),
-            None if allowed_child => inner.axo.observe_child(&name).ok_or_else(|| Refusal {
-                code: axo::ext::DispatchCode::NoSession.into(),
-                message: format!("session {name} is not attached or resident"),
-                details: None,
+            None if allowed_child => inner.axo.observe_child(&name).ok_or_else(|| {
+                Refusal::new(
+                    axo::ext::DispatchCode::NoSession,
+                    format!("session {name} is not attached or resident"),
+                )
             })?,
             None => {
-                return Err(Refusal {
-                    code: axo::ext::DispatchCode::NoSession.into(),
-                    message: format!("session {name} is not attached or resident"),
-                    details: None,
-                });
+                return Err(Refusal::new(
+                    axo::ext::DispatchCode::NoSession,
+                    format!("session {name} is not attached or resident"),
+                ));
             }
         };
         Ok(
@@ -827,11 +827,10 @@ impl Registry {
             entry.remove().task.abort();
             Ok(Value::Null)
         } else {
-            Err(Refusal {
-                code: BridgeCode::NoSubscription.into(),
-                message: "unknown subscription".into(),
-                details: None,
-            })
+            Err(Refusal::new(
+                BridgeCode::NoSubscription,
+                "unknown subscription",
+            ))
         }
     }
 }
@@ -870,49 +869,11 @@ struct Unsubscribe {
     sub: String,
 }
 
-pub(crate) fn decode<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refusal> {
-    serde_json::from_value(args).map_err(|_| Refusal {
-        code: BridgeCode::Invalid.into(),
-        message: "invalid arguments".into(),
-        details: None,
-    })
-}
-
-impl From<axo::ext::InvokeError> for Refusal {
-    fn from(error: axo::ext::InvokeError) -> Self {
-        let code = error.code().into();
-        if let InvokeError::Failed {
-            message, details, ..
-        } = error
-        {
-            match details.map(serde_json::to_value).transpose() {
-                Ok(details) => Self {
-                    code,
-                    message,
-                    details,
-                },
-                Err(error) => Self {
-                    code: axo::ext::DispatchCode::Encode.into(),
-                    message: error.to_string(),
-                    details: None,
-                },
-            }
-        } else {
-            Self {
-                code,
-                message: error.to_string(),
-                details: None,
-            }
-        }
-    }
-}
-
 fn unavailable() -> Refusal {
-    Refusal {
-        code: BridgeCode::Unavailable.into(),
-        message: "the extension manager is shut down".into(),
-        details: None,
-    }
+    Refusal::new(
+        BridgeCode::Unavailable,
+        "the extension manager is shut down",
+    )
 }
 
 fn child_error(missing: InvokeError, error: axo::Error) -> InvokeError {
@@ -943,25 +904,19 @@ impl Actions for Registry {
                 "unsubscribe" => return inner.sessions.unsubscribe(&ext, decode(args)?),
                 "invoke" => {}
                 _ => {
-                    return Err(Refusal {
-                        code: BridgeCode::Unsupported.into(),
-                        message: "unknown host method".into(),
-                        details: None,
-                    });
+                    return Err(Refusal::new(BridgeCode::Unsupported, "unknown host method"));
                 }
             }
             let invoke: Invoke = decode(args)?;
             let caller = axo::ext::Caller {
                 namespace: Some(ext),
             };
-            let invalid = || Refusal {
-                code: BridgeCode::Invalid.into(),
-                message: "invalid arguments".into(),
-                details: None,
-            };
             match invoke.object.as_str() {
                 "session" => {
-                    let id = invoke.target.as_deref().ok_or_else(invalid)?;
+                    let id = invoke
+                        .target
+                        .as_deref()
+                        .ok_or_else(Refusal::invalid_arguments)?;
                     inner
                         .resolve_session(id)
                         .await?
@@ -970,7 +925,7 @@ impl Actions for Registry {
                 }
                 "host" => {
                     if invoke.target.is_some() {
-                        return Err(invalid());
+                        return Err(Refusal::invalid_arguments());
                     }
                     if let Some(call) = crate::lifecycle::lookup(&invoke.method) {
                         return crate::run(call.invoke(inner, caller, invoke.args))
@@ -981,7 +936,7 @@ impl Actions for Registry {
                 }
                 "models" => {
                     if invoke.target.is_some() {
-                        return Err(invalid());
+                        return Err(Refusal::invalid_arguments());
                     }
                     inner
                         .axo
@@ -989,11 +944,10 @@ impl Actions for Registry {
                         .await
                 }
                 other => {
-                    return Err(Refusal {
-                        code: BridgeCode::Unsupported.into(),
-                        message: format!("unknown object: {other}"),
-                        details: None,
-                    });
+                    return Err(Refusal::new(
+                        BridgeCode::Unsupported,
+                        format!("unknown object: {other}"),
+                    ));
                 }
             }
             .map_err(Refusal::from)

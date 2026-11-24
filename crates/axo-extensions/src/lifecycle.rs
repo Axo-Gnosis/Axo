@@ -227,10 +227,11 @@ impl LifecycleCall {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .ok_or_else(|| Refusal {
-                code: crate::peer::BridgeCode::NoLifecycle.into(),
-                message: "the host registered no session lifecycle hook".into(),
-                details: None,
+            .ok_or_else(|| {
+                Refusal::new(
+                    crate::peer::BridgeCode::NoLifecycle,
+                    "the host registered no session lifecycle hook",
+                )
             })?;
         (self.0)(
             &LifecycleTarget {

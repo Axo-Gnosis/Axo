@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axo::ext::{DispatchCode, InvokeErrorCode};
+use axo::ext::{DispatchCode, InvokeError, InvokeErrorCode};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -91,6 +91,45 @@ pub struct Refusal {
     pub code: HostErrorCode,
     pub message: String,
     pub details: Option<Value>,
+}
+
+impl Refusal {
+    pub(crate) fn new(code: impl Into<HostErrorCode>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub(crate) fn invalid_arguments() -> Self {
+        Self::new(BridgeCode::Invalid, "invalid arguments")
+    }
+}
+
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refusal> {
+    serde_json::from_value(args).map_err(|_| Refusal::invalid_arguments())
+}
+
+impl From<InvokeError> for Refusal {
+    fn from(error: InvokeError) -> Self {
+        let code = error.code();
+        if let InvokeError::Failed {
+            message, details, ..
+        } = error
+        {
+            match details.map(serde_json::to_value).transpose() {
+                Ok(details) => Self {
+                    code: code.into(),
+                    message,
+                    details,
+                },
+                Err(error) => Self::new(DispatchCode::Encode, error.to_string()),
+            }
+        } else {
+            Self::new(code, error.to_string())
+        }
+    }
 }
 
 /// Serves the runner's calls made under one host call (`parent`).
@@ -866,11 +905,10 @@ mod tests {
                         let _mark = mark;
                         std::future::pending().await
                     }
-                    _ => Err(Refusal {
-                        code: DispatchCode::NoSession.into(),
-                        message: "session s is not attached".into(),
-                        details: None,
-                    }),
+                    _ => Err(Refusal::new(
+                        DispatchCode::NoSession,
+                        "session s is not attached",
+                    )),
                 }
             })
         }
@@ -932,8 +970,18 @@ mod tests {
         }
 
         for (frame, kind) in [
-            (Out::Cancel { id: HostId(u64::MAX) }, "cancel"),
-            (Out::Ping { id: HostId(u64::MAX) }, "ping"),
+            (
+                Out::Cancel {
+                    id: HostId(u64::MAX),
+                },
+                "cancel",
+            ),
+            (
+                Out::Ping {
+                    id: HostId(u64::MAX),
+                },
+                "ping",
+            ),
         ] {
             let encoded = Inner::small_frame(&frame);
             assert_eq!(

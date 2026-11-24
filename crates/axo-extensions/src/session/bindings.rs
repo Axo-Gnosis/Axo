@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{Remote, decode};
+use super::Remote;
 use crate::manifest::{CommandDecl, SchemeDecl, ToolDecl};
-use crate::peer::{BridgeCode, Callbacks, Refusal};
+use crate::peer::{BridgeCode, Callbacks, Refusal, decode};
 use crate::remote::{CALL_DEADLINE, Failure};
 
 #[derive(Serialize, specta::Type)]
@@ -189,11 +189,10 @@ impl Callbacks for ToolCalls<'_> {
                     args,
                 } = decode(args)?;
                 if object != "tools" {
-                    return Err(Refusal {
-                        code: BridgeCode::Unsupported.into(),
-                        message: format!("unknown object: {object}"),
-                        details: None,
-                    });
+                    return Err(Refusal::new(
+                        BridgeCode::Unsupported,
+                        format!("unknown object: {object}"),
+                    ));
                 }
                 let caller = axo::ext::Caller {
                     namespace: Some(self.ext.to_owned()),
@@ -203,11 +202,7 @@ impl Callbacks for ToolCalls<'_> {
                     .await
                     .map_err(Refusal::from)
             }
-            _ => Err(Refusal {
-                code: BridgeCode::Unsupported.into(),
-                message: "unknown host method".into(),
-                details: None,
-            }),
+            _ => Err(Refusal::new(BridgeCode::Unsupported, "unknown host method")),
         }
     }
 }

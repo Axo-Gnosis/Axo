@@ -14,10 +14,9 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::ProviderDecl;
-use crate::peer::{BridgeCode, Callbacks, Refusal};
+use crate::peer::{BridgeCode, Callbacks, Refusal, decode};
 use crate::placement::Placement;
 use crate::remote::{self, CALL_DEADLINE, Failure};
-use crate::session::decode;
 use crate::wire_value::{decode_credential, decode_request, encode_request};
 
 /// The provider `desc` declares, owned by extension `ext` in `placement`. Once `retired`
@@ -157,19 +156,13 @@ struct Progress {
 #[async_trait]
 impl Callbacks for LoginCallbacks<'_> {
     async fn call(&self, method: &str, args: Value) -> Result<Value, Refusal> {
-        let refuse = |code: BridgeCode, message: &str| Refusal {
-            code: code.into(),
-            message: message.to_owned(),
-            details: None,
-        };
-        let invalid = || refuse(BridgeCode::Invalid, "invalid arguments");
-        let failed = |_: Error| refuse(BridgeCode::Interaction, "host interaction failed");
+        let failed = |_: Error| Refusal::new(BridgeCode::Interaction, "host interaction failed");
         // Serde also accepts positional arrays for structs; the wire accepts only objects.
         let object = || {
             if args.is_object() {
                 Ok(args)
             } else {
-                Err(invalid())
+                Err(Refusal::invalid_arguments())
             }
         };
         match method {
@@ -196,21 +189,21 @@ impl Callbacks for LoginCallbacks<'_> {
                 let options = args
                     .get("options")
                     .and_then(Value::as_array)
-                    .ok_or_else(invalid)?;
+                    .ok_or_else(Refusal::invalid_arguments)?;
                 if options.is_empty() || !options.iter().all(Value::is_object) {
-                    return Err(invalid());
+                    return Err(Refusal::invalid_arguments());
                 }
                 let select: LoginSelect = decode(args)?;
                 let choice = self.0.select(&select).await.map_err(failed)?;
                 if !select.options.iter().any(|option| option.id == choice) {
-                    return Err(refuse(
+                    return Err(Refusal::new(
                         BridgeCode::Invalid,
                         "the selection is not one of the options",
                     ));
                 }
                 return Ok(Value::String(choice));
             }
-            _ => return Err(refuse(BridgeCode::Unsupported, "unknown host method")),
+            _ => return Err(Refusal::new(BridgeCode::Unsupported, "unknown host method")),
         }
         Ok(Value::Null)
     }
