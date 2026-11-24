@@ -10,8 +10,7 @@ use axo_agent::Tool;
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, UserBlock};
 use common::{
-    Hang, delivered, entry, host, journal, message_text, only, options, request, tool_text, until,
-    within,
+    Hang, delivered, entry, journal, message_text, only, options, request, tool_text, until, within,
 };
 use serde_json::{Value, json};
 
@@ -38,7 +37,7 @@ fn tool_names(request: &RecordedRequest) -> Vec<&str> {
 #[tokio::test]
 async fn spawn_tool_yields_structured_result() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -152,7 +151,7 @@ async fn spawn_tool_yields_structured_result() {
 #[tokio::test]
 async fn spawn_rerun_adopts_existing_child() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -251,7 +250,7 @@ async fn spawn_rerun_adopts_existing_child() {
 #[tokio::test]
 async fn mark_interrupted_admits_children_of_unfinished_spawn() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -322,7 +321,7 @@ async fn mark_interrupted_admits_children_of_unfinished_spawn() {
 #[tokio::test]
 async fn yield_outcomes() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -431,7 +430,7 @@ async fn yield_outcomes() {
 #[tokio::test]
 async fn send_follows_up_and_escapes() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -517,7 +516,7 @@ async fn send_follows_up_and_escapes() {
 #[tokio::test]
 async fn follow_up_on_idle_session_starts_a_run() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -564,7 +563,7 @@ async fn follow_up_on_idle_session_starts_a_run() {
 #[tokio::test]
 async fn bash_and_write_ceilings_outlive_the_parent_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"child"}, {"id":"scoped"}]),
         json!({}),
@@ -660,7 +659,7 @@ async fn bash_and_write_ceilings_outlive_the_parent_mode() {
 #[tokio::test]
 async fn child_scope_through_a_symlink_cannot_leave_the_ceiling() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"child"}]),
         json!({}),

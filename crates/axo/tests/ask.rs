@@ -6,7 +6,7 @@ use axo::{Answer, AnswerValue, Error, SessionEvent};
 use axo_agent::RunOutcome;
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn, ToolResultMessage, UserBlock};
-use common::{host, options, within};
+use common::{options, within};
 use serde_json::{Value, json};
 
 /// The tool result of call `question` in a request's transcript.
@@ -35,10 +35,8 @@ fn answers(result: &ToolResultMessage) -> (String, Value) {
 #[tokio::test]
 async fn steer_settles_a_pending_question() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "question",
@@ -116,10 +114,8 @@ async fn steer_settles_a_pending_question() {
 #[tokio::test]
 async fn invalid_submission_keeps_the_question_pending() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "question",
@@ -181,7 +177,7 @@ async fn invalid_submission_keeps_the_question_pending() {
 #[tokio::test]
 async fn timeout_submits_defaults_only() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}]),
         json!({"ask":{"timeoutMs":20}}),

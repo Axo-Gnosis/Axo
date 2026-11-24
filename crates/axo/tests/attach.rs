@@ -6,13 +6,13 @@ mod common;
 use std::sync::Arc;
 
 use axo::{
-    Entry, JsonlStore, KeywordSpec, PromptPart, PromptRequest, PromptResult, SeqEntry, Session,
-    SessionEvent, SubmissionKind,
+    Entry, KeywordSpec, PromptPart, PromptRequest, PromptResult, SeqEntry, Session, SessionEvent,
+    SubmissionKind,
 };
 use axo_agent::{AgentEvent, AgentMessage, CancelReason, RunOutcome};
 use axo_ai::testing::reply_text;
-use axo_ai::{AssistantBlock, AssistantEvent, Message, ScriptedApi, ScriptedTurn};
-use common::{GatedStore, WriteGate, axo, axo_with, options, within};
+use axo_ai::{AssistantBlock, AssistantEvent, Message, ScriptedTurn};
+use common::{WriteGate, options, within};
 use serde_json::json;
 use tokio::task::JoinHandle;
 
@@ -41,7 +41,9 @@ async fn start_hanging_prompt(
 #[tokio::test]
 async fn attach_mid_run_returns_missed_entries_live_state_and_next_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = axo(dir.path(), vec![ScriptedTurn::HangUntilCancel]).await;
+    let axo = common::host(dir.path(), vec![ScriptedTurn::HangUntilCancel])
+        .await
+        .axo;
     let session = Arc::new(axo.create_session(options(dir.path())).await.unwrap());
     let run = start_hanging_prompt(&session).await;
 
@@ -93,15 +95,11 @@ async fn attach_between_submission_and_enqueue_observes_queue_change() {
     let gate = WriteGate::new(
         |entry| matches!(entry, Entry::ModelChange { model_id, .. } if model_id == "second"),
     );
-    let (axo, _, _) = axo_with(
+    let common::Host { axo, .. } = common::gated_host(
         dir.path(),
         json!([{"id":"m"},{"id":"second"}]),
-        json!({}),
-        Arc::new(GatedStore {
-            inner: JsonlStore::new(dir.path().join("sessions")),
-            gate: gate.clone(),
-        }),
-        Arc::new(ScriptedApi::new(vec![ScriptedTurn::HangUntilCancel])),
+        &gate,
+        vec![ScriptedTurn::HangUntilCancel],
     )
     .await;
     let mut opts = options(dir.path());
@@ -173,7 +171,9 @@ async fn attach_between_submission_and_enqueue_observes_queue_change() {
 #[tokio::test]
 async fn prompt_with_a_repeated_request_id_submits_and_runs_once() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("hi"))]).await;
+    let axo = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("hi"))])
+        .await
+        .axo;
     let session = axo.create_session(options(dir.path())).await.unwrap();
     let request = PromptRequest {
         input: "hello".into(),

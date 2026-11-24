@@ -5,16 +5,14 @@ use std::sync::Arc;
 use axo::{MaintenanceKind, ModeSpec, SessionEvent};
 use axo_ai::ScriptedTurn;
 use axo_ai::testing::reply_text;
-use common::{host, options, until, within};
+use common::{options, until, within};
 use serde_json::json;
 
 #[tokio::test]
 async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::HangUntilCancel,
             ScriptedTurn::Reply(reply_text("done")),
@@ -102,10 +100,8 @@ async fn inspection_distinguishes_loaded_built_and_recorded_without_disk_reads()
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("AGENTS.md");
     std::fs::write(&path, "LOADED_SENTINEL").unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(axo_ai::testing::reply_tool_calls(&[(
                 "read-data",
@@ -169,10 +165,8 @@ async fn inspection_distinguishes_loaded_built_and_recorded_without_disk_reads()
 #[tokio::test]
 async fn chained_follow_up_has_no_intermediate_idle_event() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(axo_ai::testing::reply_tool_calls(&[(
                 "result",
@@ -251,7 +245,7 @@ async fn chained_follow_up_has_no_intermediate_idle_event() {
 #[tokio::test]
 async fn retry_reports_the_provider_failure_and_configured_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}]),
         json!({"retry":{"maxRetries":1,"baseDelayMs":1,"maxDelayMs":10}}),
@@ -289,7 +283,7 @@ async fn retry_reports_the_provider_failure_and_configured_limit() {
 #[tokio::test]
 async fn summary_retry_reports_the_provider_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m","contextWindow":100_000,"maxTokens":4096}]),
         json!({

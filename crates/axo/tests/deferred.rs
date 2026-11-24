@@ -10,7 +10,7 @@ use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::{current_system_message, current_system_prompt};
 use axo_ai::{Message, RecordedRequest, ScriptedTurn, UserBlock};
-use common::{host, options, within};
+use common::{options, within};
 use serde_json::{Value, json};
 
 struct Probe(&'static str);
@@ -103,10 +103,8 @@ fn successful_result(request: &RecordedRequest, id: &str) -> String {
 #[tokio::test]
 async fn deferred_call_preserves_declarations_and_system_prompt() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "invoke",
@@ -147,10 +145,8 @@ async fn deferred_call_preserves_declarations_and_system_prompt() {
 #[tokio::test]
 async fn changing_deferred_tools_announces_only_the_catalog_delta() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("first")),
             ScriptedTurn::Reply(reply_text("second")),
@@ -193,7 +189,7 @@ async fn changing_deferred_tools_announces_only_the_catalog_delta() {
 #[tokio::test]
 async fn compaction_reannounces_the_catalog_after_the_summary() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
         json!({"compaction":{
@@ -254,7 +250,7 @@ async fn compaction_reannounces_the_catalog_after_the_summary() {
 #[tokio::test]
 async fn a_retained_catalog_delta_does_not_hide_compacted_tools() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
         json!({"compaction":{
@@ -332,7 +328,7 @@ async fn reading_tool_docs_promotes_only_on_native_tool_change_models() {
         } else {
             json!({"id":"m"})
         };
-        let host = host(
+        let host = common::host_with(
             dir.path(),
             json!([model]),
             json!({}),

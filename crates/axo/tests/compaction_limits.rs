@@ -17,7 +17,7 @@ async fn harness(
     output: u64,
     turns: Vec<ScriptedTurn>,
 ) -> (Axo, Arc<ScriptedApi>, Model) {
-    let host = common::host(
+    let host = common::host_with(
         dir,
         json!([{"id":"m", "contextWindow":window, "maxTokens":output}]),
         json!({ "compaction": compaction }),

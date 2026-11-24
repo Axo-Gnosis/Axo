@@ -43,7 +43,7 @@ async fn harness(
     window: u64,
     turns: Vec<ScriptedTurn>,
 ) -> (Axo, Arc<ScriptedApi>) {
-    let host = common::host(
+    let host = common::host_with(
         dir,
         json!([{"id":"m", "contextWindow":window, "maxTokens":4096}]),
         settings,
@@ -540,7 +540,7 @@ async fn summary_prompt_overrides_apply_to_live_and_separate_requests() {
     let rules = include_str!("../prompts/SUMMARY.md")
         .trim()
         .replace("{name}", "axo");
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
         settings(0),
@@ -1333,8 +1333,6 @@ async fn eliding_a_real_read_reattaches_nested_instructions_on_the_next_touch() 
     std::fs::write(opts.cwd.join("sub/data.txt"), "payload\n".repeat(1200)).unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "first-read",

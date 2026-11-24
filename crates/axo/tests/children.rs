@@ -13,7 +13,7 @@ use axo::{
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, Usage, UserBlock};
-use common::{delivered, entry, host, journal, only, options, request, run_ends, until, within};
+use common::{delivered, entry, journal, only, options, request, run_ends, until, within};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 
@@ -38,7 +38,7 @@ fn request_text(request: &RecordedRequest) -> String {
 #[tokio::test]
 async fn spawned_child_delivers_once_and_parks() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -189,7 +189,7 @@ async fn spawned_child_delivers_once_and_parks() {
 #[tokio::test]
 async fn opening_child_with_closed_parent_names_root() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -234,7 +234,7 @@ async fn opening_child_with_closed_parent_names_root() {
 #[tokio::test]
 async fn undelivered_child_message_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -316,7 +316,7 @@ impl Tool for Gate {
 #[tokio::test]
 async fn child_finishing_while_parent_closed_is_reconciled() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -393,7 +393,7 @@ async fn child_finishing_while_parent_closed_is_reconciled() {
 #[tokio::test]
 async fn parent_shutdown_resumes_child_on_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -564,7 +564,7 @@ async fn adoption_and_lookup_share_one_parked_child_revival() {
 #[tokio::test]
 async fn reopen_survives_child_that_cannot_revive() {
     let dir = tempfile::tempdir().unwrap();
-    let first = host(
+    let first = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -581,13 +581,7 @@ async fn reopen_survives_child_that_cannot_revive() {
     drop(parent);
 
     // The child's model is gone, so reviving its unfinished run fails.
-    let second = host(
-        dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ok"))],
-    )
-    .await;
+    let second = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("ok"))]).await;
     let parent = second
         .axo
         .open_session(&path, options(dir.path()))
@@ -621,7 +615,7 @@ impl SpawnHook for ReplaceSpawn {
 #[tokio::test]
 async fn spawn_policies_block() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),
@@ -684,7 +678,7 @@ async fn spawn_policies_block() {
 #[tokio::test]
 async fn turn_budget_wraps_up_and_flags_partial() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({"subagents":{"maxTurns":2}}),
@@ -767,7 +761,7 @@ async fn queued_children_publish_running_and_per_run_usage() {
         total_tokens: 38,
         ..Default::default()
     };
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({"subagents":{"maxConcurrent":1}}),
@@ -984,7 +978,7 @@ fn sum(parts: &[&Usage]) -> Usage {
 #[tokio::test]
 async fn tree_usage_counts_descendants_and_child_compaction_once() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([
             {"id":"m"},
@@ -1154,7 +1148,7 @@ async fn tree_usage_counts_descendants_and_child_compaction_once() {
 #[tokio::test]
 async fn kill_before_child_run_starts_aborts_it() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({"subagents":{"maxConcurrent":1}}),
@@ -1201,7 +1195,7 @@ async fn kill_before_child_run_starts_aborts_it() {
 #[tokio::test]
 async fn steer_right_after_spawn_keeps_the_task_first() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"child"}]),
         json!({}),

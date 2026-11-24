@@ -17,7 +17,7 @@ use axo_agent::{
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::{current_system_message, current_system_prompt};
 use axo_ai::{Message, RecordedRequest, ScriptedTurn, ServiceTier, ThinkingLevel, UserBlock};
-use common::{host, journal, options, within};
+use common::{journal, options, within};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -73,13 +73,7 @@ fn declarations(request: &RecordedRequest) -> Value {
 #[tokio::test]
 async fn restored_mode_restricts_tools_before_factory_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
-        dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ready"))],
-    )
-    .await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("ready"))]).await;
     let mut opts = mode_options(dir.path());
     let plan = &mut opts.host.definitions.modes[0];
     plan.bash = BashAccess::ReadOnly;
@@ -121,10 +115,8 @@ async fn restored_mode_restricts_tools_before_factory_runs() {
 #[tokio::test]
 async fn mode_blocks_write_without_changing_the_cached_prefix() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("ready")),
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -214,7 +206,7 @@ async fn mode_blocks_write_without_changing_the_cached_prefix() {
 #[tokio::test]
 async fn compaction_reannounces_the_mode_after_the_summary() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
         json!({"compaction":{
@@ -277,7 +269,7 @@ async fn compaction_reannounces_the_mode_after_the_summary() {
 #[tokio::test]
 async fn mode_model_override_restores_only_its_own_selection() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"planner"}, {"id":"third"}]),
         json!({}),
@@ -308,7 +300,7 @@ async fn mode_model_override_restores_only_its_own_selection() {
 async fn explicit_same_model_clears_mode_restore_after_reopen() {
     for via_persona in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let host = host(
+        let host = common::host_with(
             dir.path(),
             json!([{"id":"m"}, {"id":"planner"}]),
             json!({}),
@@ -377,7 +369,7 @@ async fn explicit_same_model_clears_mode_restore_after_reopen() {
 }
 
 async fn planner_session(dir: &Path) -> (common::Host, axo::Session) {
-    let host = host(
+    let host = common::host_with(
         dir,
         json!([{"id":"m","reasoning":true}, {"id":"planner","reasoning":true}]),
         json!({}),
@@ -467,13 +459,7 @@ async fn navigation_out_of_removed_mode_restores_selection() {
 #[tokio::test]
 async fn mode_follows_navigation_and_survives_reopening() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
-        dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("planned"))],
-    )
-    .await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("planned"))]).await;
     let session = host
         .axo
         .create_session(mode_options(dir.path()))
@@ -554,7 +540,7 @@ fn declared(request: &RecordedRequest) -> Vec<String> {
 #[tokio::test]
 async fn mode_limits_bind_every_descendant() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"child"}]),
         json!({"subagents":{"maxDepth":2}}),
@@ -617,7 +603,7 @@ async fn mode_limits_bind_every_descendant() {
 #[tokio::test]
 async fn host_spawn_follows_the_selected_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"child"}]),
         json!({}),
@@ -650,7 +636,7 @@ async fn host_spawn_follows_the_selected_mode() {
 #[tokio::test]
 async fn navigation_across_a_mode_boundary_switches_its_model() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"planner"}]),
         json!({}),
@@ -691,7 +677,7 @@ async fn navigation_across_a_mode_boundary_switches_its_model() {
 #[tokio::test]
 async fn a_notice_after_a_prompt_is_cut_as_a_split_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100_000, "maxTokens":4096}]),
         json!({"compaction":{
@@ -781,10 +767,8 @@ impl ToolPolicy for RecordPolicy {
 #[tokio::test]
 async fn policy_sees_the_mode_and_inner_deferred_tool_name() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "invoke",
@@ -825,13 +809,7 @@ async fn policy_sees_the_mode_and_inner_deferred_tool_name() {
 #[tokio::test]
 async fn mode_command_journals_entry_and_starts_its_user_text() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
-        dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("planned"))],
-    )
-    .await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("planned"))]).await;
     let session = host
         .axo
         .create_session(mode_options(dir.path()))
@@ -884,13 +862,7 @@ async fn nested_definitions_derive_namespaced_command_names() {
         "---\ndescription: Roadmap skill\n---\nRoadmap $1\n",
     )
     .unwrap();
-    let host = host(
-        dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ok"))],
-    )
-    .await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("ok"))]).await;
     host.config.user.lock().unwrap().layer.mode_roots = vec![dir.path().join("modes")];
     // A host-bundled definition of the same name yields to the file one.
     let (bundled, diagnostics) = ModeSpec::parse(
@@ -1009,10 +981,8 @@ fn only_result(lines: &[Value], call_id: &str) -> Value {
 async fn pending_review_survives_reopening_and_records_its_outcome() {
     for revise in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let host = host(
+        let host = common::host(
             dir.path(),
-            json!([{"id":"m"}]),
-            json!({}),
             vec![
                 ScriptedTurn::Reply(reply_tool_calls(&[(
                     "final",
@@ -1099,10 +1069,8 @@ async fn pending_review_survives_reopening_and_records_its_outcome() {
 #[tokio::test]
 async fn reviewed_result_can_be_revised_then_accepted_with_a_continuation() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "draft",
@@ -1248,10 +1216,8 @@ async fn review_replacement_distinguishes_missing_from_null() {
     assert_eq!(null.replacement, Some(Value::Null));
 
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![ScriptedTurn::Reply(reply_tool_calls(&[(
             "nullable",
             "call",
@@ -1288,10 +1254,8 @@ async fn review_replacement_distinguishes_missing_from_null() {
 #[tokio::test]
 async fn accepting_without_a_continuation_ends_the_run() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "final-plan",
@@ -1359,10 +1323,8 @@ async fn accepting_without_a_continuation_ends_the_run() {
 #[tokio::test]
 async fn dismissing_a_reviewed_result_records_its_outcome_and_aborts() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![ScriptedTurn::Reply(reply_tool_calls(&[(
             "final-plan",
             "call",
@@ -1401,10 +1363,8 @@ async fn dismissing_a_reviewed_result_records_its_outcome_and_aborts() {
 #[tokio::test]
 async fn steer_settles_a_pending_review() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "final-plan",
@@ -1455,10 +1415,8 @@ async fn steer_settles_a_pending_review() {
 async fn configured_result_continuation_runs_after_reviewed_and_unreviewed_yields() {
     for review in [true, false] {
         let dir = tempfile::tempdir().unwrap();
-        let host = host(
+        let host = common::host(
             dir.path(),
-            json!([{"id":"m"}]),
-            json!({}),
             vec![
                 ScriptedTurn::Reply(reply_tool_calls(&[(
                     "final-plan",
@@ -1520,10 +1478,8 @@ async fn configured_result_continuation_runs_after_reviewed_and_unreviewed_yield
 #[tokio::test]
 async fn unreviewed_yield_without_a_continuation_exits_immediately() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![ScriptedTurn::Reply(reply_tool_calls(&[(
             "final-plan",
             "call",
@@ -1560,10 +1516,8 @@ async fn unreviewed_yield_without_a_continuation_exits_immediately() {
 #[tokio::test]
 async fn invalid_yield_arguments_leave_the_mode_active() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "invalid-plan",
@@ -1614,10 +1568,8 @@ async fn invalid_yield_arguments_leave_the_mode_active() {
 #[tokio::test]
 async fn deferred_enter_mode_advertises_only_model_invocable_modes_and_announces_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "mode-docs",
@@ -1688,10 +1640,8 @@ async fn elision_keeps_old_mode_instructions_in_context() {
     // Exceed both elision's 400-token block threshold and its 4,000-token recent window.
     let body = INSTRUCTIONS.repeat(256);
     let later_conversation = "later conversation ".repeat(2_000);
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text(&later_conversation)),
             ScriptedTurn::Reply(reply_text("still planning")),
@@ -1748,10 +1698,8 @@ async fn read_only_bash_mode_denies_writes_but_runs_git_status() {
     // Not the system temp dir: the sandbox grants /tmp, which would hide the denial.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     assert!(!dir.path().starts_with("/tmp"), "{:?}", dir.path());
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
                 ("touch", "bash", json!({"command": "touch foo"})),
@@ -1821,10 +1769,8 @@ async fn read_only_bash_mode_denies_writes_but_runs_git_status() {
 async fn mode_write_scope_confines_write_and_edit_by_real_path() {
     let dir = tempfile::tempdir().unwrap();
     let call = |id: &'static str, path: &str| (id, "write", json!({"path": path, "content": id}));
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
                 call("outside", "src.rs"),

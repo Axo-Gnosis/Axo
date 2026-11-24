@@ -10,7 +10,7 @@ use axo::{
 use axo_ai::testing::reply_text;
 use axo_ai::transcript::current_system_prompt;
 use axo_ai::{Message, ScriptedTurn, ServiceTier, ThinkingLevel};
-use common::{host, options, within};
+use common::{options, within};
 use serde_json::json;
 
 #[tokio::test]
@@ -18,7 +18,7 @@ async fn model_selectors_expand_roles_and_thinking() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
     let settings = json!({"modelRoles": {"bard": "test/live:high"}});
-    let host = host(
+    let host = common::host_with(
         dir,
         json!([
             {"id": "m", "reasoning": true},
@@ -90,7 +90,7 @@ async fn service_tier_follows_selectors_and_settings() {
 
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
-    let host = host(
+    let host = common::host_with(
         dir,
         json!([
             {"id": "a", "reasoning": true, "serviceTiers": {"fast": 2}},
@@ -218,10 +218,8 @@ async fn root_agent_applies_its_switches() {
     }
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
-    let host = host(
+    let host = common::host(
         dir,
-        json!([{"id": "m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("control")),
             ScriptedTurn::Reply(reply_text("persona")),
@@ -430,13 +428,7 @@ async fn root_agent_applies_its_switches() {
 async fn harness_name_renames_self_references() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
-    let host = host(
-        dir,
-        json!([{"id": "m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ok"))],
-    )
-    .await;
+    let host = common::host(dir, vec![ScriptedTurn::Reply(reply_text("ok"))]).await;
     let axo = Axo::builder(
         host.models.clone(),
         Arc::new(JsonlStore::new(dir.join("sessions"))),

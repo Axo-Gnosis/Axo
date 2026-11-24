@@ -194,21 +194,50 @@ pub struct Host {
 
 /// A host over `dir` with [`TestConfig::for_dir`] and `<dir>/cache` as its cache
 /// directory.
-pub async fn host(
+pub async fn host_with(
     dir: &Path,
     models: serde_json::Value,
     settings: serde_json::Value,
     turns: Vec<ScriptedTurn>,
 ) -> Host {
-    let api = Arc::new(ScriptedApi::new(turns));
-    let (axo, models, config) = axo_with(
+    scripted_host(
         dir,
         models,
         settings,
         Arc::new(JsonlStore::new(dir.join("sessions"))),
-        api.clone(),
+        turns,
     )
-    .await;
+    .await
+}
+
+pub async fn gated_host(
+    dir: &Path,
+    models: Value,
+    gate: &Arc<WriteGate>,
+    turns: Vec<ScriptedTurn>,
+) -> Host {
+    scripted_host(
+        dir,
+        models,
+        json!({}),
+        Arc::new(GatedStore {
+            inner: JsonlStore::new(dir.join("sessions")),
+            gate: gate.clone(),
+        }),
+        turns,
+    )
+    .await
+}
+
+async fn scripted_host(
+    dir: &Path,
+    models: Value,
+    settings: Value,
+    store: Arc<dyn SessionStore>,
+    turns: Vec<ScriptedTurn>,
+) -> Host {
+    let api = Arc::new(ScriptedApi::new(turns));
+    let (axo, models, config) = axo_with(dir, models, settings, store, api.clone()).await;
     Host {
         axo,
         api,
@@ -272,9 +301,9 @@ pub fn only(lines: &[Value], what: &str, pred: impl Fn(&Value) -> bool) -> usize
     found[0]
 }
 
-/// An `Axo` whose sessions stream from `turns`, with one model `test/m`.
-pub async fn axo(dir: &Path, turns: Vec<ScriptedTurn>) -> Axo {
-    host(dir, json!([{"id":"m"}]), json!({}), turns).await.axo
+/// A host whose sessions stream from `turns`, with one model `test/m`.
+pub async fn host(dir: &Path, turns: Vec<ScriptedTurn>) -> Host {
+    host_with(dir, json!([{"id":"m"}]), json!({}), turns).await
 }
 
 /// Options for a session in `<dir>/work` on `test/m`, without project resources or a

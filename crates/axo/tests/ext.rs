@@ -16,13 +16,7 @@ use serde_json::{Value, json};
 #[tokio::test]
 async fn session_invocation_distinguishes_lookup_arguments_and_method_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
-        dir.path(),
-        json!([{"id": "m"}]),
-        json!({}),
-        vec![ScriptedTurn::HangUntilCancel],
-    )
-    .await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::HangUntilCancel]).await;
     let session = host
         .axo
         .create_session(common::options(dir.path()))
@@ -78,8 +72,6 @@ async fn extensions_can_select_modes_submit_tasks_and_render_hidden_skills() {
     .unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![ScriptedTurn::Reply(axo_ai::testing::reply_text("done"))],
     )
     .await;
@@ -140,7 +132,7 @@ async fn extensions_can_select_modes_submit_tasks_and_render_hidden_skills() {
 #[tokio::test]
 async fn caller_state_is_namespaced_and_journal_pages_resume_by_sequence() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await;
     let session = host
         .axo
         .create_session(common::options(dir.path()))
@@ -181,7 +173,9 @@ async fn caller_state_is_namespaced_and_journal_pages_resume_by_sequence() {
 #[tokio::test]
 async fn host_lists_sessions_and_pages_their_saved_journals() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("done"))]).await;
+    let axo = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("done"))])
+        .await
+        .axo;
     let options = common::options(dir.path());
     let cwd = json!(options.cwd);
     let session = axo.create_session(options).await.unwrap();
@@ -235,8 +229,6 @@ async fn models_complete_uses_the_host_streamer_and_reports_provider_errors() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id": "m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("hello")),
             ScriptedTurn::Error("offline".into()),
@@ -364,7 +356,7 @@ async fn models_complete_rejects_a_stream_without_a_terminal_message() {
 #[tokio::test]
 async fn models_complete_resolves_model_roles_like_model_selectors() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id": "m", "reasoning": true}]),
         json!({"modelRoles": {"fast": "test/m:high"}}),
@@ -431,7 +423,7 @@ async fn models_exposes_credential_sources_not_credentials() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await;
     std::fs::write(
         dir.path().join("auth.json"),
         r#"{"loaded/test":{"type":"api_key","key":"private-test-key"}}"#,
@@ -495,14 +487,15 @@ impl Tool for CommandProbe {
 #[tokio::test]
 async fn command_output_addresses_each_job_and_defaults_to_the_newest() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(
+    let axo = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[("probe", "command_probe", json!({}))])),
             ScriptedTurn::Reply(reply_text("done")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let mut options = common::bash_options(dir.path());
     options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(CommandProbe(tools.clone()))
@@ -575,14 +568,15 @@ impl Tool for WriteProbe {
 #[tokio::test]
 async fn tool_invocation_records_every_write_and_rejects_stale_files() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(
+    let axo = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[("probe", "write_probe", json!({}))])),
             ScriptedTurn::Reply(reply_text("done")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let mut options = common::options(dir.path());
     options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(WriteProbe(tools.clone()))
@@ -657,7 +651,7 @@ impl Tool for FileDetailsProbe {
 #[tokio::test]
 async fn tool_result_file_records_are_harness_owned() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(
+    let axo = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
@@ -667,7 +661,8 @@ async fn tool_result_file_records_are_harness_owned() {
             ScriptedTurn::Reply(reply_text("done")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let mut options = common::options(dir.path());
     options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(FileDetailsProbe(tools.clone()))
@@ -723,7 +718,7 @@ impl Tool for DroppedWriteProbe {
 #[tokio::test]
 async fn failed_tool_invocation_waits_for_dropped_write_and_journals_it() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(
+    let axo = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -734,7 +729,8 @@ async fn failed_tool_invocation_waits_for_dropped_write_and_journals_it() {
             ScriptedTurn::Reply(reply_text("done")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let mut options = common::options(dir.path());
     let file = options.cwd.join("a.txt");
     options.host.tools.push(HostTool::direct(Arc::new(|tools| {
@@ -762,7 +758,7 @@ async fn failed_tool_invocation_waits_for_dropped_write_and_journals_it() {
 #[tokio::test]
 async fn extension_submissions_record_provenance_live_and_in_journal() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(
+    let axo = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_text("user reply")),
@@ -770,7 +766,8 @@ async fn extension_submissions_record_provenance_live_and_in_journal() {
             ScriptedTurn::Reply(reply_text("ext follow-up reply")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let session = axo
         .create_session(common::options(dir.path()))
         .await
@@ -832,7 +829,7 @@ async fn extension_submissions_record_provenance_live_and_in_journal() {
 #[tokio::test]
 async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lookup() {
     let dir = tempfile::tempdir().unwrap();
-    let axo = common::axo(dir.path(), vec![]).await;
+    let axo = common::host(dir.path(), vec![]).await.axo;
     let scoped = Arc::new(axo.models().scoped());
     let layer = scoped.provider_layer();
     layer

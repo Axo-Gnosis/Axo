@@ -13,7 +13,7 @@ use axo::{ProjectAccess, SchemeUrl, SessionOptions, SessionTools, Target, ToolFa
 use axo_agent::{RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{ScriptedTurn, UserBlock};
-use common::{axo, tool_text, within};
+use common::{tool_text, within};
 use serde_json::{Value, json};
 
 struct Where(Arc<SessionTools>);
@@ -76,7 +76,7 @@ fn artifact_after(text: &str, marker: &str) -> u64 {
 async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
     let dir = tempfile::tempdir().unwrap();
     let (path, artifact) = {
-        let host = axo(
+        let host = common::host(
             dir.path(),
             vec![
                 ScriptedTurn::Reply(reply_tool_calls(&[
@@ -95,7 +95,8 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
                 ScriptedTurn::Reply(reply_text("saved")),
             ],
         )
-        .await;
+        .await
+        .axo;
         let session = host.create_session(bash_options(dir.path())).await.unwrap();
         assert_eq!(
             within(session.prompt("Save a plan and print it after a long sequence."))
@@ -130,7 +131,7 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
 
     // Script the dependent read only after parsing the URL returned by real bash.
     let artifact_url = format!("artifact://{artifact}");
-    let host = axo(
+    let host = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -162,7 +163,8 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
             ScriptedTurn::Reply(reply_text("printed another sequence")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let session = host
         .open_session(&path, bash_options(dir.path()))
         .await
@@ -284,7 +286,7 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
 #[tokio::test]
 async fn forks_snapshot_live_spools_and_share_finished_artifacts() {
     let dir = tempfile::tempdir().unwrap();
-    let host = axo(
+    let host = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
@@ -298,7 +300,7 @@ async fn forks_snapshot_live_spools_and_share_finished_artifacts() {
             ScriptedTurn::Reply(reply_text("left a helper ticking")),
         ],
     )
-    .await;
+    .await.axo;
     let session = host.create_session(bash_options(dir.path())).await.unwrap();
     assert_eq!(
         within(session.prompt("Print a long sequence and start a ticking helper."))

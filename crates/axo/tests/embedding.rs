@@ -57,8 +57,6 @@ async fn two_projects_one_host_do_not_leak() {
     let dir = dir.path();
     let host = common::host(
         dir,
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("in a")),
             ScriptedTurn::Reply(reply_text("in b")),
@@ -157,7 +155,7 @@ async fn two_projects_one_host_do_not_leak() {
 async fn default_model_resolves_only_when_selected() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
-    let host = common::host(
+    let host = common::host_with(
         dir,
         json!([{"id":"m"}]),
         json!({"defaultModel": "${AXO_TEST_NEVER_SET_MODEL}"}),
@@ -205,13 +203,7 @@ async fn default_model_resolves_only_when_selected() {
 #[tokio::test]
 async fn bundled_docs_live_under_host_cache_dir() {
     let root = tempfile::tempdir().unwrap();
-    let host = common::host(
-        root.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ok"))],
-    )
-    .await;
+    let host = common::host(root.path(), vec![ScriptedTurn::Reply(reply_text("ok"))]).await;
     let session = host.axo.create_session(options(root.path())).await.unwrap();
     assert_eq!(
         within(session.prompt("hi")).await.unwrap(),
@@ -235,7 +227,7 @@ async fn bundled_docs_live_under_host_cache_dir() {
 #[tokio::test]
 async fn no_cache_dir_omits_bundled_docs() {
     let root = tempfile::tempdir().unwrap();
-    let host = common::host(root.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(root.path(), vec![]).await;
     let api = Arc::new(ScriptedApi::new(vec![ScriptedTurn::Reply(reply_text(
         "bare",
     ))]));

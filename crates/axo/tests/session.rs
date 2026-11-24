@@ -12,14 +12,16 @@ use axo::{PromptPart, SessionEvent, ToolPolicy, ToolScope};
 use axo_agent::{AgentMessage, BeforeToolCallContext, RunOutcome, ToolCallDecision, ToolError};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
-use common::{axo, options, within};
+use common::{options, within};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn session_names_are_file_wide_and_custom_state_follows_the_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let host = axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("saved"))]).await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("saved"))])
+        .await
+        .axo;
     let session = host.create_session(options(dir.path())).await.unwrap();
     session.prompt("persist this session").await.unwrap();
     let before = session.attach(None).await;
@@ -76,8 +78,6 @@ async fn quiet_host_message_waits_for_a_prompt_and_survives_reopening_once() {
         let dir = tempfile::tempdir().unwrap();
         let host = common::host(
             dir.path(),
-            json!([{"id": "m"}]),
-            json!({}),
             vec![
                 ScriptedTurn::Reply(reply_text("first")),
                 ScriptedTurn::Reply(reply_text("second")),
@@ -197,8 +197,6 @@ async fn input_queued_when_a_run_stops_survives_reopening() {
         let dir = tempfile::tempdir().unwrap();
         let host = common::host(
             dir.path(),
-            json!([{"id": "m"}]),
-            json!({}),
             vec![
                 ScriptedTurn::HangUntilCancel,
                 ScriptedTurn::Reply(reply_text("one")),
@@ -337,8 +335,6 @@ async fn input_after_stop_starts_the_next_run() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id": "m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[("c1", "stops_slowly", json!({}))])),
             ScriptedTurn::Reply(reply_text("ok")),
@@ -401,8 +397,6 @@ async fn resume_wakes_sends_held_input() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id": "m"}]),
-        json!({}),
         vec![
             ScriptedTurn::HangUntilCancel,
             ScriptedTurn::Reply(reply_text("ok")),
@@ -448,29 +442,14 @@ async fn resume_wakes_sends_held_input() {
     session.shutdown().await;
 }
 
-async fn gated_host(
-    dir: &std::path::Path,
-    gate: &Arc<common::WriteGate>,
-    turns: Vec<ScriptedTurn>,
-) -> (axo::Axo, Arc<axo_ai::ScriptedApi>) {
-    let api = Arc::new(axo_ai::ScriptedApi::new(turns));
-    let store = Arc::new(common::GatedStore {
-        inner: JsonlStore::new(dir.join("sessions")),
-        gate: gate.clone(),
-    });
-    let (host, ..) =
-        common::axo_with(dir, json!([{"id": "m"}]), json!({}), store, api.clone()).await;
-    (host, api)
-}
-
 #[tokio::test]
 async fn stop_during_submission_holds_later_job_result() {
     let dir = tempfile::tempdir().unwrap();
     let gate = common::WriteGate::new(
         |entry| matches!(entry, Entry::Submission { request_id: Some(id), .. } if id == "blocked"),
     );
-    let (host, api) = gated_host(
-        dir.path(),
+    let common::Host { axo: host, api, .. } = common::gated_host(
+        dir.path(), json!([{ "id": "m" }]),
         &gate,
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -592,13 +571,7 @@ async fn unsuccessful_preparation_wakes_accepted_input() {
     for kind in [SubmissionKind::Steer, SubmissionKind::FollowUp] {
         for cancel in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let host = common::host(
-                dir.path(),
-                json!([{"id": "m"}]),
-                json!({}),
-                vec![ScriptedTurn::Reply(reply_text("ok"))],
-            )
-            .await;
+            let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("ok"))]).await;
             let scheme = Arc::new(FailingScheme::default());
             let mut opts = options(dir.path());
             opts.host.schemes.push(scheme.clone());
@@ -665,7 +638,13 @@ async fn failed_withdrawal_preserves_queue_order() {
         let dir = tempfile::tempdir().unwrap();
         let gate =
             common::WriteGate::new(|entry| matches!(entry, Entry::SubmissionWithdrawn { .. }));
-        let (host, api) = gated_host(dir.path(), &gate, vec![ScriptedTurn::HangUntilCancel]).await;
+        let common::Host { axo: host, api, .. } = common::gated_host(
+            dir.path(),
+            json!([{ "id": "m" }]),
+            &gate,
+            vec![ScriptedTurn::HangUntilCancel],
+        )
+        .await;
         let session = Arc::new(host.create_session(options(dir.path())).await.unwrap());
         let run = tokio::spawn({
             let session = session.clone();
@@ -720,8 +699,6 @@ async fn withdrawn_input_is_never_delivered() {
         let dir = tempfile::tempdir().unwrap();
         let host = common::host(
             dir.path(),
-            json!([{"id": "m"}]),
-            json!({}),
             vec![
                 ScriptedTurn::HangUntilCancel,
                 ScriptedTurn::Reply(reply_text("unexpected")),
@@ -806,7 +783,7 @@ async fn reopened_session_edits_a_file_it_read_before() {
     std::fs::write(&notes, "hello\n").unwrap();
 
     let path = {
-        let axo = axo(
+        let axo = common::host(
             dir.path(),
             vec![
                 ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -817,7 +794,8 @@ async fn reopened_session_edits_a_file_it_read_before() {
                 ScriptedTurn::Reply(reply_text("read")),
             ],
         )
-        .await;
+        .await
+        .axo;
         let session = axo.create_session(options(dir.path())).await.unwrap();
         assert_eq!(
             within(session.prompt("read the notes")).await.unwrap(),
@@ -826,7 +804,7 @@ async fn reopened_session_edits_a_file_it_read_before() {
         session.path().to_path_buf()
     };
 
-    let axo = axo(
+    let axo = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -837,7 +815,8 @@ async fn reopened_session_edits_a_file_it_read_before() {
             ScriptedTurn::Reply(reply_text("edited")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let session = axo.open_session(&path, options(dir.path())).await.unwrap();
     assert_eq!(
         within(session.prompt("edit the notes")).await.unwrap(),
@@ -863,7 +842,9 @@ async fn reopened_session_edits_a_file_it_read_before() {
 async fn stranded_prompt_runs_when_the_session_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let path = {
-        let axo = axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("one"))]).await;
+        let axo = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("one"))])
+            .await
+            .axo;
         let session = axo.create_session(options(dir.path())).await.unwrap();
         assert_eq!(
             within(session.prompt("first")).await.unwrap(),
@@ -898,7 +879,9 @@ async fn stranded_prompt_runs_when_the_session_reopens() {
             .unwrap();
     }
 
-    let axo = axo(dir.path(), vec![ScriptedTurn::Reply(reply_text("two"))]).await;
+    let axo = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("two"))])
+        .await
+        .axo;
     let session = axo.open_session(&path, options(dir.path())).await.unwrap();
     let attach = session.attach(None).await;
     // The resumed run may have settled already: its `run_end` follows the submission.
@@ -957,7 +940,7 @@ async fn navigation_host(
     dir: &std::path::Path,
     turns: Vec<ScriptedTurn>,
 ) -> (axo::Axo, std::sync::Arc<axo_ai::ScriptedApi>, axo_ai::Model) {
-    let host = common::host(
+    let host = common::host_with(
         dir,
         json!([
             {"id":"m", "contextWindow":131072, "maxTokens":4096, "reasoning":true},
@@ -1220,7 +1203,7 @@ async fn suffix_pair_is_one_journal_selection() {
     use axo_ai::{ServiceTier, ThinkingLevel};
 
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id": "m", "reasoning": true, "serviceTiers": {"fast": 2}}]),
         json!({}),
@@ -1279,7 +1262,7 @@ async fn suffix_pair_is_one_journal_selection() {
 async fn sessions_follow_registry_changes_but_keep_host_copies() {
     let dir = tempfile::tempdir().unwrap();
     let turns = ["one", "two", "three"].map(|text| ScriptedTurn::Reply(reply_text(text)));
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id": "m", "contextWindow": 200000}]),
         json!({}),
@@ -1402,7 +1385,7 @@ async fn tool_policies_block_bash_in_sessions_and_forks_before_later_policies() 
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let host = axo(
+    let host = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -1419,7 +1402,8 @@ async fn tool_policies_block_bash_in_sessions_and_forks_before_later_policies() 
             ScriptedTurn::Reply(reply_text("blocked again")),
         ],
     )
-    .await;
+    .await
+    .axo;
     let later = Arc::new(LaterHook(AtomicUsize::new(0)));
     let no_bash = Arc::new(NoBash(Mutex::new(Vec::new())));
     let mut options = common::bash_options(dir.path());
@@ -1470,8 +1454,6 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id": "m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_text("a")),
             ScriptedTurn::Reply(reply_text("b")),
@@ -1574,7 +1556,7 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
     use axo::context::agents::{AgentSpec, RunAs};
 
     let dir = tempfile::tempdir().unwrap();
-    let host = axo(dir.path(), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await.axo;
     let root = AgentSpec {
         name: "root-only".into(),
         run_as: RunAs::Root,
@@ -1651,7 +1633,7 @@ mod keywords {
         for (key, value) in extra.as_object().unwrap() {
             settings[key] = value.clone();
         }
-        common::host(
+        common::host_with(
             dir,
             json!([{"id":"m"},{"id":"c"},{"id":"child"}]),
             settings,

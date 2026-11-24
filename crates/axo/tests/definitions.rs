@@ -9,7 +9,7 @@ use axo::{AgentSpec, CommandKind, Definitions, Entry, KeywordSpec, ModeSpec, Tar
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::current_system_message;
 use axo_ai::{Message, RecordedRequest, ScriptedTurn};
-use common::{host, options, within};
+use common::{options, within};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -70,7 +70,7 @@ fn definitions(dir: &Path) -> Definitions {
 async fn set_definitions_is_live() {
     let dir = tempdir().unwrap();
     // enter_mode is deferred. Reading its docs promotes it on a tool-change-capable model.
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "api":"anthropic-messages", "compat":{
             "supportsMidConvoSystemMessages":true, "supportsMidConvoToolChanges":true
@@ -185,7 +185,7 @@ async fn set_definitions_is_live() {
 #[tokio::test]
 async fn teams_validate_against_the_merged_agents() {
     let dir = tempdir().unwrap();
-    let axo = common::axo(dir.path(), vec![]).await;
+    let axo = common::host(dir.path(), vec![]).await.axo;
     let mut opts = options(dir.path());
     opts.layer.definitions.teams.push(crew("ghost"));
     let session = axo.create_session(opts).await.unwrap();
@@ -218,7 +218,7 @@ async fn precedence_files_layer_host() {
         "---\ndescription: file\n---\nFile agent.\n",
     )
     .unwrap();
-    let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await;
     host.config.user.lock().unwrap().layer.agent_roots = vec![root];
     let mut opts = options(dir.path());
     opts.layer.definitions.agents = vec![agent("a", "layer"), agent("b", "layer")];
@@ -246,13 +246,7 @@ async fn precedence_files_layer_host() {
 #[tokio::test]
 async fn unchanged_definitions_change_nothing() {
     let dir = tempdir().unwrap();
-    let host = host(
-        dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
-        vec![ScriptedTurn::Reply(reply_text("ok")); 2],
-    )
-    .await;
+    let host = common::host(dir.path(), vec![ScriptedTurn::Reply(reply_text("ok")); 2]).await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
     let defs = definitions(dir.path());
     for value in [defs.clone(), defs] {
@@ -278,7 +272,7 @@ async fn unchanged_definitions_change_nothing() {
 #[tokio::test]
 async fn forks_and_children_inherit() {
     let dir = tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"}, {"id":"child"}]),
         json!({}),

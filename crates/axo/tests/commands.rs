@@ -12,7 +12,7 @@ use axo::{Entry, SeqEntry};
 use axo_agent::{AgentMessage, RunOutcome};
 use axo_ai::testing::reply_text;
 use axo_ai::{Message, ScriptedTurn, ThinkingLevel, UserBlock};
-use common::{host, options, transient, within};
+use common::{options, transient, within};
 use serde_json::json;
 
 fn models() -> serde_json::Value {
@@ -82,7 +82,7 @@ fn model(model: &str) -> Command {
 #[tokio::test]
 async fn run_command_records_no_submission_or_model_call() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(dir.path(), models(), json!({}), vec![]).await;
+    let host = common::host_with(dir.path(), models(), json!({}), vec![]).await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
 
     // The session records its initial selection lazily, so compare against a snapshot
@@ -105,7 +105,7 @@ async fn run_command_records_no_submission_or_model_call() {
 #[tokio::test]
 async fn slash_text_is_always_a_prompt() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         models(),
         json!({}),
@@ -142,7 +142,7 @@ async fn pasted_slash_text_is_never_a_skill() {
         "description: Review a file",
         "Review $1",
     );
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         models(),
         json!({}),
@@ -176,7 +176,7 @@ async fn commands_during_a_run_follow_their_policy() {
         "description: Shadowed by /model",
         "never",
     );
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         models(),
         json!({}),
@@ -274,7 +274,7 @@ async fn commands_during_a_run_follow_their_policy() {
 async fn selection_changes_during_maintenance_apply() {
     let dir = tempfile::tempdir().unwrap();
     let settings = json!({"compaction": {"enabled": true, "keepRecentTokens": 0}});
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         models(),
         settings,

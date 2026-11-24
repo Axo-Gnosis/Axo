@@ -15,7 +15,7 @@ use serde_json::json;
 
 /// A host whose one model `test/m` accepts images, answering `turns` prompts.
 async fn host(dir: &Path, turns: usize) -> common::Host {
-    common::host(
+    common::host_with(
         dir,
         json!([{"id": "m", "input": ["text", "image"]}]),
         json!({}),

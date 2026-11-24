@@ -232,7 +232,7 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let host = common::host(
+        let host = common::host_with(
             dir.path(),
             json!([{"id":"m", "contextWindow":100000, "maxTokens":4096}]),
             json!({}),
@@ -303,7 +303,7 @@ async fn terminal_fault_recovery_persists_missing_results_before_settlement() {
 #[tokio::test]
 async fn recovery_closed_run_holds_unconsumed_input() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100000, "maxTokens":4096}]),
         json!({}),
@@ -366,7 +366,7 @@ async fn recovery_closed_run_holds_unconsumed_input() {
 #[tokio::test]
 async fn requeued_submission_is_rendered_from_its_parts_and_current_files() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m", "contextWindow":100000, "maxTokens":4096, "input":["text","image"]}]),
         json!({}),
@@ -498,7 +498,7 @@ async fn setup(dir: &Path, turns: Vec<ScriptedTurn>, enabled: bool) -> (Axo, Arc
         {"id":"other", "contextWindow":100000, "maxTokens":4096},
     ]);
     let settings = json!({"compaction": {"enabled": enabled, "keepRecentTokens": 0}});
-    let host = common::host(dir, models, settings, turns).await;
+    let host = common::host_with(dir, models, settings, turns).await;
     (host.axo, host.api)
 }
 

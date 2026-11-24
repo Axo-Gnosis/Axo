@@ -21,7 +21,7 @@ use axo_agent::{
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::current_system_prompt;
 use axo_ai::{Message, ScriptedTurn, UserBlock};
-use common::{host, options, within};
+use common::{options, within};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -104,7 +104,7 @@ fn write_file(dir: &Path) {
 #[tokio::test]
 async fn labeled_deferred_duplicates_keep_the_later_one() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await;
     let mut opts = options(dir.path());
     opts.host.tools = vec![
         HostTool::deferred(factory("x")).with_origin("a"),
@@ -129,10 +129,8 @@ async fn labeled_deferred_duplicates_keep_the_later_one() {
 async fn a_labeled_tool_replaces_a_built_in_until_the_host_drops_it() {
     let dir = tempfile::tempdir().unwrap();
     write_file(dir.path());
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![read_call("c1"), done(), read_call("c2"), done()],
     )
     .await;
@@ -219,10 +217,8 @@ impl ToolPolicy for AddText {
 async fn tool_policies_swap_between_calls() {
     let dir = tempfile::tempdir().unwrap();
     write_file(dir.path());
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             read_call("c1"),
             done(),
@@ -292,7 +288,7 @@ impl Scheme for Lab {
 #[tokio::test]
 async fn schemes_swap_at_once_and_reject_bad_sets_whole() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
     assert!(session.schemes().exact("lab://a").is_none());
 
@@ -318,7 +314,7 @@ async fn schemes_swap_at_once_and_reject_bad_sets_whole() {
 #[tokio::test]
 async fn sections_omitted_from_the_next_set_disappear() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
+    let host = common::host(dir.path(), vec![]).await;
     let session = host.axo.create_session(options(dir.path())).await.unwrap();
     session
         .set_sections(vec![("lab_rules".into(), Some("Follow lab rules.".into()))])
@@ -407,10 +403,8 @@ fn section(name: &str, body: &str) -> (String, Option<String>) {
 async fn the_layer_and_host_registrations_change_independently() {
     let dir = tempfile::tempdir().unwrap();
     write_file(dir.path());
-    let host = host(
+    let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![read_call("c1"), done(), read_call("c2"), done()],
     )
     .await;
@@ -507,7 +501,7 @@ async fn registered_commands_list_after_modes_and_run_their_handler() {
         "---\ndescription: Deploy it\n---\nDeploy.\n",
     )
     .unwrap();
-    let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![done()]).await;
+    let host = common::host(dir.path(), vec![done()]).await;
     let hello = Arc::new(Hello::default());
     let mut opts = options(dir.path());
     opts.host.definitions.modes.push(ModeSpec {

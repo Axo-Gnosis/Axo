@@ -8,7 +8,7 @@ use axo::{
 };
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedTurn};
-use common::{delivered, entry, host, journal, message_text, only, options, until, within};
+use common::{delivered, entry, journal, message_text, only, options, until, within};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -56,7 +56,7 @@ fn pair_files(dir: &Path) {
 #[tokio::test]
 async fn team_members_message_each_other_and_the_parent() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
         json!({}),
@@ -246,7 +246,7 @@ async fn team_members_message_each_other_and_the_parent() {
 #[tokio::test]
 async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
         json!({}),
@@ -403,7 +403,7 @@ async fn mail_waits_unread_on_a_paused_member_until_resume_wakes() {
 async fn mutual_wait_fails_both_waits() {
     let dir = tempfile::tempdir().unwrap();
     pair_files(dir.path());
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
         json!({}),
@@ -476,7 +476,7 @@ async fn outsider_cannot_message_team_members() {
         "---\nmodel: test/c\n---\nGamma does C.\n",
     )
     .unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
         json!({}),
@@ -544,7 +544,7 @@ async fn outsider_cannot_message_team_members() {
 #[tokio::test]
 async fn send_steer_starts_a_run_on_an_idle_child() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
         json!({}),
@@ -629,7 +629,7 @@ async fn spawn_tool_team_rerun_adopts_every_member() {
         ("w1", "wait", json!({})),
     ]))];
     turns.extend(vec![ScriptedTurn::Reply(reply_text("ack")); 8]);
-    let host = host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id":"m"},{"id":"a"},{"id":"b"},{"id":"c"},{"id":"child"}]),
         json!({}),

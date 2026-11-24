@@ -4,7 +4,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -12,14 +11,14 @@ use async_trait::async_trait;
 use axo::exec::host::ExecSpec;
 use axo::tools::CommandRequest;
 use axo::{
-    Axo, CommandExit, JobInfo, JobKind, JobStatus, Killer, MessageDelivery, Promotion, Session,
+    CommandExit, JobInfo, JobKind, JobStatus, Killer, MessageDelivery, Promotion, Session,
     SessionEvent, SessionTools, ToolFactory, jobs_from_entries,
 };
 use axo::{Entry, SeqEntry};
 use axo_agent::{AgentEvent, RunOutcome, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::testing::{RecordedRequest, reply_text, reply_tool_calls};
-use axo_ai::{Message, ScriptedApi, ScriptedTurn, UserBlock};
-use common::{Hang, axo, bash_options, dead, journal, only, tool_text, until, within};
+use axo_ai::{Message, ScriptedTurn, UserBlock};
+use common::{Hang, bash_options, dead, journal, only, tool_text, until, within};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -63,12 +62,6 @@ impl Tool for LateTool {
             )
             .await
     }
-}
-
-/// An `Axo` streaming from `turns`, plus the API that records every request.
-async fn scripted(dir: &Path, turns: Vec<ScriptedTurn>) -> (Axo, Arc<ScriptedApi>) {
-    let host = common::host(dir, json!([{"id":"m"}]), json!({}), turns).await;
-    (host.axo, host.api)
 }
 
 /// The text of every user message in `request`, in order.
@@ -207,7 +200,7 @@ async fn read_url(session: &Session, url: &str) -> String {
 #[tokio::test]
 async fn command_events_are_ordered_across_attach() {
     let dir = tempfile::tempdir().unwrap();
-    let (axo, _) = scripted(
+    let common::Host { axo, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -319,7 +312,7 @@ async fn command_events_are_ordered_across_attach() {
 #[tokio::test]
 async fn foreground_output_handle_survives_completion_and_host_can_promote() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id": "m"}]),
         json!({"bash": {"promoteAfterMs": 60000}}),
@@ -423,7 +416,7 @@ async fn abandoned_drain_marks_foreground_capture_partial() {
         let command = format!(
             "echo \"$BASHPID\" > shell.pid; printf '%0{length}d' 0; while [[ ! -e release ]]; do sleep 0.01; done"
         );
-        let host = common::host(
+        let host = common::host_with(
             dir.path(),
             json!([{"id": "m"}]),
             json!({"bash": {"promoteAfterMs": 60000}}),
@@ -492,7 +485,7 @@ async fn abandoned_drain_marks_foreground_capture_partial() {
 #[tokio::test]
 async fn retained_drain_failure_follows_the_tool_result() {
     let dir = tempfile::tempdir().unwrap();
-    let host = axo(
+    let host = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -503,7 +496,7 @@ async fn retained_drain_failure_follows_the_tool_result() {
             ScriptedTurn::Reply(reply_text("finished")),
         ],
     )
-    .await;
+    .await.axo;
     let options = bash_options(dir.path());
     let cwd = options.cwd.clone();
     let session = host.create_session(options).await.unwrap();
@@ -544,7 +537,7 @@ async fn retained_drain_failure_follows_the_tool_result() {
 async fn async_job_result_is_delivered_once_by_idle_wake() {
     let dir = tempfile::tempdir().unwrap();
     let command = "sleep 1; echo done";
-    let (axo, api) = scripted(
+    let common::Host { axo, api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -605,7 +598,7 @@ async fn async_job_result_is_delivered_once_by_idle_wake() {
 #[tokio::test]
 async fn host_command_is_listed_and_delivered_once() {
     let dir = tempfile::tempdir().unwrap();
-    let (axo, api) = scripted(
+    let common::Host { axo, api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[("c1", "late", json!({}))])),
@@ -664,7 +657,7 @@ async fn host_command_is_listed_and_delivered_once() {
 #[tokio::test]
 async fn configured_delay_promotes_a_foreground_command() {
     let dir = tempfile::tempdir().unwrap();
-    let host = common::host(
+    let host = common::host_with(
         dir.path(),
         json!([{"id": "m"}]),
         json!({"bash": {"promoteAfterMs": 200}}),
@@ -707,7 +700,7 @@ async fn configured_delay_promotes_a_foreground_command() {
 async fn wait_consumes_the_result_and_auto_delivery_skips_it() {
     let dir = tempfile::tempdir().unwrap();
     let command = "sleep 1; echo done";
-    let (axo, api) = scripted(
+    let common::Host { axo, api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -781,7 +774,7 @@ async fn wait_consumes_the_result_and_auto_delivery_skips_it() {
 #[tokio::test]
 async fn wait_sees_a_job_promoted_in_its_batch() {
     let dir = tempfile::tempdir().unwrap();
-    let (axo, _api) = scripted(
+    let common::Host { axo, api: _api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
@@ -813,7 +806,7 @@ async fn wait_sees_a_job_promoted_in_its_batch() {
 async fn steer_promotes_a_foreground_command() {
     let dir = tempfile::tempdir().unwrap();
     let command = "sleep 2; echo late";
-    let (axo, api) = scripted(
+    let common::Host { axo, api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -881,7 +874,7 @@ async fn steer_promotes_a_foreground_command() {
 #[tokio::test]
 async fn retained_helpers_return_promptly_and_are_killable() {
     let dir = tempfile::tempdir().unwrap();
-    let host = axo(
+    let host = common::host(
         dir.path(),
         vec![
             // The helper records its own pid for the test to watch.
@@ -911,7 +904,7 @@ async fn retained_helpers_return_promptly_and_are_killable() {
             ScriptedTurn::Reply(reply_text("already stopped")),
         ],
     )
-    .await;
+    .await.axo;
     let options = bash_options(dir.path());
     let pid_file = options.cwd.join("sleep.pid");
     let session = host.create_session(options).await.unwrap();
@@ -996,7 +989,7 @@ async fn retained_helpers_return_promptly_and_are_killable() {
 #[tokio::test]
 async fn host_job_api_reports_and_kills() {
     let dir = tempfile::tempdir().unwrap();
-    let (axo, _api) = scripted(
+    let common::Host { axo, api: _api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -1121,7 +1114,7 @@ async fn host_job_api_reports_and_kills() {
 #[tokio::test]
 async fn shutdown_interrupts_background_commands() {
     let dir = tempfile::tempdir().unwrap();
-    let (axo, _api) = scripted(
+    let common::Host { axo, api: _api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
@@ -1161,7 +1154,7 @@ async fn shutdown_interrupts_background_commands() {
 #[tokio::test]
 async fn resume_wakes_delivers_results_an_abort_paused() {
     let dir = tempfile::tempdir().unwrap();
-    let (axo, api) = scripted(
+    let common::Host { axo, api, .. } = common::host(
         dir.path(),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(

@@ -17,7 +17,7 @@ use axo_ai::{
     AssistantEvent, Message, Model, ScriptedApi, ScriptedTurn, SimpleStreamOptions, Streamer,
     Transcript, UserBlock,
 };
-use common::{GatedStore, WriteGate, bash_options, journal, only, within};
+use common::{WriteGate, bash_options, journal, only, within};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
@@ -62,29 +62,13 @@ async fn build(
     streamer: Arc<dyn Streamer>,
     store: Arc<dyn SessionStore>,
 ) -> Axo {
-    common::axo_with(
-        dir,
-        json!([{"id": "m", "contextWindow": 100_000, "maxTokens": 4096}]),
-        settings,
-        store,
-        streamer,
-    )
-    .await
-    .0
+    common::axo_with(dir, journal_models(), settings, store, streamer)
+        .await
+        .0
 }
 
-/// An `Axo` streaming `turns` whose writers stop at `gate`.
-async fn gated_writes(
-    dir: &Path,
-    turns: Vec<ScriptedTurn>,
-    gate: &Arc<WriteGate>,
-) -> (Axo, Arc<ScriptedApi>) {
-    let api = Arc::new(ScriptedApi::new(turns));
-    let store = Arc::new(GatedStore {
-        inner: JsonlStore::new(dir.join("sessions")),
-        gate: gate.clone(),
-    });
-    (build(dir, json!({}), api.clone(), store).await, api)
+fn journal_models() -> Value {
+    json!([{"id": "m", "contextWindow": 100_000, "maxTokens": 4096}])
 }
 
 fn admits(entry: &Entry) -> bool {
@@ -203,8 +187,6 @@ async fn parallel_async_jobs_settle_and_reach_the_next_turn() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(
         dir.path(),
-        json!([{"id":"m"}]),
-        json!({}),
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[
                 (
@@ -262,8 +244,10 @@ async fn parallel_async_jobs_settle_and_reach_the_next_turn() {
 async fn a_job_ending_while_its_admission_persists_journals_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let gate = WriteGate::new(admits);
-    let (axo, _api) = gated_writes(
+    let common::Host { axo, .. } = common::gated_host(
         dir.path(),
+        journal_models(),
+        &gate,
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c1",
@@ -273,7 +257,6 @@ async fn a_job_ending_while_its_admission_persists_journals_after_it() {
             ScriptedTurn::Reply(reply_text("started it")),
             ScriptedTurn::Reply(reply_text("it printed done")),
         ],
-        &gate,
     )
     .await;
     let options = bash_options(dir.path());
@@ -322,8 +305,10 @@ async fn a_job_ending_while_its_admission_persists_journals_after_it() {
 async fn a_steer_during_a_batch_is_accepted_and_drained() {
     let dir = tempfile::tempdir().unwrap();
     let gate = WriteGate::new(admits);
-    let (axo, api) = gated_writes(
+    let common::Host { axo, api, .. } = common::gated_host(
         dir.path(),
+        journal_models(),
+        &gate,
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c1",
@@ -334,7 +319,6 @@ async fn a_steer_during_a_batch_is_accepted_and_drained() {
             ScriptedTurn::Reply(reply_text("ok again")),
             ScriptedTurn::Reply(reply_text("and again")),
         ],
-        &gate,
     )
     .await;
     let session = Arc::new(axo.create_session(bash_options(dir.path())).await.unwrap());
@@ -369,10 +353,11 @@ async fn a_steer_during_a_batch_is_accepted_and_drained() {
 async fn attach_returns_while_a_write_is_in_flight() {
     let dir = tempfile::tempdir().unwrap();
     let gate = WriteGate::new(|entry| matches!(entry, Entry::Submission { .. }));
-    let (axo, _api) = gated_writes(
+    let common::Host { axo, .. } = common::gated_host(
         dir.path(),
-        vec![ScriptedTurn::Reply(reply_text("hello"))],
+        journal_models(),
         &gate,
+        vec![ScriptedTurn::Reply(reply_text("hello"))],
     )
     .await;
     let session = Arc::new(
@@ -571,13 +556,14 @@ async fn a_model_change_during_compaction_does_not_invalidate_it() {
 async fn dropping_a_prompt_mid_submission_never_wedges_the_session() {
     let dir = tempfile::tempdir().unwrap();
     let gate = WriteGate::new(|entry| matches!(entry, Entry::Submission { .. }));
-    let (axo, _api) = gated_writes(
+    let common::Host { axo, .. } = common::gated_host(
         dir.path(),
+        journal_models(),
+        &gate,
         vec![
             ScriptedTurn::Reply(reply_text("first")),
             ScriptedTurn::Reply(reply_text("second")),
         ],
-        &gate,
     )
     .await;
     let session = Arc::new(axo.create_session(bash_options(dir.path())).await.unwrap());
