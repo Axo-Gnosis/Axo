@@ -113,7 +113,7 @@ fn version_name(name: &str) -> bool {
 
 /// A valid `publisher/name` ID, so joining it under the store stays inside it.
 fn installed_id(id: &str) -> bool {
-    id.contains('/') && manifest::validate_id(id).is_ok()
+    id.contains('/') && axo::valid_extension_id(id)
 }
 
 /// `<dir>/install.json`, or `None` when the extension is not installed.

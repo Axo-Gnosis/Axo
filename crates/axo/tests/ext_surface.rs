@@ -18,6 +18,7 @@ const FREE: &[(&str, &str)] = &[
     ("valid_section_name", "host.validSectionName"),
     ("valid_scheme_name", "host.validSchemeName"),
     ("valid_tool_name", "host.validToolName"),
+    ("valid_extension_id", DERIVABLE),
     ("jobs_from_entries", "host.jobsFromEntries"),
     ("project", "host.project"),
     ("squash", "host.squash"),

@@ -292,6 +292,7 @@ async fn unadmitted_and_duplicate_packages_are_diagnosed() {
             .to_string(),
     );
     host.package("root", "good", &[("pg", &one.url, false, false)]);
+    host.package("root", "Upper", &[]);
     host.write_package(
         "root2",
         "decl",

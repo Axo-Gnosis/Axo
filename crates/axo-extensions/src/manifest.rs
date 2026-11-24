@@ -8,12 +8,12 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use axo::EnabledExtension;
 use axo::context::agents::{AgentDef, load_agents};
 use axo::context::keywords::load_keywords;
 use axo::context::modes::load_modes;
 use axo::context::skills::load_skills;
 use axo::{Definitions, Exposure};
+use axo::{ExtensionListError, valid_extension_id};
 use axo_agent::{ExecutionMode, Replay};
 use axo_ai::{Model, Provider};
 use serde::{Deserialize, Serialize};
@@ -202,14 +202,11 @@ pub struct ExtensionPackage {
     pub diagnostics: Vec<String>,
 }
 
-/// Rejects what [`EnabledExtension::validate_all`] rejects, so joining `id` under a root or
-/// the store stays inside it.
-pub fn validate_id(id: &str) -> Result<(), String> {
-    let candidate = EnabledExtension {
-        id: id.to_owned(),
-        group: None,
-    };
-    EnabledExtension::validate_all(&[candidate]).map_err(|error| error.to_string())
+/// Keeps a manifest ID inside the package roots or store.
+fn validate_id(id: &str) -> Result<(), String> {
+    valid_extension_id(id)
+        .then_some(())
+        .ok_or_else(|| ExtensionListError::InvalidId(id.to_owned()).to_string())
 }
 
 /// `id`'s package as it is on disk now; see `ExtensionSet::inspect`.
@@ -234,7 +231,7 @@ pub async fn authored(roots: &[PathBuf]) -> Vec<String> {
             let Ok(id) = entry.file_name().into_string() else {
                 continue;
             };
-            if found.contains(&id) || validate_id(&id).is_err() {
+            if found.contains(&id) || !valid_extension_id(&id) {
                 continue;
             }
             match tokio::fs::metadata(entry.path().join(MANIFEST)).await {

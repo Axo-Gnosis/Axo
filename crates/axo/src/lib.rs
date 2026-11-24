@@ -30,7 +30,7 @@ pub use config::{
     EffectiveConfig, EnabledExtension, ExtensionListError, ModelChoice, PROMPT_NAMES,
     ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride, RetrySettings,
     ServiceTierSettings, Settings, SubagentSettings, SubagentTier, SummaryRequest,
-    TierOnModelChange, UserConfig,
+    TierOnModelChange, UserConfig, valid_extension_id,
 };
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::definitions::Definitions;

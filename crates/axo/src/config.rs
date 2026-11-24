@@ -127,7 +127,7 @@ impl EnabledExtension {
 }
 
 /// A plain name for an authored extension, or `publisher/name` for an installed one.
-fn valid_extension_id(id: &str) -> bool {
+pub fn valid_extension_id(id: &str) -> bool {
     valid_extension_name(id)
         || id.split_once('/').is_some_and(|(publisher, name)| {
             valid_extension_name(publisher) && valid_extension_name(name)
