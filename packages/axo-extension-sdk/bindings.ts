@@ -4808,21 +4808,21 @@ export type ToolsRewriteUrlsArgs = {
 
 export type ToolsRewriteUrlsResult = string;
 
-export type ToolsRunCommandArgs = ToolsRunCommandArgs_Serialize | ToolsRunCommandArgs_Deserialize;
+export type ToolsRunBashArgs = ToolsRunBashArgs_Serialize | ToolsRunBashArgs_Deserialize;
 
-export type ToolsRunCommandArgs_Deserialize = {
+export type ToolsRunBashArgs_Deserialize = {
 	request: BashRequest_Deserialize,
 };
 
-export type ToolsRunCommandArgs_Serialize = {
+export type ToolsRunBashArgs_Serialize = {
 	request: BashRequest_Serialize,
 };
 
-export type ToolsRunCommandResult = ToolsRunCommandResult_Serialize | ToolsRunCommandResult_Deserialize;
+export type ToolsRunBashResult = ToolsRunBashResult_Serialize | ToolsRunBashResult_Deserialize;
 
-export type ToolsRunCommandResult_Deserialize = ToolOutput_Deserialize;
+export type ToolsRunBashResult_Deserialize = ToolOutput_Deserialize;
 
-export type ToolsRunCommandResult_Serialize = ToolOutput_Serialize;
+export type ToolsRunBashResult_Serialize = ToolOutput_Serialize;
 
 export type ToolsSchemeContextResult = SchemeContext;
 
@@ -5377,7 +5377,7 @@ export interface Tools {
   /**
    * Runs a supervised bash command in this invocation's context.
    */
-  runCommand(request: ToolsRunCommandArgs_Deserialize["request"], signal?: AbortSignal): Promise<ToolsRunCommandResult_Serialize>;
+  runBash(request: ToolsRunBashArgs_Deserialize["request"], signal?: AbortSignal): Promise<ToolsRunBashResult_Serialize>;
   /**
    * Rewrites scheme URLs in a command to their filesystem paths.
    */
@@ -5450,7 +5450,7 @@ export interface Tools {
    * The bash access of the session's current scope (agent, mode and child ceiling).
    */
   bashAccess(signal?: AbortSignal): Promise<ToolsBashAccessResult>;
-  // withheld: runCommand — needs the live tool call; tools.runCommand
+  // withheld: runCommand — needs the live tool call; tools.runBash
   /**
    * Cleans and resolves a scheme URL or ordinary filesystem path.
    */
@@ -5485,7 +5485,7 @@ export interface Host {
   // withheld: models — live registry; reached through the models object
   // withheld: invoke — the dispatcher itself
   // withheld: invokeModels — the dispatcher itself
-  // withheld: supervisor — live process handles; commands go through tools.runCommand
+  // withheld: supervisor — live process handles; commands go through tools.runBash
   // withheld: createSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: openSession — returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook
   // withheld: session — returns a live session; ctx.session(id) reaches it

@@ -79,8 +79,8 @@ const activate: Extension = ({ dataDir, host, models, session: getSession }) => 
     },
     async sh(run) {
       return run.call.arguments.background
-        ? await run.tools.runCommand({ command: "sleep 0.2; echo bg", background: true })
-        : await run.tools.runCommand({ command: "echo hi" });
+        ? await run.tools.runBash({ command: "sleep 0.2; echo bg", background: true })
+        : await run.tools.runBash({ command: "echo hi" });
     },
   },
   toolPolicy: {

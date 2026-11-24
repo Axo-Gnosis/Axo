@@ -37,7 +37,7 @@ const FREE: &[(&str, &str)] = &[
     ("render_skill", "served by session.renderSkill"),
     (
         "find_on_path",
-        "takes a host environment map; tools.runCommand resolves programs",
+        "takes a host environment map; tools.runBash resolves programs",
     ),
     ("run", "live process handles"),
     ("objects", "runtime metadata for hosts and generators"),

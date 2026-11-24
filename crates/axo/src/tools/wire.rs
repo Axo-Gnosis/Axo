@@ -283,7 +283,7 @@ impl ToolsWire<'_> {
 
     /// Runs a supervised bash command in this invocation's context.
     #[ext]
-    pub async fn run_command(&self, request: BashRequest) -> Result<ToolOutput, ToolError> {
+    pub async fn run_bash(&self, request: BashRequest) -> Result<ToolOutput, ToolError> {
         self.access
             .tools
             .run_bash(self.access.cx.clone(), request)

@@ -121,7 +121,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | readFileBytes | path | Reads a filesystem or scheme resource as base64 bytes. |
 | writeFile | path, content | Writes text using the session's write scope and freshness guard. |
 | writeFileBytes | path, content | Writes base64 bytes using the session's write scope and freshness guard. |
-| runCommand | request | Runs a supervised bash command in this invocation's context. |
+| runBash | request | Runs a supervised bash command in this invocation's context. |
 | rewriteUrls | command | Rewrites scheme URLs in a command to their filesystem paths. |
 | parseUrl | input | Parses a path as a registered scheme URL. |
 | exactUrl | text | Recognizes an exact registered scheme URL. |
@@ -152,7 +152,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | TOOLS_ACCESS::new | host-side construction and dispatch |
 | TOOLS_ACCESS::invoke | host-side construction and dispatch |
 | TOOLS_ACCESS::finish | host-side construction and dispatch |
-| SESSION_TOOLS::run_command | needs the live tool call; tools.runCommand |
+| SESSION_TOOLS::run_command | needs the live tool call; tools.runBash |
 | SESSION_TOOLS::rewrite_urls | borrowed result; tools.rewriteUrls |
 | SESSION_TOOLS_WRITES::read_file | needs the call's cancellation; see the wire method |
 | SESSION_TOOLS_WRITES::write_file | needs the call's cancellation; see the wire method |
@@ -195,7 +195,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | AXO::models | live registry; reached through the models object |
 | AXO::invoke | the dispatcher itself |
 | AXO::invoke_models | the dispatcher itself |
-| AXO::supervisor | live process handles; commands go through tools.runCommand |
+| AXO::supervisor | live process handles; commands go through tools.runBash |
 | AXO::create_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::open_session | returns an owned session; host.createSession and host.openSession go through the host's lifecycle hook |
 | AXO::session | returns a live session; ctx.session(id) reaches it |

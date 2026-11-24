@@ -242,7 +242,7 @@ impl Axo {
 
     /// The supervisor every local command runs under, for hosts that run other
     /// processes (such as extension runners) in the same containers.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn supervisor(&self) -> Arc<ProcessSupervisor> {
         self.supervisor.clone()
     }

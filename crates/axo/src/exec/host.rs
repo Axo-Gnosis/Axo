@@ -174,7 +174,7 @@ pub struct ProcessSupervisor {
 impl ProcessSupervisor {
     /// Checks nothing yet: hosts that never run commands keep working without a
     /// delegated cgroup.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn new(supervision: Supervision) -> Arc<Self> {
         Arc::new(Self {
             supervision,
@@ -184,7 +184,7 @@ impl ProcessSupervisor {
 
     /// Starts `spec` in a fresh container. Cancelling the returned future at any point
     /// leaves nothing behind.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn spawn(&self, spec: ExecSpec) -> Result<Process, String> {
         match &self.supervision {
             Supervision::ProcessGroup => spawn_group(spec),
@@ -207,7 +207,7 @@ impl ProcessSupervisor {
     /// Runs to completion like `Command::output`, then kills anything left in the
     /// container and closes it. Reaching `deadline` kills the job and returns
     /// [`OutputError::TimedOut`].
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn output(
         &self,
         spec: ExecSpec,
@@ -218,7 +218,7 @@ impl ProcessSupervisor {
 
     /// Runs like [`Self::output`], draining stdout without retaining it and keeping
     /// only the last `limit` bytes of stderr.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn output_stderr_tail(
         &self,
         spec: ExecSpec,
@@ -603,14 +603,14 @@ impl Watch {
 impl Process {
     /// Takes both pipes and forwards labeled raw chunks in capture order.
     /// Read errors are delivered explicitly; dropping the `JoinSet` stops the readers.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn capture_output(&mut self) -> (mpsc::Receiver<io::Result<PipeChunk>>, JoinSet<()>) {
         capture(self.stdout.take(), self.stderr.take())
     }
 
     /// Waits for the root process. In cgroup mode a guardian that dies first takes the
     /// job with it. Cancel-safe.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         tokio::select! {
             status = self.root.wait() => status,
@@ -624,12 +624,12 @@ impl Process {
     /// watcher the job must not keep running unsupervised. Never resolves while the
     /// guardian lives, nor again once its death was handled, and never in process-group
     /// mode, whose guard is best effort. Cancel-safe.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn guardian_lost(&mut self) {
         guardian_lost(&mut self.watch, &self.container).await;
     }
 
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn container(&self) -> Container {
         self.container.clone()
     }
@@ -660,7 +660,7 @@ impl Process {
     /// Waits for the root and every leftover to exit, removes the job directory (cgroup
     /// mode) and stands the watcher down. Callers that want leftovers dead call
     /// `container().kill()` first. Cancelling it falls back to the drop path.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn close(mut self) {
         self.wait_empty().await;
         if let Scope::Cgroup(dir) = &*self.container.0 {
@@ -728,7 +728,7 @@ enum Scope {
 impl Container {
     /// SIGKILLs everything in the container (`cgroup.kill` or a group kill); errors are
     /// ignored.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn kill(&self) {
         match &*self.0 {
             Scope::Cgroup(dir) => {
@@ -742,7 +742,7 @@ impl Container {
 
     /// Whether any process is left in the container; false when unreadable. Group
     /// members that refuse a signal (EPERM) still count as present.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn populated(&self) -> bool {
         match &*self.0 {
             Scope::Cgroup(dir) => supervisor::populated(dir),
@@ -755,7 +755,7 @@ impl Container {
     /// `cgroup.procs` was read makes the send fail with ESRCH instead of hitting another
     /// process. In group mode the caller must keep reaping the leader meanwhile: an
     /// unreaped zombie still counts as a member.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub async fn terminate(&self) {
         match &*self.0 {
             Scope::Cgroup(dir) => {
@@ -788,7 +788,7 @@ impl Container {
 
     /// PSS in bytes per container, in input order; `None` when no process was readable.
     /// Blocking; all requested process groups share one walk of `/proc`.
-    #[ext(skip = "live process handles; commands go through tools.runCommand")]
+    #[ext(skip = "live process handles; commands go through tools.runBash")]
     pub fn memory_batch(containers: &[Self]) -> Vec<Option<u64>> {
         let mut groups = std::collections::HashMap::new();
         for container in containers {

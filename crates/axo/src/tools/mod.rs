@@ -319,7 +319,7 @@ impl SessionTools {
     }
 
     /// Runs a command with output capture, automatic background promotion and job delivery.
-    #[ext(skip = "needs the live tool call; tools.runCommand")]
+    #[ext(skip = "needs the live tool call; tools.runBash")]
     pub async fn run_command(
         &self,
         cx: ToolContext,

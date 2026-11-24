@@ -461,7 +461,7 @@ impl Tool for CommandProbe {
         let access = ToolAccess::new(self.0.clone(), cx);
         let caller = Caller::default();
         let run =
-            |command: &str| access.invoke("runCommand", vec![json!({"command": command})], &caller);
+            |command: &str| access.invoke("runBash", vec![json!({"command": command})], &caller);
         let (one, two) = tokio::join!(run("printf one; sleep 0.5"), run("printf two; sleep 0.5"));
         one.unwrap();
         two.unwrap();
