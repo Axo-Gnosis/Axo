@@ -243,7 +243,7 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     EnabledExtension::validate_all(&[candidate]).map_err(|error| error.to_string())
 }
 
-/// `id`'s package as it is on disk now; see `Extensions::inspect`.
+/// `id`'s package as it is on disk now; see `ExtensionSet::inspect`.
 pub async fn inspect(
     id: &str,
     options: &ExtensionOptions,

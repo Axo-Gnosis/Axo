@@ -4,7 +4,7 @@
 //! [`Extensions`] owns one [`ProviderLayer`] and one lifecycle owner per placement (a
 //! dedicated extension or a named group). Declarations are read statically from each enabled
 //! package's `extension.json`; a runner starts only when a callback is first needed. Hosts
-//! layer extensions into sessions with [`Extensions::compose`] and [`Extensions::attach`].
+//! layer extensions into sessions with [`ExtensionSet::compose`] and [`ExtensionSet::attach`].
 
 mod deps;
 mod lifecycle;
@@ -36,19 +36,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use async_trait::async_trait;
 pub use axo::EnabledExtension;
 use axo::ext;
 use axo::{Axo, EnvMap, ExtensionListError, ProcessSupervisor};
 pub use axo_ai::ProviderOrigin;
-use axo_ai::{Credential, LoginInteraction, Models, Provider, ProviderLayer, ProviderLogin};
+use axo_ai::{Credential, Models, Provider, ProviderLayer};
 use futures::future::join_all;
+use std::ops::Deref;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::deps::Deps;
 use crate::manifest::Member;
-use crate::peer::Actions;
 use crate::placement::{Placement, Prepare};
 use crate::process::BunPath;
 use crate::session::Contribution;
@@ -102,7 +101,7 @@ pub struct ExtensionOptions {
     pub store: Option<PathBuf>,
     /// Whether axo runs `bun install` on its own for an authored extension whose
     /// dependencies are missing or stale. `false`: the host calls
-    /// [`Extensions::install_dependencies`].
+    /// [`ExtensionSet::install_dependencies`].
     pub auto_install: bool,
 }
 
@@ -129,7 +128,7 @@ pub enum ExtensionPhase {
     Starting,
     Ready,
     Restarting,
-    /// Load rejection, or the placement's crash budget is spent; `Extensions::retry` re-arms.
+    /// Load rejection, or the placement's crash budget is spent; `ExtensionSet::retry` re-arms.
     Disabled,
     /// Cannot run: setup, discovery or host input problem.
     Unavailable,
@@ -225,7 +224,7 @@ pub enum ExtensionEvent {
         hidden: Hidden,
     },
     Diagnostic(ExtensionDiagnostic),
-    /// A composition finding for one attached session; see `Extensions::session_diagnostics`.
+    /// A composition finding for one attached session; see `ExtensionSet::session_diagnostics`.
     SessionDiagnostic {
         session: String,
         message: String,
@@ -274,7 +273,7 @@ pub struct ScopeOptions {
     /// Holds each scoped extension's data directory (`<data_root>/<id>`).
     pub data_root: PathBuf,
     /// Whether axo runs `bun install` on its own for an authored extension whose dependencies
-    /// are missing or stale. `false`: the host calls [`ExtensionScope::install_dependencies`].
+    /// are missing or stale. `false`: the host calls [`ExtensionSet::install_dependencies`].
     pub auto_install: bool,
 }
 
@@ -291,41 +290,51 @@ impl ScopeOptions {
 /// [`axo_ai::Models`] view whose providers are invisible to other scopes and the base registry.
 ///
 /// Cloning shares the same scope; dropping the last clone tears it down asynchronously.
-/// Call [`ExtensionScope::shutdown`] to reap its runners before returning.
+/// Call [`ExtensionSet::shutdown`] to reap its runners before returning.
 #[derive(Clone)]
-pub struct ExtensionScope {
-    guard: Arc<ScopeGuard>,
+pub struct ExtensionScope(Arc<ExtensionSet>);
+
+/// The root extension manager. Dropping it fences its callbacks immediately and tears down
+/// its runners and live scopes asynchronously. Call `shutdown` to wait for teardown.
+pub struct Extensions(ExtensionSet);
+
+/// Operations shared by the root manager and its isolated extension scopes.
+pub struct ExtensionSet {
+    inner: Arc<Inner>,
 }
 
-struct ScopeGuard(Arc<Inner>);
+impl Deref for Extensions {
+    type Target = ExtensionSet;
 
-impl Drop for ScopeGuard {
-    fn drop(&mut self) {
-        teardown_on_drop(&self.0);
+    fn deref(&self) -> &ExtensionSet {
+        &self.0
     }
 }
 
-pub(crate) struct ScopeMeta {
-    pub(crate) key: String,
-    pub(crate) parent: Arc<Inner>,
+impl Deref for ExtensionScope {
+    type Target = ExtensionSet;
+
+    fn deref(&self) -> &ExtensionSet {
+        &self.0
+    }
 }
 
-/// The extension manager. `new` does no I/O; await `configure` before exposing its providers
-/// to sessions. Dropping it fences every proxy and tears runners down without waiting;
-/// `shutdown` is the path that reaps them before returning.
-pub struct Extensions {
-    inner: Arc<Inner>,
+enum Role {
+    Root {
+        scopes: Mutex<Vec<Weak<Inner>>>,
+        next_scope: AtomicU64,
+        lifecycle: Mutex<Option<Arc<dyn Lifecycle>>>,
+    },
+    Scope {
+        key: String,
+        parent: Arc<Inner>,
+    },
 }
 
 struct Inner {
     axo: Arc<Axo>,
     models: Arc<Models>,
-    /// `Some` for an [`ExtensionScope`], `None` for the root [`Extensions`].
-    scope: Option<ScopeMeta>,
-    /// Live scopes derived from the root manager; empty on scopes themselves.
-    scopes: Mutex<Vec<Weak<Inner>>>,
-    next_scope: AtomicU64,
-    lifecycle: Mutex<Option<Arc<dyn Lifecycle>>>,
+    role: Role,
     layer: ProviderLayer,
     supervisor: Arc<ProcessSupervisor>,
     /// Shared with every scope, placement and install of the root manager.
@@ -342,7 +351,7 @@ struct Inner {
     /// The next placement serial; reports carry it so a replaced placement cannot write.
     serials: AtomicU64,
     /// Attached sessions; every placement serves their session actions.
-    sessions: Arc<session::Registry>,
+    sessions: session::Registry,
     /// Authored dependency installs, one at a time per extension.
     deps: Arc<Deps>,
 }
@@ -469,44 +478,37 @@ struct Binding {
 }
 
 impl Extensions {
+    /// Creates the root manager without performing I/O.
     pub fn new(axo: Arc<Axo>, options: ExtensionOptions) -> Self {
-        let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let models = Arc::clone(axo.models());
         let bun = BunPath::new(options.bun.clone());
-        Self {
-            inner: Arc::new_cyclic(|inner| Inner {
-                layer: models.provider_layer(),
-                supervisor: axo.supervisor(),
-                deps: Arc::new(Deps::new(
-                    bun.clone(),
-                    Arc::clone(&options.env),
-                    axo.supervisor(),
-                )),
-                bun,
+        Self(ExtensionSet {
+            inner: Inner::new(
                 axo,
                 models,
-                scope: None,
-                scopes: Mutex::default(),
-                next_scope: AtomicU64::new(1),
-                lifecycle: Mutex::default(),
                 options,
-                config: tokio::sync::Mutex::new(()),
-                state: Mutex::new(State::default()),
-                closed: CancellationToken::new(),
-                teardown_done: AtomicBool::new(false),
-                events,
-                serials: AtomicU64::new(1),
-                sessions: Arc::new(session::Registry::new(inner.clone())),
-            }),
-        }
+                bun,
+                Role::Root {
+                    scopes: Mutex::default(),
+                    next_scope: AtomicU64::new(1),
+                    lifecycle: Mutex::default(),
+                },
+            ),
+        })
     }
 
     /// Creates an isolated [`ExtensionScope`] backed by this manager (for example, one
-    /// trusted workspace folder). Does no I/O; await [`ExtensionScope::configure`] before
+    /// trusted workspace folder). Does no I/O; await [`ExtensionSet::configure`] before
     /// exposing its providers to sessions.
     pub fn scope(&self, options: ScopeOptions) -> Result<ExtensionScope, BridgeError> {
         validate_scope_key(&options.key)?;
-        let serial = self.inner.next_scope.fetch_add(1, Ordering::Relaxed);
+        let Role::Root {
+            scopes, next_scope, ..
+        } = &self.inner.role
+        else {
+            unreachable!("Extensions owns the root extension set");
+        };
+        let serial = next_scope.fetch_add(1, Ordering::Relaxed);
         let ext_options = ExtensionOptions {
             // Unused: the scope shares the root manager's `BunPath`.
             bun: None,
@@ -524,11 +526,7 @@ impl Extensions {
         };
         validate_options(&ext_options)?;
 
-        let mut scopes = self
-            .inner
-            .scopes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut scopes = scopes.lock().unwrap_or_else(PoisonError::into_inner);
         // Checked under the scopes lock: `shutdown` cancels `closed` before teardown
         // snapshots the live scopes, so a new scope is either refused or torn down.
         if self.inner.closed.is_cancelled() {
@@ -537,11 +535,7 @@ impl Extensions {
         scopes.retain(|weak| weak.strong_count() > 0);
         if scopes.iter().any(|weak| {
             weak.upgrade().is_some_and(|live| {
-                !live.closed.is_cancelled()
-                    && live
-                        .scope
-                        .as_ref()
-                        .is_some_and(|meta| meta.key == options.key)
+                !live.closed.is_cancelled() && live.scope_key() == Some(options.key.as_str())
             })
         }) {
             return Err(BridgeError::InvalidOptions(format!(
@@ -550,96 +544,18 @@ impl Extensions {
             )));
         }
 
-        let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let models = Arc::new(self.inner.axo.models().scoped());
-        let parent = Arc::clone(&self.inner);
-        let inner = Arc::new_cyclic(|weak| Inner {
-            layer: models.provider_layer(),
-            supervisor: parent.axo.supervisor(),
-            bun: parent.bun.clone(),
-            deps: Arc::new(Deps::new(
-                parent.bun.clone(),
-                Arc::clone(&ext_options.env),
-                parent.axo.supervisor(),
-            )),
-            axo: Arc::clone(&parent.axo),
-            models,
-            scope: Some(ScopeMeta {
+        let inner = Inner::new(
+            Arc::clone(&self.inner.axo),
+            Arc::new(self.inner.axo.models().scoped()),
+            ext_options,
+            self.inner.bun.clone(),
+            Role::Scope {
                 key: options.key,
-                parent,
-            }),
-            scopes: Mutex::default(),
-            next_scope: AtomicU64::new(1),
-            lifecycle: Mutex::default(),
-            options: ext_options,
-            config: tokio::sync::Mutex::new(()),
-            state: Mutex::new(State::default()),
-            closed: CancellationToken::new(),
-            teardown_done: AtomicBool::new(false),
-            events,
-            serials: AtomicU64::new(1),
-            sessions: Arc::new(session::Registry::new(weak.clone())),
-        });
+                parent: Arc::clone(&self.inner),
+            },
+        );
         scopes.push(Arc::downgrade(&inner));
-        Ok(ExtensionScope {
-            guard: Arc::new(ScopeGuard(inner)),
-        })
-    }
-
-    /// Rescans the enabled packages and atomically publishes the ordered winner set: the
-    /// last enabled extension declaring a provider ID wins it. Unchanged placements (and
-    /// their crash budgets) are kept unless their setup failed. It compares declarations,
-    /// not files: a code-only package change needs `reload`. Per-package problems are
-    /// reported in `status`, not as `Err`; `Err` means invalid input or a shut-down manager,
-    /// and changes nothing.
-    pub async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError> {
-        self.inner.configure(enabled).await
-    }
-
-    /// One status per enabled extension, in enabled order.
-    pub fn status(&self) -> Vec<ExtensionStatus> {
-        self.inner.snapshot()
-    }
-
-    /// A snapshot from the last `configure`, `retry` or `reload`; later registry changes and
-    /// newer provider layers are not reflected until the next one.
-    pub fn collisions(&self) -> Vec<ProviderCollision> {
-        self.inner.lock().collisions.clone()
-    }
-
-    /// The providers this manager currently publishes, sorted by provider ID, each with the
-    /// enabled extension that wins it. For a [`axo_ai::ProviderInfo`] whose `origin` is
-    /// [`ProviderOrigin::Layer`] in a scoped `Models` view, look in that scope's
-    /// [`ExtensionScope::providers`] first, then here (scope layers win over base layers); a
-    /// `Layer` provider in neither list belongs to a host-owned [`ProviderLayer`].
-    pub fn providers(&self) -> Vec<ExtensionProvider> {
-        self.inner.providers()
-    }
-
-    pub fn diagnostics(&self) -> Vec<ExtensionDiagnostic> {
-        self.inner.lock().diagnostics.clone()
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<ExtensionEvent> {
-        self.inner.events.subscribe()
-    }
-
-    /// Rescans, and re-arms `id`'s placement if `id` is disabled or unavailable: a
-    /// load-disabled member is reloaded alone (its peers keep their own load failures); a
-    /// placement disabled by its crash budget restarts cold with a fresh budget. Like
-    /// `configure`, it also rebuilds any placement whose setup failed. A failed dependency
-    /// install is attempted again.
-    pub async fn retry(&self, id: &str) -> Result<(), BridgeError> {
-        self.inner.rearm(id, Rearm::Retry).await
-    }
-
-    /// Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the
-    /// next callback imports the package's current code. `configure` cannot see code-only
-    /// changes: it compares declarations, not files. Group peers share the runner and are
-    /// recycled with it; their own load failures are kept, `id`'s is cleared, and a failed
-    /// dependency install is attempted again.
-    pub async fn reload(&self, id: &str) -> Result<(), BridgeError> {
-        self.inner.rearm(id, Rearm::Reload).await
+        Ok(ExtensionScope(Arc::new(ExtensionSet { inner })))
     }
 
     /// Replaces the Bun executable for this manager and every scope derived from it, then
@@ -672,13 +588,6 @@ impl Extensions {
             }
         }
         root.and(scoped)
-    }
-
-    /// Installs the dependencies of enabled authored extension `id` now (the path when
-    /// `ExtensionOptions::auto_install` is off), then reloads it. Runs Bun even after a failed
-    /// install of the same files.
-    pub async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError> {
-        install_dependencies_for(Arc::clone(&self.inner), id.to_owned()).await
     }
 
     /// Installs the package folder `source` (its `extension.json` names a `publisher/name` ID
@@ -729,10 +638,123 @@ impl Extensions {
     pub async fn installed(&self) -> Result<Vec<InstalledExtension>, InstallError> {
         self.inner.installed().await
     }
+}
+
+impl ExtensionScope {
+    /// The scope key supplied in [`ScopeOptions::key`].
+    pub fn key(&self) -> &str {
+        self.inner
+            .scope_key()
+            .expect("ExtensionScope owns a scope extension set")
+    }
+
+    /// This scope's [`axo_ai::Models`] view (backed by the host's single registry, with this
+    /// scope's extension providers overlaid on top).
+    pub fn models(&self) -> Arc<Models> {
+        Arc::clone(&self.inner.models)
+    }
+}
+
+impl ExtensionSet {
+    /// Rescans the enabled packages and atomically publishes the ordered winner set: the
+    /// last enabled extension declaring a provider ID wins it. Unchanged placements (and
+    /// their crash budgets) are kept unless their setup failed. It compares declarations,
+    /// not files: a code-only package change needs `reload`. Per-package problems are
+    /// reported in `status`, not as `Err`; `Err` means invalid input or a shut-down manager,
+    /// and changes nothing.
+    pub async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError> {
+        self.inner.configure(enabled).await
+    }
+
+    /// One status per enabled extension, in enabled order.
+    pub fn status(&self) -> Vec<ExtensionStatus> {
+        self.inner.snapshot()
+    }
+
+    /// A snapshot from the last `configure`, `retry` or `reload`; later registry changes and
+    /// newer provider layers are not reflected until the next one.
+    pub fn collisions(&self) -> Vec<ProviderCollision> {
+        self.inner.lock().collisions.clone()
+    }
+
+    /// The providers this manager currently publishes, sorted by provider ID, each with the
+    /// enabled extension that wins it. For a [`axo_ai::ProviderInfo`] whose `origin` is
+    /// [`ProviderOrigin::Layer`] in a scoped `Models` view, look in that scope's
+    /// providers first, then those published by the root manager (scope layers win over base layers); a
+    /// `Layer` provider in neither list belongs to a host-owned [`ProviderLayer`].
+    pub fn providers(&self) -> Vec<ExtensionProvider> {
+        self.inner.providers()
+    }
+
+    pub fn diagnostics(&self) -> Vec<ExtensionDiagnostic> {
+        self.inner.lock().diagnostics.clone()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ExtensionEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// Rescans, and re-arms `id`'s placement if `id` is disabled or unavailable: a
+    /// load-disabled member is reloaded alone (its peers keep their own load failures); a
+    /// placement disabled by its crash budget restarts cold with a fresh budget. Like
+    /// `configure`, it also rebuilds any placement whose setup failed. A failed dependency
+    /// install is attempted again.
+    pub async fn retry(&self, id: &str) -> Result<(), BridgeError> {
+        self.inner.rearm(id, Rearm::Retry).await
+    }
+
+    /// Rescans, then replaces `id`'s placement with a cold one (fresh crash budget) so the
+    /// next callback imports the package's current code. `configure` cannot see code-only
+    /// changes: it compares declarations, not files. Group peers share the runner and are
+    /// recycled with it; their own load failures are kept, `id`'s is cleared, and a failed
+    /// dependency install is attempted again.
+    pub async fn reload(&self, id: &str) -> Result<(), BridgeError> {
+        self.inner.rearm(id, Rearm::Reload).await
+    }
+
+    /// Installs the dependencies of enabled authored extension `id` now (the path when
+    /// `ExtensionOptions::auto_install` is off), then reloads it. Runs Bun even after a failed
+    /// install of the same files.
+    pub async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError> {
+        let inner = Arc::clone(&self.inner);
+        let id = id.to_owned();
+        run(async move {
+            if inner.closed.is_cancelled() {
+                return Err(BridgeError::ShutDown);
+            }
+            let Some(admission) = inner.lock().admissions.get(&id).copied() else {
+                return Err(BridgeError::UnknownExtension(id));
+            };
+            if id.contains('/') {
+                return Err(BridgeError::InstalledDependencies(id));
+            }
+            let (package, _) = manifest::locate(&id, &inner.options)
+                .await
+                .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
+            inner.forget_install_failure(&id);
+            inner
+                .ensure_dependencies(&id, &package, admission)
+                .await
+                .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
+            inner
+                .reconcile(
+                    None,
+                    Some(Rearm::Installed {
+                        id,
+                        admission,
+                        placement: None,
+                    }),
+                )
+                .await
+        })
+        .await
+        .unwrap_or(Err(BridgeError::ShutDown))
+    }
 
     /// Reads `id`'s package as it is on disk now, enabled or not: an authored ID from the
     /// roots, a `publisher/name` ID from the store. For an enabled extension this can differ
-    /// from what is running after a failed rescan.
+    /// from what is running after a failed rescan. A scope has no store: inspecting a `publisher/name`
+    /// ID returns a [`ProblemKind::Setup`] problem.
     pub async fn inspect(&self, id: &str) -> Result<ExtensionPackage, ExtensionProblem> {
         manifest::inspect(id, &self.inner.options).await
     }
@@ -745,13 +767,45 @@ impl Extensions {
     /// One entry per runner that is currently alive, in the enabled order of its first
     /// member. A runner whose memory cannot be read is omitted.
     pub async fn memory(&self) -> Vec<RunnerMemory> {
-        runner_memory_for(&self.inner).await
+        let (metadata, containers): (Vec<_>, Vec<_>) = {
+            let state = self.inner.lock();
+            state
+                .enabled
+                .iter()
+                .filter_map(|ext| {
+                    let (_, placement) = state.member_of.get(&ext.id)?;
+                    let installed = state.placements.get(&Key::of(ext))?;
+                    if installed.members.first()?.id != ext.id {
+                        return None;
+                    }
+                    let container = placement.container()?;
+                    let members = installed.members.iter().map(|m| m.id.clone()).collect();
+                    Some(((members, installed.group.clone()), container))
+                })
+                .unzip()
+        };
+        tokio::task::spawn_blocking(move || {
+            let samples = axo::exec::host::Container::memory_batch(&containers);
+            metadata
+                .into_iter()
+                .zip(samples)
+                .filter_map(|((members, group), bytes)| {
+                    Some(RunnerMemory {
+                        members,
+                        group,
+                        pss_bytes: bytes?,
+                    })
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    /// Closes admission, restores every attached session to its host registrations and stops
-    /// tracking it, fails pending calls, kills and reaps every runner and removes this
-    /// manager's providers. Also shuts down all live [`ExtensionScope`]s created from this
-    /// manager. Idempotent.
+    /// Closes admission, fails pending calls, withdraws providers, and kills and reaps runners.
+    /// Root shutdown also shuts down every live scope and restores sessions to their host
+    /// registrations. Scope shutdown removes only that scope's extensions and keeps the root
+    /// manager's extensions and the session's host registrations. Idempotent.
     pub async fn shutdown(&self) {
         self.inner.closed.cancel();
         let inner = Arc::clone(&self.inner);
@@ -759,92 +813,7 @@ impl Extensions {
     }
 }
 
-impl ExtensionScope {
-    /// The scope key supplied in [`ScopeOptions::key`].
-    pub fn key(&self) -> &str {
-        &self
-            .guard
-            .0
-            .scope
-            .as_ref()
-            .expect("ExtensionScope has ScopeMeta")
-            .key
-    }
-
-    /// This scope's [`axo_ai::Models`] view (backed by the host's single registry, with this
-    /// scope's extension providers overlaid on top).
-    pub fn models(&self) -> Arc<Models> {
-        Arc::clone(&self.guard.0.models)
-    }
-
-    /// Rescans and atomically publishes this scope's enabled packages.
-    pub async fn configure(&self, enabled: &[EnabledExtension]) -> Result<(), BridgeError> {
-        self.guard.0.configure(enabled).await
-    }
-
-    pub fn status(&self) -> Vec<ExtensionStatus> {
-        self.guard.0.snapshot()
-    }
-
-    pub fn collisions(&self) -> Vec<ProviderCollision> {
-        self.guard.0.lock().collisions.clone()
-    }
-
-    pub fn diagnostics(&self) -> Vec<ExtensionDiagnostic> {
-        self.guard.0.lock().diagnostics.clone()
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<ExtensionEvent> {
-        self.guard.0.events.subscribe()
-    }
-
-    pub async fn retry(&self, id: &str) -> Result<(), BridgeError> {
-        self.guard.0.rearm(id, Rearm::Retry).await
-    }
-
-    pub async fn reload(&self, id: &str) -> Result<(), BridgeError> {
-        self.guard.0.rearm(id, Rearm::Reload).await
-    }
-
-    pub async fn install_dependencies(&self, id: &str) -> Result<(), BridgeError> {
-        install_dependencies_for(Arc::clone(&self.guard.0), id.to_owned()).await
-    }
-
-    pub async fn memory(&self) -> Vec<RunnerMemory> {
-        runner_memory_for(&self.guard.0).await
-    }
-
-    /// The providers this scope currently publishes; see [`Extensions::providers`].
-    pub fn providers(&self) -> Vec<ExtensionProvider> {
-        self.guard.0.providers()
-    }
-
-    /// Reads `id`'s package from this scope's roots as it is on disk now, enabled or not.
-    /// Scopes have no store: a `publisher/name` ID is a [`ProblemKind::Setup`] problem.
-    pub async fn inspect(&self, id: &str) -> Result<ExtensionPackage, ExtensionProblem> {
-        manifest::inspect(id, &self.guard.0.options).await
-    }
-
-    /// The IDs of every authored package under this scope's roots, sorted.
-    pub async fn authored(&self) -> Vec<String> {
-        manifest::authored(&self.guard.0.options.roots).await
-    }
-
-    /// Closes this scope, removes its providers from [`ExtensionScope::models`], restores
-    /// attached sessions to the parent manager's host-wide extensions, and reaps this scope's
-    /// runners. Idempotent.
-    pub async fn shutdown(&self) {
-        self.guard.0.closed.cancel();
-        let inner = Arc::clone(&self.guard.0);
-        let _ = run(inner.teardown()).await;
-    }
-
-    pub(crate) fn inner(&self) -> &Arc<Inner> {
-        &self.guard.0
-    }
-}
-
-impl Drop for Extensions {
+impl Drop for ExtensionSet {
     fn drop(&mut self) {
         teardown_on_drop(&self.inner);
     }
@@ -885,122 +854,64 @@ pub(crate) async fn run<T: Send + 'static>(
     }
 }
 
-async fn install_dependencies_for(inner: Arc<Inner>, id: String) -> Result<(), BridgeError> {
-    run(async move {
-        if inner.closed.is_cancelled() {
-            return Err(BridgeError::ShutDown);
-        }
-        let Some(admission) = inner.lock().admissions.get(&id).copied() else {
-            return Err(BridgeError::UnknownExtension(id));
-        };
-        if id.contains('/') {
-            return Err(BridgeError::InstalledDependencies(id));
-        }
-        let (package, _) = manifest::locate(&id, &inner.options)
-            .await
-            .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
-        inner.forget_install_failure(&id);
-        inner
-            .ensure_dependencies(&id, &package, admission)
-            .await
-            .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
-        inner
-            .reconcile(
-                None,
-                Some(Rearm::Installed {
-                    id,
-                    admission,
-                    placement: None,
-                }),
-            )
-            .await
-    })
-    .await
-    .unwrap_or(Err(BridgeError::ShutDown))
-}
-
-async fn runner_memory_for(inner: &Inner) -> Vec<RunnerMemory> {
-    let (metadata, containers): (Vec<_>, Vec<_>) = {
-        let state = inner.lock();
-        state
-            .enabled
-            .iter()
-            .filter_map(|ext| {
-                let (_, placement) = state.member_of.get(&ext.id)?;
-                let installed = state.placements.get(&Key::of(ext))?;
-                if installed.members.first()?.id != ext.id {
-                    return None;
-                }
-                let container = placement.container()?;
-                let members = installed.members.iter().map(|m| m.id.clone()).collect();
-                Some(((members, installed.group.clone()), container))
-            })
-            .unzip()
-    };
-    tokio::task::spawn_blocking(move || {
-        let samples = axo::exec::host::Container::memory_batch(&containers);
-        metadata
-            .into_iter()
-            .zip(samples)
-            .filter_map(|((members, group), bytes)| {
-                Some(RunnerMemory {
-                    members,
-                    group,
-                    pss_bytes: bytes?,
-                })
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default()
-}
-
 impl Inner {
+    fn new(
+        axo: Arc<Axo>,
+        models: Arc<Models>,
+        options: ExtensionOptions,
+        bun: BunPath,
+        role: Role,
+    ) -> Arc<Self> {
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let supervisor = axo.supervisor();
+        Arc::new(Self {
+            layer: models.provider_layer(),
+            deps: Arc::new(Deps::new(
+                bun.clone(),
+                Arc::clone(&options.env),
+                Arc::clone(&supervisor),
+            )),
+            supervisor,
+            bun,
+            axo,
+            models,
+            role,
+            options,
+            config: tokio::sync::Mutex::new(()),
+            state: Mutex::new(State::default()),
+            closed: CancellationToken::new(),
+            teardown_done: AtomicBool::new(false),
+            events,
+            serials: AtomicU64::new(1),
+            sessions: session::Registry::default(),
+        })
+    }
+
+    fn scope_key(&self) -> Option<&str> {
+        match &self.role {
+            Role::Root { .. } => None,
+            Role::Scope { key, .. } => Some(key),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn root(self: &Arc<Self>) -> Arc<Self> {
-        match &self.scope {
-            Some(meta) => Arc::clone(&meta.parent),
-            None => Arc::clone(self),
+    fn root(self: &Arc<Self>) -> Arc<Self> {
+        match &self.role {
+            Role::Root { .. } => Arc::clone(self),
+            Role::Scope { parent, .. } => Arc::clone(parent),
         }
     }
 
-    pub(crate) fn live_scopes(&self) -> Vec<Arc<Self>> {
-        let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
+    fn live_scopes(&self) -> Vec<Arc<Self>> {
+        let Role::Root { scopes, .. } = &self.role else {
+            return Vec::new();
+        };
+        let mut scopes = scopes.lock().unwrap_or_else(PoisonError::into_inner);
         scopes.retain(|weak| weak.strong_count() > 0);
         scopes.iter().filter_map(Weak::upgrade).collect()
-    }
-
-    /// The unit (this root or one of its live scopes) that `session_id` or its nearest
-    /// attached spawn ancestor is attached to. Never revives a parked session.
-    pub(crate) async fn owner_of(self: &Arc<Self>, session_id: &str) -> Option<Arc<Self>> {
-        let mut seen = HashSet::new();
-        let mut current = session_id.to_owned();
-        loop {
-            if self.sessions.has(&current) {
-                return Some(Arc::clone(self));
-            }
-            if let Some(scope) = self
-                .live_scopes()
-                .into_iter()
-                .find(|scope| scope.sessions.has(&current))
-            {
-                return Some(scope);
-            }
-            if !seen.insert(current.clone()) {
-                return None;
-            }
-            current = self.axo.spawn_parent(&current).await?;
-        }
-    }
-
-    pub(crate) fn detach_anywhere(&self, session_id: &str) {
-        self.sessions.detach(session_id);
-        for scope in self.live_scopes() {
-            scope.sessions.detach(session_id);
-        }
     }
 
     /// Validates `enabled` and reconciles this unit to it.
@@ -1049,12 +960,12 @@ impl Inner {
         self: &Arc<Self>,
     ) -> Vec<(Weak<Self>, Arc<Contribution>)> {
         let mut out = Vec::new();
-        if let Some(meta) = &self.scope
-            && !meta.parent.closed.is_cancelled()
+        if let Role::Scope { parent, .. } = &self.role
+            && !parent.closed.is_cancelled()
         {
-            let parent_weak = Arc::downgrade(&meta.parent);
+            let parent_weak = Arc::downgrade(parent);
             out.extend(
-                meta.parent
+                parent
                     .lock()
                     .contributions
                     .iter()
@@ -1342,7 +1253,7 @@ impl Inner {
                     }));
                     let origin = ExtensionOrigin {
                         id: &ext.id,
-                        scope: self.scope.as_ref().map(|meta| meta.key.as_str()),
+                        scope: self.scope_key(),
                     }
                     .to_string();
                     let mut definitions = found.definitions;
@@ -1389,7 +1300,7 @@ impl Inner {
                         problem = Some(crate::problem(
                             ProblemKind::DependenciesMissing,
                             format!(
-                                "extension {id}: dependencies are not installed; call Extensions::install_dependencies"
+                                "extension {id}: dependencies are not installed; call ExtensionSet::install_dependencies"
                             ),
                         ));
                     }
@@ -1461,7 +1372,7 @@ impl Inner {
                 self.bun.clone(),
                 reporter(Arc::downgrade(&self), serial),
                 self.preparer(serial),
-                Arc::clone(&self.sessions) as Arc<dyn Actions>,
+                Arc::new(session::Dispatch(Arc::downgrade(&self))),
             );
             if let Some(old) = old
                 && (forced_here || same)
@@ -1577,7 +1488,7 @@ impl Inner {
                     ext: ext.id.clone(),
                     serial: None,
                     descriptor: (*descriptor).clone(),
-                    provider: unready(descriptor, problem.clone().unwrap_or_default()),
+                    provider: proxy::unready(descriptor, problem.clone().unwrap_or_default()),
                     retired: self.closed.child_token(),
                     gate: problem,
                 },
@@ -1652,7 +1563,7 @@ impl Inner {
                     .iter()
                     .any(|(id, binding)| state.bindings[id].gate != binding.gate)
             {
-                let scope_key = self.scope.as_ref().map(|meta| meta.key.as_str());
+                let scope_key = self.scope_key();
                 self.layer.replace(
                     bindings
                         .values()
@@ -1737,7 +1648,7 @@ impl Inner {
 
     async fn teardown(self: Arc<Self>) -> Result<(), BridgeError> {
         // Shut down child scopes when tearing down the root manager.
-        if self.scope.is_none() {
+        if matches!(self.role, Role::Root { .. }) {
             let scopes = self.live_scopes();
             for scope in &scopes {
                 scope.closed.cancel();
@@ -1754,12 +1665,13 @@ impl Inner {
         // scope this removes the scope's extensions while keeping the parent's host extensions.
         session::reapply(&self).await;
         self.sessions.clear();
-        let hook = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        drop(hook);
+        if let Role::Root { lifecycle, .. } = &self.role {
+            let hook = lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            drop(hook);
+        }
         join_all(state.placements.values().map(|p| p.placement.shutdown())).await;
         drop(state);
         self.teardown_done.store(true, Ordering::Release);
@@ -1852,42 +1764,4 @@ fn validate_options(options: &ExtensionOptions) -> Result<(), BridgeError> {
         }
     }
     Ok(())
-}
-
-/// A winner that cannot run keeps its declared login capability in `Models::providers`;
-/// the registry gate rejects before this is reached, and it fails the same way if it is.
-fn unready(descriptor: &ProviderDecl, reason: String) -> Provider {
-    let mut provider = descriptor.provider();
-    if descriptor.login {
-        provider.login = Some(Arc::new(Unready {
-            provider: provider.id.clone(),
-            reason,
-        }));
-    }
-    provider
-}
-
-struct Unready {
-    provider: String,
-    reason: String,
-}
-
-impl Unready {
-    fn error(&self) -> axo_ai::Error {
-        axo_ai::Error::ProviderUnavailable {
-            provider: self.provider.clone(),
-            reason: self.reason.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl ProviderLogin for Unready {
-    async fn login(&self, _: &dyn LoginInteraction) -> Result<Credential, axo_ai::Error> {
-        Err(self.error())
-    }
-
-    async fn refresh(&self, _: Credential) -> Result<Credential, axo_ai::Error> {
-        Err(self.error())
-    }
 }

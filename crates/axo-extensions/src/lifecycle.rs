@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::peer::Refusal;
-use crate::{ExtensionScope, Extensions, Inner};
+use crate::{ExtensionScope, Extensions, Inner, Role};
 
 #[derive(Debug, Clone, Default, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -58,7 +58,7 @@ pub struct ForkReceipt {
 }
 
 /// Session lifecycle on behalf of extensions. The host builds the session its normal way
-/// ([`Extensions::compose`] or [`ExtensionScope::compose`] on the options for create and open),
+/// ([`crate::ExtensionSet::compose`] on the options for create and open),
 /// keeps it alive and updates its UI. For `create` and `open`, the host returns the target
 /// folder's [`ExtensionScope`] (or `None` for host-wide extensions only), never the calling
 /// extension's scope. Forks inherit their source session's scope automatically.
@@ -91,12 +91,11 @@ pub trait Lifecycle: Send + Sync {
 
 impl Extensions {
     /// Installs, replaces or clears the hook for extension-initiated session lifecycle calls.
-    pub fn set_lifecycle(&self, lifecycle: Option<Arc<dyn Lifecycle>>) {
-        *self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = lifecycle;
+    pub fn set_lifecycle(&self, hook: Option<Arc<dyn Lifecycle>>) {
+        let Role::Root { lifecycle, .. } = &self.inner.role else {
+            unreachable!("Extensions owns the root extension set");
+        };
+        *lifecycle.lock().unwrap_or_else(PoisonError::into_inner) = hook;
     }
 }
 
@@ -120,10 +119,11 @@ impl<'a> LifecycleWire<'a> {
     }
 
     async fn attach(&self, created: LifecycleSession) -> String {
-        match created.scope {
-            Some(scope) => scope.attach(&created.session).await,
-            None => self.target.root.attach(&created.session).await,
-        }
+        let inner = match &created.scope {
+            Some(scope) => &scope.inner,
+            None => &self.target.root,
+        };
+        inner.attach(&created.session).await;
         created.session.id().to_owned()
     }
 
@@ -222,8 +222,10 @@ impl LifecycleCall {
         args: Vec<Value>,
     ) -> Result<Value, Refusal> {
         let root = caller_unit.root();
-        let hook = root
-            .lifecycle
+        let Role::Root { lifecycle, .. } = &root.role else {
+            unreachable!("root() returns the root extension set");
+        };
+        let hook = lifecycle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()

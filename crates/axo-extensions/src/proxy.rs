@@ -43,6 +43,44 @@ pub fn bind(
     provider
 }
 
+/// A winner that cannot run keeps its declared login capability in `Models::providers`;
+/// the registry gate rejects before this is reached, and it fails the same way if it is.
+pub(super) fn unready(descriptor: &ProviderDecl, reason: String) -> Provider {
+    let mut provider = descriptor.provider();
+    if descriptor.login {
+        provider.login = Some(Arc::new(Unready {
+            provider: provider.id.clone(),
+            reason,
+        }));
+    }
+    provider
+}
+
+struct Unready {
+    provider: String,
+    reason: String,
+}
+
+impl Unready {
+    fn error(&self) -> axo_ai::Error {
+        axo_ai::Error::ProviderUnavailable {
+            provider: self.provider.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderLogin for Unready {
+    async fn login(&self, _: &dyn LoginInteraction) -> Result<Credential, axo_ai::Error> {
+        Err(self.error())
+    }
+
+    async fn refresh(&self, _: Credential) -> Result<Credential, axo_ai::Error> {
+        Err(self.error())
+    }
+}
+
 struct Bridge {
     ext: String,
     provider: String,

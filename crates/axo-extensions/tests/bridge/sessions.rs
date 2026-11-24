@@ -1060,19 +1060,36 @@ async fn dropped_manager_fences_hooks_and_restores_layer() {
                 .iter()
                 .any(|t| t.name == "read" && t.origin.as_deref() == Some("extension lab"))
         );
+        let retained_scope = extensions
+            .scope(ScopeOptions {
+                key: "retained".into(),
+                roots: vec![host.path("root")],
+                data_root: host.path("scoped-data"),
+                auto_install: false,
+            })
+            .unwrap();
+        retained_scope
+            .configure(&enabled(&[(LAB, None)]))
+            .await
+            .unwrap();
+        let scoped_session = Arc::new(
+            host.axo
+                .create_session(retained_scope.compose(options(&host)))
+                .await
+                .unwrap(),
+        );
+        retained_scope.attach(&scoped_session).await;
+        assert!(
+            scoped_session
+                .tools()
+                .iter()
+                .any(|tool| tool.origin.as_deref() == Some("extension lab (scope retained)"))
+        );
         if outside {
             std::thread::spawn(move || drop(extensions)).join().unwrap();
         } else {
             drop(extensions);
         }
-        wait_for("restoration of host registrations", || {
-            !session.commands().iter().any(|info| info.name == "hello")
-                && session
-                    .tools()
-                    .iter()
-                    .any(|t| t.name == "read" && t.origin.is_none())
-        })
-        .await;
 
         let scope = ToolScope {
             session_id: session.id().into(),
@@ -1138,6 +1155,30 @@ async fn dropped_manager_fences_hooks_and_restores_layer() {
         };
         assert!(matches!(retained.spawn_hooks[0].before_spawn(&spawn).await,
             SpawnDecision::Block(reason) if reason.contains(closed)));
+        wait_for("restoration of host registrations", || {
+            !session.commands().iter().any(|info| info.name == "hello")
+                && session
+                    .tools()
+                    .iter()
+                    .any(|t| t.name == "read" && t.origin.is_none())
+        })
+        .await;
+        wait_for("withdrawal of retained scope", || {
+            !scoped_session
+                .commands()
+                .iter()
+                .any(|info| info.name == "hello")
+                && scoped_session
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.name == "read" && tool.origin.is_none())
+        })
+        .await;
+        assert!(matches!(
+            retained_scope.configure(&[]).await,
+            Err(axo_extensions::BridgeError::ShutDown)
+        ));
+        scoped_session.shutdown().await;
         session.shutdown().await;
     }
 }
@@ -1684,11 +1725,17 @@ async fn extension_scopes_isolate_same_id_packages_providers_and_lifecycle() {
     assert_eq!(invoke_a(close_child).await.unwrap_err().0, "no_session");
     assert!(host.axo.observe_child(&child_id).is_none());
 
-    // Shutting down Scope A removes tool_a and acme/a-model while keeping host_tool and Scope B intact.
-    scope_a.shutdown().await;
-    assert!(scope_a.models().find("acme/a-model").is_none());
+    let models_a = scope_a.models();
+    let last_a = scope_a.clone();
+    drop(scope_a);
+    assert!(models_a.find("acme/a-model").is_some());
+    assert!(has_tool(&session_a, "tool_a"));
+    drop(last_a);
+    wait_for("scope A withdrawal", || {
+        models_a.find("acme/a-model").is_none() && !has_tool(&session_a, "tool_a")
+    })
+    .await;
     assert!(has_tool(&session_a, "host_tool"));
-    assert!(!has_tool(&session_a, "tool_a"));
     assert!(scope_b.models().find("acme/b-model").is_some());
     assert!(has_tool(&session_b, "tool_b"));
 
@@ -1696,6 +1743,9 @@ async fn extension_scopes_isolate_same_id_packages_providers_and_lifecycle() {
     extensions.configure(&[]).await.unwrap();
     assert!(!has_tool(&session_b, "host_tool"));
     assert!(has_tool(&session_b, "tool_b"));
+    scope_b.shutdown().await;
+    assert!(scope_b.models().find("acme/b-model").is_none());
+    assert!(!has_tool(&session_b, "tool_b"));
 
     created_in_b.shutdown().await;
     session_u.shutdown().await;

@@ -28,7 +28,7 @@ use self::bindings::{RemoteCommand, RemotePolicy, RemoteScheme, RemoteSpawnHook,
 use crate::manifest::{PolicyHook, SessionDecl};
 use crate::peer::{Actions, BridgeCode, CallError, Callbacks, Refusal, RunnerRef, decode};
 use crate::remote::{self, CALL_DEADLINE, Failure};
-use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionScope, Extensions, Inner, gate};
+use crate::{ExtensionDiagnostic, ExtensionEvent, ExtensionSet, Inner, Role, gate};
 
 /// The callable wire names for each extension object.
 pub(crate) fn methods() -> &'static BTreeMap<&'static str, Vec<&'static str>> {
@@ -97,12 +97,15 @@ pub(crate) fn collisions(contributions: &[Arc<Contribution>]) -> Vec<ExtensionDi
     out
 }
 
-impl Extensions {
-    /// Sets `options.layer` to the enabled extensions, replacing any layer the caller set.
-    /// The host's own `options.host.definitions` rank after the extensions'. No I/O, starts nothing.
+impl ExtensionSet {
+    /// Replaces `options.layer` with the enabled extensions, root first and then scope.
+    /// A scope also sets `options.models` to its scoped view; the root leaves it unchanged.
+    /// Leaves the host registrations alone. No I/O; starts nothing.
     pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
-        let contributions = self.inner.effective_contributions();
-        options.layer = layer(&contributions);
+        options.layer = self.inner.layer();
+        if matches!(self.inner.role, Role::Scope { .. }) {
+            options.models = Some(Arc::clone(&self.inner.models));
+        }
         options
     }
 
@@ -129,39 +132,6 @@ impl Extensions {
     }
 }
 
-impl ExtensionScope {
-    /// Sets `options.layer` to the parent manager's host-wide extensions followed by this
-    /// scope's extensions, and sets `options.models` to this scope's [`axo_ai::Models`] view.
-    /// No I/O, starts nothing.
-    pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
-        let contributions = self.inner().effective_contributions();
-        options.layer = layer(&contributions);
-        options.models = Some(self.models());
-        options
-    }
-
-    /// Tracks `session` in this scope for session actions and entry events and applies the
-    /// current `host + scope` composition as its layer.
-    pub async fn attach(&self, session: &Arc<Session>) {
-        self.inner().attach(session).await;
-    }
-
-    /// Stops tracking `session_id` in this scope; the session keeps what it has.
-    pub fn detach(&self, session_id: &str) {
-        self.inner().sessions.detach(session_id);
-    }
-
-    /// Composition diagnostics of the last apply to this session in this scope.
-    pub fn session_diagnostics(&self, session_id: &str) -> Vec<String> {
-        self.inner()
-            .sessions
-            .lock()
-            .get(session_id)
-            .map(|attached| attached.diagnostics.clone())
-            .unwrap_or_default()
-    }
-}
-
 impl Inner {
     pub(super) async fn attach(self: &Arc<Self>, session: &Arc<Session>) {
         let inner = self;
@@ -170,12 +140,7 @@ impl Inner {
         let id = session.id().to_owned();
         let events = session.subscribe();
         let epoch = inner.sessions.epochs.fetch_add(1, Ordering::Relaxed);
-        let pump = tokio::spawn(pump(
-            inner.sessions.inner.clone(),
-            id.clone(),
-            epoch,
-            events,
-        ));
+        let pump = tokio::spawn(pump(Arc::downgrade(self), id.clone(), epoch, events));
         {
             let mut sessions = inner.sessions.lock();
             let attached = sessions.entry(id.clone()).or_default();
@@ -191,124 +156,150 @@ impl Inner {
         }
     }
 
+    fn attached(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.session(id).or_else(|| {
+            self.live_scopes()
+                .into_iter()
+                .find_map(|scope| scope.sessions.session(id))
+        })
+    }
+
     pub(super) async fn resolve_session(&self, id: &str) -> Result<Arc<Session>, InvokeError> {
-        if let Ok(session) = self.sessions.session(id) {
+        if let Some(session) = self.attached(id) {
             return Ok(session);
         }
-        if self.scope.is_none() {
-            for scope in self.live_scopes() {
-                if let Ok(session) = scope.sessions.session(id) {
-                    return Ok(session);
-                }
-            }
-            let missing = InvokeError::NoSession(format!("session {id} is not attached"));
-            return self
-                .axo
-                .session(id)
-                .await
-                .map_err(|error| child_error(missing, error));
-        }
-        let missing = || InvokeError::NoSession(format!("session {id} is not attached"));
+        let missing = InvokeError::NoSession(format!("session {id} is not attached"));
         if !self.owns_session(id).await {
-            return Err(missing());
+            return Err(missing);
         }
         self.axo
             .session(id)
             .await
-            .map_err(|error| child_error(missing(), error))
+            .map_err(|error| child_error(missing, error))
+    }
+
+    /// The unit (this root or one of its live scopes) that `session_id` or its nearest
+    /// attached spawn ancestor is attached to. Never revives a parked session.
+    pub(super) async fn owner_of(self: &Arc<Self>, session_id: &str) -> Option<Arc<Self>> {
+        let mut seen = HashSet::new();
+        let mut current = session_id.to_owned();
+        loop {
+            if self.sessions.has(&current) {
+                return Some(Arc::clone(self));
+            }
+            if let Some(scope) = self
+                .live_scopes()
+                .into_iter()
+                .find(|scope| scope.sessions.has(&current))
+            {
+                return Some(scope);
+            }
+            if !seen.insert(current.clone()) {
+                return None;
+            }
+            current = self.axo.spawn_parent(&current).await?;
+        }
+    }
+
+    pub(super) fn detach_anywhere(&self, session_id: &str) {
+        self.sessions.detach(session_id);
+        for scope in self.live_scopes() {
+            scope.sessions.detach(session_id);
+        }
     }
 
     /// Whether this scope owns `id`: it or its nearest attached spawn ancestor is attached here.
     pub(super) async fn owns_session(&self, id: &str) -> bool {
-        let Some(meta) = &self.scope else {
+        let Role::Scope { parent, .. } = &self.role else {
             return true;
         };
-        meta.parent
+        parent
             .owner_of(id)
             .await
             .is_some_and(|owner| std::ptr::eq(Arc::as_ptr(&owner), self))
     }
-}
 
-/// Each contribution in enabled order, as one registration layer.
-fn layer(contributions: &[(Weak<Inner>, Arc<Contribution>)]) -> Registrations {
-    let mut parts = Registrations::default();
-    for (inner, c) in contributions {
-        let remote = Remote {
-            inner: inner.clone(),
-            ext: c.ext.clone(),
-        };
-        for decl in &c.decl.tools {
-            let exposure = decl.exposure;
-            let (remote, decl) = (remote.clone(), Arc::new(decl.clone()));
-            let factory = Arc::new(move |tools: &Arc<SessionTools>| {
-                Arc::new(RemoteTool {
+    /// Each contribution in enabled order, as one registration layer.
+    fn layer(self: &Arc<Self>) -> Registrations {
+        let contributions = self.effective_contributions();
+        let mut parts = Registrations::default();
+        for (inner, c) in &contributions {
+            let remote = Remote {
+                inner: inner.clone(),
+                ext: c.ext.clone(),
+            };
+            for decl in &c.decl.tools {
+                let exposure = decl.exposure;
+                let (remote, decl) = (remote.clone(), Arc::new(decl.clone()));
+                let factory = Arc::new(move |tools: &Arc<SessionTools>| {
+                    Arc::new(RemoteTool {
+                        remote: remote.clone(),
+                        decl: Arc::clone(&decl),
+                        session: tools.session_id().to_owned(),
+                        tools: Arc::downgrade(tools),
+                    }) as Arc<dyn axo_agent::Tool>
+                });
+                parts.tools.push(
+                    HostTool {
+                        factory,
+                        exposure,
+                        origin: None,
+                    }
+                    .with_origin(c.origin.clone()),
+                );
+            }
+            let hooks = &c.decl.tool_policy;
+            if !hooks.is_empty() {
+                parts.tool_policies.push(Arc::new(RemotePolicy {
                     remote: remote.clone(),
-                    decl: Arc::clone(&decl),
-                    session: tools.session_id().to_owned(),
-                    tools: Arc::downgrade(tools),
-                }) as Arc<dyn axo_agent::Tool>
-            });
-            parts.tools.push(
-                HostTool {
-                    factory,
-                    exposure,
-                    origin: None,
-                }
-                .with_origin(c.origin.clone()),
+                    origin: c.origin.clone(),
+                    before: hooks.contains(&PolicyHook::Before),
+                    after: hooks.contains(&PolicyHook::After),
+                }));
+            }
+            if c.decl.spawn_hook {
+                parts.spawn_hooks.push(Arc::new(RemoteSpawnHook {
+                    remote: remote.clone(),
+                }));
+            }
+            parts
+                .schemes
+                .extend(c.decl.schemes.iter().map(|decl| -> Arc<dyn Scheme> {
+                    Arc::new(RemoteScheme {
+                        remote: remote.clone(),
+                        decl: decl.clone(),
+                    })
+                }));
+            parts
+                .commands
+                .extend(c.decl.commands.iter().map(|decl| RegisteredCommand {
+                    name: decl.name.clone(),
+                    description: decl.description.clone(),
+                    argument_hint: decl.argument_hint.clone(),
+                    origin: Some(c.origin.clone()),
+                    handler: Arc::new(RemoteCommand {
+                        remote: remote.clone(),
+                        decl: decl.clone(),
+                    }),
+                }));
+            parts.sections.extend(
+                c.sections
+                    .iter()
+                    .map(|(name, body)| (name.clone(), Some(body.clone()))),
             );
         }
-        let hooks = &c.decl.tool_policy;
-        if !hooks.is_empty() {
-            parts.tool_policies.push(Arc::new(RemotePolicy {
-                remote: remote.clone(),
-                origin: c.origin.clone(),
-                before: hooks.contains(&PolicyHook::Before),
-                after: hooks.contains(&PolicyHook::After),
-            }));
-        }
-        if c.decl.spawn_hook {
-            parts.spawn_hooks.push(Arc::new(RemoteSpawnHook {
-                remote: remote.clone(),
-            }));
+        // Unlike the other registrations, definitions keep the first of a name.
+        // ponytail: agents beat same-name teams here; ordered per-extension Definitions would preserve precedence across kinds.
+        for (_, c) in contributions.iter().rev() {
+            let defs = &mut parts.definitions;
+            defs.agents.extend_from_slice(&c.definitions.agents);
+            defs.teams.extend_from_slice(&c.definitions.teams);
+            defs.modes.extend_from_slice(&c.definitions.modes);
+            defs.keywords.extend_from_slice(&c.definitions.keywords);
+            defs.skills.extend_from_slice(&c.definitions.skills);
         }
         parts
-            .schemes
-            .extend(c.decl.schemes.iter().map(|decl| -> Arc<dyn Scheme> {
-                Arc::new(RemoteScheme {
-                    remote: remote.clone(),
-                    decl: decl.clone(),
-                })
-            }));
-        parts
-            .commands
-            .extend(c.decl.commands.iter().map(|decl| RegisteredCommand {
-                name: decl.name.clone(),
-                description: decl.description.clone(),
-                argument_hint: decl.argument_hint.clone(),
-                origin: Some(c.origin.clone()),
-                handler: Arc::new(RemoteCommand {
-                    remote: remote.clone(),
-                    decl: decl.clone(),
-                }),
-            }));
-        parts.sections.extend(
-            c.sections
-                .iter()
-                .map(|(name, body)| (name.clone(), Some(body.clone()))),
-        );
     }
-    // Unlike the other registrations, definitions keep the first of a name.
-    // ponytail: agents beat same-name teams here; ordered per-extension Definitions would preserve precedence across kinds.
-    for (_, c) in contributions.iter().rev() {
-        let defs = &mut parts.definitions;
-        defs.agents.extend_from_slice(&c.definitions.agents);
-        defs.teams.extend_from_slice(&c.definitions.teams);
-        defs.modes.extend_from_slice(&c.definitions.modes);
-        defs.keywords.extend_from_slice(&c.definitions.keywords);
-        defs.skills.extend_from_slice(&c.definitions.skills);
-    }
-    parts
 }
 
 /// Whether two compositions install the same layer: the same extensions in the same order
@@ -336,10 +327,7 @@ async fn apply(inner: &Arc<Inner>, id: &str) {
     if session.spawn_link().is_some() {
         return;
     }
-    let contributions = inner.effective_contributions();
-    let layer = layer(&contributions);
-    drop(contributions);
-    let diagnostics: Vec<String> = match session.set_layer(layer).await {
+    let diagnostics: Vec<String> = match session.set_layer(inner.layer()).await {
         Ok(found) => found.iter().map(ToString::to_string).collect(),
         Err(error) => vec![format!("cannot apply extensions: {error}")],
     };
@@ -363,14 +351,12 @@ async fn apply(inner: &Arc<Inner>, id: &str) {
 /// manager, every live child scope's attached sessions).
 pub(crate) async fn reapply(inner: &Arc<Inner>) {
     reapply_unit(inner).await;
-    if inner.scope.is_none() {
-        let scopes = inner.live_scopes();
-        join_all(scopes.iter().map(|scope| async {
-            let _config = scope.config.lock().await;
-            reapply_unit(scope).await;
-        }))
-        .await;
-    }
+    let scopes = inner.live_scopes();
+    join_all(scopes.iter().map(|scope| async {
+        let _config = scope.config.lock().await;
+        reapply_unit(scope).await;
+    }))
+    .await;
 }
 
 async fn reapply_unit(inner: &Arc<Inner>) {
@@ -626,9 +612,9 @@ struct Sub {
 }
 
 /// Attached sessions, by id; serves the runner's session actions.
+#[derive(Default)]
 pub(crate) struct Registry {
     sessions: Mutex<HashMap<String, Attached>>,
-    inner: Weak<Inner>,
     subs: Mutex<HashMap<String, Sub>>,
     next_sub: AtomicU64,
     epochs: AtomicU64,
@@ -646,17 +632,6 @@ struct Attached {
 }
 
 impl Registry {
-    pub(crate) fn new(inner: Weak<Inner>) -> Self {
-        Self {
-            inner,
-            sessions: Mutex::default(),
-            epochs: AtomicU64::default(),
-            subs: Mutex::default(),
-            next_sub: AtomicU64::default(),
-            running: Mutex::default(),
-        }
-    }
-
     fn subs(&self) -> MutexGuard<'_, HashMap<String, Sub>> {
         self.subs.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -716,7 +691,7 @@ impl Registry {
             .is_some_and(|attached| attached.session.strong_count() > 0)
     }
 
-    fn session(&self, id: &str) -> Result<Arc<Session>, InvokeError> {
+    fn session(&self, id: &str) -> Option<Arc<Session>> {
         let mut sessions = self.lock();
         let session = sessions.get(id).and_then(|a| a.session.upgrade());
         if session.is_none()
@@ -726,79 +701,19 @@ impl Registry {
         {
             pump.abort();
         }
-        session.ok_or_else(|| InvokeError::NoSession(format!("session {id} is not attached")))
+        session
     }
-
-    async fn subscribe(
-        &self,
-        inner: &Inner,
-        runner: RunnerRef,
-        ext: String,
-        request: Subscribe,
-    ) -> Result<Value, Refusal> {
-        let (name, kinds) = match request {
-            Subscribe::Session { session, kinds } => (session, kinds),
-            Subscribe::Completion { completion } => {
-                let stop = CancellationToken::new();
-                let events = inner
-                    .axo
-                    .stream_with(&inner.models, completion, stop.clone())
-                    .map_err(axo::ext::InvokeError::from)?;
-                let guard = stop.clone().drop_guard();
-                return Ok(
-                    self.install(&mut self.subs(), ext, None, stop, |ext, id| async move {
-                        let _guard = guard;
-                        completion_stream(runner, ext, id, events).await;
-                    }),
-                );
-            }
-        };
-        let allowed_child = self.has(&name) || inner.owns_session(&name).await;
-        // Lock before lookup so detach cannot miss an attached session's subscription.
-        let mut subs = self.subs();
-        let found = self.session(&name).ok().or_else(|| {
-            if inner.scope.is_none() {
-                inner
-                    .live_scopes()
-                    .into_iter()
-                    .find_map(|scope| scope.sessions.session(&name).ok())
-            } else {
-                None
-            }
-        });
-        let (events, stop) = match found {
-            Some(session) => (session.subscribe(), CancellationToken::new()),
-            None if allowed_child => inner.axo.observe_child(&name).ok_or_else(|| {
-                Refusal::new(
-                    axo::ext::DispatchCode::NoSession,
-                    format!("session {name} is not attached or resident"),
-                )
-            })?,
-            None => {
-                return Err(Refusal::new(
-                    axo::ext::DispatchCode::NoSession,
-                    format!("session {name} is not attached or resident"),
-                ));
-            }
-        };
-        Ok(
-            self.install(&mut subs, ext, Some(name), stop.clone(), |ext, id| {
-                stream(runner, ext, id, events, kinds, stop)
-            }),
-        )
-    }
-
     fn install<F: Future<Output = ()> + Send + 'static>(
         &self,
         subs: &mut HashMap<String, Sub>,
         ext: String,
         session: Option<String>,
         stop: CancellationToken,
+        inner: Weak<Inner>,
         run: impl FnOnce(String, String) -> F,
     ) -> Value {
         let id = format!("s:{}", self.next_sub.fetch_add(1, Ordering::Relaxed));
         let stream = run(ext.clone(), id.clone());
-        let inner = self.inner.clone();
         let task_id = id.clone();
         let task = tokio::spawn(async move {
             stream.await;
@@ -818,9 +733,65 @@ impl Registry {
         );
         json!({ "sub": id })
     }
+}
+
+impl Inner {
+    async fn subscribe(
+        self: &Arc<Self>,
+        runner: RunnerRef,
+        ext: String,
+        request: Subscribe,
+    ) -> Result<Value, Refusal> {
+        let (name, kinds) = match request {
+            Subscribe::Session { session, kinds } => (session, kinds),
+            Subscribe::Completion { completion } => {
+                let stop = CancellationToken::new();
+                let events = self
+                    .axo
+                    .stream_with(&self.models, completion, stop.clone())
+                    .map_err(InvokeError::from)?;
+                let guard = stop.clone().drop_guard();
+                return Ok(self.sessions.install(
+                    &mut self.sessions.subs(),
+                    ext,
+                    None,
+                    stop,
+                    Arc::downgrade(self),
+                    |ext, id| async move {
+                        let _guard = guard;
+                        completion_stream(runner, ext, id, events).await;
+                    },
+                ));
+            }
+        };
+        let allowed_child = self.owns_session(&name).await;
+        // Lock before lookup so detach cannot miss an attached session's subscription.
+        let mut subs = self.sessions.subs();
+        let (events, stop) = if let Some(session) = self.attached(&name) {
+            (session.subscribe(), CancellationToken::new())
+        } else {
+            allowed_child
+                .then(|| self.axo.observe_child(&name))
+                .flatten()
+                .ok_or_else(|| {
+                    Refusal::new(
+                        axo::ext::DispatchCode::NoSession,
+                        format!("session {name} is not attached or resident"),
+                    )
+                })?
+        };
+        Ok(self.sessions.install(
+            &mut subs,
+            ext,
+            Some(name),
+            stop.clone(),
+            Arc::downgrade(self),
+            |ext, id| stream(runner, ext, id, events, kinds, stop),
+        ))
+    }
 
     fn unsubscribe(&self, ext: &str, request: Unsubscribe) -> Result<Value, Refusal> {
-        let mut subs = self.subs();
+        let mut subs = self.sessions.subs();
         if let std::collections::hash_map::Entry::Occupied(entry) = subs.entry(request.sub)
             && entry.get().ext == ext
         {
@@ -883,7 +854,9 @@ fn child_error(missing: InvokeError, error: axo::Error) -> InvokeError {
     }
 }
 
-impl Actions for Registry {
+pub(super) struct Dispatch(pub(super) Weak<Inner>);
+
+impl Actions for Dispatch {
     fn call(
         &self,
         runner: RunnerRef,
@@ -891,17 +864,14 @@ impl Actions for Registry {
         method: String,
         args: Value,
     ) -> BoxFuture<'static, Result<Value, Refusal>> {
-        let inner = self.inner.upgrade();
+        let inner = self.0.upgrade();
         Box::pin(async move {
             let inner = inner.ok_or_else(unavailable)?;
             match method.as_str() {
                 "subscribe" => {
-                    return inner
-                        .sessions
-                        .subscribe(&inner, runner, ext, decode(args)?)
-                        .await;
+                    return inner.subscribe(runner, ext, decode(args)?).await;
                 }
-                "unsubscribe" => return inner.sessions.unsubscribe(&ext, decode(args)?),
+                "unsubscribe" => return inner.unsubscribe(&ext, decode(args)?),
                 "invoke" => {}
                 _ => {
                     return Err(Refusal::new(BridgeCode::Unsupported, "unknown host method"));
