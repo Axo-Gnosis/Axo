@@ -7,7 +7,7 @@ pub(crate) mod command;
 
 use child::{ChildMessage, ChildPhase, ChildRun};
 pub use command::{CommandOutput, OutputProgress};
-use command::{CommandRun, OutputState, Phase, RegisterCommand, Stop};
+use command::{CommandRun, Phase, RegisterCommand, Stop};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -583,14 +583,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                                 promoted_at: promotion.and_then(|_| base.timestamp_ms()),
                                 ended_at: None,
                                 exit: None,
-                                output: Arc::new(OutputState {
-                                    path: PathBuf::new(),
-                                    progress: watch::Sender::new(OutputProgress {
-                                        bytes: 0,
-                                        done: true,
-                                        capture_failed: false,
-                                    }),
-                                }),
+                                output: None,
                                 artifact: *artifact,
                                 phase: Phase::Closed,
                                 control: None,
@@ -1023,7 +1016,7 @@ impl JobRegistry {
                     promoted_at: None,
                     ended_at: None,
                     exit: None,
-                    output,
+                    output: Some(output),
                     artifact,
                     phase: Phase::Running,
                     control: Some(control),
@@ -1615,14 +1608,12 @@ impl JobRegistry {
                         })?
                 }
             };
-            let (path, progress) = if run.output.path.as_os_str().is_empty() {
-                let tail = crate::schemes::artifact::command_log_tail(&run.tool, &run.call_id);
-                (artifacts_dir.join(format!("{}.{tail}", run.artifact)), None)
-            } else {
-                (
-                    run.output.path.clone(),
-                    Some(run.output.progress.subscribe()),
-                )
+            let (path, progress) = match &run.output {
+                Some(output) => (output.path.clone(), Some(output.progress.subscribe())),
+                None => {
+                    let tail = crate::schemes::artifact::command_log_tail(&run.tool, &run.call_id);
+                    (artifacts_dir.join(format!("{}.{tail}", run.artifact)), None)
+                }
             };
             (id, run.artifact, path, progress)
         };

@@ -137,7 +137,8 @@ pub(super) struct CommandRun {
     pub(super) promoted_at: Option<i64>,
     pub(super) ended_at: Option<i64>,
     pub(super) exit: Option<CommandExit>,
-    pub(super) output: Arc<OutputState>,
+    /// `None` for replayed rows. In-process rows retain output state after closing.
+    pub(super) output: Option<Arc<OutputState>>,
     pub(super) artifact: u64,
     pub(super) mode: Mode,
     pub(super) phase: Phase,
