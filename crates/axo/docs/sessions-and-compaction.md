@@ -20,7 +20,7 @@ There is no separate handle that opens a child on its own; a child is only ever 
 
 1. `Axo::open_session(child_path, …)` returns `Error::ChildSession { root, .. }`.
 2. Open `root` with `Axo::open_session` and the host's own session options, and keep the returned `Session` alive. Dropping a session shuts it down, kills its command jobs, releases its writer lock, and removes its children's slots from the process session table, so they are no longer reachable through `Axo::session` and stop reporting to it.
-3. `Axo::session(child_id)` returns the live child, reviving a parked one (its unfinished work resumes). Lookup and reconciliation share one in-process revival. A lookup for an unknown ID waits for any open roots still registering their children.
+3. `Axo::session(child_id)` returns the live child, reviving a parked one (its unfinished work resumes). Lookup and reconciliation share one gated in-process revival path; a failed revival leaves the child's seed registered so a later lookup can retry. A lookup for an unknown ID waits for any open roots still registering their children.
 
 Hosts should own each open root in one place (a per-process registry keyed by root session) and serve both the root's own view and every descendant's view from that one `Session`. A later request to open the root reuses the held handle: a second `Axo::open_session` on the same file fails with `Error::SessionBusy` because the first handle still holds the file lock. For read-only inspection without opening anything, `Axo::open_session_read(path)` reads any session file, child included, without locking it; pass its entries to `project(&entries, None)` for the current branch.
 
