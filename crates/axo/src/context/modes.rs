@@ -165,29 +165,15 @@ pub(crate) fn merge_modes(
     files: &[ModeSpec],
     code: &[ModeSpec],
 ) -> (Vec<ModeSpec>, Vec<Diagnostic>) {
-    let mut definitions = files.to_vec();
-    let mut diagnostics = Vec::new();
-    let mut names: HashSet<_> = files.iter().map(|spec| spec.name.as_str()).collect();
-    for spec in code {
-        let name = spec.name.as_str();
-        let mut warn = |message| {
-            diagnostics.push(Diagnostic {
-                origin: spec.path.clone().map(DiagnosticOrigin::Path),
-                message: format!("mode \"{}\": {message}", spec.name),
-            });
-        };
-        let mut spec = spec.clone();
-        spec.body = spec.body.trim().to_owned();
-        if !validate(&spec, &mut warn) {
-            continue;
-        }
-        if names.insert(name) {
-            definitions.push(spec);
-        } else {
-            warn(format!("name \"{}\" collision", spec.name));
-        }
-    }
-    (definitions, diagnostics)
+    markdown::merge_code(
+        files,
+        code,
+        "mode",
+        |spec| &spec.name,
+        |spec| spec.path.as_deref(),
+        |spec| &mut spec.body,
+        validate,
+    )
 }
 
 #[expose]
@@ -268,7 +254,7 @@ fn parse_markdown(
     validate(&spec, warn).then_some(spec)
 }
 
-fn validate(spec: &ModeSpec, warn: &mut impl FnMut(String)) -> bool {
+fn validate(spec: &ModeSpec, warn: &mut dyn FnMut(String)) -> bool {
     let problems = namespaced_name_problems(&spec.name);
     if !problems.is_empty() {
         for problem in problems {
