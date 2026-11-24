@@ -137,20 +137,11 @@ async fn service_tier_follows_selectors_and_settings() {
     assert_eq!(session.service_tier(), Fast);
     assert_eq!(session.effective_service_tier(), Standard);
 
-    let path = session.path().to_path_buf();
-    session.shutdown().await;
-    drop(session);
-    let reopened = host
-        .axo
-        .open_session(
-            &path,
-            SessionOptions {
-                model: None,
-                ..options(dir)
-            },
-        )
-        .await
-        .unwrap();
+    let reopened = common::reopen(&host.axo, session, || SessionOptions {
+        model: None,
+        ..options(dir)
+    })
+    .await;
     assert_eq!(reopened.service_tier(), Fast);
     assert_eq!(reopened.effective_service_tier(), Standard);
     reopened.shutdown().await;

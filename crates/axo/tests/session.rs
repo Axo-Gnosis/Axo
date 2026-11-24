@@ -240,14 +240,7 @@ async fn input_queued_when_a_run_stops_survives_reopening() {
         let requests = host.api.requests().len();
 
         if reopen {
-            let path = session.path().to_path_buf();
-            session.shutdown().await;
-            drop(session);
-            session = host
-                .axo
-                .open_session(&path, options(dir.path()))
-                .await
-                .unwrap();
+            session = common::reopen(&host.axo, session, || options(dir.path())).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(
                 !session.attach(None).await.live.running,
@@ -759,14 +752,7 @@ async fn withdrawn_input_is_never_delivered() {
         ));
 
         if reopen {
-            let path = session.path().to_path_buf();
-            session.shutdown().await;
-            drop(session);
-            session = host
-                .axo
-                .open_session(&path, options(dir.path()))
-                .await
-                .unwrap();
+            session = common::reopen(&host.axo, session, || options(dir.path())).await;
             assert!(session.attach(None).await.live.queued.is_empty());
         }
         session.resume_wakes();
@@ -1240,20 +1226,11 @@ async fn suffix_pair_is_one_journal_selection() {
     session.run_command(selector()).await.unwrap();
     assert_eq!(common::journal(&session), lines);
 
-    let path = session.path().to_path_buf();
-    session.shutdown().await;
-    drop(session);
-    let reopened = host
-        .axo
-        .open_session(
-            &path,
-            axo::SessionOptions {
-                model: None,
-                ..options(dir.path())
-            },
-        )
-        .await
-        .unwrap();
+    let reopened = common::reopen(&host.axo, session, || axo::SessionOptions {
+        model: None,
+        ..options(dir.path())
+    })
+    .await;
     assert_eq!(reopened.thinking(), ThinkingLevel::High);
     assert_eq!(reopened.service_tier(), ServiceTier::Fast);
 }
@@ -1538,13 +1515,7 @@ async fn personas_restore_from_the_journal_and_switch_the_next_request_shape() {
     assert!(entries.iter().any(|entry| entry["type"] == "agent_change"));
     reopened.set_agent(None).await.unwrap();
     assert!(reopened.agent().is_none());
-    reopened.shutdown().await;
-    drop(reopened);
-    let cleared = host
-        .axo
-        .open_session(&path, options(dir.path()))
-        .await
-        .unwrap();
+    let cleared = common::reopen(&host.axo, reopened, || options(dir.path())).await;
     assert!(
         cleared.agent().is_none(),
         "an explicit clear must survive reopening"

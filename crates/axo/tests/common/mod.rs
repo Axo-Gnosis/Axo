@@ -320,6 +320,17 @@ pub fn options(dir: &Path) -> SessionOptions {
     }
 }
 
+pub async fn reopen(
+    axo: &Axo,
+    session: Session,
+    options: impl FnOnce() -> SessionOptions,
+) -> Session {
+    let path = session.path().to_path_buf();
+    session.shutdown().await;
+    drop(session);
+    axo.open_session(&path, options()).await.unwrap()
+}
+
 /// [`options`] with the real Nix-provided bash on `PATH`, keeping the isolated fixture
 /// environment otherwise.
 pub fn bash_options(dir: &Path) -> SessionOptions {
