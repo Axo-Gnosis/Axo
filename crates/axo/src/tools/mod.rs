@@ -205,6 +205,23 @@ pub enum Located {
     Virtual { url: SchemeUrl },
 }
 
+impl Located {
+    pub(crate) fn existing(self) -> Self {
+        match self {
+            Self::File {
+                url: None,
+                path,
+                writable,
+            } => Self::File {
+                url: None,
+                path: existing_variant(path),
+                writable,
+            },
+            other => other,
+        }
+    }
+}
+
 #[expose(block = SESSION_TOOLS, object = "tools")]
 impl SessionTools {
     pub(crate) fn new(
@@ -405,7 +422,7 @@ pub(crate) fn folded(path: &Path) -> PathBuf {
 }
 
 /// Tries macOS screenshot variants for a plain filesystem read path that does not exist.
-pub(crate) fn existing_variant(resolved: PathBuf) -> PathBuf {
+fn existing_variant(resolved: PathBuf) -> PathBuf {
     static AM_PM: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i) (AM|PM)\.").expect("valid regex"));
     if resolved.exists() {

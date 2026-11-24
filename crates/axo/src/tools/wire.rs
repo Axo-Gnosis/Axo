@@ -333,15 +333,8 @@ impl ToolsWire<'_> {
     /// Returns the last recorded hash for a file, resolving the path as `readFile` does.
     #[ext]
     pub async fn recorded(&self, path: String) -> Result<Option<String>, ToolError> {
-        match self.access.tools.locate(&path).await? {
-            Located::File { url, path, .. } => {
-                let path = if url.is_none() {
-                    super::existing_variant(path)
-                } else {
-                    path
-                };
-                Ok(self.access.tools.ledger.recorded(&path))
-            }
+        match self.access.tools.locate(&path).await?.existing() {
+            Located::File { path, .. } => Ok(self.access.tools.ledger.recorded(&path)),
             Located::Virtual { .. } => Ok(None),
         }
     }
