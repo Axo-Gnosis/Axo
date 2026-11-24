@@ -568,21 +568,35 @@ impl Run<'_> {
             .iter()
             .map(|call| route(&self.context.tools, &self.context.deferred, call))
             .collect();
-        let sequential = routed.iter().any(|routed| {
-            routed
+        // A sequential call is a barrier: earlier calls finish before it starts and later
+        // calls start after it ends. Parallel calls between barriers run together.
+        let mut groups = Vec::new();
+        let mut start = 0;
+        for (index, routed) in routed.iter().enumerate() {
+            if routed
                 .as_ref()
                 .is_ok_and(|routed| routed.tool.execution_mode() == ExecutionMode::Sequential)
-        });
+            {
+                if start < index {
+                    groups.push(start..index);
+                }
+                groups.push(index..index + 1);
+                start = index + 1;
+            }
+        }
+        if start < calls.len() {
+            groups.push(start..calls.len());
+        }
         // The batch terminates only when every produced result asks for it.
         let mut terminates: Vec<bool> = Vec::with_capacity(calls.len());
         let mut results = Vec::with_capacity(calls.len());
 
-        let size = if sequential { 1 } else { calls.len().max(1) };
-        for (calls, routed) in calls.chunks(size).zip(routed.chunks(size)) {
+        for group in groups {
+            let (calls, routed) = (&calls[group.clone()], &routed[group]);
             let mut slots: Vec<Option<Outcome>> = calls.iter().map(|_| None).collect();
             let mut ready = Vec::with_capacity(calls.len());
             // Preparation, including `before_tool_call`, runs in source order and clears
-            // the whole batch before any call starts.
+            // the whole group before any of its calls starts.
             for (index, (call, routed)) in calls.iter().zip(routed).enumerate() {
                 let effective = routed.as_ref().map_or(call, |routed| routed.call.as_ref());
                 self.emit_start(effective).await?;

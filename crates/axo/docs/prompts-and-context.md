@@ -43,12 +43,12 @@ When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (in
 Before agent allowlists and depth filtering, the built-in order is `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `kill`, `spawn`, `send`, followed by `ask` when enabled. `spawn` is withheld when the session's depth is at least `subagents.maxDepth` (roots have depth 0). Filtering it after the allowlist avoids an unknown-tool diagnostic for an inherited allowlist naming `spawn`. `kill` and `send` bypass agent allowlists, then presence is derived from the effective tools: `kill` exists when `bash` or `spawn` remains; `send` exists when `spawn` remains or the session has a parent or teammates. Children with an output schema receive `yield` after the allowlist regardless of whether it names that tool. `call` is appended when deferred tools remain or the root has [mode tools reserved](#model-entry-and-results).
 
 Only `read`, `write`, `edit`, and `bash` define `prompt_guidelines()` in the built-in tool set:
-- `read`: `"Use read to examine files instead of cat or sed."`
+- `read`: `"Use read to examine files instead of cat or sed; edit and write refuse files this session hasn't read, and bash output doesn't count."`
 - `write`: `"Use write only for new files or complete rewrites."`
 - `edit`: `"When changing several places in one file, use one edit call with several entries in edits[]."`
 - `bash`: `"A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes."` and `"List jobs with read proc:// and stop one with kill."` (see [Background Jobs](#background-jobs-cratesaxosrcjobsmodrs-cratesaxosrcjobscommandrs))
 
-For filesystem targets, `read` refuses non-regular files, and `edit` refuses files whose contents are not valid UTF-8.
+For filesystem targets, `read` refuses non-regular files, and `edit` refuses files whose contents are not valid UTF-8. `write` (to an existing file) and `edit` require that this session last saw the file's current contents through `read`, `write`, or `edit`; any `read` range records the whole file's hash, while `bash` output records nothing. Both are `ExecutionMode::Sequential`, so a `read` issued earlier in the same batch finishes first.
 
 ### Deferred tools
 
@@ -515,7 +515,7 @@ For file targets, axo compares the real path of the target with the real path of
 
 ### `wait`
 
-`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. Any tool batch containing `wait` runs one call at a time, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. As a sequential barrier, `wait` starts only after every earlier call in its batch finishes, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
 
 Successful waits serialize `WaitReceipt` into details: `{"reason":"results","jobs":["bg_1","agent_2/3",…]}` identifies consumed messages; `reason` is `mail`, `interrupted` (steer), or `idle` for other wake paths, with empty `jobs` omitted. Stop and mutual-wait errors remain errors. Message text stays in the tool result and journal entries.
 

@@ -17,7 +17,7 @@ use crate::tools::truncate::{
 use crate::tools::{FileRead, SessionTools, file_details};
 
 const GUIDELINES: &[Cow<'static, str>] = &[Cow::Borrowed(
-    "Use read to examine files instead of cat or sed.",
+    "Use read to examine files instead of cat or sed; edit and write refuse files this session hasn't read, and bash output doesn't count.",
 )];
 
 #[derive(Deserialize)]

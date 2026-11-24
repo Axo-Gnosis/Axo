@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
+use axo_agent::{ExecutionMode, Tool, ToolContext, ToolError, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
@@ -84,6 +84,12 @@ impl Tool for EditTool {
 
     fn parameters(&self) -> &Value {
         &self.parameters
+    }
+
+    /// Sequential: a `read` of the file earlier in the batch records it before the
+    /// freshness check, and later calls see the edited file.
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
     }
 
     fn prompt_guidelines(&self) -> &[Cow<'static, str>] {

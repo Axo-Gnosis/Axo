@@ -824,6 +824,53 @@ async fn reopened_session_edits_a_file_it_read_before() {
     assert_eq!(std::fs::read_to_string(&notes).unwrap(), "bye\n");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_read_then_edit_in_one_batch_edits() {
+    // Several pairs, because one parallel pair only loses the race sometimes.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = options(dir.path()).cwd;
+    let mut calls = Vec::new();
+    for n in 0..8 {
+        std::fs::write(cwd.join(format!("{n}.txt")), "line\nhello\n").unwrap();
+        let path = format!("{n}.txt");
+        calls.push((
+            format!("r{n}"),
+            "read",
+            json!({ "path": path, "offset": 2, "limit": 1 }),
+        ));
+        calls.push((
+            format!("e{n}"),
+            "edit",
+            json!({ "path": path, "edits": [{ "oldText": "hello", "newText": "bye" }] }),
+        ));
+    }
+    let calls: Vec<_> = calls
+        .iter()
+        .map(|(id, name, args)| (id.as_str(), *name, args.clone()))
+        .collect();
+    let axo = common::host(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&calls)),
+            ScriptedTurn::Reply(reply_text("edited")),
+        ],
+    )
+    .await
+    .axo;
+    let session = axo.create_session(options(dir.path())).await.unwrap();
+    assert_eq!(
+        within(session.prompt("edit the files")).await.unwrap(),
+        RunOutcome::Done
+    );
+    for n in 0..8 {
+        assert_eq!(
+            std::fs::read_to_string(cwd.join(format!("{n}.txt"))).unwrap(),
+            "line\nbye\n",
+            "each edit waits for its batched read's ledger record"
+        );
+    }
+}
+
 #[tokio::test]
 async fn stranded_prompt_runs_when_the_session_reopens() {
     let dir = tempfile::tempdir().unwrap();

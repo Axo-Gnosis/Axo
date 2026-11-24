@@ -922,14 +922,18 @@ async fn tool_ends_in_completion_order_results_in_call_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batch_with_a_sequential_tool_runs_sequentially() {
+async fn sequential_tool_is_a_barrier_between_parallel_groups() {
+    // A batched `read` then `edit` of one file relies on this: the edit's freshness
+    // check must see the read's ledger record.
     let probe = Arc::new(Probe::default());
     let h = setup(
         vec![
             turn(&[
                 ("c1", "sleep", json!({ "ms": 60 })),
-                ("c2", "seq", json!({ "ms": 60 })),
-                ("c3", "sleep", json!({ "ms": 0 })),
+                ("c2", "sleep", json!({ "ms": 0 })),
+                ("c3", "seq", json!({ "ms": 0 })),
+                ("c4", "sleep", json!({ "ms": 60 })),
+                ("c5", "sleep", json!({ "ms": 0 })),
             ]),
             text("done"),
         ],
@@ -941,14 +945,32 @@ async fn batch_with_a_sequential_tool_runs_sequentially() {
     );
     assert_eq!(h.prompt("go").await, RunOutcome::Done);
 
-    assert_eq!(probe.max_running.load(Ordering::SeqCst), 1, "no overlap");
-    assert_eq!(probe.finished(), labels(&["c1", "c2", "c3"]));
+    assert_eq!(
+        probe.max_running.load(Ordering::SeqCst),
+        2,
+        "parallel neighbours overlap"
+    );
+    assert_eq!(probe.finished(), labels(&["c2", "c1", "c3", "c5", "c4"]));
+    assert_eq!(
+        probe.started()[2],
+        "c3",
+        "barrier starts after its predecessors"
+    );
     let names = h.rec.names();
     let ends: Vec<&String> = names
         .iter()
         .filter(|n| n.starts_with("exec-end:"))
         .collect();
-    assert_eq!(ends, ["exec-end:c1", "exec-end:c2", "exec-end:c3"]);
+    assert_eq!(
+        ends,
+        [
+            "exec-end:c2",
+            "exec-end:c1",
+            "exec-end:c3",
+            "exec-end:c5",
+            "exec-end:c4"
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

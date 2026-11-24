@@ -173,7 +173,7 @@ impl FileLedger {
     ) -> Result<String, ToolError> {
         match self.recorded(absolute) {
             None => Err(ToolError(format!(
-                "File has not been read in this session: {shown_path}. Read it first."
+                "File has not been read in this session: {shown_path}. Read it with the read tool first; any line range counts, but output from bash does not."
             ))),
             Some(hash) if hash != Self::hash(current) => Err(ToolError(format!(
                 "File changed since it was last read: {shown_path}. Read it again before editing."
