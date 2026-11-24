@@ -60,7 +60,6 @@
     { "name": "watch", "description": "Records new journal entry sequence numbers." },
     { "name": "compact-light", "description": "Compacts with a focus, or posts busy during a turn." }
   ],
-  "sections": [{ "name": "lab_rules", "file": "prompts/rules.md" }],
   "toolPolicy": ["before"],
   "spawnHook": true,
   "events": true

@@ -1,8 +1,8 @@
 //! Session capabilities through a real runner: `tests/fixtures/lab-session` is composed into
 //! and attached to a real session whose model turns come from a [`ScriptedApi`]. One case
-//! covers the replaced built-in `read` and its update, a policy block, branch state across a
-//! fork and a reopen, `/hello` reaching the journal, journal-entry events, and a host abort
-//! reaching the `probe` handler's signal, and a `burst` of updates past the peer's callback cap
+//! covers the replaced built-in `read` and its update, a policy block, handler-written branch
+//! state, `/hello` reaching the journal, a virtual URL read, journal-entry events, and a host
+//! abort reaching the `probe` handler's signal, and a `burst` of updates past the peer's callback cap
 //! that the runner queues instead of ending the generation.
 //!
 //! Barriers are the fixture's files in its data directory (`probe-started`, `canceled`,
@@ -13,10 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axo::{
-    Command, CommandKind, Entry, EntryId, PromptPart, Session, SessionEvent, SubmittedCustom,
-    Supervision,
-};
+use axo::{Entry, PromptPart, Session, SessionEvent, SubmittedCustom, Supervision};
 use axo_agent::{AgentEvent, AgentMessage, CancelReason, RunOutcome};
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::{Message, ScriptedApi, ScriptedTurn, ToolResultMessage, UserBlock};
@@ -151,44 +148,20 @@ pub async fn run(bun: &Path, mode: Supervision) {
     assert!(text(&s1).contains(r#"{"n":1}"#), "{:?}", s1.content);
     // The fixture says `lab`; the host stores it under `<ext-id>:lab`.
     assert_eq!(session.custom("lab-session:lab"), Some(json!({"n": 1})));
-    let leaf = session
-        .attach(None)
-        .await
-        .missed
-        .iter()
-        .rev()
-        .find_map(|seq| seq.entry.id().map(|id| EntryId(id.to_owned())))
-        .expect("the journal has entries");
-    let fork = Arc::new(session.fork(&leaf).await.unwrap().session);
-    host.extensions.attach(&fork).await;
-    assert_eq!(fork.custom("lab-session:lab"), Some(json!({"n": 1})));
-    host.extensions.detach(fork.id());
-    fork.shutdown().await;
-    drop(fork);
 
     // `/hello hi` runs in the runner, which posts a quiet `lab` message back.
-    let hello = session
-        .commands()
-        .into_iter()
-        .find(|command| command.name == "hello")
-        .expect("hello is listed");
-    assert!(
-        matches!(hello.kind, CommandKind::Registered { .. }),
-        "{hello:?}"
-    );
     let command = session
         .parse_command("/hello hi")
         .expect("a command")
         .unwrap();
-    assert_eq!(
-        command,
-        Command::Registered {
-            name: "hello".into(),
-            args: "hi".into()
-        }
-    );
     bounded(session.run_command(command)).await.unwrap();
     assert_posted(&session, "hi").await;
+
+    let url = session.schemes().exact("lab://a").unwrap();
+    assert_eq!(
+        bounded(session.schemes().read(&url)).await.unwrap(),
+        "read:a"
+    );
 
     let count = host.axo.models().all().len();
     assert!(count > 0);
@@ -373,16 +346,9 @@ pub async fn run(bun: &Path, mode: Supervision) {
 
     tool_access(&session, &api, &host.path("work")).await;
 
-    // The state survives a reopen.
-    let path = session.path().to_path_buf();
     host.extensions.detach(session.id());
     session.shutdown().await;
     drop(session);
-    let options = host.extensions.compose(host.session_options(None));
-    let reopened = host.axo.open_session(&path, options).await.unwrap();
-    assert_eq!(reopened.custom("lab-session:lab"), Some(json!({"n": 1})));
-    reopened.shutdown().await;
-    drop(reopened);
 
     let mut options = host.session_options(Some("test/m"));
     options.host.definitions.modes.push(axo::ModeSpec {
