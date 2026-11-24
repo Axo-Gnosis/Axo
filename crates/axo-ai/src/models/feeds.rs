@@ -34,6 +34,17 @@ pub(super) struct Inputs {
     catalog_fetched: Option<Instant>,
 }
 
+impl Inputs {
+    fn candidate(&self) -> Candidate<'_> {
+        Candidate {
+            config: &self.config,
+            extended_context: self.extended_context,
+            catalog: self.catalog.as_ref(),
+            codex: self.codex.as_deref(),
+        }
+    }
+}
+
 /// Only freshly fetched feeds. A failed catalog fetch can still accompany a useful account list.
 struct Pending {
     catalog: Result<Option<(bytes::Bytes, rules::CatalogModels)>, Error>,
@@ -42,17 +53,17 @@ struct Pending {
 
 impl Pending {
     fn candidate<'a>(&'a self, inputs: &'a Inputs) -> Candidate<'a> {
+        let retained = inputs.candidate();
         Candidate {
-            config: &inputs.config,
-            extended_context: inputs.extended_context,
             catalog: self
                 .catalog
                 .as_ref()
                 .ok()
                 .and_then(Option::as_ref)
                 .map(|(_, mapped)| mapped)
-                .or(inputs.catalog.as_ref()),
-            codex: self.codex.as_deref().or(inputs.codex.as_deref()),
+                .or(retained.catalog),
+            codex: self.codex.as_deref().or(retained.codex),
+            ..retained
         }
     }
 
@@ -176,8 +187,7 @@ impl Models {
         let candidate = Candidate {
             config: &config,
             extended_context,
-            codex: inputs.codex.as_deref(),
-            catalog: inputs.catalog.as_ref(),
+            ..inputs.candidate()
         };
         let loaded = build(
             candidate,
@@ -252,10 +262,8 @@ impl Models {
             };
             if inputs.codex.take().is_some() {
                 let candidate = Candidate {
-                    config: &inputs.config,
-                    extended_context: inputs.extended_context,
                     codex: None,
-                    catalog: inputs.catalog.as_ref(),
+                    ..inputs.candidate()
                 };
                 let loaded = build(
                     candidate,
