@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ pub struct WriteGate {
     pub entered: Notify,
     pub release: Notify,
     pub fail: AtomicBool,
+    pub open_write_attempts: AtomicUsize,
 }
 
 impl WriteGate {
@@ -41,6 +42,7 @@ impl WriteGate {
             entered: Notify::new(),
             release: Notify::new(),
             fail: AtomicBool::new(false),
+            open_write_attempts: AtomicUsize::new(0),
         })
     }
 }
@@ -87,6 +89,9 @@ impl SessionStore for GatedStore {
         &self,
         path: &Path,
     ) -> Result<(Header, Vec<SeqEntry>, Box<dyn SessionWriter>), Error> {
+        self.gate
+            .open_write_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let (header, entries, inner) = self.inner.open_write(path).await?;
         let writer = GatedWriter {
             inner,

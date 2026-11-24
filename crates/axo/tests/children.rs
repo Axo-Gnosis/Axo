@@ -1,5 +1,6 @@
 mod common;
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -439,6 +440,124 @@ async fn parent_shutdown_resumes_child_on_reopen() {
             .count(),
         2
     );
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn adoption_and_lookup_share_one_parked_child_revival() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = common::WriteGate::new(|entry| matches!(entry, Entry::RunResumed { .. }));
+    let spawn = ScriptedTurn::Reply(reply_tool_calls(&[(
+        "s1",
+        "spawn",
+        json!({"spec": {"prompt": "You check."}, "task": "check", "model": "test/child"}),
+    )]));
+    let api = Arc::new(axo_ai::ScriptedApi::new(vec![
+        spawn.clone(),
+        ScriptedTurn::Reply(reply_text("ready")),
+        spawn,
+        ScriptedTurn::Reply(reply_text("ack")),
+    ]));
+    api.lane(
+        "child",
+        vec![
+            ScriptedTurn::HangUntilCancel,
+            ScriptedTurn::Reply(reply_text("resumed result")),
+        ],
+    );
+    let (axo, _, _) = common::axo_with(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({}),
+        Arc::new(common::GatedStore {
+            inner: axo::JsonlStore::new(dir.path().join("sessions")),
+            gate: gate.clone(),
+        }),
+        api.clone(),
+    )
+    .await;
+    let parent = Arc::new(axo.create_session(options(dir.path())).await.unwrap());
+    within(parent.prompt("spawn a child")).await.unwrap();
+    until(|| api.requests().iter().any(|r| r.model.id == "child")).await;
+    let job = parent
+        .jobs()
+        .into_iter()
+        .find(|j| j.id == "agent_1")
+        .unwrap();
+    let JobKind::Child { session_id, .. } = job.kind else {
+        panic!("expected agent_1 to be a child job");
+    };
+    let child = within(axo.session(&session_id)).await.unwrap();
+    within(child.shutdown()).await;
+    let lines = journal(&child);
+    let start = only(&lines, "child run start", |v| v["type"] == "run_start");
+    let run_id = lines[start]["runId"].as_str().unwrap();
+    assert!(!lines.iter().any(|v| v["type"] == "run_end"));
+    let weak = Arc::downgrade(&child);
+    drop(child);
+    until(|| weak.upgrade().is_none()).await;
+    assert_eq!(
+        axo.spawn_parent(&session_id).await.as_deref(),
+        Some(parent.id())
+    );
+    assert!(axo.observe_child(&session_id).is_none());
+
+    let adoption = tokio::spawn({
+        let parent = parent.clone();
+        async move { parent.prompt("adopt the same child").await }
+    });
+    within(gate.entered.notified()).await;
+    let attempts = gate.open_write_attempts.load(Ordering::Relaxed);
+    let mut lookup = std::pin::pin!(axo.session(&session_id));
+    assert!(futures::poll!(&mut lookup).is_pending());
+    assert_eq!(
+        gate.open_write_attempts.load(Ordering::Relaxed),
+        attempts,
+        "lookup attempted to open a second child writer during adoption"
+    );
+    gate.release.notify_one();
+    let child = within(lookup).await.unwrap();
+    within(adoption).await.unwrap().unwrap();
+    let same = within(axo.session(&session_id)).await.unwrap();
+    assert!(Arc::ptr_eq(&child, &same));
+    entry(&child, |entry| matches!(entry, Entry::RunEnd { .. })).await;
+    delivered(&parent, "agent_1").await;
+    assert_eq!(gate.open_write_attempts.load(Ordering::Relaxed), attempts);
+
+    let lines = journal(&child);
+    let resumed = only(&lines, "child resume", |v| v["type"] == "run_resumed");
+    assert_eq!(lines[resumed]["runId"], run_id);
+    let end = only(&lines, "child run end", |v| v["type"] == "run_end");
+    assert_eq!(lines[end]["runId"], run_id);
+    assert_eq!(lines[end]["outcome"], "done");
+    assert_eq!(
+        api.requests()
+            .iter()
+            .filter(|r| r.model.id == "child")
+            .count(),
+        2
+    );
+
+    let lines = journal(&parent);
+    let start = only(&lines, "child start", |v| v["type"] == "child_start");
+    assert_eq!(lines[start]["callId"], "s1");
+    let admission = only(&lines, "spawn admission", |v| {
+        v["admittedJobs"] == json!(["agent_1"])
+    });
+    assert_eq!(lines[admission]["message"]["toolCallId"], "s1");
+    let adoption = only(&lines[admission + 1..], "adoption result", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "s1"
+    });
+    let result = &lines[admission + 1 + adoption];
+    assert_eq!(result["message"]["isError"], false);
+    assert!(common::message_text(result).starts_with("Spawned agent_1."));
+    let end = only(&lines, "resumed child result", |v| v["type"] == "job_end");
+    assert_eq!(lines[end]["jobId"], "agent_1");
+    assert_eq!(lines[end]["runId"], run_id);
+    assert_eq!(lines[end]["text"], "resumed result");
+    only(&lines, "child delivery", |v| {
+        v["deliveredJobs"] == json!(["agent_1"])
+    });
     parent.shutdown().await;
 }
 

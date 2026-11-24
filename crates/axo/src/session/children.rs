@@ -122,7 +122,7 @@ impl SessionTable {
         }
     }
 
-    pub(crate) fn seed(&self, id: String, seed: Arc<ChildSeed>) {
+    fn seed(&self, id: String, seed: Arc<ChildSeed>) {
         self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -318,7 +318,7 @@ impl SessionTable {
     }
 }
 
-pub(super) async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
+async fn revive(seed: &ChildSeed) -> Result<Arc<Session>, Error> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     // ponytail: retry covers the in-process release race; add a closing signal if it shows up in practice
     let (header, entries, writer) = loop {
@@ -505,9 +505,8 @@ impl SessionHooks {
     async fn try_reconcile_child(&self, child: &ChildRef) -> Result<(), Error> {
         let child_id = &child.session_id;
         let jobs = &self.tools.runner.jobs;
-        let log = self
-            .inherited
-            .sessions
+        let sessions = &self.inherited.sessions;
+        let log = sessions
             .child_log(&*self.inherited.store, child_id, &child.path)
             .await?;
         let output = log.link.as_ref().and_then(|link| link.spec.output.as_ref());
@@ -520,20 +519,18 @@ impl SessionHooks {
             warn!(%child_id, "child session has no spawn link");
             return Ok(());
         };
-        let seed = Arc::new(child_seed(self, child.path.clone(), link));
+        sessions.seed(
+            child_id.clone(),
+            Arc::new(child_seed(self, child.path.clone(), link)),
+        );
         if recover {
-            let child = revive(&seed).await?;
-            self.inherited
-                .sessions
-                .insert_live(child_id.clone(), seed, child.clone());
+            let child = sessions.session(child_id).await?;
             // Revival recovery can end runs without settling them through the parent.
             let view = child.hooks.journal.view();
             let output = child
                 .spawn_link()
                 .and_then(|link| link.spec.output.as_ref());
             report_runs(jobs, child_id, &view.entries, output).await?;
-        } else {
-            self.inherited.sessions.seed(child_id.clone(), seed);
         }
         Ok(())
     }
