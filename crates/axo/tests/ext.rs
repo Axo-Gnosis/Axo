@@ -86,13 +86,16 @@ async fn extensions_can_select_modes_submit_tasks_and_render_hidden_skills() {
     let session = host
         .axo
         .create_session(axo::SessionOptions {
-            definitions: Definitions {
-                modes: vec![axo::ModeSpec {
-                    name: "plan".into(),
-                    description: "Plan".into(),
-                    body: "Plan first.".into(),
+            host: axo::Registrations {
+                definitions: Definitions {
+                    modes: vec![axo::ModeSpec {
+                        name: "plan".into(),
+                        description: "Plan".into(),
+                        body: "Plan first.".into(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                },
                 ..Default::default()
             },
             ..common::options(dir.path())
@@ -478,7 +481,7 @@ async fn command_output_addresses_each_job_and_defaults_to_the_newest() {
     )
     .await;
     let mut options = common::bash_options(dir.path());
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(CommandProbe(tools.clone()))
     })));
     let session = Arc::new(axo.create_session(options).await.unwrap());
@@ -558,7 +561,7 @@ async fn tool_invocation_records_every_write_and_rejects_stale_files() {
     )
     .await;
     let mut options = common::options(dir.path());
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(WriteProbe(tools.clone()))
     })));
     let session = axo.create_session(options).await.unwrap();
@@ -643,7 +646,7 @@ async fn tool_result_file_records_are_harness_owned() {
     )
     .await;
     let mut options = common::options(dir.path());
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(FileDetailsProbe(tools.clone()))
     })));
     let session = axo.create_session(options).await.unwrap();
@@ -711,7 +714,7 @@ async fn failed_tool_invocation_waits_for_dropped_write_and_journals_it() {
     .await;
     let mut options = common::options(dir.path());
     let file = options.cwd.join("a.txt");
-    options.tools.push(HostTool::direct(Arc::new(|tools| {
+    options.host.tools.push(HostTool::direct(Arc::new(|tools| {
         Arc::new(DroppedWriteProbe(tools.clone()))
     })));
     let session = axo.create_session(options).await.unwrap();

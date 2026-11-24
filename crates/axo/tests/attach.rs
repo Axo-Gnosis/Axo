@@ -105,7 +105,7 @@ async fn attach_between_submission_and_enqueue_observes_queue_change() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.definitions.keywords.push(KeywordSpec {
+    opts.host.definitions.keywords.push(KeywordSpec {
         name: "switch".into(),
         model: Some("test/second".into()),
         ..Default::default()

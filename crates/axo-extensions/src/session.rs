@@ -99,7 +99,7 @@ pub(crate) fn collisions(contributions: &[Arc<Contribution>]) -> Vec<ExtensionDi
 
 impl Extensions {
     /// Sets `options.layer` to the enabled extensions, replacing any layer the caller set.
-    /// The host's own `options.definitions` rank after the extensions'. No I/O, starts nothing.
+    /// The host's own `options.host.definitions` rank after the extensions'. No I/O, starts nothing.
     pub fn compose(&self, mut options: SessionOptions) -> SessionOptions {
         let contributions = self.inner.effective_contributions();
         options.layer = layer(&contributions);

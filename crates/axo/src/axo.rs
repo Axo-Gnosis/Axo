@@ -29,8 +29,7 @@ use crate::ext::{Caller, HOST, InvokeError, MODELS};
 use crate::schemes::{Scheme, SchemeContext, Schemes};
 use crate::session::children::SessionTable;
 use crate::session::{
-    Inherited, Layers, RecoveryPolicy, Registrations, Session, SessionOptions, SessionSetup,
-    session_schemes,
+    Inherited, Layers, RecoveryPolicy, Session, SessionOptions, SessionSetup, session_schemes,
 };
 use crate::store::{
     Header, Projection, SeqEntry, SessionInfo, SessionStore, SessionWriter, project,
@@ -472,18 +471,12 @@ impl Axo {
             model,
             models,
             agent,
-            definitions,
             keywords_enabled,
             thinking,
             ask_enabled,
             project_access,
             exec_env,
-            sections,
-            tools: host_tools,
-            tool_policies,
-            spawn_hooks,
-            schemes: host_schemes,
-            commands,
+            host,
             layer,
             recovery: _,
         } = options;
@@ -496,7 +489,7 @@ impl Axo {
             project_access,
         )?);
         let (files, mut definition_diagnostics) = load_files(&config, &cwd, keywords_enabled);
-        let (resolved, merge_diagnostics) = merge(&files, &[&layer.definitions, &definitions]);
+        let (resolved, merge_diagnostics) = merge(&files, &[&layer.definitions, &host.definitions]);
         let explicit_agent = agent.is_some();
         let agent = match agent.as_ref().or(projection.agent.as_ref()) {
             Some(name) => {
@@ -560,16 +553,16 @@ impl Axo {
         );
 
         let mode = settings.bash.dev_shell;
-        let host = || -> Arc<dyn ExecEnv> { Arc::new(StaticEnv(self.base_env.clone())) };
+        let host_exec = || -> Arc<dyn ExecEnv> { Arc::new(StaticEnv(self.base_env.clone())) };
         let exec: Arc<dyn ExecEnv> = match exec_env {
             Some(exec) => exec,
-            None if mode == DevShellMode::Off => host(),
+            None if mode == DevShellMode::Off => host_exec(),
             None if mode == DevShellMode::Nix && self.cache_dir.is_none() => {
                 tracing::warn!(concat!(
                     "bash.devShell \"nix\" needs a cache directory (AxoBuilder::cache_dir); ",
                     "using the host environment"
                 ));
-                host()
+                host_exec()
             }
             None => Arc::new(DevShellEnv::new(
                 self.base_env.clone(),
@@ -601,18 +594,7 @@ impl Axo {
                 run_slots,
                 docs: None,
             }),
-            layers: Layers {
-                host: Registrations {
-                    definitions,
-                    sections,
-                    tools: host_tools,
-                    schemes: host_schemes,
-                    tool_policies,
-                    spawn_hooks,
-                    commands,
-                },
-                layer,
-            },
+            layers: Layers { host, layer },
             merged: Some((resolved, merge_diagnostics)),
             model,
             thinking,

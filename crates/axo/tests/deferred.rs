@@ -118,7 +118,7 @@ async fn deferred_call_preserves_declarations_and_system_prompt() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.tools = vec![deferred("probe")];
+    opts.host.tools = vec![deferred("probe")];
     let session = host.axo.create_session(opts).await.unwrap();
     within(session.prompt("Run probe.")).await.unwrap();
 
@@ -158,7 +158,7 @@ async fn changing_deferred_tools_announces_only_the_catalog_delta() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.tools = vec![deferred("a")];
+    opts.host.tools = vec![deferred("a")];
     let session = host.axo.create_session(opts).await.unwrap();
     within(session.prompt("First.")).await.unwrap();
     session
@@ -209,7 +209,7 @@ async fn compaction_reannounces_the_catalog_after_the_summary() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.tools = vec![deferred("probe")];
+    opts.host.tools = vec![deferred("probe")];
     let session = host.axo.create_session(opts).await.unwrap();
     within(session.prompt("Remember cedar.")).await.unwrap();
     within(session.prompt("Keep remembering.")).await.unwrap();
@@ -270,7 +270,7 @@ async fn a_retained_catalog_delta_does_not_hide_compacted_tools() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.tools = vec![deferred("a")];
+    opts.host.tools = vec![deferred("a")];
     let session = host.axo.create_session(opts).await.unwrap();
     within(session.prompt("First.")).await.unwrap();
     within(session.prompt("Second.")).await.unwrap();
@@ -352,7 +352,7 @@ async fn reading_tool_docs_promotes_only_on_native_tool_change_models() {
         )
         .await;
         let mut opts = options(dir.path());
-        opts.tools = vec![deferred("probe")];
+        opts.host.tools = vec![deferred("probe")];
         let session = host.axo.create_session(opts).await.unwrap();
         // Host inspection reads the same docs without promoting the tool.
         let docs = session.schemes().exact("tool://probe").unwrap();

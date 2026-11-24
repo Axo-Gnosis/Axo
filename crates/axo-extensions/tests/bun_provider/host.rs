@@ -134,7 +134,10 @@ fn session_options(cwd: PathBuf, request: SessionRequest) -> SessionOptions {
         agent: request.agent,
         thinking: request.thinking,
         project_access: request.project_access.or(Some(ProjectAccess::Ignore)),
-        sections: request.sections,
+        host: axo::Registrations {
+            sections: request.sections,
+            ..Default::default()
+        },
         exec_env: Some(Arc::new(StaticEnv(Arc::new(BTreeMap::new())))),
         ..SessionOptions::default()
     }

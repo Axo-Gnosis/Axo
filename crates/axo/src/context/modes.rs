@@ -193,7 +193,7 @@ pub(crate) fn merge_modes(
 #[expose]
 impl ModeSpec {
     /// Parses a mode definition (YAML frontmatter plus body), e.g. one a host bundles
-    /// with `include_str!` and passes in `SessionOptions::modes`. `default_name` applies only
+    /// with `include_str!` and passes in `SessionOptions::host.definitions.modes`. `default_name` applies only
     /// when the frontmatter has no `name` key; an explicit empty `name` is invalid. Problems
     /// become diagnostics without an origin;
     /// an invalid definition yields `None`. The spec has no `path`.

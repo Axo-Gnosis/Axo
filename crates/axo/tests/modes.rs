@@ -38,8 +38,11 @@ fn plan() -> ModeSpec {
 
 fn mode_options(dir: &Path) -> SessionOptions {
     SessionOptions {
-        definitions: Definitions {
-            modes: vec![plan()],
+        host: axo::Registrations {
+            definitions: Definitions {
+                modes: vec![plan()],
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..options(dir)
@@ -234,7 +237,7 @@ async fn mode_model_override_restores_only_its_own_selection() {
     )
     .await;
     let mut opts = mode_options(dir.path());
-    opts.definitions.modes[0].model = Some("test/planner".into());
+    opts.host.definitions.modes[0].model = Some("test/planner".into());
     let session = host.axo.create_session(opts).await.unwrap();
     assert_eq!(session.model().id, "m");
     session.set_mode(Some("plan")).await.unwrap();
@@ -263,7 +266,7 @@ async fn planner_session(dir: &Path) -> (common::Host, axo::Session) {
     .await;
     let mut opts = mode_options(dir);
     opts.model = Some("test/m:low:fast".into());
-    opts.definitions.modes[0].model = Some("test/planner:high:standard".into());
+    opts.host.definitions.modes[0].model = Some("test/planner:high:standard".into());
     let session = host.axo.create_session(opts).await.unwrap();
     (host, session)
 }
@@ -450,8 +453,8 @@ async fn mode_limits_bind_every_descendant() {
         ],
     );
     let mut opts = mode_options(dir.path());
-    opts.definitions.modes[0].tools.deny = vec!["write".into(), "send".into()];
-    let limits = opts.definitions.modes[0].tools.clone();
+    opts.host.definitions.modes[0].tools.deny = vec!["write".into(), "send".into()];
+    let limits = opts.host.definitions.modes[0].tools.clone();
     let parent = host.axo.create_session(opts).await.unwrap();
     parent.set_mode(Some("plan")).await.unwrap();
     let child = within(parent.spawn(common::request("Inspect only.")))
@@ -535,7 +538,7 @@ async fn navigation_across_a_mode_boundary_switches_its_model() {
     )
     .await;
     let mut opts = mode_options(dir.path());
-    opts.definitions.modes[0].model = Some("test/planner".into());
+    opts.host.definitions.modes[0].model = Some("test/planner".into());
     let session = host.axo.create_session(opts).await.unwrap();
     let before = session
         .append_custom("before-mode", Some(json!(true)))
@@ -583,7 +586,7 @@ async fn a_notice_after_a_prompt_is_cut_as_a_split_turn() {
     )
     .await;
     let mut opts = mode_options(dir.path());
-    opts.definitions.modes[0].body = INSTRUCTIONS.repeat(8);
+    opts.host.definitions.modes[0].body = INSTRUCTIONS.repeat(8);
     let session = host.axo.create_session(opts).await.unwrap();
     within(session.prompt("Remember cedar.")).await.unwrap();
     session.set_mode(Some("plan")).await.unwrap();
@@ -676,8 +679,8 @@ async fn policy_sees_the_mode_and_inner_deferred_tool_name() {
     let factory: ToolFactory =
         Arc::new(|_: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Probe("probe")) });
     let mut opts = mode_options(dir.path());
-    opts.tools = vec![HostTool::deferred(factory)];
-    opts.tool_policies = vec![policy.clone()];
+    opts.host.tools = vec![HostTool::deferred(factory)];
+    opts.host.tool_policies = vec![policy.clone()];
     let session = host.axo.create_session(opts).await.unwrap();
     session.set_mode(Some("plan")).await.unwrap();
     within(session.prompt("Run probe through call."))
@@ -778,8 +781,11 @@ async fn nested_definitions_derive_namespaced_command_names() {
     let session = host
         .axo
         .create_session(SessionOptions {
-            definitions: Definitions {
-                modes: vec![bundled.unwrap()],
+            host: axo::Registrations {
+                definitions: Definitions {
+                    modes: vec![bundled.unwrap()],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..options(dir.path())
@@ -815,7 +821,7 @@ async fn nested_definitions_derive_namespaced_command_names() {
 
 fn result_options(dir: &Path, review: bool, then: Option<&str>) -> SessionOptions {
     let mut opts = mode_options(dir);
-    opts.definitions.modes[0].result = Some(ModeResult {
+    opts.host.definitions.modes[0].result = Some(ModeResult {
         schema: json!({
             "type":"object",
             "properties":{"plan":{"type":"string"}},
@@ -1134,7 +1140,11 @@ async fn review_replacement_distinguishes_missing_from_null() {
     )
     .await;
     let mut opts = result_options(dir.path(), true, None);
-    opts.definitions.modes[0].result.as_mut().unwrap().schema = json!({"type":["string","null"]});
+    opts.host.definitions.modes[0]
+        .result
+        .as_mut()
+        .unwrap()
+        .schema = json!({"type":["string","null"]});
     let session = Arc::new(host.axo.create_session(opts).await.unwrap());
     session.set_mode(Some("plan")).await.unwrap();
     let mut events = session.attach(None).await.events;
@@ -1175,7 +1185,7 @@ async fn accepting_without_a_continuation_ends_the_run() {
     let mut opts = result_options(dir.path(), true, None);
     let factory: ToolFactory =
         Arc::new(|_: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Probe("yield")) });
-    opts.tools = vec![
+    opts.host.tools = vec![
         HostTool::direct(factory.clone()),
         HostTool::deferred(factory),
     ];
@@ -1503,7 +1513,7 @@ async fn deferred_enter_mode_advertises_only_model_invocable_modes_and_announces
     )
     .await;
     let mut opts = mode_options(dir.path());
-    opts.definitions.modes.push(ModeSpec {
+    opts.host.definitions.modes.push(ModeSpec {
         name: "host-only".into(),
         description: "Only the host may enter this mode.".into(),
         disable_model_invocation: true,
@@ -1568,7 +1578,7 @@ async fn elision_keeps_old_mode_instructions_in_context() {
     )
     .await;
     let mut opts = mode_options(dir.path());
-    opts.definitions.modes[0].body = body.clone();
+    opts.host.definitions.modes[0].body = body.clone();
     let session = host.axo.create_session(opts).await.unwrap();
     session.set_mode(Some("plan")).await.unwrap();
     within(session.prompt("Begin planning.")).await.unwrap();
@@ -1636,14 +1646,17 @@ async fn read_only_bash_mode_denies_writes_but_runs_git_status() {
     )
     .await;
     let opts = SessionOptions {
-        definitions: Definitions {
-            modes: vec![ModeSpec {
-                name: "inspect".into(),
-                description: "Inspect without writing.".into(),
-                body: "Inspect only.".into(),
-                bash: BashAccess::ReadOnly,
+        host: axo::Registrations {
+            definitions: Definitions {
+                modes: vec![ModeSpec {
+                    name: "inspect".into(),
+                    description: "Inspect without writing.".into(),
+                    body: "Inspect only.".into(),
+                    bash: BashAccess::ReadOnly,
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
+            },
             ..Default::default()
         },
         ..common::bash_options(dir.path())
@@ -1719,8 +1732,11 @@ async fn mode_write_scope_confines_write_and_edit_by_real_path() {
         ..Default::default()
     };
     let opts = SessionOptions {
-        definitions: Definitions {
-            modes: vec![mode("scoped", &["local://", "plans"]), mode("sealed", &[])],
+        host: axo::Registrations {
+            definitions: Definitions {
+                modes: vec![mode("scoped", &["local://", "plans"]), mode("sealed", &[])],
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..options(dir.path())

@@ -139,7 +139,7 @@ pub(crate) fn merge_keywords(
 #[expose]
 impl KeywordSpec {
     /// Parses a keyword definition (YAML frontmatter plus body), e.g. one a host bundles
-    /// with `include_str!` and passes in `SessionOptions::keywords`. `default_name` applies
+    /// with `include_str!` and passes in `SessionOptions::host.definitions.keywords`. `default_name` applies
     /// only when the frontmatter has no `name` key; an explicit empty `name` is invalid.
     /// Problems become diagnostics without an origin; an invalid definition yields `None`.
     /// The spec has no `path`.

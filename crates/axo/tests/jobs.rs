@@ -566,7 +566,7 @@ async fn host_command_is_listed_and_delivered_once() {
     let factory: ToolFactory = Arc::new(|tools: &Arc<SessionTools>| -> Arc<dyn Tool> {
         Arc::new(LateTool(tools.clone()))
     });
-    options.tools = vec![axo::HostTool::direct(factory)];
+    options.host.tools = vec![axo::HostTool::direct(factory)];
     let session = axo.create_session(options).await.unwrap();
 
     assert_eq!(
@@ -1125,7 +1125,7 @@ async fn resume_wakes_delivers_results_an_abort_paused() {
     let mut options = bash_options(dir.path());
     let factory: ToolFactory =
         Arc::new(|_: &Arc<SessionTools>| -> Arc<dyn Tool> { Arc::new(Hang) });
-    options.tools = vec![axo::HostTool::direct(factory)];
+    options.host.tools = vec![axo::HostTool::direct(factory)];
     let session = axo.create_session(options).await.unwrap();
 
     // Abort while the hang tool runs; the background job is still pending then.

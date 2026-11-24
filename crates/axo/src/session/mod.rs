@@ -105,8 +105,6 @@ pub struct SessionOptions {
     /// The root agent by name. `None` keeps the session's recorded agent (none for a new
     /// session); `Some` selects it, recording a change on reopen.
     pub agent: Option<String>,
-    /// Definitions supplied in code, after every file-defined one and after the layer's; the first name wins.
-    pub definitions: Definitions,
     /// `false` loads no keywords, so nothing in a prompt fires one. For host-driven sessions
     /// whose prompts are not typed by the user. Forks inherit it.
     pub keywords_enabled: bool,
@@ -120,20 +118,10 @@ pub struct SessionOptions {
     pub project_access: Option<ProjectAccess>,
     /// Overrides the environment provider built from settings.
     pub exec_env: Option<Arc<dyn ExecEnv>>,
-    /// Host prompt sections, applied last; `None` removes a section.
-    pub sections: Vec<(String, Option<String>)>,
-    /// Host tools, built per session (and per fork) from its `SessionTools`; one named like a built-in replaces it.
-    pub tools: Vec<HostTool>,
-    /// Ordered host tool policies, inherited by forks.
-    pub tool_policies: Vec<Arc<dyn ToolPolicy>>,
-    /// Ordered spawn policies; children inherit them.
-    pub spawn_hooks: Vec<Arc<dyn SpawnHook>>,
-    /// Registered commands, listed after modes; forks inherit them.
-    pub commands: Vec<RegisteredCommand>,
-    /// Host schemes; one named like a built-in replaces it (artifact, file and tool are reserved).
-    pub schemes: Vec<Arc<dyn Scheme>>,
-    /// A second registration set applied after the six lists above and replaced live by
-    /// `Session::set_layer`, for a composer such as an extension manager.
+    /// Host registrations. Definitions rank files → layer → host; other lists apply host → layer.
+    pub host: Registrations,
+    /// A second registration set, replaced live by `Session::set_layer` for a composer such
+    /// as an extension manager.
     pub layer: Registrations,
     /// What `Axo::open_session` does with a run left unfinished.
     pub recovery: RecoveryPolicy,
@@ -147,33 +135,34 @@ impl Default for SessionOptions {
             model: None,
             models: None,
             agent: None,
-            definitions: Definitions::default(),
             keywords_enabled: true,
             thinking: None,
             ask_enabled: false,
             project_access: None,
             exec_env: None,
-            sections: Vec::new(),
-            tools: Vec::new(),
-            tool_policies: Vec::new(),
-            spawn_hooks: Vec::new(),
-            commands: Vec::new(),
-            schemes: Vec::new(),
+            host: Registrations::default(),
             layer: Registrations::default(),
             recovery: RecoveryPolicy::default(),
         }
     }
 }
 
-/// One set of live registrations: the six lists and the definitions a host passes in `SessionOptions`.
+/// One set of live registrations, for a host or a composition layer.
 #[derive(Clone, Default)]
 pub struct Registrations {
+    /// Agents, modes, keywords, and skills supplied in code; the first name wins.
     pub definitions: Definitions,
+    /// Tools built per session (and per fork) from its `SessionTools`; a tool named like a built-in replaces it.
     pub tools: Vec<HostTool>,
+    /// Ordered tool policies, inherited by forks and children.
     pub tool_policies: Vec<Arc<dyn ToolPolicy>>,
+    /// Ordered spawn policies, inherited by children.
     pub spawn_hooks: Vec<Arc<dyn SpawnHook>>,
+    /// A scheme named like a built-in replaces it; artifact, file, and tool are reserved.
     pub schemes: Vec<Arc<dyn Scheme>>,
+    /// Prompt sections, applied in order; `None` removes a section.
     pub sections: Vec<(String, Option<String>)>,
+    /// Commands listed after modes; forks inherit them.
     pub commands: Vec<RegisteredCommand>,
 }
 

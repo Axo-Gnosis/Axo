@@ -22,7 +22,7 @@ async fn activity_and_effective_mode_follow_ownership_and_boundaries() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.definitions.modes.push(ModeSpec {
+    opts.host.definitions.modes.push(ModeSpec {
         name: "plan".into(),
         body: "Plan carefully.".into(),
         ..Default::default()
@@ -126,7 +126,8 @@ async fn inspection_distinguishes_loaded_built_and_recorded_without_disk_reads()
     let data = opts.cwd.join("nested/data.txt");
     std::fs::write(&nested, "NESTED_SENTINEL").unwrap();
     std::fs::write(&data, "data").unwrap();
-    opts.sections
+    opts.host
+        .sections
         .push(("project_context".into(), Some("HOST_OVERRIDE".into())));
     let session = host.axo.create_session(opts).await.unwrap();
     std::fs::remove_file(&path).unwrap();
@@ -183,7 +184,7 @@ async fn chained_follow_up_has_no_intermediate_idle_event() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.definitions.modes.push(ModeSpec {
+    opts.host.definitions.modes.push(ModeSpec {
         name: "plan".into(), body: "Produce a plan.".into(),
         result: Some(axo::ModeResult {
             schema: json!({"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}),

@@ -106,7 +106,7 @@ async fn labeled_deferred_duplicates_keep_the_later_one() {
     let dir = tempfile::tempdir().unwrap();
     let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![]).await;
     let mut opts = options(dir.path());
-    opts.tools = vec![
+    opts.host.tools = vec![
         HostTool::deferred(factory("x")).with_origin("a"),
         HostTool::deferred(factory("x")).with_origin("b"),
     ];
@@ -137,7 +137,7 @@ async fn a_labeled_tool_replaces_a_built_in_until_the_host_drops_it() {
     )
     .await;
     let mut opts = options(dir.path());
-    opts.tools = vec![HostTool::direct(factory("read")).with_origin("b")];
+    opts.host.tools = vec![HostTool::direct(factory("read")).with_origin("b")];
     let session = host.axo.create_session(opts).await.unwrap();
     assert!(
         messages(&session).contains(&"tool \"read\" from b replaces the built-in".into()),
@@ -417,7 +417,7 @@ async fn the_layer_and_host_registrations_change_independently() {
     let first = Arc::new(Counter::default());
     let weak = Arc::downgrade(&first);
     let mut opts = options(dir.path());
-    opts.sections = vec![section("lab_a", "A1")];
+    opts.host.sections = vec![section("lab_a", "A1")];
     opts.layer = Registrations {
         sections: vec![section("lab_b", "B")],
         tool_policies: vec![first.clone() as Arc<dyn ToolPolicy>],
@@ -510,12 +510,12 @@ async fn registered_commands_list_after_modes_and_run_their_handler() {
     let host = host(dir.path(), json!([{"id":"m"}]), json!({}), vec![done()]).await;
     let hello = Arc::new(Hello::default());
     let mut opts = options(dir.path());
-    opts.definitions.modes.push(ModeSpec {
+    opts.host.definitions.modes.push(ModeSpec {
         name: "plan".into(),
         body: "Plan carefully.".into(),
         ..Default::default()
     });
-    opts.commands = vec![
+    opts.host.commands = vec![
         registered("hello", "lab", hello.clone()),
         registered("compact", "lab", hello.clone()),
     ];

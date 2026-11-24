@@ -337,7 +337,10 @@ async fn child_finishing_while_parent_closed_is_reconciled() {
     let parent = host
         .axo
         .create_session(SessionOptions {
-            tools: vec![axo::HostTool::direct(factory)],
+            host: axo::Registrations {
+                tools: vec![axo::HostTool::direct(factory)],
+                ..Default::default()
+            },
             ..options(dir.path())
         })
         .await
@@ -511,7 +514,10 @@ async fn spawn_policies_block() {
     let blocked = host
         .axo
         .create_session(SessionOptions {
-            spawn_hooks: vec![Arc::new(BlockSpawn)],
+            host: axo::Registrations {
+                spawn_hooks: vec![Arc::new(BlockSpawn)],
+                ..Default::default()
+            },
             ..options(dir.path())
         })
         .await
@@ -536,7 +542,10 @@ async fn spawn_policies_block() {
     let replaced = host
         .axo
         .create_session(SessionOptions {
-            spawn_hooks: vec![Arc::new(ReplaceSpawn)],
+            host: axo::Registrations {
+                spawn_hooks: vec![Arc::new(ReplaceSpawn)],
+                ..Default::default()
+            },
             ..options(dir.path())
         })
         .await
@@ -688,7 +697,10 @@ async fn queued_children_publish_running_and_per_run_usage() {
     let parent = host
         .axo
         .create_session(SessionOptions {
-            tools: vec![axo::HostTool::direct(factory)],
+            host: axo::Registrations {
+                tools: vec![axo::HostTool::direct(factory)],
+                ..Default::default()
+            },
             ..options(dir.path())
         })
         .await
