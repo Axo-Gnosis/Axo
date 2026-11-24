@@ -46,7 +46,7 @@ use std::ops::Deref;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::deps::Deps;
+use crate::deps::{Deps, InstallGuard};
 use crate::manifest::Member;
 use crate::placement::{Placement, Prepare};
 use crate::process::BunPath;
@@ -324,6 +324,7 @@ enum Role {
         scopes: Mutex<Vec<Weak<Inner>>>,
         next_scope: AtomicU64,
         lifecycle: Mutex<Option<Arc<dyn Lifecycle>>>,
+        store_work: tokio::sync::RwLock<()>,
     },
     Scope {
         key: String,
@@ -353,7 +354,7 @@ struct Inner {
     /// Attached sessions; every placement serves their session actions.
     sessions: session::Registry,
     /// Authored dependency installs, one at a time per extension.
-    deps: Arc<Deps>,
+    deps: Deps,
 }
 
 #[derive(Default)]
@@ -442,6 +443,12 @@ enum Rearm {
     Retry(String),
     /// Always: the package's code changed.
     Reload(String),
+    /// An explicit authored install is about to run; replace only a dependency-disabled load.
+    DependencyRetry {
+        id: String,
+        admission: u64,
+        package: PathBuf,
+    },
     /// Dependency install completed for this admission and, for background work, placement.
     Installed {
         id: String,
@@ -452,7 +459,10 @@ enum Rearm {
 
 impl Rearm {
     fn id(&self) -> &str {
-        let (Rearm::Retry(id) | Rearm::Reload(id) | Rearm::Installed { id, .. }) = self;
+        let (Rearm::Retry(id)
+        | Rearm::Reload(id)
+        | Rearm::DependencyRetry { id, .. }
+        | Rearm::Installed { id, .. }) = self;
         id
     }
 }
@@ -493,6 +503,7 @@ impl Extensions {
                     scopes: Mutex::default(),
                     next_scope: AtomicU64::new(1),
                     lifecycle: Mutex::default(),
+                    store_work: tokio::sync::RwLock::default(),
                 },
             ),
         }))
@@ -732,10 +743,20 @@ impl ExtensionSet {
             let (package, _) = manifest::locate(&id, &inner.options)
                 .await
                 .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
-            inner.forget_install_failure(&id);
+            Arc::clone(&inner)
+                .reconcile(
+                    None,
+                    Some(Rearm::DependencyRetry {
+                        id: id.clone(),
+                        admission,
+                        package: package.clone(),
+                    }),
+                )
+                .await?;
             inner
                 .ensure_dependencies(&id, &package, admission)
                 .await
+                .0
                 .map_err(|problem| BridgeError::DependencyInstall(problem.message))?;
             inner
                 .reconcile(
@@ -867,11 +888,7 @@ impl Inner {
         let supervisor = axo.supervisor();
         Arc::new(Self {
             layer: models.provider_layer(),
-            deps: Arc::new(Deps::new(
-                bun.clone(),
-                Arc::clone(&options.env),
-                Arc::clone(&supervisor),
-            )),
+            deps: Deps::default(),
             supervisor,
             bun,
             axo,
@@ -923,13 +940,12 @@ impl Inner {
             .unwrap_or(Err(BridgeError::ShutDown))
     }
 
-    /// Forgets `id`'s failed install and reconciles with `id` re-armed.
+    /// Reconciles with `id` re-armed.
     async fn rearm(
         self: &Arc<Self>,
         id: &str,
         rearm: fn(String) -> Rearm,
     ) -> Result<(), BridgeError> {
-        self.forget_install_failure(id);
         run(Arc::clone(self).reconcile(None, Some(rearm(id.to_owned()))))
             .await
             .unwrap_or(Err(BridgeError::ShutDown))
@@ -1035,10 +1051,6 @@ impl Inner {
         let _ = self.events.send(ExtensionEvent::StateChanged(after));
     }
 
-    fn forget_install_failure(&self, id: &str) {
-        self.deps.forget(id);
-    }
-
     /// Installs authored `id`'s dependencies unless current, publishing `Installing` while Bun
     /// runs and `Disabled` with the reason when it fails. `Ok(true)` when an install ran.
     async fn ensure_dependencies(
@@ -1046,11 +1058,20 @@ impl Inner {
         id: &str,
         package: &Path,
         admission: u64,
-    ) -> Result<bool, ExtensionProblem> {
-        let started = || {
+    ) -> (Result<bool, ExtensionProblem>, Option<InstallGuard>) {
+        let work = async || {
             self.mark(id, package, admission, |state| {
                 state.installing.insert(id.to_owned());
-            })
+            });
+            let named = |kind, error| problem(kind, format!("extension {id}: {error}"));
+            let bun = self
+                .bun
+                .usable()
+                .await
+                .map_err(|unusable| named(ProblemKind::Bun, unusable.message))?;
+            deps::install(&bun, &self.options.env, &self.supervisor, package, false)
+                .await
+                .map_err(|error| named(ProblemKind::DependencyInstall, error))
         };
         let finished = |result: &Result<bool, ExtensionProblem>| {
             self.mark(id, package, admission, |state| {
@@ -1062,8 +1083,8 @@ impl Inner {
             })
         };
         tokio::select! {
-            result = self.deps.ensure(id, admission, package, started, finished) => result,
-            () = self.closed.cancelled() => Err(problem(ProblemKind::Setup, BridgeError::ShutDown.to_string())),
+            (result, guard) = self.deps.ensure(id, admission, package, work, finished) => (result, Some(guard)),
+            () = self.closed.cancelled() => (Err(problem(ProblemKind::Setup, BridgeError::ShutDown.to_string())), None),
         }
     }
 
@@ -1075,9 +1096,9 @@ impl Inner {
             let inner = inner.clone();
             Box::pin(async move {
                 let Some(inner) = inner.upgrade() else {
-                    return Err(problem(
-                        ProblemKind::Setup,
-                        BridgeError::ShutDown.to_string(),
+                    return Err((
+                        problem(ProblemKind::Setup, BridgeError::ShutDown.to_string()),
+                        None,
                     ));
                 };
                 if member.id.contains('/') || !inner.options.auto_install {
@@ -1090,17 +1111,20 @@ impl Inner {
                         .get(&member.id)
                         .is_none_or(|(s, _)| *s != serial)
                     {
-                        return Err(problem(
-                            ProblemKind::Setup,
-                            format!("extension {} was replaced", member.id),
+                        return Err((
+                            problem(
+                                ProblemKind::Setup,
+                                format!("extension {} was replaced", member.id),
+                            ),
+                            None,
                         ));
                     }
                     state.admissions[&member.id]
                 };
-                inner
+                let (result, guard) = inner
                     .ensure_dependencies(&member.id, &member.package, admission)
-                    .await
-                    .map(drop)
+                    .await;
+                result.map(drop).map_err(|problem| (problem, guard))
             })
         })
     }
@@ -1117,7 +1141,7 @@ impl Inner {
     ) {
         tokio::spawn(async move {
             if matches!(
-                self.ensure_dependencies(&id, &package, admission).await,
+                self.ensure_dependencies(&id, &package, admission).await.0,
                 Ok(true)
             ) && let Some(serial) = running
             {
@@ -1166,8 +1190,49 @@ impl Inner {
             return Err(BridgeError::ShutDown);
         }
         // Placements, acceptance and bindings change only under `config`.
+        let reset = rearm.as_ref().and_then(|rearm| match rearm {
+            Rearm::Retry(id) | Rearm::Reload(id) if !id.contains('/') => Some(id.as_str()),
+            Rearm::DependencyRetry { id, .. } => Some(id.as_str()),
+            _ => None,
+        });
+        // A preparation retains the same lock until it has recorded its placement failure.
+        let install_guard = if let Some(id) = reset {
+            Some(tokio::select! {
+                biased;
+                () = self.closed.cancelled() => return Err(BridgeError::ShutDown),
+                guard = self.deps.lock(id).lock_owned() => guard,
+            })
+        } else {
+            None
+        };
         let (enabled, accepted, installed, old_bindings) = {
-            let state = self.lock();
+            let mut state = self.lock();
+            if let Some(Rearm::DependencyRetry {
+                id,
+                admission,
+                package,
+            }) = &rearm
+            {
+                if state.admissions.get(id) != Some(admission)
+                    || state
+                        .accepted
+                        .get(id)
+                        .is_none_or(|(member, _)| member.package != *package)
+                {
+                    return Ok(());
+                }
+                if state
+                    .member_of
+                    .get(id)
+                    .is_none_or(|(_, placement)| !placement.dependency_load_failed(id))
+                {
+                    self.change_status(&mut state, id, |state| {
+                        self.deps.forget(id);
+                        state.install_failed.remove(id);
+                    });
+                    return Ok(());
+                }
+            }
             if let Some(Rearm::Installed {
                 id,
                 admission,
@@ -1198,7 +1263,7 @@ impl Inner {
                 .iter()
                 .find(|(_, old)| old.members.iter().any(|m| m.id == id))?;
             let stuck = match rearm {
-                Rearm::Reload(_) | Rearm::Installed { .. } => true,
+                Rearm::Reload(_) | Rearm::Installed { .. } | Rearm::DependencyRetry { .. } => true,
                 Rearm::Retry(_) => {
                     old.placement.load_disabled().iter().any(|m| m == id)
                         || old.placement.status().iter().any(|s| {
@@ -1514,6 +1579,10 @@ impl Inner {
             let mut state = self.lock();
             let state = &mut *state;
             let before = state.statuses();
+            if let Some(id) = reset {
+                self.deps.forget(id);
+                state.install_failed.remove(id);
+            }
             state
                 .last
                 .retain(|ext, (serial, _)| member_of.get(ext).is_some_and(|(s, _)| *s == *serial));
@@ -1621,6 +1690,7 @@ impl Inner {
             }
             let installs: Vec<_> = stale
                 .into_iter()
+                .filter(|(candidate, _)| !matches!(&rearm, Some(Rearm::DependencyRetry { id, .. }) if candidate == id))
                 .map(|(id, package)| {
                     let running = state
                         .member_of
@@ -1632,6 +1702,7 @@ impl Inner {
                 .collect();
             (retired, unchanged, installs)
         };
+        drop(install_guard);
         for (placement, order) in reordered {
             placement.reorder(&order);
         }
@@ -1648,16 +1719,15 @@ impl Inner {
 
     async fn teardown(self: Arc<Self>) -> Result<(), BridgeError> {
         // Shut down child scopes when tearing down the root manager.
-        if matches!(self.role, Role::Root { .. }) {
+        if let Role::Root { store_work, .. } = &self.role {
             let scopes = self.live_scopes();
             for scope in &scopes {
                 scope.closed.cancel();
             }
             join_all(scopes.into_iter().map(Inner::teardown)).await;
+            // Wait out admitted store mutators without holding this guard while taking config.
+            drop(store_work.write().await);
         }
-        // `closed` is already cancelled: wait out store mutators admitted before it, without
-        // holding the write guard while a mutator may still need `config` to publish.
-        drop(self.deps.store_work.write().await);
         let _config = self.config.lock().await;
         let state = std::mem::take(&mut *self.lock());
         self.layer.replace(Vec::new())?;

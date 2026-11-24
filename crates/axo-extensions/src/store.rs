@@ -17,7 +17,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{self, MANIFEST};
-use crate::{BridgeError, Inner, Rearm, SDK_VERSION, deps};
+use crate::{BridgeError, Inner, Rearm, Role, SDK_VERSION, deps};
 
 pub const RECORD: &str = "install.json";
 
@@ -264,6 +264,15 @@ impl Inner {
         self.options.store.as_deref().ok_or(InstallError::NoStore)
     }
 
+    fn store_work(&self) -> &tokio::sync::RwLock<()> {
+        match &self.role {
+            Role::Root { store_work, .. } => store_work,
+            Role::Scope { .. } => {
+                unreachable!("managed store operations require a root extension set")
+            }
+        }
+    }
+
     fn enabled(&self, id: &str) -> bool {
         self.lock().enabled.iter().any(|ext| ext.id == id)
     }
@@ -352,7 +361,7 @@ impl Inner {
         revision: Option<String>,
         replace_origin: bool,
     ) -> Result<InstalledExtension, InstallError> {
-        let _work = self.deps.store_work.read().await;
+        let _work = self.store_work().read().await;
         self.check_open()?;
         let store = self.store()?;
         if !source.is_absolute() {
@@ -461,7 +470,7 @@ impl Inner {
         self: Arc<Self>,
         id: String,
     ) -> Result<InstalledExtension, InstallError> {
-        let _work = self.deps.store_work.read().await;
+        let _work = self.store_work().read().await;
         self.check_open()?;
         let store = self.store()?;
         let _claim = self.claim(store, &id).await?;
@@ -493,7 +502,7 @@ impl Inner {
         id: String,
         delete_data: bool,
     ) -> Result<(), InstallError> {
-        let _work = self.deps.store_work.read().await;
+        let _work = self.store_work().read().await;
         self.check_open()?;
         let store = self.store()?;
         let _claim = self.claim(store, &id).await?;

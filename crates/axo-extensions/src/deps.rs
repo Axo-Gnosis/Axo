@@ -18,7 +18,6 @@ use axo::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::process::BunPath;
 use crate::{ExtensionProblem, ProblemKind, problem};
 
 /// Relative to the package; written only after a successful install.
@@ -132,15 +131,14 @@ pub async fn install(
     Ok(())
 }
 
+pub(super) type InstallGuard = tokio::sync::OwnedMutexGuard<()>;
+
 /// Serializes installs per extension and remembers failures, so an unchanged broken package
 /// is not reinstalled on every rescan or call.
+#[derive(Default)]
 pub struct Deps {
-    bun: BunPath,
-    env: Arc<EnvMap>,
-    supervisor: Arc<ProcessSupervisor>,
     /// Per-authored-extension locks; a lock remains interned while anyone can wait for it.
     locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    pub(crate) store_work: tokio::sync::RwLock<()>,
     /// Extension → (package admission, fingerprint, reason) of its last failed install.
     failed: Mutex<HashMap<String, InstallFailure>>,
 }
@@ -152,19 +150,8 @@ struct InstallFailure {
 }
 
 impl Deps {
-    pub fn new(bun: BunPath, env: Arc<EnvMap>, supervisor: Arc<ProcessSupervisor>) -> Self {
-        Self {
-            bun,
-            env,
-            supervisor,
-            locks: Mutex::default(),
-            store_work: tokio::sync::RwLock::default(),
-            failed: Mutex::default(),
-        }
-    }
-
     /// The lock serializing every install of `id`.
-    fn lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(super) fn lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
             return lock;
@@ -175,19 +162,18 @@ impl Deps {
         lock
     }
 
-    /// Installs `package`'s dependencies unless they are current, calling `started` right
-    /// before Bun runs. `Ok(true)` when an install ran; a failure for an unchanged fingerprint
+    /// Runs `work` unless dependencies are current, returning the per-ID guard so the
+    /// caller can record the outcome before a retry resets it. `Ok(true)` when work ran; a failure for an unchanged fingerprint
     /// is returned again without rerunning Bun until [`Deps::forget`].
     pub async fn ensure(
         &self,
         id: &str,
         admission: u64,
         package: &Path,
-        started: impl FnOnce(),
+        work: impl AsyncFnOnce() -> Result<(), ExtensionProblem>,
         finished: impl FnOnce(&Result<bool, ExtensionProblem>),
-    ) -> Result<bool, ExtensionProblem> {
-        let lock = self.lock(id);
-        let _guard = lock.lock().await;
+    ) -> (Result<bool, ExtensionProblem>, InstallGuard) {
+        let guard = self.lock(id).lock_owned().await;
         let result = async {
             let named = |kind, error: String| problem(kind, format!("extension {id}: {error}"));
             let Some(fingerprint) = fingerprint(package)
@@ -205,14 +191,7 @@ impl Deps {
             {
                 return Err(failed.reason.clone());
             }
-            started();
-            let result = match self.bun.usable().await {
-                Ok(bun) => install(&bun, &self.env, &self.supervisor, package, false)
-                    .await
-                    .map_err(|error| named(ProblemKind::DependencyInstall, error)),
-                Err(unusable) => Err(named(ProblemKind::Bun, unusable.message)),
-            };
-            match result {
+            match work().await {
                 Ok(()) => Ok(true),
                 Err(reason) => {
                     self.failures().insert(
@@ -232,7 +211,7 @@ impl Deps {
             self.forget(id);
         }
         finished(&result);
-        result
+        (result, guard)
     }
 
     /// Clears `id`'s remembered failure so the next [`Deps::ensure`] runs Bun again.

@@ -44,6 +44,7 @@ pub const CASES: &[Case] = &[
     case!(unavailable_policy_fails_closed),
     case!(removed_policy_allows),
     case!(dropped_manager_fences_hooks_and_restores_layer),
+    case!(held_dependency_retry_clears_the_previous_failure),
     case!(before_only_policy_skips_after),
     case!(concurrent_cold_calls_restart_and_disable),
     case!(failures_reach_the_host_typed),
@@ -1038,6 +1039,155 @@ async fn removed_policy_allows() {
     session.prompt("read it").await.unwrap();
     let (error, text) = result(&session, &["removed"]).await;
     assert!(!error && text.contains("built-in contents"), "{text}");
+    session.shutdown().await;
+    extensions.shutdown().await;
+}
+
+async fn held_dependency_retry_clears_the_previous_failure() {
+    use crate::{Http, assert_unavailable, find, model_json, stream};
+    use axo_extensions::{BridgeError, ExtensionEvent, ProblemKind};
+
+    let host = Host::scripted(
+        [
+            turn("cold-probe", "probe", json!({})),
+            turn("warm-probe", "probe", json!({})),
+        ]
+        .concat(),
+    )
+    .await;
+    let http = Http::start();
+    let manifest = json!({
+        "id": LAB, "entry": "index.ts",
+        "providers": [{"id": LAB, "requiresKey": false, "rewrite": true, "models": [model_json(LAB, &http.url)]}],
+        "tools": [{"name": "probe", "description": "Probe", "parameters": {"type": "object"}}],
+    }).to_string();
+    let package = host.path("root/lab");
+    host.write_package("root", LAB, &manifest);
+    let extensions = host.manager();
+    let list = enabled(&[(LAB, None)]);
+    extensions.configure(&list).await.unwrap();
+    let session = attach(&host, &extensions).await;
+    let model = find(&host.models, LAB).unwrap();
+    let control = host.path("ctl");
+    let release = control.join("install-release");
+    let installs = || lines(&control.join("installs")).len();
+    let dependencies = package.join("package.json");
+    std::fs::write(&dependencies, r#"{"dependencies":{"first":"1"}}"#).unwrap();
+    std::fs::write(control.join("install"), "fail:boom").unwrap();
+    assert_unavailable(&stream(&host.models, &model).await, "boom");
+    assert_eq!(phase(&extensions, LAB).phase, ExtensionPhase::Disabled);
+    assert_eq!(installs(), 1);
+
+    let mut changes = extensions.subscribe();
+    std::fs::write(control.join("install"), "hold").unwrap();
+    extensions.retry(LAB).await.unwrap();
+    wait_for("the second install", || installs() == 2).await;
+    let installing = phase(&extensions, LAB);
+    assert_eq!(
+        (installing.phase, installing.problem.as_ref()),
+        (ExtensionPhase::Installing, None)
+    );
+    loop {
+        if let ExtensionEvent::StateChanged(status) = changes.recv().await.unwrap()
+            && status.phase == ExtensionPhase::Installing
+        {
+            assert_eq!(status, installing);
+            break;
+        }
+    }
+
+    let mut journal = session.subscribe();
+    let provider = stream(&host.models, &model);
+    let tool = session.prompt("cold probe");
+    tokio::pin!(provider, tool);
+    tokio::select! {
+        biased;
+        outcome = &mut provider => panic!("provider returned while held: {outcome:?}"),
+        outcome = &mut tool => panic!("tool turn finished while held: {outcome:?}"),
+        () = async {
+            loop {
+                if let SessionEvent::Agent(AgentEvent::ToolExecutionStart { call_id, .. }) = journal.recv().await.unwrap().as_ref()
+                    && call_id == "cold-probe"
+                {
+                    break;
+                }
+            }
+        } => {}
+    }
+    assert!(http.requests().is_empty());
+    assert!(
+        host.calls(LAB).is_empty(),
+        "no runner starts before install"
+    );
+    std::fs::write(&release, "").unwrap();
+    let (_, turn) = tokio::join!(provider, tool);
+    turn.unwrap();
+    assert_eq!(http.requests().len(), 1);
+    assert_eq!(
+        host.calls(LAB)
+            .iter()
+            .filter(|call| *call == "rewrite")
+            .count(),
+        1
+    );
+    let (error, text) = result(&session, &["cold-probe"]).await;
+    assert!(!error && text.contains("ext:probe:"), "{text}");
+    assert_eq!(installs(), 2, "a waiting callback repeated the install");
+
+    std::fs::remove_file(&release).unwrap();
+    std::fs::write(&dependencies, r#"{"dependencies":{"changed":"1"}}"#).unwrap();
+    let mut replacement = None;
+    let while_held = async {
+        wait_for("the third install", || installs() == 3).await;
+        assert_eq!(phase(&extensions, LAB).phase, ExtensionPhase::Ready);
+        let (_, turn) = tokio::join!(stream(&host.models, &model), session.prompt("warm probe"));
+        turn.unwrap();
+        let (error, text) = result(&session, &["warm-probe"]).await;
+        assert!(!error && text.contains("ext:probe:"), "{text}");
+        assert_eq!(http.requests().len(), 2);
+        assert_eq!(
+            host.calls(LAB)
+                .iter()
+                .filter(|call| *call == "rewrite")
+                .count(),
+            2
+        );
+        assert_eq!(phase(&extensions, LAB).phase, ExtensionPhase::Ready);
+
+        // Leave the old Bun process's cwd intact, but commit a new package admission.
+        std::fs::write(&dependencies, "null").unwrap();
+        std::fs::remove_file(package.join("extension.json")).unwrap();
+        host.write_package("root2", LAB, &manifest);
+        extensions.configure(&list).await.unwrap();
+        replacement = Some(phase(&extensions, LAB));
+        assert_eq!(replacement.as_ref().unwrap().phase, ExtensionPhase::Cold);
+        std::fs::write(&release, "").unwrap();
+    };
+    let (finished, ()) = tokio::join!(extensions.install_dependencies(LAB), while_held);
+    let invalid = "package.json: not a JSON object";
+    assert!(
+        matches!(finished, Err(BridgeError::DependencyInstall(reason)) if reason.contains(invalid))
+    );
+    assert_eq!(
+        phase(&extensions, LAB),
+        replacement.unwrap(),
+        "stale install changed the new admission"
+    );
+    stream(&host.models, &model).await;
+    assert_eq!(http.requests().len(), 3);
+    assert_eq!(phase(&extensions, LAB).phase, ExtensionPhase::Ready);
+
+    // A read/parse failure before Bun still publishes the failure, without invoking Bun.
+    std::fs::write(host.path("root2/lab/package.json"), "null").unwrap();
+    assert!(
+        matches!(extensions.install_dependencies(LAB).await, Err(BridgeError::DependencyInstall(reason)) if reason.contains(invalid))
+    );
+    let failed = phase(&extensions, LAB);
+    assert_eq!(failed.phase, ExtensionPhase::Disabled);
+    let problem = failed.problem.unwrap();
+    assert_eq!(problem.kind, ProblemKind::Invalid);
+    assert!(problem.message.contains(invalid));
+    assert_eq!(installs(), 3);
     session.shutdown().await;
     extensions.shutdown().await;
 }

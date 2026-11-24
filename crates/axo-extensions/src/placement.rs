@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ExtensionOptions, ExtensionPhase, ExtensionProblem, ExtensionStatus, ProblemKind,
+    deps::InstallGuard,
     manifest::{Member, check_entry},
     peer::{Actions, CallError, Peer},
     problem,
@@ -36,8 +37,11 @@ const ACTIVATE_DEADLINE: Duration = Duration::from_secs(15);
 type Report = Arc<dyn Fn(ExtensionStatus) + Send + Sync>;
 /// Readies one member before a generation starts (installs its dependencies); `Err` disables
 /// that member with the problem.
-pub type Prepare =
-    Arc<dyn Fn(Member) -> BoxFuture<'static, Result<(), ExtensionProblem>> + Send + Sync>;
+pub type Prepare = Arc<
+    dyn Fn(Member) -> BoxFuture<'static, Result<(), (ExtensionProblem, Option<InstallGuard>)>>
+        + Send
+        + Sync,
+>;
 
 pub struct Placement {
     shared: Arc<Shared>,
@@ -64,7 +68,7 @@ struct State {
     phase: Phase,
     generation: u64,
     /// Members disabled by their own load failure, with the problem; never activated again here.
-    load: HashMap<String, ExtensionProblem>,
+    load: HashMap<String, LoadFailure>,
     /// Activation order as indices into `Shared::members`; read when a generation activates.
     order: Vec<usize>,
     /// Operations waiting for a first start; all settled on its first outcome.
@@ -73,6 +77,20 @@ struct State {
     closed: bool,
     /// The live generation's container, for memory reads.
     container: Option<Container>,
+}
+
+#[derive(Clone)]
+enum LoadFailure {
+    Dependencies(ExtensionProblem),
+    Activation(ExtensionProblem),
+}
+
+impl LoadFailure {
+    fn problem(&self) -> &ExtensionProblem {
+        match self {
+            Self::Dependencies(problem) | Self::Activation(problem) => problem,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -149,7 +167,7 @@ impl Placement {
     /// `retried`'s, so an explicit retry or reload revives only what it names. `None` carries
     /// every load failure over.
     pub fn inherit(&self, old: &Placement, retried: Option<&str>) {
-        let failures: Vec<(String, ExtensionProblem)> = old
+        let failures: Vec<(String, LoadFailure)> = old
             .shared
             .lock()
             .load
@@ -186,6 +204,13 @@ impl Placement {
     /// Members disabled by their own load failure rather than by the placement budget.
     pub fn load_disabled(&self) -> Vec<String> {
         self.shared.lock().load.keys().cloned().collect()
+    }
+
+    pub(super) fn dependency_load_failed(&self, id: &str) -> bool {
+        matches!(
+            self.shared.lock().load.get(id),
+            Some(LoadFailure::Dependencies(_))
+        )
     }
 
     /// Setup failed; the driver has exited and only a replacement can run.
@@ -297,7 +322,7 @@ impl Shared {
             return Err(format!("{label} is shut down"));
         }
         if let Some(problem) = state.load.get(ext) {
-            return Err(problem.message.clone());
+            return Err(problem.problem().message.clone());
         }
         match &state.phase {
             Phase::Cold => Ok(Check::Cold),
@@ -315,7 +340,9 @@ impl Shared {
             .iter()
             .map(|member| {
                 let (phase, problem) = match (state.load.get(&member.id), &state.phase) {
-                    (Some(problem), _) => (ExtensionPhase::Disabled, Some(problem.clone())),
+                    (Some(problem), _) => {
+                        (ExtensionPhase::Disabled, Some(problem.problem().clone()))
+                    }
                     (None, Phase::Cold) => (ExtensionPhase::Cold, None),
                     (None, Phase::Starting) => (ExtensionPhase::Starting, None),
                     (None, Phase::Restarting(problem)) => {
@@ -391,8 +418,10 @@ impl Shared {
                 prepared = (self.prepare)(member) => prepared,
                 () = stop.cancelled() => return Exit::Stopped,
             };
-            if let Err(problem) = prepared {
-                self.lock().load.insert(id, problem);
+            if let Err((problem, _guard)) = prepared {
+                self.lock()
+                    .load
+                    .insert(id, LoadFailure::Dependencies(problem));
             }
         }
         if self
@@ -441,7 +470,9 @@ impl Shared {
             match self.activate(peer, member, options).await {
                 Ok(()) => active = true,
                 Err(Activation::Member(problem)) => {
-                    self.lock().load.insert(member.id.clone(), problem);
+                    self.lock()
+                        .load
+                        .insert(member.id.clone(), LoadFailure::Activation(problem));
                 }
                 Err(Activation::Placement(reason)) => return Exit::Crash(reason),
             }

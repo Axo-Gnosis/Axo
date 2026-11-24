@@ -1032,9 +1032,9 @@ Location decides the kind of extension. An **authored** extension, written by th
 
 An enabled authored package whose `package.json` has a nonempty `dependencies`, `devDependencies`, `optionalDependencies`, or `peerDependencies` table installs them itself. The stamp `node_modules/.axo-install` records a SHA-256 of `package.json` and `bun.lock`; when it is missing or differs, `configure` (or `retry`/`reload`) starts `bun install` in the package folder in the background, under the host's `ProcessSupervisor` with `ExtensionOptions::env`, and returns without waiting. A package without dependencies never installs, and only enabled packages are looked at.
 
-- **Calls wait.** A callback arriving during the install waits for it before the runner starts; status shows `Installing`. A runner that was already live is reloaded when the install finishes, so a call in flight on it fails once.
+- **Calls wait.** A callback on a cold or starting placement waits for the install before the runner starts; status shows `Installing`. An already live runner keeps serving at `Ready`; it is reloaded when the install finishes, so a call still in flight on it fails once.
 - **No lockfile required.** It is a plain `bun install`, exactly as run by hand: it creates `bun.lock` when absent (which the stamp then covers) and runs lifecycle scripts.
-- **Failure.** The extension shows `Disabled` with `extension <id>: bun install failed (<exit status>): <end of stderr>` or `extension <id>: bun install timed out after 600 s`; its callbacks fail with that reason. The same files are not reinstalled on later rescans or calls; `retry`, `reload`, or a change to `package.json`/`bun.lock` tries again.
+- **Failure.** The extension shows `Disabled` with `extension <id>: bun install failed (<exit status>): <end of stderr>` or `extension <id>: bun install timed out after 600 s`; its callbacks fail with that reason. The same files are not reinstalled on later rescans or calls; `retry`, `reload`, `install_dependencies`, or a change to `package.json`/`bun.lock` tries again.
 - **Manual mode.** With `auto_install: false`, a stale package is `Unavailable` ("dependencies are not installed") until the host calls `ExtensionSet::install_dependencies`.
 
 #### Installed extensions
