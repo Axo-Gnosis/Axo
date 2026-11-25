@@ -26,11 +26,11 @@ pub use api::google::GoogleApi;
 pub use api::openai_responses::ResponsesApi;
 pub use api::{
     Api, ProviderRequest, ProviderResponse, ProviderTransport, RequestContext, RequestRewrite,
-    SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,
+    ResponseObserver, SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,
 };
 pub use auth::provider::{
-    DeviceCode, LoginInteraction, LoginOption, LoginPrompt, LoginSelect, ModelsRequest, Provider,
-    ProviderLogin, ProviderModels,
+    AccountUsage, DeviceCode, LoginInteraction, LoginOption, LoginPrompt, LoginSelect,
+    ModelsRequest, Provider, ProviderLogin, ProviderModels, ProviderUsage, UsageLimit, UsageSpend,
 };
 pub use auth::resolve::resolve_config_value;
 pub use auth::store::FileCredentialStore;

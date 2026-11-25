@@ -308,6 +308,8 @@ The [Bun study](research/bun-topology.md) preserves the original shared-loop/Wor
 
 Live vendor verification is separate from the bridge's deterministic offline checks and opt-in real-Bun scenarios.
 
+Unbuilt: extension providers reporting account usage (a `usage` handler mirroring `ProviderUsage`, like `listModels` mirrors `ProviderModels`); their `Provider::usage` is `None` until a Bun provider needs it.
+
 ### MCP tool adapter
 
 - **Configuration files.** Read the first existing ecosystem project-root file of `.mcp.json`, then `mcp.json`, plus host-supplied user MCP configuration (separate from settings), using the `{ "mcpServers": { name: { command, args, env } | { url, headers } } }` format.

@@ -12,12 +12,13 @@ use std::thread::JoinHandle;
 use async_trait::async_trait;
 use axo_ai::testing::{fixture_model, http_header_values, serve_http};
 use axo_ai::{
-    ApiKind, AssistantBlock, AssistantEvent, Credential, CredentialSource, CredentialStore,
-    DeviceCode, Error, FileCredentialStore, LoginInteraction, LoginPrompt, LoginSelect, Message,
-    Model, Models, ModelsConfig, ModelsOptions, ModelsRequest, Provider, ProviderLogin,
-    ProviderModels, ProviderOrigin, ProviderRequest, ProviderResponse, ProviderTransport,
-    RequestContext, RequestRewrite, ServiceTier, SimpleStreamOptions, Streamer, SystemMessage,
-    TextBlock, Transcript, is_retryable_error, now_ms,
+    AccountUsage, ApiKind, AssistantBlock, AssistantEvent, Credential, CredentialSource,
+    CredentialStore, DeviceCode, Error, FileCredentialStore, LoginInteraction, LoginPrompt,
+    LoginSelect, Message, Model, ModelAuth, Models, ModelsConfig, ModelsOptions, ModelsRequest,
+    Provider, ProviderLogin, ProviderModels, ProviderOrigin, ProviderRequest, ProviderResponse,
+    ProviderTransport, ProviderUsage, RequestContext, RequestRewrite, ServiceTier,
+    SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript, UsageLimit,
+    is_retryable_error, now_ms,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -58,6 +59,7 @@ fn provider(id: &str, models: Vec<Model>) -> Provider {
         rewrite: None,
         transport: None,
         list_models: None,
+        usage: None,
     }
 }
 
@@ -1390,6 +1392,7 @@ async fn listed_models_replace_the_static_list() {
             refreshes: AtomicUsize::new(0),
         })),
         list_models: Some(listing),
+        usage: None,
         ..provider(
             "lister",
             vec![model(
@@ -1452,4 +1455,144 @@ async fn listed_models_replace_the_static_list() {
     assert_eq!(ids(&restarted), ["a", "b"]);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(idle.calls.lock().unwrap().is_empty());
+}
+
+/// Reports a weekly limit when fetched and a 5h limit off each response's `x-used` header.
+#[derive(Default)]
+struct ScriptedUsage {
+    fetches: Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait]
+impl ProviderUsage for ScriptedUsage {
+    async fn fetch(&self, auth: ModelAuth) -> Result<AccountUsage, Error> {
+        self.fetches.lock().unwrap().push(auth.api_key);
+        Ok(AccountUsage {
+            plan: Some("max".into()),
+            limits: vec![UsageLimit {
+                id: "weekly".into(),
+                label: "Weekly".into(),
+                used: Some(0.25),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    fn observe(&self, status: u16, headers: &reqwest::header::HeaderMap) -> Vec<UsageLimit> {
+        let used = headers
+            .get("x-used")
+            .and_then(|value| value.to_str().ok()?.parse().ok());
+        used.map(|used| UsageLimit {
+            id: "5h".into(),
+            label: format!("5 hours ({status})"),
+            used: Some(used),
+            ..Default::default()
+        })
+        .into_iter()
+        .collect()
+    }
+}
+
+/// Answers every attempt with a 400 carrying `x-used: 0.5`.
+struct MeteredTransport;
+
+#[async_trait]
+impl ProviderTransport for MeteredTransport {
+    async fn send(
+        &self,
+        _model: &Model,
+        _request: &ProviderRequest,
+        _context: &RequestContext,
+    ) -> Result<ProviderResponse, Error> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-used", "0.5".parse().unwrap());
+        Ok(ProviderResponse {
+            status: 400,
+            headers,
+            body: futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn usage_merges_fetched_and_observed_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (models, _) = load(&dir).await;
+    let usage = Arc::new(ScriptedUsage::default());
+    models
+        .register(
+            "host",
+            Provider {
+                requires_key: true,
+                transport: Some(Arc::new(MeteredTransport)),
+                usage: Some(usage.clone()),
+                ..provider(
+                    "metered",
+                    vec![model(
+                        "metered",
+                        "m",
+                        ApiKind::OpenAiCompletions,
+                        "http://unreachable.invalid",
+                    )],
+                )
+            },
+        )
+        .unwrap();
+    let mut changes = models.subscribe_usage();
+
+    // No credential: nothing is fetched.
+    assert_eq!(models.refresh_usage("metered").await.unwrap(), None);
+    assert!(usage.fetches.lock().unwrap().is_empty());
+
+    // A fetch with the resolved key, then none again within five minutes.
+    models.set_api_key("metered", "key-1".into()).await.unwrap();
+    let report = models.refresh_usage("metered").await.unwrap().unwrap();
+    assert_eq!(report.plan.as_deref(), Some("max"));
+    assert!(report.fetched_at.is_some());
+    models.refresh_usage("metered").await.unwrap();
+    assert_eq!(*usage.fetches.lock().unwrap(), [Some("key-1".to_owned())]);
+    assert!(changes.has_changed().unwrap());
+    changes.mark_unchanged();
+
+    // A failed request's headers still add their limit, beside the fetched one.
+    let model = models.find("metered/m").unwrap();
+    let transcript = Transcript::new(vec![Message::System(SystemMessage {
+        content: vec![TextBlock { text: "t".into() }],
+        ..Default::default()
+    })]);
+    let last = Streamer::stream(
+        &models,
+        &model,
+        transcript,
+        SimpleStreamOptions::default(),
+        CancellationToken::new(),
+    )
+    .collect::<Vec<_>>()
+    .await
+    .pop()
+    .unwrap();
+    assert!(matches!(last, AssistantEvent::Error { .. }), "{last:?}");
+    let ids: Vec<(String, String)> = models
+        .usage("metered")
+        .unwrap()
+        .limits
+        .into_iter()
+        .map(|limit| (limit.id, limit.label))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("weekly".to_owned(), "Weekly".to_owned()),
+            ("5h".to_owned(), "5 hours (400)".to_owned())
+        ]
+    );
+    assert!(changes.has_changed().unwrap());
+
+    // A new principal forgets the report and may fetch at once.
+    models.logout("metered").await.unwrap();
+    assert_eq!(models.usage("metered"), None);
+    models.set_api_key("metered", "key-2".into()).await.unwrap();
+    models.refresh_usage("metered").await.unwrap();
+    assert_eq!(usage.fetches.lock().unwrap().len(), 2);
 }

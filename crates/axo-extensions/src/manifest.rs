@@ -78,6 +78,7 @@ impl ProviderDecl {
             rewrite: None,
             transport: None,
             list_models: None,
+            usage: None,
         }
     }
 }

@@ -28,6 +28,7 @@ impl Streamer for Models {
             Err(error) => return setup_failed(model, &error),
         };
         let transcript = transform_messages(transcript, &request.model);
+        let observe = self.view.shared.observer(&request);
         let api: Arc<dyn Api> = match request.model.api {
             ApiKind::AnthropicMessages => self.anthropic.clone(),
             ApiKind::OpenAiCompletions => self.completions.clone(),
@@ -56,6 +57,7 @@ impl Streamer for Models {
                         auth,
                         rewrite: request.rewrite,
                         transport: request.transport,
+                        observe,
                     },
                     cancel,
                 )),

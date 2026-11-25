@@ -852,6 +852,7 @@ async fn session_options_models_isolates_scoped_providers_and_supports_scoped_lo
                 rewrite: None,
                 transport: None,
                 list_models: None,
+                usage: None,
             },
             None,
         )])

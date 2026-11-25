@@ -145,6 +145,8 @@ impl Models {
                     changes: watch::Sender::new(0),
                     scopes: Mutex::new(Vec::new()),
                     timer: Mutex::new(None),
+                    usage: Mutex::new(Default::default()),
+                    usage_changes: watch::Sender::new(0),
                 }),
                 scope: None,
             },
@@ -239,6 +241,7 @@ impl Models {
         self.view.shared.credentials.remove(&info.slot).await?;
         // A listed set belongs to the credential's principal; re-list without it.
         self.view.shared.forget_listed(&info.slot).await;
+        self.view.shared.forget_usage(&info.slot);
         self.view.spawn_listing(provider, false);
         Ok(())
     }

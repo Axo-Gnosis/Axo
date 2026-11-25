@@ -197,6 +197,9 @@ pub(crate) async fn dispatch(
         }
         unsent.message
     })?;
+    if let Some(observe) = &opts.observe {
+        observe(response.status, &response.headers);
+    }
     if (200..300).contains(&response.status) {
         return Ok(response);
     }

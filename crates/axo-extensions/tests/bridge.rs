@@ -406,6 +406,7 @@ pub fn register_native(models: &Models, provider: &str, url: &str) {
                 rewrite: None,
                 transport: None,
                 list_models: None,
+                usage: None,
             },
         )
         .unwrap();

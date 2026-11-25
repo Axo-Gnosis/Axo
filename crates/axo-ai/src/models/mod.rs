@@ -12,6 +12,7 @@ mod feeds;
 mod listing;
 mod registry;
 mod stream;
+mod usage;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -112,4 +113,8 @@ struct Shared {
     scopes: Mutex<Vec<Weak<Scope>>>,
     /// The refresh timer; replaced by `reload` from any view, aborted when the root drops.
     timer: Mutex<Option<AbortHandle>>,
+    /// Account usage by credential slot.
+    usage: Mutex<self::usage::UsageReports>,
+    /// Bumped whenever a usage report changes.
+    usage_changes: watch::Sender<u64>,
 }

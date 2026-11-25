@@ -7,7 +7,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Wea
 use tokio::sync::watch;
 
 use crate::api::{ProviderTransport, RequestRewrite};
-use crate::auth::provider::{LoginInteraction, Provider, ProviderModels};
+use crate::auth::provider::{LoginInteraction, Provider, ProviderModels, ProviderUsage};
 use crate::auth::resolve::{ProviderAuth, credential_source, resolve_auth};
 use crate::auth::{Credential, CredentialSource, ModelAuth};
 use crate::error::Error;
@@ -289,6 +289,18 @@ impl View {
         self.with_registry(|base, scope| lister(Self::runtime(base, scope, id)?))
     }
 
+    /// `id`'s winning runtime provider in this view, when it is available and reports usage.
+    pub(super) fn usage_source(
+        &self,
+        id: &str,
+    ) -> Option<(Arc<ProviderAuth>, Arc<dyn ProviderUsage>)> {
+        self.with_registry(|base, scope| {
+            let (registered, unavailable) = Self::runtime(base, scope, id)?;
+            let usage = registered.usage.clone().filter(|_| unavailable.is_none())?;
+            Some((Arc::clone(&registered.auth), usage))
+        })
+    }
+
     /// Every available winning runtime provider of this view that lists models.
     pub(super) fn listers(&self) -> Vec<Lister> {
         self.with_registry(|base, scope| {
@@ -321,6 +333,7 @@ struct Registered {
     rewrite: Option<Arc<dyn RequestRewrite>>,
     transport: Option<Arc<dyn ProviderTransport>>,
     list_models: Option<Arc<dyn ProviderModels>>,
+    usage: Option<Arc<dyn ProviderUsage>>,
 }
 
 impl Registered {
@@ -345,6 +358,7 @@ impl Registered {
             rewrite,
             transport,
             list_models,
+            usage,
         } = provider;
         let auth = Arc::new(ProviderAuth {
             id: id.clone(),
@@ -363,6 +377,7 @@ impl Registered {
                 rewrite,
                 transport,
                 list_models,
+                usage,
             },
         ))
     }
@@ -374,6 +389,7 @@ impl Registered {
             headers: BTreeMap::new(),
             rewrite: self.rewrite.clone(),
             transport: self.transport.clone(),
+            usage: self.usage.clone(),
             config_base_url: false,
         }
     }
@@ -436,6 +452,7 @@ pub(super) struct Request {
     pub(super) headers: BTreeMap<String, String>,
     pub(super) rewrite: Option<Arc<dyn RequestRewrite>>,
     pub(super) transport: Option<Arc<dyn ProviderTransport>>,
+    pub(super) usage: Option<Arc<dyn ProviderUsage>>,
     pub(super) config_base_url: bool,
 }
 
@@ -584,6 +601,7 @@ impl Models {
             .credentials
             .set(&info.slot, Credential::ApiKey { key })
             .await?;
+        self.view.shared.forget_usage(&info.slot);
         self.view.spawn_listing(provider, false);
         Ok(())
     }
@@ -608,6 +626,7 @@ impl Models {
             .credentials
             .set(&info.slot, credential)
             .await?;
+        self.view.shared.forget_usage(&info.slot);
         self.view.spawn_listing(provider, false);
         Ok(())
     }
@@ -678,6 +697,7 @@ impl Models {
                     .unwrap_or_default(),
                 rewrite: None,
                 transport: None,
+                usage: None,
                 config_base_url: base.loaded.config_base_urls.contains(&key),
             })
         })
@@ -902,6 +922,7 @@ mod tests {
                             rewrite: None,
                             transport: None,
                             list_models: None,
+                            usage: None,
                         },
                     )
                     .unwrap();

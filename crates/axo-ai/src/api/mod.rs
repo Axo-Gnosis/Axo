@@ -103,7 +103,12 @@ pub struct StreamOptions {
     pub rewrite: Option<Arc<dyn RequestRewrite>>,
     /// The provider's transport, sending each attempt instead of axo's HTTP client.
     pub transport: Option<Arc<dyn ProviderTransport>>,
+    /// Sees the status and headers of every request's final response.
+    pub observe: Option<ResponseObserver>,
 }
+
+/// A `StreamOptions::observe` callback.
+pub type ResponseObserver = Arc<dyn Fn(u16, &HeaderMap) + Send + Sync>;
 
 impl std::fmt::Debug for StreamOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,6 +117,7 @@ impl std::fmt::Debug for StreamOptions {
             .field("auth", &self.auth)
             .field("rewrite", &self.rewrite.is_some())
             .field("transport", &self.transport.is_some())
+            .field("observe", &self.observe.is_some())
             .finish()
     }
 }

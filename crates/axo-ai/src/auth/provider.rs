@@ -31,6 +31,76 @@ pub struct Provider {
     /// Supplies the provider's models at runtime; `models` is then the list used until the
     /// first successful listing and after logout.
     pub list_models: Option<Arc<dyn ProviderModels>>,
+    /// Reports the account's usage limits; read through `Models::usage`.
+    pub usage: Option<Arc<dyn ProviderUsage>>,
+}
+
+/// An account's usage limits as its provider reports them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    /// The account's plan as a display label ("Max 5x", "plus").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// The account's display identity, usually its email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub limits: Vec<UsageLimit>,
+    /// When `ProviderUsage::fetch` last succeeded, in milliseconds since the epoch; `None`
+    /// while every limit comes from observed responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<i64>,
+}
+
+/// One limit: a usage window or a spend meter.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimit {
+    /// Stable within the provider (`"5h"`, `"weekly"`, `"weekly:opus"`, `"spend"`); a newer
+    /// limit replaces the one with the same id.
+    pub id: String,
+    pub label: String,
+    /// The fraction used, 0 to 1; above 1 is overage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    /// When the limit resets, in milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    /// The window's length in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u64>,
+    /// The model or model family the limit covers; `None` covers the whole account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The amounts behind a money meter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<UsageSpend>,
+}
+
+/// A money meter's amounts, in `currency`'s major unit.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSpend {
+    pub used: f64,
+    /// `None` is uncapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    /// An ISO 4217 code, or the provider's own unit (`"credits"`).
+    pub currency: String,
+}
+
+/// A provider's account usage. axo resolves the credential, keeps the latest report per
+/// credential slot, and merges observed limits into it by `UsageLimit::id`.
+#[async_trait]
+pub trait ProviderUsage: Send + Sync {
+    /// Asks the provider for the account's current limits. axo calls it at most once every
+    /// five minutes per credential slot, failures included.
+    async fn fetch(&self, auth: ModelAuth) -> Result<AccountUsage, Error>;
+    /// The limits one response to this provider's model requests reveals (rate-limit
+    /// headers). axo calls it for the final response of every request, whatever its status.
+    fn observe(&self, _status: u16, _headers: &reqwest::header::HeaderMap) -> Vec<UsageLimit> {
+        Vec::new()
+    }
 }
 
 /// What a provider's model listing receives.

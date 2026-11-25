@@ -406,6 +406,7 @@ async fn hidden_discovery_keeps_loaded_ids_without_contacting_the_endpoint() {
             rewrite: None,
             transport: None,
             list_models: None,
+            usage: None,
         };
         if gated {
             layer
@@ -650,6 +651,7 @@ async fn subscribe_and_scoped_views_isolate_and_propagate() {
         rewrite: None,
         transport: None,
         list_models: None,
+        usage: None,
     };
     layer_a
         .replace(vec![(
