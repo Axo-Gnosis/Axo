@@ -63,6 +63,7 @@ pub fn route<'a>(
                 name,
                 arguments,
                 arguments_error: None,
+                thought_signature: None,
             }),
             via: Some(tool),
         })

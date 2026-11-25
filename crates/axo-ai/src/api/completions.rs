@@ -1402,6 +1402,7 @@ impl Response {
                         name: name.to_owned(),
                         arguments: JsonMap::new(),
                         arguments_error: None,
+                        thought_signature: None,
                     }));
                 self.tools.push(ToolState {
                     index,
@@ -1500,6 +1501,7 @@ mod tests {
                 .unwrap()
                 .clone(),
             arguments_error: None,
+            thought_signature: None,
         }));
         let result = Message::ToolResult(ToolResultMessage {
             tool_call_id: "c1".into(),

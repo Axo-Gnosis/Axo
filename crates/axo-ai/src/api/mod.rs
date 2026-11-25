@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod completions;
+pub mod google;
 pub mod http;
 pub mod openai_responses;
 pub(crate) mod responses;

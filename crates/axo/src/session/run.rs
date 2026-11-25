@@ -608,6 +608,7 @@ impl Persist for SessionHooks {
                         name: name.clone(),
                         arguments: args.clone(),
                         arguments_error: None,
+                        thought_signature: None,
                     });
                     tool_names(live)
                 });

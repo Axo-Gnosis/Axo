@@ -427,6 +427,7 @@ pub fn reply_tool_calls(calls: &[(&str, &str, Value)]) -> AssistantMessage {
                     _ => Default::default(),
                 },
                 arguments_error: None,
+                thought_signature: None,
             })
         })
         .collect();

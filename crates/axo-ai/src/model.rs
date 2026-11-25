@@ -19,14 +19,16 @@ pub enum ApiKind {
     OpenAiCompletions,
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
+    #[serde(rename = "google-generative-ai")]
+    GoogleGenerativeAi,
 }
 
 pub(crate) fn tier_wire(api: ApiKind, tier: ServiceTier) -> Option<&'static str> {
-    use ApiKind::{AnthropicMessages, OpenAiCompletions, OpenAiResponses};
+    use ApiKind::{AnthropicMessages, GoogleGenerativeAi, OpenAiCompletions, OpenAiResponses};
     use ServiceTier::{Fast, Flex, Standard, Ultrafast};
 
     match (api, tier) {
-        (_, Standard) | (AnthropicMessages, Flex | Ultrafast) => None,
+        (_, Standard) | (AnthropicMessages, Flex | Ultrafast) | (GoogleGenerativeAi, _) => None,
         (AnthropicMessages, Fast) => Some("fast"),
         (OpenAiCompletions | OpenAiResponses, Flex) => Some("flex"),
         (OpenAiCompletions | OpenAiResponses, Fast) => Some("priority"),

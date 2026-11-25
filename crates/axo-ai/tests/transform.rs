@@ -66,6 +66,7 @@ fn tool_call(id: &str) -> AssistantBlock {
         name: "get_weather".to_owned(),
         arguments: json!({ "city": "Paris" }).as_object().unwrap().clone(),
         arguments_error: None,
+        thought_signature: None,
     })
 }
 

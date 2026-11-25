@@ -479,6 +479,7 @@ mod tests {
                 name: tool.to_owned(),
                 arguments,
                 arguments_error: None,
+                thought_signature: None,
             });
             ToolContext {
                 call,
@@ -829,6 +830,7 @@ mod tests {
                 name: "write".into(),
                 arguments,
                 arguments_error: None,
+                thought_signature: None,
             };
             assert_eq!(write.replay(&call), expected, "{path}");
         }

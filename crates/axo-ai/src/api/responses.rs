@@ -534,6 +534,7 @@ impl<'a> ResponsesStream<'a> {
                         name: name.clone(),
                         arguments: Default::default(),
                         arguments_error: None,
+                        thought_signature: None,
                     }),
                     AssistantEvent::ToolCallStart {
                         content_index,

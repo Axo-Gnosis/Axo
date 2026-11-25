@@ -32,6 +32,7 @@ impl Streamer for Models {
             ApiKind::AnthropicMessages => self.anthropic.clone(),
             ApiKind::OpenAiCompletions => self.completions.clone(),
             ApiKind::OpenAiResponses => self.responses.clone(),
+            ApiKind::GoogleGenerativeAi => self.google.clone(),
         };
         let auth = resolve_auth(
             request.auth,

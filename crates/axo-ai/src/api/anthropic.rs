@@ -461,6 +461,7 @@ impl BlockMapper {
                     },
                     arguments: block["input"].as_object().cloned().unwrap_or_default(),
                     arguments_error: None,
+                    thought_signature: None,
                 }),
                 "",
             ),

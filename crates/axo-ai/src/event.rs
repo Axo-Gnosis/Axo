@@ -155,6 +155,7 @@ impl Accumulator {
                         name: name.clone(),
                         arguments: JsonMap::new(),
                         arguments_error: None,
+                        thought_signature: None,
                     }),
                 );
             }

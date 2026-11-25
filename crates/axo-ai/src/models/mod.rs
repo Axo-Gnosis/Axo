@@ -22,6 +22,7 @@ use tokio::task::AbortHandle;
 
 use crate::api::anthropic::AnthropicApi;
 use crate::api::completions::CompletionsApi;
+use crate::api::google::GoogleApi;
 use crate::api::openai_responses::ResponsesApi;
 use crate::auth::CredentialStore;
 
@@ -68,6 +69,7 @@ pub struct Models {
     anthropic: Arc<AnthropicApi>,
     completions: Arc<CompletionsApi>,
     responses: Arc<ResponsesApi>,
+    google: Arc<GoogleApi>,
 }
 
 /// An owned set of providers above the runtime registrations, created by

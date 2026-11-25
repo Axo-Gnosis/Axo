@@ -167,6 +167,7 @@ fn transform_assistant(
                 text_signature: None,
             }),
             AssistantBlock::ToolCall(mut call) if !same_model => {
+                call.thought_signature = None;
                 let id = normalize_tool_call_id(&call.id, model, &assistant);
                 if id != call.id {
                     id_map.insert(call.id, id.clone());
@@ -196,8 +197,10 @@ fn normalize_tool_call_id(id: &str, model: &Model, source: &AssistantMessage) ->
             .collect()
     };
     match model.api {
-        // Anthropic requires ^[a-zA-Z0-9_-]+$, at most 64 chars.
-        ApiKind::AnthropicMessages => sanitize(id).chars().take(64).collect(),
+        // Anthropic requires ^[a-zA-Z0-9_-]+$, at most 64 chars; Gemini function-call ids too.
+        ApiKind::AnthropicMessages | ApiKind::GoogleGenerativeAi => {
+            sanitize(id).chars().take(64).collect()
+        }
         // Chat Completions: keep item-level uniqueness of `call_id|item_id` ids within
         // OpenAI's 40-char limit.
         ApiKind::OpenAiCompletions => match id.split_once('|') {

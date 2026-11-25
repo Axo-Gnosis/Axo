@@ -480,6 +480,7 @@ mod tests {
             name: name.into(),
             arguments: JsonMap::new(),
             arguments_error: None,
+            thought_signature: None,
         }
     }
 

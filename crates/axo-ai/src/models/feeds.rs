@@ -8,6 +8,7 @@ use tokio::sync::watch;
 
 use crate::api::anthropic::AnthropicApi;
 use crate::api::completions::CompletionsApi;
+use crate::api::google::GoogleApi;
 use crate::api::openai_responses::ResponsesApi;
 use crate::error::Error;
 
@@ -149,7 +150,8 @@ impl Models {
             },
             anthropic: Arc::new(AnthropicApi::new(http.clone())),
             completions: Arc::new(CompletionsApi::new(http.clone())),
-            responses: Arc::new(ResponsesApi::new(http)),
+            responses: Arc::new(ResponsesApi::new(http.clone())),
+            google: Arc::new(GoogleApi::new(http)),
         };
         models.start_timer(interval, age, attempted);
         Ok(models)

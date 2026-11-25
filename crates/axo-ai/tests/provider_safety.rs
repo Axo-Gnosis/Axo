@@ -5,9 +5,9 @@ use std::thread::JoinHandle;
 
 use axo_ai::testing::{fixture_model, http_header_values, read_http_request_parts, serve_http};
 use axo_ai::{
-    AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CompletionsApi, Message, Model,
-    ModelAuth, ResponsesApi, ServiceTier, SimpleStreamOptions, StreamOptions, SystemMessage,
-    TextBlock, ToolChoice, ToolSpec, Transcript,
+    AnthropicApi, Api, ApiKind, AssistantEvent, AssistantMessage, CompletionsApi, GoogleApi,
+    Message, Model, ModelAuth, ResponsesApi, ServiceTier, SimpleStreamOptions, StreamOptions,
+    SystemMessage, TextBlock, ToolChoice, ToolSpec, Transcript,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -48,6 +48,7 @@ async fn request_with(
         ApiKind::AnthropicMessages => Box::new(AnthropicApi::new(client)),
         ApiKind::OpenAiCompletions => Box::new(CompletionsApi::new(client)),
         ApiKind::OpenAiResponses => Box::new(ResponsesApi::new(client)),
+        ApiKind::GoogleGenerativeAi => Box::new(GoogleApi::new(client)),
     };
     let events: Vec<_> = adapter
         .stream(
@@ -301,6 +302,7 @@ async fn service_tiers_reach_the_wire_and_the_bill() {
                          event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
                     )
                 }
+                ApiKind::GoogleGenerativeAi => unreachable!("not in this loop"),
             };
             let (url, server) = server(200, "Content-Type: text/event-stream\r\n", &response);
             let mut model = model(api, url);

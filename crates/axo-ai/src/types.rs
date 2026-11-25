@@ -234,6 +234,9 @@ pub struct ToolCall {
     /// is then `{}`. Tool argument validation fails with this text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments_error: Option<String>,
+    /// Opaque provider data replayed with the call (Google `thoughtSignature`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Opaque provider data needed to replay reasoning, tagged with its kind so data from
@@ -252,6 +255,8 @@ pub enum ReasoningReplay {
     ReasoningField(String),
     /// OpenRouter-style `reasoning_details`.
     ReasoningDetails(Value),
+    /// Google `thoughtSignature` of a thought part.
+    GoogleThoughtSignature(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]

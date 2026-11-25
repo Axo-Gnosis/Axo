@@ -237,7 +237,7 @@ export type Answer_Serialize = {
 };
 
 /**  The wire API a model is served through. */
-export type ApiKind = "anthropic-messages" | "openai-completions" | "openai-responses";
+export type ApiKind = "anthropic-messages" | "openai-completions" | "openai-responses" | "google-generative-ai";
 
 /**  The reserved numeric id and path for a session artifact. */
 export type ArtifactSlot = {
@@ -3056,7 +3056,9 @@ export type ReasoningReplay =
  */
 { type: "reasoningField"; value: string } | 
 /**  OpenRouter-style `reasoning_details`. */
-{ type: "reasoningDetails"; value: Value };
+{ type: "reasoningDetails"; value: Value } | 
+/**  Google `thoughtSignature` of a thought part. */
+{ type: "googleThoughtSignature"; value: string };
 
 /**  How a pending mode result review ended. */
 export type ResultResolution = 
@@ -4566,6 +4568,8 @@ export type ToolCall_Deserialize = {
 	 *  is then `{}`. Tool argument validation fails with this text.
 	 */
 	argumentsError?: string | null,
+	/**  Opaque provider data replayed with the call (Google `thoughtSignature`). */
+	thoughtSignature?: string | null,
 };
 
 export type ToolCall_Serialize = {
@@ -4577,6 +4581,8 @@ export type ToolCall_Serialize = {
 	 *  is then `{}`. Tool argument validation fails with this text.
 	 */
 	argumentsError?: string,
+	/**  Opaque provider data replayed with the call (Google `thoughtSignature`). */
+	thoughtSignature?: string,
 };
 
 export type ToolChoice = "auto" | "none";

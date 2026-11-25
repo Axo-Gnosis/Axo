@@ -22,6 +22,7 @@ pub mod testing;
 
 pub use api::anthropic::AnthropicApi;
 pub use api::completions::CompletionsApi;
+pub use api::google::GoogleApi;
 pub use api::openai_responses::ResponsesApi;
 pub use api::{
     Api, ProviderRequest, ProviderResponse, ProviderTransport, RequestContext, RequestRewrite,

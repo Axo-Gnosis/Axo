@@ -1256,6 +1256,7 @@ async fn dropped_manager_fences_hooks_and_restores_layer() {
             name: "read".into(),
             arguments: Default::default(),
             arguments_error: None,
+            thought_signature: None,
         };
         let assistant_message = &reply_tool_calls(&[("r", "read", json!({}))]);
         let cancel = CancellationToken::new();

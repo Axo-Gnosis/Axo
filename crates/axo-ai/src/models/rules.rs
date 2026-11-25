@@ -81,8 +81,9 @@ pub(crate) fn cap_at_price_tier(model: &mut Arc<Model>) {
 
 /// `api` keys axo serves, in the order tried when the recommended entry is not servable:
 /// a model's native wire before the OpenAI-compatible shim.
-const WIRES: [(&str, ApiKind); 3] = [
+const WIRES: [(&str, ApiKind); 4] = [
     ("messages", ApiKind::AnthropicMessages),
+    ("generate-content", ApiKind::GoogleGenerativeAi),
     ("responses", ApiKind::OpenAiResponses),
     ("chat-completions", ApiKind::OpenAiCompletions),
 ];
@@ -171,6 +172,18 @@ fn catalog_model(provider_id: &str, model_id: &str, dev: DevModel, today: &str) 
                 compat.force_adaptive_thinking = Some(true);
                 thinking_map(&reasoning.effort, reasoning.toggle)
             })
+        }
+        // A budget that cannot reach 0 cannot turn thinking off.
+        ApiKind::GoogleGenerativeAi
+            if reasoning.effort.is_empty()
+                && !reasoning.toggle
+                && reasoning
+                    .budget
+                    .as_ref()
+                    .and_then(|budget| budget["min"].as_f64())
+                    .is_some_and(|min| min > 0.0) =>
+        {
+            Some(ThinkingLevelMap::from([(ThinkingLevel::Off, None)]))
         }
         _ => (!reasoning.effort.is_empty()).then(|| {
             thinking_map(

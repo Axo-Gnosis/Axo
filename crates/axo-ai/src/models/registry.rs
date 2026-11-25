@@ -476,6 +476,7 @@ impl Models {
             anthropic: Arc::clone(&self.anthropic),
             completions: Arc::clone(&self.completions),
             responses: Arc::clone(&self.responses),
+            google: Arc::clone(&self.google),
         }
     }
 
