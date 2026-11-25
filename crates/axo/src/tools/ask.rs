@@ -195,7 +195,7 @@ impl PendingQuestions {
         }
     }
 
-    /// Settles the pending call as dismissed; the tool reports a user cancellation.
+    /// Settles the pending call as dismissed; the tool returns a non-error result and the run continues.
     pub(crate) fn dismiss(&self, call_id: &str) -> Result<(), Error> {
         self.settle(call_id, AskOutcome::Dismissed)
     }
@@ -595,6 +595,18 @@ fn steered() -> ToolOutput {
     }
 }
 
+fn dismissed() -> ToolOutput {
+    ToolOutput {
+        content: vec![UserBlock::Text {
+            text: "The user dismissed these questions without answering. Do not ask them again. Continue with the recommended options or your best judgement, and say which assumptions you made."
+                .into(),
+        }],
+        details: Some(json!({ "outcome": "dismissed" })),
+        is_error: false,
+        terminate: false,
+    }
+}
+
 fn answered(prefix: &str, answers: Map<String, Value>, timed_out: bool) -> ToolOutput {
     let text = format!(
         "{prefix}User answers:\n{}",
@@ -697,7 +709,7 @@ impl Tool for AskTool {
                 defaults(&blocks),
                 true,
             )),
-            AskOutcome::Dismissed => Err(ToolError("Ask tool was cancelled by the user".into())),
+            AskOutcome::Dismissed => Ok(dismissed()),
             AskOutcome::Steered => Ok(steered()),
         }
     }

@@ -32,7 +32,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | abort |  | Stops the active run (CancelReason::User). Stopping an active run holds queued input and job results until the user's next input or resume_wakes; input sent after the Stop starts the next run once this one settles. An idle Stop changes nothing. |
 | setAgent | name? | Switches the root persona from the next request, applying its model selector when present. Changing the system prompt and tools is cache-heavy on models without mid-conversation system-message and tool changes. |
 | answer | callId, answers | Settles the pending question of tool call call_id. A submission that does not fit the document returns Error::InvalidInput and leaves the question pending. |
-| dismiss | callId | Dismisses a pending question or mode result; the run is cancelled. |
+| dismiss | callId | Dismisses a pending question or mode result. A dismissed question returns a result telling the model to continue without answers. A dismissed mode result cancels the run. |
 | model |  | The currently selected model. |
 | thinking |  | The thinking level applied to the current model. |
 | serviceTier |  | The chosen service tier; it applies only on models that support it. |

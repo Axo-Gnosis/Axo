@@ -112,6 +112,69 @@ async fn steer_settles_a_pending_question() {
 }
 
 #[tokio::test]
+async fn dismiss_settles_a_pending_question_and_the_run_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "question",
+                "ask",
+                json!({"blocks":[{
+                    "type":"choice", "id":"choice", "question":"Which approach?",
+                    "options":[{"value":"a","label":"A"}, {"value":"b","label":"B"}]
+                }]}),
+            )])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    )
+    .await;
+    let mut opts = options(dir.path());
+    opts.ask_enabled = true;
+    let session = Arc::new(host.axo.create_session(opts).await.unwrap());
+    let mut events = session.attach(None).await.events;
+    let run = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("Ask me which approach.").await }
+    });
+    within(async {
+        loop {
+            if let SessionEvent::QuestionPending { call_id, .. } = &*events.recv().await.unwrap() {
+                assert_eq!(call_id, "question");
+                break;
+            }
+        }
+    })
+    .await;
+    session.dismiss("question").unwrap();
+    within(async {
+        loop {
+            if let SessionEvent::QuestionResolved { call_id } = &*events.recv().await.unwrap() {
+                assert_eq!(call_id, "question");
+                break;
+            }
+        }
+    })
+    .await;
+    assert_eq!(within(run).await.unwrap().unwrap(), RunOutcome::Done);
+    assert!(!session.attach(None).await.live.auto_paused);
+
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 2);
+    let result = question_result(&requests[1].transcript);
+    assert!(!result.is_error);
+    assert!(
+        result
+            .content
+            .iter()
+            .filter_map(UserBlock::as_text)
+            .any(|text| text.contains("dismissed these questions"))
+    );
+    assert_eq!(result.details, Some(json!({"outcome":"dismissed"})));
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn invalid_submission_keeps_the_question_pending() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(

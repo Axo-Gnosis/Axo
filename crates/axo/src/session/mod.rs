@@ -911,15 +911,17 @@ impl Session {
         self.hooks.questions.answer(call_id, answers)
     }
 
-    /// Dismisses a pending question or mode result; the run is cancelled.
+    /// Dismisses a pending question or mode result. A dismissed question returns a result
+    /// telling the model to continue without answers. A dismissed mode result cancels the run.
     #[ext]
     pub fn dismiss(&self, call_id: &str) -> Result<(), Error> {
-        if let Err(error) = self.hooks.questions.dismiss(call_id) {
-            self.hooks
-                .results
-                .settle(call_id, modes::ResultOutcome::Dismissed)
-                .map_err(|_| error)?;
-        }
+        let Err(error) = self.hooks.questions.dismiss(call_id) else {
+            return Ok(());
+        };
+        self.hooks
+            .results
+            .settle(call_id, modes::ResultOutcome::Dismissed)
+            .map_err(|_| error)?;
         self.abort();
         Ok(())
     }

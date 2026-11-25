@@ -350,10 +350,13 @@ Shipped; the contract lives in [Ask documents for hosts](../crates/axo/docs/exte
 
 Later, not in this track: pasted images on notes, and re-answering a settled question on a sibling branch (both exist in omp).
 
+Dismissing a question now continues the run with `details.outcome: "dismissed"`; only a dismissed mode result stops it.
+
 ---
 
 ## Deferred studies
 
+- **Session name generation:** axo generates a short session name after the first prompt and records it with `set_name`. The host may supply a guideline prompt, and extensions must be able to shape or replace the result. Open: which model writes it, the trigger, and how a host supplies an icon vocabulary. Requested by Axome; not designed yet.
 - **Compaction follow-ups (`research/compaction-methods.md`):** background precomputed summaries before the threshold; optional provider server-side compaction; Factory-style probe-based prompt evaluation harness.
 - **Token-efficiency / output minimizer:** evaluate source-time output filtering for noisy build/test commands (with full output recoverable via spool paths).
 - **Swarm versus teams (`research/swarm.md`, pinned 2026-11-21):** compared against shipped teams and not adopted. Teams already meet the spec's activation, delivery, pause and reopen recovery contracts through receiver-side mail. The unbuilt parts are a shared board, a changeable roster, a finish/cancel seal and idempotent send retries. A board readable by every member is not wanted by default: it invites over-reading and breaks independent review, and the parent and host, who want the full trail, can read mail from the child journals. No second coordination system is planned beside teams; a host may name a coordinator protocol "swarm" in its own keyword. Revisit only for large rosters or a first-class host timeline. One open check: whether each member run's result starts a parent turn, which keeps the parent a hub.

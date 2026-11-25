@@ -191,7 +191,7 @@ Local commands (`bash`, dev-shell capture, and host tools using `SessionTools::s
 | `name` | `fn name(&self) -> Option<String>` | Returns the latest session name in file order, globally rather than scoped to the current branch |
 | `append_custom` | `async fn append_custom(&self, custom_type: &str, data: Option<Value>) -> Result<SeqEntry, Error>` | Appends `Entry::Custom` at the current position. May run at any time; adds no model-context messages. Rejects an empty `custom_type` with `Error::InvalidInput` |
 | `custom` | `fn custom(&self, custom_type: &str) -> Option<Value>` | Returns the latest data of that type on the current root-to-leaf path (branch-scoped), or `None` if absent or the latest entry has no data |
-| `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles a pending question; a submission that does not fit the document returns `Error::InvalidInput` and leaves the question pending (see [Ask documents for hosts](#ask-documents-for-hosts)). `dismiss` settles a pending question or mode result and stops the run like `abort` (`CancelReason::User`), leaving the selected mode active. Both return `Error::NoPendingQuestion` for an id absent from their supported pending registries, including a question a steer already settled |
+| `answer` / `dismiss` | `fn answer(&self, call_id: &str, answers: Vec<Answer>) -> Result<(), Error>`<br>`fn dismiss(&self, call_id: &str) -> Result<(), Error>` | `answer` settles a pending question; a submission that does not fit the document returns `Error::InvalidInput` and leaves the question pending (see [Ask documents for hosts](#ask-documents-for-hosts)). `dismiss` settles a pending question or mode result. A dismissed question lets the run continue; a dismissed mode result stops the run like `abort` (`CancelReason::User`), leaving the selected mode active. Both return `Error::NoPendingQuestion` for an id absent from their supported pending registries, including a question a steer already settled |
 | `attach` | `async fn attach(&self, from: Option<u64>) -> Attach` | Returns `missed` entries after `from`, the current `LiveSnapshot` (including `jobs`, the same list as `Session::jobs`), and a live `broadcast::Receiver<Arc<SessionEvent>>` |
 | `subscribe` | `fn subscribe(&self) -> broadcast::Receiver<Arc<SessionEvent>>` | Events from now on, without the journal and live snapshot `attach` takes; for consumers that need no catch-up |
 | `compact` | `async fn compact(&self, focus: Option<String>) -> Result<(), Error>` | Runs a standalone compaction summary checkpoint in a session-owned task; `focus` tells the summary what to prioritize and is recorded on the `Entry::Compaction`; blank focus counts as none |
@@ -379,7 +379,7 @@ A steer already queued when `ask` or a reviewed `yield` starts returns the same 
 
 ### Ask documents for hosts
 
-The `ask` tool (registered when `SessionOptions::ask_enabled` is `true`) sends one document: `blocks` in reading order, each Markdown or a typed question. `SessionEvent::QuestionPending { call_id, blocks }` and `LiveSnapshot::pending_questions` carry it as `Vec<AskBlock>`. Render the blocks in order, then settle the call with `Session::answer(call_id, answers)` or cancel it with `Session::dismiss(call_id)`.
+The `ask` tool (registered when `SessionOptions::ask_enabled` is `true`) sends one document: `blocks` in reading order, each Markdown or a typed question. `SessionEvent::QuestionPending { call_id, blocks }` and `LiveSnapshot::pending_questions` carry it as `Vec<AskBlock>`. Render the blocks in order, then settle the call with `Session::answer(call_id, answers)` or dismiss it with `Session::dismiss(call_id)`.
 
 | Block `type` | Rust type | Fields |
 | :--- | :--- | :--- |
@@ -417,7 +417,7 @@ A submission that breaks a rule returns `Error::InvalidInput` naming the questio
 
 **Timeout.** With `ask.timeoutMs` set (see [configuration](configuration.md#question-tool-ask--axoasksettings)), an unanswered call settles with only what the model marked: the `recommended` option(s), a non-blank `prefill`, or the `default`, each as `{ "value": … }`, and `null` for any question without one, required or not. The first option is never guessed. The text says the user did not answer in time, and `details` also has `"timedOut": true`; the result is not an error.
 
-`dismiss` makes the call an error result ("Ask tool was cancelled by the user") and stops the run; an empty submission is not a cancellation. A queued steer settles the call as described in [Queued input for hosts](#queued-input-for-hosts).
+`dismiss` settles the call with a non-error result that tells the model the user dismissed the questions and to continue on its own judgement; `details` is `{ "outcome": "dismissed" }` and the run is not stopped. An empty submission is not a dismissal. A queued steer settles the call as described in [Queued input for hosts](#queued-input-for-hosts).
 
 ### Context usage
 

@@ -5180,7 +5180,8 @@ export interface Session {
    */
   answer(callId: SessionAnswerArgs_Deserialize["callId"], answers: SessionAnswerArgs_Deserialize["answers"], signal?: AbortSignal): Promise<void>;
   /**
-   * Dismisses a pending question or mode result; the run is cancelled.
+   * Dismisses a pending question or mode result. A dismissed question returns a result
+   * telling the model to continue without answers. A dismissed mode result cancels the run.
    */
   dismiss(callId: SessionDismissArgs["callId"], signal?: AbortSignal): Promise<void>;
   /**
