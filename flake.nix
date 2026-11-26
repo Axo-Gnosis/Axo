@@ -8,8 +8,25 @@
     in {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+          packages = with pkgs; [
+            cargo
+            cargo-nextest
+            clang
+            clippy
+            mold
+            rust-analyzer
+            rustc
+            rustfmt
+            sccache
+          ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          shellHook = ''
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            export RUSTC_WRAPPER="sccache"
+          '';
         };
       });
     };

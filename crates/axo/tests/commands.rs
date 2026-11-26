@@ -2,7 +2,7 @@
 //! submitted; prompt text never runs one. Skill commands are expanded and queued like
 //! ordinary input.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

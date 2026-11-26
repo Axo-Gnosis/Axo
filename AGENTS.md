@@ -51,7 +51,8 @@ Run inside `nix develop`:
 
 ```bash
 cargo check --workspace --all-targets
-cargo test --workspace
+cargo nextest run --workspace   # or `cargo test --workspace` (`nextest` skips doctests; pass `--no-pager` to `list`)
+cargo test --doc --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```

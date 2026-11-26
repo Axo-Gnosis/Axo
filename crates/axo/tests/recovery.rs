@@ -1,6 +1,6 @@
 //! Session recovery preserves durable results, interrupted output, and queued input.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

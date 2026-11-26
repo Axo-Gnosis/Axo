@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+autotests = false
 
 [dependencies]
 async-trait.workspace = true
@@ -53,6 +54,22 @@ syn.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+[[test]]
+name = "doc_identifiers"
+path = "tests/doc_identifiers.rs"
+
+[[test]]
+name = "ext_surface"
+path = "tests/ext_surface.rs"
+
+[[test]]
+name = "ext_reference"
+path = "tests/ext_reference.rs"
 
 [[test]]
 name = "supervisor"

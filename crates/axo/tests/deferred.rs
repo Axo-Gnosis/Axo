@@ -1,6 +1,6 @@
 //! Deferred tools preserve the cached prompt and promote only on capable models.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, LazyLock};
 

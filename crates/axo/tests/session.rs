@@ -1,7 +1,7 @@
 //! Session runs outlive their callers, the read record survives reopening, and input
 //! stranded by a crash runs when the session is opened again.
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

@@ -1,7 +1,7 @@
 //! A client attaching mid-run catches up exactly, and a resubmitted request id starts
 //! nothing.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

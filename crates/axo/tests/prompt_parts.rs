@@ -1,7 +1,7 @@
 //! Prompt parts: handed-over content saved under `local://`, references sent as paths,
 //! images sent as pixels, and the stored parts that apps redraw and resubmit.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

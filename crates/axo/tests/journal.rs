@@ -2,7 +2,7 @@
 //! an attach or a job's own records, and maintenance commits only on the transcript it
 //! read. Every wait has a hard deadline; a hang fails the test.
 
-mod common;
+use crate::common;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
 //! Session modes preserve the cached prefix while constraining execution and branch state.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};

@@ -1,7 +1,7 @@
 //! Background jobs: commands whose processes outlive them stay supervised and stoppable,
 //! and promoted commands deliver their results exactly once.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};

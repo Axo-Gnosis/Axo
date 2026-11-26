@@ -1,7 +1,7 @@
 //! Background job lifecycle: a user Stop defers delivery, and reopening closes jobs a
 //! dead host left running.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

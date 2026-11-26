@@ -1,7 +1,7 @@
 //! The embedding contract: hosts supply every configuration input, sessions sample it
 //! at the documented points, and axo itself reads no configuration directory.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

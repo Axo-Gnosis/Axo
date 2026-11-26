@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};

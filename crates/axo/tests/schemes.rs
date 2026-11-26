@@ -1,6 +1,6 @@
 //! Session URLs survive reopening and forks without sharing writable scratch files.
 
-mod common;
+use crate::common;
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;

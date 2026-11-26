@@ -1,5 +1,5 @@
 //! Persistence and safety boundaries for recoverable context maintenance.
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

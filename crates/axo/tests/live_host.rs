@@ -2,7 +2,7 @@
 //! replacements, policies, schemes, sections and registered commands swap in place, and a
 //! registration layer replaces independently of the host's own lists.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
