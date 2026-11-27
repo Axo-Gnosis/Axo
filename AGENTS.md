@@ -5,7 +5,7 @@
 Shared by the AGENTS.md of axo, Axo-Extras, Axome, and Axophyte; change all four together.
 
 - **axo**: the embeddable agent-harness library. It owns harness architecture and the public API every host builds on, designed for any host, never one.
-- **Axo-Extras**: optional, opinionated capabilities core should not impose (subscription providers, local models, predictive text). Host-agnostic, built only on axo's public API to axo's standard; each host adopts, ignores, or replaces each crate.
+- **Axo-Extras**: optional, opinionated capabilities core should not impose. Host-agnostic, built only on axo's public API to axo's standard; each host adopts, ignores, or replaces each crate.
 - **Axome**: Toph's desktop host. It proves axo's surface and exposes its gaps; its product choices never define axo or Extras.
 - **Axophyte**: Toph's personal persona, workflows, and extensions. It inspires ideas but has no bearing on the engineering of the others.
 
