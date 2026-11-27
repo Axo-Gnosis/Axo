@@ -4,6 +4,8 @@
 
 `axo` is built to be linked directly into Rust hosts such as [Axome](https://github.com/tophc7/Axome), running durable agent sessions in a single process (~92 MiB PSS idle for one to three live sessions; see [plan/research/README.md](plan/research/README.md#memory-measurements)) without a sidecar runtime or terminal UI.
 
+axo stays host-agnostic: Axome is its reference host, not its specification. Useful capabilities that not every host wants, such as subscription providers, local models, and predictive text, live in [Axo-Extras](https://git.ryot.foo/toph/Axo-Extras) as opt-in crates built on axo's public API.
+
 It ports [pi](https://github.com/earendil-works/pi) v1.3.0's core architecture—a sectioned system prompt stored in the transcript, delta-only streaming events, a tool-calling agent loop, and an append-only JSONL session tree—while adding crash recovery, recoverable `/shake` and cache-preserving compaction, cached Nix flake dev shells, and granular project access controls.
 
 ---
