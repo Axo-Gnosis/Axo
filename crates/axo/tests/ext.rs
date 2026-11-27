@@ -602,7 +602,7 @@ async fn tool_invocation_records_every_write_and_rejects_stale_files() {
     assert_eq!(&files[0], first);
     assert_eq!(
         details["stale"],
-        "File changed since it was last read: a.txt. Read it again before editing."
+        "File changed since it was last read: a.txt. Read it again before replacing it with write, or change it with edit."
     );
 }
 

@@ -346,3 +346,76 @@ async fn tool_name_prefix_long_names_and_protocol_placeholder_are_distinct() {
         );
     }
 }
+
+/// A plain model with one system prompt, two tools and a user turn: three breakpoints.
+fn breakpoint_fixture() -> (Model, Transcript) {
+    let mut model = model();
+    model.compat.tool_name_prefix = None;
+    model.compat.supports_mid_convo_tool_changes = None;
+    let mut messages = transcript(&["read", "bash"]).into_messages();
+    messages.push(Message::User(crate::types::UserMessage {
+        content: vec![UserBlock::Text {
+            text: "hello".into(),
+        }],
+        timestamp: 0,
+    }));
+    (model, Transcript::new(messages))
+}
+
+#[test]
+fn cache_retention_marks_every_breakpoint() {
+    let (model, transcript) = breakpoint_fixture();
+    let mut opts = options();
+    opts.simple.cache_retention = CacheRetention::Long;
+    let body = prepare_request(&model, &transcript, &opts, ServiceTier::Standard)
+        .unwrap()
+        .request
+        .body;
+    let long = json!({"type": "ephemeral", "ttl": "1h"});
+    assert_eq!(body["system"][0]["cache_control"], long);
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.last().unwrap()["cache_control"], long);
+    let last_user = body["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last_user["role"], "user");
+    assert_eq!(
+        last_user["content"].as_array().unwrap().last().unwrap()["cache_control"],
+        long
+    );
+
+    opts.simple.cache_retention = CacheRetention::None;
+    let body = prepare_request(&model, &transcript, &opts, ServiceTier::Standard)
+        .unwrap()
+        .request
+        .body;
+    assert!(!body.to_string().contains("cache_control"));
+}
+
+#[test]
+fn warm_body_is_non_streaming_zero_tokens_without_thinking() {
+    let (mut model, transcript) = breakpoint_fixture();
+    model.reasoning = true;
+    model.compat.force_adaptive_thinking = Some(true);
+    let mut opts = options();
+    opts.simple.thinking = ThinkingLevel::Medium;
+    let normal = prepare_request(&model, &transcript, &opts, ServiceTier::Standard)
+        .unwrap()
+        .request
+        .body;
+    assert_eq!(normal["thinking"]["type"], "adaptive");
+    opts.simple.warm = true;
+    let body = prepare_request(&model, &transcript, &opts, ServiceTier::Standard)
+        .unwrap()
+        .request
+        .body;
+    assert_eq!(body["max_tokens"], 0);
+    assert_eq!(body["stream"], false);
+    assert!(body.get("thinking").is_none());
+    assert!(body.get("output_config").is_none());
+    assert_eq!(body["messages"], normal["messages"]);
+    assert_eq!(body["system"], normal["system"]);
+    assert_eq!(body["tools"], normal["tools"]);
+
+    // Budget thinking changes the body in ways the cache does not survive: refused.
+    model.compat.force_adaptive_thinking = None;
+    assert!(prepare_request(&model, &transcript, &opts, ServiceTier::Standard).is_err());
+}

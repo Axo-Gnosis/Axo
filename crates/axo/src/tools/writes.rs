@@ -65,7 +65,7 @@ pub enum FileRead<T = Vec<u8>> {
     },
 }
 
-fn check_cancel(cancel: &CancellationToken) -> Result<(), ToolError> {
+pub(super) fn check_cancel(cancel: &CancellationToken) -> Result<(), ToolError> {
     if cancel.is_cancelled() {
         Err(ToolError("Operation aborted".into()))
     } else {
@@ -403,7 +403,8 @@ impl SessionTools {
                     .await
                     .map_err(|error| ToolError(fs_error(&error, "read", shown)))?;
                 check_cancel(cancel)?;
-                let sha256 = self.ledger.check_fresh(&absolute, shown_path, &bytes)?;
+                // The edit closure proves freshness: every oldText must match these bytes.
+                let sha256 = FileLedger::hash(&bytes);
                 let after = edit(&bytes, shown_path)?;
                 let before = if after == bytes {
                     Before::Identical(sha256)

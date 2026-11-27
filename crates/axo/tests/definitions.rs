@@ -209,6 +209,58 @@ async fn teams_validate_against_the_merged_agents() {
 }
 
 #[tokio::test]
+async fn hidden_agents_stay_out_of_the_listing_but_spawn_by_name() {
+    let dir = tempdir().unwrap();
+    let host = common::host_with(
+        dir.path(),
+        json!([{"id":"m"}, {"id":"child"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ready"))],
+    )
+    .await;
+    host.api.lane("child", vec![ScriptedTurn::HangUntilCancel]);
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    let secret = AgentSpec {
+        hidden: true,
+        ..agent("secret", "Secret")
+    };
+    let diags = session
+        .set_definitions(Definitions {
+            agents: vec![agent("helper", "Assists with reviews"), secret],
+            teams: vec![crew("secret")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(session.agents().contains(&AgentDef::Team(crew("secret"))));
+    within(session.prompt("Look.")).await.unwrap();
+    let requests = host.api.requests();
+    let tools = current_system_message(requests[0].transcript.messages())
+        .unwrap()
+        .tools_added;
+    let listing = &tools
+        .iter()
+        .find(|tool| tool.name == "spawn")
+        .unwrap()
+        .description;
+    assert!(
+        listing.contains("- helper: Assists with reviews"),
+        "{listing}"
+    );
+    assert!(!listing.contains("- secret"), "{listing}");
+    let child = within(session.spawn(axo::SpawnRequest {
+        agent: Some("secret".into()),
+        ..common::request("Inspect.")
+    }))
+    .await
+    .unwrap()
+    .session;
+    assert_eq!(child.agent().map(|spec| spec.name), Some("secret".into()));
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn precedence_files_layer_host() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("agents");

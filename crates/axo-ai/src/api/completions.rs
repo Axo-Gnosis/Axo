@@ -7,8 +7,7 @@
 //!   keyless local servers work;
 //! - not ported: the GitHub Copilot and opencode-go branches, grammar (custom) tools,
 //!   per-tool strict JSON-schema sampling (axo tools never request it), sampling
-//!   presets, long cache retention and the `PI_CACHE_RETENTION` switch (retention is
-//!   always pi's default `short`), and the `onPayload`/`onResponse` hooks.
+//!   presets, the `PI_CACHE_RETENTION` switch, and the `onPayload`/`onResponse` hooks.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -279,12 +278,10 @@ fn build_params(
     } else {
         None
     };
-    if compat.cache_control_format == Some(CacheControlFormat::Anthropic) {
-        apply_cache_control(
-            &mut converted,
-            tools.as_mut(),
-            &json!({ "type": "ephemeral" }),
-        );
+    if compat.cache_control_format == Some(CacheControlFormat::Anthropic)
+        && let Some(marker) = simple.cache_retention.cache_control()
+    {
+        apply_cache_control(&mut converted, tools.as_mut(), &marker);
     }
 
     let max_tokens = clamp_max_tokens_to_context(

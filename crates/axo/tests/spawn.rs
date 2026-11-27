@@ -57,7 +57,7 @@ async fn spawn_tool_yields_structured_result() {
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "r1",
                 "read",
-                json!({"path":"agent://agent_1/transcript","limit":5}),
+                json!({"path":"agent://agent_1/transcript:1+5"}),
             )])),
             ScriptedTurn::Reply(reply_text("done")),
         ],
@@ -142,9 +142,12 @@ async fn spawn_tool_yields_structured_result() {
         v["type"] == "message" && v["message"]["toolCallId"] == "r1"
     });
     let text = message_text(&lines[transcript]);
-    let (page, remainder) = text.rsplit_once("\n\n[").unwrap();
+    let (header, page) = text.split_once('\n').unwrap();
+    assert!(
+        header.starts_with("agent://agent_1/transcript:1-5 ("),
+        "{text}"
+    );
     assert_eq!(page.lines().count(), 5, "{text}");
-    assert!(remainder.contains("more lines"));
     parent.shutdown().await;
 }
 

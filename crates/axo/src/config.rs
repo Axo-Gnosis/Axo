@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use axo_agent::QueueMode;
-use axo_ai::{Model, Models, ServiceTier, ThinkingLevel};
+use axo_ai::{CacheRetention, Model, Models, ServiceTier, ThinkingLevel};
 use axo_macros::expose;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -31,6 +31,10 @@ pub struct Settings {
     pub default_thinking_level: ThinkingLevel,
     /// What happens to the chosen service tier when the model changes. User settings only.
     pub service_tier: ServiceTierSettings,
+    /// Anthropic prompt-cache lifetime per session kind. User settings only.
+    pub cache_ttl: CacheTtlSettings,
+    /// When axo keeps a 5-minute prompt cache warm; see `CacheWarming`. User settings only.
+    pub cache_warming: CacheWarming,
     /// User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`.
     pub home_agents_dir: bool,
     pub steering_mode: QueueMode,
@@ -39,6 +43,7 @@ pub struct Settings {
     pub nested_context_files: bool,
     pub bash: BashSettings,
     pub ask: AskSettings,
+    pub read: ReadSettings,
     pub project: ProjectSettings,
     pub compaction: CompactionSettings,
     pub retry: RetrySettings,
@@ -58,6 +63,8 @@ impl Default for Settings {
             model_roles: IndexMap::new(),
             default_thinking_level: ThinkingLevel::Medium,
             service_tier: ServiceTierSettings::default(),
+            cache_ttl: CacheTtlSettings::default(),
+            cache_warming: CacheWarming::default(),
             home_agents_dir: false,
             steering_mode: QueueMode::All,
             follow_up_mode: QueueMode::OneAtATime,
@@ -65,6 +72,7 @@ impl Default for Settings {
             nested_context_files: true,
             bash: BashSettings::default(),
             ask: AskSettings::default(),
+            read: ReadSettings::default(),
             project: ProjectSettings::default(),
             compaction: CompactionSettings::default(),
             retry: RetrySettings::default(),
@@ -174,7 +182,7 @@ pub struct SubagentSettings {
     pub default_model: Option<String>,
     /// Agent name → selector.
     pub models: IndexMap<String, String>,
-    /// Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`.
+    /// Children's context files: `"nested"` (default) area files only, `false` none, `true` the session's, or a name→bool map over `contextFiles`.
     #[serde(deserialize_with = "crate::context::agents::context_files_switch")]
     #[specta(type = specta_serde::Phased<Option<ContextFiles>, Option<crate::context::agents::RawContextFiles>>)]
     pub context_files: Option<ContextFiles>,
@@ -190,7 +198,7 @@ impl Default for SubagentSettings {
             max_turns: 50,
             default_model: None,
             models: IndexMap::new(),
-            context_files: Some(ContextFiles::Off),
+            context_files: Some(ContextFiles::Nested),
             service_tier: SubagentTier::Standard,
         }
     }
@@ -229,6 +237,49 @@ impl TierOnModelChange {
             }
         })
     }
+}
+
+/// Anthropic prompt-cache lifetime per session kind. User settings only: 1-hour writes cost more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CacheTtlSettings {
+    /// Root sessions; `None` (default) picks 1h on unpriced first-party Anthropic routes
+    /// (subscription), 5m otherwise.
+    pub root: Option<CacheTtl>,
+    /// Child sessions; default 5m.
+    pub child: CacheTtl,
+}
+
+/// One Anthropic prompt-cache lifetime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+pub enum CacheTtl {
+    #[default]
+    #[serde(rename = "5m")]
+    Short,
+    #[serde(rename = "1h")]
+    Long,
+}
+
+impl From<CacheTtl> for CacheRetention {
+    fn from(ttl: CacheTtl) -> Self {
+        match ttl {
+            CacheTtl::Short => Self::Short,
+            CacheTtl::Long => Self::Long,
+        }
+    }
+}
+
+/// When a 5-minute Anthropic cache is kept warm by re-sending the last request's prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarming {
+    /// Never.
+    Off,
+    /// During pauses inside a run (tool calls, waits), up to 60 minutes.
+    Streaming,
+    /// Also while a root session is idle, up to 30 minutes.
+    #[default]
+    Idle,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
@@ -533,6 +584,8 @@ pub struct BashSettings {
     pub ci: bool,
     /// Milliseconds before a foreground command becomes a background job; zero disables it.
     pub promote_after_ms: u64,
+    /// Refuse a bash command that is one file view or search a built-in tool does.
+    pub block_tool_views: bool,
 }
 
 impl Default for BashSettings {
@@ -544,6 +597,7 @@ impl Default for BashSettings {
             dev_shell_timeout_ms: 600_000,
             ci: true,
             promote_after_ms: 60_000,
+            block_tool_views: false,
         }
     }
 }
@@ -568,6 +622,22 @@ pub enum DevShellMode {
 pub struct AskSettings {
     /// Auto-select the recommended option after this long; `None` waits forever.
     pub timeout_ms: Option<u64>,
+}
+
+/// The `read` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadSettings {
+    /// Unranged reads of Rust, TypeScript, JavaScript or Svelte files of at least this many bytes return an outline; 0 turns outlines off.
+    pub outline_min_bytes: u64,
+}
+
+impl Default for ReadSettings {
+    fn default() -> Self {
+        Self {
+            outline_min_bytes: 24_000,
+        }
+    }
 }
 
 /// Overridable prompt names. Order is irrelevant.
@@ -656,6 +726,19 @@ pub struct EffectiveConfig {
     pub context_files: Vec<PathBuf>,
 }
 
+/// Top-level settings keys only the user layer may set; `EffectiveConfig::resolve` drops
+/// them from project layers.
+pub const USER_ONLY_KEYS: &[&str] = &[
+    "project",
+    "homeAgentsDir",
+    "modelRoles",
+    "subagents",
+    "serviceTier",
+    "cacheTtl",
+    "cacheWarming",
+    "extensions",
+];
+
 #[expose]
 impl EffectiveConfig {
     /// Samples `source.user()`, derives access (`access` overrides the user policy), then,
@@ -669,15 +752,6 @@ impl EffectiveConfig {
         cwd: &Path,
         access: Option<ProjectAccess>,
     ) -> Result<Self, Error> {
-        const USER_ONLY_KEYS: &[&str] = &[
-            "project",
-            "homeAgentsDir",
-            "modelRoles",
-            "subagents",
-            "serviceTier",
-            "extensions",
-        ];
-
         let UserConfig {
             layer: user,
             context_files,

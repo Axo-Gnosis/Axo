@@ -3,7 +3,7 @@
 //! [`SessionTools::run_command`].
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::exec::host::{ExecSpec, Sandbox, find_on_path};
 use crate::jobs::command::{HEAD_BYTES, TAIL_BYTES};
+use crate::tools::shell::{ShellKind, ShellUnit, classify_bash};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use crate::tools::{CommandRequest, SessionTools};
 
@@ -24,6 +25,12 @@ use crate::tools::{CommandRequest, SessionTools};
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
 
 const GUIDELINES: &[Cow<'static, str>] = &[
+    Cow::Borrowed(
+        "Use bash for pipelines, counts, git, jq, builds and tests; use the file tools for viewing and searching files.",
+    ),
+    Cow::Borrowed(
+        "Scope output with the command's own flags (`--quiet`, `--stat`, `-q`, `rg -l`/`-c`). Don't pipe build or test output into `head`/`tail`: the result keeps its head and tail and saves the full log.",
+    ),
     Cow::Borrowed(
         "A background job's result arrives automatically as a message; never poll it with read, sleep or repeated commands. Call wait when you have nothing else to do until it finishes.",
     ),
@@ -50,12 +57,13 @@ pub struct BashRequest {
 
 pub struct BashTool {
     tools: Arc<SessionTools>,
+    block_tool_views: bool,
     parameters: Value,
     description: String,
 }
 
 impl BashTool {
-    pub(crate) fn new(tools: Arc<SessionTools>) -> Self {
+    pub(crate) fn new(tools: Arc<SessionTools>, block_tool_views: bool) -> Self {
         let timed_promotion = if tools.runner.promote_after.is_zero() {
             String::new()
         } else {
@@ -72,6 +80,7 @@ impl BashTool {
         );
         Self {
             tools,
+            block_tool_views,
             description,
             parameters: json!({
                 "type": "object",
@@ -117,7 +126,17 @@ impl Tool for BashTool {
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let args: BashArgs = serde_json::from_value(Value::Object(cx.call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
-        self.tools
+        let units = classify_bash(&args.command);
+        if self.block_tool_views
+            && let [unit] = units.as_slice()
+            && let Some(call) = &unit.equivalent
+        {
+            return Err(ToolError(format!(
+                "This command only views or searches files; call {call} instead (bash.blockToolViews)."
+            )));
+        }
+        let mut output = self
+            .tools
             .run_bash(
                 cx,
                 BashRequest {
@@ -126,7 +145,49 @@ impl Tool for BashTool {
                     background: args.run_async == Some(true),
                 },
             )
-            .await
+            .await?;
+        let promoted = output
+            .details
+            .as_ref()
+            .is_some_and(|details| details.get("job").is_some());
+        if !output.is_error && !promoted {
+            self.attach_viewed(&units, &mut output).await;
+        }
+        Ok(output)
+    }
+}
+
+impl BashTool {
+    /// Attaches nested context files for the files a successful command's view units
+    /// name, as `read` does. Relative paths after `cd`, `pushd` or `popd`, globs,
+    /// variables, URLs and `/proc/` paths are skipped.
+    async fn attach_viewed(&self, units: &[ShellUnit], output: &mut ToolOutput) {
+        let mut after_cd = false;
+        for unit in units {
+            if matches!(unit.program.as_str(), "cd" | "pushd" | "popd") {
+                after_cd = true;
+                continue;
+            }
+            if unit.kind != ShellKind::View {
+                continue;
+            }
+            for path in &unit.paths {
+                let relative = !Path::new(path).is_absolute() && !path.starts_with('~');
+                if path.contains(['*', '?', '[', '{', '$', '`'])
+                    || path.starts_with("/proc/")
+                    || self.tools.parse_url(path).ok().flatten().is_some()
+                    || (after_cd && relative)
+                {
+                    continue;
+                }
+                output.content.extend(
+                    self.tools
+                        .context
+                        .attach(&self.tools.resolve_path(path))
+                        .await,
+                );
+            }
+        }
     }
 }
 

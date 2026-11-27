@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use axo_agent::AgentMessage;
 use axo_ai::estimate::estimate_text_tokens;
-use axo_ai::{AssistantBlock, Message, UserBlock};
+use axo_ai::{AssistantBlock, Message, ToolCall, UserBlock};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use super::Limits;
+use super::{ClearGoal, Limits};
 use crate::Error;
 use crate::context::skills::Skill;
 use crate::schemes::artifact::Artifacts;
@@ -20,12 +21,21 @@ use crate::store::{
 };
 use crate::tools::{FileAccess, file_key, ledger_records};
 
+/// Text spans below this many tokens are never elided: the marker would save too little.
+const MIN_ELIDE_TOKENS: u64 = 400;
+
 #[derive(Clone, Copy)]
 pub(crate) enum ElisionMode {
     Elide,
     Images,
     Thinking,
-    Clearing { limits: Limits },
+    /// Automatic clearing; `gemini` leaves tool calls of the current turn (after the last
+    /// real user message) untouched.
+    Clearing {
+        limits: Limits,
+        goal: ClearGoal,
+        gemini: bool,
+    },
 }
 
 pub(crate) struct Artifact {
@@ -54,15 +64,10 @@ pub(crate) fn prepare(
     skills: &[Skill],
     mode: ElisionMode,
 ) -> Result<Option<Elision>, Error> {
-    let clearing_target = if let ElisionMode::Clearing { limits } = mode {
-        let Some(target) = limits.clearing_target() else {
-            return Ok(None);
-        };
-        Some(target)
-    } else {
-        None
+    let (clearing, gemini) = match mode {
+        ElisionMode::Clearing { gemini, .. } => (true, gemini),
+        _ => (false, false),
     };
-    let clearing = clearing_target.is_some();
     let messages = &projection.messages;
     let sources =
         projection
@@ -89,7 +94,10 @@ pub(crate) fn prepare(
     }
     let mut recent = 0u64;
     let mut age_protected = HashSet::new();
-    let window = if clearing { 40_000 } else { 4_000 };
+    let window = match mode {
+        ElisionMode::Clearing { limits, .. } => limits.protect_window(),
+        _ => 4_000,
+    };
     for (index, message) in messages.iter().enumerate().rev() {
         if matches!(message, AgentMessage::Llm(Message::System(_))) {
             continue;
@@ -102,9 +110,27 @@ pub(crate) fn prepare(
         }
         recent = recent.saturating_add(super::message_tokens(message));
     }
+    // Calls whose results this pass may clear: their large edit/write arguments go too.
+    let aged_calls: HashSet<&str> = messages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            clearing && !protected.contains(index) && !age_protected.contains(index)
+        })
+        .filter_map(|(_, message)| match message {
+            AgentMessage::Llm(Message::ToolResult(result)) => Some(result.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let stub_before = if gemini {
+        messages.iter().rposition(super::real_user).unwrap_or(0)
+    } else {
+        usize::MAX
+    };
     let mut recoveries = Vec::new();
     let mut replacements = Vec::new();
-    let mut candidate_tokens = super::estimate_messages(messages);
+    let initial = super::estimate_messages(messages);
+    let mut candidate_tokens = initial;
     for (id, range) in sources {
         // An ordinary source projects exactly one message. Never reinterpret a
         // checkpoint's system+summary pair as editable source content.
@@ -127,14 +153,21 @@ pub(crate) fn prepare(
             continue;
         }
         let tool_result = matches!(message, AgentMessage::Llm(Message::ToolResult(_)));
-        if clearing && !tool_result {
+        let stubbable = !aged_calls.is_empty()
+            && matches!(message, AgentMessage::Llm(Message::Assistant(_)))
+            && index < stub_before;
+        if clearing && !tool_result && !stubbable {
             continue;
         }
         let (updated, content) = match message {
             AgentMessage::Llm(Message::Assistant(message)) => {
-                let Some(blocks) =
-                    elide_assistant_blocks(&message.content, mode, artifacts, &mut recoveries)
-                else {
+                let Some(blocks) = elide_assistant_blocks(
+                    &message.content,
+                    mode,
+                    &aged_calls,
+                    artifacts,
+                    &mut recoveries,
+                ) else {
                     continue;
                 };
                 let mut updated = message.clone();
@@ -171,8 +204,8 @@ pub(crate) fn prepare(
             .saturating_add(super::message_tokens(&updated));
         replacements.push((id.clone(), ContextReplacement { content }));
     }
-    if let Some(target) = clearing_target
-        && (replacements.is_empty() || candidate_tokens > target)
+    if let ElisionMode::Clearing { goal, .. } = mode
+        && (replacements.is_empty() || !goal.met(initial, candidate_tokens))
     {
         return Ok(None);
     }
@@ -184,8 +217,7 @@ pub(crate) fn prepare(
 
 fn elide_text(
     text: &str,
-    ranges: Vec<Range<usize>>,
-    mode: ElisionMode,
+    ranges: impl IntoIterator<Item = Range<usize>, IntoIter: DoubleEndedIterator>,
     artifacts: &Artifacts,
     recoveries: &mut Vec<Artifact>,
 ) -> Option<String> {
@@ -193,9 +225,7 @@ fn elide_text(
     for range in ranges.into_iter().rev() {
         let original = &text[range.clone()];
         let tokens = estimate_text_tokens(original);
-        if (!matches!(mode, ElisionMode::Clearing { .. }) && tokens < 400)
-            || original.contains("[shaken ")
-        {
+        if tokens < MIN_ELIDE_TOKENS || original.contains("[shaken ") {
             continue;
         }
         let (n, recovery) = artifact(artifacts, "txt", original.as_bytes().to_vec());
@@ -230,29 +260,17 @@ fn elide_user_blocks(
                 } else {
                     block_ranges(text)
                 };
-                elide_text(text, ranges, mode, artifacts, recoveries)
-                    .map(|text| UserBlock::Text { text })
+                elide_text(text, ranges, artifacts, recoveries).map(|text| UserBlock::Text { text })
             }
-            (ElisionMode::Images, UserBlock::Image { data, mime_type }) if !has_skill => {
-                let bytes = STANDARD
-                    .decode(data.as_ref())
-                    .map_err(|error| Error::Compaction(format!("cannot recover image: {error}")))?;
-                let extension = match mime_type.as_str() {
-                    "image/png" => "png",
-                    "image/jpeg" => "jpg",
-                    "image/gif" => "gif",
-                    "image/webp" => "webp",
-                    "image/avif" => "avif",
-                    "image/svg+xml" => "svg",
-                    "image/bmp" => "bmp",
-                    "image/tiff" => "tiff",
-                    "image/x-icon" => "ico",
-                    _ => "bin",
-                };
-                let (n, recovery) = artifact(artifacts, extension, bytes);
-                let text = format!("[shaken image; full image: artifact://{n}]");
-                recoveries.push(recovery);
-                Some(UserBlock::Text { text })
+            (ElisionMode::Images, UserBlock::Image { data, mime_type }) if !has_skill => Some(
+                image_stub(data, mime_type, artifacts, recoveries)
+                    .map_err(|error| Error::Compaction(format!("cannot recover image: {error}")))?,
+            ),
+            // Clearing skips an undecodable image instead of failing the pass.
+            (ElisionMode::Clearing { .. }, UserBlock::Image { data, mime_type })
+                if tool_result && !has_skill =>
+            {
+                image_stub(data, mime_type, artifacts, recoveries).ok()
             }
             _ => None,
         };
@@ -263,9 +281,36 @@ fn elide_user_blocks(
     Ok(updated)
 }
 
+fn image_stub(
+    data: &str,
+    mime_type: &str,
+    artifacts: &Artifacts,
+    recoveries: &mut Vec<Artifact>,
+) -> Result<UserBlock, base64::DecodeError> {
+    let bytes = STANDARD.decode(data)?;
+    let extension = match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "image/x-icon" => "ico",
+        _ => "bin",
+    };
+    let (n, recovery) = artifact(artifacts, extension, bytes);
+    recoveries.push(recovery);
+    Ok(UserBlock::Text {
+        text: format!("[shaken image; full image: artifact://{n}]"),
+    })
+}
+
 fn elide_assistant_blocks(
     blocks: &[AssistantBlock],
     mode: ElisionMode,
+    aged_calls: &HashSet<&str>,
     artifacts: &Artifacts,
     recoveries: &mut Vec<Artifact>,
 ) -> Option<Vec<AssistantBlock>> {
@@ -274,31 +319,73 @@ fn elide_assistant_blocks(
     );
     let mut updated = None;
     for (index, block) in blocks.iter().enumerate() {
-        let text = match (mode, block) {
-            (
-                ElisionMode::Elide | ElisionMode::Clearing { .. },
-                AssistantBlock::Text { text, .. },
-            ) => elide_text(text, block_ranges(text), mode, artifacts, recoveries),
+        let replacement = match (mode, block) {
+            (ElisionMode::Elide, AssistantBlock::Text { text, .. }) => {
+                elide_text(text, block_ranges(text), artifacts, recoveries).map(|text| {
+                    AssistantBlock::Text {
+                        text,
+                        text_signature: None,
+                    }
+                })
+            }
             (ElisionMode::Thinking, AssistantBlock::Thinking { .. }) if !has_skill => {
                 let (n, recovery) = artifact(
                     artifacts,
                     "json",
                     serde_json::to_vec(&block).expect("content blocks serialize"),
                 );
-                let text = format!("[shaken thinking; full thinking: artifact://{n}]");
                 recoveries.push(recovery);
-                Some(text)
+                Some(AssistantBlock::Text {
+                    text: format!("[shaken thinking; full thinking: artifact://{n}]"),
+                    text_signature: None,
+                })
+            }
+            (ElisionMode::Clearing { .. }, AssistantBlock::ToolCall(call))
+                if matches!(call.name.as_str(), "edit" | "write")
+                    && aged_calls.contains(call.id.as_str()) =>
+            {
+                stub_arguments(call, artifacts, recoveries).map(AssistantBlock::ToolCall)
             }
             _ => None,
         };
-        if let Some(text) = text {
-            updated.get_or_insert_with(|| blocks.to_vec())[index] = AssistantBlock::Text {
-                text,
-                text_signature: None,
-            };
+        if let Some(replacement) = replacement {
+            updated.get_or_insert_with(|| blocks.to_vec())[index] = replacement;
         }
     }
     updated
+}
+
+/// `call` with its large `write` content or `edit` texts elided; `path` and the JSON shape stay.
+fn stub_arguments(
+    call: &ToolCall,
+    artifacts: &Artifacts,
+    recoveries: &mut Vec<Artifact>,
+) -> Option<ToolCall> {
+    let mut stubbed = call.clone();
+    let mut changed = false;
+    let mut stub = |value: &mut Value| {
+        if let Value::String(text) = value
+            && let Some(marker) =
+                elide_text(text, std::iter::once(0..text.len()), artifacts, recoveries)
+        {
+            *text = marker;
+            changed = true;
+        }
+    };
+    if call.name == "write" {
+        if let Some(content) = stubbed.arguments.get_mut("content") {
+            stub(content);
+        }
+    } else if let Some(Value::Array(edits)) = stubbed.arguments.get_mut("edits") {
+        for edit in edits {
+            for key in ["oldText", "newText"] {
+                if let Some(text) = edit.get_mut(key) {
+                    stub(text);
+                }
+            }
+        }
+    }
+    changed.then_some(stubbed)
 }
 
 pub(crate) async fn write_artifacts(dir: &Path, artifacts: &[Artifact]) -> Result<(), Error> {

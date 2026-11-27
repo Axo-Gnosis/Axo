@@ -176,10 +176,7 @@ pub(crate) fn checkpoint_completed(
     });
     after < before
         && ((checkpoint && after <= limits.trigger)
-            || (clearing
-                && limits
-                    .clearing_target()
-                    .is_some_and(|target| after <= target)))
+            || (clearing && after <= limits.clearing_target()))
 }
 
 /// What opening a session must do about its last `run_start` without a `run_end`, or

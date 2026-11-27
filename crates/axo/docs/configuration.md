@@ -32,7 +32,7 @@ Definition roots are Rust fields on `ConfigLayer`, not keys in the settings JSON
 2. **Validate the user settings on their own:** `None` or `null` is no settings; a non-object is `Error::Config { origin, message: "expected a JSON object" }`; a value that does not deserialize as `Settings` is `Error::Config` with the layer's `origin` and the deserializer's message. The valid object is merged over the defaults.
 3. **Validate the user prompt overrides:** a name outside `PROMPT_NAMES` is `Error::Config` with that override's `origin` and the message `unknown prompt override "<name>"`; texts are trimmed.
 4. **Derive access:** an explicit `access` wins; otherwise the `project` policy of this same user sample decides via `ProjectSettings::access_for(project_root(cwd))` (see [Project access](#project-access-project--axoprojectsettings)). A project layer can never raise its own access.
-5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project`, `homeAgentsDir`, `modelRoles`, `serviceTier`, `subagents`, and `extensions`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. Project definition roots follow the [project resource gates](#project-resources). At `Ignore`, or with `project.files.config: false`, `project` is not called and no project contribution applies.
+5. **Apply the project layer unless access is `Ignore` or the user's `project.files.config` is `false`:** call `source.project(cwd)` and validate its settings as in step 2 before any filtering, so an invalid value fails with the project's `origin` even for a key that would be stripped. Strip the user-only keys `project`, `homeAgentsDir`, `modelRoles`, `serviceTier`, `cacheTtl`, `cacheWarming`, `subagents`, and `extensions`, logging a `tracing` warning carrying the layer's `origin` for each stripped key. The rest deep-merges over the user settings: objects merge key by key with the project winning, arrays and scalars replace. Project prompt overrides (validated as in step 3) replace the user's per name, at `Read` and `Trust`. Project definition roots follow the [project resource gates](#project-resources). At `Ignore`, or with `project.files.config: false`, `project` is not called and no project contribution applies.
 6. **Deserialize the merged object** into `Settings`; an error is attributed to the last applied origin (the project's when project settings were merged, else the user's). Below `Trust`, any enabled `bash.devShell` resolves to `"off"`, regardless of which layer enabled it, with one warning naming that setting's winning origin.
 
 Project skill roots from the acquired layer precede user roots and require the user's `project.files.skills` at both `Read` and `Trust`. `project.files.config: false` prevents acquiring that layer at all. User skill roots are never gated by project settings. Discovery still searches project `.agents/skills` before explicit roots and optional home `.agents/skills` afterward.
@@ -100,6 +100,8 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
   "defaultModel": null,
   "modelRoles": {},
   "serviceTier": { "onModelChange": "reset" },
+  "cacheTtl": { "root": null, "child": "5m" },
+  "cacheWarming": "idle",
   "subagents": {
     "maxDepth": 1,
     "maxConcurrent": 8,
@@ -107,7 +109,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
     "defaultModel": null,
     "serviceTier": "standard",
     "models": {},
-    "contextFiles": false
+    "contextFiles": "nested"
   },
   "defaultThinkingLevel": "medium",
   "homeAgentsDir": false,
@@ -127,10 +129,14 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
     "devShellWatch": [],
     "devShellTimeoutMs": 600000,
     "ci": true,
-    "promoteAfterMs": 60000
+    "promoteAfterMs": 60000,
+    "blockToolViews": false
   },
   "ask": {
     "timeoutMs": null
+  },
+  "read": {
+    "outlineMinBytes": 24000
   },
   "keywords": {
     "enabled": true,
@@ -167,6 +173,8 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `defaultModel` | `default_model` | `None` | User or project | A [model selector](#model-selectors). Accepts `$ENV` (see [Config values](#config-values)); resolved by `EffectiveConfig::default_model` only when a session falls back to it and references `$NAME`/`${NAME}` (`$$`/`$!` escapes alone leave it unchanged). Values starting with `!` are rejected when selected |
 | `defaultThinkingLevel` | `default_thinking_level` | `"medium"` | User or project | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (clamped to the active model via `clamp_level`) |
 | `serviceTier` | `service_tier` | {"onModelChange": "reset"} | User only | `onModelChange` controls a switch to another model without an explicit tier: "reset" selects standard; "keep" carries the chosen tier over |
+| `cacheTtl` | `cache_ttl` | {"root": null, "child": "5m"} | User only | Anthropic prompt-cache lifetime (`CacheTtlSettings`) of root and child sessions, `"5m"` or `"1h"`. See [Prompt caching](#prompt-caching-cachettl--cachewarming) |
+| `cacheWarming` | `cache_warming` | `"idle"` | User only | `CacheWarming`: `"off"`; `"streaming"` warms during pauses inside a run only; `"idle"` also warms an idle root session for up to 30 minutes. See [Prompt caching](#prompt-caching-cachettl--cachewarming) |
 | `modelRoles` | `model_roles` | `{}` | User only | Role name → [model selector](#model-selectors); expanded by `@role`. A role cannot name another role. Ignored with a warning in project settings |
 | `homeAgentsDir` | `home_agents_dir` | `false` | User only | Also load `~/.agents/AGENTS.md` and `~/.agents/skills/`. Ignored with a warning in project settings |
 | `steeringMode` | `steering_mode` | `"all"` | User or project | `QueueMode::All` (`"all"`, every queued steer enters at the next drain point) or `QueueMode::OneAtATime` (`"one-at-a-time"`, one per drain point) |
@@ -175,12 +183,26 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
 | `bash` | `bash` | See below | User or project | Supervised subprocess and dev-shell execution (`BashSettings`) |
 | `ask` | `ask` | See below | User or project | Question tool configuration (`AskSettings`) |
+| `read` | `read` | See below | User or project | `read` tool output (`ReadSettings`) |
 | `keywords` | `keywords` | See below | User or project | Keyword matching switches (`KeywordSettings`) |
 | `project` | `project` | See below | User only | Project access boundaries and policy (`ProjectSettings`) |
 | `compaction` | `compaction` | See below | User or project | Session compaction triggers and reserve (`CompactionSettings`) |
 | `retry` | `retry` | See below | User or project | Transient model request retry policy (`RetrySettings`) |
 | `subagents` | `subagents` | See below | User only | Child-session budgets and defaults (`SubagentSettings`). Ignored with a warning in project settings |
 | `extensions` | `extensions` | `[]` | User only | Enabled extension packages in priority order (`EnabledExtension`). Ignored with a warning in project settings. See [Extensions](#extensions-extensions--axoenabledextension) |
+
+### Prompt caching (`cacheTtl` / `cacheWarming`)
+
+`cacheTtl` controls breakpoint lifetime on Anthropic Messages and Anthropic-format Chat Completions rows (`cacheControlFormat`). On Anthropic Messages, axo marks the system prompt, the last tool, and the last user or system message.
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `cacheTtl.root` | `root` | `null` | `null`: `1h` on unpriced `https://api.anthropic.com` Anthropic Messages routes (subscription), `5m` otherwise |
+| `cacheTtl.child` | `child` | `"5m"` | Child sessions' lifetime |
+
+- **One lifetime per request:** `1h` marks tools, system and messages together, so no 5-minute breakpoint precedes a 1-hour one. The route default applies when the model's `api` is Anthropic Messages, its `cost` is unknown, and its base URL is `https://api.anthropic.com`. One-shot separate summary requests carry no breakpoints.
+- **Warming:** only 5-minute caches on Anthropic Messages are warmed. 270 seconds after the last request was sent (or the last warm), while the session pauses, axo re-sends the same prefix with `max_tokens: 0`, non-streaming and without thinking. Inside a run (tool calls, waits, children) it warms for up to 60 minutes after the request; an idle root session with `"idle"` warms for up to 30 minutes; children never warm while idle. A warm is sent only when its expected saving reaches 12,500 input-token equivalents, priced from the model's cache write and read prices (else the `anthropic` catalog row, else 1.25 and 0.1 on a subscription route), and only while the cache is still live. A model without prices never warms, nor does budget (non-adaptive) thinking. A new request, compaction, navigation, or a model, thinking or tier change stops warming the old prefix; a warm the provider rejects with HTTP 400 turns warming off for the session.
+- **Usage:** hosts see warm requests as `usage` entries with `kind: "cache_warm"`; a warm is never a turn and never enters context.
 
 ### Model selectors
 
@@ -208,11 +230,11 @@ The whole block is **user-only**, including in trusted projects. These settings 
 | `subagents.defaultModel` | `default_model` | `None` | Fallback child model selector before inheriting the parent's live model |
 | `subagents.models` | `models` | `{}` | Catalog agent name → model selector |
 | subagents.serviceTier | `service_tier` | "standard" | Without a tier suffix through the winning child selector, "standard" selects no tier; "inherit" uses the parent's chosen tier |
-| `subagents.contextFiles` | `context_files` | `false` | Default child context-file policy: `false` disables home, user, project, and nested context files; `true` uses the inherited session settings; a name-to-boolean map overrides the inherited `contextFiles` map |
+| `subagents.contextFiles` | `context_files` | `"nested"` | Default child context-file policy: `"nested"` loads no startup files and attaches context files from directories below the project root on first touch; files in the root directory and user/home files never attach. `false` disables home, user, project, and nested context files; `true` uses the inherited session settings; a name-to-boolean map overrides the inherited `contextFiles` map |
 
 Child model selection considers `SpawnRequest::model`, the named agent's entry in `subagents.models`, the resolved spec's model, then `subagents.defaultModel`. The first selector naming a model wins; otherwise the parent's live model is inherited. The first thinking suffix encountered through that winning selector wins, otherwise the parent's live thinking level is used, clamped to the selected model. These child selectors use [model selector](#model-selectors) syntax, not the environment-expanding `defaultModel` fallback.
 
-An agent's explicit context-file map or `false` overrides the child default. Omitted or `true` on the agent uses `subagents.contextFiles`. Children always disable `ask` and inherit the current host prompt sections; see [Child prompts](prompts-and-context.md#child-prompts).
+An agent's explicit context-file map, `"nested"`, or `false` overrides the child default. Omitted or `true` on the agent uses `subagents.contextFiles`. Children always disable `ask` and inherit the current host prompt sections; see [Child prompts](prompts-and-context.md#child-prompts).
 
 See [Spawning child sessions](extending.md#spawning-child-sessions) and [Spawning and returning results](prompts-and-context.md#spawning-and-returning-results) for call-level `output` overrides, team resolution, and child tool filtering, and [Root-session modes](extending.md#root-session-modes) for inherited mode tool limits.
 
@@ -244,6 +266,7 @@ A Rust host can override the resolved access level per session via `SessionOptio
 | `bash.devShellTimeoutMs` | `dev_shell_timeout_ms` | `600000` | Timeout in milliseconds for `nix print-dev-env` or `direnv export json` |
 | `bash.ci` | `ci` | `true` | Set `CI=true` in the command environment |
 | `bash.promoteAfterMs` | `promote_after_ms` | `60000` | Promote a still-running command to a background job after this many milliseconds; `0` disables timed promotion, but explicit async execution and pending steering still promote. Applies to `bash` and host tools using `SessionTools::run_command` |
+| `bash.blockToolViews` | `block_tool_views` | `false` | Refuse a `bash` command that is a single file view or search a built-in tool can do (no compound, no redirect, no filter but `head`, `tail` or `sed -n 'A,Bp'`); the error names the replacement call. Hosts can build their own policy on `axo::classify_bash` |
 
 In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<cache_dir>/devshell/<hash>/gcroot` under the host's `AxoBuilder::cache_dir`, where `<hash>` is a 16-hex-digit key of flake dir, ref, system, and `devShellWatch` globs), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
 
@@ -336,6 +359,12 @@ Both keys apply only to root sessions; children never match keywords. Disabled k
 | `ask.timeoutMs` | `timeout_ms` | `None` | Optional timeout in milliseconds for `ask` tool calls. When it elapses, only the model's `recommended` option(s), `prefill` and `default` values are submitted, with `null` for every question without one; the first option is never guessed. The result is not an error and its `details` carry `"timedOut": true`. See [Ask documents for hosts](extending.md#ask-documents-for-hosts) |
 
 A queued steer settles a pending question instead of waiting behind it: `ask` returns a non-error result, "The user did not answer. They sent a message instead; it follows this result.", with `details.outcome == "steered"`, and the steer is delivered right after. See [Queued input for hosts](extending.md#queued-input-for-hosts).
+
+### Read tool (`read` / `axo::ReadSettings`)
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `read.outlineMinBytes` | `outline_min_bytes` | `24000` | Unranged reads of `.rs`, `.ts`, `.tsx`, `.js`, `.mjs` or `.svelte` files at least this large return a declaration outline (`N⇥` rows, `… a-b` folds, a footer naming a selector); `0` disables. Ranged reads are always verbatim |
 
 ### Compaction (`compaction` / `axo::CompactionSettings`)
 
@@ -443,6 +472,7 @@ Model metadata is data: new models and changed limits, prices, thinking levels a
 - **Catalog (`models.dev` v2):** cached as `<cache_dir>/models.dev.v2.json`. A row becomes a model when it is a tool-calling `chat` model with a servable `api` entry: one keyed `messages` (`"anthropic-messages"`), `generate-content` (`"google-generative-ai"`), `responses` (`"openai-responses"`) or `chat-completions` (`"openai-completions"`), whatever SDK package it names, at a `base_url` that resolves (env templates such as `${AZURE_RESOURCE_NAME}` resolve like [config values](#config-values); entries that do not are skipped). The row's `recommended_api` entry is used when servable; otherwise the first servable entry in the order `messages`, `generate-content`, `responses`, `chat-completions` (a model's native wire before the OpenAI-compatible shim). Entries naming a package that is not the wire its key names, or that needs auth axo lacks, are never servable: `gitlab-ai-provider`, `watsonx-ai-provider`, `@jerome-benoit/sap-ai-provider-v2` (their own API paths and auth), `@ai-sdk/google-vertex` and `@ai-sdk/google-vertex/anthropic` (Google Cloud credentials), `@ai-sdk/azure` (an `api-key` header rather than a bearer key) and `@ai-sdk/amazon-bedrock/mantle` (AWS credentials). Only providers that contribute a model are listed, with their `env` variables. Mapped fields: name, the smaller of the `context` and `input` limits, `output` as `maxTokens`, image input, `reasoning`, prices (the 5-minute cache-write price when several TTLs are listed, and context-size overrides as `cost.tiers`).
 - **Thinking levels:** levels follow the row's `reasoning.effort` list; a level it does not list is unsupported. Off maps to `"none"` when listed, stays available when the row has a `toggle` or `budget`, and is unsupported otherwise. Anthropic Messages rows with efforts and no `budget` use adaptive thinking (`forceAdaptiveThinking`); with a `budget` they keep budget thinking and the default levels.
 - **Anthropic Messages capabilities:** `temperature: false` sets `supportsTemperature: false`; system and effort updates set `supportsMidConvoSystemMessages` and `supportsMidConvoEffort`, and tool updates listing add, remove and replace set `supportsMidConvoToolChanges`. The same flags are not mapped for Chat Completions rows; set them with `compat` where wanted.
+- **OpenAI Responses rows:** a row flagged `supportsMidConvoSystemMessages` sends the prompt as a leading `developer` input item and later prompt changes as further items, instead of top-level `instructions`. First-party `openai` rows set the flag; host-registered rows (for example Codex) set it themselves.
 - **Subscription providers:** axo has none built in. Providers that sign in to a subscription (for example ChatGPT Codex or a Claude subscription) are registered by the host with `Models::register`, using `transport`, `list_models`, `usage` and `compat.toolNamePrefix` for their wire differences and account limits (see [Runtime providers, login, and reload](#runtime-providers-login-and-reload)).
 - **Loading:** `Models::load` reads the catalog cache and the [runtime model list](#runtime-providers-login-and-reload) cache. When the catalog cache is missing it fetches the catalog once before building; a failure logs a warning and loads without the catalog.
 - **Refresh:** `Models::refresh()` fetches the catalog, re-runs discovery and rebuilds in place, then re-lists runtime providers that list their models; registrations are kept. A catalog that fails to download or parse, or contains no usable model, returns `Err`, is not cached, and leaves the previous catalog in place; a failed discovery request or listing only logs and keeps the previous models. With a cache directory, a timer runs it every `refreshInterval` seconds, first when the cached catalog reaches that age (at once if it is older). Hosts call `refresh` to fetch on demand.

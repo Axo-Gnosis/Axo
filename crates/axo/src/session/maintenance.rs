@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axo_agent::{Agent, AgentMessage};
-use axo_ai::{Message, Model, Usage};
+use axo_ai::{ApiKind, Message, Model, Usage};
 use axo_macros::expose;
 use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
@@ -11,7 +11,8 @@ use super::SessionEvent;
 use super::delivery::Claim;
 use super::journal::{self, View};
 use super::{Selection, Session, SessionHooks, detached};
-use crate::compaction::{self, Limits};
+use crate::compaction::elide::ElisionMode;
+use crate::compaction::{self, ClearGoal, Limits};
 use crate::config::{CompactionSettings, SummaryRequest};
 use crate::error::Error;
 use crate::store::{CompactionReason, Entry, EntryId, SeqEntry, project};
@@ -62,6 +63,10 @@ pub enum MaintenanceKind {
 }
 
 const SUMMARY_ATTEMPTS: u32 = 3;
+/// Cold-cache clearing runs only on prompts at least this large, and only when it
+/// removes at least `COLD_CLEAR_MIN_REMOVED` tokens.
+const COLD_CLEAR_MIN_PROMPT: u64 = 150_000;
+const COLD_CLEAR_MIN_REMOVED: u64 = 20_000;
 enum MaintenanceOperation {
     Compact {
         focus: Option<String>,
@@ -79,6 +84,7 @@ pub(super) struct Maintenance {
     pub(super) prompts: compaction::summary::SummaryPrompts,
     pub(super) cancel: Mutex<Option<CancellationToken>>,
 }
+
 impl SessionHooks {
     pub(super) fn cancel_maintenance(&self, shutdown: bool) {
         if shutdown {
@@ -201,12 +207,12 @@ impl SessionHooks {
         compaction::validate_projection(&projected, before, limits, require_trigger)
     }
 
-    async fn save_usage(
+    pub(super) async fn save_usage(
         &self,
         kind: &str,
         model: &Model,
         usage: Usage,
-        note: String,
+        note: Option<String>,
     ) -> Result<(), Error> {
         if usage == Usage::default() || self.shutdown.load(Ordering::Acquire) {
             return Ok(());
@@ -217,7 +223,7 @@ impl SessionHooks {
             provider: model.provider.clone(),
             model: model.id.clone(),
             usage,
-            note: Some(note),
+            note,
         }])
         .await?;
         Ok(())
@@ -254,7 +260,7 @@ impl SessionHooks {
                     kind,
                     &model,
                     std::mem::take(&mut failure.usage),
-                    failure.message.clone(),
+                    Some(failure.message.clone()),
                 )
                 .await?;
                 let terminal = failure.fatal || failure.aborted;
@@ -263,11 +269,7 @@ impl SessionHooks {
         }
     }
 
-    async fn elide(
-        &self,
-        mode: compaction::elide::ElisionMode,
-        cancel: &CancellationToken,
-    ) -> Result<bool, Error> {
+    async fn elide(&self, mode: ElisionMode, cancel: &CancellationToken) -> Result<bool, Error> {
         let (artifacts, pending, revision) = {
             let view = self.journal.view();
             let before = compaction::estimate(&view.projection);
@@ -291,14 +293,11 @@ impl SessionHooks {
                     replacement: Some(replacement),
                 })
                 .collect();
-            if let compaction::elide::ElisionMode::Clearing { limits } = mode {
+            if let ElisionMode::Clearing { limits, goal, .. } = mode {
                 let Ok(after) = Self::candidate(&view, &pending, before, &limits, true) else {
                     return Ok(false);
                 };
-                if limits
-                    .clearing_target()
-                    .is_some_and(|target| after > target)
-                {
+                if !goal.met(before, after) {
                     return Ok(false);
                 }
             }
@@ -333,12 +332,15 @@ impl SessionHooks {
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
         let automatic = reason != CompactionReason::Manual;
-        if automatic
-            && self
-                .elide(compaction::elide::ElisionMode::Clearing { limits }, cancel)
-                .await?
-        {
-            return Ok(true);
+        if automatic {
+            let mode = ElisionMode::Clearing {
+                limits,
+                goal: ClearGoal::Below(limits.clearing_target()),
+                gemini: self.model().api == ApiKind::GoogleGenerativeAi,
+            };
+            if self.elide(mode, cancel).await? {
+                return Ok(true);
+            }
         }
         let mut method = if reason == CompactionReason::Overflow {
             SummaryRequest::Separate
@@ -431,7 +433,7 @@ impl SessionHooks {
                                 "compaction",
                                 &model,
                                 generated.usage,
-                                error.to_string(),
+                                Some(error.to_string()),
                             )
                             .await?;
                             if !matches!(error, Error::Compaction(_) | Error::ContextChanged) {
@@ -455,11 +457,30 @@ impl SessionHooks {
         if !self.maintenance.settings.enabled {
             return Ok(false);
         }
-        let limits = Limits::resolve(&self.model(), &self.maintenance.settings)?;
-        if reason == CompactionReason::Threshold
-            && compaction::estimate(&self.journal.view().projection) <= limits.trigger
-        {
-            return Ok(false);
+        let model = self.model();
+        let limits = Limits::resolve(&model, &self.maintenance.settings)?;
+        if reason == CompactionReason::Threshold {
+            let estimate = compaction::estimate(&self.journal.view().projection);
+            if estimate <= limits.trigger {
+                // Below the trigger clearing runs alone and never escalates to a summary.
+                // ponytail: re-scans each request between thresholds; remember the failed revision if profiles show it
+                let goal = if estimate >= COLD_CLEAR_MIN_PROMPT && self.cache_cold() {
+                    ClearGoal::Remove(COLD_CLEAR_MIN_REMOVED)
+                } else if estimate > limits.clear_at {
+                    ClearGoal::Below(limits.clear_at.saturating_sub(limits.headroom()))
+                } else {
+                    return Ok(false);
+                };
+                let mode = ElisionMode::Clearing {
+                    limits,
+                    goal,
+                    gemini: model.api == ApiKind::GoogleGenerativeAi,
+                };
+                self.reserve(MaintenanceKind::Compact, false, cancel.clone())?;
+                return self
+                    .maintained(false, self.elide(mode, cancel), || {})
+                    .await;
+            }
         }
         self.reserve(MaintenanceKind::Compact, false, cancel.clone())?;
         self.maintained(
@@ -576,7 +597,7 @@ impl SessionHooks {
         };
         if let Err(error) = committed {
             if let Some((usage, model)) = usage {
-                self.save_usage("branch_summary", &model, usage, error.to_string())
+                self.save_usage("branch_summary", &model, usage, Some(error.to_string()))
                     .await?;
             }
             return Err(error);

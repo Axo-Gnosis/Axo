@@ -205,7 +205,7 @@ pub(crate) async fn dispatch(
     }
     let status = response.status;
     reply.message.failure = Some(response_failure(&response));
-    let text = error_body(response, cancel)
+    let text = read_body(response, cancel)
         .await
         .ok_or_else(|| ABORTED.to_owned())?;
     let body = serde_json::from_str::<serde_json::Value>(&text).ok();
@@ -248,9 +248,12 @@ pub(crate) async fn read_sse(
     }
 }
 
-/// The body of an unsuccessful response, or `None` when `cancel` fires first: the shared
-/// client has no global timeout, so an error body that never finishes must not pin a request.
-async fn error_body(response: ProviderResponse, cancel: &CancellationToken) -> Option<String> {
+/// A whole response body, or `None` when `cancel` fires first: the shared client has no
+/// global timeout, so a body that never finishes must not pin a request.
+pub(crate) async fn read_body(
+    response: ProviderResponse,
+    cancel: &CancellationToken,
+) -> Option<String> {
     let collect = async {
         let mut bytes = Vec::new();
         let mut body = response.body;
@@ -381,7 +384,7 @@ mod tests {
         .unwrap();
         assert_eq!(response.status().as_u16(), 400);
         let cancel = CancellationToken::new();
-        let mut body = pin!(error_body(response.into(), &cancel));
+        let mut body = pin!(read_body(response.into(), &cancel));
         assert!(futures::poll!(body.as_mut()).is_pending());
         cancel.cancel();
         assert_eq!(

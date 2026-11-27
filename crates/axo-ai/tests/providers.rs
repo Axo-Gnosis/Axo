@@ -1174,6 +1174,70 @@ async fn keyless_responses_rewrite_reaches_http() {
     }
 }
 
+#[tokio::test]
+async fn responses_send_prompt_as_leading_developer_item() {
+    let (url, server) = server(2);
+    let mut flagged = model("lab", "flagged", ApiKind::OpenAiResponses, &url);
+    flagged.reasoning = true;
+    flagged.compat.supports_mid_convo_system_messages = Some(true);
+    let mut plain = model("lab", "plain", ApiKind::OpenAiResponses, &url);
+    plain.reasoning = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (models, _) = load(&dir).await;
+    models
+        .register(
+            "host",
+            provider("lab", vec![flagged.clone(), plain.clone()]),
+        )
+        .unwrap();
+    let system = |text: &str| {
+        Message::System(SystemMessage {
+            content: vec![TextBlock { text: text.into() }],
+            ..Default::default()
+        })
+    };
+    let transcript = Transcript::new(vec![
+        system("P"),
+        Message::User(axo_ai::UserMessage {
+            content: vec![axo_ai::UserBlock::Text { text: "u".into() }],
+            timestamp: 0,
+        }),
+        Message::Assistant(axo_ai::testing::reply_text("a")),
+        system("Q"),
+    ]);
+    for model in [&flagged, &plain] {
+        let events: Vec<_> = Streamer::stream(
+            &models,
+            model,
+            transcript.clone(),
+            SimpleStreamOptions::default(),
+            CancellationToken::new(),
+        )
+        .collect()
+        .await;
+        assert_server_error(&model.id, events.into_iter().last().unwrap());
+    }
+    let requests = server.join().unwrap();
+
+    let body = &requests[0].1;
+    assert!(body.get("instructions").is_none(), "{body}");
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input[0], json!({"role": "developer", "content": "P"}));
+    let assistant = input
+        .iter()
+        .position(|item| item["role"] == "assistant" || item["type"] == "message")
+        .unwrap();
+    assert!(
+        input[assistant..].contains(&json!({"role": "developer", "content": "Q"})),
+        "{body}"
+    );
+
+    // Unflagged rows keep top-level instructions and no leading developer item.
+    let body = &requests[1].1;
+    assert_eq!(body["instructions"], "P\n\nQ", "{body}");
+    assert_eq!(body["input"][0]["role"], "user", "{body}");
+}
+
 /// What a scripted transport does with one attempt.
 enum Attempt {
     Status(u16),

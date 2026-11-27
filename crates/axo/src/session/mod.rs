@@ -10,6 +10,7 @@ pub(crate) mod maintenance;
 pub(crate) mod modes;
 mod policy;
 pub(crate) mod prompt;
+mod prompt_cache;
 pub(crate) mod registrations;
 mod resume;
 mod run;
@@ -201,6 +202,8 @@ struct SessionHooks {
     /// one now means the registry changed. `None` when the registry does not have the model.
     registry_model: Mutex<Option<Arc<Model>>>,
     maintenance: Maintenance,
+    /// Prompt-cache clock and warm refusal.
+    cache: prompt_cache::PromptCache,
     /// Prompts between their fast-path admission and their run start; idle-wake delivery
     /// holds off meanwhile, so pending results ride the prompt instead of making it busy.
     preparing: AtomicUsize,
@@ -886,7 +889,7 @@ impl Session {
             hooks
                 .tools
                 .context
-                .reset(nested.root, nested.names, &nested.startup);
+                .reset(nested.root, nested.names, &nested.startup, &nested.seen);
             hooks
                 .tools
                 .context

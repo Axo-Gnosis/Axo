@@ -4,7 +4,7 @@ use std::sync::{Arc, MutexGuard, PoisonError, Weak};
 use async_trait::async_trait;
 use axo_agent::{
     Agent, AgentContext, AgentEvent, AgentMessage, CancelReason, HookError, LoopHooks, Persist,
-    PersistError, QueuedMessage, RunOutcome, TurnContext, TurnFinish,
+    PersistError, QueuedMessage, RequestCache, RunOutcome, TurnContext, TurnFinish,
 };
 use axo_ai::{
     Accumulator, AssistantMessage, Message, Model, StopReason, ToolCall, ToolResultMessage, Usage,
@@ -298,6 +298,10 @@ impl LoopHooks for SessionHooks {
     fn should_skip_tools(&self, response: &AssistantMessage, model: &Model) -> bool {
         recovery::is_pressure(response, model)
             && (response.stop_reason != StopReason::Stop || response.tool_calls().next().is_some())
+    }
+
+    fn request_cache(&self, model: &Model) -> RequestCache {
+        self.cache_policy(model)
     }
 
     async fn prepare_request(

@@ -903,7 +903,7 @@ impl SpawnTool {
         let mut defined = false;
         for definition in agents {
             if let AgentDef::Agent(spec) = definition {
-                if spec.run_as == RunAs::Root {
+                if spec.run_as == RunAs::Root || spec.hidden {
                     continue;
                 }
                 if !defined {

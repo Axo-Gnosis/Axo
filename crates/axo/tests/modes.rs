@@ -1598,6 +1598,13 @@ async fn deferred_enter_mode_advertises_only_model_invocable_modes_and_announces
         .unwrap();
     let attached = session.attach(None).await;
     let docs = common::tool_text(&attached.missed, "mode-docs");
+    // Drop the read header and each row's `N\t` line number.
+    let docs = docs
+        .lines()
+        .skip(1)
+        .map(|line| line.split_once('\t').map_or(line, |(_, text)| text))
+        .collect::<Vec<_>>()
+        .join("\n");
     let schema = docs
         .split_once("Arguments (JSON Schema):\n")
         .expect("schema header")

@@ -15,7 +15,22 @@ use crate::store::{Entry, EntryId, Projection, SeqEntry};
 use crate::tools::{FileAccess, ledger_records};
 use crate::{CompactionSettings, Error};
 
-const CLEARING_HEADROOM: u64 = 20_000;
+/// What a clearing pass must achieve to commit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ClearGoal {
+    /// The estimate after clearing is at most this.
+    Below(u64),
+    /// Clearing removes at least this many tokens.
+    Remove(u64),
+}
+impl ClearGoal {
+    pub(crate) fn met(self, before: u64, after: u64) -> bool {
+        match self {
+            Self::Below(target) => after <= target,
+            Self::Remove(tokens) => before.saturating_sub(after) >= tokens,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
@@ -23,11 +38,24 @@ pub(crate) struct Limits {
     pub reply: u64,
     pub reserve: u64,
     pub trigger: u64,
+    /// Estimate above which clearing alone runs, below the summary trigger.
+    pub clear_at: u64,
     pub keep_recent: u64,
 }
 impl Limits {
-    pub(crate) fn clearing_target(&self) -> Option<u64> {
-        self.trigger.checked_sub(CLEARING_HEADROOM)
+    /// Newest tool-result tokens clearing never touches.
+    pub(crate) fn protect_window(&self) -> u64 {
+        40_000.min(self.trigger / 4)
+    }
+
+    /// Margin clearing must reach below its threshold.
+    pub(crate) fn headroom(&self) -> u64 {
+        20_000.min(self.trigger / 10)
+    }
+
+    /// Estimate clearing must reach above the trigger to stand in for a summary.
+    pub(crate) fn clearing_target(&self) -> u64 {
+        self.trigger - self.headroom()
     }
 
     pub(crate) fn resolve(model: &Model, settings: &CompactionSettings) -> Result<Self, Error> {
@@ -49,6 +77,7 @@ impl Limits {
             ));
         }
         let trigger = window - reserve;
+        let clear_at = (window * 3 / 4).min(trigger);
         let keep_recent = settings
             .keep_recent_tokens
             .unwrap_or(20000.min(trigger / 4));
@@ -62,6 +91,7 @@ impl Limits {
             reply,
             reserve,
             trigger,
+            clear_at,
             keep_recent,
         })
     }

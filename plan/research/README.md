@@ -30,6 +30,8 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 
 **2026-11-21 coordination specification:** [Swarm](swarm.md) defines shared boards, selective wakeups, independent members, lifecycle, permissions, and recovery without assuming a particular implementation. It was compared against shipped teams and not adopted; see [Deferred studies](../plan.md#deferred-studies).
 
+**2026-11-26 efficiency study:** [`efficiency.md`](efficiency.md) vets an external token/context audit against code, 209 measured Axome sessions and a survey of omp, pi, Octet, Claude Code, Codex, OpenCode, Gemini CLI, Aider, SWE-agent, Cline and Roo; it holds the owner-sorted inventory (axo, Axome, personal) and the discussion queue for [Track 8](../plan.md#track-8-token-and-context-efficiency).
+
 ## Why a new core
 
 Axome needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:

@@ -26,11 +26,11 @@ pub use commands::{
     valid_command_name,
 };
 pub use config::{
-    AskSettings, BashSettings, CompactionSettings, ConfigLayer, ConfigSource, DevShellMode,
-    EffectiveConfig, EnabledExtension, ExtensionListError, ModelChoice, PROMPT_NAMES,
-    ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride, RetrySettings,
-    ServiceTierSettings, Settings, SubagentSettings, SubagentTier, SummaryRequest,
-    TierOnModelChange, UserConfig, valid_extension_id,
+    AskSettings, BashSettings, CacheTtl, CacheTtlSettings, CacheWarming, CompactionSettings,
+    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, EnabledExtension, ExtensionListError,
+    ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride,
+    ReadSettings, RetrySettings, ServiceTierSettings, Settings, SubagentSettings, SubagentTier,
+    SummaryRequest, TierOnModelChange, USER_ONLY_KEYS, UserConfig, valid_extension_id,
 };
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::definitions::Definitions;
@@ -76,9 +76,9 @@ pub use tools::{
     Answer, AnswerValue, ArtifactSlot, AskBlock, BashRequest, ChoiceQuestion, CommandRequest,
     Exposure, FileAccess, FileChange, FileRead, FileRecord, FileWrite, HostTool, LedgerRecord,
     LineDiff, MAX_SNAPSHOT_BYTES, MarkdownBlock, NumberQuestion, Omitted, QuestionOption,
-    SessionTools, SnapshotBlob, SnapshotStore, SquashedChange, TextQuestion, ToolAccess,
-    ToolFactory, WriteRoot, WriteScope, Written, file_changes, file_details, file_records, squash,
-    valid_tool_name,
+    SessionTools, ShellKind, ShellUnit, SnapshotBlob, SnapshotStore, SquashedChange, TextQuestion,
+    ToolAccess, ToolFactory, WriteRoot, WriteScope, Written, classify_bash, file_changes,
+    file_details, file_records, squash, valid_tool_name,
 };
 
 #[cfg(doctest)]

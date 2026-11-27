@@ -137,13 +137,13 @@ async fn session_urls_preserve_artifacts_and_isolate_fork_scratch_files() {
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c3",
                 "read",
-                json!({"path": artifact_url, "offset": 4999, "limit": 3}),
+                json!({"path": format!("{artifact_url}:4999+3")}),
             )])),
             ScriptedTurn::Reply(reply_text("read the full output")),
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c4",
                 "read",
-                json!({"path": artifact_url, "offset": 4999, "limit": 3}),
+                json!({"path": format!("{artifact_url}:4999+3")}),
             )])),
             ScriptedTurn::Reply(reply_tool_calls(&[
                 ("c5", "read", json!({"path": "local://plan.md"})),

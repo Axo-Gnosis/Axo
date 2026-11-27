@@ -25,8 +25,8 @@ pub use api::completions::CompletionsApi;
 pub use api::google::GoogleApi;
 pub use api::openai_responses::ResponsesApi;
 pub use api::{
-    Api, ProviderRequest, ProviderResponse, ProviderTransport, RequestContext, RequestRewrite,
-    ResponseObserver, SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,
+    Api, CacheRetention, ProviderRequest, ProviderResponse, ProviderTransport, RequestContext,
+    RequestRewrite, ResponseObserver, SimpleStreamOptions, StreamOptions, Streamer, ToolChoice,
 };
 pub use auth::provider::{
     AccountUsage, DeviceCode, LoginInteraction, LoginOption, LoginPrompt, LoginSelect,

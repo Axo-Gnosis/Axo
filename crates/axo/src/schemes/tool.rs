@@ -57,7 +57,7 @@ impl Scheme for ToolScheme {
                 text.push_str(&format!("\n- {guideline}"));
             }
         }
-        let parameters = serde_json::to_string_pretty(tool.parameters())
+        let parameters = serde_json::to_string(tool.parameters())
             .map_err(|error| ToolError(error.to_string()))?;
         let name =
             serde_json::to_string(tool.name()).map_err(|error| ToolError(error.to_string()))?;

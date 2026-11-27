@@ -50,7 +50,7 @@ For a team member, `SpawnLink::team` is a `TeamLink` containing the per-parent i
 | `model_change` | `Entry::ModelChange { base, provider, model_id }` | Updates `Projection::model` (`"{provider}/{model_id}"`) |
 | `agent_change` | `Entry::AgentChange { base, agent }` | Updates `Projection::agent` to the root persona's catalog name; absent `agent` removes the persona. Children never write it: their persona is the spec in their spawn link. Never enters model context |
 | `mode_change` | `Entry::ModeChange { base, mode, restore }` | Updates branch-scoped `Projection::mode` and `Projection::mode_restore`; absent mode ends the mode. Optional `ModeRestore` saves the provider, model ID, thinking level, and chosen `service_tier` to restore on exit. Neither field enters model context |
-| `usage` | `Entry::Usage { base, kind, provider, model, usage, note }` | Usage of summary requests that did not commit (`kind`: `compaction` or `branch_summary`; `note`: the error). Committed summaries carry usage on their own entry. Never enters model context |
+| `usage` | `Entry::Usage { base, kind, provider, model, usage, note }` | Usage outside the transcript: summary requests that did not commit (`kind`: `compaction` or `branch_summary`; `note`: the error) and cache warms (`kind`: `cache_warm`; no `note`, see [Prompt caching](configuration.md#prompt-caching-cachettl--cachewarming)). Committed summaries carry usage on their own entry. Never enters model context |
 | `compaction` | `Entry::Compaction { base, summary, first_kept_entry_id, preserved_user_ids, tokens_before, details, usage, from_hook, reason, focus, system_message }` | Replaces messages before `first_kept_entry_id` with the checkpoint `system_message`, preserved user messages, and a `compactionSummary` custom message wrapping the summary in `<summary>…</summary>` (lowered to a user message). `reason` (`CompactionReason`: `manual`, `threshold`, or `overflow`; absent in older files) records what started it and `focus` the user's focus for a manual compaction |
 | `branch_summary` | `Entry::BranchSummary { base, from_id, summary, details, usage, from_hook, focus }` | Injects a `branchSummary` custom message wrapping the summary in `<summary>…</summary>` (lowered to a user message); `focus` records the user's focus for the summary |
 | `custom` | `Entry::Custom { base, custom_type, data }` | Host metadata appended with `Session::append_custom`; `Session::custom` returns the latest value of that type on the current root-to-leaf path (branch-scoped). Never enters model context |
@@ -237,24 +237,31 @@ W           = min(model.context_window, compaction.max_context)
 reply       = min(model.max_tokens, 32_768)
 reserve     = compaction.reserve_tokens.unwrap_or(min(reply + 4_096, W / 4))
 trigger     = W - reserve
+clear_at    = min(W * 3 / 4, trigger)
 keep_recent = compaction.keep_recent_tokens.unwrap_or(min(20_000, trigger / 4))
+protect     = min(40_000, trigger / 4)
+headroom    = min(20_000, trigger / 10)
 ```
 
 `Limits::resolve` fails with `Error::Compaction` when the context window, output limit or cap is 0, when `reserve >= W`, or when `keep_recent >= trigger`.
 
 Context tokens are estimated from the latest non-errored assistant message's provider-reported usage plus local token estimates (`(utf16_units * 2).div_ceil(7)`, with each image counted as 4,800 UTF-16 units, ≈1,372 tokens) for messages after it, falling back to full local estimation when an edit invalidates earlier usage.
 
-Automatic maintenance checks `estimate > trigger` in `prepare_request` (before a prompt and between tool turns) and in `finish_turn` (after a turn settles).
+Automatic maintenance checks `estimate > clear_at` and `estimate > trigger` in `prepare_request` (before a prompt and between tool turns) and in `finish_turn` (after a turn settles).
 
 ### One action per pass: clearing vs summarization
 
-When `estimate > trigger`, `axo` evaluates two candidates locally:
+Recoverable clearing (`elide::prepare`) protects the newest `protect` tokens of tool-result content (the newest result always, since it is counted first) and elides older eligible tool-result text of at least 400 tokens into `<session>/artifacts/<n>.shake.txt` markers (`[shaken ~N tokens; full text: artifact://<n>]`). The same 400-token floor applies to every text elision, `/shake elide` included; the whole-block image and thinking shakes have none. Clearing also replaces the large string arguments (`content`, `oldText`, `newText`) of `edit`/`write` calls whose results are aged with the same marker, keeping `path` (on `google-generative-ai`, only before the last real user message), and images in aged tool results with the image marker; undecodable images are skipped. Each changed message gets one `Entry::ContextEdit`, so replay rebuilds the stubs and navigating before the pass restores the originals. Clearing never touches user or assistant prose.
 
-1. **Recoverable clearing (`elide::prepare`):** Protects the newest `40,000` tokens of tool-result content and elides older eligible tool-result text into `<session>/artifacts/<n>.shake.txt` markers (`[shaken ~N tokens; full text: artifact://<n>]`). Clearing is chosen **only** if the resulting context estimate is at most `trigger - 20,000`, and is skipped when `trigger < 20,000`.
+- **Between `clear_at` and `trigger`:** clearing alone runs and commits only if it reaches `clear_at - headroom`; otherwise nothing happens and no summary follows. The pass is retried on every request while the estimate stays in this band.
+- **Cold cache:** on Anthropic Messages models, when the estimate is at most `trigger` but at least 150,000 tokens and the prompt cache has expired (no request or cache warm within its TTL, 5 minutes or 1 hour; after reopening, 5 minutes since the last assistant message), clearing runs first and commits only if it removes at least 20,000 tokens. A cold cache must be rewritten anyway, so clearing then costs no extra cache write. This check outranks the `clear_at` band.
+- **Above `trigger`:** `axo` evaluates two candidates locally:
+
+1. **Recoverable clearing:** chosen **only** if the resulting context estimate is at most `trigger - headroom`.
 2. **Checkpoint summarization (`Entry::Compaction`):**
    - **Cut point:** Walks backward from the end of the transcript accumulating `keep_recent` tokens and cuts at the first valid boundary (`User`, `Custom`, or `Assistant`, never a `ToolResult`). Message-less records just before the cut (`run_start`, `submission`, `run_end`, settings changes) stay with the kept tail; a cut at a `User` or non-notice `Custom` message is always a complete-turn boundary, so only history is summarized. Engine notices (`mode_notice`, `tool_catalog`) are cut points but not turn starts: they precede a reply inside a turn, so a cut there splits that turn. If a single turn exceeds the budget, the turn is split at an `Assistant` or notice boundary and its prefix is summarized with the `COMPACTION_SPLIT_TURN` prompt and merged with the history summary.
    - **Live summary (`SummaryRequest::Live`):** Appends the summary prompt to the live uncleared conversation with `ToolChoice::None` so the request reuses the provider's prompt cache. A live response with a tool call, a non-`Stop` finish, empty text, or text not strictly smaller than the messages it replaces is rejected, and the next attempt uses a separate summary request. A retryable error is first retried in place under `RetrySettings`. Aborts, fatal provider errors, and an overflowing separate request end the pass.
-   - **Separate summary (`SummaryRequest::Separate`):** Serializes the messages to summarize into `<conversation>` text and sends a tool-free request under the `SUMMARY` prompt.
+   - **Separate summary (`SummaryRequest::Separate`):** Serializes the messages to summarize into `<conversation>` text and sends a tool-free request under the `SUMMARY` prompt. Each tool call's `name(args)` and each tool result is cut to 2,000 UTF-16 units with `[... N more characters truncated]`.
    - **Carryover:** The committed `Entry::Compaction` stores the current `SystemMessage` snapshot, `preserved_user_ids` (recent whole user messages from the summarized region that fit within `keep_recent`), `details: {"readFiles": […], "modifiedFiles": […]}`, and the summary text. `summary` stores the model text followed by `Session history: <path>` and `<read-files>`/`<modified-files>` lists. Lists accumulate across checkpoints, and modified paths are removed from the read list. File lists come from successful `read`, `write`, and `edit` results and use absolute paths.
    - **Escalation bound:** Automatic maintenance attempts one clearing attempt, then at most 3 summary attempts (falling back to a separate request after a failure) before failing with `Error::Compaction`.
 

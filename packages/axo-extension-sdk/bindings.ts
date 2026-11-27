@@ -147,11 +147,16 @@ export type AgentSpec_Deserialize = {
 	description?: string,
 	/**  Root persona, spawned agent, or both (the default). */
 	runAs?: RunAs,
+	/**  Left out of the spawn tool's agent listing; still spawnable by name and usable in teams. */
+	hidden?: boolean,
 	/**  A model selector (`[@role | provider/model][:thinking]`). */
 	model?: string | null,
 	/**  Tool allowlist over built-in and host tools; `None` keeps every tool. */
 	tools?: string[] | null,
-	/**  `None`, or `true` on input, keeps `settings.contextFiles`. */
+	/**
+	 *  `None`, or `true` on input, keeps `settings.contextFiles` (for spawned agents,
+	 *  `subagents.contextFiles`); `"nested"` loads no startup files.
+	 */
 	contextFiles?: RawContextFiles | null,
 	/**  `false` removes the section; `true` changes nothing. */
 	sections?: { [key in string]: boolean },
@@ -181,11 +186,16 @@ export type AgentSpec_Serialize = {
 	description?: string,
 	/**  Root persona, spawned agent, or both (the default). */
 	runAs?: RunAs,
+	/**  Left out of the spawn tool's agent listing; still spawnable by name and usable in teams. */
+	hidden?: boolean,
 	/**  A model selector (`[@role | provider/model][:thinking]`). */
 	model?: string,
 	/**  Tool allowlist over built-in and host tools; `None` keeps every tool. */
 	tools?: string[],
-	/**  `None`, or `true` on input, keeps `settings.contextFiles`. */
+	/**
+	 *  `None`, or `true` on input, keeps `settings.contextFiles` (for spawned agents,
+	 *  `subagents.contextFiles`); `"nested"` loads no startup files.
+	 */
 	contextFiles?: ContextFiles,
 	/**  `false` removes the section; `true` changes nothing. */
 	sections?: { [key in string]: boolean },
@@ -420,6 +430,8 @@ export type BashSettings_Deserialize = {
 	ci?: boolean,
 	/**  Milliseconds before a foreground command becomes a background job; zero disables it. */
 	promoteAfterMs?: number,
+	/**  Refuse a bash command that is one file view or search a built-in tool does. */
+	blockToolViews?: boolean,
 };
 
 export type BashSettings_Serialize = {
@@ -433,6 +445,8 @@ export type BashSettings_Serialize = {
 	ci: boolean,
 	/**  Milliseconds before a foreground command becomes a background job; zero disables it. */
 	promoteAfterMs: number,
+	/**  Refuse a bash command that is one file view or search a built-in tool does. */
+	blockToolViews: boolean,
 };
 
 export type BeforeToolCall = BeforeToolCall_Serialize | BeforeToolCall_Deserialize;
@@ -450,6 +464,43 @@ export type BeforeToolCall_Serialize = {
 export type BridgeCode = "no_lifecycle" | "no_subscription" | "unsupported" | "stalled" | "unavailable" | "invalid" | "too_large" | "interaction";
 
 export type CacheControlFormat = "anthropic";
+
+/**  One Anthropic prompt-cache lifetime. */
+export type CacheTtl = "5m" | "1h";
+
+/**  Anthropic prompt-cache lifetime per session kind. User settings only: 1-hour writes cost more. */
+export type CacheTtlSettings = CacheTtlSettings_Serialize | CacheTtlSettings_Deserialize;
+
+/**  Anthropic prompt-cache lifetime per session kind. User settings only: 1-hour writes cost more. */
+export type CacheTtlSettings_Deserialize = {
+	/**
+	 *  Root sessions; `None` (default) picks 1h on unpriced first-party Anthropic routes
+	 *  (subscription), 5m otherwise.
+	 */
+	root?: CacheTtl | null,
+	/**  Child sessions; default 5m. */
+	child?: CacheTtl,
+};
+
+/**  Anthropic prompt-cache lifetime per session kind. User settings only: 1-hour writes cost more. */
+export type CacheTtlSettings_Serialize = {
+	/**
+	 *  Root sessions; `None` (default) picks 1h on unpriced first-party Anthropic routes
+	 *  (subscription), 5m otherwise.
+	 */
+	root: CacheTtl | null,
+	/**  Child sessions; default 5m. */
+	child: CacheTtl,
+};
+
+/**  When a 5-minute Anthropic cache is kept warm by re-sending the last request's prefix. */
+export type CacheWarming = 
+/**  Never. */
+"off" | 
+/**  During pauses inside a run (tool calls, waits), up to 60 minutes. */
+"streaming" | 
+/**  Also while a root session is idle, up to 30 minutes. */
+"idle";
 
 /**  Why a run was cancelled. */
 export type CancelReason = 
@@ -831,7 +882,7 @@ export type ContextFile = {
 };
 
 /**  An agent's override of context-file discovery. */
-export type ContextFiles = boolean | { [key in string]: boolean };
+export type ContextFiles = boolean | { [key in string]: boolean } | NestedTag;
 
 export type ContextFilesInspection = {
 	/**  Startup loader inventory. Overrides may omit these from `project_context`. */
@@ -1649,6 +1700,16 @@ export type HostCatalogResult = HostCatalogResult_Serialize | HostCatalogResult_
 export type HostCatalogResult_Deserialize = Catalog_Deserialize;
 
 export type HostCatalogResult_Serialize = Catalog_Serialize;
+
+export type HostClassifyBashArgs = {
+	command: string,
+};
+
+export type HostClassifyBashResult = HostClassifyBashResult_Serialize | HostClassifyBashResult_Deserialize;
+
+export type HostClassifyBashResult_Deserialize = ShellUnit_Deserialize[];
+
+export type HostClassifyBashResult_Serialize = ShellUnit_Serialize[];
 
 export type HostDecodeCommandArgs = {
 	name: string,
@@ -2612,6 +2673,9 @@ export type NavigateOptions_Serialize = {
 	focus: string | null,
 };
 
+/**  The wire spelling of [`ContextFiles::Nested`]. */
+export type NestedTag = "nested";
+
 export type NumberQuestion = NumberQuestion_Serialize | NumberQuestion_Deserialize;
 
 export type NumberQuestion_Deserialize = {
@@ -3032,12 +3096,27 @@ export type Range<T> = {
 	end: T,
 };
 
-export type RawContextFiles = boolean | { [key in string]: boolean };
+export type RawContextFiles = boolean | { [key in string]: boolean } | NestedTag;
 
 /**  Type-only shape of [`Entry::Unknown`]: a line whose tag or fields this build cannot decode. */
 export type RawEntry = {
 	type: string,
 } & { [key in string]: Value };
+
+/**  The `read` tool. */
+export type ReadSettings = ReadSettings_Serialize | ReadSettings_Deserialize;
+
+/**  The `read` tool. */
+export type ReadSettings_Deserialize = {
+	/**  Unranged reads of Rust, TypeScript, JavaScript or Svelte files of at least this many bytes return an outline; 0 turns outlines off. */
+	outlineMinBytes?: number,
+};
+
+/**  The `read` tool. */
+export type ReadSettings_Serialize = {
+	/**  Unranged reads of Rust, TypeScript, JavaScript or Svelte files of at least this many bytes return an outline; 0 turns outlines off. */
+	outlineMinBytes: number,
+};
 
 /**
  *  Opaque provider data needed to replay reasoning, tagged with its kind so data from
@@ -3925,6 +4004,10 @@ export type Settings_Deserialize = {
 	defaultThinkingLevel?: ThinkingLevel,
 	/**  What happens to the chosen service tier when the model changes. User settings only. */
 	serviceTier?: ServiceTierSettings_Deserialize,
+	/**  Anthropic prompt-cache lifetime per session kind. User settings only. */
+	cacheTtl?: CacheTtlSettings_Deserialize,
+	/**  When axo keeps a 5-minute prompt cache warm; see `CacheWarming`. User settings only. */
+	cacheWarming?: CacheWarming,
 	/**  User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`. */
 	homeAgentsDir?: boolean,
 	steeringMode?: QueueMode,
@@ -3933,6 +4016,7 @@ export type Settings_Deserialize = {
 	nestedContextFiles?: boolean,
 	bash?: BashSettings_Deserialize,
 	ask?: AskSettings_Deserialize,
+	read?: ReadSettings_Deserialize,
 	project?: ProjectSettings_Deserialize,
 	compaction?: CompactionSettings_Deserialize,
 	retry?: RetrySettings_Deserialize,
@@ -3954,6 +4038,10 @@ export type Settings_Serialize = {
 	defaultThinkingLevel: ThinkingLevel,
 	/**  What happens to the chosen service tier when the model changes. User settings only. */
 	serviceTier: ServiceTierSettings_Serialize,
+	/**  Anthropic prompt-cache lifetime per session kind. User settings only. */
+	cacheTtl: CacheTtlSettings_Serialize,
+	/**  When axo keeps a 5-minute prompt cache warm; see `CacheWarming`. User settings only. */
+	cacheWarming: CacheWarming,
 	/**  User settings only: also read `~/.agents/AGENTS.md` and `~/.agents/skills`. */
 	homeAgentsDir: boolean,
 	steeringMode: QueueMode,
@@ -3962,6 +4050,7 @@ export type Settings_Serialize = {
 	nestedContextFiles: boolean,
 	bash: BashSettings_Serialize,
 	ask: AskSettings_Serialize,
+	read: ReadSettings_Serialize,
 	project: ProjectSettings_Serialize,
 	compaction: CompactionSettings_Serialize,
 	retry: RetrySettings_Serialize,
@@ -3975,6 +4064,52 @@ export type Settings_Serialize = {
 };
 
 export type ShakeMode = "elide" | "images" | "thinking";
+
+/**  What one statement of a bash command does. */
+export type ShellKind = 
+/**  Prints file contents (`cat`, `head`, `sed -n`, `nl`, …). */
+"view" | 
+/**  Searches file contents (`grep`, `rg`, `git grep`). */
+"search" | 
+/**  Lists paths (`ls`, `find`, `fd`, `tree`, `rg --files`, `git ls-files`). */
+"list" | "other";
+
+/**  One statement (pipeline) of a bash command. */
+export type ShellUnit = ShellUnit_Serialize | ShellUnit_Deserialize;
+
+/**  One statement (pipeline) of a bash command. */
+export type ShellUnit_Deserialize = {
+	kind: ShellKind,
+	/**  Base name of the pipeline's first command after prefixes (`sudo`, `env`, `NAME=v`…); "" if none. */
+	program: string,
+	/**  File operands as written (views: viewed files; searches: searched paths; lists: roots). */
+	paths: string[],
+	/**  Views of one file: the read line selector (`5-16`, `5-16,960-973`, `-60`, `40-`); None = whole file. */
+	selector?: string | null,
+	/**  Base names of the later pipeline stages. */
+	filters: string[],
+	/**  Writes a file or reads a heredoc (`>`, `>>`, `&>`, `<<`, `tee` stage), `/dev/null` and `>&N` excepted. */
+	redirects: boolean,
+	/**  The equivalent tool call, as `read {json}` / `grep {json}`, when one tool call returns the same content. */
+	equivalent?: string | null,
+};
+
+/**  One statement (pipeline) of a bash command. */
+export type ShellUnit_Serialize = {
+	kind: ShellKind,
+	/**  Base name of the pipeline's first command after prefixes (`sudo`, `env`, `NAME=v`…); "" if none. */
+	program: string,
+	/**  File operands as written (views: viewed files; searches: searched paths; lists: roots). */
+	paths: string[],
+	/**  Views of one file: the read line selector (`5-16`, `5-16,960-973`, `-60`, `40-`); None = whole file. */
+	selector: string | null,
+	/**  Base names of the later pipeline stages. */
+	filters: string[],
+	/**  Writes a file or reads a heredoc (`>`, `>>`, `&>`, `<<`, `tee` stage), `/dev/null` and `>&N` excepted. */
+	redirects: boolean,
+	/**  The equivalent tool call, as `read {json}` / `grep {json}`, when one tool call returns the same content. */
+	equivalent: string | null,
+};
 
 /**  One discovered skill. */
 export type Skill = Skill_Serialize | Skill_Deserialize;
@@ -4271,7 +4406,7 @@ export type SubagentSettings_Deserialize = {
 	defaultModel?: string | null,
 	/**  Agent name → selector. */
 	models?: { [key in string]: string },
-	/**  Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`. */
+	/**  Children's context files: `"nested"` (default) area files only, `false` none, `true` the session's, or a name→bool map over `contextFiles`. */
 	contextFiles?: RawContextFiles | null,
 	/**  Children's service tier when their cascade names none: `standard` (default) or the parent's (`inherit`). */
 	serviceTier?: SubagentTier,
@@ -4289,7 +4424,7 @@ export type SubagentSettings_Serialize = {
 	defaultModel: string | null,
 	/**  Agent name → selector. */
 	models: { [key in string]: string },
-	/**  Children's context files: `false` (default) none, `true` the session's, or a name→bool map over `contextFiles`. */
+	/**  Children's context files: `"nested"` (default) area files only, `false` none, `true` the session's, or a name→bool map over `contextFiles`. */
 	contextFiles: ContextFiles | null,
 	/**  Children's service tier when their cascade names none: `standard` (default) or the parent's (`inherit`). */
 	serviceTier: SubagentTier,
@@ -5641,6 +5776,10 @@ export interface Host {
    * Substitutes command arguments into a template.
    */
   substituteArgs(template: HostSubstituteArgsArgs["template"], args: HostSubstituteArgsArgs["args"], signal?: AbortSignal): Promise<HostSubstituteArgsResult>;
+  /**
+   * Classifies a bash command into statements.
+   */
+  classifyBash(command: HostClassifyBashArgs["command"], signal?: AbortSignal): Promise<HostClassifyBashResult_Serialize>;
   // withheld: stream — live stream; served as models.stream
   // withheld: streamWith — live stream; served as models.stream
   // withheld: complete — served as models.complete

@@ -9,11 +9,11 @@ use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::http::{dispatch, read_sse};
+use crate::api::http::{dispatch, read_body, read_sse};
 use crate::api::sse::SseEvent;
 use crate::api::{
-    ABORTED, Api, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions, header_map, respond,
-    served_tier,
+    ABORTED, Api, CacheRetention, ProviderRequest, Reply, SimpleStreamOptions, StreamOptions,
+    header_map, respond, served_tier,
 };
 use crate::cost::calculate_cost;
 use crate::estimate::clamp_max_tokens_to_context;
@@ -126,6 +126,7 @@ struct RequestOptions {
     thinking_enabled: bool,
     thinking_budget_tokens: Option<u64>,
     effort: Option<String>,
+    cache_retention: CacheRetention,
 }
 
 /// Port of pi `streamSimple`: map the provider-neutral thinking level to adaptive effort
@@ -148,6 +149,7 @@ fn request_options(
         thinking_enabled: false,
         thinking_budget_tokens: None,
         effort: None,
+        cache_retention: simple.cache_retention,
     };
     let level = simple.thinking;
     if level == ThinkingLevel::Off {
@@ -214,7 +216,10 @@ fn prepare_request(
         .map(|prefix| ToolNames::new(transcript, prefix))
         .transpose()?;
     let resolved = transcript.resolve(compat.mid_convo_system_messages);
-    let built = build_params(model, &resolved, &compat, &options, names.as_ref());
+    let mut built = build_params(model, &resolved, &compat, &options, names.as_ref());
+    if opts.simple.warm {
+        warm_body(&mut built.params)?;
+    }
     let betas = beta_features(
         model,
         &resolved,
@@ -233,6 +238,21 @@ fn prepare_request(
         tool_names: names.map(|names| names.active),
         provider_thinking_level: built.provider_thinking_level,
     })
+}
+
+/// Turns a request body into a cache warm: same prefix, no reply, no stream. Budget thinking
+/// is refused because its body change could miss the cache.
+fn warm_body(params: &mut Value) -> Result<(), String> {
+    if params["thinking"]["type"] == "enabled" {
+        return Err("cache warm skipped: budget thinking".into());
+    }
+    params["max_tokens"] = json!(0);
+    params["stream"] = json!(false);
+    if let Some(params) = params.as_object_mut() {
+        params.remove("thinking");
+        params.remove("output_config");
+    }
+    Ok(())
 }
 
 /// One request, from building the body to the last SSE event. `reply` keeps partial content.
@@ -257,6 +277,16 @@ async fn run(
     )
     .await?;
     reply.start();
+    if opts.simple.warm {
+        // A warm reports usage only; `stop_reason: "max_tokens"` is expected and ignored.
+        let text = read_body(response, cancel)
+            .await
+            .ok_or_else(|| ABORTED.to_owned())?;
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("Could not parse Anthropic warm response: {error}"))?;
+        read_start_usage(&body["usage"], model, &mut reply.message);
+        return Ok(StopReason::Stop);
+    }
 
     let mut blocks = BlockMapper {
         tool_names: prepared.tool_names,
@@ -294,6 +324,24 @@ fn error_response_message(status: u16, text: &str, body: Option<&Value>) -> Stri
     } else {
         format!("{status} {detail}")
     }
+}
+
+/// The full usage of a `message_start` event (or a non-streaming body), priced.
+fn read_start_usage(usage: &Value, model: &Model, output: &mut AssistantMessage) {
+    if let Some(speed) = usage["speed"].as_str() {
+        output.service_tier = served_tier(speed);
+    }
+    let tokens = |key: &str| usage[key].as_u64().unwrap_or(0);
+    output.usage.input = tokens("input_tokens");
+    output.usage.output = tokens("output_tokens");
+    output.usage.cache_read = tokens("cache_read_input_tokens");
+    output.usage.cache_write = tokens("cache_creation_input_tokens");
+    output.usage.cache_write_1h = Some(
+        usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+    );
+    update_cost(model, output);
 }
 
 /// Maps Anthropic's block indices onto `output.content` positions while streaming.
@@ -346,21 +394,7 @@ impl BlockMapper {
                     output.response_model = Some(response_model.to_owned());
                 }
                 // Captured now so an early abort still reports the input tokens.
-                let usage = &message["usage"];
-                if let Some(speed) = usage["speed"].as_str() {
-                    output.service_tier = served_tier(speed);
-                }
-                let tokens = |key: &str| usage[key].as_u64().unwrap_or(0);
-                output.usage.input = tokens("input_tokens");
-                output.usage.output = tokens("output_tokens");
-                output.usage.cache_read = tokens("cache_read_input_tokens");
-                output.usage.cache_write = tokens("cache_creation_input_tokens");
-                output.usage.cache_write_1h = Some(
-                    usage["cache_creation"]["ephemeral_1h_input_tokens"]
-                        .as_u64()
-                        .unwrap_or(0),
-                );
-                update_cost(model, output);
+                read_start_usage(&message["usage"], model, output);
             }
             "content_block_start" => self.start_block(&event, reply)?,
             "content_block_delta" => self.delta(&event, reply),
@@ -612,7 +646,7 @@ fn build_params(
     options: &RequestOptions,
     names: Option<&ToolNames>,
 ) -> BuiltParams {
-    let cache_control = json!({ "type": "ephemeral" });
+    let cache_control = options.cache_retention.cache_control();
     let initial = transcript.initial_system_message();
     let initial_text = initial.map(system_message_text).unwrap_or_default();
     let initial_tools = initial.map_or(&[][..], |system| &system.tools_added[..]);
@@ -635,7 +669,7 @@ fn build_params(
     let effort_messages = mid_convo_effort && !thinking_disabled;
     let (messages, assistant_levels) = convert_messages(
         transcript.without_initial_system_message(),
-        &cache_control,
+        cache_control.as_ref(),
         compat,
         effort_messages.then_some(model.provider.as_str()),
         native_tool_changes,
@@ -658,8 +692,11 @@ fn build_params(
         params["tool_choice"] = json!({ "type": choice.as_str() });
     }
     if !initial_text.is_empty() {
-        params["system"] =
-            json!([{ "type": "text", "text": initial_text, "cache_control": cache_control }]);
+        let mut block = json!({ "type": "text", "text": initial_text });
+        if let Some(cache_control) = &cache_control {
+            block["cache_control"] = cache_control.clone();
+        }
+        params["system"] = json!([block]);
     }
     // Temperature is incompatible with extended thinking and unsupported on Opus 4.7+.
     if let Some(temperature) = options.temperature
@@ -673,7 +710,9 @@ fn build_params(
         params["speed"] = json!(word);
     }
 
-    let tool_cache_control = compat.cache_control_on_tools.then_some(&cache_control);
+    let tool_cache_control = cache_control
+        .as_ref()
+        .filter(|_| compat.cache_control_on_tools);
     if native_tool_changes {
         // Initial tools stay active with the cache breakpoint on the last one, followed by
         // a stable deferred placeholder: declaring it from the first request keeps
@@ -932,7 +971,7 @@ fn split_error_tool_result_images(message: &ToolResultMessage) -> Option<SplitEr
 /// models, the effort each replayed assistant message was produced with (by wire index).
 fn convert_messages(
     messages: &[Message],
-    cache_control: &Value,
+    cache_control: Option<&Value>,
     compat: &AnthropicCompat,
     managed_provider: Option<&str>,
     native_tool_changes: bool,
@@ -1097,7 +1136,8 @@ fn convert_messages(
     params.append(&mut pending_system);
 
     // Cache the conversation history up to the last user or system message.
-    if let Some(last) = params.last_mut()
+    if let Some(cache_control) = cache_control
+        && let Some(last) = params.last_mut()
         && matches!(last["role"].as_str(), Some("user" | "system"))
         && let Some(block) = last["content"]
             .as_array_mut()

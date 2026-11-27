@@ -8,7 +8,7 @@ This is the live planning document for unbuilt work and active design discussion
 
 ## Overview of tracks
 
-M1–M5 plus Tracks 2, 3, 4 and 7 are complete. See [Shipped tracks](#shipped-tracks) for landed work; this overview tracks the remaining work.
+M1–M5 plus Tracks 2, 3, 4, 7 and 8 are complete. See [Shipped tracks](#shipped-tracks) for landed work; this overview tracks the remaining work.
 
 ```mermaid
 flowchart LR
@@ -27,6 +27,7 @@ flowchart LR
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
 | **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | **Shipped.** See [Shipped tracks](#shipped-tracks) |
 | **Tool surface & session modes** | Deferred tools, action tools, scoped host policy, cache-safe root mode overlays and completion | **Shipped (A–H).** See [Shipped tracks](#shipped-tracks) |
+| **8. Token & context efficiency** | Efficient-by-default tools, guidance, caching, clearing and compaction; see [`research/efficiency.md`](research/efficiency.md) | **Shipped.** See [Shipped tracks](#shipped-tracks) |
 
 ---
 
@@ -293,6 +294,7 @@ Key risks to design around when building step 3 (script hooks):
 - **Extension host inspection and provenance:** Landed in code: typed provider and extension origins, attributed blocked tool results, typed extension problems, live Bun replacement across scopes, disk-only package inspection and authored-package listings, provider ownership, and installed-copy revision/time metadata. Install records use whole copies with no old-format migration. Runtime contract in [Bun extensions](../crates/axo/docs/extending.md#4-bun-extensions-axo-extensions).
 - **Track 7 (Ask documents):** Landed in code: `ask` takes one document of Markdown and typed `choice`/`text`/`number` blocks (`AskBlock`), validates the call and the host's submission against it (an invalid `Session::answer` returns `Error::InvalidInput` and stays pending), and returns one answer object keyed by question id; a timeout submits only `recommended`/`prefill`/`default` values. Runtime contract in [`crates/axo/docs/extending.md`](../crates/axo/docs/extending.md#ask-documents-for-hosts).
 - **Decomplect cleanup:** Completed the model-registry and session responsibility splits, shared provider overlays and rewrite-once dispatch, finite tier validation, host/layer `Registrations`, pre-factory tool restrictions, atomic agent selection and queue-withdrawal tokens, provenance-only submissions, and one gated parked-child revival path. Extension dispatch now separates host and model calls and names bash execution `tools.runBash`; root and scoped extensions share `ExtensionSet`, validate options at construction, serialize dependency-failure resets, and use socket-bound wire identity with code-only runner errors. Test helpers were consolidated without changing the dependency direction. Settled ownership is recorded in [`design.md`](design.md#architecture); live contracts are in the [embedding reference](../crates/axo/docs/extending.md).
+- **Track 8 (Token and context efficiency):** Landed in code: the axo (A-numbered) decisions of [`research/efficiency.md`](research/efficiency.md). `read` with numbered lines, selectors, several paths, directory listings and outlines; `grep` with several paths, exclusions, modes and grouped, capped output; `edit` by exact match without an earlier read; the public `classify_bash` with the opt-in `bash.blockToolViews` and nested context on bash views; `cacheTtl` and gated `cacheWarming`; the leading `developer` item on flagged OpenAI Responses rows; clearing at 75% of the window, cold-clear, argument and image stubs and the summarizer argument cap; compact `tool://` schemas; `hidden` agents and nested-only child context. Runtime reference in [`crates/axo/docs/configuration.md`](../crates/axo/docs/configuration.md), [`crates/axo/docs/prompts-and-context.md`](../crates/axo/docs/prompts-and-context.md) and [`crates/axo/docs/sessions-and-compaction.md`](../crates/axo/docs/sessions-and-compaction.md).
 
 ---
 
@@ -354,11 +356,22 @@ Dismissing a question now continues the run with `details.outcome: "dismissed"`;
 
 ---
 
+## Track 8: Token and context efficiency
+
+Shipped; study and full inventory in [`research/efficiency.md`](research/efficiency.md), settled decisions in [`design.md`](design.md#settled-core-decisions).
+
+Batching is re-measured against the saved baseline now that the tool changes have landed; trigger and method in [`research/efficiency.md`](research/efficiency.md).
+
+Not verifiable offline, to watch on first live use: Codex accepting the leading `developer` item and 1h breakpoints on API-key Anthropic routes.
+
+The bash classifier (`tools/shell.rs`) and the scheme rewriter (`tools/bash_urls.rs`) each lex bash; unify them when either next changes.
+
+---
+
 ## Deferred studies
 
 - **Session name generation:** axo generates a short session name after the first prompt and records it with `set_name`. The host may supply a guideline prompt, and extensions must be able to shape or replace the result. Open: which model writes it, the trigger, and how a host supplies an icon vocabulary. Requested by Axome; not designed yet.
 - **Compaction follow-ups (`research/compaction-methods.md`):** background precomputed summaries before the threshold; optional provider server-side compaction; Factory-style probe-based prompt evaluation harness.
-- **Token-efficiency / output minimizer:** evaluate source-time output filtering for noisy build/test commands (with full output recoverable via spool paths).
 - **Swarm versus teams (`research/swarm.md`, pinned 2026-11-21):** compared against shipped teams and not adopted. Teams already meet the spec's activation, delivery, pause and reopen recovery contracts through receiver-side mail. The unbuilt parts are a shared board, a changeable roster, a finish/cancel seal and idempotent send retries. A board readable by every member is not wanted by default: it invites over-reading and breaks independent review, and the parent and host, who want the full trail, can read mail from the child journals. No second coordination system is planned beside teams; a host may name a coordinator protocol "swarm" in its own keyword. Revisit only for large rosters or a first-class host timeline. One open check: whether each member run's result starts a parent turn, which keeps the parent a hub.
   - **Planned, unbuilt: spawner broadcast.** The only change taken from the study. The agent that spawned a team, usually the root, can message every member at once; members still have no broadcast. Sketch: `send` accepts the team id (`team_N`, which cannot collide with a roster name) and queues one ordinary child follow-up per member in roster order, or a steer with `steer: true`, reusing the single-child path. Hosts get the same operation as a typed method returning one receipt per member. Open: the receipt shape, and how a failure after some members were reached is reported.
 

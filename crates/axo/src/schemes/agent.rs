@@ -70,7 +70,7 @@ impl Scheme for AgentScheme {
     }
 
     fn prompt_doc(&self) -> &str {
-        "agent:// subagents you spawned: read agent://agent_N for status, agent://agent_N/result (or agent://agent_N/result/<json-pointer>) for its result, agent://agent_N/transcript for its conversation (page with offset/limit). Message one with send; stop its run with kill."
+        "agent:// subagents you spawned: read agent://agent_N for status, agent://agent_N/result (or agent://agent_N/result/<json-pointer>) for its result, agent://agent_N/transcript for its conversation (read ranges with a selector, e.g. agent://agent_N/transcript:-50). Message one with send; stop its run with kill."
     }
 
     async fn resolve(&self, _url: &SchemeUrl, _cx: &SchemeContext) -> Result<Target, ToolError> {

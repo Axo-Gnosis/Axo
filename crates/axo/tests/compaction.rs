@@ -12,9 +12,9 @@ use axo_ai::estimate::estimate_message_tokens;
 use axo_ai::testing::{reply_text, reply_tool_calls};
 use axo_ai::transcript::current_system_message;
 use axo_ai::{
-    AssistantBlock, FileCredentialStore, Message, Models, ModelsConfig, ModelsOptions,
-    ReasoningReplay, ScriptedApi, ScriptedTurn, ToolChoice, ToolResultMessage, UserBlock,
-    UserMessage,
+    AssistantBlock, CacheRetention, FileCredentialStore, Message, Models, ModelsConfig,
+    ModelsOptions, ReasoningReplay, ScriptedApi, ScriptedTurn, ToolChoice, ToolResultMessage,
+    UserBlock, UserMessage,
 };
 use common::{TestConfig, options, within};
 use serde_json::json;
@@ -519,6 +519,8 @@ async fn live_tool_rejection_falls_back_to_separate_without_side_effects() {
             .is_empty()
     );
     assert_ne!(live.options.session_id, separate.options.session_id);
+    assert_eq!(live.options.cache_retention, CacheRetention::Short);
+    assert_eq!(separate.options.cache_retention, CacheRetention::None);
     assert!(live.options.max_tokens.is_some_and(|n| n > 0 && n <= 4096));
     assert!(
         separate
@@ -739,7 +741,10 @@ async fn large_tool_history_crosses_threshold_then_continues_with_a_real_tool() 
     assert!(requests[2].transcript.iter().any(|m| matches!(m, Message::ToolResult(r) if r.tool_call_id == "new" && !r.is_error && text(m).contains("NEXT-FILE-CONTENT"))));
     let raw = entries(&axo, &session).await;
     assert_eq!(checkpoints(&raw).len(), 1);
-    assert!(edits(&raw).is_empty(), "40k-protected output cannot clear");
+    assert!(
+        edits(&raw).is_empty(),
+        "the newest tool output is always protected"
+    );
     assert!(
         llm(&raw)
             .iter()
@@ -906,7 +911,7 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
         let dir = tempfile::tempdir().unwrap();
         let (offline, _) = harness(dir.path(), settings(0), 500_000, vec![]).await;
         let old = "o".repeat(210_000);
-        let protected = "p".repeat(140_000); // exactly 40,000 shared-estimate tokens
+        let protected = "p".repeat(140_000); // newest result; protected because it is counted first
         let original_user = "user prose must stay byte-for-byte";
         let original_answer = "assistant prose must stay byte-for-byte";
         let (session, ids) = seed(
@@ -937,7 +942,11 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
         drop(session);
         let mut config = settings(0);
         config["compaction"]["enabled"] = json!(true);
-        config["compaction"]["maxContext"] = json!(candidate + 20_000 + 1024 - u64::from(above));
+        // The smallest trigger whose derived headroom still leaves `candidate`.
+        let trigger = (candidate..)
+            .find(|t| t - (t / 10).min(20_000) >= candidate)
+            .unwrap();
+        config["compaction"]["maxContext"] = json!(trigger + 1024 - u64::from(above));
         // Pin the tool-free serializer so its truncation of both results is observable.
         config["compaction"]["summaryRequest"] = json!("separate");
         let turns = if above {
@@ -1024,6 +1033,174 @@ async fn clearing_counts_marker_overhead_and_uses_the_exact_headroom_boundary() 
             for original in [original_user, original_answer, protected.as_str()] {
                 assert!(requests[0].transcript.iter().any(|m| text(m) == original));
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn clearing_stubs_aged_edit_arguments_and_replays_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = settings(0);
+    config["compaction"]["enabled"] = json!(true);
+    // Trigger 100k: protects the newest 25k result tokens and must reach 90k.
+    config["compaction"]["maxContext"] = json!(101_024);
+    let (axo, api) = harness(
+        dir.path(),
+        config,
+        500_000,
+        vec![ScriptedTurn::Reply(reply_text("done"))],
+    )
+    .await;
+    let old_text = "x".repeat(280_000);
+    let (session, ids) = seed(
+        &axo,
+        dir.path(),
+        vec![
+            user("change a.rs"),
+            call(
+                "e",
+                "edit",
+                json!({"path":"a.rs","edits":[{"oldText":old_text,"newText":"y"}]}),
+            ),
+            result("e", "edit", "Successfully replaced 1 block(s) in a.rs."),
+            call("newest", "read", json!({"path":"newest.txt"})),
+            result("newest", "read", "p".repeat(140_000)),
+            assistant("edited"),
+        ],
+    )
+    .await;
+    let baseline = entries(&axo, &session).await.len();
+    assert_eq!(
+        within(session.prompt("continue")).await.unwrap(),
+        RunOutcome::Done
+    );
+    let raw = entries(&axo, &session).await;
+    let added = &raw[baseline..];
+    assert_eq!(edits(added), vec![&ids[1]]);
+    assert!(checkpoints(added).is_empty());
+    let requests = api.requests();
+    assert_eq!(requests.len(), 1);
+    // The request saw the stub, and replaying the journal rebuilds it from the ContextEdit.
+    for messages in [requests[0].transcript.messages().to_vec(), llm(&raw)] {
+        let args = messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Assistant(a) => a
+                    .tool_calls()
+                    .find(|c| c.id == "e")
+                    .map(|c| c.arguments.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(args["path"], "a.rs");
+        assert_eq!(args["edits"][0]["newText"], "y");
+        let stub = args["edits"][0]["oldText"].as_str().unwrap();
+        assert!(stub.starts_with("[shaken ~"), "{stub}");
+        let n = artifacts(stub)[0];
+        assert_eq!(
+            std::fs::read_to_string(artifact_path(&session, n)).unwrap(),
+            old_text
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_cache_clears_aged_results_below_the_threshold() {
+    for minutes in [10, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = settings(0);
+        config["compaction"]["enabled"] = json!(true);
+        // 1M window: clear_at is 750k, so only the cold cache can clear a ~220k prompt.
+        let host = common::host_with(
+            dir.path(),
+            json!([{"id":"m", "api":"anthropic-messages", "contextWindow":1_000_000, "maxTokens":4096}]),
+            config,
+            vec![ScriptedTurn::Reply(reply_text("done"))],
+        )
+        .await;
+        // No request yet, so the cache clock falls back to the last assistant message.
+        let mut answer = reply_text("read both");
+        answer.timestamp = axo_ai::now_ms() - minutes * 60_000;
+        let (session, ids) = seed(
+            &host.axo,
+            dir.path(),
+            vec![
+                user("read the logs"),
+                call("old", "read", json!({"path":"old.txt"})),
+                result("old", "read", "o".repeat(630_000)),
+                call("newest", "read", json!({"path":"newest.txt"})),
+                result("newest", "read", "p".repeat(140_000)),
+                Message::Assistant(answer),
+            ],
+        )
+        .await;
+        let baseline = entries(&host.axo, &session).await.len();
+        assert_eq!(
+            within(session.prompt("continue")).await.unwrap(),
+            RunOutcome::Done
+        );
+        let raw = entries(&host.axo, &session).await;
+        let added = &raw[baseline..];
+        assert!(checkpoints(added).is_empty());
+        let requests = host.api.requests();
+        assert_eq!(requests.len(), 1);
+        let sent = estimated(requests[0].transcript.messages());
+        if minutes == 10 {
+            assert_eq!(edits(added), vec![&ids[2]]);
+            assert!(sent < 100_000, "{sent}");
+        } else {
+            assert!(edits(added).is_empty());
+            assert!(sent > 200_000, "{sent}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn clearing_alone_runs_between_its_threshold_and_the_trigger() {
+    // 400k window: clear_at is 300k, the trigger 398,976 and the clearing goal 280k.
+    for (old, clears) in [(700_000, true), (14_000, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = settings(0);
+        config["compaction"]["enabled"] = json!(true);
+        let host = common::host_with(
+            dir.path(),
+            json!([{"id":"m", "contextWindow":400_000, "maxTokens":4096}]),
+            config,
+            vec![ScriptedTurn::Reply(reply_text("done"))],
+        )
+        .await;
+        let (session, ids) = seed(
+            &host.axo,
+            dir.path(),
+            vec![
+                user("read the logs"),
+                call("old", "read", json!({"path":"old.txt"})),
+                result("old", "read", "o".repeat(old)),
+                call("newest", "read", json!({"path":"newest.txt"})),
+                // Protected as the newest result; together they estimate ~320k tokens.
+                result("newest", "read", "p".repeat(1_120_000 - old)),
+                assistant("read both"),
+            ],
+        )
+        .await;
+        let baseline = entries(&host.axo, &session).await.len();
+        assert_eq!(
+            within(session.prompt("continue")).await.unwrap(),
+            RunOutcome::Done
+        );
+        let raw = entries(&host.axo, &session).await;
+        let added = &raw[baseline..];
+        // A pass that misses its goal commits nothing and never escalates to a summary.
+        assert!(checkpoints(added).is_empty());
+        let requests = host.api.requests();
+        assert_eq!(requests.len(), 1);
+        let sent = estimated(requests[0].transcript.messages());
+        if clears {
+            assert_eq!(edits(added), vec![&ids[2]]);
+            assert!(sent <= 280_000, "{sent}");
+        } else {
+            assert!(edits(added).is_empty());
+            assert!(sent > 300_000, "{sent}");
         }
     }
 }

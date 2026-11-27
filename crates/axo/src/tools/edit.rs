@@ -1,4 +1,4 @@
-//! The `edit` tool (pi `core/tools/edit.ts`, `edit-diff.ts`), plus the stale-file guard.
+//! The `edit` tool (pi `core/tools/edit.ts`, `edit-diff.ts`).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -86,8 +86,7 @@ impl Tool for EditTool {
         &self.parameters
     }
 
-    /// Sequential: a `read` of the file earlier in the batch records it before the
-    /// freshness check, and later calls see the edited file.
+    /// Sequential: later calls in the batch see the edited file.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -148,6 +147,31 @@ fn normalize_for_fuzzy_match(text: &str) -> String {
     out
 }
 
+/// Length of a leading `N\t` line-number prefix (one or more ASCII digits and a tab).
+fn line_number_len(line: &str) -> Option<usize> {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0 && line.as_bytes().get(digits) == Some(&b'\t')).then_some(digits + 1)
+}
+
+/// `text` with a leading `N\t` (from numbered reads) removed from every line, when every
+/// non-empty line has one and at least one does; else None.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let mut numbered = false;
+    for line in text.split('\n').filter(|line| !line.is_empty()) {
+        line_number_len(line)?;
+        numbered = true;
+    }
+    numbered.then(|| strip_present_numbers(text))
+}
+
+/// Removes a leading `N\t` from each line that has one.
+fn strip_present_numbers(text: &str) -> String {
+    text.split('\n')
+        .map(|line| line_number_len(line).map_or(line, |len| &line[len..]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Applies `edits` to LF-normalized `base` (pi `applyEditsToNormalizedContent`). All edits
 /// match against the same original; when any needs fuzzy matching, matching runs in
 /// fuzzy-normalized space and only the touched lines are taken from it. `Err` is the
@@ -157,10 +181,13 @@ fn apply_edits(base: &str, edits: Vec<Edit>, path: &str) -> Result<String, Strin
     let edits: Vec<(String, String)> = edits
         .into_iter()
         .map(|edit| {
-            (
-                normalize_to_lf(&edit.old_text),
-                normalize_to_lf(&edit.new_text),
-            )
+            let old = normalize_to_lf(&edit.old_text);
+            let new = normalize_to_lf(&edit.new_text);
+            // A `N\t` prefix pasted from a numbered read; newText lines without one stay.
+            match strip_line_numbers(&old).filter(|_| !base.contains(&old)) {
+                Some(stripped) => (stripped, strip_present_numbers(&new)),
+                None => (old, new),
+            }
         })
         .collect();
     if let Some(i) = edits.iter().position(|(old, _)| old.is_empty()) {
@@ -343,7 +370,7 @@ fn apply_preserving_unchanged_lines(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
     use std::fs::Permissions;
     use std::os::unix::ffi::OsStrExt;
@@ -374,7 +401,6 @@ mod tests {
     use crate::schemes::artifact::Artifacts;
     use crate::schemes::dir::DirScheme;
     use crate::schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target};
-    use crate::tools::ask::PendingQuestions;
     use crate::tools::{
         FileAccess, FileChange, FileLedger, FileRead, SessionTools, ToolAccess, lock_file, squash,
     };
@@ -397,14 +423,15 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        dir: TempDir,
-        session: Arc<SessionTools>,
+    /// Session tools in a temp dir, shared by the file tool tests.
+    pub(in crate::tools) struct Fixture {
+        pub(in crate::tools) dir: TempDir,
+        pub(in crate::tools) session: Arc<SessionTools>,
         tools: Vec<Arc<dyn Tool>>,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(in crate::tools) fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let env = Arc::new(BTreeMap::new());
             let artifacts = Arc::new(Artifacts::new(dir.path().join("artifacts")));
@@ -449,20 +476,19 @@ mod tests {
                     None,
                     None,
                     None,
-                    false,
-                    Arc::new(PendingQuestions::new(broadcast::channel(16).0)),
                     None,
+                    &crate::Settings::default(),
                 ),
                 session,
                 dir,
             }
         }
 
-        fn path(&self, name: &str) -> PathBuf {
+        pub(in crate::tools) fn path(&self, name: &str) -> PathBuf {
             self.dir.path().join(name)
         }
 
-        fn put(&self, name: &str, content: &[u8]) {
+        pub(in crate::tools) fn put(&self, name: &str, content: &[u8]) {
             std::fs::write(self.path(name), content).expect("write fixture");
         }
 
@@ -491,7 +517,7 @@ mod tests {
         }
 
         /// Converts tool failures to the same error output exposed by the agent.
-        async fn call(&self, name: &str, args: Value) -> ToolOutput {
+        pub(in crate::tools) async fn call(&self, name: &str, args: Value) -> ToolOutput {
             let tool = self.tools.iter().find(|tool| tool.name() == name).unwrap();
             tool.execute(Self::context(name, args))
                 .await
@@ -946,11 +972,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_existing_file_is_refused() {
+    async fn unread_file_edits_by_match_but_write_is_refused() {
         let fx = Fixture::new();
         fx.put("u.txt", b"original\n");
-        assert!(fx.edit("u.txt", &[("original", "changed")]).await.is_error);
-        assert_eq!(fx.get("u.txt"), b"original\n");
+        assert!(!fx.edit("u.txt", &[("original", "changed")]).await.is_error);
+        assert_eq!(fx.get("u.txt"), b"changed\n");
+        fx.put("u.txt", b"other\n");
         assert!(
             fx.call(
                 "write",
@@ -959,22 +986,50 @@ mod tests {
             .await
             .is_error
         );
-        assert_eq!(fx.get("u.txt"), b"original\n");
+        assert_eq!(fx.get("u.txt"), b"other\n");
     }
 
     #[tokio::test]
-    async fn external_modification_after_read_is_refused() {
+    async fn external_modification_is_edited_by_match() {
         let fx = Fixture::new();
         fx.put("e.txt", b"original\n");
         fx.read("e.txt").await;
         fx.put("e.txt", b"original\nexternal\n");
-        assert!(fx.edit("e.txt", &[("original", "changed")]).await.is_error);
-        assert_eq!(fx.get("e.txt"), b"original\nexternal\n");
-
-        // Reading again re-arms the guard.
-        fx.read("e.txt").await;
         assert!(!fx.edit("e.txt", &[("original", "changed")]).await.is_error);
         assert_eq!(fx.get("e.txt"), b"changed\nexternal\n");
+
+        fx.put("e.txt", b"external again\n");
+        let refused = fx
+            .call(
+                "write",
+                json!({ "path": "e.txt", "content": "clobbered\n" }),
+            )
+            .await;
+        assert!(refused.is_error);
+        let [UserBlock::Text { text }] = &refused.content[..] else {
+            panic!("expected one text block");
+        };
+        assert!(
+            text.starts_with("File changed since it was last read"),
+            "{text}"
+        );
+        assert_eq!(fx.get("e.txt"), b"external again\n");
+    }
+
+    #[tokio::test]
+    async fn numbered_old_text_is_stripped() {
+        let fx = Fixture::new();
+        fx.put("n.txt", b"a\nb\nc\n");
+        assert!(
+            !fx.edit("n.txt", &[("2\tb\n3\tc", "2\tB\nnew")])
+                .await
+                .is_error
+        );
+        assert_eq!(fx.get("n.txt"), b"a\nB\nnew\n");
+
+        fx.put("l.txt", b"1\tx\n");
+        assert!(!fx.edit("l.txt", &[("1\tx", "y")]).await.is_error);
+        assert_eq!(fx.get("l.txt"), b"y\n");
     }
 
     #[tokio::test]

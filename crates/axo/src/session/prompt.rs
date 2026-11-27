@@ -58,10 +58,13 @@ pub(super) struct ToolBase {
 }
 
 /// Discovery inputs and startup files installed together in nested context.
+#[derive(Default)]
 pub(crate) struct NestedParts {
     pub root: Option<PathBuf>,
     pub names: Vec<PathBuf>,
     pub startup: Vec<ContextFile>,
+    /// Paths pre-marked as seen without reading them.
+    pub seen: Vec<PathBuf>,
 }
 
 struct ShapedTools {
@@ -80,40 +83,50 @@ pub(crate) fn shape(
     let settings = &base.config.settings;
     let mut context = Vec::new();
     let mut names = settings.context_files.clone();
-    let disabled = matches!(
-        agent.and_then(|spec| spec.context_files.as_ref()),
-        Some(ContextFiles::Off)
-    );
-    if let Some(ContextFiles::Names(overrides)) = agent.and_then(|spec| spec.context_files.as_ref())
-    {
+    let switch = agent.and_then(|spec| spec.context_files.as_ref());
+    if let Some(ContextFiles::Names(overrides)) = switch {
         names.extend(
             overrides
                 .iter()
                 .map(|(name, enabled)| (name.clone(), *enabled)),
         );
     }
-    let nested = if disabled {
-        NestedParts {
-            root: None,
-            names: Vec::new(),
-            startup: Vec::new(),
-        }
+    let root = (base.project && settings.nested_context_files).then(|| project_root(&base.cwd));
+    let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
+    let nested = if matches!(switch, Some(ContextFiles::Off)) {
+        NestedParts::default()
     } else {
         let (names, name_diagnostics) = context_file_names(&names);
         context.extend(name_diagnostics);
-        let home_agents = settings.home_agents_dir.then(home_agents_dir).flatten();
-        let (startup, file_diagnostics) = load_context_files(
-            &base.config.context_files,
-            home_agents.as_deref(),
-            &base.cwd,
-            base.project,
-            &names,
-        );
-        context.extend(file_diagnostics);
+        // Nested: files at or above the root (home, user and root-directory files) never
+        // attach; directories between the root and the cwd still do.
+        let (startup, seen) = if matches!(switch, Some(ContextFiles::Nested)) {
+            let seen = home_agents
+                .iter()
+                .map(|home| home.join("AGENTS.md"))
+                .chain(base.config.context_files.iter().cloned())
+                .chain(
+                    root.iter()
+                        .flat_map(|root| names.iter().map(move |name| root.join(name))),
+                )
+                .collect();
+            (Vec::new(), seen)
+        } else {
+            let (startup, file_diagnostics) = load_context_files(
+                &base.config.context_files,
+                home_agents.as_deref(),
+                &base.cwd,
+                base.project,
+                &names,
+            );
+            context.extend(file_diagnostics);
+            (startup, Vec::new())
+        };
         NestedParts {
-            root: (base.project && settings.nested_context_files).then(|| project_root(&base.cwd)),
+            root,
             names,
             startup,
+            seen,
         }
     };
     let agent_sections = agent

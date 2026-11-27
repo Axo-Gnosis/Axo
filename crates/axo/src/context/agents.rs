@@ -43,13 +43,17 @@ pub struct AgentSpec {
     /// Root persona, spawned agent, or both (the default).
     #[serde(default, skip_serializing_if = "RunAs::is_any")]
     pub run_as: RunAs,
+    /// Left out of the spawn tool's agent listing; still spawnable by name and usable in teams.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     /// A model selector (`[@role | provider/model][:thinking]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Tool allowlist over built-in and host tools; `None` keeps every tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// `None`, or `true` on input, keeps `settings.contextFiles`.
+    /// `None`, or `true` on input, keeps `settings.contextFiles` (for spawned agents,
+    /// `subagents.contextFiles`); `"nested"` loads no startup files.
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "context_files_switch"
@@ -91,6 +95,9 @@ pub enum ContextFiles {
     Off,
     /// Override individual names in `settings.contextFiles`.
     Names(IndexMap<String, bool>),
+    /// No startup files; files below the project root attach on first touch. Files at or
+    /// above the root never attach.
+    Nested,
 }
 
 impl Serialize for ContextFiles {
@@ -98,6 +105,7 @@ impl Serialize for ContextFiles {
         match self {
             Self::Off => serializer.serialize_bool(false),
             Self::Names(names) => names.serialize(serializer),
+            Self::Nested => serializer.serialize_str("nested"),
         }
     }
 }
@@ -110,6 +118,7 @@ impl<'de> Deserialize<'de> for ContextFiles {
                 "`true` keeps the default context files",
             )),
             RawContextFiles::Map(names) => Ok(Self::Names(names)),
+            RawContextFiles::Nested(_) => Ok(Self::Nested),
         }
     }
 }
@@ -121,6 +130,7 @@ pub(crate) fn context_files_switch<'de, D: Deserializer<'de>>(
         None | Some(RawContextFiles::Bool(true)) => None,
         Some(RawContextFiles::Bool(false)) => Some(ContextFiles::Off),
         Some(RawContextFiles::Map(names)) => Some(ContextFiles::Names(names)),
+        Some(RawContextFiles::Nested(_)) => Some(ContextFiles::Nested),
     })
 }
 
@@ -197,6 +207,8 @@ struct Frontmatter {
     description: String,
     #[serde(default)]
     run_as: RunAs,
+    #[serde(default)]
+    hidden: bool,
     model: Option<String>,
     tools: Option<ToolList>,
     #[serde(default, deserialize_with = "context_files_switch")]
@@ -224,6 +236,14 @@ enum ToolList {
 pub(crate) enum RawContextFiles {
     Bool(bool),
     Map(IndexMap<String, bool>),
+    Nested(NestedTag),
+}
+
+/// The wire spelling of [`ContextFiles::Nested`].
+#[derive(Deserialize, specta::Type)]
+pub(crate) enum NestedTag {
+    #[serde(rename = "nested")]
+    Nested,
 }
 
 #[derive(Deserialize)]
@@ -376,6 +396,7 @@ fn parse_markdown(
             "name",
             "description",
             "runAs",
+            "hidden",
             "model",
             "tools",
             "contextFiles",
@@ -429,6 +450,7 @@ fn parse_markdown(
         name,
         description: frontmatter.description,
         run_as: frontmatter.run_as,
+        hidden: frontmatter.hidden,
         model: frontmatter.model,
         tools: frontmatter.tools.map(|tools| match tools {
             ToolList::List(tools) => tools,

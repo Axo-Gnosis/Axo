@@ -20,6 +20,7 @@ use crate::json::parse_tool_arguments;
 use crate::model::{InputKind, Model};
 use crate::transcript::{
     TranscriptToolSupport, render_system_message_update, resolve_transcript_tools,
+    system_message_text,
 };
 use crate::transform::short_hash;
 use crate::types::{
@@ -59,6 +60,14 @@ pub(crate) fn convert_messages(
         let leading = source_index == 0 && matches!(message, Message::System(_));
         match message {
             Message::System(system) => {
+                // Rows that take mid-conversation system items get the prompt as the leading
+                // instruction item, so later prompt changes sit in the same item stream.
+                if leading && options.supports_mid_convo_system_messages {
+                    let text = system_message_text(system);
+                    if !text.is_empty() {
+                        input.push(json!({ "role": instruction_role, "content": text }));
+                    }
+                }
                 let anchors_tool_changes = system_index >= transcript_tools.folded_system_messages;
                 system_index += 1;
                 if anchors_tool_changes {

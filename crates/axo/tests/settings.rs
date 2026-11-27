@@ -506,6 +506,27 @@ fn context_file_defaults_survive_and_added_names_append() {
 }
 
 #[test]
+fn subagent_context_files_default_to_nested() {
+    use axo::context::agents::ContextFiles;
+    let settings = load(
+        Some(r#"{"subagents":{"contextFiles":"nested"}}"#),
+        None,
+        ProjectAccess::Read,
+    );
+    assert_eq!(settings.subagents.context_files, Some(ContextFiles::Nested));
+    let off = load(
+        Some(r#"{"subagents":{"contextFiles":false}}"#),
+        None,
+        ProjectAccess::Read,
+    );
+    assert_eq!(off.subagents.context_files, Some(ContextFiles::Off));
+    assert_eq!(
+        serde_json::to_value(Settings::default()).unwrap()["subagents"]["contextFiles"],
+        "nested"
+    );
+}
+
+#[test]
 fn unknown_keys_and_null_settings_mean_defaults() {
     for (user, project) in [
         (

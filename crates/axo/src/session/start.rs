@@ -302,6 +302,12 @@ impl Session {
                 routes,
             )) as Arc<dyn Tool>
         });
+        let ask = inherited.ask_enabled.then(|| {
+            Arc::new(tools::ask::AskTool::new(
+                questions.clone(),
+                settings.ask.timeout_ms.map(Duration::from_millis),
+            )) as Arc<dyn Tool>
+        });
         let builtin = tools::builtin(
             &session_tools,
             Some(spawn_tool.clone()),
@@ -311,9 +317,8 @@ impl Session {
                 member: session_id.clone(),
                 sessions: inherited.sessions.clone(),
             }),
-            inherited.ask_enabled,
-            questions.clone(),
-            settings.ask.timeout_ms.map(Duration::from_millis),
+            ask,
+            settings,
         );
         let yield_tool: Option<Arc<dyn Tool>> = link
             .as_ref()
@@ -356,7 +361,7 @@ impl Session {
         let (prompt_shape, nested, context_diagnostics) = shape(&shape_base, root_agent);
         session_tools
             .context
-            .reset(nested.root, nested.names, &nested.startup);
+            .reset(nested.root, nested.names, &nested.startup, &nested.seen);
         let tools = prompt_shape.tools.clone();
         let mode_diagnostic = projection
             .mode
@@ -452,6 +457,7 @@ impl Session {
                     prompts: summary_prompts,
                     cancel: Mutex::new(None),
                 },
+                cache: Default::default(),
                 stop_requested: AtomicBool::new(false),
                 preparing: AtomicUsize::new(0),
                 prompt: SessionPrompt {
@@ -501,6 +507,10 @@ impl Session {
             ..AgentConfig::new(inherited.streamer.clone(), model)
         }));
         let _ = hooks.agent.set(Arc::downgrade(&agent));
+        tokio::spawn(super::prompt_cache::keep_warm(
+            Arc::downgrade(&hooks),
+            agent.last_request(),
+        ));
         hooks.rebase_promoted();
         hooks.install_tools();
         if hooks.child.is_some() {

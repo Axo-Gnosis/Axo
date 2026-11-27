@@ -184,11 +184,20 @@ struct NestedState {
 #[expose]
 impl NestedContext {
     /// `root`: the project root, or `None` to disable. `startup`: system-prompt files.
+    /// `seen`: paths pre-marked as seen without reading them; they never attach.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
-    pub fn new(root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) -> Self {
+    pub fn new(
+        root: Option<PathBuf>,
+        names: Vec<PathBuf>,
+        startup: &[ContextFile],
+        seen: &[PathBuf],
+    ) -> Self {
         let mut base = Seen::default();
         for file in startup {
             base.admit(file_key(&file.path), &file.content);
+        }
+        for path in seen {
+            base.paths.insert(file_key(path));
         }
         Self {
             state: Mutex::new(NestedState {
@@ -202,14 +211,21 @@ impl NestedContext {
 
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn disabled() -> Self {
-        Self::new(None, Vec::new(), &[])
+        Self::new(None, Vec::new(), &[], &[])
     }
 
-    /// Replaces discovery settings and clears deduplication to the new startup files.
+    /// Replaces discovery settings and clears deduplication to the new startup files and
+    /// pre-marked `seen` paths.
     /// In-flight attachments retain their previous snapshot and cannot pollute the new one.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
-    pub fn reset(&self, root: Option<PathBuf>, names: Vec<PathBuf>, startup: &[ContextFile]) {
-        let replacement = Self::new(root, names, startup);
+    pub fn reset(
+        &self,
+        root: Option<PathBuf>,
+        names: Vec<PathBuf>,
+        startup: &[ContextFile],
+        seen: &[PathBuf],
+    ) {
+        let replacement = Self::new(root, names, startup, seen);
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = replacement
             .state
             .into_inner()
@@ -487,7 +503,7 @@ mod tests {
         put(&root.join("sub/CLAUDE.md"), "startup");
         let (startup, diagnostics) = load_context_files(&user, None, &root, true, &names());
         assert!(diagnostics.is_empty());
-        let context = NestedContext::new(Some(root.clone()), names(), &startup);
+        let context = NestedContext::new(Some(root.clone()), names(), &startup, &[]);
         let touched = root.join("sub/feature/x.txt");
         let blocks = context.attach(&touched).await;
         assert_eq!(
@@ -530,5 +546,28 @@ mod tests {
         assert!(NestedContext::disabled().attach(&touched).await.is_empty());
         context.restore(&[]);
         assert_eq!(context.attach(&touched).await, blocks);
+    }
+
+    #[tokio::test]
+    async fn pre_marked_root_files_never_attach_even_after_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        put(&root.join("AGENTS.md"), "root");
+        let sub = root.join("src/AGENTS.md");
+        put(&sub, "src");
+        let context =
+            NestedContext::new(Some(root.clone()), names(), &[], &[root.join("AGENTS.md")]);
+        let touched = root.join("src/a/x.rs");
+        let expected = vec![UserBlock::Text {
+            text: ContextFile {
+                path: sub,
+                content: "src".to_owned(),
+            }
+            .render(),
+        }];
+        assert_eq!(context.attach(&touched).await, expected);
+        context.restore(&[]);
+        assert_eq!(context.attach(&touched).await, expected);
     }
 }

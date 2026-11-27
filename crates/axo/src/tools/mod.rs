@@ -12,10 +12,13 @@ pub(crate) mod find;
 pub(crate) mod grep;
 pub(crate) mod kill;
 mod ledger;
+mod outline;
 pub(crate) mod output;
 pub(crate) mod pending;
 pub(crate) mod read;
+pub(crate) mod selector;
 pub(crate) mod send;
+pub(crate) mod shell;
 pub(crate) mod snapshots;
 pub(crate) mod truncate;
 pub(crate) mod wait;
@@ -29,7 +32,6 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
 
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_macros::expose;
@@ -38,6 +40,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::config::Settings;
 use crate::context::files::NestedContext;
 use crate::context::modes::BashAccess;
 use crate::context::{Diagnostic, DiagnosticOrigin};
@@ -46,7 +49,6 @@ use crate::exec::host::ProcessSupervisor;
 use crate::jobs::command::CommandRunner;
 use crate::schemes::{SchemeUrl, Schemes, Target};
 use crate::session::team::TeamSeat;
-use ask::AskTool;
 pub(crate) use ask::PendingQuestions;
 pub use ask::{
     Answer, AnswerValue, AskBlock, ChoiceQuestion, MarkdownBlock, NumberQuestion, QuestionOption,
@@ -70,6 +72,7 @@ pub use ledger::{
     FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
 };
 pub(crate) use ledger::{file_key, ledger_records};
+pub use shell::{ShellKind, ShellUnit, classify_bash};
 pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
 pub use wire::{ArtifactSlot, ToolAccess};
 pub(crate) use wire::{TOOLS_BASE_BLOCKS, TOOLS_BLOCKS};
@@ -481,7 +484,10 @@ fn byte_capped(
     }
     before.extend(after);
     if !before.is_empty() {
-        output.push_str(&format!("\n\n[{}]", before.join(". ")));
+        let notice = format!("[{}]", before.join(". "));
+        output.push_str("\n\n");
+        output.push_str(&notice);
+        details.insert("notice".into(), notice.into());
     }
     (
         output,
@@ -527,21 +533,23 @@ fn clean_path(path: &str) -> Cow<'_, str> {
 }
 
 /// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait, kill`,
-/// followed by `spawn` and `send` when supplied and `ask` when `ask` is set.
+/// followed by `spawn`, `send` and `ask` when supplied.
 pub(crate) fn builtin(
     tools: &Arc<SessionTools>,
     spawn: Option<Arc<dyn Tool>>,
     send: Option<Arc<dyn Tool>>,
     team: Option<TeamSeat>,
-    ask: bool,
-    questions: Arc<PendingQuestions>,
-    timeout: Option<Duration>,
+    ask: Option<Arc<dyn Tool>>,
+    settings: &Settings,
 ) -> Vec<Arc<dyn Tool>> {
     let mut list: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadTool::new(tools.clone())),
+        Arc::new(ReadTool::new(
+            tools.clone(),
+            settings.read.outline_min_bytes,
+        )),
         Arc::new(WriteTool::new(tools.clone())),
         Arc::new(EditTool::new(tools.clone())),
-        Arc::new(BashTool::new(tools.clone())),
+        Arc::new(BashTool::new(tools.clone(), settings.bash.block_tool_views)),
         Arc::new(GrepTool::new(tools.clone())),
         Arc::new(FindTool::new(tools.clone())),
         Arc::new(WaitTool::new(tools.clone(), team)),
@@ -553,9 +561,7 @@ pub(crate) fn builtin(
     if let Some(send) = send {
         list.push(send);
     }
-    if ask {
-        list.push(Arc::new(AskTool::new(questions, timeout)));
-    }
+    list.extend(ask);
     list
 }
 

@@ -136,10 +136,12 @@ fn build_request_body(
         "input": input,
         "include": ["reasoning.encrypted_content"],
     });
-    if let Some(instructions) = resolved
-        .initial_system_message()
-        .map(system_message_text)
-        .filter(|text| !text.is_empty())
+    // Flagged rows carry the prompt as the leading input item instead (`convert_messages`).
+    if !options.supports_mid_convo_system_messages
+        && let Some(instructions) = resolved
+            .initial_system_message()
+            .map(system_message_text)
+            .filter(|text| !text.is_empty())
     {
         body["instructions"] = json!(instructions);
     }

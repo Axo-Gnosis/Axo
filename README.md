@@ -24,11 +24,11 @@ The workspace is split into three layered core crates so hosts only recompile wh
 
 | Tool | Replay | Description |
 | :--- | :--- | :--- |
-| `read` | `Safe` | Reads UTF-8 text files (with `offset`/`limit` pagination) and images (`png`, `jpeg`, `gif`, `webp`, `bmp`), recording read hashes in the session's file ledger and loading nested directory `AGENTS.md` files on demand. Local content targets must be regular files |
+| `read` | `Safe` | Reads text as numbered lines with line selectors, several paths per call, one-level directory listings and outlines of large code files, and images (`png`, `jpeg`, `gif`, `webp`, `bmp`), recording read hashes in the session's file ledger and loading nested directory `AGENTS.md` files on demand ([output format](crates/axo/docs/prompts-and-context.md)). Local content targets must be regular files or directories |
 | `write` | `Safe` for plain paths; scheme URLs use `Scheme::write_replay` (default `Never`; `local://` is `Safe`) | Writes new files or complete rewrites, guarded by the read ledger when overwriting existing files. Scheme writes store content readable back at the same URL; actions are tools |
-| `edit` | `Never` | Performs exact or whitespace/quote-fuzzy multi-hunk replacements against UTF-8 files recorded in the read ledger, rejecting stale external modifications |
-| `bash` | `Never` | Executes commands under the session's `ExecEnv` (host, `direnv`, or cached Nix flake dev shell) in a dedicated container (its own process group, or a cgroup v2 job when the host selects `Supervision::Cgroup`), with head+tail inline truncation and output spooled under the session directory; long commands (configurable `bash.promoteAfterMs`, default 60 s; a user steer; or `async: true`) continue as background jobs `bg_N`. Host tools share this command/job support through `SessionTools::run_command` |
-| `grep` | `Safe` | In-process regex search built on `ignore` and `grep-searcher` |
+| `edit` | `Never` | Performs exact or whitespace/quote-fuzzy multi-hunk replacements against UTF-8 files; every `oldText` must match the current file exactly once, so no earlier read is needed. A pasted `N⇥` line-number prefix is stripped |
+| `bash` | `Never` | Executes commands under the session's `ExecEnv` (host, `direnv`, or cached Nix flake dev shell) in a dedicated container (its own process group, or a cgroup v2 job when the host selects `Supervision::Cgroup`), with head+tail inline truncation and output spooled under the session directory; long commands (configurable `bash.promoteAfterMs`, default 60 s; a user steer; or `async: true`) continue as background jobs `bg_N`. Host tools share this command/job support through `SessionTools::run_command`. Successful file views load nested `AGENTS.md` files like `read`, and `bash.blockToolViews` (off by default) refuses a command that is one view or search a built-in tool does, naming the call (`axo::classify_bash`) |
+| `grep` | `Safe` | In-process regex search built on `ignore` and `grep-searcher`: results grouped per file with per-file caps, path lists with line selectors and `!glob` exclusions, context lines, and `files` and `count` modes ([output format](crates/axo/docs/prompts-and-context.md)) |
 | `find` | `Safe` | In-process gitignore-aware file discovery built on `ignore` and `globset` |
 | `wait` | `Safe` | Returns pending command/subagent results or wakes for mail; a steer interrupts it. Outside teams, returns immediately without running jobs; in teams, detects mutual waits |
 | `kill` | `Never` | Stops a background job or a subagent's run with `{"id":"bg_N"}` or `{"id":"agent_N"}`; available when `bash` or `spawn` remains |
@@ -66,6 +66,8 @@ Hosts can read live or retained output as raw merged bytes or stdout/stderr-tagg
 ### Cache-aware compaction & `/shake`
 
 `axo` manages context pressure through append-only context edits, manual `/shake` elision, and one-action-per-pass automatic clearing or prompt-cached summarization. See [Automatic Compaction](crates/axo/docs/sessions-and-compaction.md#automatic-compaction-cratesaxosrccompaction).
+
+Anthropic prompt caches default to 1 hour on subscription root sessions and 5 minutes elsewhere (`cacheTtl`); a paused session's 5-minute cache is kept warm by `max_tokens: 0` refresh requests when the expected saving pays for them (`cacheWarming`). See [Prompt caching](crates/axo/docs/configuration.md#prompt-caching-cachettl--cachewarming).
 
 ### Sectioned system prompt, context files & skills
 

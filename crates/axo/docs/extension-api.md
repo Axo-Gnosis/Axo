@@ -186,6 +186,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | homeAgentsDir |  | Returns the user's shared agents directory when a home directory is available. |
 | parseCommandArgs | input | Splits command argument text into arguments. |
 | substituteArgs | template, args | Substitutes command arguments into a template. |
+| classifyBash | command | Classifies a bash command into statements. |
 
 ### Withheld
 

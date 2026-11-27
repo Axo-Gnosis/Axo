@@ -163,6 +163,10 @@ fn catalog_model(provider_id: &str, model_id: &str, dev: DevModel, today: &str) 
 
     let reasoning = &dev.capabilities.reasoning;
     let mut compat = Compat::default();
+    // First-party Responses takes developer items mid-conversation (A27 evidence is OpenAI only).
+    if api == ApiKind::OpenAiResponses && provider_id == "openai" {
+        compat.supports_mid_convo_system_messages = Some(true);
+    }
     let thinking_level_map = match api {
         ApiKind::AnthropicMessages => {
             messages_compat(&dev, entry, &mut compat);

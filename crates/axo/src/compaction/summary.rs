@@ -5,9 +5,9 @@ use std::sync::Arc;
 use axo_agent::AgentMessage;
 use axo_ai::estimate::{estimate_message_tokens, estimate_text_tokens};
 use axo_ai::{
-    Accumulator, AssistantBlock, AssistantMessage, Message, Model, SimpleStreamOptions, StopReason,
-    Streamer, SystemMessage, TextBlock, ThinkingLevel, ToolChoice, Transcript, Usage, UserBlock,
-    UserMessage, is_context_overflow, now_ms,
+    Accumulator, AssistantBlock, AssistantMessage, CacheRetention, Message, Model,
+    SimpleStreamOptions, StopReason, Streamer, SystemMessage, TextBlock, ThinkingLevel, ToolChoice,
+    Transcript, Usage, UserBlock, UserMessage, is_context_overflow, now_ms,
 };
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -203,7 +203,7 @@ fn tool_text(text: &str) -> String {
 /// How a rendered conversation shows tool calls and results.
 #[derive(Clone, Copy)]
 pub(crate) enum ToolDetail {
-    /// Summarizer input: full call arguments, results capped at 2000 UTF-16 units (`tool_text`).
+    /// Summarizer input: each call's rendered `name(args)` and each result capped at 2000 UTF-16 units (`tool_text`).
     Capped,
     /// `agent://…/transcript`: each call and each result cut to one line of at most 200 chars.
     OneLine,
@@ -248,7 +248,7 @@ pub(crate) fn render_conversation(messages: &[Message], detail: ToolDetail) -> S
                             .join(", ");
                         let text = format!("{}({args})", call.name);
                         match detail {
-                            ToolDetail::Capped => text,
+                            ToolDetail::Capped => tool_text(&text),
                             ToolDetail::OneLine => truncate_line(&text, 200).0.into_owned(),
                         }
                     })
@@ -376,6 +376,12 @@ async fn request(
         } else {
             uuid::Uuid::now_v7().to_string()
         }),
+        // A one-shot Separate request is never sent again, so a cache write is wasted.
+        cache_retention: if live {
+            CacheRetention::Short
+        } else {
+            CacheRetention::None
+        },
         ..Default::default()
     };
     let mut usage = Usage::default();

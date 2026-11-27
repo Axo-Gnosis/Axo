@@ -114,7 +114,7 @@ pub(crate) fn build_sections(
     if let Some(agent) = &shape.agent {
         bodies.insert("agent".into(), agent.clone());
     }
-    if sources.docs {
+    if sources.docs && !shape.tools.is_empty() {
         let name = &sources.name;
         bodies.insert(
             "docs".into(),
@@ -123,7 +123,7 @@ pub(crate) fn build_sections(
     }
 
     bodies.insert("tools".into(), render_guidelines(&shape.tools));
-    if !shape.scheme_docs.is_empty() {
+    if !shape.tools.is_empty() && !shape.scheme_docs.is_empty() {
         let mut body = "Tools accept these URLs as paths. In bash, a URL that is a whole argument, a `--flag=`/`NAME=` value or a redirect target becomes its file path.".to_owned();
         for doc in &shape.scheme_docs {
             body.push_str("\n- ");
@@ -302,6 +302,12 @@ mod tests {
 
         sources.docs = true;
         let sections = build_sections(&sources, &shape, None, "2026-10-22");
+        assert!(
+            !sections.contains_key("docs"),
+            "a tool-less session has no docs"
+        );
+        shape.tools = vec![Arc::new(Dummy) as Arc<dyn Tool>];
+        let sections = build_sections(&sources, &shape, None, "2026-10-22");
         let keys: Vec<&str> = sections.keys().map(String::as_str).collect();
         assert_eq!(&keys[..3], &["system", "agent", "docs"]);
         assert_eq!(sections["agent"], "<agent>\nPersona.\n</agent>");
@@ -315,6 +321,31 @@ mod tests {
                 sections["delegation"],
                 format!("<delegation>\n{}\n</delegation>", BUNDLED_DELEGATION.trim())
             );
+        }
+    }
+
+    struct Dummy;
+
+    #[async_trait::async_trait]
+    impl Tool for Dummy {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+
+        fn description(&self) -> &str {
+            ""
+        }
+
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: serde_json::Value = serde_json::Value::Null;
+            &PARAMETERS
+        }
+
+        async fn execute(
+            &self,
+            _cx: axo_agent::ToolContext,
+        ) -> Result<axo_agent::ToolOutput, axo_agent::ToolError> {
+            Ok(axo_agent::ToolOutput::default())
         }
     }
 }

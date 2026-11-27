@@ -28,6 +28,7 @@ const FREE: &[(&str, &str)] = &[
     ("home_agents_dir", "host.homeAgentsDir"),
     ("parse_command_args", "host.parseCommandArgs"),
     ("substitute_args", "host.substituteArgs"),
+    ("classify_bash", "host.classifyBash"),
     ("load_agents", ROOTS),
     ("load_modes", ROOTS),
     ("load_keywords", ROOTS),

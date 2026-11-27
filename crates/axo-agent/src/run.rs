@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, RunOutcome};
+use crate::agent::{Agent, RunOutcome, SentRequest};
 use crate::cancel::CancelReason;
 use crate::error::Error;
 use crate::event::{AgentEvent, MessageOrigin};
@@ -490,12 +490,20 @@ impl Run<'_> {
         }
         let transcript = Transcript::new(messages);
         let (model, thinking, service_tier) = self.model();
+        let cache = agent.hooks.request_cache(&model);
         let options = SimpleStreamOptions {
             thinking,
             service_tier,
             session_id: agent.session_id.clone(),
+            cache_retention: cache.retention,
             ..SimpleStreamOptions::default()
         };
+        agent.last_request.send_replace(None);
+        // One clone per request, only when warming may re-send it.
+        let kept = cache
+            .keep_warm
+            .then(|| (transcript.clone(), options.clone()));
+        let sent_at = Instant::now();
         let mut stream =
             agent
                 .streamer
@@ -555,6 +563,18 @@ impl Run<'_> {
             MessageOrigin::Run,
         )
         .await?;
+        if let Some((transcript, options)) = kept
+            && !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        {
+            let usage = &message.usage;
+            agent.last_request.send_replace(Some(Arc::new(SentRequest {
+                model: model.clone(),
+                transcript,
+                options,
+                started: sent_at,
+                prompt_tokens: usage.input + usage.cache_read + usage.cache_write,
+            })));
+        }
         Ok(Some((message, model)))
     }
 
@@ -966,6 +986,7 @@ impl Run<'_> {
     /// Replaces the transcript in both the agent state and the run's working context.
     fn replace_messages(&mut self, messages: Vec<AgentMessage>) {
         self.agent.lock().messages = messages.clone();
+        self.agent.last_request.send_replace(None);
         self.context.messages = messages;
     }
 

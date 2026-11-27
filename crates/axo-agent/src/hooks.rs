@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axo_ai::{AssistantMessage, Message, Model, ToolCall, ToolResultMessage, UserBlock};
+use axo_ai::{
+    AssistantMessage, CacheRetention, Message, Model, ToolCall, ToolResultMessage, UserBlock,
+};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -108,6 +110,15 @@ pub struct AfterToolCallResult {
     pub terminate: Option<bool>,
 }
 
+/// The prompt-cache policy of one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestCache {
+    pub retention: CacheRetention,
+    /// Keep the request as [`Agent::last_request`](crate::Agent::last_request) so the host
+    /// can re-send its prefix to keep the cache warm.
+    pub keep_warm: bool,
+}
+
 #[async_trait]
 pub trait LoopHooks: Send + Sync {
     /// Lowers agent messages to LLM messages. The default keeps `Llm` messages and
@@ -130,6 +141,12 @@ pub trait LoopHooks: Send + Sync {
         _cancel: &CancellationToken,
     ) -> Result<Option<Vec<AgentMessage>>, HookError> {
         Ok(None)
+    }
+
+    /// Cache breakpoints for a request to `model`, and whether the agent keeps a snapshot
+    /// for cache warming.
+    fn request_cache(&self, _model: &Model) -> RequestCache {
+        RequestCache::default()
     }
 
     /// After `TurnEnd` when continuing. Returned messages are appended with normal

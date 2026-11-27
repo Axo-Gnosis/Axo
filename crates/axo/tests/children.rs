@@ -1252,3 +1252,112 @@ async fn steer_right_after_spawn_keeps_the_task_first() {
     assert_eq!(lines[note]["note"], true);
     parent.shutdown().await;
 }
+
+#[tokio::test]
+async fn default_children_attach_only_context_below_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "ROOT RULES").unwrap();
+    std::fs::write(repo.join("sub/AGENTS.md"), "SUB RULES").unwrap();
+    std::fs::write(repo.join("sub/f.txt"), "data").unwrap();
+    let host = common::host_with(
+        dir.path(),
+        json!([{"id":"m"},{"id":"child"}]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("ok"))],
+    )
+    .await;
+    host.api.lane(
+        "child",
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[("r1", "read", json!({"path":"f.txt"}))])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    );
+    host.config
+        .set_project(repo.join("sub"), axo::ConfigLayer::default());
+    let parent = host
+        .axo
+        .create_session(SessionOptions {
+            cwd: repo.join("sub"),
+            project_access: Some(axo::ProjectAccess::Read),
+            ..options(dir.path())
+        })
+        .await
+        .unwrap();
+    let handle = parent.spawn(request("read f.txt")).await.unwrap();
+    delivered(&parent, "agent_1").await;
+
+    let requests = host.api.requests();
+    let first = requests.iter().find(|r| r.model.id == "child").unwrap();
+    let sections = first
+        .transcript
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            Message::System(system) => system.sections.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!sections.contains_key("project_context"), "{sections:?}");
+    let lines = journal(&handle.session);
+    let result = only(&lines, "r1", |v| {
+        v["type"] == "message" && v["message"]["toolCallId"] == "r1"
+    });
+    let text = lines[result]["message"]["content"].to_string();
+    assert!(text.contains("SUB RULES"), "{text}");
+    assert!(!text.contains("ROOT RULES"), "{text}");
+    parent.shutdown().await;
+}
+
+#[tokio::test]
+async fn bash_view_attaches_nested_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("sub/AGENTS.md"), "SUB RULES").unwrap();
+    std::fs::write(repo.join("sub/a.rs"), "fn a() {}\n").unwrap();
+    let host = common::host(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "v1",
+                "bash",
+                json!({"command": "cat sub/a.rs"}),
+            )])),
+            ScriptedTurn::Reply(reply_tool_calls(&[(
+                "v2",
+                "bash",
+                json!({"command": "sed -n 1p sub/a.rs"}),
+            )])),
+            ScriptedTurn::Reply(reply_text("done")),
+        ],
+    )
+    .await;
+    host.config.set_project(&repo, axo::ConfigLayer::default());
+    let session = host
+        .axo
+        .create_session(SessionOptions {
+            cwd: repo.clone(),
+            project_access: Some(axo::ProjectAccess::Read),
+            ..common::bash_options(dir.path())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        within(session.prompt("view the file")).await.unwrap(),
+        axo_agent::RunOutcome::Done
+    );
+    let entries = session.attach(None).await.missed;
+    let first = common::tool_text(&entries, "v1");
+    assert!(
+        first.contains("<project_instructions path=") && first.contains("SUB RULES"),
+        "{first}"
+    );
+    let second = common::tool_text(&entries, "v2");
+    assert!(!second.contains("SUB RULES"), "attached once: {second}");
+    session.shutdown().await;
+}

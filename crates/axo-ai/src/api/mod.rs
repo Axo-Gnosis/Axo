@@ -16,6 +16,7 @@ use futures::channel::mpsc::{self, UnboundedSender};
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, future};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::ModelAuth;
@@ -70,6 +71,29 @@ impl ToolChoice {
     }
 }
 
+/// Prompt-cache breakpoints a request carries (pi `cacheRetention`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheRetention {
+    /// 5-minute breakpoints.
+    #[default]
+    Short,
+    /// 1-hour breakpoints.
+    Long,
+    /// No breakpoints.
+    None,
+}
+
+impl CacheRetention {
+    /// The Anthropic `cache_control` marker for this retention; `None` places no breakpoint.
+    pub(crate) fn cache_control(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Short => Some(json!({ "type": "ephemeral" })),
+            Self::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
+            Self::None => None,
+        }
+    }
+}
+
 /// Request options shared by every API.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SimpleStreamOptions {
@@ -83,6 +107,12 @@ pub struct SimpleStreamOptions {
     pub session_id: Option<String>,
     /// Extra request headers; `None` deletes a default header.
     pub headers: BTreeMap<String, Option<String>>,
+    /// Cache breakpoints: 5-minute (default), 1-hour, or none, on Anthropic Messages
+    /// and Anthropic-format Completions.
+    pub cache_retention: CacheRetention,
+    /// A cache-refresh request: Anthropic Messages only. Same prefix, `max_tokens: 0`,
+    /// non-streaming, no thinking.
+    pub warm: bool,
 }
 
 /// The tier a provider's echoed tier or speed word means.

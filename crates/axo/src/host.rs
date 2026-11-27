@@ -9,7 +9,7 @@ use crate::ext::{Base64, Caller};
 use crate::store::page_limit;
 use crate::{
     AgentSpec, Axo, Catalog, Command, Diagnostic, EntryId, Error, FileChange, Header, JobInfo,
-    KeywordSpec, ModeSpec, ProjectAccess, Projection, SeqEntry, SquashedChange, context,
+    KeywordSpec, ModeSpec, ProjectAccess, Projection, SeqEntry, ShellUnit, SquashedChange, context,
 };
 
 /// A saved session's header and a bounded page of its journal in sequence order.
@@ -197,5 +197,11 @@ impl HostWire<'_> {
     #[ext]
     pub fn substitute_args(&self, template: String, args: Vec<String>) -> String {
         context::skills::substitute_args(&template, &args)
+    }
+
+    /// Classifies a bash command into statements.
+    #[ext]
+    pub fn classify_bash(&self, command: String) -> Vec<ShellUnit> {
+        crate::classify_bash(&command)
     }
 }

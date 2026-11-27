@@ -6,7 +6,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axo_ai::{
-    AssistantMessage, Message, Model, ServiceTier, Streamer, ThinkingLevel, ToolResultMessage,
+    AssistantMessage, Message, Model, ServiceTier, SimpleStreamOptions, Streamer, ThinkingLevel,
+    ToolResultMessage, Transcript,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -83,6 +84,18 @@ pub enum RunOutcome {
     Failed(String),
 }
 
+/// A completed request, kept for re-sending its prefix (cache warming).
+#[derive(Debug, Clone)]
+pub struct SentRequest {
+    pub model: Model,
+    pub transcript: Transcript,
+    pub options: SimpleStreamOptions,
+    /// When the request was sent; the provider cache's lifetime starts here.
+    pub started: std::time::Instant,
+    /// Input plus cache-read and cache-write tokens of the response.
+    pub prompt_tokens: u64,
+}
+
 pub struct Agent {
     pub(crate) streamer: Arc<dyn Streamer>,
     pub(crate) hooks: Arc<dyn LoopHooks>,
@@ -96,6 +109,8 @@ pub struct Agent {
     pub(crate) steer_pending: watch::Sender<bool>,
     /// The next [`ToolInvocationId`](crate::ToolInvocationId).
     pub(crate) next_invocation: AtomicU64,
+    /// See [`Agent::last_request`].
+    pub(crate) last_request: watch::Sender<Option<Arc<SentRequest>>>,
 }
 
 /// A withdrawn input and its position in the original queue.
@@ -167,6 +182,7 @@ impl Agent {
             }),
             steer_pending: watch::channel(false).0,
             next_invocation: AtomicU64::new(0),
+            last_request: watch::channel(None).0,
         }
     }
 
@@ -175,6 +191,12 @@ impl Agent {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The last completed request, kept only when `RequestCache::keep_warm`; `None` while a
+    /// request streams or after the transcript or selection changed.
+    pub fn last_request(&self) -> watch::Receiver<Option<Arc<SentRequest>>> {
+        self.last_request.subscribe()
     }
 
     /// Replaces the tool hooks for hook passes that start after this returns.
@@ -404,18 +426,32 @@ impl Agent {
         self.lock().messages.clone()
     }
 
+    /// Replaces the transcript; a different one drops [`Agent::last_request`].
     pub fn set_messages(&self, m: Vec<AgentMessage>) {
-        self.lock().messages = m;
+        let mut state = self.lock();
+        if state.messages != m {
+            state.messages = m;
+            drop(state);
+            self.last_request.send_replace(None);
+        }
     }
 
-    /// Installs the next request's selection under the same lock used to sample it.
+    /// Installs the next request's selection under the same lock used to sample it; a
+    /// different one drops [`Agent::last_request`].
     pub fn set_selection(&self, model: Option<Model>, thinking: ThinkingLevel, tier: ServiceTier) {
         let mut state = self.lock();
+        let changed = model.as_ref().is_some_and(|model| *model != state.model)
+            || state.thinking != thinking
+            || state.service_tier != tier;
         if let Some(model) = model {
             state.model = model;
         }
         state.thinking = thinking;
         state.service_tier = tier;
+        drop(state);
+        if changed {
+            self.last_request.send_replace(None);
+        }
     }
 
     /// Takes effect from the next turn; the change is declared to the model with a

@@ -11,7 +11,7 @@ use axo::{Entry, EntryBase, EntryId, JsonlStore, SeqEntry, SessionStore, Submiss
 use axo::{PromptPart, SessionEvent, ToolPolicy, ToolScope};
 use axo_agent::{AgentMessage, BeforeToolCallContext, RunOutcome, ToolCallDecision, ToolError};
 use axo_ai::testing::{reply_text, reply_tool_calls};
-use axo_ai::{AssistantBlock, Message, ScriptedTurn, UserBlock};
+use axo_ai::{AssistantBlock, CacheRetention, Message, ScriptedTurn, UserBlock};
 use common::{options, within};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -763,7 +763,7 @@ async fn withdrawn_input_is_never_delivered() {
 }
 
 #[tokio::test]
-async fn reopened_session_edits_a_file_it_read_before() {
+async fn reopened_session_writes_a_file_it_read_before() {
     let dir = tempfile::tempdir().unwrap();
     let notes = options(dir.path()).cwd.join("notes.txt");
     std::fs::write(&notes, "hello\n").unwrap();
@@ -795,17 +795,17 @@ async fn reopened_session_edits_a_file_it_read_before() {
         vec![
             ScriptedTurn::Reply(reply_tool_calls(&[(
                 "c2",
-                "edit",
-                json!({ "path": "notes.txt", "edits": [{ "oldText": "hello", "newText": "bye" }] }),
+                "write",
+                json!({ "path": "notes.txt", "content": "bye\n" }),
             )])),
-            ScriptedTurn::Reply(reply_text("edited")),
+            ScriptedTurn::Reply(reply_text("wrote")),
         ],
     )
     .await
     .axo;
     let session = axo.open_session(&path, options(dir.path())).await.unwrap();
     assert_eq!(
-        within(session.prompt("edit the notes")).await.unwrap(),
+        within(session.prompt("write the notes")).await.unwrap(),
         RunOutcome::Done
     );
 
@@ -819,56 +819,9 @@ async fn reopened_session_edits_a_file_it_read_before() {
             } if result.tool_call_id == "c2" => Some(result),
             _ => None,
         })
-        .expect("the edit's result");
+        .expect("the write's result");
     assert!(!result.is_error, "{:?}", result.content);
     assert_eq!(std::fs::read_to_string(&notes).unwrap(), "bye\n");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn partial_read_then_edit_in_one_batch_edits() {
-    // Several pairs, because one parallel pair only loses the race sometimes.
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = options(dir.path()).cwd;
-    let mut calls = Vec::new();
-    for n in 0..8 {
-        std::fs::write(cwd.join(format!("{n}.txt")), "line\nhello\n").unwrap();
-        let path = format!("{n}.txt");
-        calls.push((
-            format!("r{n}"),
-            "read",
-            json!({ "path": path, "offset": 2, "limit": 1 }),
-        ));
-        calls.push((
-            format!("e{n}"),
-            "edit",
-            json!({ "path": path, "edits": [{ "oldText": "hello", "newText": "bye" }] }),
-        ));
-    }
-    let calls: Vec<_> = calls
-        .iter()
-        .map(|(id, name, args)| (id.as_str(), *name, args.clone()))
-        .collect();
-    let axo = common::host(
-        dir.path(),
-        vec![
-            ScriptedTurn::Reply(reply_tool_calls(&calls)),
-            ScriptedTurn::Reply(reply_text("edited")),
-        ],
-    )
-    .await
-    .axo;
-    let session = axo.create_session(options(dir.path())).await.unwrap();
-    assert_eq!(
-        within(session.prompt("edit the files")).await.unwrap(),
-        RunOutcome::Done
-    );
-    for n in 0..8 {
-        assert_eq!(
-            std::fs::read_to_string(cwd.join(format!("{n}.txt"))).unwrap(),
-            "line\nbye\n",
-            "each edit waits for its batched read's ledger record"
-        );
-    }
 }
 
 #[tokio::test]
@@ -1605,6 +1558,121 @@ async fn persona_run_modes_are_enforced_before_root_changes_and_child_creation()
         session.jobs().is_empty(),
         "rejected spawns must not admit children"
     );
+}
+
+/// A priced Anthropic model whose idle 100k-token prompt passes the warm gate
+/// (reads at 0.05 of input).
+fn warm_model(id: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "api": "anthropic-messages",
+        "baseUrl": "https://anthropic.example",
+        "contextWindow": 1_000_000,
+        "cost": {"input": 5, "output": 25, "cacheWrite": 6.25, "cacheRead": 0.25},
+    })
+}
+
+/// A reply whose prompt counts `tokens` input tokens.
+fn reply_with_prompt(text: &str, tokens: u64) -> ScriptedTurn {
+    let mut reply = reply_text(text);
+    reply.usage.input = tokens;
+    ScriptedTurn::Reply(reply)
+}
+
+fn cache_warm(entry: &Entry) -> bool {
+    matches!(entry, Entry::Usage { kind, .. } if kind == "cache_warm")
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_root_warms_once_and_journals_cache_warm() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut warm = reply_text("");
+    warm.usage.cache_read = 100_000;
+    let host = common::host_with(
+        dir.path(),
+        json!([warm_model("m")]),
+        json!({}),
+        vec![reply_with_prompt("hi", 100_000), ScriptedTurn::Reply(warm)],
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    within(session.prompt("hello")).await.unwrap();
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].options.cache_retention, CacheRetention::Short);
+    assert!(!requests[0].options.warm);
+
+    tokio::time::advance(Duration::from_secs(271)).await;
+    common::entry(&session, cache_warm).await;
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].options.warm);
+    assert_eq!(requests[1].transcript, requests[0].transcript);
+    let entries = session.attach(None).await.missed;
+    let warms: Vec<_> = (0..entries.len())
+        .filter(|&at| cache_warm(&entries[at].entry))
+        .collect();
+    assert_eq!(warms.len(), 1, "{entries:#?}");
+    assert!(
+        !entries[warms[0]..]
+            .iter()
+            .any(|seq| matches!(seq.entry, Entry::Message { .. })),
+        "a warm is never a turn"
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_child_never_warms() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host_with(
+        dir.path(),
+        json!([{"id": "m"}, warm_model("child")]),
+        json!({}),
+        vec![ScriptedTurn::Reply(reply_text("noted"))],
+    )
+    .await;
+    host.api
+        .lane("child", vec![reply_with_prompt("done", 100_000)]);
+    let parent = host.axo.create_session(options(dir.path())).await.unwrap();
+    let handle = parent.spawn(common::request("check")).await.unwrap();
+    common::delivered(&parent, &handle.job).await;
+    common::entry(&parent, |entry| matches!(entry, Entry::RunEnd { .. })).await;
+
+    tokio::time::advance(Duration::from_secs(271)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let requests = host.api.requests();
+    assert_eq!(requests.iter().filter(|r| r.model.id == "child").count(), 1);
+    assert!(requests.iter().all(|r| !r.options.warm));
+    parent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscription_root_caches_for_an_hour_without_warming() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host_with(
+        dir.path(),
+        json!([{
+            "id": "m",
+            "api": "anthropic-messages",
+            "baseUrl": "https://api.anthropic.com",
+            "contextWindow": 1_000_000,
+        }]),
+        json!({}),
+        vec![reply_with_prompt("hi", 100_000)],
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    within(session.prompt("hello")).await.unwrap();
+    assert_eq!(
+        host.api.requests()[0].options.cache_retention,
+        CacheRetention::Long
+    );
+
+    tokio::time::advance(Duration::from_secs(271)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(host.api.requests().len(), 1);
+    session.shutdown().await;
 }
 
 mod keywords {

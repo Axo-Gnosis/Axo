@@ -161,7 +161,8 @@ impl FileLedger {
             .cloned()
     }
 
-    /// Checks that the file still holds the bytes this session last read or wrote.
+    /// Checks that an existing file still holds the bytes this session last read or wrote;
+    /// `write` needs this, `edit` proves freshness by its match.
     #[ext(
         skip = "recording or checking outside the file lock is unsafe; tools.readFile and tools.writeFile do both"
     )]
@@ -173,10 +174,10 @@ impl FileLedger {
     ) -> Result<String, ToolError> {
         match self.recorded(absolute) {
             None => Err(ToolError(format!(
-                "File has not been read in this session: {shown_path}. Read it with the read tool first; any line range counts, but output from bash does not."
+                "File has not been read in this session: {shown_path}. Read it before replacing it with write, or change it with edit."
             ))),
             Some(hash) if hash != Self::hash(current) => Err(ToolError(format!(
-                "File changed since it was last read: {shown_path}. Read it again before editing."
+                "File changed since it was last read: {shown_path}. Read it again before replacing it with write, or change it with edit."
             ))),
             Some(hash) => Ok(hash),
         }
