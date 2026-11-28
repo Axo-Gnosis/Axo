@@ -36,17 +36,24 @@ pub(crate) struct ConvertOptions {
 }
 
 /// Collect raw input declarations before collapsing system messages, so calls to tools
-/// since removed can still be replayed as custom calls.
+/// since removed can still be replayed as custom calls. The last declaration of a name
+/// wins: re-adding a tool without a raw input drops its mapping.
 pub(crate) fn raw_tool_inputs(messages: &[Message]) -> HashMap<&str, &str> {
-    messages
+    let mut inputs = HashMap::new();
+    let declared = messages
         .iter()
         .filter_map(|message| match message {
             Message::System(system) => Some(&system.tools_added),
             _ => None,
         })
-        .flatten()
-        .filter_map(|tool| Some((tool.name.as_str(), tool.raw_input.as_deref()?)))
-        .collect()
+        .flatten();
+    for tool in declared {
+        match tool.raw_input.as_deref() {
+            Some(property) => inputs.insert(tool.name.as_str(), property),
+            None => inputs.remove(tool.name.as_str()),
+        };
+    }
+    inputs
 }
 
 /// Convert a resolved transcript (see `Transcript::resolve`) into Responses `input` items.

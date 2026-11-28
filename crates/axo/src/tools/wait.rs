@@ -132,7 +132,7 @@ impl Tool for WaitTool {
         let mut guard: Option<WaitGuard> = None;
         loop {
             if steer.is_pending() {
-                let running = jobs.running_admitted();
+                let running = jobs.running_admitted(parent.as_deref());
                 let ids: Vec<String> = running.iter().map(ToString::to_string).collect();
                 return Ok(output(
                     format!(
@@ -151,7 +151,7 @@ impl Tool for WaitTool {
                     render_results(&results),
                     WaitReason::Results,
                     &results,
-                    nested.then(|| jobs.running_admitted()),
+                    nested.then(|| jobs.running_admitted(parent.as_deref())),
                 ));
             }
             if jobs.has_mail() {
@@ -159,12 +159,12 @@ impl Tool for WaitTool {
                     MAIL_ARRIVED.into(),
                     WaitReason::Mail,
                     &[],
-                    nested.then(|| jobs.running_admitted()),
+                    nested.then(|| jobs.running_admitted(parent.as_deref())),
                 ));
             }
             match &self.team {
                 None => {
-                    if jobs.running_admitted().is_empty() {
+                    if jobs.running_admitted(parent.as_deref()).is_empty() {
                         return Ok(output(
                             "No background jobs are running.".into(),
                             WaitReason::Idle,

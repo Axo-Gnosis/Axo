@@ -14,10 +14,8 @@ use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use super::command::{
-    CommandRunner, JobControl, RegisterCommand, Stop, StopOnDrop, lock, with_status,
-};
-use super::{CommandExit, JobId, Killer, Promotion};
+use super::command::{CommandRunner, JobControl, Stop, StopOnDrop, lock, with_status};
+use super::{JobId, Killer, Promotion, Register, ScriptExit};
 use crate::schemes::artifact::command_log_tail;
 use crate::tools::FileRecord;
 
@@ -88,22 +86,18 @@ impl CommandRunner {
         let control = Arc::new(JobControl {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
-            container: None,
             host_promotable: true,
             promote: Notify::new(),
         });
         let started_at = axo_ai::now_ms();
         let start = Instant::now();
-        let id = jobs.register(RegisterCommand {
-            command: request.label,
-            script: true,
+        let id = jobs.register_script(Register {
+            label: request.label,
             tool: cx.call.name.clone(),
-            cwd: Default::default(),
             call_id: cx.call.id.clone(),
             started_at,
             artifact,
             control: control.clone(),
-            output: None,
         });
         let mut abandon = StopOnDrop(Some((jobs, id)));
         let progress = Arc::new(Mutex::new(TaskProgress::default()));
@@ -159,9 +153,8 @@ impl CommandRunner {
                         end.is_error = true;
                         exit
                     }
-                    None => CommandExit::Exited {
-                        code: i32::from(end.is_error),
-                    },
+                    None if end.is_error => ScriptExit::Failed,
+                    None => ScriptExit::Returned,
                 };
                 let files = std::mem::take(&mut lock(&progress).files);
                 drop(live);
@@ -169,7 +162,7 @@ impl CommandRunner {
                     let _ = tokio::fs::remove_file(&path).await;
                 }
                 if promoted {
-                    jobs.command_done(id, end.text, end.is_error, Some(exit), files)
+                    jobs.command_done(id, end.text, end.is_error, exit.stopped(), files)
                         .await;
                     jobs.closed(id);
                 } else {
@@ -255,22 +248,22 @@ fn output(text: String, details: Map<String, Value>, is_error: bool) -> ToolOutp
     }
 }
 
-fn stop_status(id: JobId, stop: Stop) -> (CommandExit, String) {
+fn stop_status(id: JobId, stop: Stop) -> (ScriptExit, String) {
     match stop {
-        Stop::Aborted => (CommandExit::Aborted, "Script aborted".into()),
+        Stop::Aborted => (ScriptExit::Aborted, "Script aborted".into()),
         Stop::TimedOut(secs) => (
-            CommandExit::TimedOut { after_secs: secs },
+            ScriptExit::TimedOut { after_secs: secs },
             format!("Script timed out after {secs} seconds"),
         ),
         Stop::Killed(by) => (
-            CommandExit::Killed { by },
+            ScriptExit::Killed { by },
             match by {
                 Killer::Model => format!("Script was stopped (kill {id})"),
                 Killer::Host => "Script was stopped by the user".into(),
             },
         ),
         Stop::Shutdown => (
-            CommandExit::Interrupted,
+            ScriptExit::Interrupted,
             "Script was interrupted when the session closed".into(),
         ),
     }
@@ -280,7 +273,7 @@ fn stop_status(id: JobId, stop: Stop) -> (CommandExit, String) {
 mod tests {
     use super::*;
     use crate::exec::host::{ProcessSupervisor, Supervision};
-    use crate::jobs::{JOB_RESULT, JobHost, JobKind, JobRegistry};
+    use crate::jobs::{CommandExit, JOB_RESULT, JobHost, JobKind, JobRegistry};
     use crate::schemes::artifact::Artifacts;
     use crate::session::journal;
     use crate::store::{Entry, SeqEntry};
@@ -438,10 +431,7 @@ mod tests {
         .unwrap();
         assert_eq!(text(&out.content), "hello");
         assert_eq!(file_records_in(out.details.as_ref()), vec![record]);
-        assert_eq!(
-            out.details.unwrap()["exit"],
-            json!({ "type": "exited", "code": 0 })
-        );
+        assert_eq!(out.details.unwrap()["exit"], json!({ "type": "returned" }));
         assert!(
             runner
                 .jobs
@@ -760,7 +750,7 @@ mod tests {
         assert!(matches!(
             job.kind,
             JobKind::Script {
-                exit: Some(CommandExit::Interrupted),
+                exit: Some(ScriptExit::Interrupted),
                 ..
             }
         ));

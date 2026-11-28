@@ -130,6 +130,15 @@ impl SessionHooks {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Forgets nested calls under `root` still pending once their calling tool is done:
+    /// a crashed nested runner or a suppressed emit never sends their end.
+    #[cfg(feature = "codemode")]
+    pub(super) fn forget_nested(&self, root: &str) {
+        self.live()
+            .nested
+            .retain(|pending| pending.parent_call_id != root);
+    }
+
     /// Keep live state and its event on the same side of an attach snapshot.
     fn relay_live<T>(&self, event: &AgentEvent, update: impl FnOnce(&mut LiveRun) -> T) -> T {
         let mut live = self.live();
@@ -737,7 +746,13 @@ impl Persist for SessionHooks {
                 });
                 let appended = self.append(batch).await;
                 jobs.settle(receipts, appended.is_ok()).await;
-                appended.map_err(|err| PersistError(err.to_string()))?;
+                // Subscribers see the end even if its record failed, so no call stays pending.
+                let _ = self
+                    .events
+                    .send(Arc::new(SessionEvent::Agent(event.clone())));
+                return appended
+                    .map(|_| ())
+                    .map_err(|err| PersistError(err.to_string()));
             }
             AgentEvent::ToolExecutionEnd {
                 call_id,

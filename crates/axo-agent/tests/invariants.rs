@@ -2776,7 +2776,7 @@ async fn nested_calls_reject_unknown_invalid_and_non_nestable_tools() {
                 (
                     "outer",
                     JsonMap::new(),
-                    "outer cannot be called from a script",
+                    "outer cannot be called by another tool",
                 ),
             ] {
                 let result = cx.calls.call(name, args).await;
@@ -2939,4 +2939,35 @@ async fn nested_hook_content_overrides_clear_structured_content() {
     });
     agent.set_tool_hooks(vec![Arc::new(NestedPolicy)]);
     run_outer(&agent).await;
+}
+
+#[tokio::test]
+async fn nested_structured_content_reaches_the_caller_but_not_events() {
+    let typed = Arc::new(ScriptTool {
+        name: "typed",
+        run: |_: ToolContext| async move {
+            ToolOutput {
+                structured_content: Some(json!({ "ok": true })),
+                ..ToolOutput::default()
+            }
+        },
+    });
+    let (agent, events) = nested_agent(vec![typed], |cx| async move {
+        let result = cx.calls.call("typed", JsonMap::new()).await;
+        assert_eq!(result.structured_content, Some(json!({ "ok": true })));
+    });
+    run_outer(&agent).await;
+    let events = events.events.lock().unwrap();
+    let nested = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolExecutionEnd {
+                result,
+                parent_call_id: Some(_),
+                ..
+            } => Some(result),
+            _ => None,
+        })
+        .expect("nested end event");
+    assert!(nested.structured_content.is_none());
 }

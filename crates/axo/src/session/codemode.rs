@@ -147,30 +147,23 @@ impl Tool for CodemodeTool {
             promote_after: Duration::from_millis(self.settings.promote_after_ms),
             timeout,
         };
-        let limits = script::Limits {
-            memory_bytes: (self.settings.memory_mb as usize).saturating_mul(1 << 20),
-            cpu: Duration::from_millis(self.settings.cpu_ms),
-            max_calls: self.settings.max_calls,
-            max_in_flight: self.settings.max_in_flight as usize,
-            ..script::Limits::default()
+        let setup = Setup {
+            limits: script::Limits {
+                memory_bytes: (self.settings.memory_mb as usize).saturating_mul(1 << 20),
+                cpu: Duration::from_millis(self.settings.cpu_ms),
+                max_calls: self.settings.max_calls,
+                max_in_flight: self.settings.max_in_flight as usize,
+                ..script::Limits::default()
+            },
+            pool: self.pool.clone(),
+            max_output_bytes: (self.settings.max_output_tokens as usize).saturating_mul(4),
+            root_call: cx.call.id.clone(),
         };
-        let max_output_bytes = (self.settings.max_output_tokens as usize).saturating_mul(4);
         let calls = cx.calls.clone();
-        let pool = self.pool.clone();
         self.tools
             .runner
-            .run_task(&cx, request, move |scope| async move {
-                run_script(
-                    code,
-                    store,
-                    calls,
-                    scope,
-                    Arc::downgrade(&hooks),
-                    limits,
-                    &pool,
-                    max_output_bytes,
-                )
-                .await
+            .run_task(&cx, request, move |scope| {
+                run_script(code, store, calls, scope, Arc::downgrade(&hooks), setup)
             })
             .await
     }
@@ -317,16 +310,29 @@ impl ScriptHost for Driver {
     }
 }
 
+/// How one script runs, fixed when its call starts.
+struct Setup {
+    limits: script::Limits,
+    pool: script::Pool,
+    max_output_bytes: usize,
+    /// The model's `codemode` call, which every nested call runs under.
+    root_call: String,
+}
+
 async fn run_script(
     code: String,
     store: BTreeMap<String, Value>,
     calls: Calls,
     scope: TaskScope,
     hooks: Weak<SessionHooks>,
-    limits: script::Limits,
-    pool: &script::Pool,
-    max_output_bytes: usize,
+    setup: Setup,
 ) -> TaskEnd {
+    let Setup {
+        limits,
+        pool,
+        max_output_bytes,
+        root_call,
+    } = setup;
     let max_store = limits.store_total_bytes;
     let driver = Arc::new(Driver {
         calls,
@@ -340,10 +346,14 @@ async fn run_script(
         store,
         driver.clone(),
         limits,
-        pool,
+        &pool,
         scope.cancel.clone(),
     )
     .await;
+    // Every nested call has returned; any still pending will never end.
+    if let Some(hooks) = hooks.upgrade() {
+        hooks.forget_nested(&root_call);
+    }
     let artifact = format!("artifact://{}", scope.artifact);
     let log_error = driver
         .log_error

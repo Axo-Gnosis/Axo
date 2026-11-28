@@ -187,7 +187,7 @@ impl Family {
         }
         if !routed.tool.nestable() {
             return Some(error_output(format!(
-                "{} cannot be called from a script",
+                "{} cannot be called by another tool",
                 routed.call.name
             )));
         }

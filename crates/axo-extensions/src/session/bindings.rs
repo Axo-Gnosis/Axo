@@ -348,12 +348,27 @@ impl ToolPolicy for RemotePolicy {
             return Ok(None);
         }
         let ext = &self.remote.ext;
+        // A nested call's typed value is for its calling tool and in-process hooks only.
+        let text_only;
+        let result = match call.result {
+            result if call.parent.is_some() && result.structured_content.is_some() => {
+                text_only = ToolOutput {
+                    content: result.content.clone(),
+                    details: result.details.clone(),
+                    structured_content: None,
+                    is_error: result.is_error,
+                    terminate: result.terminate,
+                };
+                &text_only
+            }
+            result => result,
+        };
         let args = serde_json::to_value(PolicyArgs {
             scope,
             cx: AfterToolCall {
                 assistant_message: call.assistant_message,
                 tool_call: call.tool_call,
-                result: call.result,
+                result,
                 parent: call.parent,
             },
         })

@@ -1631,6 +1631,43 @@ async fn responses_replay_custom_calls_and_their_results() {
     }
 }
 
+#[tokio::test]
+async fn responses_raw_input_follows_the_latest_declaration() {
+    let target = model("openai", "only", ApiKind::OpenAiResponses, "http://unused");
+    let raw = raw_tool_spec();
+    let plain = ToolSpec {
+        raw_input: None,
+        ..raw.clone()
+    };
+    let arguments = json!({"code": "return 1"});
+    let mut assistant = AssistantMessage::empty(&target);
+    assistant.stop_reason = StopReason::ToolUse;
+    assistant.content.push(AssistantBlock::ToolCall(ToolCall {
+        id: "call_1|fc_1".into(),
+        name: raw.name.clone(),
+        arguments: arguments.as_object().unwrap().clone(),
+        arguments_error: None,
+        thought_signature: None,
+    }));
+    let messages = vec![
+        system_tools(vec![raw]),
+        system_tools(vec![plain]),
+        Message::Assistant(assistant),
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_1|fc_1".into(),
+            tool_name: "script".into(),
+            content: vec![UserBlock::Text { text: "ok".into() }],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+            duration_ms: None,
+        }),
+    ];
+    let (body, _) = scripted_responses(&target, messages, RESPONSES_COMPLETED).await;
+    assert_eq!(body["input"][0]["type"], "function_call", "{body}");
+    assert_eq!(body["tools"][0]["type"], "function", "{body}");
+}
+
 /// Lists two models, or fails, or returns a list naming another provider.
 struct ScriptedModels {
     mode: Mutex<&'static str>,

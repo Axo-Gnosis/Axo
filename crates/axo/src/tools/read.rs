@@ -170,6 +170,8 @@ impl ReadTool {
         };
 
         let context = budget.is_some();
+        // A scripted read leaves nested instructions for the first direct read there.
+        let instructions = context && program.is_none();
         let mut piece =
             if let Some(mime) = detect_image_mime(&bytes[..bytes.len().min(IMAGE_SNIFF_BYTES)]) {
                 if specs.is_some() {
@@ -231,7 +233,7 @@ impl ReadTool {
             };
 
         check_cancel(cancel)?;
-        if context {
+        if instructions {
             piece
                 .blocks
                 .extend(self.tools.context.attach(&absolute).await);
@@ -300,8 +302,20 @@ impl Tool for ReadTool {
                         "[{raw}: not read, output limit reached; read it in another call]"
                     ),
                 });
-                if program.is_none() {
-                    continue;
+                match &program {
+                    None => continue,
+                    // Both budgets are spent: nothing more could reach the script either.
+                    Some(program) if program.max_bytes == 0 => {
+                        files.push(ReadPiece {
+                            path: raw.clone(),
+                            data: ReadData::Error {
+                                error: "not read, output limit reached; read it in another call"
+                                    .into(),
+                            },
+                        });
+                        continue;
+                    }
+                    Some(_) => {}
                 }
             }
             match self

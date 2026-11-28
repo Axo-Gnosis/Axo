@@ -14,11 +14,10 @@ use serde_json::{Value, json};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot, watch};
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use super::{CommandExit, JobId, JobRegistry, Killer, Mode, Promotion};
+use super::{BgRun, CommandExit, JobId, JobRegistry, Killer, Promotion, Register};
 use crate::exec::host::{
     Container, ExecSpec, OutputChunk, OutputStream, Pipe, PipeChunk, Process, ProcessSupervisor,
 };
@@ -115,7 +114,6 @@ pub(super) enum Stop {
 pub(super) struct JobControl {
     pub(super) cancel: CancellationToken,
     pub(super) stop: Mutex<Option<Stop>>,
-    pub(super) container: Option<Container>,
     pub(super) host_promotable: bool,
     pub(super) promote: Notify,
 }
@@ -131,35 +129,17 @@ impl JobControl {
 }
 
 pub(super) struct CommandRun {
-    pub(super) command: String,
-    pub(super) script: bool,
-    pub(super) call_id: String,
-    pub(super) tool: String,
+    pub(super) bg: BgRun,
     pub(super) cwd: PathBuf,
-    pub(super) started_at: i64,
-    pub(super) promotion: Option<Promotion>,
-    pub(super) promoted_at: Option<i64>,
-    pub(super) ended_at: Option<i64>,
     pub(super) exit: Option<CommandExit>,
-    /// Live capture state for processes; absent for scripts and replayed rows.
-    pub(super) output: Option<Arc<OutputState>>,
-    pub(super) artifact: u64,
-    pub(super) mode: Mode,
-    pub(super) phase: Phase,
-    pub(super) control: Option<Arc<JobControl>>,
-    pub(super) task: Option<JoinHandle<()>>,
+    /// Absent for replayed rows.
+    pub(super) live: Option<LiveCommand>,
 }
 
-pub(super) struct RegisterCommand {
-    pub(super) command: String,
-    pub(super) script: bool,
-    pub(super) tool: String,
-    pub(super) cwd: PathBuf,
-    pub(super) call_id: String,
-    pub(super) started_at: i64,
-    pub(super) artifact: u64,
-    pub(super) control: Arc<JobControl>,
-    pub(super) output: Option<Arc<OutputState>>,
+/// The process behind a command row started in this session.
+pub(super) struct LiveCommand {
+    pub(super) output: Arc<OutputState>,
+    pub(super) container: Container,
 }
 
 pub(super) struct OutputState {
@@ -500,7 +480,6 @@ impl CommandRunner {
         let control = Arc::new(JobControl {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
-            container: Some(process.container()),
             host_promotable: !nested,
             promote: Notify::new(),
         });
@@ -508,17 +487,21 @@ impl CommandRunner {
             path: artifact_path,
             progress: watch::Sender::new(OutputProgress::default()),
         });
-        let id = jobs.register(RegisterCommand {
-            command: label,
-            script: false,
-            tool: call.name.clone(),
+        let id = jobs.register_command(
+            Register {
+                label,
+                tool: call.name.clone(),
+                call_id: call.id.clone(),
+                started_at,
+                artifact,
+                control: control.clone(),
+            },
             cwd,
-            call_id: call.id.clone(),
-            started_at,
-            artifact,
-            control: control.clone(),
-            output: Some(output.clone()),
-        });
+            LiveCommand {
+                output: output.clone(),
+                container: process.container(),
+            },
+        );
         let (done, mut ended) = oneshot::channel();
         let mut changes = output.progress.subscribe();
         let shared = Arc::new(CommandShared {

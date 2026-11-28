@@ -224,7 +224,7 @@ try { await tools.ask({}); } catch (e) { print(e.message); }
     let output = message_text(success(&lines, "nest"));
     for name in ["codemode", "ask"] {
         assert!(
-            output.contains(&format!("{name} cannot be called from a script")),
+            output.contains(&format!("{name} cannot be called by another tool")),
             "{output}"
         );
         assert_eq!(lines[nested(&lines, "nest", name)]["isError"], true);
@@ -569,6 +569,72 @@ async fn command_pid(session: &Session, call: &str) -> u32 {
         }
     })
     .await
+}
+
+#[tokio::test]
+async fn a_background_scripts_own_wait_does_not_wait_on_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        vec![
+            background(
+                "waiter",
+                r#"await tools.read({path: "example.txt"}); return (await tools.wait({})).reason;"#,
+            ),
+            done(),
+            done(),
+        ],
+    )
+    .await;
+    let mut options = options(dir.path());
+    std::fs::write(options.cwd.join("example.txt"), "text").unwrap();
+    // Hold the script until its row is admitted, so `wait` sees it running.
+    let gate = Arc::new(HoldRead::default());
+    options.host.tool_policies.push(gate.clone());
+    let session = host.axo.create_session(options).await.unwrap();
+    prompt(&session, "Wait in the background").await;
+    let lines = journal(&session);
+    let job = success(&lines, "waiter")["message"]["details"]["job"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    gate.0.notify_one();
+    common::delivered(&session, &job).await;
+    let lines = journal(&session);
+    let text = message_text(&lines[job_result(&lines, &job)]);
+    assert!(text.contains("idle"), "{text}");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_scripted_read_leaves_nested_instructions_for_a_direct_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        vec![
+            script(
+                "scripted",
+                r#"await tools.read({path: "nested/data.txt"});"#,
+            ),
+            call("direct", "read", json!({"path": "nested/data.txt"})),
+            done(),
+        ],
+    )
+    .await;
+    let mut options = options(dir.path());
+    options.project_access = Some(ProjectAccess::Read);
+    host.config
+        .set_project(options.cwd.clone(), ConfigLayer::default());
+    std::fs::create_dir_all(options.cwd.join(".git")).unwrap();
+    std::fs::create_dir_all(options.cwd.join("nested")).unwrap();
+    std::fs::write(options.cwd.join("nested/AGENTS.md"), "NESTED_SENTINEL").unwrap();
+    std::fs::write(options.cwd.join("nested/data.txt"), "data").unwrap();
+    let session = host.axo.create_session(options).await.unwrap();
+    prompt(&session, "Read it twice").await;
+    let lines = journal(&session);
+    let direct = serde_json::to_string(&success(&lines, "direct")["message"]["content"]).unwrap();
+    assert!(direct.contains("NESTED_SENTINEL"), "{direct}");
+    session.shutdown().await;
 }
 
 #[tokio::test]

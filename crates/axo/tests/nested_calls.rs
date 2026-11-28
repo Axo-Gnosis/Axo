@@ -517,3 +517,51 @@ async fn attach_lists_nested_calls_separately_even_after_the_run_ends() {
     );
     session.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_nested_end_whose_record_fails_still_reaches_subscribers() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = WriteGate::new(
+        |entry| matches!(entry, Entry::NestedToolCall { name, .. } if name == "read"),
+    );
+    let host = common::gated_host(dir.path(), json!([{"id":"m"}]), &gate, turns()).await;
+    let options = options(
+        dir.path(),
+        vec![("read", json!({"path": "example.txt"}))],
+        false,
+    );
+    std::fs::write(options.cwd.join("example.txt"), "text").unwrap();
+    let session = host.axo.create_session(options).await.unwrap();
+    let mut events = session.subscribe();
+    let fail = async {
+        gate.entered.notified().await;
+        gate.fail.store(true, Ordering::Release);
+        gate.release.notify_one();
+    };
+    let (outcome, ()) = within(async { tokio::join!(session.prompt("read nested"), fail) }).await;
+    assert_eq!(outcome.unwrap(), RunOutcome::Done);
+    let ended = within(async {
+        loop {
+            if let SessionEvent::Agent(AgentEvent::ToolExecutionEnd {
+                name,
+                parent_call_id: Some(_),
+                ..
+            }) = &*events.recv().await.unwrap()
+                && name == "read"
+            {
+                break true;
+            }
+        }
+    })
+    .await;
+    assert!(ended);
+    assert!(
+        session
+            .attach(None)
+            .await
+            .live
+            .pending_nested_calls
+            .is_empty()
+    );
+    session.shutdown().await;
+}

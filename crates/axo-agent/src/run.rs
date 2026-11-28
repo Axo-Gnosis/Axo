@@ -189,11 +189,25 @@ impl Outcome {
         )
     }
 
+    /// A nested call's `structured_content` goes only to its caller (see `Calls::call`),
+    /// so its event carries the text and details alone.
     pub(crate) fn end_event(&self, parent_call_id: Option<String>) -> AgentEvent {
+        let result = if parent_call_id.is_some() {
+            let output = &self.output;
+            ToolOutput {
+                content: output.content.clone(),
+                details: output.details.clone(),
+                structured_content: None,
+                is_error: output.is_error,
+                terminate: output.terminate,
+            }
+        } else {
+            self.output.clone()
+        };
         AgentEvent::ToolExecutionEnd {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
-            result: self.output.clone(),
+            result,
             parent_call_id,
             invocation: self.invocation,
             duration_ms: self.duration_ms,
