@@ -65,6 +65,9 @@ pub(crate) struct Inherited {
     pub(crate) exec: Arc<dyn ExecEnv>,
     /// Runs every local command in its own supervised container (process group or cgroup).
     pub(crate) supervisor: Arc<ProcessSupervisor>,
+    /// Bounds the script VMs executing at once, shared by every session of the host.
+    #[cfg(feature = "codemode")]
+    pub(crate) script_pool: crate::script::Pool,
     pub(crate) ask_enabled: bool,
     pub(crate) store: Arc<dyn SessionStore>,
     pub(crate) sessions: Arc<SessionTable>,
@@ -296,6 +299,7 @@ impl Session {
             Arc::new(CodemodeTool::new(
                 session_tools.clone(),
                 settings.codemode.clone(),
+                inherited.script_pool.clone(),
             ))
         });
         #[cfg(feature = "codemode")]

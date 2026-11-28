@@ -11,7 +11,37 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use axo_ai::JsonMap;
 use serde_json::Value;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+/// Bounds how many script VMs execute at once. A VM waiting on a host call holds no
+/// slot, so scripts blocked in long tool calls never starve the others. Clones share
+/// slots; give every `run` that should compete for them the same pool.
+#[derive(Debug, Clone)]
+pub struct Pool(Arc<Semaphore>);
+
+impl Pool {
+    /// A pool of `vms` slots, at least one.
+    pub fn new(vms: usize) -> Self {
+        Self(Arc::new(Semaphore::new(
+            vms.clamp(1, Semaphore::MAX_PERMITS),
+        )))
+    }
+
+    async fn acquire(&self, cancel: &CancellationToken) -> Option<OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            slot = self.0.clone().acquire_owned() => slot.ok(),
+        }
+    }
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self::new(4)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
@@ -58,6 +88,15 @@ pub trait ScriptHost: Send + Sync + 'static {
     fn abandon(&self);
 }
 
+/// What a store counts against [`Limits::store_total_bytes`]: each key plus its compact
+/// JSON.
+pub(crate) fn store_bytes<'a>(values: impl IntoIterator<Item = (&'a String, &'a Value)>) -> usize {
+    values
+        .into_iter()
+        .map(|(key, value)| key.len() + value.to_string().len())
+        .sum()
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoreChanges {
     pub set: BTreeMap<String, Value>,
@@ -88,7 +127,8 @@ pub async fn run(
     store: BTreeMap<String, Value>,
     host: Arc<dyn ScriptHost>,
     limits: Limits,
+    pool: &Pool,
     cancel: CancellationToken,
 ) -> ScriptEnd {
-    engine::run(code, store, host, limits, cancel).await
+    engine::run(code, store, host, limits, pool, cancel).await
 }

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, SeekFrom, Write};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,12 +15,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::{SessionHooks, journal};
 use crate::config::CodemodeSettings;
+use crate::error::Error;
 use crate::jobs::task::{TaskEnd, TaskProgress, TaskRequest, TaskScope};
 use crate::script::{self, ScriptHost};
-use crate::store::{self, Entry};
+use crate::store::Entry;
 use crate::tools::{SessionTools, deferred, file_records_in, truncate};
 
-const STORE: &str = "axo.codemode.store";
 const PROGRESS_BYTES: usize = 20 * 1024;
 
 const DESCRIPTION: &str = "Run a JavaScript script that calls your tools and returns only what it prints or returns. Use it when one script replaces several tool calls: a loop over many files or items, parallel calls with Promise.all, or filtering and aggregating large results so they never enter the conversation. For a single call, or when you need to read each result before choosing the next step, call the tool directly.
@@ -45,14 +45,20 @@ pub(super) struct CodemodeTool {
     hooks: OnceLock<Weak<SessionHooks>>,
     tools: Arc<SessionTools>,
     settings: CodemodeSettings,
+    pool: script::Pool,
 }
 
 impl CodemodeTool {
-    pub(super) fn new(tools: Arc<SessionTools>, settings: CodemodeSettings) -> Self {
+    pub(super) fn new(
+        tools: Arc<SessionTools>,
+        settings: CodemodeSettings,
+        pool: script::Pool,
+    ) -> Self {
         Self {
             hooks: OnceLock::new(),
             tools,
             settings,
+            pool,
         }
     }
 
@@ -126,7 +132,7 @@ impl Tool for CodemodeTool {
             .map(Duration::try_from_secs_f64)
             .transpose()
             .map_err(|error| ToolError(format!("Invalid script timeout: {error}")))?;
-        let store = load_store(&hooks);
+        let store = hooks.journal.read(journal::View::script_store);
         let label = code
             .lines()
             .map(str::trim)
@@ -150,6 +156,7 @@ impl Tool for CodemodeTool {
         };
         let max_output_bytes = (self.settings.max_output_tokens as usize).saturating_mul(4);
         let calls = cx.calls.clone();
+        let pool = self.pool.clone();
         self.tools
             .runner
             .run_task(&cx, request, move |scope| async move {
@@ -160,6 +167,7 @@ impl Tool for CodemodeTool {
                     scope,
                     Arc::downgrade(&hooks),
                     limits,
+                    &pool,
                     max_output_bytes,
                 )
                 .await
@@ -168,30 +176,39 @@ impl Tool for CodemodeTool {
     }
 }
 
-fn load_store(hooks: &SessionHooks) -> BTreeMap<String, Value> {
-    let view = hooks.journal.view();
-    let mut store = BTreeMap::new();
-    if let Some(leaf) = view.entries.last().and_then(|seq| seq.entry.id()) {
-        for at in store::path_to(&view.entries, leaf) {
-            if let Entry::Custom {
-                custom_type,
-                data: Some(data),
-                ..
-            } = &view.entries[at].entry
-                && custom_type == STORE
-            {
-                if let Some(set) = data["set"].as_object() {
-                    store.extend(set.iter().map(|(key, value)| (key.clone(), value.clone())));
-                }
-                if let Some(delete) = data["delete"].as_array() {
-                    for key in delete.iter().filter_map(Value::as_str) {
-                        store.remove(key);
-                    }
-                }
-            }
+/// Commits a script's store changes over the branch's current store, which other
+/// scripts may have changed since this one started. Fails if the merged store would
+/// grow past `max_total`; a store already over it may still shrink.
+async fn commit_store(
+    hooks: &SessionHooks,
+    changes: script::StoreChanges,
+    max_total: usize,
+) -> Result<(), String> {
+    loop {
+        let (revision, current) = hooks
+            .journal
+            .read(|view| (view.revision, view.script_store()));
+        let before = script::store_bytes(&current);
+        let mut merged: BTreeMap<_, _> = current.iter().collect();
+        for key in &changes.delete {
+            merged.remove(key);
+        }
+        merged.extend(&changes.set);
+        let after = script::store_bytes(merged);
+        if after > max_total && after > before {
+            return Err("store total limit exceeded".into());
+        }
+        let entry = Entry::ScriptStore {
+            base: journal::base(),
+            set: changes.set.clone(),
+            delete: changes.delete.clone(),
+        };
+        // Commits only over the store just checked; another commit in between retries.
+        match hooks.append_if(revision, vec![entry]).await {
+            Err(Error::ContextChanged) => continue,
+            result => return result.map(|_| ()).map_err(|error| error.to_string()),
         }
     }
-    store
 }
 
 #[derive(Default)]
@@ -214,11 +231,11 @@ impl ScriptHost for Driver {
         let output = self.calls.call(tool, arguments).await;
         self.progress
             .lock()
-            .expect("script progress lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .files
             .extend(file_records_in(output.details.as_ref()));
         {
-            let mut counts = self.counts.lock().expect("script counts lock");
+            let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
             *counts.by_name.entry(tool.to_owned()).or_default() += 1;
             counts.failed += u32::from(output.is_error);
         }
@@ -282,10 +299,10 @@ impl ScriptHost for Driver {
         if let Err(error) = writeln!(&self.log, "{text}") {
             self.log_error
                 .lock()
-                .expect("script log lock")
+                .unwrap_or_else(PoisonError::into_inner)
                 .get_or_insert(error);
         }
-        let mut progress = self.progress.lock().expect("script progress lock");
+        let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
         progress.text.push_str(text);
         progress.text.push('\n');
         let mut start = progress.text.len().saturating_sub(PROGRESS_BYTES);
@@ -307,8 +324,10 @@ async fn run_script(
     scope: TaskScope,
     hooks: Weak<SessionHooks>,
     limits: script::Limits,
+    pool: &script::Pool,
     max_output_bytes: usize,
 ) -> TaskEnd {
+    let max_store = limits.store_total_bytes;
     let driver = Arc::new(Driver {
         calls,
         log: scope.log.into_std().await,
@@ -316,9 +335,21 @@ async fn run_script(
         progress: scope.progress,
         counts: Mutex::default(),
     });
-    let end = script::run(&code, store, driver.clone(), limits, scope.cancel.clone()).await;
+    let end = script::run(
+        &code,
+        store,
+        driver.clone(),
+        limits,
+        pool,
+        scope.cancel.clone(),
+    )
+    .await;
     let artifact = format!("artifact://{}", scope.artifact);
-    let log_error = driver.log_error.lock().expect("script log lock").take();
+    let log_error = driver
+        .log_error
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
     let mut log = String::new();
     let read = async {
         let mut file = tokio::fs::File::from_std(driver.log.try_clone()?);
@@ -351,15 +382,7 @@ async fn run_script(
         && (!end.store.set.is_empty() || !end.store.delete.is_empty())
     {
         let saved = match hooks.upgrade() {
-            Some(hooks) => hooks
-                .append(vec![Entry::Custom {
-                    base: journal::base(),
-                    custom_type: STORE.into(),
-                    data: Some(json!({ "set": end.store.set, "delete": end.store.delete })),
-                }])
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
+            Some(hooks) => commit_store(&hooks, end.store, max_store).await,
             None => Err("session closed".into()),
         };
         if let Err(save_error) = saved {
@@ -368,7 +391,7 @@ async fn run_script(
             ));
         }
     }
-    let counts = driver.counts.lock().expect("script counts lock");
+    let counts = driver.counts.lock().unwrap_or_else(PoisonError::into_inner);
     let is_error = error.is_some() || io_failed;
     if let Some(error) = error {
         if !text.is_empty() {

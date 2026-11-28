@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axo::script::{Limits, ScriptEnd, ScriptHost, StoreChanges, run};
+use axo::script::{Limits, Pool, ScriptEnd, ScriptHost, StoreChanges, run};
 use axo_ai::JsonMap;
 use serde_json::{Value, json};
 use tokio::{
@@ -101,6 +101,7 @@ async fn eval(code: &str, limits: Limits) -> (ScriptEnd, Arc<Host>) {
             BTreeMap::new(),
             host.clone(),
             limits,
+            &Pool::default(),
             CancellationToken::new(),
         ),
     )
@@ -165,7 +166,6 @@ async fn deadline_cannot_be_caught_and_ends_an_oom_loop_and_regex() {
         r#"/(a+)+$/.test("a".repeat(40)+"b")"#,
     ] {
         let (end, host) = eval(code, limits.clone()).await;
-        // Other tests can hold all worker slots; only time spent executing counts here.
         assert!(
             end.cpu >= limits.cpu && end.cpu < Duration::from_secs(1),
             "{code}: {:?}",
@@ -181,11 +181,13 @@ async fn cancel_while_spinning_or_awaiting_the_host() {
     for code in ["print('ready'); while(true){}", "await tools.hang()"] {
         let host = Arc::new(Host::default());
         let cancel = CancellationToken::new();
+        let pool = Pool::default();
         let mut script = std::pin::pin!(run(
             code,
             BTreeMap::new(),
             host.clone(),
             Limits::default(),
+            &pool,
             cancel.clone()
         ));
         tokio::select! {
@@ -368,6 +370,7 @@ async fn only_failure_abandons_pending_calls() {
     for cancelled in [false, true] {
         let host = Arc::new(Host::default());
         let cancel = CancellationToken::new();
+        let pool = Pool::default();
         let mut script = std::pin::pin!(run(
             "store('k', 1); for (let i = 0; i < 5; i++) tools.hang().finally(() => print('late')); return 1;",
             BTreeMap::new(),
@@ -376,6 +379,7 @@ async fn only_failure_abandons_pending_calls() {
                 max_in_flight: 1,
                 ..limits()
             },
+            &pool,
             cancel.clone(),
         ));
         tokio::select! {
@@ -424,7 +428,7 @@ async fn store_is_bounded_and_commit_is_transactional() {
       store('temp', undefined);
       if (load('delete') !== undefined || load('temp') !== undefined) throw new Error('not deleted');
       store('new', [load('keep').v, true]);
-    "#, initial, host.clone(), limits(), CancellationToken::new()).await;
+    "#, initial, host.clone(), limits(), &Pool::default(), CancellationToken::new()).await;
     assert!(end.error.is_none(), "{end:?}");
     assert_eq!(
         end.store.set,
@@ -452,6 +456,93 @@ async fn store_is_bounded_and_commit_is_transactional() {
     )
     .await;
     assert_error(end, "Store total limit exceeded");
+
+    // A snapshot over the cap still runs: it may delete and shrink, never grow.
+    let over = BTreeMap::from([
+        ("a".into(), json!("x".repeat(8))),
+        ("b".into(), json!("y".repeat(8))),
+    ]);
+    let tight = Limits {
+        store_total_bytes: 16,
+        ..limits()
+    };
+    for (code, error) in [
+        (
+            "store('a', undefined); store('b', 'z'); return load('b')",
+            None,
+        ),
+        (
+            "store('b', 'y'.repeat(9))",
+            Some("Store total limit exceeded"),
+        ),
+    ] {
+        let host = Arc::new(Host::default());
+        let end = run(
+            code,
+            over.clone(),
+            host.clone(),
+            tight.clone(),
+            &Pool::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        match error {
+            None => {
+                assert_eq!(end.store.delete, ["a"]);
+                assert_ok(end, &host, &["z"]);
+            }
+            Some(error) => assert_error(end, error),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_promise_that_can_never_settle_fails_without_cancel() {
+    for code in [
+        "await new Promise(() => {})",
+        "await tools.echo(); await new Promise(() => {})",
+    ] {
+        let (end, _) = eval(code, limits()).await;
+        assert_error(end, "Script is waiting on a promise that can never settle");
+    }
+}
+
+#[tokio::test]
+async fn a_script_waiting_on_the_host_holds_no_slot() {
+    let pool = Pool::new(1);
+    let host = Arc::new(Host::default());
+    let blocked = tokio::spawn({
+        let (host, pool) = (host.clone(), pool.clone());
+        async move {
+            run(
+                "return await tools.hang()",
+                BTreeMap::new(),
+                host,
+                limits(),
+                &pool,
+                CancellationToken::new(),
+            )
+            .await
+        }
+    });
+    timeout(SLACK, host.started.notified()).await.unwrap();
+    let other = Arc::new(Host::default());
+    let end = timeout(
+        SLACK,
+        run(
+            "return 5",
+            BTreeMap::new(),
+            other.clone(),
+            limits(),
+            &pool,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_ok(end, &other, &["5"]);
+    host.stop.cancel();
+    assert_error(blocked.await.unwrap(), "stopped");
 }
 
 #[tokio::test]
@@ -488,7 +579,7 @@ async fn output_limits_apply_to_print_and_return_in_utf8_bytes() {
 }
 
 // A gated native callback models a builtin that cannot poll the interrupt hook.
-// Unlike a big sort, it gives us a deterministic way to hold all four slots.
+// Unlike a big sort, it gives us a deterministic way to hold the only slot.
 #[tokio::test]
 async fn cancelled_non_cooperative_worker_still_holds_its_slot() {
     struct Gate {
@@ -514,46 +605,49 @@ async fn cancelled_non_cooperative_worker_still_holds_its_slot() {
             unreachable!()
         }
     }
+    let pool = Pool::new(1);
     let (start, started) = mpsc::channel();
-    let mut workers = Vec::new();
-    for _ in 0..4 {
-        let (release, rx) = mpsc::channel();
-        let host = Arc::new(Gate {
-            started: start.clone(),
-            release: Mutex::new(rx),
-        });
-        let cancel = CancellationToken::new();
-        let token = cancel.clone();
-        let task = tokio::spawn(async move {
+    let (release, rx) = mpsc::channel();
+    let host = Arc::new(Gate {
+        started: start,
+        release: Mutex::new(rx),
+    });
+    let cancel = CancellationToken::new();
+    let blocked = tokio::spawn({
+        let (token, pool) = (cancel.clone(), pool.clone());
+        async move {
             run(
                 "print('blocked');",
                 BTreeMap::new(),
                 host,
                 Limits::default(),
+                &pool,
                 token,
             )
             .await
-        });
-        workers.push((release, cancel, task));
-    }
-    tokio::task::spawn_blocking(move || (0..4).for_each(|_| started.recv_timeout(SLACK).unwrap()))
+        }
+    });
+    tokio::task::spawn_blocking(move || started.recv_timeout(SLACK).unwrap())
         .await
         .unwrap();
-    workers[0].1.cancel();
-    let waiting = eval("return 5", limits());
+    cancel.cancel();
+    let other = Arc::new(Host::default());
+    let waiting = run(
+        "return 5",
+        BTreeMap::new(),
+        other.clone(),
+        limits(),
+        &pool,
+        CancellationToken::new(),
+    );
     let mut waiting = std::pin::pin!(waiting);
     assert!(
         timeout(Duration::from_millis(35), &mut waiting)
             .await
             .is_err()
     );
-    workers[0].0.send(()).unwrap();
-    let (end, host) = timeout(SLACK, waiting).await.unwrap();
-    assert_ok(end, &host, &["5"]);
-    let (_, _, cancelled) = workers.remove(0);
-    assert_error(cancelled.await.unwrap(), "Script cancelled");
-    for (release, _, task) in workers {
-        release.send(()).unwrap();
-        assert!(task.await.unwrap().error.is_none());
-    }
+    release.send(()).unwrap();
+    let end = timeout(SLACK, waiting).await.unwrap();
+    assert_ok(end, &other, &["5"]);
+    assert_error(blocked.await.unwrap(), "Script cancelled");
 }

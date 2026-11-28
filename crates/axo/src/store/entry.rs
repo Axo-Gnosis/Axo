@@ -3,6 +3,7 @@
 //! run and submission entries.
 
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -404,6 +405,16 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
     },
+    /// The script store changes one successful `codemode` script committed: `set`
+    /// then `delete`, folded along the branch. Never in context.
+    ScriptStore {
+        #[serde(flatten)]
+        base: EntryBase,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        set: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delete: Vec<String>,
+    },
     /// A host message that is in context.
     CustomMessage {
         #[serde(flatten)]
@@ -657,6 +668,7 @@ impl Entry {
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
             | Entry::Custom { base, .. }
+            | Entry::ScriptStore { base, .. }
             | Entry::CustomMessage { base, .. }
             | Entry::ContextEdit { base, .. }
             | Entry::Label { base, .. }
@@ -688,6 +700,7 @@ impl Entry {
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
             | Entry::Custom { base, .. }
+            | Entry::ScriptStore { base, .. }
             | Entry::CustomMessage { base, .. }
             | Entry::ContextEdit { base, .. }
             | Entry::Label { base, .. }

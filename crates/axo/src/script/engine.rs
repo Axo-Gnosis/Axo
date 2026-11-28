@@ -20,10 +20,10 @@ use rquickjs::{
     String as JsString, Value as JsValue, context::EvalOptions,
 };
 use serde_json::Value;
-use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{Limits, ScriptEnd, ScriptError, ScriptHost, StoreChanges};
+use super::{Limits, Pool, ScriptEnd, ScriptError, ScriptHost, StoreChanges};
 
 // ponytail: in-process QuickJS. Move this module behind a supervised subprocess
 // or wasm if engine memory safety or non-interruptible builtins become a problem.
@@ -31,19 +31,18 @@ const THREAD_STACK: usize = 8 << 20;
 const SOURCE: &str = "axo-script.js";
 const RESULT_TOO_LARGE: &str = "Result too large";
 const CANCELLED: &str = "Script cancelled";
-static SLOTS: Semaphore = Semaphore::const_new(4);
+const UNSETTLEABLE: &str = "Script is waiting on a promise that can never settle";
 
 pub(super) async fn run(
     code: &str,
     store: BTreeMap<String, Value>,
     host: Arc<dyn ScriptHost>,
     limits: Limits,
+    pool: &Pool,
     cancel: CancellationToken,
 ) -> ScriptEnd {
-    let slot = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return failed(CANCELLED),
-        slot = SLOTS.acquire() => slot.expect("script semaphore stays open"),
+    let Some(slot) = pool.acquire(&cancel).await else {
+        return failed(CANCELLED);
     };
     if !(1..=u32::MAX as usize).contains(&limits.max_in_flight)
         || limits.max_in_flight > Semaphore::MAX_PERMITS
@@ -66,12 +65,14 @@ pub(super) async fn run(
         limits: limits.clone(),
         cancel: cancel.clone(),
         host: host.clone(),
+        pool: pool.clone(),
+        slot: Cell::new(Some(slot)),
+        replied: Cell::new(0),
     };
     let code = code.to_owned();
     if let Err(error) = thread::Builder::new()
         .stack_size(THREAD_STACK)
         .spawn(move || {
-            let _slot = slot;
             let _ = end_tx.send(worker.execute(&code, store));
         })
     {
@@ -193,6 +194,11 @@ struct Worker {
     limits: Limits,
     cancel: CancellationToken,
     host: Arc<dyn ScriptHost>,
+    pool: Pool,
+    /// Held while the VM executes; released while it waits on a host reply.
+    slot: Cell<Option<OwnedSemaphorePermit>>,
+    /// Replies received, compared with requests sent to tell waiting from deadlock.
+    replied: Cell<u32>,
 }
 
 type HeldValue = Persistent<JsValue<'static>>;
@@ -210,9 +216,7 @@ impl Worker {
         let meter = Rc::new(Meter::new(self.limits.cpu, self.cancel.clone()));
         let calls = Rc::new(Cell::new(0));
         let result = (|| {
-            let store = Rc::new(RefCell::new(
-                Store::new(store, &self.limits).map_err(problem)?,
-            ));
+            let store = Rc::new(RefCell::new(Store::new(store)));
             self.eval(code, &meter, &calls, &store)?;
             Ok(store.take().changes())
         })();
@@ -333,6 +337,11 @@ impl Worker {
                 })?;
                 return self.drain(&context, meter, drain);
             }
+            // The prelude sends whenever a slot is free, so no outstanding request
+            // means nothing is queued in JS either: the promise can never settle.
+            if self.replied.get() == calls.get() {
+                return Err(problem(UNSETTLEABLE));
+            }
             let completion = self.completion()?;
             meter.slice(|| {
                 context.with(|cx| {
@@ -359,11 +368,17 @@ impl Worker {
         }
     }
 
+    /// Waits for the next host reply without holding a VM slot.
     fn completion(&self) -> Result<Completion, ScriptError> {
-        match self.replies.recv() {
-            Ok(Reply::Complete(completion)) => Ok(completion),
-            _ => Err(problem(CANCELLED)),
-        }
+        drop(self.slot.take());
+        let Ok(Reply::Complete(completion)) = self.replies.recv() else {
+            return Err(problem(CANCELLED));
+        };
+        self.replied.set(self.replied.get() + 1);
+        let slot = futures::executor::block_on(self.pool.acquire(&self.cancel))
+            .ok_or_else(|| problem(CANCELLED))?;
+        self.slot.set(Some(slot));
+        Ok(completion)
     }
 
     fn drain(
@@ -598,20 +613,17 @@ struct Store {
 }
 
 impl Store {
-    fn new(values: BTreeMap<String, Value>, limits: &Limits) -> Result<Self, &'static str> {
+    /// Loads any snapshot, even one over the limits, so a script can still run and
+    /// shrink it; only writes are checked.
+    fn new(values: BTreeMap<String, Value>) -> Self {
         let mut store = Self::default();
         for (key, value) in values {
-            let json = bounded_json(&value, limits.store_value_bytes)
-                .ok_or("Store value limit exceeded")?;
+            let json = value.to_string();
+            store.bytes += key.len() + json.len();
             store.original.insert(key.clone());
-            store.replace(
-                key,
-                Some(json),
-                limits.store_value_bytes,
-                limits.store_total_bytes,
-            )?;
+            store.values.insert(key, json);
         }
-        Ok(store)
+        store
     }
 
     fn write(
@@ -651,7 +663,8 @@ impl Store {
                 return Err("Store value limit exceeded");
             }
             let size = key.len().saturating_add(json.len());
-            if size > max_total - bytes {
+            // An over-cap snapshot may still shrink: only growth past the cap fails.
+            if size > old && size > max_total.saturating_sub(bytes) {
                 return Err("Store total limit exceeded");
             }
             let value = serde_json::from_str(&json).map_err(|_| "Value is not serializable")?;

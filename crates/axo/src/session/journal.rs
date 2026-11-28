@@ -2,7 +2,7 @@
 //! and everyone else reads immutable snapshots. Appending never waits on anything but the
 //! task, and the task never waits on anyone but the disk.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -10,7 +10,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use super::SessionEvent;
 use crate::error::Error;
-use crate::store::{Entry, EntryBase, EntryId, Projection, SeqEntry, SessionWriter};
+use serde_json::Value;
+
+use crate::store::{self, Entry, EntryBase, EntryId, Projection, SeqEntry, SessionWriter};
 
 /// The journal after one committed batch. Immutable once published.
 #[derive(Clone)]
@@ -28,6 +30,28 @@ impl View {
     /// Whether the entry with id `id` exists.
     pub(crate) fn has(&self, id: &str) -> bool {
         self.ids.contains(id)
+    }
+
+    /// The script store on the current branch: every `script_store` entry on the path
+    /// to the leaf, in order, `set` then `delete`.
+    pub(crate) fn script_store(&self) -> BTreeMap<String, Value> {
+        // ponytail: folds the branch per script; cache per leaf if store churn makes this show up
+        let Some(leaf) = self.entries.last().and_then(|seq| seq.entry.id()) else {
+            return BTreeMap::new();
+        };
+        let mut values = BTreeMap::<&str, &Value>::new();
+        for at in store::path_to(&self.entries, leaf) {
+            if let Entry::ScriptStore { set, delete, .. } = &self.entries[at].entry {
+                values.extend(set.iter().map(|(key, value)| (key.as_str(), value)));
+                for key in delete {
+                    values.remove(key.as_str());
+                }
+            }
+        }
+        values
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.clone()))
+            .collect()
     }
 }
 

@@ -25,6 +25,7 @@ mod surface;
 pub(crate) mod team;
 pub(crate) mod wire;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -573,6 +574,13 @@ impl Session {
                 })
                 .flatten()
         })
+    }
+
+    /// The values `codemode` scripts stored on the current branch, as the next script
+    /// would `load` them.
+    #[ext]
+    pub fn script_store(&self) -> BTreeMap<String, Value> {
+        self.hooks.journal.read(journal::View::script_store)
     }
 
     /// The skills in force now; the prompt's catalog and `/name` commands use these.

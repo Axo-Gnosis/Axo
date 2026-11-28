@@ -233,6 +233,8 @@ pub(super) fn child_seed(hooks: &SessionHooks, path: PathBuf, link: SpawnLink) -
         models: parent.models.clone(),
         exec: parent.exec.clone(),
         supervisor: parent.supervisor.clone(),
+        #[cfg(feature = "codemode")]
+        script_pool: parent.script_pool.clone(),
         ask_enabled: false,
         store: parent.store.clone(),
         sessions: parent.sessions.clone(),

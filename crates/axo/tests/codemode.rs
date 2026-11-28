@@ -376,16 +376,19 @@ async fn store_commits_only_successful_changes_on_the_current_branch() {
     for text in ["Save", "Try overwriting in a failing script", "Load"] {
         prompt(&session, text).await;
     }
+    assert_eq!(
+        session.script_store(),
+        std::collections::BTreeMap::from([("k".into(), json!(1))])
+    );
     session
         .navigate(Some(ancestor), Default::default())
         .await
         .unwrap();
+    assert!(session.script_store().is_empty());
     prompt(&session, "Load on the other branch").await;
     let lines = journal(&session);
-    let saved = only(&lines, "store entry", |e| {
-        e["type"] == "custom" && e["customType"] == "axo.codemode.store"
-    });
-    assert_eq!(lines[saved]["data"]["set"], json!({"k": 1}));
+    let saved = only(&lines, "store entry", |e| e["type"] == "script_store");
+    assert_eq!(lines[saved]["set"], json!({"k": 1}));
     assert_eq!(lines[result(&lines, "fail")]["message"]["isError"], true);
     assert_eq!(
         serde_json::from_str::<Value>(message_text(success(&lines, "load"))).unwrap(),
@@ -397,6 +400,67 @@ async fn store_commits_only_successful_changes_on_the_current_branch() {
 
 fn background(id: &str, code: &str) -> ScriptedTurn {
     call(id, "codemode", json!({"code": code, "async": true}))
+}
+
+#[tokio::test]
+async fn overlapping_scripts_cannot_commit_past_the_store_limit_together() {
+    // Each script stores about 600 KiB; together they pass the 1 MiB total.
+    let fill = |prefix: &str| {
+        format!(r#"for (let i = 0; i < 3; i++) store("{prefix}" + i, "x".repeat(200 << 10));"#)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        vec![
+            ScriptedTurn::Reply(reply_tool_calls(&[
+                (
+                    "held",
+                    "codemode",
+                    json!({"code": format!("{} await tools.read({{path: \"example.txt\"}});", fill("a")), "async": true}),
+                ),
+                ("quick", "codemode", json!({"code": fill("b")})),
+            ])),
+            done(),
+            done(),
+            script(
+                "later",
+                r#"store("b0", undefined); return ["a0", "b0", "b1"].map(k => typeof load(k));"#,
+            ),
+            done(),
+        ],
+    )
+    .await;
+    let mut options = options(dir.path());
+    std::fs::write(options.cwd.join("example.txt"), "text").unwrap();
+    let gate = Arc::new(HoldRead::default());
+    options.host.tool_policies.push(gate.clone());
+    let session = host.axo.create_session(options).await.unwrap();
+    prompt(&session, "Fill the store twice").await;
+    let lines = journal(&session);
+    success(&lines, "quick");
+    let job = success(&lines, "held")["message"]["details"]["job"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ends = common::run_ends(&session);
+    gate.0.notify_one();
+    common::delivered(&session, &job).await;
+    common::until(|| common::run_ends(&session) > ends).await;
+    let lines = journal(&session);
+    let text = message_text(&lines[job_result(&lines, &job)]);
+    assert!(
+        text.contains(
+            "Script succeeded but its stored values could not be saved: store total limit exceeded"
+        ),
+        "{text}"
+    );
+    prompt(&session, "Shrink it").await;
+    let lines = journal(&session);
+    assert_eq!(
+        serde_json::from_str::<Value>(message_text(success(&lines, "later"))).unwrap(),
+        json!(["undefined", "undefined", "string"])
+    );
+    session.shutdown().await;
 }
 
 fn job_result(lines: &[Value], job: &str) -> usize {
