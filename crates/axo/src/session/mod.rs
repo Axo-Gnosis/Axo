@@ -1,6 +1,8 @@
 //! A conversation with one agent in one working directory, saved as it happens.
 
 pub(crate) mod children;
+#[cfg(feature = "codemode")]
+mod codemode;
 pub(crate) mod coordination;
 pub(crate) mod delivery;
 pub(crate) mod events;

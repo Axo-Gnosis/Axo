@@ -1,8 +1,5 @@
 //! Async script jobs use the same registry and admission receipts as commands.
 
-// integration: gate this module on `any(test, feature = "codemode")` when the feature lands.
-#![allow(dead_code)]
-
 use std::future::{Future, pending};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
@@ -44,7 +41,7 @@ pub(crate) struct TaskProgress {
 pub(crate) struct TaskScope {
     /// Fires on foreground abort, timeout, kill and shutdown. Work must clean up and return.
     pub cancel: CancellationToken,
-    /// The append-only output log. Flush it before reading it through the artifact store.
+    /// The append-only output log, also open for reading.
     pub log: File,
     pub progress: Arc<Mutex<TaskProgress>>,
     pub job: String,
@@ -80,7 +77,7 @@ impl CommandRunner {
             .create(&command_log_tail(&cx.call.name, &cx.call.id))
             .await
             .map_err(|err| ToolError(err.to_string()))?;
-        let log = match OpenOptions::new().append(true).open(&path).await {
+        let log = match OpenOptions::new().read(true).append(true).open(&path).await {
             Ok(log) => log,
             Err(err) => {
                 drop(live);
@@ -137,11 +134,11 @@ impl CommandRunner {
                     result = &mut work => result,
                     secs = async {
                         match timeout {
-                            Some(timeout) => {
-                                sleep_until(start + timeout).await;
+                            Some(timeout) if let Some(deadline) = start.checked_add(timeout) => {
+                                sleep_until(deadline).await;
                                 timeout.as_secs_f64()
                             }
-                            None => pending().await,
+                            _ => pending().await,
                         }
                     } => {
                         control.stop(Stop::TimedOut(secs));
@@ -192,6 +189,9 @@ impl CommandRunner {
         };
         jobs.set_task(id, task);
 
+        let promote_at = (!request.promote_after.is_zero())
+            .then(|| start.checked_add(request.promote_after))
+            .flatten();
         let mut steer = cx.steer.clone();
         let mut aborting = false;
         let mut promotable = true;
@@ -213,7 +213,12 @@ impl CommandRunner {
                         tokio::select! {
                             () = control.promote.notified() => Promotion::Host,
                             () = steer.pending() => Promotion::Steer,
-                            () = sleep_until(start + request.promote_after), if !request.promote_after.is_zero() => Promotion::Timer,
+                            () = async {
+                                match promote_at {
+                                    Some(deadline) => sleep_until(deadline).await,
+                                    None => pending().await,
+                                }
+                            } => Promotion::Timer,
                         }
                     }
                 }, if promotable && !aborting => {

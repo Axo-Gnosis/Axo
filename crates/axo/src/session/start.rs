@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::children::{self, ChildState, SessionTable, TurnBudget};
+#[cfg(feature = "codemode")]
+use super::codemode::CodemodeTool;
 use super::delivery::{ActivityState, enqueue};
 use super::journal::Journal;
 use super::maintenance::Maintenance;
@@ -289,6 +291,19 @@ impl Session {
         });
         let (host, host_deferred) = tools::instantiate(&joined_tools, &session_tools);
         let spawn_tool = Arc::new(SpawnTool::new(&resolved.agents, &settings.model_roles));
+        #[cfg(feature = "codemode")]
+        let codemode_tool = settings.codemode.enabled.then(|| {
+            Arc::new(CodemodeTool::new(
+                session_tools.clone(),
+                settings.codemode.clone(),
+            ))
+        });
+        #[cfg(feature = "codemode")]
+        let codemode = codemode_tool
+            .as_ref()
+            .map(|tool| tool.clone() as Arc<dyn Tool>);
+        #[cfg(not(feature = "codemode"))]
+        let codemode = None;
         let routes = AgentRoutes {
             session_id: session_id.clone(),
             parent: link.as_ref().map(|link| link.parent_session_id.clone()),
@@ -318,6 +333,7 @@ impl Session {
                 sessions: inherited.sessions.clone(),
             }),
             ask,
+            codemode,
             settings,
         );
         let yield_tool: Option<Arc<dyn Tool>> = link
@@ -373,6 +389,12 @@ impl Session {
                     "mode \"{name}\" from the session is unavailable; running without it"
                 ),
             });
+        let codemode_diagnostic =
+            (settings.codemode.enabled && !cfg!(feature = "codemode")).then(|| Diagnostic {
+                origin: None,
+                message: "codemode is enabled in settings but this build does not include it"
+                    .into(),
+            });
         let diagnostics: Vec<_> = context_diagnostics
             .into_iter()
             .chain(prompt_shape.tool_diagnostics.iter().cloned())
@@ -392,6 +414,7 @@ impl Session {
             .chain(inherited.definition_diagnostics.iter().cloned())
             .chain(merge_diagnostics)
             .chain(mode_diagnostic)
+            .chain(codemode_diagnostic)
             .collect();
         for diagnostic in &diagnostics {
             warn!("{diagnostic}");
@@ -418,6 +441,10 @@ impl Session {
         let hooks = Arc::new_cyclic(|this: &Weak<SessionHooks>| {
             jobs.attach(this.clone() as Weak<dyn JobHost>);
             spawn_tool.attach(this.clone());
+            #[cfg(feature = "codemode")]
+            if let Some(tool) = &codemode_tool {
+                tool.attach(this.clone());
+            }
             if let Some(tool) = &enter_mode {
                 tool.attach(this.clone());
             }

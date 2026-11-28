@@ -640,6 +640,10 @@ impl Tool for AskTool {
         Replay::Safe
     }
 
+    fn nestable(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let ToolContext {
             call,

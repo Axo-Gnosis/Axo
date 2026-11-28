@@ -477,6 +477,7 @@ pub(super) mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &crate::Settings::default(),
                 ),
                 session,
