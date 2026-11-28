@@ -440,7 +440,7 @@ Emitted by `attach().events` (`broadcast::Receiver<Arc<SessionEvent>>`; every re
 | `MaintenanceStart` | `kind: MaintenanceKind` | Compaction, `/shake`, or branch summary started |
 | `MaintenanceEnd` | `kind: MaintenanceKind`, `error: Option<String>`, `aborted: bool` | Maintenance task finished |
 | `Retry` | `attempt: u32`, `delay_ms: u64`, `max_retries: u32`, `error: Option<String>`, `failure: Option<axo_ai::ProviderFailure>` | Turn or summary retry: retry number, selected delay, configured limit, and available provider error text/structured failure |
-| `Job` | `JobInfo` | A listed job appeared or changed: a command or child row's state after a promotion, exit, admission, run start, or run message |
+| `Job` | `JobInfo` | A listed job appeared or changed: a command, script, or child row's state after a promotion, exit, admission, run start, or run message |
 | `JobGone` | `id: String` | A job left the list |
 | `Context` | `ContextUsage` | Current context estimate and model window, compaction trigger, and reserve |
 | `AutoPaused` | `paused: bool` | Automatic-continuation pause state changed |
@@ -454,7 +454,9 @@ Emitted by `attach().events` (`broadcast::Receiver<Arc<SessionEvent>>`; every re
 
 Events arrive in one total order per session. `attach` subscribes while holding the journal, live, mode, job-registry, and tree-usage locks, then captures pending questions and results. State-valued events such as `Job`, `Context`, `AutoPaused`, and `TreeUsage` may repeat a value the snapshot already holds. Pending-review events can overlap their snapshot: upsert `ModeResult` by call id and remove on `ModeResultResolved`; reattach after broadcast lag to rebuild live state.
 
-For a promoted command, the stream reports the running row, then the finished/failed row with typed exit and message delivery `Writing`, then its persisted `Entry::JobEnd`, and then the row with delivery `Pending` (or its later state). Entries carry the durable result text; row updates carry state, not a second result transcript.
+`AgentEvent::ToolExecutionStart`, `ToolExecutionUpdate`, and `ToolExecutionEnd` have `parent_call_id: Option<String>` (wire `parentCallId`), set to the model-issued call id for nested calls. The end event also reports `invocation: Option<ToolInvocationId>` and `duration_ms: Option<u64>` (wire `durationMs`) when the call ran; synthetic results may omit them. Nested events can interleave with loop events, but each call starts before its updates and end. On attach, use `LiveSnapshot::pending_nested_calls` (each `PendingNestedCall` holds the parent id and `call`), separate from `pending_tool_calls`. Finished nested calls are journaled as `Entry::NestedToolCall`, not as transcript messages.
+
+For a promoted command or script, the stream reports the running row, then the finished/failed row with typed exit and message delivery `Writing`, then its persisted `Entry::JobEnd`, and then the row with delivery `Pending` (or its later state). Entries carry the durable result text; row updates carry state, not a second result transcript.
 
 ### Background jobs for hosts
 
@@ -462,8 +464,8 @@ Commands and scripts that move to the background become jobs `bg_N` (see [Backgr
 
 - **State:** `Session::jobs()` returns `Vec<JobInfo>`, and `attach().live` carries the same list as `LiveSnapshot::jobs`.
 - **Spend and selection:** `LiveSnapshot::usage` is the session's own spend: `Entry::usage()` summed over its whole journal, across branches, including maintenance and failed responses, without counting `run_end` or `job_end` rollups again. `LiveSnapshot::tree_usage` (also `Session::tree_usage()`, kept current by `SessionEvent::TreeUsage { usage }`) adds every descendant's own spend, computed the same way from each child's journal, so it includes child compaction and branch summaries and grandchildren. Each child row's `JobKind::Child::tree_usage` is that child's subtree share. Do not total `Entry::JobEnd` usage for cost: it covers one child run's assistant messages only, excluding the child's maintenance and its descendants. The snapshot also carries the live `model`, `thinking`, chosen `service_tier`, and selected persona name in `agent`; getters expose the same current selection.
-- **Changes:** each listed row that appears or changes emits `SessionEvent::Job(info)`, and a row leaving the list emits `SessionEvent::JobGone { id }`; upsert rows by `id` over the snapshot. Foreground commands that are never listed emit nothing.
-- **Stop:** `Session::kill_job(id)` returns `KillReceipt { id, stopping }`; the job outcome is then journaled and delivered normally. Commands record `CommandExit::Killed { by: Killer::Host }` and read `Command was stopped by the user`; model calls to `kill` record `Killer::Model` instead. Model `kill` and `send` serialize typed [coordination receipts](#coordination-receipts) into result details. `proc://` is read-only.
+- **Changes:** each listed row that appears or changes emits `SessionEvent::Job(info)`, and a row leaving the list emits `SessionEvent::JobGone { id }`; upsert rows by `id` over the snapshot. Foreground work that is never listed emits no job-row events.
+- **Stop:** `Session::kill_job(id)` returns `KillReceipt { id, stopping }`; the job outcome is then journaled and delivered normally. Commands and scripts record `CommandExit::Killed { by: Killer::Host }`; their results say `Command was stopped by the user` or `Script was stopped by the user`. Model calls to `kill` record `Killer::Model` instead. Model `kill` and `send` serialize typed [coordination receipts](#coordination-receipts) into result details. `proc://` is read-only.
 - **Scheme text:** `session.schemes().read(&url).await` resolves file targets and reads them as UTF-8, while virtual targets use their handler. A missing file reports `{url} not found`; binary data reports `{url} is not UTF-8 text; resolve it and read the file`. Use `CommandOutput::read` for live command byte ranges, or resolve a file target and perform host file I/O.
 - **Replay:** `jobs_from_entries(&header, &entries)` reconstructs listed rows without opening a live session. Supply all raw entries, as returned by `Axo::open_session_read`, not just a projected branch. An unfinished command or script remains `Running`; replay does not reconcile it or invent live-only facts.
 - **Output:** `command_output(call_id)` opens the newest command the call started; `command_jobs(call_id)` lists all its command IDs, oldest first, and `job_output(job_id)` opens one by ID. For scripts, read the artifact while the script runs; the log has no stream index and `job_output` opens it once finished. These lookups include unlisted foreground commands and retained output after reopen; a missing or unopenable spool yields no handle. A `CommandOutput` provides `job()` (`bg_N`), `artifact()` (numeric artifact id), `path()` (the raw log file), `progress()` (a watch receiver of `OutputProgress { bytes, done, capture_failed }`), and async `read(range: Range<u64>)` / `read_chunks(range: Range<u64>)`. Both ranges use byte offsets into the raw merged spool and clamp to its flushed prefix. `read_chunks` returns `Vec<OutputChunk>`, each with `stream: OutputStream` (`Stdout`, `Stderr`, or `Merged` for bytes without stream metadata, including an unindexed tail or a live log without a readable index) and `bytes: Vec<u8>`. Cross-pipe order is capture order, not guaranteed process-write chronology. `done` means capture ended, including retained helpers; `capture_failed` distinguishes incomplete capture. A held handle stays readable after foreground files are unlinked on Unix. No stdin or detach API is exposed; background commands die with their session.
@@ -550,7 +552,64 @@ Enable the `codemode` Cargo feature to use `axo::script`. Implement `ScriptHost`
 
 Scripts can `await tools.name({...})`, discover tools with `searchTools` and `describeTool`, and emit text with `print`, the console methods, or a return value. `store` and `load` work on the supplied snapshot; apply the changes in `ScriptEnd` only on success. No timers, filesystem, network, or imports are provided by the VM.
 
-The engine runs on a dedicated thread, with at most four VMs active per process. The CPU budget excludes waiting for the host, and native builtins may delay interrupts until they return. The synchronous `ScriptHost::output` callback runs on the VM thread and should return promptly. On completion or cancellation, `run` calls `ScriptHost::abandon` if host calls are still outstanding and waits for them to settle. Implementations must arrange for outstanding calls to finish on abandonment.
+The engine runs on a dedicated thread, with at most four VMs active per process. The CPU budget excludes waiting for the host, and native builtins may delay interrupts until they return. The synchronous `ScriptHost::output` callback runs on the VM thread and should return promptly. On success, `run` waits for every tool call the script started, including unawaited calls still queued at the in-flight limit. Only on failure, cancellation, or interruption does `run` stop dispatching queued calls and call `ScriptHost::abandon` if host calls are still running. The host must arrange for those calls to stop; `run` waits for them to settle.
+
+This host exposes one read-only operation and prints each output item. A real host would return tool descriptions in `search` and `describe`, and signal its in-flight operations in `abandon`.
+
+```rust
+# fn main() {
+# #[cfg(feature = "codemode")]
+# {
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axo::script::{Limits, ScriptEnd, ScriptHost, run};
+use axo_ai::JsonMap;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+struct Host;
+
+#[async_trait]
+impl ScriptHost for Host {
+    async fn call(&self, tool: &str, arguments: JsonMap) -> Result<Value, String> {
+        match tool {
+            "count" if arguments.is_empty() => Ok(json!({ "count": 3 })),
+            _ => Err(format!("Unsupported call: {tool}")),
+        }
+    }
+
+    fn search(&self, _: &str) -> Value {
+        json!([])
+    }
+
+    fn describe(&self, _: &str) -> Result<Value, String> {
+        Err("No tool descriptions".into())
+    }
+
+    fn output(&self, text: &str) {
+        println!("{text}");
+    }
+
+    fn abandon(&self) {} // This host has no pending I/O.
+}
+
+#[tokio::main]
+async fn main() {
+    let end: ScriptEnd = run(
+        "return (await tools.count()).count;",
+        Default::default(),
+        Arc::new(Host),
+        Limits::default(),
+        CancellationToken::new(),
+    )
+    .await; // Prints 3.
+    assert!(end.error.is_none(), "{:?}", end.error);
+}
+# main();
+# }
+# }
+```
 
 ## 3. Rust Extension Traits
 
@@ -564,7 +623,7 @@ The engine runs on a dedicated thread, with at most four VMs active per process.
 | `ToolPolicy` | `axo::ToolPolicy` | Ordered host policy via `SessionOptions::host.tool_policies: Vec<Arc<dyn ToolPolicy>>` (empty by default; `Session::set_tool_policies` replaces the list for invocations that start afterwards; forks and children start with the session's current list). Both callbacks receive `&ToolScope`, the call context, and a cancellation token. `ToolScope { session_id, depth, agent, mode, bash, writes }` identifies the session (root depth is zero), root persona or child spec, effective mode as `Option<Arc<ModeSpec>>`, not a selection awaiting the next request boundary, the effective `BashAccess` (`ReadOnly` when the agent, the effective mode, or the child ceiling declares it), and the effective write scope as `Option<WriteScope>` (`None` when unrestricted). Internal budget and mode checks precede host policies. `before_tool_call` receives `BeforeToolCallContext` and returns `ToolCallDecision`; the first `Block { reason, terminate, origin }` or error blocks the call and skips later policies. `ToolPolicy::origin(&self) -> Option<&str>` defaults to `None` and supplies the label when a policy returns a block without an origin. `after_tool_call` receives `AfterToolCallContext` and returns optional `AfterToolCallResult` overrides; each policy sees prior overrides, and errors are logged and skipped |
 | `SpawnHook` | `axo::SpawnHook` | Child-creation policy via `SessionOptions::host.spawn_hooks`, replaced live by `Session::set_spawn_hooks`; returns `SpawnDecision` from the resolved `SpawnContext`. See [Spawning child sessions](#spawning-child-sessions) |
 | `LoopHooks` | `axo_agent::LoopHooks` | The loop driver's contract, implemented internally by each `Session` (a private hooks object), not supplied through session options. `prepare_request(&AgentContext, cancel)` returns `Result<Option<Vec<AgentMessage>>, HookError>` to optionally replace messages (`AgentContext { messages, tools, deferred }` exposes both declared and deferred tool lists); `request_cache(&Model)` returns `RequestCache { retention, keep_warm }`, the request's `CacheRetention` and whether `Agent::last_request` keeps it as a `SentRequest` for cache warming (default: 5-minute breakpoints, not kept); `convert_to_llm` lowers `Custom` messages (default drops them); `should_skip_tools` intercepts unusable responses; `finish_turn` returns `TurnFinish { continue_turn: bool, messages: Option<Vec<AgentMessage>> }`; `prepare_next_turn` returns `Vec<AgentMessage>` appended with normal events and `MessageOrigin::Run`; `steering` supplies queued host input (see [Queued inputs and message origins](#queued-inputs-and-message-origins)). For model selection and tool setters, see [Implementing `axo_agent::Tool`](#implementing-axo_agenttool) |
-| `Persist` | `axo_agent::Persist` | The agent's only event sink: ordered, awaited `async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError>`; an error stops the run. `Session` uses it to persist `Entry::Message` on `MessageEnd { message, origin }` before the next request, maintain live run state, and relay session events. The agent has no broadcast or snapshot API; clients attach to `Session` |
+| `Persist` | `axo_agent::Persist` | The agent's only event sink: awaited `async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError>`. Loop events arrive in order; nested events can arrive concurrently. A persist error stops the loop on the loop path or cancels that nested call's family on the nested path. `Session` uses it to persist `Entry::Message` on `MessageEnd { message, origin }` before the next request, maintain live run state, and relay session events. The agent has no broadcast or snapshot API; clients attach to `Session` |
 | `Streamer` | `axo_ai::Streamer` | Host streaming extension, injected via `AxoBuilder::streamer` for tests and custom transports. `Models` implements it with provider dispatch; `ScriptedApi` implements it behind the `testing` feature |
 | `Api` | `axo_ai::Api` | Wire adapter contract that `Models` dispatches to: `AnthropicApi`, `CompletionsApi`, or `ResponsesApi` |
 | `CredentialStore` | `axo_ai::CredentialStore` | Loads and saves `Credential`s under [opaque origin-based slots](configuration.md#models-axo_aimodelsconfig--credentials); `Models::credential_slot(provider)` returns the current slot (`FileCredentialStore` over a host-named file is bundled). Supports `get`, `set`, `remove`, and `update` (runs a transform under the store's cross-process file lock). Injected via `ModelsOptions::credentials` into the `Models` the host passes to `Axo::builder` |
@@ -659,14 +718,14 @@ impl Tool for PingTool {
 }
 ```
 
-- **`ToolContext`:** owned per-call state, because each call runs on its own Tokio task: `call: Arc<ToolCall>` (the validated call), `cancel: CancellationToken` (the tool must honor it; see the task lifecycle below), `updates: ToolUpdates` (partial results while the call runs), `steer: SteerSignal`, and `invocation: ToolInvocationId`. `parent` is the id of the model-issued call for nested calls, and `calls` is the nested-call handle. For direct calls outside an agent, pass `parent: None` and `Calls::none()`.
+- **`ToolContext`:** owned per-call state, because each call runs on its own Tokio task: `call: Arc<ToolCall>` (the validated call), `cancel: CancellationToken` (the tool must honor it; see the task lifecycle below), `updates: ToolUpdates` (partial results while the call runs), `steer: SteerSignal`, and `invocation: ToolInvocationId`. `ToolContext::parent` is the id of the model-issued call for nested calls; `ToolContext::calls` is the nested-call handle. For direct calls outside an agent, pass `parent: None` and `calls: Calls::none()`.
 - **Task lifecycle:** the loop never polls a tool future itself, so a tool may await anything, including state the host's `Persist` holds. Calls start only after the batch's preparation and `ToolHooks::before_tool_call` decisions complete. When the run is stopped or shut down, every unfinished call's `cancel` fires and the loop keeps waiting; 3 s later the loop signals a hard stop. An unfinished call drops `execute` and awaits any recovery registered with `ToolContext::on_hard_stop` (`impl Future<Output = Option<ToolOutput>> + Send + 'static`). Register it once on the native call before admitting a mutation. Recovery has no further timeout: `Some(output)` becomes the result, and no recovery or `None` becomes an `Operation aborted` error result. Direct calls and detached tasks cannot register recovery. A panicking call becomes an error result. Cleanup that must happen however the call ends belongs in a `Drop` guard. `ToolHooks::after_tool_call` runs on the loop after `execute` returns; hard-stopped calls skip it.
 - **`ToolUpdates`:** `send(update)` never blocks; updates sent before `execute` returns are emitted before that call's `ToolExecutionEnd`, whose `result.is_error` reports failure. Clonable, so spawned helpers can stream too. `ToolUpdates::new(f)` streams to a closure and `ToolUpdates::sink()` discards updates, for calling `execute` outside an `Agent`.
 - **`SteerSignal`:** `is_pending()` is true while steering input is queued and not yet drained into the transcript; `pending().await` resolves when it becomes so (and never if the agent is gone). The built-in `bash` uses it to move a foreground command to the background, `wait` to return early, and `ask` and reviewed mode `yield` to stop waiting for the user. `Agent::remove_queued` clears it when it removes the last queued steer. Results the host injects through `LoopHooks::steering` never set it. `SteerSignal::never()` gives a signal that never fires, for calling `execute` outside an `Agent`.
 - **`ToolInvocationId(u64)`:** unique per execution within one `Agent`, assigned right before `execute`. It is the identity reported back as `MessageOrigin::Tool` for that call's persisted result.
-- **`ToolOutput`:** `content` (model-facing), `details: Option<Value>` (host/log data, never sent to the model), `structured_content` (typed data for programmatic callers, never in the transcript), `is_error` (a failure with output, e.g. a failing command; an `Err(ToolError)` also becomes an error result), and `terminate` (stop after this batch, honored only when every result in the batch sets it). `Tool::output_schema` can describe `structured_content` with JSON Schema. A hook replacing `content` also clears `structured_content`. `Tool::raw_input` identifies the single string argument a provider may take as raw text.
+- **`ToolOutput`:** `content` (model-facing), `details: Option<Value>` (host/log data, never sent to the model), `structured_content` (typed data for programmatic callers, never in the transcript), `is_error` (a failure with output, e.g. a failing command; an `Err(ToolError)` also becomes an error result), and `terminate` (stop after this batch, honored only when every result in the batch sets it). `Tool::output_schema` can describe `structured_content` with JSON Schema (default `None`). A hook replacing `content` also clears `structured_content`. `Tool::raw_input` names the single string argument a provider may take as raw text (default `None`). The Responses adapter can declare it as a custom tool; the agent and journal still see ordinary JSON tool arguments.
 - **`ExecutionMode::Parallel` vs `ExecutionMode::Sequential`:** A call to an `ExecutionMode::Sequential` tool is a barrier in its batch: every earlier call finishes before it starts, and later calls start only after it ends. Consecutive `ExecutionMode::Parallel` calls between barriers run concurrently as one group. Within a group, preparation and `ToolHooks::before_tool_call` run sequentially in call order before any call starts, so a later group's hooks see earlier groups' effects; `ToolResult` messages are always emitted in call order. Built-in `write`, `edit`, and `wait` are sequential. Execution mode is controlled only by tools, not by agent configuration.
-- **Nested calls:** A model-issued tool can use `Calls::tools` to enumerate nestable direct and deferred tools, and `Calls::call` to execute them with the normal routing, argument validation and tool hooks. Tools that need the model or user can opt out with `Tool::nestable`. Nested hooks receive the outer assistant message and set `parent` to its outer call id. A sequential nested tool runs exclusively in its family; parallel nested tools can share the gate. Nested execution events carry `parentCallId`, can arrive concurrently with loop events, and do not produce transcript messages. Nested calls have no steering signal and cannot nest further. A tool owns its nested calls: cancel and await them before returning unless deliberately handing them off to background work. Dropping the waiting future does not cancel its call. `Agent::shutdown` cancels all families.
+- **Nested calls:** A model-issued tool can use `Calls::tools` to enumerate nestable direct and deferred tools, and `Calls::call` to execute them with the normal routing, argument validation and tool hooks. `Tool::nestable` defaults to `true`; tools that need the model or user can return `false`. `BeforeToolCallContext` and `AfterToolCallContext` receive the outer assistant message for a nested call and their `parent` holds the outer call id (`None` for ordinary calls). Extension tools and tool hooks receive this same `parent` on the wire. A sequential nested tool runs exclusively in its family; parallel nested tools can share the gate. Nested execution events carry `parentCallId`, can arrive concurrently with loop events, and do not produce transcript messages. Nested calls have no steering signal and cannot nest further. A tool owns its nested calls: cancel and await them before returning unless deliberately handing them off to background work. Dropping the waiting future does not cancel its call. `Agent::shutdown` cancels all families.
 - **`Replay::Safe` vs `Replay::Never`:** Controls whether an unfinished tool call is re-executed (`Safe`) or marked interrupted (`Never`) when `Session` recovers a crashed run. `replay(&self, call: &ToolCall)` decides per call; `write`, for example, is `Safe` for plain paths and defers to the scheme's `write_replay` for scheme URLs.
 - **Dispatch and identity:** `Tool::target` optionally returns a target name and arguments. `axo_agent::route` resolves direct and deferred tools into `Routed { tool, call, via }`, preserving the original call id. The loop validates both dispatcher and target arguments, then uses the target for execution mode, policy contexts, execution events, `ToolContext`, and result names. Session crash recovery uses the same route for `Replay` and interrupted-result identity, including command-output lookup and admission of children started by an interrupted `spawn`; an unresolvable call retains its original identity. The dispatcher does not execute a second nested call or create another invocation. For Completions models with `requiresToolResultName`, the wire result name instead matches the assistant's original call name by id (for example `call`); an orphan result falls back to its stored tool name.
 
@@ -779,7 +838,7 @@ The supervision API (`axo::exec::host`, with `OutputError`, `ProcessSupervisor`,
 | `KILL_GRACE` | `const KILL_GRACE: Duration` | Fixed 1 s grace period between SIGTERM and SIGKILL used by `Container::terminate` |
 | `find_on_path` | `fn find_on_path(name: &str, env: &EnvMap, cwd: &Path) -> Option<PathBuf>` | Path search helper resolving a command against `env["PATH"]` and `cwd` |
 
-Commands run through `SessionTools::run_command` have the same background behavior as `bash`: immediate promotion with `run_async`, timed promotion controlled by `bash.promoteAfterMs`, promotion when a steer is pending, or host promotion via `Session::background(call_id)`; retained helpers remain supervised. Their jobs appear in `Session::jobs` and `proc://`, and results are delivered exactly once through `wait` or a later message. Hosts needing a strictly call-scoped subprocess can use `ProcessSupervisor::output` directly; those subprocesses are not registered as session jobs or promoted.
+Commands run through `SessionTools::run_command` have the same background behavior as `bash`: immediate promotion with `run_async`, timed promotion controlled by `bash.promoteAfterMs`, promotion when a steer is pending, or host promotion via `Session::background(call_id)`. Nested commands promote only with `run_async`; `Session::background(call_id)` returns `false` for a nested command. Retained helpers remain supervised. Their jobs appear in `Session::jobs` and `proc://`, and results are delivered exactly once through `wait` or a later message. Hosts needing a strictly call-scoped subprocess can use `ProcessSupervisor::output` directly; those subprocesses are not registered as session jobs or promoted.
 
 `axo::classify_bash(command)` (also `host.classifyBash`) splits a bash command into statements and classifies each as a `ShellUnit`: its `kind` (`ShellKind::View`, `Search`, `List` or `Other`), base `program`, file operands in `paths`, the read line `selector` of a one-file view, later pipeline stages in `filters`, whether it `redirects` (writes a file or reads a heredoc), and, when one `read` or `grep` call returns the same content, that call as `equivalent` (`read {"path":"src/a.rs:5-16"}`). It is a heuristic that never fails; shapes it does not understand are `Other`. The built-in `bash` uses it for `bash.blockToolViews` and for nested context attachment; hosts can build their own command policies on it.
 

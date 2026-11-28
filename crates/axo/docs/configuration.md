@@ -135,6 +135,15 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
   "ask": {
     "timeoutMs": null
   },
+  "codemode": {
+    "enabled": false,
+    "promoteAfterMs": 60000,
+    "cpuMs": 30000,
+    "memoryMb": 256,
+    "maxCalls": 1000,
+    "maxInFlight": 16,
+    "maxOutputTokens": 10000
+  },
   "read": {
     "outlineMinBytes": 24000
   },
@@ -183,6 +192,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
 | `bash` | `bash` | See below | User or project | Supervised subprocess and dev-shell execution (`BashSettings`) |
 | `ask` | `ask` | See below | User or project | Question tool configuration (`AskSettings`) |
+| `codemode` | `codemode` | See [Codemode](#codemode) | User only | Enable and limit the built-in script tool (`CodemodeSettings`). Ignored with a warning in project settings |
 | `read` | `read` | See below | User or project | `read` tool output (`ReadSettings`) |
 | `keywords` | `keywords` | See below | User or project | Keyword matching switches (`KeywordSettings`) |
 | `project` | `project` | See below | User only | Project access boundaries and policy (`ProjectSettings`) |
@@ -359,6 +369,20 @@ Both keys apply only to root sessions; children never match keywords. Disabled k
 | `ask.timeoutMs` | `timeout_ms` | `None` | Optional timeout in milliseconds for `ask` tool calls. When it elapses, only the model's `recommended` option(s), `prefill` and `default` values are submitted, with `null` for every question without one; the first option is never guessed. The result is not an error and its `details` carry `"timedOut": true`. See [Ask documents for hosts](extending.md#ask-documents-for-hosts) |
 
 A queued steer settles a pending question instead of waiting behind it: `ask` returns a non-error result, "The user did not answer. They sent a message instead; it follows this result.", with `details.outcome == "steered"`, and the steer is delivered right after. See [Queued input for hosts](extending.md#queued-input-for-hosts).
+
+### Codemode
+
+`Settings::codemode` is user-only, even for trusted projects. `CodemodeSettings` is available in every build, but the [tool](prompts-and-context.md#codemode) requires the `codemode` Cargo feature. If enabled in settings without the feature, session startup reports `codemode is enabled in settings but this build does not include it`.
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | ---: | :--- |
+| `codemode.enabled` | `enabled` | `false` | Offer the built-in script tool, subject to normal session tool filtering |
+| `codemode.promoteAfterMs` | `promote_after_ms` | `60000` | Milliseconds before a foreground script promotes to a background job; `0` disables timed promotion |
+| `codemode.cpuMs` | `cpu_ms` | `30000` | VM execution budget in milliseconds; excludes waiting on host calls |
+| `codemode.memoryMb` | `memory_mb` | `256` | VM heap cap in MiB |
+| `codemode.maxCalls` | `max_calls` | `1000` | Maximum host requests per script, including tool discovery |
+| `codemode.maxInFlight` | `max_in_flight` | `16` | Maximum tool calls running concurrently per script |
+| `codemode.maxOutputTokens` | `max_output_tokens` | `10000` | Inline output budget, approximated as four bytes per token; longer output goes to an artifact |
 
 ### Read tool (`read` / `axo::ReadSettings`)
 
