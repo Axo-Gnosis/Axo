@@ -1,14 +1,23 @@
 #![cfg(feature = "codemode")]
 
 use crate::common::{self, bash_options, journal, message_text, only, options, within};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
-use axo::{Session, ToolPolicy, ToolScope};
+use axo::{Axo, ConfigLayer, JsonlStore, ProjectAccess, Session, ToolPolicy, ToolScope};
 use axo_agent::{BeforeToolCallContext, RunOutcome, ToolCallDecision, ToolError};
-use axo_ai::ScriptedTurn;
 use axo_ai::testing::{reply_text, reply_tool_calls};
+use axo_ai::transcript::current_system_message;
+use axo_ai::{
+    FileCredentialStore, Message, Model, Models, ModelsConfig, ModelsOptions, Provider,
+    ProviderRequest, ProviderResponse, ProviderTransport, RequestContext, ScriptedTurn,
+};
+use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn settings() -> Value {
@@ -184,7 +193,7 @@ return "unexpected success";
     assert!(message_text(success(&lines, "blocked")).contains("bash blocked by host"));
     assert_eq!(
         lines[nested(&lines, "blocked", "bash")]["details"]["blocked"],
-        true
+        json!({"origin": null})
     );
     assert!(!path.exists());
     session.shutdown().await;
@@ -378,7 +387,464 @@ async fn store_commits_only_successful_changes_on_the_current_branch() {
     });
     assert_eq!(lines[saved]["data"]["set"], json!({"k": 1}));
     assert_eq!(lines[result(&lines, "fail")]["message"]["isError"], true);
-    assert_eq!(message_text(success(&lines, "load")), r#"[1,"undefined"]"#);
+    assert_eq!(
+        serde_json::from_str::<Value>(message_text(success(&lines, "load"))).unwrap(),
+        json!([1, "undefined"])
+    );
     assert_eq!(message_text(success(&lines, "branch")), "undefined");
+    session.shutdown().await;
+}
+
+fn background(id: &str, code: &str) -> ScriptedTurn {
+    call(id, "codemode", json!({"code": code, "async": true}))
+}
+
+fn job_result(lines: &[Value], job: &str) -> usize {
+    only(lines, "job result delivery", |e| {
+        e["message"]["customType"] == "job_result"
+            && e["deliveredJobs"]
+                .as_array()
+                .is_some_and(|jobs| jobs.contains(&json!(job)))
+    })
+}
+
+#[derive(Default)]
+struct HoldRead(Notify);
+
+#[async_trait]
+impl ToolPolicy for HoldRead {
+    async fn before_tool_call(
+        &self,
+        _: &ToolScope,
+        call: BeforeToolCallContext<'_>,
+        _: &CancellationToken,
+    ) -> Result<ToolCallDecision, ToolError> {
+        if call.tool_call.name == "read" {
+            self.0.notified().await;
+        }
+        Ok(ToolCallDecision::Allow)
+    }
+}
+
+#[tokio::test]
+async fn promotion_delivers_post_promotion_calls_and_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        vec![
+            background(
+                "promote",
+                r#"
+await tools.read({path: "example.txt"});
+await tools.write({path: "example.txt", content: "after promotion"});
+return 42;
+"#,
+            ),
+            done(),
+            done(),
+        ],
+    )
+    .await;
+    let mut options = options(dir.path());
+    let path = options.cwd.join("example.txt");
+    std::fs::write(&path, "before promotion").unwrap();
+    let gate = Arc::new(HoldRead::default());
+    options.host.tool_policies.push(gate.clone());
+    let session = host.axo.create_session(options).await.unwrap();
+    prompt(&session, "Run in the background").await;
+    let lines = journal(&session);
+    let promoted = success(&lines, "promote");
+    let job = promoted["message"]["details"]["job"].as_str().unwrap();
+    assert!(message_text(promoted).contains(&format!("still running in the background as {job}")));
+    assert_eq!(promoted["message"]["details"]["files"], json!([]));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "before promotion");
+
+    gate.0.notify_one();
+    common::delivered(&session, job).await;
+    let lines = journal(&session);
+    let delivery = job_result(&lines, job);
+    let text = message_text(&lines[delivery]);
+    assert!(text.contains("42"), "{text}");
+    let read = nested(&lines, "promote", "read");
+    let write = nested(&lines, "promote", "write");
+    assert!(result(&lines, "promote") < read && read < write && write < delivery);
+    assert_eq!(
+        lines[delivery]["message"]["details"]["files"],
+        json!([
+            lines[read]["details"]["files"][0],
+            lines[write]["details"]["files"][0]
+        ])
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "after promotion");
+    session.shutdown().await;
+}
+
+// The command writes its PID just before exec, so the pipe is live and the PID remains
+// the same once sleep takes over. The tests stop it, rather than waiting for sleep.
+const HANGING_COMMAND: &str =
+    r#"await tools.bash({command: "printf '%s\\n' \"$$\"; exec sleep 60"});"#;
+
+async fn command_pid(session: &Session, call: &str) -> u32 {
+    within(async {
+        let output = loop {
+            if let Some(output) = session.command_output(call) {
+                break output;
+            }
+            tokio::task::yield_now().await;
+        };
+        let mut progress = output.progress();
+        loop {
+            let bytes = progress.borrow().bytes;
+            if bytes > 0 {
+                let raw = output.read(0..bytes).await.unwrap();
+                if let Some(pid) = std::str::from_utf8(&raw).unwrap().strip_suffix('\n') {
+                    break pid.parse().unwrap();
+                }
+            }
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn model_kill_ends_a_promoted_script_and_its_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        vec![
+            background("promote", HANGING_COMMAND),
+            done(),
+            call("kill", "kill", json!({"id": "bg_1"})),
+            done(),
+            done(),
+        ],
+    )
+    .await;
+    let session = host
+        .axo
+        .create_session(bash_options(dir.path()))
+        .await
+        .unwrap();
+    prompt(&session, "Start the hanging script").await;
+    let pid = command_pid(&session, "promote/1").await;
+    assert!(!common::dead(pid));
+    prompt(&session, "Kill the script").await;
+    common::delivered(&session, "bg_1").await;
+    let lines = journal(&session);
+    let delivered = job_result(&lines, "bg_1");
+    assert_eq!(
+        success(&lines, "kill")["message"]["details"]["stopping"],
+        true
+    );
+    assert!(message_text(&lines[delivered]).contains("Script was stopped (kill bg_1)"));
+    let bash = nested(&lines, "promote", "bash");
+    assert_eq!(lines[bash]["isError"], true);
+    assert!(bash < delivered);
+    assert!(common::dead(pid));
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_aborts_the_foreground_script_and_its_command_within_the_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(dir.path(), vec![script("stop", HANGING_COMMAND)]).await;
+    let session = host
+        .axo
+        .create_session(bash_options(dir.path()))
+        .await
+        .unwrap();
+    let stop = async {
+        let pid = command_pid(&session, "stop/1").await;
+        assert!(!common::dead(pid));
+        session.abort();
+        pid
+    };
+    let (outcome, pid) =
+        within(async { tokio::join!(session.prompt("Start the hanging script"), stop) }).await;
+    assert!(matches!(outcome.unwrap(), RunOutcome::Aborted(_)));
+    let lines = journal(&session);
+    let aborted = result(&lines, "stop");
+    assert_eq!(lines[aborted]["message"]["isError"], true);
+    let text = message_text(&lines[aborted]);
+    assert!(text.contains("Script aborted"), "{text}");
+    let bash = nested(&lines, "stop", "bash");
+    assert_eq!(lines[bash]["isError"], true);
+    assert!(bash < aborted);
+    assert!(common::dead(pid));
+    assert!(session.jobs().is_empty());
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn spawn_then_wait_returns_the_childs_typed_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host_with(
+        dir.path(),
+        json!([{"id": "m"}, {"id": "child"}]),
+        settings(),
+        vec![
+            script(
+                "delegate",
+                r#"
+const spawned = await tools.spawn({task: "Report a count", spec: {
+    prompt: "Yield the count", model: "test/child",
+    output: {type: "object", properties: {count: {type: "integer"}}, required: ["count"]}
+}});
+const r = await tools.wait({});
+return r.results.find(item => item.job === spawned.job).value;
+"#,
+            ),
+            done(),
+        ],
+    )
+    .await;
+    host.api
+        .lane("child", vec![call("yield", "yield", json!({"count": 7}))]);
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    prompt(&session, "Delegate and wait").await;
+    let lines = journal(&session);
+    assert_eq!(
+        serde_json::from_str::<Value>(message_text(success(&lines, "delegate"))).unwrap(),
+        json!({"count": 7})
+    );
+    let spawn = nested(&lines, "delegate", "spawn");
+    let wait = nested(&lines, "delegate", "wait");
+    assert!(spawn < wait && wait < result(&lines, "delegate"));
+    assert_eq!(lines[spawn]["admittedJobs"], json!(["agent_1"]));
+    assert_eq!(lines[wait]["deliveredJobs"], json!(["agent_1"]));
+    session.shutdown().await;
+}
+
+const RAW_CODE: &str = "print(\"a\\\\b\");\nreturn 19;";
+
+#[derive(Default)]
+struct ResponsesTransport(Mutex<Vec<Value>>);
+
+#[async_trait]
+impl ProviderTransport for ResponsesTransport {
+    async fn send(
+        &self,
+        _: &Model,
+        request: &ProviderRequest,
+        _: &RequestContext,
+    ) -> Result<ProviderResponse, axo_ai::Error> {
+        let mut seen = self.0.lock().unwrap();
+        let events = match seen.len() {
+            0 => {
+                let item = json!({"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "codemode", "input": RAW_CODE});
+                let mut started = item.clone();
+                started["input"] = json!("");
+                vec![
+                    json!({"type": "response.output_item.added", "output_index": 0, "item": started}),
+                    json!({"type": "response.custom_tool_call_input.delta", "output_index": 0, "delta": RAW_CODE}),
+                    json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+                ]
+            }
+            1 => vec![
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": []}}),
+                json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}}),
+            ],
+            _ => panic!("unexpected Responses request"),
+        };
+        seen.push(request.body.clone());
+        let body: String = events
+            .into_iter()
+            .chain([json!({"type": "response.completed", "response": {"status": "completed"}})])
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        Ok(ProviderResponse {
+            status: 200,
+            headers: Default::default(),
+            body: futures::stream::once(async move { Ok(body.into()) }).boxed(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn responses_declares_codemode_as_custom_and_runs_raw_javascript() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ModelsConfig::parse_jsonc(
+        r#"{"providers": {"test": {
+        "api": "openai-responses", "baseUrl": "http://unused.invalid",
+        "models": [{"id": "m", "compat": {"supportsCustomTools": true}}]
+    }}}"#,
+    )
+    .unwrap();
+    let models = Arc::new(
+        Models::load(ModelsOptions {
+            config,
+            credentials: Arc::new(FileCredentialStore::new(dir.path().join("auth.json"))),
+            cache_dir: None,
+            http_client: None,
+            extended_context: false,
+        })
+        .await
+        .unwrap(),
+    );
+    let transport = Arc::new(ResponsesTransport::default());
+    models
+        .register(
+            "test",
+            Provider {
+                id: "test".into(),
+                models: vec![models.find("test/m").unwrap()],
+                env: Vec::new(),
+                requires_key: false,
+                oauth_only: false,
+                login: None,
+                rewrite: None,
+                transport: Some(transport.clone()),
+                list_models: None,
+                usage: None,
+            },
+        )
+        .unwrap();
+    let axo = Axo::builder(
+        models,
+        Arc::new(JsonlStore::new(dir.path().join("sessions"))),
+    )
+    .config(Arc::new(common::TestConfig::for_dir(
+        dir.path(),
+        settings(),
+    )))
+    .build();
+    let session = axo.create_session(options(dir.path())).await.unwrap();
+    prompt(&session, "Run raw JavaScript").await;
+    let lines = journal(&session);
+    assert_eq!(message_text(success(&lines, "call_1|ctc_1")), "a\\b\n19");
+    {
+        let seen = transport.0.lock().unwrap();
+        let [initial, replay] = seen.as_slice() else {
+            panic!("expected two requests")
+        };
+        let tool = initial["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "codemode")
+            .unwrap();
+        assert_eq!(tool["type"], "custom");
+        assert!(tool.get("parameters").is_none());
+        let items = replay["input"].as_array().unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item["type"] == "custom_tool_call" && item["input"] == RAW_CODE)
+        );
+        assert!(
+            items.iter().any(
+                |item| item["type"] == "custom_tool_call_output" && item["call_id"] == "call_1"
+            )
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn clearing_stubs_an_old_script_and_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = settings();
+    config["compaction"] =
+        json!({"maxContext": 33_024, "reserveTokens": 1024, "keepRecentTokens": 0});
+    // The newest result exceeds the 8k protected tail. The combined requests go
+    // over the clearing threshold (24,768 tokens), but not the summary trigger.
+    let code = format!("/*{}*/\nreturn 'x'.repeat(8_000);", "a".repeat(60_000));
+    let host = common::host_with(
+        dir.path(),
+        json!([{"id": "m", "contextWindow": 100_000, "maxTokens": 4096}]),
+        config,
+        vec![
+            script("old", &code),
+            done(),
+            script("recent", "return 'y'.repeat(32_000);"),
+            done(),
+        ],
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    prompt(&session, "Run the old script").await;
+    assert_eq!(
+        message_text(success(&journal(&session), "old")).len(),
+        8_000
+    );
+    prompt(&session, "Run a newer script").await;
+    let requests = host.api.requests();
+    let messages = requests.last().unwrap().transcript.messages();
+    let stub = messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Assistant(a) => a
+                .tool_calls()
+                .find(|call| call.id == "old")
+                .map(|call| call.arguments["code"].as_str().unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        stub.starts_with("[shaken ~") && stub.contains("artifact://"),
+        "old code ({} bytes) was not stubbed",
+        stub.len()
+    );
+    let cleared = messages
+        .iter()
+        .find_map(|message| match message {
+            Message::ToolResult(r) if r.tool_call_id == "old" => r.content[0].as_text(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        cleared.starts_with("[shaken ~") && cleared.contains("artifact://"),
+        "old result ({} bytes) was not cleared",
+        cleared.len()
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_codemode_cannot_be_enabled_by_a_project_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = common::host_with(
+        dir.path(),
+        json!([{"id": "m"}]),
+        json!({"codemode": {"enabled": false}}),
+        vec![done(), done()],
+    )
+    .await;
+    let session = host.axo.create_session(options(dir.path())).await.unwrap();
+    assert!(session.tools().iter().all(|tool| tool.name != "codemode"));
+    prompt(&session, "Without project settings").await;
+    session.shutdown().await;
+
+    let mut options = options(dir.path());
+    let path = options.cwd.join("settings.json");
+    std::fs::write(&path, r#"{"codemode": {"enabled": true}}"#).unwrap();
+    // The embedder supplies parsed project settings; axo owns the trust check.
+    host.config.set_project(
+        &options.cwd,
+        ConfigLayer {
+            origin: path.display().to_string(),
+            settings: Some(serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()),
+            ..Default::default()
+        },
+    );
+    options.project_access = Some(ProjectAccess::Trust);
+    let project_acquisition = format!("project:{}", options.cwd.display());
+    let session = host.axo.create_session(options).await.unwrap();
+    assert!(host.config.take_calls().contains(&project_acquisition));
+    assert!(session.tools().iter().all(|tool| tool.name != "codemode"));
+    prompt(&session, "With trusted project settings").await;
+    let requests = host.api.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let system = current_system_message(request.transcript.messages()).unwrap();
+        assert!(system.tools_added.iter().any(|tool| tool.name == "read"));
+        assert!(
+            system
+                .tools_added
+                .iter()
+                .all(|tool| tool.name != "codemode")
+        );
+    }
     session.shutdown().await;
 }
