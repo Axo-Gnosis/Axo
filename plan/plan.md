@@ -39,9 +39,9 @@ Rungs 0–1 are built: model-written JavaScript can call the session's tools and
 
 The implementation plan superseded the earlier foreground-only, JSON-only design and dropped the `table` tool. Scripts can promote to background jobs; capable OpenAI Responses models send script source as raw text. Each script starts in a fresh VM; small JSON state survives successful scripts, and `local://` is for bulk data. Scripts use `spawn` and `wait` for model work, not a separate completion helper.
 
-- **OpenAI live check pending:** Offline fixtures cover the custom-tool declaration, streaming input, and call/result replay shapes. Check those wire shapes against a live OpenAI Responses request.
+- **OpenAI live check done (2026-11-27):** gpt-5-mini received `codemode` as a custom tool, streamed `custom_tool_call` items (`ctc_` ids), and accepted their replay with `custom_tool_call_output` across three turns. See [the codemode report](research/codemode.md#live-checks-and-measurement).
 - **Engine spike:** The [spike report](research/codemode.md) records x86_64 Linux results and the selection of `rquickjs` 0.14. The aarch64-darwin spike checks were not run.
-- **Phase 9 measurement pending:** Re-run the [batching baseline](research/efficiency.md) with codemode on and off on at least one Anthropic and one OpenAI model. Compare tokens, turns, wall time and success; measure PSS with the feature compiled but unused and after one 200 MB script. Record the results in [the codemode report](research/codemode.md) before changing default enablement or deciding on model gating.
+- **Phase 9 measurement partial:** A small OpenAI A/B and the compiled-but-unused footprint are in [the codemode report](research/codemode.md#live-checks-and-measurement): neither gpt-5-mini nor gpt-5.6 chose `codemode` on neutral prompts that one shell pipeline answers, and having it costs about 490 cached prompt tokens per request. Still open: an Anthropic run, prompts that need many non-shell calls (spawn/wait fan-out, read-then-edit), the corpus re-run against the [batching baseline](research/efficiency.md), and PSS after one 200 MB script. Keep `codemode.enabled` off by default until those exist.
 
 ### omp `eval` vs pi `codemode`
 
