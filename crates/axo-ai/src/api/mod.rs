@@ -11,6 +11,7 @@ pub(crate) mod sse;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::mpsc::{self, UnboundedSender};
 use futures::stream::{self, BoxStream};
@@ -113,6 +114,10 @@ pub struct SimpleStreamOptions {
     /// A cache-refresh request: Anthropic Messages only. Same prefix, `max_tokens: 0`,
     /// non-streaming, no thinking.
     pub warm: bool,
+    /// Longest silence before a request fails as timed out (retryable): waiting for the
+    /// response headers, then between body chunks. `None` uses [`DEFAULT_IDLE_TIMEOUT`](http::DEFAULT_IDLE_TIMEOUT);
+    /// `Duration::ZERO` disables it.
+    pub idle_timeout: Option<Duration>,
 }
 
 /// The tier a provider's echoed tier or speed word means.

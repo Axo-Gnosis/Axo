@@ -1246,6 +1246,8 @@ enum Attempt {
     Fail,
     /// Never answers; the sender drops when axo drops the attempt.
     Hang(tokio::sync::oneshot::Sender<()>),
+    /// Answers 200 with this much body, then goes silent.
+    Stall(&'static str),
 }
 
 #[derive(Default)]
@@ -1267,18 +1269,25 @@ impl ProviderTransport for ScriptedTransport {
             .unwrap()
             .push((request.clone(), context.clone()));
         let attempt = self.attempts.lock().unwrap().pop_front().unwrap();
+        let stalls = matches!(attempt, Attempt::Stall(_));
         let (status, body) = match attempt {
             Attempt::Status(status) => (status, ""),
             Attempt::Sse(body) => (200, body),
             Attempt::Fail => return Err(Error::Auth("transport refused".into())),
             Attempt::Hang(_dropped_on_cancel) => futures::future::pending().await,
+            Attempt::Stall(body) => (200, body),
         };
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "0".parse().unwrap());
+        let body = futures::stream::once(async move { Ok(bytes::Bytes::from(body)) });
         Ok(ProviderResponse {
             status,
             headers,
-            body: futures::stream::once(async move { Ok(bytes::Bytes::from(body)) }).boxed(),
+            body: if stalls {
+                body.chain(futures::stream::pending()).boxed()
+            } else {
+                body.boxed()
+            },
         })
     }
 }
@@ -1390,6 +1399,45 @@ async fn transport_owns_the_exchange() {
     });
     assert!(matches!(event, AssistantEvent::Error { .. }), "{event:?}");
     assert!(dropped.await.is_err(), "the attempt must be dropped");
+
+    // Silence past the idle timeout fails retryably, before headers (one attempt: turn
+    // retry owns it) and between body chunks.
+    let quiet = SimpleStreamOptions {
+        idle_timeout: Some(std::time::Duration::from_millis(50)),
+        ..session.clone()
+    };
+    transport.seen.lock().unwrap().clear();
+    let model = models.find("carried/responses").unwrap();
+    for (attempt, expected) in [
+        (
+            Attempt::Hang(tokio::sync::oneshot::channel().0),
+            "no response headers for 0.05 s",
+        ),
+        (
+            Attempt::Stall("data: {\"type\":\"response.created\"}\n\n"),
+            "no data for 0.05 s",
+        ),
+    ] {
+        transport.attempts.lock().unwrap().push_back(attempt);
+        let event = Streamer::stream(
+            &models,
+            &model,
+            Transcript::new(Vec::new()),
+            quiet.clone(),
+            CancellationToken::new(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .pop()
+        .unwrap();
+        let AssistantEvent::Error { message, .. } = event else {
+            panic!("{event:?}");
+        };
+        let text = message.error_message.as_deref().unwrap_or_default();
+        assert!(text.contains(expected), "{text}");
+        assert!(axo_ai::is_retryable_error(&message), "{text}");
+        assert_eq!(transport.seen.lock().unwrap().drain(..).count(), 1);
+    }
 }
 
 const RESPONSES_COMPLETED: &str =

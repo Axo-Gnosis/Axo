@@ -28,6 +28,42 @@ pub fn client() -> reqwest::Client {
         .expect("TLS backend initialization failed")
 }
 
+/// pi's `httpIdleTimeoutMs` default: long enough for a slow reasoning start, short enough
+/// that a stalled stream reaches turn retry instead of holding the run.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The effective idle timeout of `opts`; `None` when disabled.
+fn idle_timeout(opts: &StreamOptions) -> Option<Duration> {
+    match opts.simple.idle_timeout {
+        None => Some(DEFAULT_IDLE_TIMEOUT),
+        Some(Duration::ZERO) => None,
+        Some(timeout) => Some(timeout),
+    }
+}
+
+/// The error text of a timed-out request; "timed out" is a retryable pattern.
+fn idle_error(what: &str, timeout: Duration) -> String {
+    format!(
+        "Provider request timed out: no {what} for {} s",
+        timeout.as_secs_f64()
+    )
+}
+
+/// `body` failing with a timeout error once a chunk takes longer than `timeout`.
+fn idle_guard(
+    body: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
+    timeout: Duration,
+) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, String>> {
+    futures::stream::unfold(Some(body), move |body| async move {
+        let mut body = body?;
+        match tokio::time::timeout(timeout, body.next()).await {
+            Ok(chunk) => Some((chunk?, Some(body))),
+            Err(_) => Some((Err(idle_error("data", timeout)), None)),
+        }
+    })
+    .boxed()
+}
+
 const MAX_REQUEST_RETRIES: u32 = 2;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(60);
 
@@ -106,6 +142,7 @@ impl Sender<'_> {
 /// sleeping, preserving its failure metadata.
 async fn send_with_retry(
     sender: &Sender<'_>,
+    idle: Option<Duration>,
     cancel: &CancellationToken,
 ) -> Result<ProviderResponse, Unsent> {
     let aborted = || Unsent {
@@ -118,7 +155,17 @@ async fn send_with_retry(
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(aborted()),
-            result = sender.send(retry_index) => result,
+            result = async {
+                let Some(idle) = idle else { return sender.send(retry_index).await };
+                tokio::time::timeout(idle, sender.send(retry_index))
+                    .await
+                    .unwrap_or_else(|_| Err(Unsent {
+                        message: idle_error("response headers", idle),
+                        // Turn retry handles it; retrying here too would multiply the wait.
+                        retryable: false,
+                        failure: None,
+                    }))
+            } => result,
         };
         let retryable = match &result {
             Ok(response) if (200..300).contains(&response.status) => false,
@@ -191,12 +238,18 @@ pub(crate) async fn dispatch(
             body: request.body.to_string().into(),
         },
     };
-    let response = send_with_retry(&sender, cancel).await.map_err(|unsent| {
-        if unsent.failure.is_some() {
-            reply.message.failure = unsent.failure;
-        }
-        unsent.message
-    })?;
+    let idle = idle_timeout(opts);
+    let mut response = send_with_retry(&sender, idle, cancel)
+        .await
+        .map_err(|unsent| {
+            if unsent.failure.is_some() {
+                reply.message.failure = unsent.failure;
+            }
+            unsent.message
+        })?;
+    if let Some(idle) = idle {
+        response.body = idle_guard(response.body, idle);
+    }
     if let Some(observe) = &opts.observe {
         observe(response.status, &response.headers);
     }
@@ -248,8 +301,8 @@ pub(crate) async fn read_sse(
     }
 }
 
-/// A whole response body, or `None` when `cancel` fires first: the shared client has no
-/// global timeout, so a body that never finishes must not pin a request.
+/// A whole response body, or `None` when `cancel` fires first. Bodies from `dispatch` end
+/// at its idle timeout; other bodies end only on cancel.
 pub(crate) async fn read_body(
     response: ProviderResponse,
     cancel: &CancellationToken,
