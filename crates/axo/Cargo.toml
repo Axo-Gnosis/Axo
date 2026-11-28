@@ -8,6 +8,9 @@ rust-version.workspace = true
 repository.workspace = true
 autotests = false
 
+[features]
+codemode = ["dep:rquickjs"]
+
 [dependencies]
 async-trait.workspace = true
 axo-agent = { path = "../axo-agent" }
@@ -27,6 +30,7 @@ jsonschema.workspace = true
 landlock.workspace = true
 rand.workspace = true
 regex.workspace = true
+rquickjs = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
 schemars.workspace = true
 serde.workspace = true
@@ -71,6 +75,11 @@ path = "tests/ext_surface.rs"
 [[test]]
 name = "ext_reference"
 path = "tests/ext_reference.rs"
+
+[[test]]
+name = "script"
+path = "tests/script.rs"
+required-features = ["codemode"]
 
 [[test]]
 name = "supervisor"

@@ -41,7 +41,11 @@ const FREE: &[(&str, &str)] = &[
         "find_on_path",
         "takes a host environment map; tools.runBash resolves programs",
     ),
-    ("run", "live process handles"),
+    ("exec::supervisor::run", "live process handles"),
+    (
+        "script::run",
+        "runs host code; not callable across the wire",
+    ),
     ("objects", "runtime metadata for hosts and generators"),
     (
         "lock_file",
@@ -181,7 +185,14 @@ fn scan(dir: &Path, files: &mut BTreeMap<PathBuf, syn::File>) {
 struct FreeFunctions {
     // Re-exports are matched by the original Rust function name, even for `as` aliases.
     exports: BTreeSet<String>,
-    functions: Vec<(String, String, bool)>,
+    functions: Vec<FreeFunction>,
+}
+
+struct FreeFunction {
+    name: String,
+    qualified: String,
+    at: String,
+    public: bool,
 }
 
 impl FreeFunctions {
@@ -208,6 +219,7 @@ impl FreeFunctions {
         files: &BTreeMap<PathBuf, syn::File>,
         path: &Path,
         dir: &Path,
+        module: &str,
         items: &[Item],
         public: bool,
     ) {
@@ -216,7 +228,12 @@ impl FreeFunctions {
                 Item::Fn(f) if matches!(f.vis, Visibility::Public(_)) => {
                     let name = &f.sig.ident;
                     let at = format!("{}:{}", path.display(), name.span().start().line);
-                    self.functions.push((name.to_string(), at, public));
+                    self.functions.push(FreeFunction {
+                        name: name.to_string(),
+                        qualified: format!("{module}{name}"),
+                        at,
+                        public,
+                    });
                 }
                 Item::Use(u) if public && matches!(u.vis, Visibility::Public(_)) => {
                     self.export(&u.tree, path);
@@ -224,8 +241,9 @@ impl FreeFunctions {
                 Item::Mod(m) if !test_module(m) => {
                     let public = public && matches!(m.vis, Visibility::Public(_));
                     let child = dir.join(m.ident.to_string());
+                    let module = format!("{module}{}::", m.ident);
                     if let Some((_, items)) = &m.content {
-                        self.collect(files, path, &child, items, public);
+                        self.collect(files, path, &child, &module, items, public);
                     } else {
                         let flat = child.with_extension("rs");
                         let nested = child.join("mod.rs");
@@ -242,7 +260,7 @@ impl FreeFunctions {
                                 m.ident
                             )
                         });
-                        self.collect(files, &source, &child, &file.items, public);
+                        self.collect(files, &source, &child, &module, &file.items, public);
                     }
                 }
                 _ => {}
@@ -276,7 +294,7 @@ fn public_surface_has_an_exposure_decision() {
     }
     let mut free = FreeFunctions::default();
     let root = src.join("lib.rs");
-    free.collect(&files, &root, &src, &files[&root].items, true);
+    free.collect(&files, &root, &src, "", &files[&root].items, true);
     let host: BTreeSet<_> = axo::ext::objects()
         .iter()
         .filter(|o| o.name == "host")
@@ -286,27 +304,36 @@ fn public_surface_has_an_exposure_decision() {
         .map(|m| m.name)
         .collect();
     let mut seen = BTreeMap::new();
-    for (name, at, public) in free.functions {
+    for FreeFunction {
+        name,
+        qualified,
+        at,
+        public,
+    } in free.functions
+    {
         if !public && !free.exports.contains(&name) {
             continue;
         }
-        match FREE.iter().find(|(n, _)| *n == name) {
-            None => surface
+        let decision = FREE
+            .iter()
+            .find(|(key, _)| *key == qualified)
+            .or_else(|| FREE.iter().find(|(key, _)| *key == name));
+        let Some(&(key, decision)) = decision else {
+            surface
                 .problems
-                .push(format!("{at}: pub fn {name} missing FREE decision")),
-            Some((_, decision)) => {
-                if let Some(wire) = decision.strip_prefix("host.")
-                    && !host.contains(wire)
-                {
-                    surface.problems.push(format!(
-                        "{at}: FREE decision for {name} names missing callable {decision}"
-                    ));
-                }
-            }
-        }
-        if let Some(first) = seen.insert(name.clone(), at.clone()) {
+                .push(format!("{at}: pub fn {qualified} missing FREE decision"));
+            continue;
+        };
+        if let Some(wire) = decision.strip_prefix("host.")
+            && !host.contains(wire)
+        {
             surface.problems.push(format!(
-                "{at}: pub fn {name} shares its FREE decision with {first}; rename one"
+                "{at}: FREE decision for {qualified} names missing callable {decision}"
+            ));
+        }
+        if let Some(first) = seen.insert(key, at.clone()) {
+            surface.problems.push(format!(
+                "{at}: pub fn {qualified} shares its FREE decision with {first}; qualify the decisions"
             ));
         }
     }
