@@ -24,6 +24,7 @@ use crate::jobs::ChildProgress;
 use crate::recovery;
 use crate::store::{self, CompactionReason, Entry, EntryId};
 use crate::tools::output::{MAX_YIELD_FAILURES, YIELD, YIELD_NUDGE};
+use crate::tools::truncate::floor_char_boundary;
 
 /// The open run's live state, updated and relayed under the same lock.
 #[derive(Default)]
@@ -522,7 +523,7 @@ fn bounded_arguments(mut arguments: JsonMap) -> JsonMap {
         match value {
             Value::String(text) if text.len() > 1024 => {
                 let bytes = text.len();
-                text.truncate(text.floor_char_boundary(1024));
+                text.truncate(floor_char_boundary(text, 1024));
                 text.push_str(&format!("… [{bytes} bytes]"));
             }
             Value::Array(items) => items.iter_mut().for_each(trim),
@@ -550,7 +551,7 @@ fn nested_result_text(content: &[UserBlock]) -> String {
         if i != 0 {
             result.push('\n');
         }
-        let end = text.floor_char_boundary(2048 - result.len());
+        let end = floor_char_boundary(text, 2048 - result.len());
         result.push_str(&text[..end]);
         if end != text.len() {
             break;

@@ -157,3 +157,13 @@ pub fn truncate_line(line: &str, max_chars: usize) -> (Cow<'_, str>, bool) {
         None => (Cow::Borrowed(line), false),
     }
 }
+
+/// The largest char boundary of `text` at or below `index` (`str::floor_char_boundary`
+/// is above the MSRV).
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut end = index.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
