@@ -48,12 +48,14 @@ export type AfterToolCall_Deserialize = {
 	assistantMessage: AssistantMessage_Deserialize,
 	toolCall: ToolCall_Deserialize,
 	result: ToolOutput_Deserialize,
+	parent?: string | null,
 };
 
 export type AfterToolCall_Serialize = {
 	assistantMessage: AssistantMessage_Serialize,
 	toolCall: ToolCall_Serialize,
 	result: ToolOutput_Serialize,
+	parent: string | null,
 };
 
 /**  An agent or team in the shared definition namespace. */
@@ -454,11 +456,13 @@ export type BeforeToolCall = BeforeToolCall_Serialize | BeforeToolCall_Deseriali
 export type BeforeToolCall_Deserialize = {
 	assistantMessage: AssistantMessage_Deserialize,
 	toolCall: ToolCall_Deserialize,
+	parent?: string | null,
 };
 
 export type BeforeToolCall_Serialize = {
 	assistantMessage: AssistantMessage_Serialize,
 	toolCall: ToolCall_Serialize,
+	parent: string | null,
 };
 
 export type BridgeCode = "no_lifecycle" | "no_subscription" | "unsupported" | "stalled" | "unavailable" | "invalid" | "too_large" | "interaction";
@@ -1383,6 +1387,25 @@ export type Entry_Deserialize =
 	value?: Value | null,
 	/**  File records not reported before promotion. */
 	files?: FileRecord_Deserialize[],
+} & EntryBase_Deserialize | 
+/**  One finished tool call made from inside another call; never in context. */
+{
+	type: "nested_tool_call",
+} & {
+	/**  The model-issued call it ran under. */
+	rootCallId: string,
+	callId: string,
+	name: string,
+	/**  Bounded copy of the arguments. */
+	arguments: { [key in string]: Value },
+	/**  The first 2 KiB of the result's text. */
+	result: string,
+	isError: boolean,
+	durationMs?: number | null,
+	/**  The result's details, unchanged. */
+	details?: Value | null,
+	admittedJobs?: string[],
+	deliveredJobs?: string[],
 } & EntryBase_Deserialize | RawEntry;
 
 /**
@@ -1612,6 +1635,25 @@ export type Entry_Serialize =
 	value?: Value,
 	/**  File records not reported before promotion. */
 	files?: FileRecord_Serialize[],
+} & EntryBase_Serialize | 
+/**  One finished tool call made from inside another call; never in context. */
+{
+	type: "nested_tool_call",
+} & {
+	/**  The model-issued call it ran under. */
+	rootCallId: string,
+	callId: string,
+	name: string,
+	/**  Bounded copy of the arguments. */
+	arguments: { [key in string]: Value },
+	/**  The first 2 KiB of the result's text. */
+	result: string,
+	isError: boolean,
+	durationMs?: number,
+	/**  The result's details, unchanged. */
+	details?: Value,
+	admittedJobs?: string[],
+	deliveredJobs?: string[],
 } & EntryBase_Serialize | RawEntry;
 
 /**  Machine-readable category of an [`Error`]. */
@@ -2269,6 +2311,8 @@ export type LiveSnapshot_Deserialize = {
 	running: boolean,
 	streaming?: AssistantMessage_Deserialize | null,
 	pendingToolCalls: ToolCall_Deserialize[],
+	/**  Executing nested calls, which may outlive the open run. */
+	pendingNestedCalls: PendingNestedCall_Deserialize[],
 	/**  Steers, then follow-ups, each in delivery order. */
 	queued: QueuedInput_Deserialize[],
 	/**  The projected conversation at this point in the append order, from the journal's view. */
@@ -2303,6 +2347,8 @@ export type LiveSnapshot_Serialize = {
 	running: boolean,
 	streaming: AssistantMessage_Serialize | null,
 	pendingToolCalls: ToolCall_Serialize[],
+	/**  Executing nested calls, which may outlive the open run. */
+	pendingNestedCalls: PendingNestedCall_Serialize[],
 	/**  Steers, then follow-ups, each in delivery order. */
 	queued: QueuedInput_Serialize[],
 	/**  The projected conversation at this point in the append order, from the journal's view. */
@@ -2762,6 +2808,21 @@ export type OutputProgress = {
 
 /**  Origin of replayed bytes; logs without a stream index are `Merged`. */
 export type OutputStream = "stdout" | "stderr" | "merged";
+
+/**  A tool call made by another tool, still executing in this session. */
+export type PendingNestedCall = PendingNestedCall_Serialize | PendingNestedCall_Deserialize;
+
+/**  A tool call made by another tool, still executing in this session. */
+export type PendingNestedCall_Deserialize = {
+	parentCallId: string,
+	call: ToolCall_Deserialize,
+};
+
+/**  A tool call made by another tool, still executing in this session. */
+export type PendingNestedCall_Serialize = {
+	parentCallId: string,
+	call: ToolCall_Serialize,
+};
 
 /**  A mode result waiting for the host's review. */
 export type PendingResult = {
@@ -4829,6 +4890,7 @@ export type ToolRunArgs_Deserialize = {
 	session: string,
 	call: ToolCall_Deserialize,
 	invocation: ToolInvocationId,
+	parent?: string | null,
 };
 
 export type ToolRunArgs_Serialize = {
@@ -4836,6 +4898,7 @@ export type ToolRunArgs_Serialize = {
 	session: string,
 	call: ToolCall_Serialize,
 	invocation: ToolInvocationId,
+	parent: string | null,
 };
 
 /**  The session a tool call runs in, as host policies see it. */

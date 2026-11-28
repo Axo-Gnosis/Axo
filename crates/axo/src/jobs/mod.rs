@@ -30,7 +30,7 @@ use crate::schemes::artifact::Artifacts;
 use crate::session::children::SessionTable;
 use crate::session::{SessionEvent, journal};
 use crate::store::{Entry, Header, SeqEntry, TeamRef};
-use crate::tools::FileRecord;
+use crate::tools::{FileRecord, file_records_in};
 
 /// Custom type of the message that delivers background job results.
 pub(crate) const JOB_RESULT: &str = "job_result";
@@ -527,7 +527,8 @@ pub(crate) fn add_result_files(details: &mut Value, results: &[ReservedMessage])
     }
 }
 
-/// Journal metadata reserved for one message; settled only after its append completes.
+/// Journal metadata reserved for one result; settled only after its append completes.
+#[derive(Default)]
 pub(crate) struct Receipts {
     pub start: Option<Entry>,
     pub admitted_jobs: Vec<String>,
@@ -554,13 +555,35 @@ struct Replayed {
     unended: Vec<JobId>,
 }
 
-fn interrupted_script_files(
-    _entries: &[SeqEntry],
-    _session_id: &str,
-    _id: JobId,
-) -> Vec<FileRecord> {
-    // integration: after this job's JobStart, collect details.files from NestedToolCall entries for its root call.
-    Vec::new()
+fn interrupted_script_files(entries: &[SeqEntry], session_id: &str, id: JobId) -> Vec<FileRecord> {
+    let Some((start, call_id)) = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, seq)| match &seq.entry {
+            Entry::JobStart {
+                session_id: owner,
+                job_id,
+                call_id,
+                ..
+            } if owner == session_id && JobId::parse(job_id) == Some(id) => Some((at, call_id)),
+            _ => None,
+        })
+    else {
+        return Vec::new();
+    };
+    // Preserve access order so a later write or read can supersede an earlier hash.
+    entries[start + 1..]
+        .iter()
+        .flat_map(|seq| match &seq.entry {
+            Entry::NestedToolCall {
+                root_call_id,
+                details,
+                ..
+            } if root_call_id == call_id => file_records_in(details.as_ref()),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Rebuilds listed jobs from the journal without opening a session.
@@ -692,6 +715,11 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                 }
             }
             Entry::Message {
+                admitted_jobs,
+                delivered_jobs,
+                ..
+            }
+            | Entry::NestedToolCall {
                 admitted_jobs,
                 delivered_jobs,
                 ..
@@ -1490,12 +1518,11 @@ impl JobRegistry {
         }).collect()
     }
 
-    fn move_reserved(&self, key: Option<&DeliveryKey>, to: Delivery) {
+    fn move_reserved(&self, matches: impl Fn(&DeliveryKey) -> bool, to: Delivery) {
         let mut changed = false;
         for job in self.lock().jobs.values_mut() {
             for message in job.messages.values_mut() {
-                if matches!(&message.delivery, Delivery::Reserved(k) if key.is_none_or(|key| k == key))
-                {
+                if matches!(&message.delivery, Delivery::Reserved(key) if matches(key)) {
                     message.delivery = to.clone();
                     if to == Delivery::Delivered {
                         message.text = None;
@@ -1511,21 +1538,27 @@ impl JobRegistry {
     }
 
     fn commit(&self, key: &DeliveryKey) {
-        self.move_reserved(Some(key), Delivery::Delivered);
+        self.move_reserved(|reserved| reserved == key, Delivery::Delivered);
     }
     fn release(&self, key: &DeliveryKey) {
-        self.move_reserved(Some(key), Delivery::Pending);
+        self.move_reserved(|reserved| reserved == key, Delivery::Pending);
     }
 
     /// At settle, return reservations and drop admissions whose receipt was never written.
-    pub(crate) fn release_uncommitted(&self) {
+    /// Check invocation liveness under the registry lock: new nested calls mark themselves
+    /// active before they can add a reservation or admission here.
+    pub(crate) fn release_uncommitted(&self, active_nested: impl Fn(ToolInvocationId) -> bool) {
         let mut state = self.lock();
-        let dropped: Vec<JobId> = state
-            .admissions
-            .drain()
-            .filter(|(_, admission)| admission.admits)
-            .flat_map(|(_, admission)| admission.ids)
-            .collect();
+        let mut dropped = Vec::new();
+        state.admissions.retain(|invocation, admission| {
+            if active_nested(*invocation) {
+                return true;
+            }
+            if admission.admits {
+                dropped.append(&mut admission.ids);
+            }
+            false
+        });
         let children: Vec<String> = dropped
             .iter()
             .filter_map(|&id| fail_admission(&mut state, id))
@@ -1539,7 +1572,13 @@ impl JobRegistry {
         if !dropped.is_empty() {
             self.bump();
         }
-        self.move_reserved(None, Delivery::Pending);
+        self.move_reserved(
+            |key| match key {
+                DeliveryKey::Invocation(invocation) => !active_nested(*invocation),
+                DeliveryKey::Input(_) => true,
+            },
+            Delivery::Pending,
+        );
     }
 
     /// Queues a saved teammate message; the next turn boundary, run start or `wait` takes it.

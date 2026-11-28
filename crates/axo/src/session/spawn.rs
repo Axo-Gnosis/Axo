@@ -1188,7 +1188,7 @@ impl Tool for SpawnTool {
             }
         };
         let admission = Some(ToolAdmission {
-            call_id: cx.call.id.clone(),
+            call_id: cx.parent.as_deref().unwrap_or(&cx.call.id).to_owned(),
             invocation: cx.invocation,
         });
         if !is_team {

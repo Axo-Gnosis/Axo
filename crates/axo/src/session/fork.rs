@@ -106,7 +106,8 @@ impl Session {
                         message: AgentMessage::Custom(message),
                         ..
                     } => &message.details,
-                    Entry::CustomMessage { details, .. } => details,
+                    Entry::CustomMessage { details, .. }
+                    | Entry::NestedToolCall { details, .. } => details,
                     _ => return Vec::new(),
                 };
                 tools::file_records_in(details.as_ref())

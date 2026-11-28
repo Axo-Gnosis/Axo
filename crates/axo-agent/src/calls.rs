@@ -216,7 +216,7 @@ impl Family {
                 }
             } => guard,
         };
-        let invocation = agent.invocation();
+        let invocation = agent.nested_invocation();
         let (sender, mut updates) = mpsc::unbounded_channel();
         let cx = ToolContext {
             call: Arc::new(call.clone()),
@@ -225,7 +225,7 @@ impl Family {
                 let _ = sender.send(update);
             }),
             steer: SteerSignal::never(),
-            invocation,
+            invocation: invocation.id,
             parent: Some(self.root_call_id.clone()),
             calls: Calls::none(),
         };
@@ -275,7 +275,7 @@ impl Family {
             Some(result) => result,
             None => task.await,
         };
-        let (mut outcome, executed) = Outcome::joined(call, invocation, started, joined);
+        let (mut outcome, executed) = Outcome::joined(call, invocation.id, started, joined);
         if executed {
             after_tool_call(
                 &agent.tool_hooks(),

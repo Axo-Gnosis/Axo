@@ -18,6 +18,7 @@ mod jobs_lifecycle;
 mod journal;
 mod live_host;
 mod modes;
+mod nested_calls;
 mod prompt_parts;
 mod recovery;
 mod schemes;
