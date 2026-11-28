@@ -59,6 +59,12 @@ impl Scheme for ProcScheme {
                         JobKind::Command { command, .. } => {
                             format!("{}  {}  {}", job.id, job.status.label(), headline(command))
                         }
+                        JobKind::Script { label, .. } => format!(
+                            "{}  {}  script: {}",
+                            job.id,
+                            job.status.label(),
+                            headline(label)
+                        ),
                         JobKind::Child {
                             agent, model, team, ..
                         } => {
@@ -85,14 +91,24 @@ impl Scheme for ProcScheme {
                     .ok_or_else(|| ToolError(format!("No job {id}")))?;
                 let mut text = match &job.kind {
                     JobKind::Command {
-                        command, artifact, ..
-                    } => format!(
-                        "Job: {}\nCommand: {}\nStatus: {}\nOutput: artifact://{}",
-                        job.id,
-                        command,
-                        job.status.label(),
-                        artifact
-                    ),
+                        command: label,
+                        artifact,
+                        ..
+                    }
+                    | JobKind::Script {
+                        label, artifact, ..
+                    } => {
+                        let title = if matches!(job.kind, JobKind::Script { .. }) {
+                            "Script"
+                        } else {
+                            "Command"
+                        };
+                        format!(
+                            "Job: {}\n{title}: {label}\nStatus: {}\nOutput: artifact://{artifact}",
+                            job.id,
+                            job.status.label()
+                        )
+                    }
                     JobKind::Child {
                         session_id,
                         agent,

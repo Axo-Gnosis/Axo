@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::context::agents::AgentSpec;
 use crate::context::modes::{BashAccess, ToolLimits};
 use crate::input::PromptPart;
-use crate::tools::WriteScope;
+use crate::tools::{FileRecord, WriteScope};
 
 /// The `version` written into new session headers.
 pub const FORMAT_VERSION: u32 = 1;
@@ -498,7 +498,7 @@ pub enum Entry {
         base: EntryBase,
         submission_id: String,
     },
-    /// A command promoted to a background job; never in context.
+    /// A command or script promoted to a background job; never in context.
     JobStart {
         #[serde(flatten)]
         base: EntryBase,
@@ -515,6 +515,8 @@ pub enum Entry {
         cwd: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         promotion: Option<crate::jobs::Promotion>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        script: bool,
     },
     /// A child session admitted as row `job_id` (`agent_N`); never in context.
     ChildStart {
@@ -535,7 +537,7 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         team: Option<TeamRef>,
     },
-    /// One message of a row: a command's result or a child's message; `job_id` names it
+    /// One job result or child message; `job_id` names it
     /// (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
     JobEnd {
         #[serde(flatten)]
@@ -559,6 +561,9 @@ pub enum Entry {
         /// The child's structured result, if one was yielded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<Value>,
+        /// File records not reported before promotion.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileRecord>,
     },
     #[serde(untagged)]
     Unknown(#[specta(type = RawEntry)] Value),

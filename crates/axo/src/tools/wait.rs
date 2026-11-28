@@ -8,7 +8,7 @@ use axo_ai::{ToolCall, UserBlock};
 use serde_json::{Value, json};
 
 use crate::coordination::{WaitReason, WaitReceipt};
-use crate::jobs::render_results;
+use crate::jobs::{add_result_files, render_results};
 use crate::session::team::{TeamSeat, WaitGuard, mutual_wait};
 use crate::tools::SessionTools;
 
@@ -97,7 +97,11 @@ impl Tool for WaitTool {
                     .iter()
                     .map(|result| result.msg.to_string())
                     .collect();
-                return Ok(text(render_results(&results), WaitReason::Results, refs));
+                let mut output = text(render_results(&results), WaitReason::Results, refs);
+                if let Some(details) = &mut output.details {
+                    add_result_files(details, &results);
+                }
+                return Ok(output);
             }
             if jobs.has_mail() {
                 return Ok(text(MAIL_ARRIVED.into(), WaitReason::Mail, vec![]));

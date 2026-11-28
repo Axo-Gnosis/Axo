@@ -22,7 +22,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | jobs |  | The background jobs read proc:// lists (promoted, retained and rebuilt, finished ones included), ascending. |
 | killJob | id | Stops job id (bg_N or agent_N), reporting whether it was running. |
 | commandJobs | callId | The job ids of the commands a tool call started, oldest first, foreground commands included. |
-| background | callId | Requests promotion of every foreground command the call started. A command that finishes first stays foreground. |
+| background | callId | Requests promotion of each foreground command or script the call started. Work that finishes first stays foreground. |
 | tools |  | The tools this session exposes: direct ones in prompt order, then deferred catalog entries. Reading it promotes nothing. |
 | commands |  | The commands a host may offer: built-ins, modes, registered commands, then unhidden skills. |
 | modes |  | The mode definitions in force now; empty for children. |

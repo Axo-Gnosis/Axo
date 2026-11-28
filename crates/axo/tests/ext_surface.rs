@@ -49,6 +49,7 @@ const FREE: &[(&str, &str)] = &[
     ),
     ("file_details", DERIVABLE),
     ("file_records", DERIVABLE),
+    ("file_records_in", DERIVABLE),
 ];
 
 #[derive(Default)]

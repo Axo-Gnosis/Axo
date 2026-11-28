@@ -78,27 +78,21 @@ pub fn file_details(records: &[FileRecord]) -> Value {
 
 /// Every file a result read or wrote; absent or invalid records yield an empty list.
 pub fn file_records(result: &ToolResultMessage) -> Vec<FileRecord> {
-    result
-        .details
-        .as_ref()
+    file_records_in(result.details.as_ref())
+}
+
+/// Reads a message's `details.files`, or returns an empty list if absent or invalid.
+pub fn file_records_in(details: Option<&Value>) -> Vec<FileRecord> {
+    details
         .and_then(|details| details.get("files"))
         .and_then(|files| Vec::deserialize(files).ok())
         .unwrap_or_default()
 }
 
 pub(crate) fn ledger_records(result: &ToolResultMessage) -> Vec<LedgerRecord> {
-    #[derive(Deserialize)]
-    struct Entry {
-        ledger: LedgerRecord,
-    }
-    result
-        .details
-        .as_ref()
-        .and_then(|details| details.get("files"))
-        .and_then(|files| Vec::<Entry>::deserialize(files).ok())
-        .unwrap_or_default()
+    file_records(result)
         .into_iter()
-        .map(|entry| entry.ledger)
+        .map(|record| record.ledger)
         .collect()
 }
 
@@ -184,18 +178,21 @@ impl FileLedger {
     }
 
     /// Replaces the record with what `messages` show this session saw: the `details.files`
-    /// of every tool result, later accesses winning. Run on open and after
+    /// of tool results and custom messages, later accesses winning. Run on open and after
     /// navigation, so the record matches the branch the model sees.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn restore(&self, messages: &[AgentMessage]) {
         let mut ledger = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         ledger.clear();
         for message in messages {
-            let AgentMessage::Llm(Message::ToolResult(result)) = message else {
-                continue;
+            let details = match message {
+                AgentMessage::Llm(Message::ToolResult(result)) => result.details.as_ref(),
+                AgentMessage::Custom(message) => message.details.as_ref(),
+                _ => continue,
             };
-            for record in ledger_records(result) {
-                ledger.insert(file_key(Path::new(&record.path)), record.sha256);
+            for record in file_records_in(details) {
+                let LedgerRecord { path, sha256, .. } = record.ledger;
+                ledger.insert(file_key(Path::new(&path)), sha256);
             }
         }
     }

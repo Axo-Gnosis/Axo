@@ -522,9 +522,9 @@ For file targets, axo compares the real path of the target with the real path of
 
 ### `wait`
 
-`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. As a sequential barrier, `wait` starts only after every earlier call in its batch finishes, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command or script (`bg_N`), or subagent (`agent_N`), reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. As a sequential barrier, `wait` starts only after every earlier call in its batch finishes, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
 
-Successful waits serialize `WaitReceipt` into details: `{"reason":"results","jobs":["bg_1","agent_2/3",…]}` identifies consumed messages; `reason` is `mail`, `interrupted` (steer), or `idle` for other wake paths, with empty `jobs` omitted. Stop and mutual-wait errors remain errors. Message text stays in the tool result and journal entries.
+Successful waits serialize `WaitReceipt` into details: `{"reason":"results","jobs":["bg_1","agent_2/3",…]}` identifies consumed messages; `reason` is `mail`, `interrupted` (steer), or `idle` for other wake paths, with empty `jobs` omitted. Stop and mutual-wait errors remain errors. Message text stays in the tool result and journal entries. If the delivered results report file accesses, `details.files` carries those records.
 
 Incoming teammate mail also wakes `wait`. With no row results to return, it responds `New messages arrived; they follow this result.`; the queued mail is delivered immediately after the tool batch, not embedded in that tool result. Outside a team, no running admitted jobs and no mail returns `No background jobs are running.` immediately.
 
@@ -532,19 +532,19 @@ In a team, `wait` keeps waiting while teammates can still reply, even with no jo
 
 ### `proc://`
 
-The session's read-only `proc://` scheme (`Target::Virtual`) inspects background command jobs and subagents without consuming results. List both with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop one with [kill](#kill).
+The session's read-only `proc://` scheme (`Target::Virtual`) inspects background commands, scripts, and subagents without consuming results. List them with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop one with [kill](#kill).
 
 | Operation | Result |
 | :--- | :--- |
-| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `queued` (a child waiting for a run slot), `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
-| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc:// or proc://<id>.` |
+| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, `bg_N  {status}  script: {label}` for scripts, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `queued` (a child waiting for a run slot), `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
+| `read proc://bg_N` | `Job:`, `Command:` or `Script:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc:// or proc://<id>.` |
 | `read proc://agent_N` | Child row details: `Job:`, `Agent:`, optional `Team: team_N (member)`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
 
 Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside an open session) has neither `proc://` nor `agent://`.
 
 ### `kill`
 
-`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Both results carry `details: {"id": "<id>", "stopping": <bool>}`, where `stopping` is true only when a running command or a busy child was signalled. Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
+`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, stops a script, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Both results carry `details: {"id": "<id>", "stopping": <bool>}`, where `stopping` is true only when a running command, script, or busy child was signalled. Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
 
 There are no proc action paths: reads of a `/kill` suffix are unsupported, and all proc writes fail with `<url> is read-only`.
 

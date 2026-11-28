@@ -47,6 +47,7 @@ impl Session {
             .jobs
             .reconcile(
                 unfinished,
+                &self.hooks.journal.view().entries,
                 self.hooks.tools.schemes.artifacts(),
                 &*self.hooks,
             )

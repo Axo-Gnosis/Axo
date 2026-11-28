@@ -1330,7 +1330,7 @@ export type Entry_Deserialize =
 } & {
 	submissionId: string,
 } & EntryBase_Deserialize | 
-/**  A command promoted to a background job; never in context. */
+/**  A command or script promoted to a background job; never in context. */
 {
 	type: "job_start",
 } & {
@@ -1343,6 +1343,7 @@ export type Entry_Deserialize =
 	tool?: string | null,
 	cwd?: string | null,
 	promotion?: Promotion | null,
+	script?: boolean,
 } & EntryBase_Deserialize | 
 /**  A child session admitted as row `job_id` (`agent_N`); never in context. */
 {
@@ -1361,7 +1362,7 @@ export type Entry_Deserialize =
 	team?: TeamRef_Deserialize | null,
 } & EntryBase_Deserialize | 
 /**
- *  One message of a row: a command's result or a child's message; `job_id` names it
+ *  One job result or child message; `job_id` names it
  *  (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
  */
 {
@@ -1380,6 +1381,8 @@ export type Entry_Deserialize =
 	usage?: Usage_Deserialize | null,
 	/**  The child's structured result, if one was yielded. */
 	value?: Value | null,
+	/**  File records not reported before promotion. */
+	files?: FileRecord_Deserialize[],
 } & EntryBase_Deserialize | RawEntry;
 
 /**
@@ -1556,7 +1559,7 @@ export type Entry_Serialize =
 } & {
 	submissionId: string,
 } & EntryBase_Serialize | 
-/**  A command promoted to a background job; never in context. */
+/**  A command or script promoted to a background job; never in context. */
 {
 	type: "job_start",
 } & {
@@ -1569,6 +1572,7 @@ export type Entry_Serialize =
 	tool?: string,
 	cwd?: string,
 	promotion?: Promotion,
+	script?: boolean,
 } & EntryBase_Serialize | 
 /**  A child session admitted as row `job_id` (`agent_N`); never in context. */
 {
@@ -1587,7 +1591,7 @@ export type Entry_Serialize =
 	team?: TeamRef_Serialize,
 } & EntryBase_Serialize | 
 /**
- *  One message of a row: a command's result or a child's message; `job_id` names it
+ *  One job result or child message; `job_id` names it
  *  (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
  */
 {
@@ -1606,6 +1610,8 @@ export type Entry_Serialize =
 	usage?: Usage_Serialize,
 	/**  The child's structured result, if one was yielded. */
 	value?: Value,
+	/**  File records not reported before promotion. */
+	files?: FileRecord_Serialize[],
 } & EntryBase_Serialize | RawEntry;
 
 /**  Machine-readable category of an [`Error`]. */
@@ -2056,7 +2062,7 @@ export type JobInfo_Deserialize = {
 	status: JobStatus,
 	/**  The tool call that started or spawned it; `None` for host spawns. */
 	callId?: string | null,
-	/**  Command spawn or child admission time, in milliseconds since the epoch. */
+	/**  Command or script start, or child admission time, in milliseconds since the epoch. */
 	startedAt: number,
 	kind: JobKind_Deserialize,
 	messages: JobMessageInfo_Deserialize[],
@@ -2069,7 +2075,7 @@ export type JobInfo_Serialize = {
 	status: JobStatus,
 	/**  The tool call that started or spawned it; `None` for host spawns. */
 	callId: string | null,
-	/**  Command spawn or child admission time, in milliseconds since the epoch. */
+	/**  Command or script start, or child admission time, in milliseconds since the epoch. */
 	startedAt: number,
 	kind: JobKind_Serialize,
 	messages: JobMessageInfo_Serialize[],
@@ -2082,6 +2088,10 @@ export type JobKind_Deserialize = { type: "command";
 command: string; tool: string; cwd: string; artifact: number; 
 /**  `None` for foreground commands retained for their helpers. */
 promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | null; exit?: CommandExit | null } | 
+/**  A script running as a job (the `codemode` tool). */
+{ type: "script"; 
+/**  The display label supplied by the tool. */
+label: string; artifact: number; promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | null; exit?: CommandExit | null } | 
 /**  `model` is the expanded `provider/id`. */
 { type: "child"; sessionId: string; path: string; depth: number; agent?: string | null; model: string; team?: TeamRef_Deserialize | null; resident: boolean; 
 /**  Boxed so a child row stays near a command row's size. */
@@ -2099,6 +2109,10 @@ export type JobKind_Serialize = { type: "command";
 command: string; tool: string; cwd: string; artifact: number; 
 /**  `None` for foreground commands retained for their helpers. */
 promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; exit: CommandExit | null } | 
+/**  A script running as a job (the `codemode` tool). */
+{ type: "script"; 
+/**  The display label supplied by the tool. */
+label: string; artifact: number; promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; exit: CommandExit | null } | 
 /**  `model` is the expanded `provider/id`. */
 { type: "child"; sessionId: string; path: string; depth: number; agent: string | null; model: string; team: TeamRef_Serialize | null; resident: boolean; 
 /**  Boxed so a child row stays near a command row's size. */
@@ -5289,7 +5303,7 @@ export interface Session {
    */
   commandJobs(callId: SessionCommandJobsArgs["callId"], signal?: AbortSignal): Promise<SessionCommandJobsResult>;
   /**
-   * Requests promotion of every foreground command the call started. A command that finishes first stays foreground.
+   * Requests promotion of each foreground command or script the call started. Work that finishes first stays foreground.
    */
   background(callId: SessionBackgroundArgs["callId"], signal?: AbortSignal): Promise<SessionBackgroundResult>;
   /**

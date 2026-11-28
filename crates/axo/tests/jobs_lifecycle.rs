@@ -198,6 +198,7 @@ async fn reopen_marks_admitted_jobs_interrupted_once() {
             tool: None,
             cwd: None,
             promotion: None,
+            script: false,
         };
         let rows = [
             message(
@@ -307,6 +308,7 @@ async fn job_ids_skip_every_recorded_id() {
                 tool: None,
                 cwd: None,
                 promotion: None,
+                script: false,
             },
             Entry::Message {
                 base: EntryBase::new(EntryId("delivery-5".into()), Some(start)),
