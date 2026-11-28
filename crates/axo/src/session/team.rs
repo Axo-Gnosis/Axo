@@ -92,7 +92,7 @@ impl TeamState {
             activity.maintenance.is_none()
                 && (!activity.running || waiting.contains(id))
                 && !(session.hooks.may_deliver() && jobs.has_pending())
-                && jobs.running_admitted().is_empty()
+                && jobs.running_admitted(None).is_empty()
         });
         if !stuck || !waiting.contains(member) {
             return false;

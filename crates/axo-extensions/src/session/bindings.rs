@@ -29,6 +29,7 @@ pub(crate) struct ToolRunArgs<'a> {
     session: &'a str,
     call: &'a ToolCall,
     invocation: ToolInvocationId,
+    parent: Option<&'a str>,
 }
 
 #[derive(Serialize, specta::Type)]
@@ -36,6 +37,7 @@ pub(crate) struct ToolRunArgs<'a> {
 pub(crate) struct BeforeToolCall<'a> {
     assistant_message: &'a AssistantMessage,
     tool_call: &'a ToolCall,
+    parent: Option<&'a str>,
 }
 
 #[derive(Serialize, specta::Type)]
@@ -44,6 +46,7 @@ pub(crate) struct AfterToolCall<'a> {
     assistant_message: &'a AssistantMessage,
     tool_call: &'a ToolCall,
     result: &'a ToolOutput,
+    parent: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -115,6 +118,7 @@ impl Tool for RemoteTool {
             session: access.tools.session_id(),
             call: &cx.call,
             invocation: cx.invocation,
+            parent: cx.parent.as_deref(),
         })
         .map_err(|error| {
             ToolError(format!(
@@ -143,6 +147,7 @@ impl Tool for RemoteTool {
             Ok(ToolOutput {
                 content: output.content,
                 details: output.details,
+                structured_content: None,
                 is_error: output.is_error.unwrap_or(false),
                 terminate: output.terminate.unwrap_or(false),
             })
@@ -289,6 +294,7 @@ impl ToolPolicy for RemotePolicy {
             cx: BeforeToolCall {
                 assistant_message: call.assistant_message,
                 tool_call: call.tool_call,
+                parent: call.parent,
             },
         })
         .map_err(|error| {
@@ -342,12 +348,28 @@ impl ToolPolicy for RemotePolicy {
             return Ok(None);
         }
         let ext = &self.remote.ext;
+        // A nested call's typed value is for its calling tool and in-process hooks only.
+        let text_only;
+        let result = match call.result {
+            result if call.parent.is_some() && result.structured_content.is_some() => {
+                text_only = ToolOutput {
+                    content: result.content.clone(),
+                    details: result.details.clone(),
+                    structured_content: None,
+                    is_error: result.is_error,
+                    terminate: result.terminate,
+                };
+                &text_only
+            }
+            result => result,
+        };
         let args = serde_json::to_value(PolicyArgs {
             scope,
             cx: AfterToolCall {
                 assistant_message: call.assistant_message,
                 tool_call: call.tool_call,
-                result: call.result,
+                result,
+                parent: call.parent,
             },
         })
         .map_err(|error| {

@@ -48,12 +48,14 @@ export type AfterToolCall_Deserialize = {
 	assistantMessage: AssistantMessage_Deserialize,
 	toolCall: ToolCall_Deserialize,
 	result: ToolOutput_Deserialize,
+	parent?: string | null,
 };
 
 export type AfterToolCall_Serialize = {
 	assistantMessage: AssistantMessage_Serialize,
 	toolCall: ToolCall_Serialize,
 	result: ToolOutput_Serialize,
+	parent: string | null,
 };
 
 /**  An agent or team in the shared definition namespace. */
@@ -73,10 +75,10 @@ export type AgentDef_Serialize =
 /**  A team roster and charter. */
 { type: "team"; value: TeamSpec_Serialize };
 
-/**  One event of a run, delivered to the ordered, awaited [`Persist`] sink. */
+/**  One event of a run or nested call, delivered to the awaited [`Persist`] sink. */
 export type AgentEvent = AgentEvent_Serialize | AgentEvent_Deserialize;
 
-/**  One event of a run, delivered to the ordered, awaited [`Persist`] sink. */
+/**  One event of a run or nested call, delivered to the awaited [`Persist`] sink. */
 export type AgentEvent_Deserialize = { type: "agentStart" } | 
 /**  Last event of a run; `messages` are the messages this run added. */
 { type: "agentEnd"; messages: AgentMessage_Deserialize[] } | { type: "turnStart" } | { type: "turnEnd"; message: AgentMessage_Deserialize; toolResults: ToolResultMessage_Deserialize[] } | 
@@ -91,11 +93,11 @@ export type AgentEvent_Deserialize = { type: "agentStart" } |
  */
 { type: "messageUpdate"; event: AssistantEvent_Deserialize } | 
 /**  The finished message. */
-{ type: "messageEnd"; message: AgentMessage_Deserialize; origin: MessageOrigin_Deserialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value } } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Deserialize } | 
+{ type: "messageEnd"; message: AgentMessage_Deserialize; origin: MessageOrigin_Deserialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value }; parentCallId?: string | null } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Deserialize; parentCallId?: string | null } | 
 /**  The finalized result (after `after_tool_call`), in completion order. */
-{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Deserialize };
+{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Deserialize; parentCallId?: string | null; invocation?: ToolInvocationId | null; durationMs?: number | null };
 
-/**  One event of a run, delivered to the ordered, awaited [`Persist`] sink. */
+/**  One event of a run or nested call, delivered to the awaited [`Persist`] sink. */
 export type AgentEvent_Serialize = { type: "agentStart" } | 
 /**  Last event of a run; `messages` are the messages this run added. */
 { type: "agentEnd"; messages: AgentMessage_Serialize[] } | { type: "turnStart" } | { type: "turnEnd"; message: AgentMessage_Serialize; toolResults: ToolResultMessage_Serialize[] } | 
@@ -110,9 +112,9 @@ export type AgentEvent_Serialize = { type: "agentStart" } |
  */
 { type: "messageUpdate"; event: AssistantEvent_Serialize } | 
 /**  The finished message. */
-{ type: "messageEnd"; message: AgentMessage_Serialize; origin: MessageOrigin_Serialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value } } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Serialize } | 
+{ type: "messageEnd"; message: AgentMessage_Serialize; origin: MessageOrigin_Serialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value }; parentCallId?: string } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Serialize; parentCallId?: string } | 
 /**  The finalized result (after `after_tool_call`), in completion order. */
-{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Serialize };
+{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Serialize; parentCallId?: string; invocation?: ToolInvocationId; durationMs?: number };
 
 /**
  *  A transcript entry. `Custom` messages never reach a provider directly:
@@ -454,11 +456,13 @@ export type BeforeToolCall = BeforeToolCall_Serialize | BeforeToolCall_Deseriali
 export type BeforeToolCall_Deserialize = {
 	assistantMessage: AssistantMessage_Deserialize,
 	toolCall: ToolCall_Deserialize,
+	parent?: string | null,
 };
 
 export type BeforeToolCall_Serialize = {
 	assistantMessage: AssistantMessage_Serialize,
 	toolCall: ToolCall_Serialize,
+	parent: string | null,
 };
 
 export type BridgeCode = "no_lifecycle" | "no_subscription" | "unsupported" | "stalled" | "unavailable" | "invalid" | "too_large" | "interaction";
@@ -601,6 +605,33 @@ export type ChoiceQuestion_Serialize = {
 	options: QuestionOption_Serialize[],
 	/**  Several options may be picked. */
 	multi?: boolean,
+};
+
+/**  The `codemode` tool. Available only in builds with the `codemode` feature. */
+export type CodemodeSettings = CodemodeSettings_Serialize | CodemodeSettings_Deserialize;
+
+/**  The `codemode` tool. Available only in builds with the `codemode` feature. */
+export type CodemodeSettings_Deserialize = {
+	enabled?: boolean,
+	/**  Milliseconds before a foreground script becomes a background job; zero disables it. */
+	promoteAfterMs?: number,
+	cpuMs?: number,
+	memoryMb?: number,
+	maxCalls?: number,
+	maxInFlight?: number,
+	maxOutputTokens?: number,
+};
+
+/**  The `codemode` tool. Available only in builds with the `codemode` feature. */
+export type CodemodeSettings_Serialize = {
+	enabled: boolean,
+	/**  Milliseconds before a foreground script becomes a background job; zero disables it. */
+	promoteAfterMs: number,
+	cpuMs: number,
+	memoryMb: number,
+	maxCalls: number,
+	maxInFlight: number,
+	maxOutputTokens: number,
 };
 
 /**  A built-in session operation, mode or registered command, decoded and validated. */
@@ -756,6 +787,7 @@ export type Compat_Deserialize = {
 	vllmPriority?: number | null,
 	supportsAdditionalTools?: boolean | null,
 	supportsToolSearch?: boolean | null,
+	supportsCustomTools?: boolean | null,
 	supportsEagerToolInputStreaming?: boolean | null,
 	supportsCacheControlOnTools?: boolean | null,
 	supportsTemperature?: boolean | null,
@@ -807,6 +839,7 @@ export type Compat_Serialize = {
 	vllmPriority?: number | null,
 	supportsAdditionalTools?: boolean,
 	supportsToolSearch?: boolean,
+	supportsCustomTools?: boolean,
 	supportsEagerToolInputStreaming?: boolean,
 	supportsCacheControlOnTools?: boolean,
 	supportsTemperature?: boolean,
@@ -1241,6 +1274,16 @@ export type Entry_Deserialize =
 	customType: string,
 	data?: Value | null,
 } & EntryBase_Deserialize | 
+/**
+ *  The script store changes one successful `codemode` script committed: `set`
+ *  then `delete`, folded along the branch. Never in context.
+ */
+{
+	type: "script_store",
+} & {
+	set?: { [key in string]: Value },
+	delete?: string[],
+} & EntryBase_Deserialize | 
 /**  A host message that is in context. */
 {
 	type: "custom_message",
@@ -1328,7 +1371,7 @@ export type Entry_Deserialize =
 } & {
 	submissionId: string,
 } & EntryBase_Deserialize | 
-/**  A command promoted to a background job; never in context. */
+/**  A command or script promoted to a background job; never in context. */
 {
 	type: "job_start",
 } & {
@@ -1341,6 +1384,7 @@ export type Entry_Deserialize =
 	tool?: string | null,
 	cwd?: string | null,
 	promotion?: Promotion | null,
+	script?: boolean,
 } & EntryBase_Deserialize | 
 /**  A child session admitted as row `job_id` (`agent_N`); never in context. */
 {
@@ -1359,7 +1403,7 @@ export type Entry_Deserialize =
 	team?: TeamRef_Deserialize | null,
 } & EntryBase_Deserialize | 
 /**
- *  One message of a row: a command's result or a child's message; `job_id` names it
+ *  One job result or child message; `job_id` names it
  *  (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
  */
 {
@@ -1378,6 +1422,27 @@ export type Entry_Deserialize =
 	usage?: Usage_Deserialize | null,
 	/**  The child's structured result, if one was yielded. */
 	value?: Value | null,
+	/**  File records not reported before promotion. */
+	files?: FileRecord_Deserialize[],
+} & EntryBase_Deserialize | 
+/**  One finished tool call made from inside another call; never in context. */
+{
+	type: "nested_tool_call",
+} & {
+	/**  The model-issued call it ran under. */
+	rootCallId: string,
+	callId: string,
+	name: string,
+	/**  Bounded copy of the arguments. */
+	arguments: { [key in string]: Value },
+	/**  The first 2 KiB of the result's text. */
+	result: string,
+	isError: boolean,
+	durationMs?: number | null,
+	/**  The result's details, unchanged. */
+	details?: Value | null,
+	admittedJobs?: string[],
+	deliveredJobs?: string[],
 } & EntryBase_Deserialize | RawEntry;
 
 /**
@@ -1473,6 +1538,16 @@ export type Entry_Serialize =
 	customType: string,
 	data?: Value,
 } & EntryBase_Serialize | 
+/**
+ *  The script store changes one successful `codemode` script committed: `set`
+ *  then `delete`, folded along the branch. Never in context.
+ */
+{
+	type: "script_store",
+} & {
+	set?: { [key in string]: Value },
+	delete?: string[],
+} & EntryBase_Serialize | 
 /**  A host message that is in context. */
 {
 	type: "custom_message",
@@ -1554,7 +1629,7 @@ export type Entry_Serialize =
 } & {
 	submissionId: string,
 } & EntryBase_Serialize | 
-/**  A command promoted to a background job; never in context. */
+/**  A command or script promoted to a background job; never in context. */
 {
 	type: "job_start",
 } & {
@@ -1567,6 +1642,7 @@ export type Entry_Serialize =
 	tool?: string,
 	cwd?: string,
 	promotion?: Promotion,
+	script?: boolean,
 } & EntryBase_Serialize | 
 /**  A child session admitted as row `job_id` (`agent_N`); never in context. */
 {
@@ -1585,7 +1661,7 @@ export type Entry_Serialize =
 	team?: TeamRef_Serialize,
 } & EntryBase_Serialize | 
 /**
- *  One message of a row: a command's result or a child's message; `job_id` names it
+ *  One job result or child message; `job_id` names it
  *  (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
  */
 {
@@ -1604,6 +1680,27 @@ export type Entry_Serialize =
 	usage?: Usage_Serialize,
 	/**  The child's structured result, if one was yielded. */
 	value?: Value,
+	/**  File records not reported before promotion. */
+	files?: FileRecord_Serialize[],
+} & EntryBase_Serialize | 
+/**  One finished tool call made from inside another call; never in context. */
+{
+	type: "nested_tool_call",
+} & {
+	/**  The model-issued call it ran under. */
+	rootCallId: string,
+	callId: string,
+	name: string,
+	/**  Bounded copy of the arguments. */
+	arguments: { [key in string]: Value },
+	/**  The first 2 KiB of the result's text. */
+	result: string,
+	isError: boolean,
+	durationMs?: number,
+	/**  The result's details, unchanged. */
+	details?: Value,
+	admittedJobs?: string[],
+	deliveredJobs?: string[],
 } & EntryBase_Serialize | RawEntry;
 
 /**  Machine-readable category of an [`Error`]. */
@@ -2054,7 +2151,7 @@ export type JobInfo_Deserialize = {
 	status: JobStatus,
 	/**  The tool call that started or spawned it; `None` for host spawns. */
 	callId?: string | null,
-	/**  Command spawn or child admission time, in milliseconds since the epoch. */
+	/**  Command or script start, or child admission time, in milliseconds since the epoch. */
 	startedAt: number,
 	kind: JobKind_Deserialize,
 	messages: JobMessageInfo_Deserialize[],
@@ -2067,7 +2164,7 @@ export type JobInfo_Serialize = {
 	status: JobStatus,
 	/**  The tool call that started or spawned it; `None` for host spawns. */
 	callId: string | null,
-	/**  Command spawn or child admission time, in milliseconds since the epoch. */
+	/**  Command or script start, or child admission time, in milliseconds since the epoch. */
 	startedAt: number,
 	kind: JobKind_Serialize,
 	messages: JobMessageInfo_Serialize[],
@@ -2080,6 +2177,10 @@ export type JobKind_Deserialize = { type: "command";
 command: string; tool: string; cwd: string; artifact: number; 
 /**  `None` for foreground commands retained for their helpers. */
 promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | null; exit?: CommandExit | null } | 
+/**  A script running as a job (the `codemode` tool). */
+{ type: "script"; 
+/**  The display label supplied by the tool. */
+label: string; artifact: number; promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | null; exit?: ScriptExit | null } | 
 /**  `model` is the expanded `provider/id`. */
 { type: "child"; sessionId: string; path: string; depth: number; agent?: string | null; model: string; team?: TeamRef_Deserialize | null; resident: boolean; 
 /**  Boxed so a child row stays near a command row's size. */
@@ -2097,6 +2198,10 @@ export type JobKind_Serialize = { type: "command";
 command: string; tool: string; cwd: string; artifact: number; 
 /**  `None` for foreground commands retained for their helpers. */
 promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; exit: CommandExit | null } | 
+/**  A script running as a job (the `codemode` tool). */
+{ type: "script"; 
+/**  The display label supplied by the tool. */
+label: string; artifact: number; promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; exit: ScriptExit | null } | 
 /**  `model` is the expanded `provider/id`. */
 { type: "child"; sessionId: string; path: string; depth: number; agent: string | null; model: string; team: TeamRef_Serialize | null; resident: boolean; 
 /**  Boxed so a child row stays near a command row's size. */
@@ -2253,6 +2358,8 @@ export type LiveSnapshot_Deserialize = {
 	running: boolean,
 	streaming?: AssistantMessage_Deserialize | null,
 	pendingToolCalls: ToolCall_Deserialize[],
+	/**  Executing nested calls, which may outlive the open run. */
+	pendingNestedCalls: PendingNestedCall_Deserialize[],
 	/**  Steers, then follow-ups, each in delivery order. */
 	queued: QueuedInput_Deserialize[],
 	/**  The projected conversation at this point in the append order, from the journal's view. */
@@ -2287,6 +2394,8 @@ export type LiveSnapshot_Serialize = {
 	running: boolean,
 	streaming: AssistantMessage_Serialize | null,
 	pendingToolCalls: ToolCall_Serialize[],
+	/**  Executing nested calls, which may outlive the open run. */
+	pendingNestedCalls: PendingNestedCall_Serialize[],
 	/**  Steers, then follow-ups, each in delivery order. */
 	queued: QueuedInput_Serialize[],
 	/**  The projected conversation at this point in the append order, from the journal's view. */
@@ -2746,6 +2855,21 @@ export type OutputProgress = {
 
 /**  Origin of replayed bytes; logs without a stream index are `Merged`. */
 export type OutputStream = "stdout" | "stderr" | "merged";
+
+/**  A tool call made by another tool, still executing in this session. */
+export type PendingNestedCall = PendingNestedCall_Serialize | PendingNestedCall_Deserialize;
+
+/**  A tool call made by another tool, still executing in this session. */
+export type PendingNestedCall_Deserialize = {
+	parentCallId: string,
+	call: ToolCall_Deserialize,
+};
+
+/**  A tool call made by another tool, still executing in this session. */
+export type PendingNestedCall_Serialize = {
+	parentCallId: string,
+	call: ToolCall_Serialize,
+};
 
 /**  A mode result waiting for the host's review. */
 export type PendingResult = {
@@ -3208,6 +3332,11 @@ export type SchemeUrl = {
 	scheme: string,
 	path: string,
 };
+
+/**  How a script ended. */
+export type ScriptExit = { type: "returned" } | 
+/**  The script threw, or its result could not be recorded. */
+{ type: "failed" } | { type: "timedOut"; afterSecs: number | null } | { type: "killed"; by: Killer } | { type: "aborted" } | { type: "interrupted" };
 
 export type SendIdentity = { type: "submission"; id: string } | { type: "message"; id: string };
 
@@ -3799,6 +3928,8 @@ export type SessionRunCommandArgs_Serialize = {
 	command: Command_Serialize,
 };
 
+export type SessionScriptStoreResult = { [key in string]: Value };
+
 export type SessionSendArgs = {
 	to: string,
 	message: string,
@@ -4016,6 +4147,8 @@ export type Settings_Deserialize = {
 	nestedContextFiles?: boolean,
 	bash?: BashSettings_Deserialize,
 	ask?: AskSettings_Deserialize,
+	/**  Script execution and limits. User settings only. */
+	codemode?: CodemodeSettings_Deserialize,
 	read?: ReadSettings_Deserialize,
 	project?: ProjectSettings_Deserialize,
 	compaction?: CompactionSettings_Deserialize,
@@ -4050,6 +4183,8 @@ export type Settings_Serialize = {
 	nestedContextFiles: boolean,
 	bash: BashSettings_Serialize,
 	ask: AskSettings_Serialize,
+	/**  Script execution and limits. User settings only. */
+	codemode: CodemodeSettings_Serialize,
 	read: ReadSettings_Serialize,
 	project: ProjectSettings_Serialize,
 	compaction: CompactionSettings_Serialize,
@@ -4487,7 +4622,7 @@ export type SystemMessage = SystemMessage_Serialize | SystemMessage_Deserialize;
 export type SystemMessage_Deserialize = {
 	content: MessageContent<text> | null,
 	sections?: { [key in string]: string | null } | null,
-	toolsAdded?: ToolSpec[],
+	toolsAdded?: ToolSpec_Deserialize[],
 	toolsRemoved?: string[],
 	timestamp: number,
 };
@@ -4503,7 +4638,7 @@ export type SystemMessage_Deserialize = {
 export type SystemMessage_Serialize = {
 	content: text[],
 	sections?: { [key in string]: string | null },
-	toolsAdded?: ToolSpec[],
+	toolsAdded?: ToolSpec_Serialize[],
 	toolsRemoved?: string[],
 	timestamp: number,
 };
@@ -4744,6 +4879,8 @@ export type ToolOutput_Deserialize = {
 	content: UserBlock[],
 	/**  Host/log data; never reaches the model. */
 	details?: Value | null,
+	/**  A typed value for programmatic callers; never reaches the model or transcript. */
+	structuredContent?: Value | null,
 	isError: boolean,
 	/**  Hint to stop after this batch; only honored when every result in the batch sets it. */
 	terminate: boolean,
@@ -4754,6 +4891,8 @@ export type ToolOutput_Serialize = {
 	content: UserBlock[],
 	/**  Host/log data; never reaches the model. */
 	details: Value | null,
+	/**  A typed value for programmatic callers; never reaches the model or transcript. */
+	structuredContent?: Value,
 	isError: boolean,
 	/**  Hint to stop after this batch; only honored when every result in the batch sets it. */
 	terminate: boolean,
@@ -4809,6 +4948,7 @@ export type ToolRunArgs_Deserialize = {
 	session: string,
 	call: ToolCall_Deserialize,
 	invocation: ToolInvocationId,
+	parent?: string | null,
 };
 
 export type ToolRunArgs_Serialize = {
@@ -4816,6 +4956,7 @@ export type ToolRunArgs_Serialize = {
 	session: string,
 	call: ToolCall_Serialize,
 	invocation: ToolInvocationId,
+	parent: string | null,
 };
 
 /**  The session a tool call runs in, as host policies see it. */
@@ -4852,11 +4993,32 @@ export type ToolScope_Serialize = {
 };
 
 /**  A tool declaration as the model sees it. */
-export type ToolSpec = {
+export type ToolSpec = ToolSpec_Serialize | ToolSpec_Deserialize;
+
+/**  A tool declaration as the model sees it. */
+export type ToolSpec_Deserialize = {
 	name: string,
 	description: string,
 	/**  JSON Schema of the arguments object. */
 	parameters: Value,
+	/**
+	 *  The single string argument a provider may take as raw text instead of JSON
+	 *  (OpenAI Responses custom tools). Other providers ignore it.
+	 */
+	rawInput?: string | null,
+};
+
+/**  A tool declaration as the model sees it. */
+export type ToolSpec_Serialize = {
+	name: string,
+	description: string,
+	/**  JSON Schema of the arguments object. */
+	parameters: Value,
+	/**
+	 *  The single string argument a provider may take as raw text instead of JSON
+	 *  (OpenAI Responses custom tools). Other providers ignore it.
+	 */
+	rawInput?: string,
 };
 
 /**  A partial result streamed while a tool runs. */
@@ -5235,6 +5397,11 @@ export interface Session {
   // withheld: appendCustom — namespaced per caller; see the wire method
   // withheld: custom — namespaced per caller; see the wire method
   /**
+   * The values `codemode` scripts stored on the current branch, as the next script
+   * would `load` them.
+   */
+  scriptStore(signal?: AbortSignal): Promise<SessionScriptStoreResult>;
+  /**
    * The skills in force now; the prompt's catalog and `/name` commands use these.
    */
   skills(signal?: AbortSignal): Promise<SessionSkillsResult_Serialize>;
@@ -5262,7 +5429,7 @@ export interface Session {
    */
   commandJobs(callId: SessionCommandJobsArgs["callId"], signal?: AbortSignal): Promise<SessionCommandJobsResult>;
   /**
-   * Requests promotion of every foreground command the call started. A command that finishes first stays foreground.
+   * Requests promotion of each foreground command or script the call started. Work that finishes first stays foreground.
    */
   background(callId: SessionBackgroundArgs["callId"], signal?: AbortSignal): Promise<SessionBackgroundResult>;
   /**

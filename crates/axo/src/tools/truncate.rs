@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
+pub(crate) const PROGRAM_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const PROGRAM_COMMAND_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_lines: usize,
@@ -156,4 +159,14 @@ pub fn truncate_line(line: &str, max_chars: usize) -> (Cow<'_, str>, bool) {
         Some((end, _)) => (Cow::Owned(format!("{}... [truncated]", &line[..end])), true),
         None => (Cow::Borrowed(line), false),
     }
+}
+
+/// The largest char boundary of `text` at or below `index` (`str::floor_char_boundary`
+/// is above the MSRV).
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut end = index.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }

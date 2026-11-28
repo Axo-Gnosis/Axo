@@ -261,9 +261,13 @@ fn shape_tools(base: &ToolBase, agent: Option<&AgentSpec>) -> ShapedTools {
         tools.retain(|tool| tool.name() != SPAWN);
     }
     let has_spawn = tools.iter().any(|tool| tool.name() == SPAWN);
-    let has_bash = tools.iter().any(|tool| tool.name() == "bash");
+    // Each of these can leave a background job for `kill` to stop.
+    let has_jobs = has_spawn
+        || tools
+            .iter()
+            .any(|tool| matches!(tool.name(), "bash" | "codemode"));
     tools.retain(|tool| match tool.name() {
-        KILL => has_bash || has_spawn,
+        KILL => has_jobs,
         SEND => has_spawn || base.has_peers,
         _ => true,
     });
@@ -577,6 +581,7 @@ impl SessionHooks {
                     name: tool.name().to_owned(),
                     description: tool.description().to_owned(),
                     parameters: tool.parameters().clone(),
+                    raw_input: tool.raw_input().map(str::to_owned),
                 })
                 .collect();
             let changes = axo_ai::transcript::tool_state_changes(

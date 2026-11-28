@@ -233,6 +233,8 @@ pub struct Compat {
     pub supports_additional_tools: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tool_search: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_custom_tools: Option<bool>,
 
     // Anthropic Messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]

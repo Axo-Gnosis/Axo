@@ -130,6 +130,10 @@ impl Tool for YieldTool {
         Replay::Safe
     }
 
+    fn nestable(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, _cx: ToolContext) -> Result<ToolOutput, ToolError> {
         self.state.set_yielded();
         Ok(ToolOutput {

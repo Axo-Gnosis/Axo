@@ -61,6 +61,7 @@ async fn request_with(
                     name: "read".into(),
                     description: "Read".into(),
                     parameters: json!({"type":"object","properties":{}}),
+                    raw_input: None,
                 }],
                 ..Default::default()
             })]),

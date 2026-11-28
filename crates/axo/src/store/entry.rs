@@ -3,11 +3,12 @@
 //! run and submission entries.
 
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
 use axo_agent::AgentMessage;
-use axo_ai::{Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_ai::{JsonMap, Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
 use axo_macros::expose;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -15,7 +16,7 @@ use serde_json::Value;
 use crate::context::agents::AgentSpec;
 use crate::context::modes::{BashAccess, ToolLimits};
 use crate::input::PromptPart;
-use crate::tools::WriteScope;
+use crate::tools::{FileRecord, WriteScope};
 
 /// The `version` written into new session headers.
 pub const FORMAT_VERSION: u32 = 1;
@@ -404,6 +405,16 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
     },
+    /// The script store changes one successful `codemode` script committed: `set`
+    /// then `delete`, folded along the branch. Never in context.
+    ScriptStore {
+        #[serde(flatten)]
+        base: EntryBase,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        set: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delete: Vec<String>,
+    },
     /// A host message that is in context.
     CustomMessage {
         #[serde(flatten)]
@@ -498,7 +509,7 @@ pub enum Entry {
         base: EntryBase,
         submission_id: String,
     },
-    /// A command promoted to a background job; never in context.
+    /// A command or script promoted to a background job; never in context.
     JobStart {
         #[serde(flatten)]
         base: EntryBase,
@@ -515,6 +526,8 @@ pub enum Entry {
         cwd: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         promotion: Option<crate::jobs::Promotion>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        script: bool,
     },
     /// A child session admitted as row `job_id` (`agent_N`); never in context.
     ChildStart {
@@ -535,7 +548,7 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         team: Option<TeamRef>,
     },
-    /// One message of a row: a command's result or a child's message; `job_id` names it
+    /// One job result or child message; `job_id` names it
     /// (`<row>` is message 1, `<row>/<n>` is message n ≥ 2).
     JobEnd {
         #[serde(flatten)]
@@ -559,6 +572,32 @@ pub enum Entry {
         /// The child's structured result, if one was yielded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<Value>,
+        /// File records not reported before promotion.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileRecord>,
+    },
+    /// One finished tool call made from inside another call; never in context.
+    NestedToolCall {
+        #[serde(flatten)]
+        base: EntryBase,
+        /// The model-issued call it ran under.
+        root_call_id: String,
+        call_id: String,
+        name: String,
+        /// Bounded copy of the arguments.
+        arguments: JsonMap,
+        /// The first 2 KiB of the result's text.
+        result: String,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// The result's details, unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admitted_jobs: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delivered_jobs: Vec<String>,
     },
     #[serde(untagged)]
     Unknown(#[specta(type = RawEntry)] Value),
@@ -595,6 +634,11 @@ impl Entry {
                 admitted_jobs,
                 delivered_jobs,
                 ..
+            }
+            | Entry::NestedToolCall {
+                admitted_jobs,
+                delivered_jobs,
+                ..
             } => !admitted_jobs.is_empty() || !delivered_jobs.is_empty(),
             _ => false,
         }
@@ -624,6 +668,7 @@ impl Entry {
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
             | Entry::Custom { base, .. }
+            | Entry::ScriptStore { base, .. }
             | Entry::CustomMessage { base, .. }
             | Entry::ContextEdit { base, .. }
             | Entry::Label { base, .. }
@@ -636,7 +681,8 @@ impl Entry {
             | Entry::SubmissionWithdrawn { base, .. }
             | Entry::JobStart { base, .. }
             | Entry::ChildStart { base, .. }
-            | Entry::JobEnd { base, .. } => Some(base),
+            | Entry::JobEnd { base, .. }
+            | Entry::NestedToolCall { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
     }
@@ -654,6 +700,7 @@ impl Entry {
             | Entry::Compaction { base, .. }
             | Entry::BranchSummary { base, .. }
             | Entry::Custom { base, .. }
+            | Entry::ScriptStore { base, .. }
             | Entry::CustomMessage { base, .. }
             | Entry::ContextEdit { base, .. }
             | Entry::Label { base, .. }
@@ -666,7 +713,8 @@ impl Entry {
             | Entry::SubmissionWithdrawn { base, .. }
             | Entry::JobStart { base, .. }
             | Entry::ChildStart { base, .. }
-            | Entry::JobEnd { base, .. } => Some(base),
+            | Entry::JobEnd { base, .. }
+            | Entry::NestedToolCall { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
     }

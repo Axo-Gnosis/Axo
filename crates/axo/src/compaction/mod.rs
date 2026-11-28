@@ -12,7 +12,7 @@ use axo_ai::{Message, Model, StopReason};
 
 use crate::session::{MODE_NOTICE, TOOL_CATALOG};
 use crate::store::{Entry, EntryId, Projection, SeqEntry};
-use crate::tools::{FileAccess, ledger_records};
+use crate::tools::{FileAccess, message_file_records};
 use crate::{CompactionSettings, Error};
 
 /// What a clearing pass must achieve to commit.
@@ -235,15 +235,12 @@ pub(crate) fn file_lists<'a>(
     let mut read = BTreeSet::new();
     let mut modified = BTreeSet::new();
     for message in messages {
-        let AgentMessage::Llm(Message::ToolResult(result)) = message else {
-            continue;
-        };
-        for record in ledger_records(result) {
-            let paths = match record.access {
+        for record in message_file_records(message) {
+            let paths = match record.ledger.access {
                 FileAccess::Read => &mut read,
                 FileAccess::Modify => &mut modified,
             };
-            paths.insert(record.path);
+            paths.insert(record.ledger.path);
         }
     }
     for entry in entries {

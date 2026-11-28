@@ -12,13 +12,14 @@ use std::thread::JoinHandle;
 use async_trait::async_trait;
 use axo_ai::testing::{fixture_model, http_header_values, serve_http};
 use axo_ai::{
-    AccountUsage, ApiKind, AssistantBlock, AssistantEvent, Credential, CredentialSource,
-    CredentialStore, DeviceCode, Error, FileCredentialStore, LoginInteraction, LoginPrompt,
-    LoginSelect, Message, Model, ModelAuth, Models, ModelsConfig, ModelsOptions, ModelsRequest,
-    Provider, ProviderLogin, ProviderModels, ProviderOrigin, ProviderRequest, ProviderResponse,
-    ProviderTransport, ProviderUsage, RequestContext, RequestRewrite, ServiceTier,
-    SimpleStreamOptions, Streamer, SystemMessage, TextBlock, Transcript, UsageLimit,
-    is_retryable_error, now_ms,
+    AccountUsage, Api, ApiKind, AssistantBlock, AssistantEvent, AssistantMessage, Credential,
+    CredentialSource, CredentialStore, DeviceCode, Error, FileCredentialStore, LoginInteraction,
+    LoginPrompt, LoginSelect, Message, Model, ModelAuth, Models, ModelsConfig, ModelsOptions,
+    ModelsRequest, Provider, ProviderLogin, ProviderModels, ProviderOrigin, ProviderRequest,
+    ProviderResponse, ProviderTransport, ProviderUsage, RequestContext, RequestRewrite,
+    ResponsesApi, ServiceTier, SimpleStreamOptions, StopReason, StreamOptions, Streamer,
+    SystemMessage, TextBlock, ToolCall, ToolResultMessage, ToolSpec, Transcript, UsageLimit,
+    UserBlock, is_retryable_error, now_ms, transform_messages,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -1245,12 +1246,14 @@ enum Attempt {
     Fail,
     /// Never answers; the sender drops when axo drops the attempt.
     Hang(tokio::sync::oneshot::Sender<()>),
+    /// Answers 200 with this much body, then goes silent.
+    Stall(&'static str),
 }
 
 #[derive(Default)]
 struct ScriptedTransport {
     attempts: Mutex<std::collections::VecDeque<Attempt>>,
-    seen: Mutex<Vec<(String, RequestContext)>>,
+    seen: Mutex<Vec<(ProviderRequest, RequestContext)>>,
 }
 
 #[async_trait]
@@ -1264,20 +1267,27 @@ impl ProviderTransport for ScriptedTransport {
         self.seen
             .lock()
             .unwrap()
-            .push((request.url.clone(), context.clone()));
+            .push((request.clone(), context.clone()));
         let attempt = self.attempts.lock().unwrap().pop_front().unwrap();
+        let stalls = matches!(attempt, Attempt::Stall(_));
         let (status, body) = match attempt {
             Attempt::Status(status) => (status, ""),
             Attempt::Sse(body) => (200, body),
             Attempt::Fail => return Err(Error::Auth("transport refused".into())),
             Attempt::Hang(_dropped_on_cancel) => futures::future::pending().await,
+            Attempt::Stall(body) => (200, body),
         };
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "0".parse().unwrap());
+        let body = futures::stream::once(async move { Ok(bytes::Bytes::from(body)) });
         Ok(ProviderResponse {
             status,
             headers,
-            body: futures::stream::once(async move { Ok(bytes::Bytes::from(body)) }).boxed(),
+            body: if stalls {
+                body.chain(futures::stream::pending()).boxed()
+            } else {
+                body.boxed()
+            },
         })
     }
 }
@@ -1356,8 +1366,8 @@ async fn transport_owns_the_exchange() {
         let seen = std::mem::take(&mut *transport.seen.lock().unwrap());
         let attempts: Vec<_> = seen.iter().map(|(_, context)| context.attempt).collect();
         assert_eq!(attempts, [0, 1], "{id}");
-        assert!(seen.iter().all(|(url, context)| {
-            url.starts_with("http://unreachable.invalid")
+        assert!(seen.iter().all(|(request, context)| {
+            request.url.starts_with("http://unreachable.invalid")
                 && context.session_id.as_deref() == Some("session-1")
         }));
     }
@@ -1389,6 +1399,273 @@ async fn transport_owns_the_exchange() {
     });
     assert!(matches!(event, AssistantEvent::Error { .. }), "{event:?}");
     assert!(dropped.await.is_err(), "the attempt must be dropped");
+
+    // Silence past the idle timeout fails retryably, before headers (one attempt: turn
+    // retry owns it) and between body chunks.
+    let quiet = SimpleStreamOptions {
+        idle_timeout: Some(std::time::Duration::from_millis(50)),
+        ..session.clone()
+    };
+    transport.seen.lock().unwrap().clear();
+    let model = models.find("carried/responses").unwrap();
+    for (attempt, expected) in [
+        (
+            Attempt::Hang(tokio::sync::oneshot::channel().0),
+            "no response headers for 0.05 s",
+        ),
+        (
+            Attempt::Stall("data: {\"type\":\"response.created\"}\n\n"),
+            "no data for 0.05 s",
+        ),
+    ] {
+        transport.attempts.lock().unwrap().push_back(attempt);
+        let event = Streamer::stream(
+            &models,
+            &model,
+            Transcript::new(Vec::new()),
+            quiet.clone(),
+            CancellationToken::new(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .pop()
+        .unwrap();
+        let AssistantEvent::Error { message, .. } = event else {
+            panic!("{event:?}");
+        };
+        let text = message.error_message.as_deref().unwrap_or_default();
+        assert!(text.contains(expected), "{text}");
+        assert!(axo_ai::is_retryable_error(&message), "{text}");
+        assert_eq!(transport.seen.lock().unwrap().drain(..).count(), 1);
+    }
+}
+
+const RESPONSES_COMPLETED: &str =
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+
+fn raw_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "script".into(),
+        description: "Run a script".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+        }),
+        raw_input: Some("code".into()),
+    }
+}
+
+fn system_tools(tools_added: Vec<ToolSpec>) -> Message {
+    Message::System(SystemMessage {
+        tools_added,
+        ..Default::default()
+    })
+}
+
+async fn scripted_responses(
+    model: &Model,
+    messages: Vec<Message>,
+    sse: &'static str,
+) -> (Value, Vec<AssistantEvent>) {
+    let transport = Arc::new(ScriptedTransport::default());
+    transport
+        .attempts
+        .lock()
+        .unwrap()
+        .push_back(Attempt::Sse(sse));
+    let events = ResponsesApi::new(reqwest::Client::new())
+        .stream(
+            model,
+            transform_messages(Transcript::new(messages), model),
+            StreamOptions {
+                transport: Some(transport.clone()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+    let (request, _) = transport.seen.lock().unwrap().pop().unwrap();
+    assert!(
+        matches!(events.last(), Some(AssistantEvent::Done { .. })),
+        "{events:?}"
+    );
+    (request.body, events)
+}
+
+#[tokio::test]
+async fn responses_declare_raw_input_as_custom_when_supported() {
+    let spec = raw_tool_spec();
+    let custom = json!({"type": "custom", "name": "script", "description": "Run a script"});
+    let function = json!({
+        "type": "function", "name": "script", "description": "Run a script",
+        "parameters": spec.parameters, "strict": null,
+    });
+    for (provider, flag, expected) in [
+        ("openai", None, &custom),
+        ("openai", Some(false), &function),
+        ("lab", Some(true), &custom),
+        ("lab", None, &function),
+    ] {
+        let mut model = model(provider, "only", ApiKind::OpenAiResponses, "http://unused");
+        model.compat.supports_custom_tools = flag;
+        let (body, _) = scripted_responses(
+            &model,
+            vec![system_tools(vec![spec.clone()])],
+            RESPONSES_COMPLETED,
+        )
+        .await;
+        assert_eq!(&body["tools"][0], expected, "{provider}/{flag:?}");
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_custom_tool_input_as_json_arguments() {
+    const SSE: &str = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"script","input":""}}
+
+data: {"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"print(\"a\\\\b\");"}
+
+data: {"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"\nprint(2);"}
+
+data: {"type":"response.custom_tool_call_input.done","output_index":0,"input":"ignored"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"script","input":"print(\"a\\\\b\");\nprint(2);"}}
+
+data: {"type":"response.completed","response":{"status":"completed"}}
+
+"#;
+    let model = model("openai", "only", ApiKind::OpenAiResponses, "http://unused");
+    let (_, events) =
+        scripted_responses(&model, vec![system_tools(vec![raw_tool_spec()])], SSE).await;
+    let Some(AssistantEvent::Done {
+        reason: StopReason::ToolUse,
+        message,
+    }) = events.last()
+    else {
+        panic!("{events:?}");
+    };
+    let [AssistantBlock::ToolCall(call)] = message.content.as_slice() else {
+        panic!("{message:?}");
+    };
+    assert_eq!(call.id, "call_1|ctc_1");
+    assert_eq!(call.name, "script");
+    let arguments = json!({"code": "print(\"a\\\\b\");\nprint(2);"});
+    assert_eq!(&call.arguments, arguments.as_object().unwrap());
+    assert_eq!(call.arguments_error, None);
+    let deltas: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantEvent::ToolCallDelta {
+                content_index: 0,
+                delta,
+            } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(serde_json::from_str::<Value>(&deltas).unwrap(), arguments);
+}
+
+#[tokio::test]
+async fn responses_replay_custom_calls_and_their_results() {
+    let mut target = model("openai", "only", ApiKind::OpenAiResponses, "http://unused");
+    let spec = raw_tool_spec();
+    let text = "print(\"a\\\\b\");\nprint(2);";
+    let arguments = json!({"code": text});
+    for (enabled, source_model, item_id) in [
+        (true, "only", "ctc_1"),
+        (false, "only", "ctc_1"),
+        (true, "other", "fc_1"),
+    ] {
+        target.compat.supports_custom_tools = Some(enabled);
+        let call_id = format!("call_1|{item_id}");
+        let mut assistant = AssistantMessage::empty(&target);
+        assistant.model = source_model.into();
+        assistant.stop_reason = StopReason::ToolUse;
+        assistant.content.push(AssistantBlock::ToolCall(ToolCall {
+            id: call_id.clone(),
+            name: spec.name.clone(),
+            arguments: arguments.as_object().unwrap().clone(),
+            arguments_error: None,
+            thought_signature: None,
+        }));
+        let messages = vec![
+            system_tools(vec![spec.clone()]),
+            Message::Assistant(assistant),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: call_id,
+                tool_name: spec.name.clone(),
+                content: vec![UserBlock::Text { text: "ok".into() }],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+                duration_ms: None,
+            }),
+            // The latest tool list no longer declares this tool, but its calls still replay.
+            Message::System(SystemMessage {
+                tools_removed: vec![spec.name.clone()],
+                ..Default::default()
+            }),
+        ];
+        let (body, _) = scripted_responses(&target, messages, RESPONSES_COMPLETED).await;
+        let (call, result_type) = if enabled {
+            let mut call = json!({"type": "custom_tool_call", "call_id": "call_1", "name": "script", "input": text});
+            if source_model == target.id {
+                call["id"] = json!(item_id);
+            }
+            (call, "custom_tool_call_output")
+        } else {
+            (
+                json!({"type": "function_call", "call_id": "call_1", "name": "script", "arguments": arguments.to_string()}),
+                "function_call_output",
+            )
+        };
+        assert_eq!(
+            body["input"],
+            json!([
+                call,
+                {"type": result_type, "call_id": "call_1", "output": "ok"},
+            ]),
+            "{enabled}/{source_model}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_raw_input_follows_the_latest_declaration() {
+    let target = model("openai", "only", ApiKind::OpenAiResponses, "http://unused");
+    let raw = raw_tool_spec();
+    let plain = ToolSpec {
+        raw_input: None,
+        ..raw.clone()
+    };
+    let arguments = json!({"code": "return 1"});
+    let mut assistant = AssistantMessage::empty(&target);
+    assistant.stop_reason = StopReason::ToolUse;
+    assistant.content.push(AssistantBlock::ToolCall(ToolCall {
+        id: "call_1|fc_1".into(),
+        name: raw.name.clone(),
+        arguments: arguments.as_object().unwrap().clone(),
+        arguments_error: None,
+        thought_signature: None,
+    }));
+    let messages = vec![
+        system_tools(vec![raw]),
+        system_tools(vec![plain]),
+        Message::Assistant(assistant),
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_1|fc_1".into(),
+            tool_name: "script".into(),
+            content: vec![UserBlock::Text { text: "ok".into() }],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+            duration_ms: None,
+        }),
+    ];
+    let (body, _) = scripted_responses(&target, messages, RESPONSES_COMPLETED).await;
+    assert_eq!(body["input"][0]["type"], "function_call", "{body}");
+    assert_eq!(body["tools"][0]["type"], "function", "{body}");
 }
 
 /// Lists two models, or fails, or returns a list naming another provider.

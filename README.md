@@ -32,7 +32,8 @@ The workspace is split into three layered core crates so hosts only recompile wh
 | `bash` | `Never` | Executes commands under the session's `ExecEnv` (host, `direnv`, or cached Nix flake dev shell) in a dedicated container (its own process group, or a cgroup v2 job when the host selects `Supervision::Cgroup`), with head+tail inline truncation and output spooled under the session directory; long commands (configurable `bash.promoteAfterMs`, default 60 s; a user steer; or `async: true`) continue as background jobs `bg_N`. Host tools share this command/job support through `SessionTools::run_command`. Successful file views load nested `AGENTS.md` files like `read`, and `bash.blockToolViews` (off by default) refuses a command that is one view or search a built-in tool does, naming the call (`axo::classify_bash`) |
 | `grep` | `Safe` | In-process regex search built on `ignore` and `grep-searcher`: results grouped per file with per-file caps, path lists with line selectors and `!glob` exclusions, context lines, and `files` and `count` modes ([output format](crates/axo/docs/prompts-and-context.md)) |
 | `find` | `Safe` | In-process gitignore-aware file discovery built on `ignore` and `globset` |
-| `wait` | `Safe` | Returns pending command/subagent results or wakes for mail; a steer interrupts it. Outside teams, returns immediately without running jobs; in teams, detects mutual waits |
+| `wait` | `Safe` | Returns pending command, script, and subagent results or wakes for mail; a steer interrupts it. Outside teams, returns immediately without running jobs; in teams, detects mutual waits |
+| `codemode` | `Never` | Runs JavaScript that calls session tools and returns only what it prints or returns. Requires the `codemode` Cargo feature and the user-only setting `codemode.enabled` (off by default). See [Codemode](crates/axo/docs/prompts-and-context.md#codemode) |
 | `kill` | `Never` | Stops a background job or a subagent's run with `{"id":"bg_N"}` or `{"id":"agent_N"}`; available when `bash` or `spawn` remains |
 | `spawn` | `Safe` | Starts a named, inline, or plain-delegate child, or a named/ad-hoc team, asynchronously; offered below `subagents.maxDepth`. Teams use `agent` or `members`, shared `task` or per-member `tasks`, optional `context`, and an ad-hoc `charter`; call-level `model` / `output` are single-agent only |
 | `send` | `Never` | Messages a child, teammate, or parent with required `to` and `message`; optional `steer: true` interrupts only one's own child at its next steering boundary. Available with `spawn` or parent/team peers |
@@ -61,7 +62,7 @@ Hosts spawn asynchronous children with `Session::spawn` and teams with `Session:
 
 ### Supervised commands & background jobs
 
-Every local command runs in a host-selected container (`Supervision::ProcessGroup` or `Supervision::Cgroup`); long commands continue as `bg_N` background jobs delivered exactly once. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) and [Background Job Durability](crates/axo/docs/sessions-and-compaction.md#background-job-durability).
+Every local command runs in a host-selected container (`Supervision::ProcessGroup` or `Supervision::Cgroup`). Long commands and `codemode` scripts can continue as `bg_N` background jobs. Each result is consumed once, either through a model-visible message or by a `wait` inside a script without a model-visible message of its own. Scripts are tasks, not subprocesses, and use the same `proc://`, `wait`, and `kill` tools. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) and [Background Job Durability](crates/axo/docs/sessions-and-compaction.md#background-job-durability).
 
 Hosts can read live or retained output as raw merged bytes or stdout/stderr-tagged chunks through `CommandOutput`, with durable `.streams` sidecars. Ordering is capture order, not guaranteed cross-stream write chronology. See [Background jobs for hosts](crates/axo/docs/extending.md#background-jobs-for-hosts).
 
@@ -173,14 +174,14 @@ Enter the Nix development shell for the Rust toolchain (`cargo`, `rustc`, `clipp
 
 ```sh
 nix develop
-cargo check --workspace --all-targets
-cargo test --workspace  # process-group mode: no cgroup delegation or helper binary needed
+cargo check --workspace --all-targets --all-features
+cargo test --workspace --all-features  # process-group mode: no cgroup delegation or helper binary needed
 systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 cargo test -p axo --test supervisor  # opt-in cgroup cases
 cargo test -p axo-extensions --test bridge  # manager, lifecycle, session and install checks with the test binary as a scripted Rust runner; no Bun needed
 env AXO_TEST_BUN=/absolute/path/to/bun cargo test -p axo-extensions --test bun_provider  # real Bun runner; skips when unset, fails when set but unusable
 systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 AXO_TEST_BUN=/absolute/path/to/bun cargo test -p axo-extensions --test bun_provider  # same, under cgroup supervision
 bun test crates/axo-extensions/tests/runner-activation.test.ts  # embedded runner activation and rollback checks; needs Bun
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 

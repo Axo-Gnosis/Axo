@@ -52,6 +52,9 @@ pub struct Axo {
     /// Supervises every local command (bash and dev-shell capture) in its own container
     /// (process group or cgroup).
     supervisor: Arc<ProcessSupervisor>,
+    /// Bounds the script VMs executing at once across every session.
+    #[cfg(feature = "codemode")]
+    script_pool: crate::script::Pool,
     sessions: Arc<SessionTable>,
 }
 
@@ -99,6 +102,8 @@ pub struct AxoBuilder {
     cache_dir: Option<PathBuf>,
     streamer: Option<Arc<dyn Streamer>>,
     supervision: Option<Supervision>,
+    #[cfg(feature = "codemode")]
+    script_pool: Option<crate::script::Pool>,
 }
 
 /// The configuration of a host that supplies none: defaults and an empty project layer.
@@ -156,6 +161,16 @@ impl AxoBuilder {
         self
     }
 
+    /// Bounds how many `codemode` scripts execute at once across every session; a
+    /// script waiting on a tool call holds no slot. Defaults to
+    /// [`script::Pool::default`](crate::script::Pool).
+    #[cfg(feature = "codemode")]
+    #[ext(skip = "host construction")]
+    pub fn script_pool(mut self, pool: crate::script::Pool) -> Self {
+        self.script_pool = Some(pool);
+        self
+    }
+
     #[ext(skip = "host construction")]
     pub fn build(self) -> Axo {
         let base_env = StaticEnv::host().0;
@@ -171,6 +186,8 @@ impl AxoBuilder {
             cache_dir: self.cache_dir,
             base_env,
             supervisor,
+            #[cfg(feature = "codemode")]
+            script_pool: self.script_pool.unwrap_or_default(),
             sessions: Arc::new(SessionTable::default()),
         }
     }
@@ -188,6 +205,8 @@ impl Axo {
             cache_dir: None,
             streamer: None,
             supervision: None,
+            #[cfg(feature = "codemode")]
+            script_pool: None,
         }
     }
 
@@ -574,6 +593,8 @@ impl Axo {
                 models,
                 exec,
                 supervisor: self.supervisor.clone(),
+                #[cfg(feature = "codemode")]
+                script_pool: self.script_pool.clone(),
                 ask_enabled,
                 store: self.store.clone(),
                 sessions: self.sessions.clone(),

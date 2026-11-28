@@ -78,27 +78,31 @@ pub fn file_details(records: &[FileRecord]) -> Value {
 
 /// Every file a result read or wrote; absent or invalid records yield an empty list.
 pub fn file_records(result: &ToolResultMessage) -> Vec<FileRecord> {
-    result
-        .details
-        .as_ref()
+    file_records_in(result.details.as_ref())
+}
+
+/// Reads a message's `details.files`, or returns an empty list if absent or invalid.
+pub fn file_records_in(details: Option<&Value>) -> Vec<FileRecord> {
+    details
         .and_then(|details| details.get("files"))
         .and_then(|files| Vec::deserialize(files).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn ledger_records(result: &ToolResultMessage) -> Vec<LedgerRecord> {
-    #[derive(Deserialize)]
-    struct Entry {
-        ledger: LedgerRecord,
+/// The file records a message reports: a tool result's, or a custom message's such as a
+/// job delivery.
+pub(crate) fn message_file_records(message: &AgentMessage) -> Vec<FileRecord> {
+    match message {
+        AgentMessage::Llm(Message::ToolResult(result)) => file_records(result),
+        AgentMessage::Custom(message) => file_records_in(message.details.as_ref()),
+        _ => Vec::new(),
     }
-    result
-        .details
-        .as_ref()
-        .and_then(|details| details.get("files"))
-        .and_then(|files| Vec::<Entry>::deserialize(files).ok())
-        .unwrap_or_default()
+}
+
+pub(crate) fn ledger_records(result: &ToolResultMessage) -> Vec<LedgerRecord> {
+    file_records(result)
         .into_iter()
-        .map(|entry| entry.ledger)
+        .map(|record| record.ledger)
         .collect()
 }
 
@@ -184,18 +188,16 @@ impl FileLedger {
     }
 
     /// Replaces the record with what `messages` show this session saw: the `details.files`
-    /// of every tool result, later accesses winning. Run on open and after
+    /// of tool results and custom messages, later accesses winning. Run on open and after
     /// navigation, so the record matches the branch the model sees.
     #[ext(skip = "construction or internal state rebuilding with no meaning across the wire")]
     pub fn restore(&self, messages: &[AgentMessage]) {
         let mut ledger = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         ledger.clear();
         for message in messages {
-            let AgentMessage::Llm(Message::ToolResult(result)) = message else {
-                continue;
-            };
-            for record in ledger_records(result) {
-                ledger.insert(file_key(Path::new(&record.path)), record.sha256);
+            for record in message_file_records(message) {
+                let LedgerRecord { path, sha256, .. } = record.ledger;
+                ledger.insert(file_key(Path::new(&path)), sha256);
             }
         }
     }

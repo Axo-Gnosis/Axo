@@ -233,6 +233,8 @@ pub(super) fn child_seed(hooks: &SessionHooks, path: PathBuf, link: SpawnLink) -
         models: parent.models.clone(),
         exec: parent.exec.clone(),
         supervisor: parent.supervisor.clone(),
+        #[cfg(feature = "codemode")]
+        script_pool: parent.script_pool.clone(),
         ask_enabled: false,
         store: parent.store.clone(),
         sessions: parent.sessions.clone(),
@@ -1113,11 +1115,23 @@ impl Tool for SpawnTool {
         &self.parameters
     }
 
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(crate::tools::result_schema::<SpawnReceipt>);
+        Some(&SCHEMA)
+    }
+
     fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let structured = |mut output: ToolOutput| {
+            if cx.parent.is_some() {
+                output.structured_content.clone_from(&output.details);
+            }
+            output
+        };
         let SpawnArguments {
             agent,
             spec,
@@ -1143,7 +1157,7 @@ impl Tool for SpawnTool {
             for child in &children {
                 hooks.reconcile_child(child).await;
             }
-            return Ok(match &first.team {
+            return Ok(structured(match &first.team {
                 Some(team) => team_output(
                     &team.id,
                     children.iter().map(|child| {
@@ -1154,7 +1168,7 @@ impl Tool for SpawnTool {
                     }),
                 ),
                 None => single_output(first.id.to_string()),
-            });
+            }));
         }
         let defs = hooks.definitions.get();
         let named_team = agent.as_deref().and_then(|name| {
@@ -1188,7 +1202,7 @@ impl Tool for SpawnTool {
             }
         };
         let admission = Some(ToolAdmission {
-            call_id: cx.call.id.clone(),
+            call_id: cx.parent.as_deref().unwrap_or(&cx.call.id).to_owned(),
             invocation: cx.invocation,
         });
         if !is_team {
@@ -1211,7 +1225,7 @@ impl Tool for SpawnTool {
                 )
                 .await
                 .map_err(|error| ToolError(error.to_string()))?;
-            return Ok(single_output(handle.job));
+            return Ok(structured(single_output(handle.job)));
         }
         if model.is_some() || output.is_some() {
             return Err(ToolError(
@@ -1256,12 +1270,12 @@ impl Tool for SpawnTool {
             )
             .await
             .map_err(|error| ToolError(error.to_string()))?;
-        Ok(team_output(
+        Ok(structured(team_output(
             &handle.team,
             handle
                 .members
                 .into_iter()
                 .map(|(name, child)| (name, child.job)),
-        ))
+        )))
     }
 }

@@ -183,6 +183,14 @@ pub struct Attach {
     pub events: broadcast::Receiver<Arc<SessionEvent>>,
 }
 
+/// A tool call made by another tool, still executing in this session.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingNestedCall {
+    pub parent_call_id: String,
+    pub call: ToolCall,
+}
+
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSnapshot {
@@ -192,6 +200,8 @@ pub struct LiveSnapshot {
     pub running: bool,
     pub streaming: Option<AssistantMessage>,
     pub pending_tool_calls: Vec<ToolCall>,
+    /// Executing nested calls, which may outlive the open run.
+    pub pending_nested_calls: Vec<PendingNestedCall>,
     /// Steers, then follow-ups, each in delivery order.
     pub queued: Vec<QueuedInput>,
     /// The projected conversation at this point in the append order, from the journal's view.
@@ -295,6 +305,7 @@ impl Session {
                     auto_paused: self.hooks.auto_paused.load(Ordering::Acquire),
                     streaming: live.streaming.as_ref().and_then(Accumulator::snapshot),
                     pending_tool_calls: live.tool_calls.clone(),
+                    pending_nested_calls: live.nested.clone(),
                     queued,
                     messages: view.projection.messages.clone(),
                     pending_questions: self.hooks.questions.pending(),

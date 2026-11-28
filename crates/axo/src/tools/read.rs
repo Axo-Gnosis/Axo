@@ -3,12 +3,13 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -16,7 +17,8 @@ use crate::tools::files::{IMAGE_SNIFF_BYTES, detect_image_mime, process_image};
 use crate::tools::outline::{self, Row};
 use crate::tools::selector::{self, LineSpec, Paths};
 use crate::tools::truncate::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, TruncatedBy, format_size,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, PROGRAM_MAX_BYTES, TruncatedBy, format_size,
+    truncate_head,
 };
 use crate::tools::writes::check_cancel;
 use crate::tools::{FileRead, FileRecord, Located, SessionTools, file_details};
@@ -44,7 +46,51 @@ struct Piece {
     record: Option<FileRecord>,
     /// Its `details.reads` entry; images have none.
     entry: Option<Value>,
+    file: Option<ReadPiece>,
 }
+
+#[derive(Serialize, JsonSchema)]
+struct ReadResult {
+    files: Vec<ReadPiece>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ReadPiece {
+    path: String,
+    #[serde(flatten)]
+    data: ReadData,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum ReadData {
+    Text {
+        text: String,
+        total_lines: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lines: Option<Vec<Range>>,
+        truncated: bool,
+    },
+    Directory {
+        entries: Vec<String>,
+        truncated: bool,
+    },
+    Image {
+        bytes: usize,
+    },
+    Binary {
+        bytes: usize,
+    },
+    Error {
+        error: String,
+    },
+}
+
+type Range = (usize, usize);
 
 pub struct ReadTool {
     tools: Arc<SessionTools>,
@@ -84,7 +130,8 @@ impl ReadTool {
         &self,
         raw: &str,
         cancel: &CancellationToken,
-        budget: &mut Limits,
+        budget: Option<&mut Limits>,
+        program: Option<&mut Limits>,
     ) -> Result<Piece, ToolError> {
         let (target, specs) = selector::split_target(&self.tools, raw).await;
         let specs = specs.transpose().map_err(ToolError)?;
@@ -102,7 +149,7 @@ impl ReadTool {
                     "{shown} is a directory; line selectors apply to files"
                 )));
             }
-            return list(path, &shown, budget).await;
+            return list(path, &shown, budget, program).await;
         }
 
         let read = self.tools.read_file(cancel, &target, None).await?;
@@ -118,45 +165,36 @@ impl ReadTool {
                     self.tools.deferred.request(&url.path);
                 }
                 check_cancel(cancel)?;
-                let (text, entry) =
-                    number_text(&lines_of(&text), &url.to_string(), false, specs, budget)?;
-                return Ok(Piece {
-                    blocks: vec![UserBlock::Text { text }],
-                    record: None,
-                    entry: Some(entry),
-                });
+                return text_piece(&text, &url.to_string(), specs, budget, program, None);
             }
         };
 
-        let mut entry = None;
-        let mut blocks =
+        let context = budget.is_some();
+        // A scripted read leaves nested instructions for the first direct read there.
+        let instructions = context && program.is_none();
+        let mut piece =
             if let Some(mime) = detect_image_mime(&bytes[..bytes.len().min(IMAGE_SNIFF_BYTES)]) {
                 if specs.is_some() {
                     return Err(ToolError(format!(
                         "{shown} is an image; line selectors apply to text"
                     )));
                 }
-                let processed = tokio::task::spawn_blocking(move || process_image(&bytes, mime))
-                    .await
-                    .map_err(|error| ToolError(error.to_string()))?;
-                match processed {
-                    Ok(image) => {
-                        let mut note = format!("Read image file [{}]", image.mime_type);
-                        for hint in &image.hints {
-                            note.push('\n');
-                            note.push_str(hint);
-                        }
-                        vec![
-                            UserBlock::Text { text: note },
-                            UserBlock::Image {
-                                data: image.data.into(),
-                                mime_type: image.mime_type.to_string(),
-                            },
-                        ]
-                    }
-                    Err(message) => vec![UserBlock::Text {
-                        text: format!("Read image file [{mime}]\n{message}"),
-                    }],
+                let file = program.map(|_| ReadPiece {
+                    path: shown,
+                    data: ReadData::Image { bytes: bytes.len() },
+                });
+                let blocks = if context {
+                    tokio::task::spawn_blocking(move || image_blocks(&bytes, mime))
+                        .await
+                        .map_err(|error| ToolError(error.to_string()))?
+                } else {
+                    Vec::new()
+                };
+                Piece {
+                    blocks,
+                    record: None,
+                    entry: None,
+                    file,
                 }
             } else if bytes.contains(&0) {
                 if specs.is_some() {
@@ -164,33 +202,44 @@ impl ReadTool {
                         "{shown} is binary; line selectors apply to text"
                     )));
                 }
-                vec![UserBlock::Text {
-                    text: format!("Binary file: {shown} ({} bytes)", bytes.len()),
-                }]
-            } else {
-                let text = String::from_utf8_lossy(&bytes);
-                let lines = lines_of(&text);
-                let outlined = (specs.is_none()
-                    && self.outline_min_bytes > 0
-                    && bytes.len() as u64 >= self.outline_min_bytes)
-                    .then(|| outline::lang(&absolute))
-                    .flatten()
-                    .and_then(|lang| outline::outline(lang, &lines));
-                let (text, read_entry) = match outlined {
-                    Some(rows) => outline_text(&rows, &lines, &shown, budget),
-                    None => number_text(&lines, &shown, true, specs, budget)?,
+                let blocks = if context {
+                    vec![UserBlock::Text {
+                        text: format!("Binary file: {shown} ({} bytes)", bytes.len()),
+                    }]
+                } else {
+                    Vec::new()
                 };
-                entry = Some(read_entry);
-                vec![UserBlock::Text { text }]
+                let file = program.map(|_| ReadPiece {
+                    path: shown,
+                    data: ReadData::Binary { bytes: bytes.len() },
+                });
+                Piece {
+                    blocks,
+                    record: None,
+                    entry: None,
+                    file,
+                }
+            } else {
+                let can_outline =
+                    self.outline_min_bytes > 0 && bytes.len() as u64 >= self.outline_min_bytes;
+                text_piece(
+                    &String::from_utf8_lossy(&bytes),
+                    &shown,
+                    specs,
+                    budget,
+                    program,
+                    Some((&absolute, can_outline)),
+                )?
             };
 
         check_cancel(cancel)?;
-        blocks.extend(self.tools.context.attach(&absolute).await);
-        Ok(Piece {
-            blocks,
-            record: Some(record),
-            entry,
-        })
+        if instructions {
+            piece
+                .blocks
+                .extend(self.tools.context.attach(&absolute).await);
+        }
+        piece.record = Some(record);
+        Ok(piece)
     }
 }
 
@@ -208,6 +257,11 @@ impl Tool for ReadTool {
         &self.parameters
     }
 
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: LazyLock<Value> = LazyLock::new(super::result_schema::<ReadResult>);
+        Some(&SCHEMA)
+    }
+
     fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
@@ -217,7 +271,12 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ToolContext { call, cancel, .. } = cx;
+        let ToolContext {
+            call,
+            cancel,
+            parent,
+            ..
+        } = cx;
         let ReadArgs { path } = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|error| ToolError(error.to_string()))?;
         let paths = path.into_vec("read")?;
@@ -225,45 +284,184 @@ impl Tool for ReadTool {
             return Err(ToolError("path must name at least one file".into()));
         }
         let mut budget = Limits::default();
+        let mut program = parent.is_some().then_some(Limits {
+            max_bytes: PROGRAM_MAX_BYTES,
+            max_lines: usize::MAX,
+        });
+        let mut files = Vec::new();
         let mut content = Vec::new();
         let mut records = Vec::new();
         let mut reads = Vec::new();
         let mut errors = Vec::new();
         for raw in &paths {
             check_cancel(&cancel)?;
-            if budget.max_lines == 0 || budget.max_bytes == 0 {
+            let model_read = budget.max_lines > 0 && budget.max_bytes > 0;
+            if !model_read {
                 content.push(UserBlock::Text {
                     text: format!(
                         "[{raw}: not read, output limit reached; read it in another call]"
                     ),
                 });
-                continue;
+                match &program {
+                    None => continue,
+                    // Both budgets are spent: nothing more could reach the script either.
+                    Some(program) if program.max_bytes == 0 => {
+                        files.push(ReadPiece {
+                            path: raw.clone(),
+                            data: ReadData::Error {
+                                error: "not read, output limit reached; read it in another call"
+                                    .into(),
+                            },
+                        });
+                        continue;
+                    }
+                    Some(_) => {}
+                }
             }
-            match self.read_path(raw, &cancel, &mut budget).await {
+            match self
+                .read_path(
+                    raw,
+                    &cancel,
+                    model_read.then_some(&mut budget),
+                    program.as_mut(),
+                )
+                .await
+            {
                 Ok(piece) => {
                     content.extend(piece.blocks);
                     records.extend(piece.record);
                     reads.extend(piece.entry);
+                    files.extend(piece.file);
                 }
-                Err(error) if paths.len() == 1 || cancel.is_cancelled() => return Err(error),
+                Err(error) if cancel.is_cancelled() || (paths.len() == 1 && program.is_none()) => {
+                    return Err(error);
+                }
                 Err(error) => {
-                    let text = format!("{raw}: {}", error.0);
+                    let text = if paths.len() == 1 {
+                        error.0.clone()
+                    } else {
+                        format!("{raw}: {}", error.0)
+                    };
                     errors.push(text.clone());
-                    content.push(UserBlock::Text { text });
+                    if model_read {
+                        content.push(UserBlock::Text { text });
+                    }
+                    if program.is_some() {
+                        files.push(ReadPiece {
+                            path: raw.clone(),
+                            data: ReadData::Error { error: error.0 },
+                        });
+                    }
                 }
             }
         }
-        if errors.len() == paths.len() {
+        let is_error = errors.len() == paths.len();
+        if is_error && program.is_none() {
             return Err(ToolError(errors.join("\n")));
         }
         let mut details = file_details(&records);
         details["reads"] = Value::Array(reads);
         Ok(ToolOutput {
             content,
-            details: Some(details),
+            details: (!is_error).then_some(details),
+            structured_content: program.map(|_| json!(ReadResult { files })),
+            is_error,
             ..ToolOutput::default()
         })
     }
+}
+
+fn image_blocks(bytes: &[u8], mime: &'static str) -> Vec<UserBlock> {
+    match process_image(bytes, mime) {
+        Ok(image) => {
+            let mut note = format!("Read image file [{}]", image.mime_type);
+            for hint in &image.hints {
+                note.push('\n');
+                note.push_str(hint);
+            }
+            vec![
+                UserBlock::Text { text: note },
+                UserBlock::Image {
+                    data: image.data.into(),
+                    mime_type: image.mime_type.to_string(),
+                },
+            ]
+        }
+        Err(message) => vec![UserBlock::Text {
+            text: format!("Read image file [{mime}]\n{message}"),
+        }],
+    }
+}
+
+fn text_piece(
+    text: &str,
+    shown: &str,
+    specs: Option<&[LineSpec]>,
+    budget: Option<&mut Limits>,
+    program: Option<&mut Limits>,
+    file: Option<(&std::path::Path, bool)>,
+) -> Result<Piece, ToolError> {
+    let lines = lines_of(text);
+    let total = lines.len();
+    let selected = specs
+        .map(|specs| selector::resolve(specs, total))
+        .transpose()
+        .map_err(ToolError)?;
+    let whole = [(1, total)];
+    let ranges = selected
+        .as_deref()
+        .unwrap_or(&whole[..usize::from(total > 0)]);
+    let (blocks, entry) = match budget {
+        Some(budget) => {
+            let outlined = file
+                .filter(|&(_, enabled)| enabled && specs.is_none())
+                .and_then(|(path, _)| outline::lang(path))
+                .and_then(|lang| outline::outline(lang, &lines));
+            let (text, entry) = match outlined {
+                Some(rows) => outline_text(&rows, &lines, shown, budget),
+                None => number_text(
+                    &lines,
+                    shown,
+                    file.is_some(),
+                    selected.is_some(),
+                    ranges,
+                    budget,
+                ),
+            };
+            (vec![UserBlock::Text { text }], Some(entry))
+        }
+        None => (Vec::new(), None),
+    };
+    let file = program.map(|budget| {
+        let (text, truncated) = if budget.max_bytes == 0 {
+            (String::new(), true)
+        } else if let Some(ranges) = &selected {
+            let (body, _, cut) = fit(numbers(ranges).map(|n| lines[n - 1]), budget);
+            (body, cut.is_some())
+        } else {
+            let cut = truncate_head(text, *budget);
+            budget.max_bytes -= cut.content.len();
+            (cut.content.to_owned(), cut.truncated())
+        };
+        if truncated {
+            budget.max_bytes = 0;
+        }
+        ReadPiece {
+            path: shown.to_owned(),
+            data: ReadData::Text {
+                text,
+                total_lines: total,
+                lines: selected,
+                truncated,
+            },
+        }
+    });
+    Ok(Piece {
+        blocks,
+        record: None,
+        entry,
+        file,
+    })
 }
 
 /// Lines split on `\n` (a trailing newline ends the last line), each without one trailing `\r`.
@@ -337,33 +535,23 @@ fn number_text(
     lines: &[&str],
     shown: &str,
     sed: bool,
-    specs: Option<&[LineSpec]>,
+    selected: bool,
+    ranges: &[Range],
     budget: &mut Limits,
-) -> Result<(String, Value), ToolError> {
+) -> (String, Value) {
     let total = lines.len();
-    let (ranges, header) = match specs {
-        None => (
-            if total == 0 {
-                Vec::new()
-            } else {
-                vec![(1, total)]
-            },
-            format!("{shown} ({})", count(total, "line", "lines")),
-        ),
-        Some(specs) => {
-            let ranges = selector::resolve(specs, total).map_err(ToolError)?;
-            let header = format!(
-                "{shown}:{} ({})",
-                selector::render(&ranges),
-                count(total, "line", "lines")
-            );
-            (ranges, header)
-        }
+    let line_count = count(total, "line", "lines");
+    let header = if selected {
+        format!("{shown}:{} ({line_count})", selector::render(ranges))
+    } else {
+        format!("{shown} ({line_count})")
     };
-    let numbers = || ranges.iter().flat_map(|&(start, end)| start..=end);
-    let (body, fitted, cut) = fit(numbers().map(|n| format!("{n}\t{}", lines[n - 1])), budget);
+    let (body, fitted, cut) = fit(
+        numbers(ranges).map(|n| format!("{n}\t{}", lines[n - 1])),
+        budget,
+    );
     let shown_ranges: Vec<(usize, usize)> =
-        match fitted.checked_sub(1).and_then(|i| numbers().nth(i)) {
+        match fitted.checked_sub(1).and_then(|i| numbers(ranges).nth(i)) {
             Some(last) => ranges
                 .iter()
                 .filter(|&&(start, _)| start <= last)
@@ -372,7 +560,7 @@ fn number_text(
             None => Vec::new(),
         };
     let footer = cut.map(|by| {
-        let next = numbers().nth(fitted).expect("a cut leaves a line");
+        let next = numbers(ranges).nth(fitted).expect("a cut leaves a line");
         let remaining: Vec<(usize, usize)> = ranges
             .iter()
             .filter(|&&(_, end)| end >= next)
@@ -418,7 +606,11 @@ fn number_text(
         "truncated": cut.is_some(),
         "notice": footer,
     });
-    Ok((block(header, &body, footer), entry))
+    (block(header, &body, footer), entry)
+}
+
+fn numbers(ranges: &[Range]) -> impl Iterator<Item = usize> + '_ {
+    ranges.iter().flat_map(|&(start, end)| start..=end)
 }
 
 /// An outline's rows under a header, with a footer naming selectors for folded bodies.
@@ -478,7 +670,12 @@ fn outline_text(rows: &[Row], lines: &[&str], shown: &str, budget: &mut Limits) 
 
 /// Lists a directory one level deep: names sorted, directories ending in `/`, ignore files
 /// applied. Records no ledger entry and attaches no context.
-async fn list(path: PathBuf, shown: &str, budget: &mut Limits) -> Result<Piece, ToolError> {
+async fn list(
+    path: PathBuf,
+    shown: &str,
+    budget: Option<&mut Limits>,
+    program: Option<&mut Limits>,
+) -> Result<Piece, ToolError> {
     let names = tokio::task::spawn_blocking(move || {
         super::walker(&path)
             .max_depth(Some(1))
@@ -498,17 +695,40 @@ async fn list(path: PathBuf, shown: &str, budget: &mut Limits) -> Result<Piece, 
     .await
     .map_err(|error| ToolError(error.to_string()))?;
     let dir = shown.trim_end_matches('/');
-    let (body, fitted, _) = fit(names.iter().take(MAX_DIR_ENTRIES), budget);
-    let more = names.len() - fitted;
-    let footer = (more > 0).then(|| format!("[{more} more entries; use find to search]"));
-    let header = format!("{dir}/ ({})", count(names.len(), "entry", "entries"));
-    let entry = json!({ "path": dir, "directory": true, "entries": names.len(), "notice": footer });
+    let (blocks, entry) = if let Some(budget) = budget {
+        let (body, fitted, _) = fit(names.iter().take(MAX_DIR_ENTRIES), budget);
+        let more = names.len() - fitted;
+        let footer = (more > 0).then(|| format!("[{more} more entries; use find to search]"));
+        let header = format!("{dir}/ ({})", count(names.len(), "entry", "entries"));
+        let entry =
+            json!({ "path": dir, "directory": true, "entries": names.len(), "notice": footer });
+        (
+            vec![UserBlock::Text {
+                text: block(header, &body, footer),
+            }],
+            Some(entry),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    let file = program.map(|budget| {
+        let (_, fitted, cut) = fit(&names, budget);
+        if cut.is_some() {
+            budget.max_bytes = 0;
+        }
+        ReadPiece {
+            path: shown.to_owned(),
+            data: ReadData::Directory {
+                entries: names.into_iter().take(fitted).collect(),
+                truncated: cut.is_some(),
+            },
+        }
+    });
     Ok(Piece {
-        blocks: vec![UserBlock::Text {
-            text: block(header, &body, footer),
-        }],
+        blocks,
         record: None,
-        entry: Some(entry),
+        entry,
+        file,
     })
 }
 

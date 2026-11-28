@@ -16,13 +16,14 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | config |  | The effective configuration for this session. |
 | setName | name? | Sets the file-wide session name; newlines become spaces and blank names clear it. May be called while a run is active; this entry contributes no context message. |
 | name |  | The latest session name in file order, independent of the selected branch. |
+| scriptStore |  | The values codemode scripts stored on the current branch, as the next script would load them. |
 | skills |  | The skills in force now; the prompt's catalog and /name commands use these. |
 | agents |  | Agent and team definitions in force now. |
 | diagnostics |  | Start-time context, skill, prompt, and scheme diagnostics, also logged as warnings. |
 | jobs |  | The background jobs read proc:// lists (promoted, retained and rebuilt, finished ones included), ascending. |
 | killJob | id | Stops job id (bg_N or agent_N), reporting whether it was running. |
 | commandJobs | callId | The job ids of the commands a tool call started, oldest first, foreground commands included. |
-| background | callId | Requests promotion of every foreground command the call started. A command that finishes first stays foreground. |
+| background | callId | Requests promotion of each foreground command or script the call started. Work that finishes first stays foreground. |
 | tools |  | The tools this session exposes: direct ones in prompt order, then deferred catalog entries. Reading it promotes nothing. |
 | commands |  | The commands a host may offer: built-ins, modes, registered commands, then unhidden skills. |
 | modes |  | The mode definitions in force now; empty for children. |

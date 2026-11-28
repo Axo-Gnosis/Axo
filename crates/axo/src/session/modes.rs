@@ -524,6 +524,10 @@ impl Tool for ModeYield {
         }
     }
 
+    fn nestable(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let hooks = self
             .hooks
@@ -717,6 +721,10 @@ impl Tool for EnterModeTool {
     }
     fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
+    }
+
+    fn nestable(&self) -> bool {
+        false
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {

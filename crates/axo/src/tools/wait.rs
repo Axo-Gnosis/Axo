@@ -1,14 +1,16 @@
 //! `wait`: blocks until a background job's result is in, or a new user message arrives.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo_agent::{ExecutionMode, Replay, Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::{ToolCall, UserBlock};
+use schemars::JsonSchema;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::coordination::{WaitReason, WaitReceipt};
-use crate::jobs::render_results;
+use crate::jobs::{JobId, ReservedMessage, add_result_files, render_results};
 use crate::session::team::{TeamSeat, WaitGuard, mutual_wait};
 use crate::tools::SessionTools;
 
@@ -31,12 +33,56 @@ impl WaitTool {
     }
 }
 
-fn text(text: String, reason: WaitReason, jobs: Vec<String>) -> ToolOutput {
+#[derive(Serialize, JsonSchema)]
+struct WaitResult<'a> {
+    reason: WaitReason,
+    results: Vec<WaitMessage<'a>>,
+    running: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WaitMessage<'a> {
+    job: String,
+    message: String,
+    label: &'a str,
+    text: &'a str,
+    is_error: bool,
+    value: Option<&'a Value>,
+}
+
+fn output(
+    text: String,
+    reason: WaitReason,
+    results: &[ReservedMessage],
+    running: Option<Vec<JobId>>,
+) -> ToolOutput {
+    let jobs = results
+        .iter()
+        .map(|result| result.msg.to_string())
+        .collect();
+    let mut details = json!(WaitReceipt { reason, jobs });
+    add_result_files(&mut details, results);
     ToolOutput {
         content: vec![UserBlock::Text { text }],
-        details: Some(
-            serde_json::to_value(WaitReceipt { reason, jobs }).expect("serializable wait receipt"),
-        ),
+        details: Some(details),
+        structured_content: running.map(|running| {
+            json!(WaitResult {
+                reason,
+                running: running.iter().map(ToString::to_string).collect(),
+                results: results
+                    .iter()
+                    .map(|result| WaitMessage {
+                        job: result.msg.job.to_string(),
+                        message: result.msg.to_string(),
+                        label: &result.label,
+                        text: &result.text,
+                        is_error: result.is_error,
+                        value: result.value.as_ref(),
+                    })
+                    .collect(),
+            })
+        }),
         ..ToolOutput::default()
     }
 }
@@ -55,6 +101,11 @@ impl Tool for WaitTool {
         &self.parameters
     }
 
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: LazyLock<Value> = LazyLock::new(super::result_schema::<WaitResult<'static>>);
+        Some(&SCHEMA)
+    }
+
     /// Sequential: each earlier call's result, and with it a promoted job's admission,
     /// commits before `wait` looks for running jobs.
     fn execution_mode(&self) -> ExecutionMode {
@@ -70,8 +121,10 @@ impl Tool for WaitTool {
             cancel,
             mut steer,
             invocation,
+            parent,
             ..
         } = cx;
+        let nested = parent.is_some();
         let jobs = &self.tools.runner.jobs;
         // Subscribe before the first check so no change between check and await is missed.
         let mut changed = jobs.subscribe();
@@ -79,36 +132,44 @@ impl Tool for WaitTool {
         let mut guard: Option<WaitGuard> = None;
         loop {
             if steer.is_pending() {
-                let running = jobs.running_admitted();
+                let running = jobs.running_admitted(parent.as_deref());
                 let ids: Vec<String> = running.iter().map(ToString::to_string).collect();
-                return Ok(text(
+                return Ok(output(
                     format!(
                         "Wait interrupted by a new message; {} background job(s) still running: {}.",
                         ids.len(),
                         ids.join(", ")
                     ),
                     WaitReason::Interrupted,
-                    vec![],
+                    &[],
+                    nested.then_some(running),
                 ));
             }
             let results = jobs.reserve_for(invocation);
             if !results.is_empty() {
-                let refs: Vec<String> = results
-                    .iter()
-                    .map(|result| result.msg.to_string())
-                    .collect();
-                return Ok(text(render_results(&results), WaitReason::Results, refs));
+                return Ok(output(
+                    render_results(&results),
+                    WaitReason::Results,
+                    &results,
+                    nested.then(|| jobs.running_admitted(parent.as_deref())),
+                ));
             }
             if jobs.has_mail() {
-                return Ok(text(MAIL_ARRIVED.into(), WaitReason::Mail, vec![]));
+                return Ok(output(
+                    MAIL_ARRIVED.into(),
+                    WaitReason::Mail,
+                    &[],
+                    nested.then(|| jobs.running_admitted(parent.as_deref())),
+                ));
             }
             match &self.team {
                 None => {
-                    if jobs.running_admitted().is_empty() {
-                        return Ok(text(
+                    if jobs.running_admitted(parent.as_deref()).is_empty() {
+                        return Ok(output(
                             "No background jobs are running.".into(),
                             WaitReason::Idle,
-                            vec![],
+                            &[],
+                            nested.then(Vec::new),
                         ));
                     }
                 }

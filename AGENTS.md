@@ -59,8 +59,8 @@ Architecture, active plans, and runtime reference docs live in dedicated files�
 Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -> `axo-ai`):
 
 - **`crates/axo-ai`**: LLM wire layer—message/transcript model, streaming adapters, model catalog, auth, cross-model transforms, error/overflow classification.
-- **`crates/axo-agent`**: Stateful turn loop, tool execution (`Tool`), deferred-tool routing (`route`), host tool-policy hooks (`ToolHooks`), loop-driver contract (`LoopHooks`), immutable event sink (`Persist`), queues, and cancellation.
-- **`crates/axo`**: Coding-agent harness—`Axo` host, `Session`, JSONL tree store & projection, recovery, compaction, context/skills, root session modes, scoped `ToolPolicy`, deferred tools (`call`, `tool://`), `ExecEnv`, command supervision (`ProcessSupervisor`), background jobs, the command catalog, URL `schemes`, and built-in tools.
+- **`crates/axo-agent`**: Stateful turn loop, direct and nested tool execution (`Tool`, `Calls`), deferred-tool routing (`route`), host tool-policy hooks (`ToolHooks`), loop-driver contract (`LoopHooks`), immutable event sink (`Persist`), queues, and cancellation.
+- **`crates/axo`**: Coding-agent harness—`Axo` host, `Session`, JSONL tree store & projection, recovery, compaction, context/skills, root session modes, scoped `ToolPolicy`, deferred tools (`call`, `tool://`), `ExecEnv`, command supervision (`ProcessSupervisor`), background jobs, the command catalog, URL `schemes`, and built-in tools, including feature-gated `codemode` over the public `axo::script` sandbox.
 - **`crates/axo-extensions`**: Optional extension bridge above `axo`—`Extensions` manager, static `extension.json` discovery, supervised Bun runners (`runner.ts`) and their wire protocol, provider layers, and composition over public session APIs. Nothing below may depend on it.
 - **`crates/axo-macros`**: Procedural macros beside the runtime chain. `axo` and `axo-extensions` use parameterized `#[expose]` to generate JSON dispatch and type metadata from Rust method signatures, and bare `#[expose]` to validate withheld-only impls.
 
@@ -81,10 +81,10 @@ Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -
 Run inside `nix develop`:
 
 ```bash
-cargo check --workspace --all-targets
-cargo nextest run --workspace   # or `cargo test --workspace` (`nextest` skips doctests; pass `--no-pager` to `list`)
-cargo test --doc --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace --all-targets --all-features
+cargo nextest run --workspace --all-features   # or `cargo test --workspace --all-features` (`nextest` skips doctests; pass `--no-pager` to `list`)
+cargo test --doc --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 

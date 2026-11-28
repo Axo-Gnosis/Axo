@@ -22,7 +22,7 @@ flowchart LR
 
 | Track | Scope | Status |
 |---|---|---|
-| **1. Codemode & script extensions** | Embedded JS sandbox (QuickJS/Boa engine evaluation), nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then `define_tool` and script hooks on spawned specs (rungs 2–5) | Rungs 0–1 scoped; rungs 2+ in discussion. Not the current implementation priority |
+| **1. Codemode & script extensions** | Embedded QuickJS-NG sandbox, nested tool calls, structured tool output, `codemode` tool (rungs 0–1), then defined tools and script hooks (rungs 2–5) | Rungs 0–1 built; live checks and measurement pending. Rungs 2+ open |
 | **5. MCP, `ast_edit` & extension follow-ups** | MCP tool adapter, optional structural edits and follow-ups to the shipped Bun bridge | Deferred |
 | **6. ACP binary (`axo-acp`, M6)** | Stdio JSON-RPC binary mapping ACP onto `Session` | Deferred: rethink whether axo itself should ship ACP or leave it to a host |
 | **7. Ask documents** | Rework `ask` from a list of option questions into one Markdown document with typed questions placed in reading order, one validated answer object, and notes | **Shipped.** See [Shipped tracks](#shipped-tracks) |
@@ -33,16 +33,15 @@ flowchart LR
 
 ## Track 1: Codemode and script extensions
 
-Notes from the design discussion of 2026-10-22. Only items marked **Decided** are settled; items marked **Direction** remain open for discussion.
+Rungs 0–1 are built: model-written JavaScript can call the session's tools and named resources, with program-sized results. See the [runtime reference](../crates/axo/docs/prompts-and-context.md#codemode) and [settled design](design.md#built-in-tools-and-execution-environment-axo). Rungs 2 and up below are proposals from the design discussion, not part of the shipped tool.
 
-### Where we landed
+### Decisions and remaining verification
 
-- **Decided:** axo builds a codemode tool in pi's shape (rungs 0–1 below): a stateless, sandboxed JavaScript script per call whose only powers are tool calls. It is built in, behind a Cargo feature, on an embedded engine. It does not wait for the Bun extension host.
-- **Direction:** state lives in resources that tools own, not in the script; everything addressable is reachable from scripts; and scripts may configure the harness of the subagents they spawn, but not change the session the user talks to.
-- **Shape:** three separate systems, each useful alone. Codemode composes them but owns none of them:
-  1. subagents, specified by an `AgentSpec`;
-  2. the script sandbox;
-  3. the hooks contract, with a script implementation among others.
+The implementation plan superseded the earlier foreground-only, JSON-only design and dropped the `table` tool. Scripts can promote to background jobs; capable OpenAI Responses models send script source as raw text. Each script starts in a fresh VM; small JSON state survives successful scripts, and `local://` is for bulk data. Scripts use `spawn` and `wait` for model work, not a separate completion helper.
+
+- **OpenAI live check done (2026-11-27):** gpt-5-mini received `codemode` as a custom tool, streamed `custom_tool_call` items (`ctc_` ids), and accepted their replay with `custom_tool_call_output` across three turns. See [the codemode report](research/codemode.md#live-checks-and-measurement).
+- **Engine spike:** The [spike report](research/codemode.md) records x86_64 Linux results and the selection of `rquickjs` 0.14.
+- **Phase 9 measurement partial:** A small OpenAI A/B and the compiled-but-unused footprint are in [the codemode report](research/codemode.md#live-checks-and-measurement): neither gpt-5-mini nor gpt-5.6 chose `codemode` on neutral prompts that one shell pipeline answers, and having it costs about 490 cached prompt tokens per request. Memory after a 200 MB script returns to baseline. On script-favouring prompts gpt-5-mini chose a script once in seven runs (a correct 26-file read-then-edit). Still open: an Anthropic run, spawn/wait fan-out prompts, and the corpus re-run against the [batching baseline](research/efficiency.md). Keep `codemode.enabled` off by default until those exist.
 
 ### omp `eval` vs pi `codemode`
 
@@ -99,7 +98,7 @@ Possible only by going through `bash`, at the cost of a process per step, text i
 | Fuzzy-dedupe 50k strings | V8 or Python speed | QuickJS interprets with a 256 MB heap; slow, or bash a real runtime |
 | Hash files, diff text, resize images | Standard library or packages | `sha256sum`, `diff`, `magick` through bash |
 
-Codemode plus bash covers everything eval does except state between calls and orchestration. Items 3 and 6 are not sandbox limits: `agent()` or `completion()` is another host function or tool call. What a sandbox cannot give on its own is state or a handle that outlives the script.
+pi's codemode plus bash covers everything eval does except live state between calls and orchestration. Items 3 and 6 are not sandbox limits: `agent()` or `completion()` is another host function or tool call. What a sandbox cannot give on its own is state or a handle that outlives the script.
 
 ### Embedded, not the Bun host
 
@@ -109,26 +108,20 @@ Codemode plus bash covers everything eval does except state between calls and or
 |---|---|---|
 | Access | Full runtime: `fetch`, fs, processes, npm, OAuth servers | Only tool calls, so `before_tool_call` cannot be bypassed |
 | Sandbox | Given up on purpose | The point |
-| Lifetime | Long-lived extension registrations and owned resources | One short script per call |
+| Lifetime | Long-lived extension registrations and owned resources | One fresh VM per script; a long script can run as a job |
 | Isolation | [Supervised Bun process per extension or user group](design.md#extension-parity-and-authority); installed code is trusted | A runaway script must not take extensions down |
 | Cost when unused | Bun is host-supplied; the runner starts only when needed | Nothing to install |
 
 - **pi does the same.** Its extensions run in Node/Bun, yet codemode runs in a separate QuickJS-wasm VM in a worker with a 256 MiB cap (`execute.ts`, `config.ts:491`).
 - **Fewer hops.** In the Bun host, every nested tool call would cross the stdio bridge twice: script → Bun → axo's tool pipeline → Bun → script. Embedded, a nested call is an in-process call into the tool pipeline.
 - **The VM has no power of its own.** QuickJS starts with nothing. Every capability is a Rust host function that axo injects. Rust decides what is possible; JS lets the agent express runtime logic (loops, conditions, filtering).
-- **Engine candidates** (to verify in a short spike before coding):
-
-  | Engine | Notes |
-  |---|---|
-  | QuickJS (`rquickjs`) | Initial candidate: verify async Rust integration, memory/interrupt controls and per-context overhead; no engine selected |
-  | `boa` | Rust implementation; user interested in evaluating it for codemode (2026-11-15). Not selected; compare during the engine spike |
-  | V8 (`deno_core`) | Fast, but tens of MB in the binary; against the memory goal |
+- **Engine:** QuickJS-NG through `rquickjs`, in-process on a dedicated thread. See the [spike report](research/codemode.md) for the decision and limits.
 
 ### The model: a ladder of power
 
 #### Three ideas
 
-- **A. Data lives in a tool or resource, not in the script.** The script stays stateless. Anything that lasts has an owner and a name; scripts refer to it by name. Each resource has its own crash behavior, unlike an eval kernel where everything dies together:
+- **A. Data lives in a tool or resource, not in the script.** The VM is fresh for each script. Small JSON values can live in its branch store; longer-lived or larger resources have an owner and a name that scripts refer to. Each resource has its own crash behavior, unlike an eval kernel where everything dies together:
 
   | Resource | Owner | Name |
   |---|---|---|
@@ -151,7 +144,7 @@ Codemode plus bash covers everything eval does except state between calls and or
 | 4 | register hooks | after each edit to a `.rs` file, run `cargo check` and attach errors |
 | 5 | change the prompt or tool set | add a section; hide tools for a focused task |
 
-**Decided:** rungs 0–1 are the initial codemode build scope, not a prerequisite for the current extension work. Rungs 2 and up need the design below.
+**Built:** rungs 0–1. The remaining rungs need the design below.
 
 - **Rungs 2 and 3 merge.** A saved function is a defined tool that only scripts can call.
 - **Tools and hooks differ in kind.** A tool runs only when called; the call and its result are visible, and a bad tool is one the model can stop using. A hook runs on every matching event without being called, and can block, rewrite or redirect other calls or decide whether the loop continues. A tool adds a new verb; a hook changes how the existing ones behave.
@@ -195,8 +188,8 @@ flowchart LR
 ```
 
 1. **Subagents (Rust core).** An `AgentSpec` is plain data (`name`, `description`, `model`, `tools`, `contextFiles`, `sections`, `output`, `maxTurns`, body); inline specs in `spawn` restrict prompt, tools, model, and output. Spawning it returns a handle (`agent://<id>`) to wait on. It knows nothing about JS.
-2. **The script sandbox.** Runs JS with injected host functions under limits. Codemode is a thin tool on top of it; `define_tool` sources and script hooks reuse the same sandbox.
-3. **Hooks.** One Rust contract with several implementations: Rust (hosts and first-party features), TypeScript (Bun extensions), and a script implementation that runs stored JS in the sandbox when the hook fires.
+2. **The script sandbox.** Runs JS with injected host functions under limits. Codemode is a tool on top of it; proposed `define_tool` sources and script hooks would use the same sandbox.
+3. **Hooks.** One Rust contract used by Rust hosts and Bun extensions. A proposed script implementation would run stored JS in the sandbox when the hook fires.
 
 #### Which tool grants each rung
 
@@ -262,19 +255,6 @@ Key risks to design around when building step 3 (script hooks):
 3. **Bugs and stalls on the hot path:** per-hook time budget, auto-disable after errors with a notice, no recursive self-triggering, and cancellation propagation.
 4. **Prompt cache churn:** new tools default to script-only exposure so the declared tool set stays stable.
 5. **VM lifetime for hooks:** measure a fresh embedded-engine context per hook invocation (stateless, durable) against one VM per session.
-
-### Step 1 build scope: Codemode rungs 0–1
-
-1. **Embedded-engine spike:** compare `rquickjs` and Boa for async/tokio bridging, language compatibility, memory and execution limits, cancellation and per-context overhead against the PSS target. The user is interested in Boa for codemode; no engine has been selected.
-2. **Core prerequisites (`axo-agent` & `axo`):**
-   - **Nested tool calls:** extend `ToolContext` with a nested-call runner that goes through prepare, validate, `ToolHooks` / `ToolPolicy::before_tool_call`, and `ToolPolicy::after_tool_call`, inheriting the parent's `ToolScope` (mode, `BashAccess`, `writes`, depth). Hosts and policies therefore see both the outer `codemode` call (with script source) and each inner nested call with its resolved arguments. Assign `<parent>/<n>` IDs, tag `AgentEvent::ToolExecution*` with `parent_call_id`, and record nested calls (preserving `details.files` / `FileChange` snapshots from nested `edit`/`write` calls) on the parent `ToolResultMessage` so compaction extracts file operations and hosts can render collapsed script blocks with real diffs and rebuild them from the journal.
-   - **Structured tool output:** add `output_schema` and `structured_content: Option<Value>` on `ToolOutput` (for `bash`: `{ output, truncated, full_output_path, exit_code, wall_time_seconds }` with a 1 MiB output cap; for `read`: text string or image object).
-3. **Sandbox module (`axo::script`):** standalone module (not buried inside the tool) that runs JS on a blocking worker thread with a memory cap, interrupt budget/timeout, concurrency semaphore, and channel bridge for async host functions.
-4. **`codemode` tool (`axo::tools::codemode`):**
-   - Globals: `tools.*`, `searchTools()` / `describeTool()` (backed by the deferred tool catalog / `tool://`), `text()`, `image()`, `return`, `console.*`, `exit()`, `store(k, v)` / `load(k)` (backed by branch-scoped `custom` session entries committed only when the script succeeds), and `// @options: {"max_output_tokens", "timeout_ms"}`.
-   - Keep the tool description compact (at most active direct tools' declarations) and discover deferred, extension, and MCP tools on demand via `searchTools()` / `describeTool()` so large catalogs do not bloat context or churn the prompt cache.
-   - User-only enablement (never auto-enabled by project-level config, matching `extensions`).
-   - `Replay::Never`: crash recovery reports the script as interrupted and lists completed nested calls.
 
 ---
 
@@ -384,8 +364,8 @@ The bash classifier (`tools/shell.rs`) and the scheme rewriter (`tools/bash_urls
 3. **Parent-and-children rule** (Track 1, codemode rungs 2+). Adopt the rule strictly (scripts may add tools to the parent, but may only attach hooks/prompt changes to spawned children), or allow some parent hooks? Shipped `InlineSpec` enforces the strict form by shape: inline specs carry only `prompt`, `tools`, `model`, and `output`, while host policies and hooks are inherited (see [`design.md`](design.md#agents-and-child-sessions-axo)).
 4. **Where model-written tools/scripts live and how they promote.** Session-scoped (`custom` entries) by default; what is the file format and workflow for promoting a useful tool to a host-provided location?
 5. **Hook safety without approvals** (Track 1, codemode rungs 2+). Since axo has no approval system (`design.md`), should child script hooks be restricted to a narrower host-function set (e.g. no network/write outside cwd), or rely strictly on the parent's inherited policy hooks running last?
-6. **Which stateful resources ship built-in:** a SQLite-backed `table` tool, browser? (Subagents ship with Track 2; background `bash` jobs ship with Track 3.)
+6. **Which additional stateful resources belong in core?** A browser or query resource is not part of rungs 0–1; no `table` tool is planned for this build.
 7. **VM lifetime for script hooks:** fresh embedded-engine context per hook invocation vs one retained context per child session (measure PSS impact).
-8. **Naming:** tool names (`codemode` vs `eval` vs `script`, `define_tool`) and module path (`axo::script`).
-9. **Orchestration in scripts** (Track 1, codemode rungs 2+): expose subagents and one-shot completions strictly through `tools.spawn(...)` (preserving "no powers beyond tools"), or also as top-level helpers?
+8. **Naming:** what should the higher-rung `define_tool` proposal be called? The `codemode` tool and `axo::script` module names are settled.
+9. **Orchestration in scripts** (Track 1, codemode rungs 2+): if a one-shot completion capability becomes necessary, what tool contract should it use? Rungs 0–1 expose model work through `spawn` and `wait`, with no completion helper.
 10. ~~**Per-host identity.**~~ Resolved in Track 2: `axo` by default, renamed per host through `AxoBuilder::name`.

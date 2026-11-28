@@ -16,6 +16,8 @@ mod jobs;
 mod models;
 mod recovery;
 pub mod schemes;
+#[cfg(feature = "codemode")]
+pub mod script;
 mod session;
 pub mod store;
 pub mod tools;
@@ -26,11 +28,12 @@ pub use commands::{
     valid_command_name,
 };
 pub use config::{
-    AskSettings, BashSettings, CacheTtl, CacheTtlSettings, CacheWarming, CompactionSettings,
-    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, EnabledExtension, ExtensionListError,
-    ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride,
-    ReadSettings, RetrySettings, ServiceTierSettings, Settings, SubagentSettings, SubagentTier,
-    SummaryRequest, TierOnModelChange, USER_ONLY_KEYS, UserConfig, valid_extension_id,
+    AskSettings, BashSettings, CacheTtl, CacheTtlSettings, CacheWarming, CodemodeSettings,
+    CompactionSettings, ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, EnabledExtension,
+    ExtensionListError, ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings,
+    PromptOverride, ReadSettings, RetrySettings, ServiceTierSettings, Settings, SubagentSettings,
+    SubagentTier, SummaryRequest, TierOnModelChange, USER_ONLY_KEYS, UserConfig,
+    valid_extension_id,
 };
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::definitions::Definitions;
@@ -61,10 +64,11 @@ pub use session::wire::{EntryPage, OutputPage};
 pub use session::{
     AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
     HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
-    PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput, RecoveryPolicy,
-    Registrations, ResultResolution, Session, SessionEvent, SessionEventKind, SessionOptions,
-    SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
-    SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
+    PendingNestedCall, PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput,
+    RecoveryPolicy, Registrations, ResultResolution, Session, SessionEvent, SessionEventKind,
+    SessionOptions, SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision, SpawnHook,
+    SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy,
+    ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,
@@ -78,7 +82,7 @@ pub use tools::{
     LineDiff, MAX_SNAPSHOT_BYTES, MarkdownBlock, NumberQuestion, Omitted, QuestionOption,
     SessionTools, ShellKind, ShellUnit, SnapshotBlob, SnapshotStore, SquashedChange, TextQuestion,
     ToolAccess, ToolFactory, WriteRoot, WriteScope, Written, classify_bash, file_changes,
-    file_details, file_records, squash, valid_tool_name,
+    file_details, file_records, file_records_in, squash, valid_tool_name,
 };
 
 #[cfg(doctest)]

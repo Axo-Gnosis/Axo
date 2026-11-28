@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
 use axo_agent::{AgentMessage, CustomMessage, QueuedMessage, Replay};
 use axo_ai::{
     AssistantMessage, Message, Model, StopReason, ToolCall, ToolResultMessage, UserBlock,
@@ -6,7 +9,6 @@ use axo_ai::{
 
 use super::delivery::enqueue;
 use super::journal::{self, View};
-use super::spawn::SPAWN;
 use super::{RecoveryPolicy, RunRequest, Session};
 use crate::compaction::Limits;
 use crate::error::Error;
@@ -29,6 +31,32 @@ pub(super) enum Resumption {
     RecoverResponse(RunRequest),
 }
 
+fn report_finished_nested_calls(text: &mut String, entries: &[SeqEntry], call_id: &str) {
+    let mut counts = BTreeMap::new();
+    let mut total = 0;
+    for seq in entries {
+        if let Entry::NestedToolCall {
+            root_call_id, name, ..
+        } = &seq.entry
+            && root_call_id == call_id
+        {
+            *counts.entry(name).or_insert(0) += 1;
+            total += 1;
+        }
+    }
+    if total > 0 {
+        let counts = counts
+            .into_iter()
+            .map(|(name, n)| format!("{name} ×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            text,
+            " {total} nested calls had finished ({counts}); their effects stay."
+        );
+    }
+}
+
 /// What recovering a terminal response read from the journal.
 struct RecoveredResponse {
     response: AssistantMessage,
@@ -47,6 +75,7 @@ impl Session {
             .jobs
             .reconcile(
                 unfinished,
+                &self.hooks.journal.view().entries,
                 self.hooks.tools.schemes.artifacts(),
                 &*self.hooks,
             )
@@ -313,13 +342,11 @@ impl Session {
                         if let Some(n) = artifact {
                             text.push_str(&format!(" Output so far: artifact://{n}"));
                         }
-                        // The children an interrupted spawn started are admitted by this
-                        // result, as its own result would have.
-                        let ids = if call.name == SPAWN {
-                            jobs.spawned_pending(&call.id)
-                        } else {
-                            Vec::new()
-                        };
+                        self.hooks.journal.read(|view| {
+                            report_finished_nested_calls(&mut text, &view.entries, &call.id);
+                        });
+                        // Admit the children started directly or through a nested call.
+                        let ids = jobs.spawned_pending(&call.id);
                         let admitted_jobs: Vec<_> = ids.iter().map(ToString::to_string).collect();
                         if !admitted_jobs.is_empty() {
                             text.push_str(&format!(

@@ -1,12 +1,13 @@
 //! `send`: messages a subagent, teammate or parent.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
 use axo_ai::UserBlock;
 use serde_json::{Value, json};
 
+use crate::coordination::SendReceipt;
 use crate::jobs::JobRegistry;
 use crate::session::children::SessionTable;
 use crate::session::{AgentRoutes, coordination};
@@ -58,6 +59,11 @@ impl Tool for SendTool {
         &self.parameters
     }
 
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: LazyLock<Value> = LazyLock::new(super::result_schema::<SendReceipt>);
+        Some(&SCHEMA)
+    }
+
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let arguments = &cx.call.arguments;
         let to = arguments.get("to").and_then(Value::as_str).unwrap_or("");
@@ -74,9 +80,11 @@ impl Tool for SendTool {
                 .await
                 .map_err(|error| ToolError(error.to_string()))?;
         let text = receipt.text();
+        let receipt = json!(receipt);
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
-            details: Some(serde_json::to_value(receipt).expect("serializable send receipt")),
+            structured_content: cx.parent.is_some().then(|| receipt.clone()),
+            details: Some(receipt),
             ..ToolOutput::default()
         })
     }

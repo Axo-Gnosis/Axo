@@ -69,9 +69,10 @@ pub use changes::{
     FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_changes, squash,
 };
 pub use ledger::{
-    FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
+    FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, file_records_in,
+    lock_file,
 };
-pub(crate) use ledger::{file_key, ledger_records};
+pub(crate) use ledger::{file_key, ledger_records, message_file_records};
 pub use shell::{ShellKind, ShellUnit, classify_bash};
 pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
 pub use wire::{ArtifactSlot, ToolAccess};
@@ -463,6 +464,10 @@ fn walker(root: &Path) -> WalkBuilder {
     walk
 }
 
+pub(crate) fn result_schema<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect("serializable output schema")
+}
+
 fn byte_capped(
     raw: &str,
     mut before: Vec<String>,
@@ -533,13 +538,14 @@ fn clean_path(path: &str) -> Cow<'_, str> {
 }
 
 /// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait, kill`,
-/// followed by `spawn`, `send` and `ask` when supplied.
+/// followed by `spawn`, `send`, `ask` and `codemode` when supplied.
 pub(crate) fn builtin(
     tools: &Arc<SessionTools>,
     spawn: Option<Arc<dyn Tool>>,
     send: Option<Arc<dyn Tool>>,
     team: Option<TeamSeat>,
     ask: Option<Arc<dyn Tool>>,
+    codemode: Option<Arc<dyn Tool>>,
     settings: &Settings,
 ) -> Vec<Arc<dyn Tool>> {
     let mut list: Vec<Arc<dyn Tool>> = vec![
@@ -562,6 +568,7 @@ pub(crate) fn builtin(
         list.push(send);
     }
     list.extend(ask);
+    list.extend(codemode);
     list
 }
 

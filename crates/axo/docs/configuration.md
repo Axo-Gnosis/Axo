@@ -135,6 +135,15 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
   "ask": {
     "timeoutMs": null
   },
+  "codemode": {
+    "enabled": false,
+    "promoteAfterMs": 60000,
+    "cpuMs": 30000,
+    "memoryMb": 256,
+    "maxCalls": 1000,
+    "maxInFlight": 16,
+    "maxOutputTokens": 10000
+  },
   "read": {
     "outlineMinBytes": 24000
   },
@@ -183,6 +192,7 @@ A layer's `settings` is a JSON object (`serde_json::Value`); how a host stores o
 | `nestedContextFiles` | `nested_context_files` | `true` | User or project | Attach unseen subdirectory context files onto `read`, `write`, and `edit` tool results |
 | `bash` | `bash` | See below | User or project | Supervised subprocess and dev-shell execution (`BashSettings`) |
 | `ask` | `ask` | See below | User or project | Question tool configuration (`AskSettings`) |
+| `codemode` | `codemode` | See [Codemode](#codemode) | User only | Enable and limit the built-in script tool (`CodemodeSettings`). Ignored with a warning in project settings |
 | `read` | `read` | See below | User or project | `read` tool output (`ReadSettings`) |
 | `keywords` | `keywords` | See below | User or project | Keyword matching switches (`KeywordSettings`) |
 | `project` | `project` | See below | User only | Project access boundaries and policy (`ProjectSettings`) |
@@ -265,7 +275,7 @@ A Rust host can override the resolved access level per session via `SessionOptio
 | `bash.devShellWatch` | `dev_shell_watch` | `[]` | Additional globs relative to the flake root whose mtime/size changes trigger recapture |
 | `bash.devShellTimeoutMs` | `dev_shell_timeout_ms` | `600000` | Timeout in milliseconds for `nix print-dev-env` or `direnv export json` |
 | `bash.ci` | `ci` | `true` | Set `CI=true` in the command environment |
-| `bash.promoteAfterMs` | `promote_after_ms` | `60000` | Promote a still-running command to a background job after this many milliseconds; `0` disables timed promotion, but explicit async execution and pending steering still promote. Applies to `bash` and host tools using `SessionTools::run_command` |
+| `bash.promoteAfterMs` | `promote_after_ms` | `60000` | Promote a still-running command to a background job after this many milliseconds; `0` disables timed promotion, but explicit async execution and pending steering still promote. Applies to model-issued `bash` and host tools using `SessionTools::run_command`; nested commands promote only when explicitly async |
 | `bash.blockToolViews` | `block_tool_views` | `false` | Refuse a `bash` command that is a single file view or search a built-in tool can do (no compound, no redirect, no filter but `head`, `tail` or `sed -n 'A,Bp'`); the error names the replacement call. Hosts can build their own policy on `axo::classify_bash` |
 
 In `DevShellMode::Nix`, `DevShellEnv` finds the nearest ancestor containing `flake.nix` (stopping at the git root), captures the environment by evaluating `nix print-dev-env` output in a clean `bash` (GC root `--profile` at `<cache_dir>/devshell/<hash>/gcroot` under the host's `AxoBuilder::cache_dir`, where `<hash>` is a 16-hex-digit key of flake dir, ref, system, and `devShellWatch` globs), and watches `flake.nix`, `flake.lock`, git-tracked `*.nix` files, and `devShellWatch`. Concurrent `bash` calls share a single in-flight capture per key. If capture fails, commands fall back to the host environment and prefix the next `bash` result with a capture failure notice (once per session).
@@ -359,6 +369,20 @@ Both keys apply only to root sessions; children never match keywords. Disabled k
 | `ask.timeoutMs` | `timeout_ms` | `None` | Optional timeout in milliseconds for `ask` tool calls. When it elapses, only the model's `recommended` option(s), `prefill` and `default` values are submitted, with `null` for every question without one; the first option is never guessed. The result is not an error and its `details` carry `"timedOut": true`. See [Ask documents for hosts](extending.md#ask-documents-for-hosts) |
 
 A queued steer settles a pending question instead of waiting behind it: `ask` returns a non-error result, "The user did not answer. They sent a message instead; it follows this result.", with `details.outcome == "steered"`, and the steer is delivered right after. See [Queued input for hosts](extending.md#queued-input-for-hosts).
+
+### Codemode
+
+`Settings::codemode` is user-only, even for trusted projects. `CodemodeSettings` is available in every build, but the [tool](prompts-and-context.md#codemode) requires the `codemode` Cargo feature. If enabled in settings without the feature, session startup reports `codemode is enabled in settings but this build does not include it`.
+
+| Key | Rust field | Default | Meaning |
+| :--- | :--- | ---: | :--- |
+| `codemode.enabled` | `enabled` | `false` | Offer the built-in script tool, subject to normal session tool filtering |
+| `codemode.promoteAfterMs` | `promote_after_ms` | `60000` | Milliseconds before a foreground script promotes to a background job; `0` disables timed promotion |
+| `codemode.cpuMs` | `cpu_ms` | `30000` | VM execution budget in milliseconds; excludes waiting on host calls |
+| `codemode.memoryMb` | `memory_mb` | `256` | VM heap cap in MiB |
+| `codemode.maxCalls` | `max_calls` | `1000` | Maximum host requests per script, including tool discovery |
+| `codemode.maxInFlight` | `max_in_flight` | `16` | Maximum tool calls running concurrently per script |
+| `codemode.maxOutputTokens` | `max_output_tokens` | `10000` | Inline output budget, approximated as four bytes per token; longer output goes to an artifact |
 
 ### Read tool (`read` / `axo::ReadSettings`)
 
@@ -473,6 +497,7 @@ Model metadata is data: new models and changed limits, prices, thinking levels a
 - **Thinking levels:** levels follow the row's `reasoning.effort` list; a level it does not list is unsupported. Off maps to `"none"` when listed, stays available when the row has a `toggle` or `budget`, and is unsupported otherwise. Anthropic Messages rows with efforts and no `budget` use adaptive thinking (`forceAdaptiveThinking`); with a `budget` they keep budget thinking and the default levels.
 - **Anthropic Messages capabilities:** `temperature: false` sets `supportsTemperature: false`; system and effort updates set `supportsMidConvoSystemMessages` and `supportsMidConvoEffort`, and tool updates listing add, remove and replace set `supportsMidConvoToolChanges`. The same flags are not mapped for Chat Completions rows; set them with `compat` where wanted.
 - **OpenAI Responses rows:** a row flagged `supportsMidConvoSystemMessages` sends the prompt as a leading `developer` input item and later prompt changes as further items, instead of top-level `instructions`. First-party `openai` rows set the flag; host-registered rows (for example Codex) set it themselves.
+- **Raw-text tool input:** OpenAI Responses models with `supportsCustomTools` send tools that declare `ToolSpec::raw_input` as unconstrained custom tools. This flag defaults to true for provider `openai` and false elsewhere. The transcript still stores the input as a string property in the usual tool arguments object. Other models receive the tool's JSON schema and use ordinary function calls.
 - **Subscription providers:** axo has none built in. Providers that sign in to a subscription (for example ChatGPT Codex or a Claude subscription) are registered by the host with `Models::register`, using `transport`, `list_models`, `usage` and `compat.toolNamePrefix` for their wire differences and account limits (see [Runtime providers, login, and reload](#runtime-providers-login-and-reload)).
 - **Loading:** `Models::load` reads the catalog cache and the [runtime model list](#runtime-providers-login-and-reload) cache. When the catalog cache is missing it fetches the catalog once before building; a failure logs a warning and loads without the catalog.
 - **Refresh:** `Models::refresh()` fetches the catalog, re-runs discovery and rebuilds in place, then re-lists runtime providers that list their models; registrations are kept. A catalog that fails to download or parse, or contains no usable model, returns `Err`, is not cached, and leaves the previous catalog in place; a failed discovery request or listing only logs and keeps the previous models. With a cache directory, a timer runs it every `refreshInterval` seconds, first when the cached catalog reaches that age (at once if it is older). Hosts call `refresh` to fetch on demand.

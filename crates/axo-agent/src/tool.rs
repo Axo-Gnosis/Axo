@@ -13,12 +13,26 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::Calls;
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     /// JSON Schema of the arguments; the loop validates calls against it.
     fn parameters(&self) -> &Value;
+    /// May another tool call this tool? Tools that need the model or user return false.
+    fn nestable(&self) -> bool {
+        true
+    }
+    /// JSON Schema of [`ToolOutput::structured_content`], when this tool produces one.
+    fn output_schema(&self) -> Option<&Value> {
+        None
+    }
+    /// The name of the single string argument that a provider may take as raw text.
+    fn raw_input(&self) -> Option<&str> {
+        None
+    }
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Parallel
     }
@@ -38,8 +52,8 @@ pub trait Tool: Send + Sync {
     }
     /// Runs one validated call on its own task. An `Err` becomes an error result the
     /// model sees; a tool that reports a failure with output (e.g. a failing command)
-    /// returns `Ok` with `is_error: true`. Must honor `cx.cancel`: on Stop the loop
-    /// waits up to 3 s for the call to return, then drops its future. Use
+    /// returns `Ok` with `is_error: true`. Must honor `cx.cancel`: the agent waits
+    /// up to 3 s for a cancelled call to return, then drops its future. Use
     /// [`ToolContext::on_hard_stop`] to settle an admitted mutation after that drop.
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
@@ -80,6 +94,10 @@ pub struct ToolContext {
     pub updates: ToolUpdates,
     pub steer: SteerSignal,
     pub invocation: ToolInvocationId,
+    /// For a nested call, the id of the model-issued call it runs under.
+    pub parent: Option<Arc<str>>,
+    /// Runs other tools; unavailable on nested calls and outside an agent.
+    pub calls: Calls,
 }
 
 type Interrupted = BoxFuture<'static, Option<ToolOutput>>;
@@ -90,7 +108,7 @@ tokio::task_local! {
 
 impl ToolContext {
     /// Arms one recovery future on the current native agent call, before admitting a
-    /// mutation. It runs only if the loop forcibly drops `execute`. Direct calls and
+    /// mutation. It runs only if the agent forcibly drops `execute`. Direct calls and
     /// detached tasks have no agent-owned result to recover, so registration there
     /// drops the future unused. Registering twice on one call is a programming error.
     pub fn on_hard_stop(
@@ -183,6 +201,9 @@ pub struct ToolOutput {
     pub content: Vec<UserBlock>,
     /// Host/log data; never reaches the model.
     pub details: Option<Value>,
+    /// A typed value for programmatic callers; never reaches the model or transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     pub is_error: bool,
     /// Hint to stop after this batch; only honored when every result in the batch sets it.
     pub terminate: bool,

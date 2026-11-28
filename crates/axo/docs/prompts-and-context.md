@@ -40,7 +40,7 @@ When the host sets `AxoBuilder::cache_dir`, constructing a session's schemes (in
 
 ### Built-in tool guidelines (`tools`)
 
-Before agent allowlists and depth filtering, the built-in order is `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `kill`, `spawn`, `send`, followed by `ask` when enabled. `spawn` is withheld when the session's depth is at least `subagents.maxDepth` (roots have depth 0). Filtering it after the allowlist avoids an unknown-tool diagnostic for an inherited allowlist naming `spawn`. `kill` and `send` bypass agent allowlists, then presence is derived from the effective tools: `kill` exists when `bash` or `spawn` remains; `send` exists when `spawn` remains or the session has a parent or teammates. Children with an output schema receive `yield` after the allowlist regardless of whether it names that tool. `call` is appended when deferred tools remain or the root has [mode tools reserved](#model-entry-and-results).
+Before agent allowlists and depth filtering, the built-in order is `read`, `write`, `edit`, `bash`, `grep`, `find`, `wait`, `kill`, `spawn`, `send`, followed by `ask` and `codemode` when enabled. `spawn` is withheld when the session's depth is at least `subagents.maxDepth` (roots have depth 0). Filtering it after the allowlist avoids an unknown-tool diagnostic for an inherited allowlist naming `spawn`. `kill` and `send` bypass agent allowlists, then presence is derived from the effective tools: `kill` exists when `bash`, `spawn`, or `codemode` remains (each can leave a background job); `send` exists when `spawn` remains or the session has a parent or teammates. Children with an output schema receive `yield` after the allowlist regardless of whether it names that tool. `call` is appended when deferred tools remain or the root has [mode tools reserved](#model-entry-and-results).
 
 Only `read`, `write`, `edit`, `bash`, and `grep` define `prompt_guidelines()` in the built-in tool set:
 - `read`: `"Use read for files and directories instead of cat, sed, nl or ls; path:5-16,960-973 reads ranges and a list of paths reads several. write over an existing file needs a read first; edit needs only oldText that matches the current file exactly once."` and `"Read small files whole; for large files, find the spot with grep and read only the ranges you need."`
@@ -54,6 +54,8 @@ For filesystem targets, `read` refuses non-regular files other than directories,
 `read` output: each text read is one block headed `<path> (<N> lines)` (with a selector, `<path>:<ranges> (<N> lines)`), followed by `N⇥text` rows (line number, tab, text; one trailing `\r` is not shown). A selector follows the path's last `:`: `N`, `N-`, `N-M`, `N+K` or `-N`, comma-joined, clamped to the file, sorted and merged; a literal path containing `:` that exists wins over the selector, and a suffix that does not parse as a selector is part of the path. One call reads up to 20 paths in argument order and shares one 2,000-line / 50 KB budget; a cut block ends with `[Showing lines a-b of N. Continue with <path>:<ranges>]` naming the unread ranges, and a path the budget cannot reach gets `[<path>: not read, output limit reached; read it in another call]`. With several paths, a failing path becomes a `<path>: <error>` block and the call fails only when every path does. A directory lists its entries one level deep (`<path>/ (<N> entries)`, directories ending in `/`, ignore files applied, at most 500), with no ledger record. Without a selector, `.rs`, `.ts`, `.tsx`, `.js`, `.mjs` and `.svelte` files of at least `read.outlineMinBytes` bytes (`ReadSettings::outline_min_bytes`) return a declaration outline: kept rows plus `… a-b` folds and an `[Outline: …]` footer naming selectors. `details.reads` lists one entry per text read or directory: `{ path, totalLines, lines: [[a, b], …], outline, truncated, notice }` with the ranges actually shown, or `{ path, directory: true, entries, notice }`; `details.files` holds the ledger records. `notice` is the block's bracketed footer exactly as shown, or `null`.
 
 `grep` output: in `content` mode matches are grouped under each file's path, groups separated by a blank line: `N:line` for a match, `N-line` for context, `--` between separate windows; `files` mode lists paths and `count` mode lists `path:N` rows. `path` takes one entry or a list of up to 20: files or directories, a file with a line selector (`src/a.rs:10-80` or `src/a.rs:-60`), and `!glob` exclusions. Content mode keeps 10 matches per file when a directory or several paths are searched and 50 for a single file, stops at `limit` matches (default 100; files in the other modes) and truncates lines to 500 characters; output is capped at 50 KB. `find` lists matching paths up to its `limit` under the same byte cap. When a cap is reported or output is truncated, the text ends with one bracketed line after a blank line and `details` records it: `notice` (that line exactly), `matchLimitReached` (`grep`) or `resultLimitReached` (`find`) with the limit, `cappedFiles` (`grep`: the files that hit the per-file cap), `linesTruncated` (`grep`) and `truncation` (the byte cap). Otherwise there are no `details`.
+
+`codemode` is present when the Cargo feature of the same name is compiled in, the user sets `codemode.enabled`, and the tool survives session tool filtering. It uses the [description and script contract below](#codemode), not an extra system-prompt guideline. See [Codemode settings](configuration.md#codemode).
 
 ### Deferred tools
 
@@ -467,9 +469,62 @@ Host messages sent with `Session::post(HostMessage { custom_type, text, display,
 
 The `submission` entry stores the prepared parts (with `Saved`, never `Content`), so apps can redraw chips after reload or fork; see [JSONL format](sessions-and-compaction.md#jsonl-format-format_version--1).
 
+## Codemode
+
+`codemode` runs plain JavaScript as the body of an async function in a fresh QuickJS-NG VM. It is a sequential tool and is never replayed after an interruption. Its description is:
+
+```text
+Run a JavaScript script that calls your tools and returns only what it prints or returns. Use it when one script replaces several tool calls: a loop over many files or items, parallel calls with Promise.all, or filtering and aggregating large results so they never enter the conversation. For a single call, or when you need to read each result before choosing the next step, call the tool directly.
+
+The script is the body of an async function in plain JavaScript: no TypeScript, imports, require, fetch, timers, Intl or filesystem access. Call any tool as `await tools.<name>(args)` with the arguments of a direct call. A tool with a typed result returns an object (shapes below); any other tool returns its text. A call rejects when the tool is blocked or fails without a result. A failing command still resolves: check `exitCode`.
+
+- `print(...values)` or `return value` produces the output; objects print as JSON. Output over the budget is cut in the middle and saved to an artifact.
+- `store(key, value)` and `load(key)` keep small JSON values for later scripts in this conversation; they are saved only if the script succeeds. Keep large data in files under local://.
+- `await searchTools(query)` lists tools by name or description; `await describeTool(name)` returns a tool's argument and result schemas. Both are async.
+- Each script starts fresh: no variables survive. Calls that completed are not undone when a script fails.
+- A script still running after a while continues in the background as bg_N, like a long command. Inside a script, a command runs in the background only with `async: true`.
+
+Result shapes:
+- bash → { output, exitCode, exit, truncated, fullOutput, job, durationMs }
+- read → { files: [{ path, kind, text, totalLines, lines, truncated, entries, bytes, error }] }
+- grep → { matches: [{ path, line, text, context }], files, counts, truncated }
+- find → { paths, truncated }
+- wait → { reason, results: [{ job, message, label, text, isError, value }], running }
+- spawn → { job } or { team, jobs }
+```
+
+### Calling the tool
+
+JSON calls take required string `code`, optional `timeout` (wall-clock seconds, no default), and optional `async` (boolean, request immediate background promotion); no other properties are accepted. On OpenAI Responses models with `compat.supportsCustomTools` enabled (the default for provider `openai`), the tool takes raw JavaScript instead: only `code` can be sent. Timer, steer, and host promotion still work. Other models use JSON arguments.
+
+Call a tool with `await tools.name(args)` or `await tools["name"](args)`. Arguments must be a plain object and default to `{}`. Calls use the session's normal routing, validation, mode limits, and hooks. The built-in `codemode`, `ask`, `yield`, and `enter_mode` cannot be called from a script, including through `call`. `searchTools(query)` searches direct and deferred nestable tools case-insensitively, returning up to 50 `{ name, summary }` matches with name matches first. Discovery does not filter by mode; calls can still be denied at execution. `describeTool(name)` returns `{ name, description, parameters, output }`, with `output: null` if no result schema is available. Unknown names reject.
+
+### Nested results
+
+A present `ToolOutput::structured_content` takes precedence over the error flag. Without it, success resolves to the text blocks joined with newlines (images are rendered as `[image]`), and an error rejects with that text. Built-in structured results are program-sized and never become model transcript messages. Tool schemas are available through `Tool::output_schema`.
+
+| Tool | Result and limits |
+| :--- | :--- |
+| `bash` | `{ output, exitCode, exit, truncated, fullOutput, job, durationMs }`. Foreground `output` is the last 1 MiB of the spool as lossy UTF-8, with ANSI escapes removed and no per-line cuts. A truncated result points to the retained spool in `fullOutput`; `fullOutput` is `null` when the spool could not be captured, so `truncated: true` does not guarantee an artifact. `exitCode` is the process exit code, `128 + signal` for a signalled command, or `null` otherwise. A promoted command returns a snapshot, `job` and `fullOutput`, with `exitCode` and `exit` both `null` and `truncated: false`. |
+| `read` | `{ files: [{ path, kind, … }] }`, in request order, even for one path. `text` entries have unnumbered `text` (never an outline), `totalLines`, `truncated`, and `lines: [[start, end], …]` when a selector was supplied. `directory` entries have `entries` (names with `/` on directories) and `truncated`; `image` and `binary` have `bytes` only; `error` entries have `error`. Text and directory names share a 4 MiB budget, cutting at complete lines or entries. Once both that budget and the model-facing one are spent, later paths are not read and get the `error` entry `not read, output limit reached; read it in another call`. A scripted read never attaches nested project instructions, so the first direct read in that directory still delivers them. |
+| `grep` | `{ matches: [{ path, line, text, context }], files: [path, …], counts: [{ path, count }], truncated }`. Only the array for the requested mode is populated. Defaults to 10,000 matches or files with no per-file cap; content is cut at 10,000 characters per line and a shared 4 MiB text budget. |
+| `find` | `{ paths, truncated }`. Defaults to 100,000 paths, with a 4 MiB budget for the total bytes of the returned paths. Directory paths end in `/`. |
+| `wait` | `{ reason, results: [{ job, message, label, text, isError, value }], running }`. `value` is the child's schema-validated result, or `null` when absent. See [wait](#wait). |
+| `spawn`, `kill`, `send` | The existing [coordination receipts](extending.md#coordination-receipts). `write`, `edit`, and Bun extension tools instead return text. |
+
+### Output, state, and limits
+
+`print(...values)` joins values with a space, leaves strings as written, and pretty-prints JSON values. `console.log`, `info`, `warn`, `error`, and `debug` do the same. A return value other than `undefined` is one final output item. The VM enforces 4 MiB and 10,000 output items. Separately, the tool's inline budget is `maxOutputTokens` × 4 bytes: a cut keeps the first 40% and last 60% on line boundaries and points to the full log. Success without output reads `(no output)`. Errors append `Script failed: <message>` with the script line if known and a count of completed calls by tool if any; this notice is not cut.
+
+After the script returns successfully, pending tool calls run to completion, including calls still queued behind `maxInFlight`. The engine does not settle their promises or run JavaScript continuations during this drain: `.then` handlers on those calls do not fire, and the script does not observe their failures. On failure, cancellation, or interruption, queued calls are not dispatched and active calls are cancelled and awaited. No tool side effects are rolled back.
+
+`store(key, value)` accepts a string key and a JSON value, with a 256 KiB per-value and 1 MiB total limit. Passing `undefined` deletes a key; `load(key)` returns `undefined` if missing. Each script takes a snapshot of the current branch's store at startup and appends its changes only on success, as an `Entry::ScriptStore`. Overlapping scripts, including promoted scripts, do not see changes appended after their snapshots. For a key changed by both scripts on the same branch, the later append wins. The total limit is checked again at commit over the then-current branch store: if the merged store would grow past 1 MiB, nothing is saved and the call fails with `Script succeeded but its stored values could not be saved: store total limit exceeded`. A snapshot already over the limit still runs; its script may delete and shrink values, and only growth fails. If the store write fails, the call reports an error. Use `local://` files for bulk state.
+
+By default each script has 30 seconds of VM CPU time, a 256 MiB heap, a 1 MiB VM stack, 1,000 requests (tool calls and lookups) and 16 tool calls in flight. At most four VMs execute at once across the host's sessions by default (`AxoBuilder::script_pool`); a script waiting on a tool call holds no slot. Waiting for tools or a VM slot does not spend CPU budget. A script awaiting a promise that nothing can settle (no tool call outstanding) fails at once with `Script is waiting on a promise that can never settle`; the optional wall-clock timeout remains armed after promotion. Native builtins that do not poll for interrupts can overrun the CPU limit and hold their slot until they return. There is no TypeScript, module loading, `require`, `fetch`, Intl, timers, or direct filesystem or network access. Only callable tools grant capabilities, so the script is only as restricted as those tools.
+
 ## Background Jobs (`crates/axo/src/jobs/mod.rs`, `crates/axo/src/jobs/command.rs`)
 
-Every `bash` command and host command submitted through `SessionTools::run_command` runs in its own container under the session's `ProcessSupervisor`: a process group by default, or a cgroup v2 job directory when the host selects `Supervision::Cgroup` through `AxoBuilder::supervision` (see [Command supervision](configuration.md#command-supervision-axosupervision)). The shared command runner owns execution and output capture; the job registry owns admission and delivery. A command can move to the background as job `bg_N`; its result reaches the model later as a message. How results are journaled and delivered exactly once is in [Background Job Durability](sessions-and-compaction.md#background-job-durability).
+Every `bash` command and host command submitted through `SessionTools::run_command` runs in its own container under the session's `ProcessSupervisor`: a process group by default, or a cgroup v2 job directory when the host selects `Supervision::Cgroup` through `AxoBuilder::supervision` (see [Command supervision](configuration.md#command-supervision-axosupervision)). The shared command runner owns execution and output capture; the job registry owns admission and delivery. A command or `codemode` script can move to the background as job `bg_N`. A script is a task with a log artifact, not an OS process. Each job result is consumed once: in a model-visible message or by a nested `wait`, whose own result never enters model context. See [Background Job Durability](sessions-and-compaction.md#background-job-durability).
 
 Inline command output strips ANSI escapes and cuts long lines at 768 bytes before adding a truncation marker. The inline budget is up to 20 KiB and 800 lines from the start and 30 KiB and 1,200 lines from the end. When output is truncated and capture is complete, `artifact://<n>` holds the unshaped output.
 
@@ -492,6 +547,18 @@ Every completed foreground result (not aborted or unstartable calls, which fail 
 **Retained helpers.** A result is the root shell's: it returns when the root exits plus a drain of up to 100 ms. If processes the command started are still alive in its container (for example backgrounded `&` or `nohup` children, which stay in the process group; under cgroup supervision also `setsid` descendants, which leave the process group and are invisible to process-group mode), the result, foreground or background, ends with `Processes started by this command are still running as bg_N (read proc://bg_N; stop with kill).` If capture has not failed, the notice adds `Their output continues in artifact://<n>.` Helpers stay listed and killable as `bg_N` until they exit; no second result follows.
 
 **Capture loss.** A spool or stream-index write error or a pipe read error does not stop the command. Capture also fails with `output drain deadline expired` if an output pipe is still open at the end of the post-exit drain and there are no retained helpers. The completion result shows bounded partial output with `[Output capture failed: {err}. Showing partial output only.]` and no artifact URL or `fullOutput`. A promoted or retained job's partial raw log remains accessible through its job entry.
+
+### Script promotion
+
+Scripts promote on `async: true`, after `codemode.promoteAfterMs` (60 seconds by default, zero disables the timer), on a queued steer, or when the host calls `Session::background(call_id)`. The job label is the first nonblank line of the script, up to 80 characters. The response contains the latest output (up to 20 KiB, or `(no output yet)`) followed by:
+
+```text
+Script is still running in the background as bg_N. Output so far: artifact://<n>. Its result is delivered automatically when it finishes; call wait if you have nothing else to do. Inspect with read proc://bg_N; stop with kill.
+```
+
+Promotion detaches a script from foreground Stop; its timeout, `kill`, `Session::kill_job`, and session shutdown still stop it. Promotion reports the job and log URL in `details` (`job` and `fullOutput`). File records collected by then go on that result; later records follow with the job's result. A completed foreground result reports `calls`, `failedCalls`, `cpuMs`, `exit`, `durationMs`, and `files` in `details`, plus `fullOutput` if clipped. The log is retained on clipping or promotion.
+
+A command called by a script (or another tool) promotes only on explicit `async: true`. Neither the timer nor a steer can promote it, and `Session::background(call_id)` returns `false` for its nested call id. Have the script await a foreground command or explicitly start a background command and collect its result with `wait`.
 
 ### Read-only bash
 
@@ -522,9 +589,9 @@ For file targets, axo compares the real path of the target with the real path of
 
 ### `wait`
 
-`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command (`bg_N`) or subagent (`agent_N`) reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. As a sequential barrier, `wait` starts only after every earlier call in its batch finishes, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
+`wait` takes no arguments (`{"type":"object","properties":{}}`, `Replay::Safe`, `ExecutionMode::Sequential`). It blocks until a background command or script (`bg_N`), or subagent (`agent_N`), reports, then returns every pending row message, joined by blank lines with the labels described under [Results in context](#results-in-context). A steer interrupts it with a notice listing running row ids; Stop returns `Operation aborted` (error). It sleeps on registry and team changes rather than polling, and committed result receipts prevent redelivery. As a sequential barrier, `wait` starts only after every earlier call in its batch finishes, so an earlier promoted `bash` or `spawn` has committed admission before `wait` checks jobs.
 
-Successful waits serialize `WaitReceipt` into details: `{"reason":"results","jobs":["bg_1","agent_2/3",…]}` identifies consumed messages; `reason` is `mail`, `interrupted` (steer), or `idle` for other wake paths, with empty `jobs` omitted. Stop and mutual-wait errors remain errors. Message text stays in the tool result and journal entries.
+Nested waits also return the [structured value](#nested-results), including any child's accepted `yield` value; they have no steering signal. Successful waits serialize `WaitReceipt` into details: `{"reason":"results","jobs":["bg_1","agent_2/3",…]}` identifies consumed messages; `reason` is `mail`, `interrupted` (steer), or `idle` for other wake paths, with empty `jobs` omitted. Stop and mutual-wait errors remain errors. A nested wait consumes the results without sending them to the model; the script can surface them by printing or returning them. If the delivered results report file accesses, `details.files` carries those records.
 
 Incoming teammate mail also wakes `wait`. With no row results to return, it responds `New messages arrived; they follow this result.`; the queued mail is delivered immediately after the tool batch, not embedded in that tool result. Outside a team, no running admitted jobs and no mail returns `No background jobs are running.` immediately.
 
@@ -532,19 +599,19 @@ In a team, `wait` keeps waiting while teammates can still reply, even with no jo
 
 ### `proc://`
 
-The session's read-only `proc://` scheme (`Target::Virtual`) inspects background command jobs and subagents without consuming results. List both with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop one with [kill](#kill).
+The session's read-only `proc://` scheme (`Target::Virtual`) inspects background commands, scripts, and subagents without consuming results. List them with `read proc://`, inspect one with `read proc://bg_N` or `read proc://agent_N`, and stop one with [kill](#kill).
 
 | Operation | Result |
 | :--- | :--- |
-| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `queued` (a child waiting for a run slot), `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
-| `read proc://bg_N` | `Job:`, `Command:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc:// or proc://<id>.` |
+| `read proc://` | One line per job: `bg_N  {status}  {command first line, max 120 chars}` for commands, `bg_N  {status}  script: {label}` for scripts, or the child row, status, agent name (or “subagent”), and expanded model for children. Team members show “<member> of team_N” in place of the agent name. Status is `queued` (a child waiting for a run slot), `running`, `helpers running`, `finished`, or `failed`; an empty registry returns `No background jobs.` |
+| `read proc://bg_N` | `Job:`, `Command:` or `Script:`, `Status:`, `Output: artifact://<n>`, plus `Result:` once finished and until the result is delivered (the delivered text lives in the transcript, not the registry). Unknown id: `No job bg_N`. Unknown path: `Unsupported proc:// path: {path}. Use proc:// or proc://<id>.` |
 | `read proc://agent_N` | Child row details: `Job:`, `Agent:`, optional `Team: team_N (member)`, `Model:`, `Session:`, `Status:`, `Details: agent://agent_N`, plus `Result:` for its latest undelivered message |
 
 Reading a finished job's result here does not consume it; its delivery still follows. Promoted jobs, jobs retaining helpers, child sessions, and jobs rebuilt from the journal are listed; ordinary foreground commands leave no entry. `Axo::schemes` (outside an open session) has neither `proc://` nor `agent://`.
 
 ### `kill`
 
-`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Both results carry `details: {"id": "<id>", "stopping": <bool>}`, where `stopping` is true only when a running command or a busy child was signalled. Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
+`kill` takes a required string `id` and no other properties: `kill {"id":"bg_1"}` or `kill {"id":"agent_1"}`. It stops a listed command and retained helpers, stops a script, or aborts a child's current run without removing the row or preventing later messages. It returns `Stopping <id>.` when stopped, otherwise `<id> is not running.` (including a valid but unknown id). Both results carry `details: {"id": "<id>", "stopping": <bool>}`, where `stopping` is true only when a running command, script, or busy child was signalled. Invalid ids fail with `<id> is not a job id; use bg_N or agent_N`. The tool uses the default `Replay::Never` policy.
 
 There are no proc action paths: reads of a `/kill` suffix are unsupported, and all proc writes fail with `<url> is read-only`.
 
@@ -589,8 +656,8 @@ Background job results:
 <result>
 ```
 
-Child messages use the same envelope, with the child row in brackets followed by its catalog agent name (or “subagent”); team rows use “<member> of team_N”. Mid-run notes prefix that label with “message from”. Budget-limited results add “(partial: turn budget exhausted)”. A note does not change the child's run status. See [Child sessions](sessions-and-compaction.md#child-sessions) for durability.
+Script messages use the script label in place of the command. Child messages use the same envelope, with the child row in brackets followed by its catalog agent name (or “subagent”); team rows use “<member> of team_N”. Mid-run notes prefix that label with “message from”. Budget-limited results add “(partial: turn budget exhausted)”. A note does not change the child's run status. See [Child sessions](sessions-and-compaction.md#child-sessions) for durability.
 
-Child delivery text is capped at 2000 lines or 50 KB, with an `agent://agent_N/result` pointer for the full result. An oversized first line is replaced by a notice suggesting that URL or a JSON pointer. The pointer always names the latest result, even if the capped delivery was an older run. Both command and child deliveries escape axo's fixed wrapper tags (such as `<system>` and `<conversation>`) by changing their opening `<` to `&lt;`; arbitrary host section names are not covered. The journal's `job_end` retains the full, unescaped text.
+Child delivery text is capped at 2000 lines or 50 KB, with an `agent://agent_N/result` pointer for the full result. An oversized first line is replaced by a notice suggesting that URL or a JSON pointer. The pointer always names the latest result, even if the capped delivery was an older run. Command, script, and child deliveries escape axo's fixed wrapper tags (such as `<system>` and `<conversation>`) by changing their opening `<` to `&lt;`; arbitrary host section names are not covered. The journal's `job_end` retains the full, unescaped text.
 
 During a run, automatic row-message delivery occurs at the next turn boundary after the current tool batch; it never counts as a steer or promotes `bash`. A pending row message satisfies `wait` through its result reservation instead. With the session idle, it starts a run of its own unless automatic continuation is latched off by a Stop or an unsuccessful run. A new `prompt` places pending results before the user's message.

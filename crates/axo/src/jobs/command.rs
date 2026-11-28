@@ -14,16 +14,17 @@ use serde_json::{Value, json};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot, watch};
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use super::{CommandExit, JobId, JobRegistry, Killer, Mode, Promotion};
+use super::{BgRun, CommandExit, JobId, JobRegistry, Killer, Promotion, Register};
 use crate::exec::host::{
     Container, ExecSpec, OutputChunk, OutputStream, Pipe, PipeChunk, Process, ProcessSupervisor,
 };
 use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail, stream_index_path};
-use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
+use crate::tools::truncate::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, PROGRAM_COMMAND_BYTES, floor_char_boundary, format_size,
+};
 
 /// Inline output keeps the first `HEAD_*` and the last `TAIL_*`; together they are pi's
 /// 2000 lines / 50 KB budget.
@@ -106,14 +107,14 @@ pub(super) enum Stop {
     Aborted,
     TimedOut(f64),
     Killed(Killer),
-    /// The session shut down around the command.
+    /// The session shut down around the job.
     Shutdown,
 }
 
 pub(super) struct JobControl {
     pub(super) cancel: CancellationToken,
     pub(super) stop: Mutex<Option<Stop>>,
-    pub(super) container: Container,
+    pub(super) host_promotable: bool,
     pub(super) promote: Notify,
 }
 
@@ -128,33 +129,17 @@ impl JobControl {
 }
 
 pub(super) struct CommandRun {
-    pub(super) command: String,
-    pub(super) call_id: String,
-    pub(super) tool: String,
+    pub(super) bg: BgRun,
     pub(super) cwd: PathBuf,
-    pub(super) started_at: i64,
-    pub(super) promotion: Option<Promotion>,
-    pub(super) promoted_at: Option<i64>,
-    pub(super) ended_at: Option<i64>,
     pub(super) exit: Option<CommandExit>,
-    /// `None` for replayed rows. In-process rows retain output state after closing.
-    pub(super) output: Option<Arc<OutputState>>,
-    pub(super) artifact: u64,
-    pub(super) mode: Mode,
-    pub(super) phase: Phase,
-    pub(super) control: Option<Arc<JobControl>>,
-    pub(super) task: Option<JoinHandle<()>>,
+    /// Absent for replayed rows.
+    pub(super) live: Option<LiveCommand>,
 }
 
-pub(super) struct RegisterCommand {
-    pub(super) command: String,
-    pub(super) tool: String,
-    pub(super) cwd: PathBuf,
-    pub(super) call_id: String,
-    pub(super) started_at: i64,
-    pub(super) artifact: u64,
-    pub(super) control: Arc<JobControl>,
+/// The process behind a command row started in this session.
+pub(super) struct LiveCommand {
     pub(super) output: Arc<OutputState>,
+    pub(super) container: Container,
 }
 
 pub(super) struct OutputState {
@@ -442,7 +427,10 @@ impl CommandRunner {
             updates,
             mut steer,
             invocation,
+            parent,
+            ..
         } = cx;
+        let nested = parent.is_some();
         let CommandRequest {
             mut spec,
             label,
@@ -492,23 +480,28 @@ impl CommandRunner {
         let control = Arc::new(JobControl {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
-            container: process.container(),
+            host_promotable: !nested,
             promote: Notify::new(),
         });
         let output = Arc::new(OutputState {
             path: artifact_path,
             progress: watch::Sender::new(OutputProgress::default()),
         });
-        let id = jobs.register(RegisterCommand {
-            command: label,
-            tool: call.name.clone(),
+        let id = jobs.register_command(
+            Register {
+                label,
+                tool: call.name.clone(),
+                call_id: call.id.clone(),
+                started_at,
+                artifact,
+                control: control.clone(),
+            },
             cwd,
-            call_id: call.id.clone(),
-            started_at,
-            artifact,
-            control: control.clone(),
-            output: output.clone(),
-        });
+            LiveCommand {
+                output: output.clone(),
+                container: process.container(),
+            },
+        );
         let (done, mut ended) = oneshot::channel();
         let mut changes = output.progress.subscribe();
         let shared = Arc::new(CommandShared {
@@ -533,6 +526,7 @@ impl CommandRunner {
                 artifact,
                 timeout,
                 started_at,
+                nested,
                 live,
             }
             .run(),
@@ -566,7 +560,7 @@ impl CommandRunner {
                             () = sleep_until(promote_at), if !self.promote_after.is_zero() => Promotion::Timer,
                         }
                     }
-                }, if promotable && !aborting => {
+                }, if promotable && !aborting && (!nested || run_async) => {
                     promotable = false;
                     // Refused once the command finished meanwhile: it stays in the foreground.
                     if jobs.promote(id, invocation, &call.id, cause) {
@@ -590,6 +584,15 @@ impl CommandRunner {
                                 "job": name,
                                 "fullOutput": format!("artifact://{artifact}"),
                             })),
+                            structured_content: nested.then(|| CommandResult {
+                                output: snapshot,
+                                exit: None,
+                                exit_code: None,
+                                truncated: false,
+                                full_output: Some(format!("artifact://{artifact}")),
+                                job: Some(name),
+                                duration_ms: axo_ai::now_ms() - started_at,
+                            }.into_value()),
                             is_error: false,
                             terminate: false,
                         });
@@ -625,6 +628,7 @@ impl CommandRunner {
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
             details: end.details,
+            structured_content: end.raw.map(CommandResult::into_value),
             is_error: end.is_error,
             terminate: false,
         })
@@ -638,6 +642,25 @@ struct CommandEnd {
     /// The call fails with a [`ToolError`] (aborted, or the shell could not be waited on).
     aborted: bool,
     details: Option<Value>,
+    raw: Option<CommandResult>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandResult {
+    output: String,
+    exit_code: Option<i32>,
+    exit: Option<CommandExit>,
+    truncated: bool,
+    full_output: Option<String>,
+    job: Option<String>,
+    duration_ms: i64,
+}
+
+impl CommandResult {
+    fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("serializable command result")
+    }
 }
 
 /// What the command task shares with the foreground waiter.
@@ -647,12 +670,12 @@ struct CommandShared {
     done: Mutex<Option<oneshot::Sender<CommandEnd>>>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Stops the job when the waiter is dropped before its command finished.
-struct StopOnDrop<'a>(Option<(&'a JobRegistry, JobId)>);
+/// Stops the job when the waiter is dropped before it finishes.
+pub(super) struct StopOnDrop<'a>(pub(super) Option<(&'a JobRegistry, JobId)>);
 
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
@@ -676,6 +699,7 @@ struct CommandTask {
     artifact: u64,
     timeout: Option<Duration>,
     started_at: i64,
+    nested: bool,
     live: LiveArtifact,
 }
 
@@ -693,6 +717,7 @@ impl CommandTask {
             artifact,
             timeout,
             started_at,
+            nested,
             live,
         } = self;
         let container = process.container();
@@ -773,7 +798,14 @@ impl CommandTask {
         // reference their log through the journal regardless, so partial logs stay readable there.
         let full_output = (truncated && capture.error.is_none() && !pipes_open)
             .then(|| format!("artifact://{artifact}"));
-        let keep = full_output.is_some() || retained || promoted;
+        let raw = if nested && !promoted {
+            Some(capture.program_tail().await)
+        } else {
+            None
+        };
+        let raw_full_output =
+            capture.error.is_none() && raw.as_ref().is_some_and(|(_, truncated)| *truncated);
+        let keep = full_output.is_some() || retained || promoted || raw_full_output;
         if !keep {
             capture.discard().await;
         }
@@ -867,12 +899,27 @@ impl CommandTask {
                 ));
             }
         }
+        let raw = raw.map(|(output, truncated)| CommandResult {
+            output,
+            exit_code: match &exit {
+                Some(CommandExit::Exited { code }) => Some(*code),
+                Some(CommandExit::Signaled { signal }) => Some(128 + signal),
+                _ => None,
+            },
+            exit: exit.clone(),
+            truncated,
+            full_output: raw_full_output.then(|| format!("artifact://{artifact}")),
+            job: retained.then(|| id.to_string()),
+            duration_ms: ended_at - started_at,
+        });
         if promoted {
-            jobs.command_done(id, text, is_error, exit).await;
+            jobs.command_done(id, text, is_error, exit, Vec::new())
+                .await;
         } else {
             if retained {
                 // `proc://bg_N` shows the result while the helpers run; never journaled.
-                jobs.command_done(id, text.clone(), is_error, exit).await;
+                jobs.command_done(id, text.clone(), is_error, exit, Vec::new())
+                    .await;
             }
             if let Some(done) = lock(&shared.done).take() {
                 let _ = done.send(CommandEnd {
@@ -880,6 +927,7 @@ impl CommandTask {
                     is_error,
                     aborted,
                     details: Some(details),
+                    raw,
                 });
             }
         }
@@ -935,7 +983,7 @@ impl CommandTask {
 }
 
 /// Appends `text`'s status line after a blank line, or uses it alone for empty output.
-fn with_status(text: String, line: &str) -> String {
+pub(super) fn with_status(text: String, line: &str) -> String {
     if text.is_empty() {
         line.to_owned()
     } else {
@@ -1004,6 +1052,32 @@ impl Capture {
             progress.bytes += written;
             progress.capture_failed = self.error.is_some();
         });
+    }
+
+    async fn program_tail(&self) -> (String, bool) {
+        let capture_failed = self.error.is_some();
+        let end = self.output.progress.borrow().bytes;
+        let start = end.saturating_sub(PROGRAM_COMMAND_BYTES as u64);
+        if end == 0 {
+            return (String::new(), capture_failed);
+        }
+        let path = self.output.path.clone();
+        match tokio::task::spawn_blocking(move || {
+            read_span(&std::fs::File::open(path)?, start..end)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result)
+        {
+            Ok(bytes) => (
+                clean_program_output(&bytes),
+                capture_failed || start > 0 || bytes.len() as u64 != end - start,
+            ),
+            Err(error) => {
+                tracing::warn!(path = %self.output.path.display(), %error, "could not read command output tail");
+                (String::new(), true)
+            }
+        }
     }
 
     async fn discard(&mut self) {
@@ -1084,11 +1158,7 @@ impl Shaper {
     fn end_line(&mut self) {
         let mut line = clean_segment(&self.segment);
         if line.len() > MAX_LINE_BYTES || self.segment_overflow {
-            let mut end = line.len().min(MAX_LINE_BYTES);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
+            line.truncate(floor_char_boundary(&line, MAX_LINE_BYTES));
             line.push_str("... [truncated]");
             self.lines_cut = true;
         }
@@ -1158,6 +1228,23 @@ impl Shaper {
     }
 }
 
+/// Keep the spool's line endings and tabs, which the ANSI stripper drops.
+fn clean_program_output(raw: &[u8]) -> String {
+    if !raw.contains(&b'\x1b') {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    let mut cleaned = Vec::with_capacity(raw.len());
+    for piece in raw.split_inclusive(|byte| matches!(byte, b'\t' | b'\r')) {
+        if let Some((&end @ (b'\t' | b'\r'), body)) = piece.split_last() {
+            cleaned.extend(strip_ansi_escapes::strip(body));
+            cleaned.push(end);
+        } else {
+            cleaned.extend(strip_ansi_escapes::strip(piece));
+        }
+    }
+    String::from_utf8_lossy(&cleaned).into_owned()
+}
+
 /// One line's raw bytes as text with ANSI escapes and other control bytes removed. Tabs
 /// survive (`strip-ansi-escapes` would drop them, so pieces between tabs are stripped
 /// separately); invalid UTF-8 becomes U+FFFD.
@@ -1204,6 +1291,7 @@ mod tests {
         let expected = chunk.bytes.clone();
         capture.record(Ok(chunk)).await;
         assert!(capture.error.is_some());
+        assert!(capture.program_tail().await.1);
         assert!(capture.output.progress.borrow().capture_failed);
         assert_eq!(capture.output.progress.borrow().bytes, 3);
         assert_eq!(std::fs::read(&path).unwrap(), expected);

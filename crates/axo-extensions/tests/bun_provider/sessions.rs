@@ -73,9 +73,9 @@ pub async fn run(bun: &Path, mode: Supervision) {
     let mut updated = false;
     loop {
         match events.try_recv().as_deref() {
-            Ok(SessionEvent::Agent(AgentEvent::ToolExecutionUpdate { call_id, update }))
-                if call_id == "r1" =>
-            {
+            Ok(SessionEvent::Agent(AgentEvent::ToolExecutionUpdate {
+                call_id, update, ..
+            })) if call_id == "r1" => {
                 assert_eq!(
                     update.content,
                     vec![UserBlock::Text {

@@ -3,6 +3,7 @@
 //! `openai-codex-responses.ts`, so providers that rename the terminal events (Codex) decode
 //! too. Not ported: the WebSocket transport and `previous_response_id` continuation.
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use futures::stream::BoxStream;
@@ -10,7 +11,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::http::{dispatch, read_sse};
-use crate::api::responses::{ConvertOptions, ResponsesStream, convert_messages, convert_tools};
+use crate::api::responses::{
+    ConvertOptions, ResponsesStream, convert_messages, convert_tools, raw_tool_inputs,
+};
 use crate::api::{
     Api, ProviderRequest, ProviderResponse, Reply, StreamOptions, header_map, respond,
 };
@@ -57,17 +60,18 @@ impl Api for ResponsesApi {
         let owned_model = model.clone();
         respond(model, tier, cancel, move |mut reply, cancel| async move {
             let result = async {
+                let (request, raw_inputs) = request?;
                 let response = dispatch(
                     &http,
                     &opts,
                     &owned_model,
-                    request?,
+                    request,
                     &cancel,
                     &mut reply,
                     describe,
                 )
                 .await?;
-                drive(&owned_model, response, &cancel, &mut reply).await
+                drive(&owned_model, response, raw_inputs, &cancel, &mut reply).await
             }
             .await;
             (reply, result)
@@ -80,14 +84,15 @@ fn build_request(
     transcript: &Transcript,
     opts: &StreamOptions,
     tier: ServiceTier,
-) -> Result<ProviderRequest, String> {
+) -> Result<(ProviderRequest, HashMap<String, String>), String> {
     let token = opts.auth.api_key.as_deref().filter(|key| !key.is_empty());
     let session_id: Option<String> = opts
         .simple
         .session_id
         .as_deref()
         .map(|id| id.chars().take(PROMPT_CACHE_KEY_MAX_CHARS).collect());
-    let body = build_request_body(model, transcript, opts, session_id.as_deref(), tier);
+    let (body, raw_inputs) =
+        build_request_body(model, transcript, opts, session_id.as_deref(), tier);
     let headers = header_map([
         vec![
             ("accept".to_owned(), Some("text/event-stream".to_owned())),
@@ -102,11 +107,12 @@ fn build_request(
             .into_iter()
             .collect(),
     ])?;
-    Ok(ProviderRequest {
+    let request = ProviderRequest {
         url: format!("{}/responses", opts.base_url(model)),
         headers,
         body,
-    })
+    };
+    Ok((request, raw_inputs))
 }
 
 /// pi `buildRequestBody`, with `streamSimple`'s thinking-level handling.
@@ -116,18 +122,26 @@ fn build_request_body(
     opts: &StreamOptions,
     prompt_cache_key: Option<&str>,
     tier: ServiceTier,
-) -> Value {
+) -> (Value, HashMap<String, String>) {
     let compat = &model.compat;
     let options = ConvertOptions {
         supports_mid_convo_system_messages: compat
             .supports_mid_convo_system_messages
             .unwrap_or(false),
         supports_strict_mode: compat.supports_strict_mode.unwrap_or(true),
+        supports_custom_tools: compat
+            .supports_custom_tools
+            .unwrap_or(model.provider == "openai"),
+    };
+    let raw_inputs = if options.supports_custom_tools {
+        raw_tool_inputs(transcript)
+    } else {
+        HashMap::new()
     };
     let resolved = transcript.resolve(options.supports_mid_convo_system_messages);
     let support = model.tool_support();
     let request_tools = resolve_transcript_tools(&resolved, support).request_tools;
-    let input = convert_messages(model, &resolved, &options);
+    let input = convert_messages(model, &resolved, &options, &raw_inputs);
 
     let mut body = json!({
         "model": model.id,
@@ -167,6 +181,7 @@ fn build_request_body(
         body["tools"] = json!(convert_tools(
             &request_tools,
             options.supports_strict_mode,
+            options.supports_custom_tools,
             false
         ));
     }
@@ -192,17 +207,22 @@ fn build_request_body(
             }
         }
     }
-    body
+    let raw_inputs = raw_inputs
+        .into_iter()
+        .map(|(name, property)| (name.to_owned(), property.to_owned()))
+        .collect();
+    (body, raw_inputs)
 }
 
 async fn drive(
     model: &Model,
     response: ProviderResponse,
+    raw_inputs: HashMap<String, String>,
     cancel: &CancellationToken,
     reply: &mut Reply,
 ) -> Result<StopReason, String> {
     reply.start();
-    let mut stream = ResponsesStream::new(model);
+    let mut stream = ResponsesStream::new(model, raw_inputs);
     read_sse(response, cancel, |sse| {
         map_event(&mut stream, &sse.data, reply)
     })

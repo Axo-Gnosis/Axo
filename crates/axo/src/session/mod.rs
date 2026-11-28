@@ -1,6 +1,8 @@
 //! A conversation with one agent in one working directory, saved as it happens.
 
 pub(crate) mod children;
+#[cfg(feature = "codemode")]
+mod codemode;
 pub(crate) mod coordination;
 pub(crate) mod delivery;
 pub(crate) mod events;
@@ -9,6 +11,8 @@ pub(crate) mod journal;
 pub(crate) mod maintenance;
 pub(crate) mod modes;
 mod policy;
+#[cfg(test)]
+mod program_results;
 pub(crate) mod prompt;
 mod prompt_cache;
 pub(crate) mod registrations;
@@ -21,6 +25,7 @@ mod surface;
 pub(crate) mod team;
 pub(crate) mod wire;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -37,7 +42,8 @@ pub use self::delivery::{
     Activity, HostDelivery, HostMessage, PromptRequest, PromptResult, QueuedInput,
 };
 pub use self::events::{
-    Attach, ContextUsage, LiveSnapshot, ResultResolution, SessionEvent, SessionEventKind,
+    Attach, ContextUsage, LiveSnapshot, PendingNestedCall, ResultResolution, SessionEvent,
+    SessionEventKind,
 };
 use self::journal::Journal;
 use self::maintenance::Maintenance;
@@ -570,6 +576,13 @@ impl Session {
         })
     }
 
+    /// The values `codemode` scripts stored on the current branch, as the next script
+    /// would `load` them.
+    #[ext]
+    pub fn script_store(&self) -> BTreeMap<String, Value> {
+        self.hooks.journal.read(journal::View::script_store)
+    }
+
     /// The skills in force now; the prompt's catalog and `/name` commands use these.
     #[ext]
     pub fn skills(&self) -> Vec<Skill> {
@@ -622,7 +635,8 @@ impl Session {
             .command_output(call_id, self.hooks.tools.schemes.artifacts().dir())
     }
 
-    /// Opens one command's flushed raw output by job id (`bg_N`), foreground commands included.
+    /// Opens flushed command output or a finished script's log by job id (`bg_N`).
+    /// Foreground commands are included; use the artifact for a running script.
     #[ext(skip = "live reader; the wire method reads one page")]
     pub fn job_output(&self, job_id: &str) -> Option<crate::jobs::CommandOutput> {
         self.hooks
@@ -638,7 +652,7 @@ impl Session {
         self.hooks.tools.runner.jobs.command_jobs(call_id)
     }
 
-    /// Requests promotion of every foreground command the call started. A command that finishes first stays foreground.
+    /// Requests promotion of each foreground command or script the call started. Work that finishes first stays foreground.
     #[ext]
     pub fn background(&self, call_id: &str) -> bool {
         self.hooks.tools.runner.jobs.background(call_id)

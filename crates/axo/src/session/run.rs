@@ -3,25 +3,28 @@ use std::sync::{Arc, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
 use axo_agent::{
-    Agent, AgentContext, AgentEvent, AgentMessage, CancelReason, HookError, LoopHooks, Persist,
-    PersistError, QueuedMessage, RequestCache, RunOutcome, TurnContext, TurnFinish,
+    Agent, AgentContext, AgentEvent, AgentMessage, CancelReason, HookError, LoopHooks,
+    MessageOrigin, Persist, PersistError, QueuedMessage, RequestCache, RunOutcome, TurnContext,
+    TurnFinish,
 };
 use axo_ai::{
-    Accumulator, AssistantMessage, Message, Model, StopReason, ToolCall, ToolResultMessage, Usage,
-    UserBlock,
+    Accumulator, AssistantMessage, JsonMap, Message, Model, StopReason, ToolCall,
+    ToolResultMessage, Usage, UserBlock,
 };
 use futures::FutureExt;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::{SessionEvent, SessionHooks, journal};
+use super::{PendingNestedCall, SessionEvent, SessionHooks, journal};
 use crate::compaction::Limits;
 use crate::error::Error;
 use crate::jobs::ChildProgress;
 use crate::recovery;
 use crate::store::{self, CompactionReason, Entry, EntryId};
 use crate::tools::output::{MAX_YIELD_FAILURES, YIELD, YIELD_NUDGE};
+use crate::tools::truncate::floor_char_boundary;
 
 /// The open run's live state, updated and relayed under the same lock.
 #[derive(Default)]
@@ -30,6 +33,7 @@ pub(super) struct LiveRun {
     pub(super) run_id: Option<String>,
     pub(super) streaming: Option<Accumulator>,
     pub(super) tool_calls: Vec<ToolCall>,
+    pub(super) nested: Vec<PendingNestedCall>,
     /// Assistant usage of the open run so far; seeded from the journal when a run resumes.
     pub(super) usage: Usage,
 }
@@ -108,14 +112,14 @@ pub(super) async fn run_to_settle(
     // failing. Reconcile even then; the next prompt must not resurrect raw failures.
     agent.set_messages(hooks.journal.view().projection.messages.clone());
     match result {
-        Ok(result) => hooks.settle(result).await,
+        Ok(result) => hooks.settle(&agent, result).await,
         Err(panic) => {
             let outcome = if hooks.shutdown.load(Ordering::Acquire) {
                 RunOutcome::Aborted(CancelReason::Shutdown)
             } else {
                 RunOutcome::Failed("Agent task panicked".into())
             };
-            let _ = hooks.settle(Ok(outcome)).await;
+            let _ = hooks.settle(&agent, Ok(outcome)).await;
             std::panic::resume_unwind(panic)
         }
     }
@@ -124,6 +128,15 @@ pub(super) async fn run_to_settle(
 impl SessionHooks {
     pub(super) fn live(&self) -> MutexGuard<'_, LiveRun> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets nested calls under `root` still pending once their calling tool is done:
+    /// a crashed nested runner or a suppressed emit never sends their end.
+    #[cfg(feature = "codemode")]
+    pub(super) fn forget_nested(&self, root: &str) {
+        self.live()
+            .nested
+            .retain(|pending| pending.parent_call_id != root);
     }
 
     /// Keep live state and its event on the same side of an attach snapshot.
@@ -198,9 +211,13 @@ impl SessionHooks {
     /// when pressed, so input sent since then still starts the next run.
     async fn settle(
         &self,
+        agent: &Agent,
         result: Result<RunOutcome, axo_agent::Error>,
     ) -> Result<RunOutcome, Error> {
-        self.tools.runner.jobs.release_uncommitted();
+        self.tools
+            .runner
+            .jobs
+            .release_uncommitted(|id| agent.is_nested_invocation_active(id));
         if !matches!(
             result,
             Ok(RunOutcome::Done | RunOutcome::Aborted(CancelReason::User))
@@ -509,6 +526,65 @@ impl LoopHooks for SessionHooks {
     }
 }
 
+/// Keep maps up to 8 KiB intact; for larger maps, trim strings at 1 KiB and add their original byte counts.
+/// If the trimmed map still exceeds 16 KiB, keep the top-level keys with JSON byte counts in place of
+/// their values. If that also exceeds 16 KiB, store one marker with the total trimmed JSON byte count.
+fn bounded_arguments(mut arguments: JsonMap) -> JsonMap {
+    fn json_bytes(value: &impl serde::Serialize) -> usize {
+        serde_json::to_vec(value)
+            .expect("JSON arguments serialize")
+            .len()
+    }
+
+    const MAX_BYTES: usize = 16 * 1024;
+
+    fn trim(value: &mut Value) {
+        match value {
+            Value::String(text) if text.len() > 1024 => {
+                let bytes = text.len();
+                text.truncate(floor_char_boundary(text, 1024));
+                text.push_str(&format!("… [{bytes} bytes]"));
+            }
+            Value::Array(items) => items.iter_mut().for_each(trim),
+            Value::Object(fields) => fields.values_mut().for_each(trim),
+            _ => {}
+        }
+    }
+
+    if json_bytes(&arguments) <= 8 * 1024 {
+        return arguments;
+    }
+    arguments.values_mut().for_each(trim);
+    let bytes = json_bytes(&arguments);
+    if bytes > MAX_BYTES {
+        for value in arguments.values_mut() {
+            *value = Value::String(format!("… [{} bytes]", json_bytes(value)));
+        }
+        if json_bytes(&arguments) > MAX_BYTES {
+            return JsonMap::from_iter([("…".into(), Value::String(format!("[{bytes} bytes]")))]);
+        }
+    }
+    arguments
+}
+
+fn nested_result_text(content: &[UserBlock]) -> String {
+    let mut result = String::new();
+    for (i, text) in content.iter().filter_map(UserBlock::as_text).enumerate() {
+        if result.len() == 2048 {
+            break;
+        }
+        if i != 0 {
+            result.push('\n');
+        }
+        let end = floor_char_boundary(text, 2048 - result.len());
+        result.push_str(&text[..end]);
+        if end != text.len() {
+            break;
+        }
+    }
+    result
+}
+
 #[async_trait]
 impl Persist for SessionHooks {
     /// Saves the run's start and every finished message before the loop goes on, then
@@ -605,21 +681,84 @@ impl Persist for SessionHooks {
                 call_id,
                 name,
                 args,
+                parent_call_id,
             } => {
-                let tools = self.relay_live(event, |live| {
-                    live.tool_calls.push(ToolCall {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        arguments: args.clone(),
-                        arguments_error: None,
-                        thought_signature: None,
+                let call = ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: args.clone(),
+                    arguments_error: None,
+                    thought_signature: None,
+                };
+                if let Some(root) = parent_call_id {
+                    self.relay_live(event, |live| {
+                        live.nested.push(PendingNestedCall {
+                            parent_call_id: root.clone(),
+                            call,
+                        });
                     });
-                    tool_names(live)
-                });
-                self.publish_child_tools(tools);
+                } else {
+                    let tools = self.relay_live(event, |live| {
+                        live.tool_calls.push(call);
+                        tool_names(live)
+                    });
+                    self.publish_child_tools(tools);
+                }
                 return Ok(());
             }
-            AgentEvent::ToolExecutionEnd { call_id, .. } => {
+            AgentEvent::ToolExecutionEnd {
+                call_id,
+                name,
+                result,
+                parent_call_id: Some(root),
+                invocation,
+                duration_ms,
+            } => {
+                // As with message streaming, an attach in the append window receives the entry.
+                let pending = self
+                    .live()
+                    .nested
+                    .extract_if(.., |pending| {
+                        &pending.parent_call_id == root && &pending.call.id == call_id
+                    })
+                    .next();
+                let arguments = pending.map_or_else(JsonMap::new, |pending| {
+                    bounded_arguments(pending.call.arguments)
+                });
+                let jobs = &self.tools.runner.jobs;
+                let mut receipts = invocation.map_or_else(Default::default, |invocation| {
+                    jobs.receipts(&MessageOrigin::Tool(invocation))
+                });
+                let mut batch = Vec::with_capacity(2);
+                batch.extend(receipts.start.take());
+                batch.push(Entry::NestedToolCall {
+                    base: journal::base(),
+                    root_call_id: root.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments,
+                    result: nested_result_text(&result.content),
+                    is_error: result.is_error,
+                    duration_ms: *duration_ms,
+                    details: result.details.clone(),
+                    admitted_jobs: std::mem::take(&mut receipts.admitted_jobs),
+                    delivered_jobs: std::mem::take(&mut receipts.delivered_jobs),
+                });
+                let appended = self.append(batch).await;
+                jobs.settle(receipts, appended.is_ok()).await;
+                // Subscribers see the end even if its record failed, so no call stays pending.
+                let _ = self
+                    .events
+                    .send(Arc::new(SessionEvent::Agent(event.clone())));
+                return appended
+                    .map(|_| ())
+                    .map_err(|err| PersistError(err.to_string()));
+            }
+            AgentEvent::ToolExecutionEnd {
+                call_id,
+                parent_call_id: None,
+                ..
+            } => {
                 let tools = self.relay_live(event, |live| {
                     live.tool_calls.retain(|call| &call.id != call_id);
                     tool_names(live)

@@ -341,7 +341,7 @@ fn elide_assistant_blocks(
                 })
             }
             (ElisionMode::Clearing { .. }, AssistantBlock::ToolCall(call))
-                if matches!(call.name.as_str(), "edit" | "write")
+                if matches!(call.name.as_str(), "edit" | "write" | "codemode")
                     && aged_calls.contains(call.id.as_str()) =>
             {
                 stub_arguments(call, artifacts, recoveries).map(AssistantBlock::ToolCall)
@@ -355,7 +355,7 @@ fn elide_assistant_blocks(
     updated
 }
 
-/// `call` with its large `write` content or `edit` texts elided; `path` and the JSON shape stay.
+/// `call` with large tool arguments elided; the JSON shape stays.
 fn stub_arguments(
     call: &ToolCall,
     artifacts: &Artifacts,
@@ -372,16 +372,26 @@ fn stub_arguments(
             changed = true;
         }
     };
-    if call.name == "write" {
-        if let Some(content) = stubbed.arguments.get_mut("content") {
-            stub(content);
-        }
-    } else if let Some(Value::Array(edits)) = stubbed.arguments.get_mut("edits") {
-        for edit in edits {
-            for key in ["oldText", "newText"] {
-                if let Some(text) = edit.get_mut(key) {
-                    stub(text);
+    match call.name.as_str() {
+        "edit" => {
+            if let Some(Value::Array(edits)) = stubbed.arguments.get_mut("edits") {
+                for edit in edits {
+                    for key in ["oldText", "newText"] {
+                        if let Some(text) = edit.get_mut(key) {
+                            stub(text);
+                        }
+                    }
                 }
+            }
+        }
+        name => {
+            let key = if name == "codemode" {
+                "code"
+            } else {
+                "content"
+            };
+            if let Some(value) = stubbed.arguments.get_mut(key) {
+                stub(value);
             }
         }
     }

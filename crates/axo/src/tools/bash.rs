@@ -4,8 +4,8 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -117,6 +117,32 @@ impl Tool for BashTool {
 
     fn parameters(&self) -> &Value {
         &self.parameters
+    }
+
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
+            json!({
+                "type": "object",
+                "required": ["output", "exitCode", "exit", "truncated", "fullOutput", "job", "durationMs"],
+                "properties": {
+                    "output": {"type": "string"},
+                    "exitCode": {"type": ["integer", "null"]},
+                    "exit": {"oneOf": [
+                        {"type": "null"},
+                        {"type": "object", "required": ["type", "code"], "properties": {"type": {"const": "exited"}, "code": {"type": "integer"}}},
+                        {"type": "object", "required": ["type", "signal"], "properties": {"type": {"const": "signaled"}, "signal": {"type": "integer"}}},
+                        {"type": "object", "required": ["type", "afterSecs"], "properties": {"type": {"const": "timedOut"}, "afterSecs": {"type": "number"}}},
+                        {"type": "object", "required": ["type", "by"], "properties": {"type": {"const": "killed"}, "by": {"enum": ["model", "host"]}}},
+                        {"type": "object", "required": ["type"], "properties": {"type": {"enum": ["aborted", "interrupted"]}}}
+                    ]},
+                    "truncated": {"type": "boolean"},
+                    "fullOutput": {"type": ["string", "null"]},
+                    "job": {"type": ["string", "null"]},
+                    "durationMs": {"type": "integer"}
+                }
+            })
+        });
+        Some(&SCHEMA)
     }
 
     fn replay(&self, _call: &ToolCall) -> Replay {
