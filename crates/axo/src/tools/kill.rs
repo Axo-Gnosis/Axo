@@ -1,6 +1,6 @@
 //! `kill`: stops a background job or a subagent's run.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo_agent::{Tool, ToolContext, ToolError, ToolOutput};
@@ -46,6 +46,11 @@ impl Tool for KillTool {
         &self.parameters
     }
 
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: LazyLock<Value> = LazyLock::new(super::result_schema::<KillReceipt>);
+        Some(&SCHEMA)
+    }
+
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
         let id = cx
             .call
@@ -61,15 +66,14 @@ impl Tool for KillTool {
         } else {
             format!("{id} is not running.")
         };
+        let receipt = json!(KillReceipt {
+            id: id.to_string(),
+            stopping
+        });
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
-            details: Some(
-                serde_json::to_value(KillReceipt {
-                    id: id.to_string(),
-                    stopping,
-                })
-                .expect("serializable kill receipt"),
-            ),
+            structured_content: cx.parent.is_some().then(|| receipt.clone()),
+            details: Some(receipt),
             ..ToolOutput::default()
         })
     }

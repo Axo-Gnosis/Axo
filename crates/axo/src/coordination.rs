@@ -3,13 +3,17 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type, schemars::JsonSchema,
+)]
 pub struct KillReceipt {
     pub id: String,
     pub stopping: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum SendKind {
     Note,
@@ -34,14 +38,18 @@ pub enum SubmissionProvenance {
     Extension { id: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type, schemars::JsonSchema,
+)]
 #[serde(tag = "type", content = "id", rename_all = "camelCase")]
 pub enum SendIdentity {
     Submission(String),
     Message(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct SendReceipt {
     pub to: String,
@@ -66,7 +74,9 @@ impl SendReceipt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum WaitReason {
     Results,
@@ -83,7 +93,9 @@ pub struct WaitReceipt {
     pub jobs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type, schemars::JsonSchema,
+)]
 #[serde(untagged)]
 pub enum SpawnReceipt {
     Child {
@@ -91,6 +103,7 @@ pub enum SpawnReceipt {
     },
     Team {
         team: String,
+        #[schemars(with = "std::collections::BTreeMap<String, String>")]
         jobs: IndexMap<String, String>,
     },
 }

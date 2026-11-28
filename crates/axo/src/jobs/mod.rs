@@ -516,6 +516,8 @@ pub(crate) struct ReservedMessage {
     pub(crate) msg: MessageRef,
     pub(crate) label: String,
     pub(crate) text: String,
+    pub(crate) is_error: bool,
+    pub(crate) value: Option<Value>,
     pub(crate) files: Vec<FileRecord>,
 }
 
@@ -1499,6 +1501,8 @@ impl JobRegistry {
                     },
                     label,
                     text,
+                    is_error: message.is_error,
+                    value: message.value.clone(),
                     files: message.files.clone(),
                 });
             }
@@ -1756,6 +1760,7 @@ impl JobRegistry {
             if run.call_id == call_id
                 && run.mode == Mode::Foreground
                 && let Some(control) = &run.control
+                && control.host_promotable
             {
                 control.promote.notify_one();
                 matched = true;
