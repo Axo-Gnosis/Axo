@@ -32,6 +32,8 @@ Focused studies, made on 2026-10-22. Their line references into `core.md` point 
 
 **2026-11-26 efficiency study:** [`efficiency.md`](efficiency.md) vets an external token/context audit against code, 209 measured Axome sessions and a survey of omp, pi, Octet, Claude Code, Codex, OpenCode, Gemini CLI, Aider, SWE-agent, Cline and Roo; it holds the owner-sorted inventory (axo, Axome, personal) and the discussion queue for [Track 8](../plan.md#track-8-token-and-context-efficiency).
 
+**2026-11-27 codemode engine spike:** [`codemode.md`](codemode.md) checks QuickJS-NG heap, deadline, and host-bridge behavior on Linux and measures runtime and binary cost for the two candidate releases.
+
 ## Why a new core
 
 Axome needed an agent it could own: drive richly, extend freely, and keep light. The options examined, and where each fell short:

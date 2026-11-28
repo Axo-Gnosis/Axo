@@ -16,6 +16,8 @@ mod jobs;
 mod models;
 mod recovery;
 pub mod schemes;
+#[cfg(feature = "codemode")]
+pub mod script;
 mod session;
 pub mod store;
 pub mod tools;
