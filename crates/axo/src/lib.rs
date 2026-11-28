@@ -63,10 +63,11 @@ pub use session::wire::{EntryPage, OutputPage};
 pub use session::{
     AcceptResultOptions, Activity, Attach, ChildHandle, ContextFilesInspection, ContextUsage, Fork,
     HostDelivery, HostMessage, InlineSpec, LiveSnapshot, MaintenanceKind, NavigateOptions,
-    PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput, RecoveryPolicy,
-    Registrations, ResultResolution, Session, SessionEvent, SessionEventKind, SessionOptions,
-    SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision, SpawnHook, SpawnOrigin, SpawnRequest,
-    SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy, ToolScope,
+    PendingNestedCall, PendingResult, PromptInspection, PromptRequest, PromptResult, QueuedInput,
+    RecoveryPolicy, Registrations, ResultResolution, Session, SessionEvent, SessionEventKind,
+    SessionOptions, SessionToolInfo, ShakeMode, SpawnContext, SpawnDecision, SpawnHook,
+    SpawnOrigin, SpawnRequest, SpawnTeam, TeamHandle, TeamMemberRequest, TeamRequest, ToolPolicy,
+    ToolScope,
 };
 pub use store::{
     CompactionReason, ContextReplacement, Entry, EntryBase, EntryId, FORMAT_VERSION, Header,

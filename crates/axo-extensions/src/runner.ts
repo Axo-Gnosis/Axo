@@ -629,6 +629,7 @@ async function tool(id: string, call: Call, handler: ToolHandler, args: ToolRunA
     call: args.call,
     sessionId: args.session,
     invocation: args.invocation,
+    parent: args.parent ?? null,
     tools: object(ext, "tools", {}, undefined, parent) as ToolRun["tools"],
     signal,
     update(update) {

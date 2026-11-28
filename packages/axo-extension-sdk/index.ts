@@ -149,6 +149,8 @@ export interface ToolRun {
   call: ToolCall;
   sessionId: string;
   invocation: number;
+  /** The model-issued call id for a nested call; null for a direct call. */
+  parent: string | null;
   /** Guarded file operations, supervised commands, and helpers for this call. */
   tools: Tools;
   /** Aborts when the host cancels the call. */

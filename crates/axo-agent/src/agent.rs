@@ -1,7 +1,7 @@
 //! The stateful agent: owns the transcript, queues and run cancellation around the
 //! loop in [`crate::run`]. Events are delivered through [`Persist`].
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -140,6 +140,7 @@ pub(crate) struct State {
     pub(crate) follow_up: VecDeque<QueuedMessage>,
     /// The active run, if any.
     pub(crate) run: Option<ActiveRun>,
+    nested_invocations: HashSet<ToolInvocationId>,
     /// Set by `Agent::shutdown`: every later run begins cancelled.
     pub(crate) shut_down: bool,
 }
@@ -175,6 +176,18 @@ impl Drop for RunGuard<'_> {
     }
 }
 
+/// Keeps a nested invocation active until its end event has been persisted.
+pub(crate) struct NestedInvocation<'a> {
+    agent: &'a Agent,
+    pub(crate) id: ToolInvocationId,
+}
+
+impl Drop for NestedInvocation<'_> {
+    fn drop(&mut self) {
+        self.agent.lock().nested_invocations.remove(&self.id);
+    }
+}
+
 impl Agent {
     pub fn new(cfg: AgentConfig) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
@@ -195,6 +208,7 @@ impl Agent {
                 steering: VecDeque::new(),
                 follow_up: VecDeque::new(),
                 run: None,
+                nested_invocations: HashSet::new(),
                 shut_down: false,
             }),
             steer_pending: watch::channel(false).0,
@@ -207,6 +221,18 @@ impl Agent {
 
     pub(crate) fn invocation(&self) -> ToolInvocationId {
         ToolInvocationId(self.next_invocation.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub(crate) fn nested_invocation(&self) -> NestedInvocation<'_> {
+        let id = self.invocation();
+        self.lock().nested_invocations.insert(id);
+        NestedInvocation { agent: self, id }
+    }
+
+    /// Whether this nested invocation is executing or still persisting its end event.
+    /// It can own receipts independently of any model run.
+    pub fn is_nested_invocation_active(&self, id: ToolInvocationId) -> bool {
+        self.lock().nested_invocations.contains(&id)
     }
 
     /// During shutdown only AgentEnd is delivered, so the session can clear live state.

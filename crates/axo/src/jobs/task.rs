@@ -694,7 +694,33 @@ mod tests {
         }))
         .await
         .unwrap();
+        let nested = |n: u32, root: &str, record: &FileRecord| Entry::NestedToolCall {
+            base: journal::base(),
+            root_call_id: root.into(),
+            call_id: format!("{root}/{n}"),
+            name: "read".into(),
+            arguments: Default::default(),
+            result: "read".into(),
+            is_error: false,
+            duration_ms: None,
+            details: Some(crate::file_details(std::slice::from_ref(record))),
+            admitted_jobs: Vec::new(),
+            delivered_jobs: Vec::new(),
+        };
+        host.journal(nested(1, "script", &file("before.txt")))
+            .await
+            .unwrap();
         admit(&runner.jobs, &host, &cx, Promotion::Async).await;
+        let recovered_files = vec![file("first.txt"), file("second.txt")];
+        host.journal(nested(2, "script", &recovered_files[0]))
+            .await
+            .unwrap();
+        host.journal(nested(1, "other", &file("unrelated.txt")))
+            .await
+            .unwrap();
+        host.journal(nested(3, "script", &recovered_files[1]))
+            .await
+            .unwrap();
         let shutdown = runner.jobs.shutdown();
         tokio::pin!(shutdown);
         bounded(async {
@@ -709,7 +735,7 @@ mod tests {
         let entries = lock(&host.0).clone();
         assert_eq!(
             entries.len(),
-            2,
+            6,
             "shutdown leaves the journal without a job_end"
         );
 
@@ -722,8 +748,8 @@ mod tests {
             .unwrap();
         let result = "Script was interrupted when the session closed; it may have partially run. Output so far: artifact://0";
         assert!(matches!(&lock(&host.0)[0].entry, Entry::JobEnd {
-            exit: Some(CommandExit::Interrupted), text, is_error: true, ..
-        } if text == result));
+            exit: Some(CommandExit::Interrupted), text, is_error: true, files, ..
+        } if text == result && files == &recovered_files));
         let (job, text) = reopened.get(id()).unwrap();
         assert!(matches!(
             job.kind,

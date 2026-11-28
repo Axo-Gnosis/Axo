@@ -29,6 +29,7 @@ pub(crate) struct ToolRunArgs<'a> {
     session: &'a str,
     call: &'a ToolCall,
     invocation: ToolInvocationId,
+    parent: Option<&'a str>,
 }
 
 #[derive(Serialize, specta::Type)]
@@ -36,6 +37,7 @@ pub(crate) struct ToolRunArgs<'a> {
 pub(crate) struct BeforeToolCall<'a> {
     assistant_message: &'a AssistantMessage,
     tool_call: &'a ToolCall,
+    parent: Option<&'a str>,
 }
 
 #[derive(Serialize, specta::Type)]
@@ -44,6 +46,7 @@ pub(crate) struct AfterToolCall<'a> {
     assistant_message: &'a AssistantMessage,
     tool_call: &'a ToolCall,
     result: &'a ToolOutput,
+    parent: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -115,6 +118,7 @@ impl Tool for RemoteTool {
             session: access.tools.session_id(),
             call: &cx.call,
             invocation: cx.invocation,
+            parent: cx.parent.as_deref(),
         })
         .map_err(|error| {
             ToolError(format!(
@@ -290,6 +294,7 @@ impl ToolPolicy for RemotePolicy {
             cx: BeforeToolCall {
                 assistant_message: call.assistant_message,
                 tool_call: call.tool_call,
+                parent: call.parent,
             },
         })
         .map_err(|error| {
@@ -349,6 +354,7 @@ impl ToolPolicy for RemotePolicy {
                 assistant_message: call.assistant_message,
                 tool_call: call.tool_call,
                 result: call.result,
+                parent: call.parent,
             },
         })
         .map_err(|error| {

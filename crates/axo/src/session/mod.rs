@@ -37,7 +37,8 @@ pub use self::delivery::{
     Activity, HostDelivery, HostMessage, PromptRequest, PromptResult, QueuedInput,
 };
 pub use self::events::{
-    Attach, ContextUsage, LiveSnapshot, ResultResolution, SessionEvent, SessionEventKind,
+    Attach, ContextUsage, LiveSnapshot, PendingNestedCall, ResultResolution, SessionEvent,
+    SessionEventKind,
 };
 use self::journal::Journal;
 use self::maintenance::Maintenance;

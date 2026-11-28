@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use axo_agent::AgentMessage;
-use axo_ai::{Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
+use axo_ai::{JsonMap, Message, ServiceTier, SystemMessage, ThinkingLevel, Usage, UserBlock};
 use axo_macros::expose;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -565,6 +565,29 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<FileRecord>,
     },
+    /// One finished tool call made from inside another call; never in context.
+    NestedToolCall {
+        #[serde(flatten)]
+        base: EntryBase,
+        /// The model-issued call it ran under.
+        root_call_id: String,
+        call_id: String,
+        name: String,
+        /// Bounded copy of the arguments.
+        arguments: JsonMap,
+        /// The first 2 KiB of the result's text.
+        result: String,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// The result's details, unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admitted_jobs: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delivered_jobs: Vec<String>,
+    },
     #[serde(untagged)]
     Unknown(#[specta(type = RawEntry)] Value),
 }
@@ -597,6 +620,11 @@ impl Entry {
             | Entry::ChildStart { .. }
             | Entry::JobEnd { .. } => true,
             Entry::Message {
+                admitted_jobs,
+                delivered_jobs,
+                ..
+            }
+            | Entry::NestedToolCall {
                 admitted_jobs,
                 delivered_jobs,
                 ..
@@ -641,7 +669,8 @@ impl Entry {
             | Entry::SubmissionWithdrawn { base, .. }
             | Entry::JobStart { base, .. }
             | Entry::ChildStart { base, .. }
-            | Entry::JobEnd { base, .. } => Some(base),
+            | Entry::JobEnd { base, .. }
+            | Entry::NestedToolCall { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
     }
@@ -671,7 +700,8 @@ impl Entry {
             | Entry::SubmissionWithdrawn { base, .. }
             | Entry::JobStart { base, .. }
             | Entry::ChildStart { base, .. }
-            | Entry::JobEnd { base, .. } => Some(base),
+            | Entry::JobEnd { base, .. }
+            | Entry::NestedToolCall { base, .. } => Some(base),
             Entry::Unknown(_) => None,
         }
     }
