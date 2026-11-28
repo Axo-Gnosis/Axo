@@ -6,6 +6,7 @@ mod agents;
 mod ask;
 mod attach;
 mod children;
+mod codemode;
 mod commands;
 mod compaction;
 mod compaction_limits;
