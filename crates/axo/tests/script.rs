@@ -166,7 +166,7 @@ async fn deadline_cannot_be_caught_and_ends_an_oom_loop_and_regex() {
     ] {
         let start = Instant::now();
         let (end, host) = eval(code, limits.clone()).await;
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < SLACK);
         assert!(end.cpu >= limits.cpu);
         assert_error(end, "Script exceeded its CPU limit of 0.035 s");
         assert!(host.output.lock().unwrap().is_empty());
@@ -196,11 +196,8 @@ async fn cancel_while_spinning_or_awaiting_the_host() {
         }
         let start = Instant::now();
         std::thread::spawn(move || cancel.cancel()).join().unwrap();
-        assert_error(
-            timeout(Duration::from_secs(1), script).await.unwrap(),
-            "Script cancelled",
-        );
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_error(timeout(SLACK, script).await.unwrap(), "Script cancelled");
+        assert!(start.elapsed() < SLACK);
         let called = usize::from(code.contains("hang"));
         assert_eq!(host.abandoned.load(Relaxed), called);
         assert_eq!(host.finished.load(Relaxed), called);
