@@ -120,6 +120,22 @@ async fn drive(
     let permits = Semaphore::new(limits.max_in_flight);
     let stopping = AtomicBool::new(false);
     let running = AtomicUsize::new(0);
+    let start_call = {
+        let (host, permits, stopping, running) = (&host, &permits, &stopping, &running);
+        move |id, name: String, args| async move {
+            let _permit = permits
+                .acquire()
+                .await
+                .expect("script call semaphore stays open");
+            if stopping.load(Relaxed) {
+                return None;
+            }
+            running.fetch_add(1, Relaxed);
+            let result = host.call(&name, args).await;
+            running.fetch_sub(1, Relaxed);
+            Some((id, result))
+        }
+    };
     let mut calls = FuturesUnordered::new();
     let result = loop {
         tokio::select! {
@@ -133,17 +149,7 @@ async fn drive(
                 let memory = limits.memory_bytes;
                 match request.op {
                     Operation::Call(name, args) => {
-                        let (host, permits, stopping, running) = (&host, &permits, &stopping, &running);
-                        calls.push(async move {
-                            let _permit = permits.acquire().await.expect("script call semaphore stays open");
-                            if stopping.load(Relaxed) {
-                                return None;
-                            }
-                            running.fetch_add(1, Relaxed);
-                            let result = host.call(&name, args).await;
-                            running.fetch_sub(1, Relaxed);
-                            Some(Completion { id, result: wire(result, memory) })
-                        });
+                        calls.push(start_call(id, name, args));
                     }
                     op => {
                         let value = match op {
@@ -155,13 +161,34 @@ async fn drive(
                     }
                 }
             }
-            Some(Some(completion)) = calls.next(), if !calls.is_empty() => {
-                let _ = replies.send(Reply::Complete(completion));
+            Some(Some((id, result))) = calls.next(), if !calls.is_empty() => {
+                let _ = replies.send(Reply::Complete(Completion { id, result: wire(result, limits.memory_bytes) }));
             }
             result = &mut end => break Some(result),
         }
     };
-    // Drain calls already polled without starting any still queued on shutdown.
+    let result = match result {
+        Some(Ok(mut end)) if end.error.is_none() => {
+            // The VM has stopped publishing. A send could have raced the select's
+            // final receive poll, so take any calls it dispatched before returning.
+            for Request { id, op } in requests.try_iter() {
+                if let Operation::Call(name, args) = op {
+                    calls.push(start_call(id, name, args));
+                }
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    end.error = Some(problem(CANCELLED));
+                    end.store = StoreChanges::default();
+                }
+                () = async { while calls.next().await.is_some() {} } => return end,
+            }
+            Some(Ok(end))
+        }
+        result => result,
+    };
+    // On failure or cancellation, stop active calls without starting any still queued.
     stopping.store(true, Relaxed);
     if running.load(Relaxed) != 0 {
         host.abandon();

@@ -435,7 +435,9 @@ async fn result_shapes_match_tool_schemas() {
     fn has_property(schema: &Value, key: &str) -> bool {
         match schema {
             Value::Object(fields) => {
-                fields.get("properties").is_some_and(|props| props.get(key).is_some())
+                fields
+                    .get("properties")
+                    .is_some_and(|props| props.get(key).is_some())
                     || fields.values().any(|schema| has_property(schema, key))
             }
             Value::Array(schemas) => schemas.iter().any(|schema| has_property(schema, key)),
@@ -450,8 +452,14 @@ async fn result_shapes_match_tool_schemas() {
         let (name, shape) = line.strip_prefix("- ").unwrap().split_once(" → ").unwrap();
         let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
         let schema = tool.output_schema().unwrap();
-        for key in shape.split(|ch: char| !ch.is_ascii_alphanumeric()).filter(|key| !key.is_empty() && *key != "or") {
-            assert!(has_property(schema, key), "{name} advertises {key}, but it is missing from {schema}");
+        for key in shape
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|key| !key.is_empty() && *key != "or")
+        {
+            assert!(
+                has_property(schema, key),
+                "{name} advertises {key}, but it is missing from {schema}"
+            );
         }
     }
 }

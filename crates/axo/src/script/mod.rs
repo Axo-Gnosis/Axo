@@ -53,7 +53,8 @@ pub trait ScriptHost: Send + Sync + 'static {
     fn describe(&self, name: &str) -> Result<Value, String>;
     /// One finished output item, in order. Runs on the VM thread.
     fn output(&self, text: &str);
-    /// The script ended with calls still running; stop them. `run` awaits them afterwards.
+    /// Stop active calls after script failure, cancellation or interruption. `run` awaits
+    /// them afterwards. A successful script lets its dispatched calls complete.
     fn abandon(&self);
 }
 

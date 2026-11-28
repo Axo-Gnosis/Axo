@@ -355,28 +355,52 @@ async fn call_cap_and_cpu_excludes_host_wait() {
 }
 
 #[tokio::test]
-async fn returning_stops_and_drains_started_calls() {
-    let (end, host) = eval("tools.hang(); return 1;", limits()).await;
-    assert_ok(end, &host, &["1"]);
-    assert_eq!(host.peak.load(Relaxed), 1);
-    assert_eq!(host.abandoned.load(Relaxed), 1);
-    assert_eq!(host.finished.load(Relaxed), 1);
-
+async fn only_failure_abandons_pending_calls() {
     let (end, host) = eval(
-        "tools.hang(); tools.hang(); return (await searchTools('lookup'))[0];",
-        Limits {
-            max_in_flight: 1,
-            ..limits()
-        },
+        "tools.hang(); await tools.yield({i:0}); throw new Error('boom');",
+        limits(),
     )
     .await;
-    assert_ok(end, &host, &["lookup"]);
+    assert_error(end, "boom");
     assert_eq!(host.abandoned.load(Relaxed), 1);
-    assert_eq!(
-        host.finished.load(Relaxed),
-        1,
-        "queued call started during shutdown"
-    );
+    assert_eq!(host.finished.load(Relaxed), 2);
+
+    for cancelled in [false, true] {
+        let host = Arc::new(Host::default());
+        let cancel = CancellationToken::new();
+        let mut script = std::pin::pin!(run(
+            "store('k', 1); tools.hang(); return 1;",
+            BTreeMap::new(),
+            host.clone(),
+            limits(),
+            cancel.clone(),
+        ));
+        tokio::select! {
+            result = &mut script => panic!("pending call not drained: {result:?}"),
+            ready = timeout(SLACK, async {
+                host.started.notified().await;
+                while host.output.lock().unwrap().is_empty() {
+                    sleep(Duration::from_millis(2)).await;
+                }
+            }) => ready.unwrap(),
+        }
+        assert_eq!(*host.output.lock().unwrap(), ["1"]);
+        if cancelled {
+            cancel.cancel();
+        } else {
+            host.stop.cancel();
+        }
+        let end = timeout(SLACK, script).await.unwrap();
+        if cancelled {
+            assert!(end.store.set.is_empty());
+            assert_error(end, "Script cancelled");
+        } else {
+            assert_eq!(end.store.set.get("k"), Some(&json!(1)));
+            assert_ok(end, &host, &["1"]);
+        }
+        assert_eq!(host.abandoned.load(Relaxed), usize::from(cancelled));
+        assert_eq!(host.finished.load(Relaxed), 1);
+    }
 }
 
 #[tokio::test]
