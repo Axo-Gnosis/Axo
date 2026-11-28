@@ -56,7 +56,7 @@ pub use host::SessionPage;
 pub use input::{PromptInput, PromptPart};
 pub use jobs::{
     ChildProgress, CommandExit, CommandOutput, JobInfo, JobKind, JobMessageInfo, JobStatus, Killer,
-    MessageDelivery, OutputProgress, Promotion, jobs_from_entries,
+    MessageDelivery, OutputProgress, Promotion, ScriptExit, jobs_from_entries,
 };
 pub use models::CompletionRequest;
 pub use schemes::{Scheme, SchemeContext, SchemeUrl, Schemes, Target, valid_scheme_name};
