@@ -16,6 +16,7 @@ Wire arguments are positional. `?` marks a parameter that accepts `null` and can
 | config |  | The effective configuration for this session. |
 | setName | name? | Sets the file-wide session name; newlines become spaces and blank names clear it. May be called while a run is active; this entry contributes no context message. |
 | name |  | The latest session name in file order, independent of the selected branch. |
+| scriptStore |  | The values codemode scripts stored on the current branch, as the next script would load them. |
 | skills |  | The skills in force now; the prompt's catalog and /name commands use these. |
 | agents |  | Agent and team definitions in force now. |
 | diagnostics |  | Start-time context, skill, prompt, and scheme diagnostics, also logged as warnings. |

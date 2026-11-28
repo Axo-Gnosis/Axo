@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axo_ai::JsonMap;
+use axo_macros::expose;
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -20,8 +21,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct Pool(Arc<Semaphore>);
 
+#[expose]
 impl Pool {
     /// A pool of `vms` slots, at least one.
+    #[ext(skip = "runs host code; not callable across the wire")]
     pub fn new(vms: usize) -> Self {
         Self(Arc::new(Semaphore::new(
             vms.clamp(1, Semaphore::MAX_PERMITS),

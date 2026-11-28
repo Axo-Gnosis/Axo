@@ -81,10 +81,10 @@ Dependency flow is strictly downward (`axo-extensions` -> `axo` -> `axo-agent` -
 Run inside `nix develop`:
 
 ```bash
-cargo check --workspace --all-targets
-cargo nextest run --workspace   # or `cargo test --workspace` (`nextest` skips doctests; pass `--no-pager` to `list`)
-cargo test --doc --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace --all-targets --all-features
+cargo nextest run --workspace --all-features   # or `cargo test --workspace --all-features` (`nextest` skips doctests; pass `--no-pager` to `list`)
+cargo test --doc --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 

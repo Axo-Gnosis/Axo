@@ -1274,6 +1274,16 @@ export type Entry_Deserialize =
 	customType: string,
 	data?: Value | null,
 } & EntryBase_Deserialize | 
+/**
+ *  The script store changes one successful `codemode` script committed: `set`
+ *  then `delete`, folded along the branch. Never in context.
+ */
+{
+	type: "script_store",
+} & {
+	set?: { [key in string]: Value },
+	delete?: string[],
+} & EntryBase_Deserialize | 
 /**  A host message that is in context. */
 {
 	type: "custom_message",
@@ -1527,6 +1537,16 @@ export type Entry_Serialize =
 } & {
 	customType: string,
 	data?: Value,
+} & EntryBase_Serialize | 
+/**
+ *  The script store changes one successful `codemode` script committed: `set`
+ *  then `delete`, folded along the branch. Never in context.
+ */
+{
+	type: "script_store",
+} & {
+	set?: { [key in string]: Value },
+	delete?: string[],
 } & EntryBase_Serialize | 
 /**  A host message that is in context. */
 {
@@ -2160,7 +2180,7 @@ promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | nul
 /**  A script running as a job (the `codemode` tool). */
 { type: "script"; 
 /**  The display label supplied by the tool. */
-label: string; artifact: number; promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | null; exit?: CommandExit | null } | 
+label: string; artifact: number; promotion?: Promotion | null; promotedAt?: number | null; endedAt?: number | null; exit?: ScriptExit | null } | 
 /**  `model` is the expanded `provider/id`. */
 { type: "child"; sessionId: string; path: string; depth: number; agent?: string | null; model: string; team?: TeamRef_Deserialize | null; resident: boolean; 
 /**  Boxed so a child row stays near a command row's size. */
@@ -2181,7 +2201,7 @@ promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; 
 /**  A script running as a job (the `codemode` tool). */
 { type: "script"; 
 /**  The display label supplied by the tool. */
-label: string; artifact: number; promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; exit: CommandExit | null } | 
+label: string; artifact: number; promotion: Promotion | null; promotedAt: number | null; endedAt: number | null; exit: ScriptExit | null } | 
 /**  `model` is the expanded `provider/id`. */
 { type: "child"; sessionId: string; path: string; depth: number; agent: string | null; model: string; team: TeamRef_Serialize | null; resident: boolean; 
 /**  Boxed so a child row stays near a command row's size. */
@@ -3313,6 +3333,11 @@ export type SchemeUrl = {
 	path: string,
 };
 
+/**  How a script ended. */
+export type ScriptExit = { type: "returned" } | 
+/**  The script threw, or its result could not be recorded. */
+{ type: "failed" } | { type: "timedOut"; afterSecs: number | null } | { type: "killed"; by: Killer } | { type: "aborted" } | { type: "interrupted" };
+
 export type SendIdentity = { type: "submission"; id: string } | { type: "message"; id: string };
 
 export type SendKind = "note" | "steer" | "followUp" | "mail";
@@ -3902,6 +3927,8 @@ export type SessionRunCommandArgs_Deserialize = {
 export type SessionRunCommandArgs_Serialize = {
 	command: Command_Serialize,
 };
+
+export type SessionScriptStoreResult = { [key in string]: Value };
 
 export type SessionSendArgs = {
 	to: string,
@@ -5369,6 +5396,11 @@ export interface Session {
   name(signal?: AbortSignal): Promise<SessionNameResult_Serialize>;
   // withheld: appendCustom — namespaced per caller; see the wire method
   // withheld: custom — namespaced per caller; see the wire method
+  /**
+   * The values `codemode` scripts stored on the current branch, as the next script
+   * would `load` them.
+   */
+  scriptStore(signal?: AbortSignal): Promise<SessionScriptStoreResult>;
   /**
    * The skills in force now; the prompt's catalog and `/name` commands use these.
    */

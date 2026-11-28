@@ -174,14 +174,14 @@ Enter the Nix development shell for the Rust toolchain (`cargo`, `rustc`, `clipp
 
 ```sh
 nix develop
-cargo check --workspace --all-targets
-cargo test --workspace  # process-group mode: no cgroup delegation or helper binary needed
+cargo check --workspace --all-targets --all-features
+cargo test --workspace --all-features  # process-group mode: no cgroup delegation or helper binary needed
 systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 cargo test -p axo --test supervisor  # opt-in cgroup cases
 cargo test -p axo-extensions --test bridge  # manager, lifecycle, session and install checks with the test binary as a scripted Rust runner; no Bun needed
 env AXO_TEST_BUN=/absolute/path/to/bun cargo test -p axo-extensions --test bun_provider  # real Bun runner; skips when unset, fails when set but unusable
 systemd-run --user --scope -p Delegate=yes -- env AXO_TEST_CGROUP=1 AXO_TEST_BUN=/absolute/path/to/bun cargo test -p axo-extensions --test bun_provider  # same, under cgroup supervision
 bun test crates/axo-extensions/tests/runner-activation.test.ts  # embedded runner activation and rollback checks; needs Bun
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
