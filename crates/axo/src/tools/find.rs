@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::SessionTools;
+use crate::tools::truncate::PROGRAM_MAX_BYTES;
 
 const DEFAULT_LIMIT: usize = 1000;
 const PROGRAM_LIMIT: usize = 100_000;
@@ -151,6 +152,7 @@ fn find(
     let mut results = Vec::new();
     let mut errors = Vec::new();
     let mut truncated = false;
+    let mut bytes_left = PROGRAM_MAX_BYTES;
     for entry in walk.build() {
         if !program && results.len() >= limit {
             break;
@@ -186,6 +188,13 @@ fn find(
         let mut relative = relative.to_string_lossy().replace('\\', "/");
         if entry.file_type().is_some_and(|kind| kind.is_dir()) {
             relative.push('/');
+        }
+        if program {
+            if relative.len() > bytes_left {
+                truncated = true;
+                break;
+            }
+            bytes_left -= relative.len();
         }
         results.push(relative);
     }
@@ -223,4 +232,39 @@ fn find(
         }),
         ..ToolOutput::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_find_caps_total_path_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let component = "a".repeat(240);
+        let prefix = [component.as_str(); 3].join("/");
+        let subdir = dir.path().join(&prefix);
+        std::fs::create_dir_all(&subdir).unwrap();
+        let path_bytes = prefix.len() + "/000000.txt".len();
+        let fits = PROGRAM_MAX_BYTES / path_bytes;
+        for i in 0..=fits {
+            std::fs::write(subdir.join(format!("{i:06}.txt")), []).unwrap();
+        }
+
+        let output = find(
+            FindArgs {
+                pattern: "*.txt".into(),
+                path: None,
+                limit: Some(1_000_000.0),
+            },
+            dir.path().to_owned(),
+            None,
+            &CancellationToken::new(),
+            true,
+        )
+        .unwrap();
+        let result = output.structured_content.unwrap();
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["paths"].as_array().unwrap().len(), fits);
+    }
 }

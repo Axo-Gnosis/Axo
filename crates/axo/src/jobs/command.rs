@@ -820,10 +820,9 @@ impl CommandTask {
         } else {
             None
         };
-        let keep = full_output.is_some()
-            || retained
-            || promoted
-            || raw.as_ref().is_some_and(|(_, truncated)| *truncated);
+        let raw_full_output =
+            capture.error.is_none() && raw.as_ref().is_some_and(|(_, truncated)| *truncated);
+        let keep = full_output.is_some() || retained || promoted || raw_full_output;
         if !keep {
             capture.discard().await;
         }
@@ -926,7 +925,7 @@ impl CommandTask {
             },
             exit: exit.clone(),
             truncated,
-            full_output: truncated.then(|| format!("artifact://{artifact}")),
+            full_output: raw_full_output.then(|| format!("artifact://{artifact}")),
             job: retained.then(|| id.to_string()),
             duration_ms: ended_at - started_at,
         });
@@ -1073,10 +1072,11 @@ impl Capture {
     }
 
     async fn program_tail(&self) -> (String, bool) {
+        let capture_failed = self.error.is_some();
         let end = self.output.progress.borrow().bytes;
         let start = end.saturating_sub(PROGRAM_COMMAND_BYTES as u64);
         if end == 0 {
-            return (String::new(), false);
+            return (String::new(), capture_failed);
         }
         let path = self.output.path.clone();
         match tokio::task::spawn_blocking(move || {
@@ -1088,7 +1088,7 @@ impl Capture {
         {
             Ok(bytes) => (
                 clean_program_output(&bytes),
-                start > 0 || bytes.len() as u64 != end - start,
+                capture_failed || start > 0 || bytes.len() as u64 != end - start,
             ),
             Err(error) => {
                 tracing::warn!(path = %self.output.path.display(), %error, "could not read command output tail");
@@ -1308,6 +1308,7 @@ mod tests {
         let expected = chunk.bytes.clone();
         capture.record(Ok(chunk)).await;
         assert!(capture.error.is_some());
+        assert!(capture.program_tail().await.1);
         assert!(capture.output.progress.borrow().capture_failed);
         assert_eq!(capture.output.progress.borrow().bytes, 3);
         assert_eq!(std::fs::read(&path).unwrap(), expected);

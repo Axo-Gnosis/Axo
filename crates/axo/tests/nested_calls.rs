@@ -150,13 +150,18 @@ async fn journal_keeps_nested_calls_out_of_context_and_recovers_an_interrupted_r
 }
 
 #[tokio::test]
-async fn nested_write_bounds_large_arguments() {
+async fn journal_bounds_large_nested_arguments() {
     let dir = tempfile::tempdir().unwrap();
     let host = common::host(dir.path(), turns()).await;
     let content = "€".repeat(350_000);
+    let numbers = (0..10_000).collect::<Vec<_>>();
+    let number_bytes = serde_json::to_vec(&numbers).unwrap().len();
     let options = options(
         dir.path(),
-        vec![("write", json!({"path": "big.txt", "content": content}))],
+        vec![
+            ("write", json!({"path": "big.txt", "content": content})),
+            ("find", json!({"pattern": "big.txt", "values": numbers})),
+        ],
         false,
     );
     let path = options.cwd.join("big.txt");
@@ -169,6 +174,13 @@ async fn nested_write_bounds_large_arguments() {
     let expected = format!("{}… [{} bytes]", &content[..1023], content.len());
     assert_eq!(write["arguments"]["content"], expected);
     assert!(write["details"]["files"].is_array());
+    let find = &lines[only(&lines, "nested find", |v| is_nested(v, "find"))];
+    assert_eq!(find["isError"], false);
+    assert!(find.to_string().len() < 16 * 1024);
+    assert_eq!(
+        find["arguments"],
+        json!({"pattern": "… [9 bytes]", "values": format!("… [{number_bytes} bytes]")})
+    );
     session.shutdown().await;
 }
 

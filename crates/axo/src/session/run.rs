@@ -517,8 +517,18 @@ impl LoopHooks for SessionHooks {
     }
 }
 
-/// Keep small argument maps intact. For large ones, trim long strings without changing the JSON shape.
+/// Keep maps up to 8 KiB intact; for larger maps, trim strings at 1 KiB and add their original byte counts.
+/// If the trimmed map still exceeds 16 KiB, keep the top-level keys with JSON byte counts in place of
+/// their values. If that also exceeds 16 KiB, store one marker with the total trimmed JSON byte count.
 fn bounded_arguments(mut arguments: JsonMap) -> JsonMap {
+    fn json_bytes(value: &impl serde::Serialize) -> usize {
+        serde_json::to_vec(value)
+            .expect("JSON arguments serialize")
+            .len()
+    }
+
+    const MAX_BYTES: usize = 16 * 1024;
+
     fn trim(value: &mut Value) {
         match value {
             Value::String(text) if text.len() > 1024 => {
@@ -532,12 +542,18 @@ fn bounded_arguments(mut arguments: JsonMap) -> JsonMap {
         }
     }
 
-    if serde_json::to_vec(&arguments)
-        .expect("JSON arguments serialize")
-        .len()
-        > 8 * 1024
-    {
-        arguments.values_mut().for_each(trim);
+    if json_bytes(&arguments) <= 8 * 1024 {
+        return arguments;
+    }
+    arguments.values_mut().for_each(trim);
+    let bytes = json_bytes(&arguments);
+    if bytes > MAX_BYTES {
+        for value in arguments.values_mut() {
+            *value = Value::String(format!("… [{} bytes]", json_bytes(value)));
+        }
+        if json_bytes(&arguments) > MAX_BYTES {
+            return JsonMap::from_iter([("…".into(), Value::String(format!("[{bytes} bytes]")))]);
+        }
     }
     arguments
 }
