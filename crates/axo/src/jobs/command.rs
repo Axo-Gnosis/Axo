@@ -24,7 +24,7 @@ use crate::exec::host::{
 };
 use crate::schemes::artifact::{Artifacts, LiveArtifact, command_log_tail, stream_index_path};
 use crate::tools::truncate::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, PROGRAM_COMMAND_BYTES, format_size,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, PROGRAM_COMMAND_BYTES, floor_char_boundary, format_size,
 };
 
 /// Inline output keeps the first `HEAD_*` and the last `TAIL_*`; together they are pi's
@@ -1175,11 +1175,7 @@ impl Shaper {
     fn end_line(&mut self) {
         let mut line = clean_segment(&self.segment);
         if line.len() > MAX_LINE_BYTES || self.segment_overflow {
-            let mut end = line.len().min(MAX_LINE_BYTES);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
+            line.truncate(floor_char_boundary(&line, MAX_LINE_BYTES));
             line.push_str("... [truncated]");
             self.lines_cut = true;
         }
