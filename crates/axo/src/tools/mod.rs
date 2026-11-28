@@ -72,7 +72,7 @@ pub use ledger::{
     FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, file_records_in,
     lock_file,
 };
-pub(crate) use ledger::{file_key, ledger_records};
+pub(crate) use ledger::{file_key, ledger_records, message_file_records};
 pub use shell::{ShellKind, ShellUnit, classify_bash};
 pub use snapshots::{MAX_SNAPSHOT_BYTES, SnapshotStore};
 pub use wire::{ArtifactSlot, ToolAccess};

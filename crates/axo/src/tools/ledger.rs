@@ -89,6 +89,16 @@ pub fn file_records_in(details: Option<&Value>) -> Vec<FileRecord> {
         .unwrap_or_default()
 }
 
+/// The file records a message reports: a tool result's, or a custom message's such as a
+/// job delivery.
+pub(crate) fn message_file_records(message: &AgentMessage) -> Vec<FileRecord> {
+    match message {
+        AgentMessage::Llm(Message::ToolResult(result)) => file_records(result),
+        AgentMessage::Custom(message) => file_records_in(message.details.as_ref()),
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn ledger_records(result: &ToolResultMessage) -> Vec<LedgerRecord> {
     file_records(result)
         .into_iter()
@@ -185,12 +195,7 @@ impl FileLedger {
         let mut ledger = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         ledger.clear();
         for message in messages {
-            let details = match message {
-                AgentMessage::Llm(Message::ToolResult(result)) => result.details.as_ref(),
-                AgentMessage::Custom(message) => message.details.as_ref(),
-                _ => continue,
-            };
-            for record in file_records_in(details) {
+            for record in message_file_records(message) {
                 let LedgerRecord { path, sha256, .. } = record.ledger;
                 ledger.insert(file_key(Path::new(&path)), sha256);
             }
