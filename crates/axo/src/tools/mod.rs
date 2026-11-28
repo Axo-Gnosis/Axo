@@ -464,6 +464,10 @@ fn walker(root: &Path) -> WalkBuilder {
     walk
 }
 
+pub(crate) fn result_schema<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect("serializable output schema")
+}
+
 fn byte_capped(
     raw: &str,
     mut before: Vec<String>,

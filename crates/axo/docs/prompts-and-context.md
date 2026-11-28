@@ -55,6 +55,21 @@ For filesystem targets, `read` refuses non-regular files other than directories,
 
 `grep` output: in `content` mode matches are grouped under each file's path, groups separated by a blank line: `N:line` for a match, `N-line` for context, `--` between separate windows; `files` mode lists paths and `count` mode lists `path:N` rows. `path` takes one entry or a list of up to 20: files or directories, a file with a line selector (`src/a.rs:10-80` or `src/a.rs:-60`), and `!glob` exclusions. Content mode keeps 10 matches per file when a directory or several paths are searched and 50 for a single file, stops at `limit` matches (default 100; files in the other modes) and truncates lines to 500 characters; output is capped at 50 KB. `find` lists matching paths up to its `limit` under the same byte cap. When a cap is reported or output is truncated, the text ends with one bracketed line after a blank line and `details` records it: `notice` (that line exactly), `matchLimitReached` (`grep`) or `resultLimitReached` (`find`) with the limit, `cappedFiles` (`grep`: the files that hit the per-file cap), `linesTruncated` (`grep`) and `truncation` (the byte cap). Otherwise there are no `details`.
 
+### Programmatic tool results
+
+A nested call through `ToolContext::calls` still runs the session tool, but can also return `ToolOutput::structured_content` to its caller. This value is not part of the model transcript. Each tool that produces a typed result advertises its JSON Schema through `Tool::output_schema`.
+
+| Tool | Structured result |
+| :--- | :--- |
+| `read` | One entry per path: raw text (never an outline), directory entries, image or binary byte length, or a per-path error. Text shares a 4 MiB budget per call and cuts at line boundaries. |
+| `grep` | Match and context rows, paths, or per-path counts. Defaults to 10,000 matches or files with no per-file cap, a 10,000-character line limit, and a shared 4 MiB text budget. |
+| `find` | Matching paths, with a default limit of 100,000. |
+| `bash` | The last 1 MiB of captured output, without ANSI escapes or line cuts, plus exit status and elapsed time. A cut preserves the complete output artifact. A nested command only promotes when explicitly called with `async: true`; a promoted call returns its job id, output snapshot, and artifact URL. |
+| `wait` | The reason for returning, result messages (including each child's schema-validated yield value when present), and running job ids. |
+| `spawn`, `kill`, `send` | Their existing receipts. |
+
+`write` and `edit` return text only.
+
 ### Deferred tools
 
 Host tools may be direct (`HostTool::direct`) or deferred (`HostTool::deferred`). Direct tools contribute declarations and guidelines to the initial prompt. Deferred tools remain callable but are omitted from those initial declarations and guidelines. Agent allowlists filter both sets. A deferred name colliding with a direct tool is ignored with a diagnostic; among deferred duplicates, the later wins, with the diagnostic `deferred tool "<name>" from <winner> replaces the one from <loser>`.

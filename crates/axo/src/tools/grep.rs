@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use axo_agent::{Replay, Tool, ToolContext, ToolError, ToolOutput};
@@ -17,17 +17,20 @@ use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
 use ignore::overrides::OverrideBuilder;
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::SessionTools;
 use crate::tools::selector::{self, Paths};
-use crate::tools::truncate::truncate_line;
+use crate::tools::truncate::{PROGRAM_MAX_BYTES, truncate_line};
 
 const GREP_MAX_LINE_LENGTH: usize = 500;
 
 const DEFAULT_LIMIT: usize = 100;
+const PROGRAM_LIMIT: usize = 10_000;
+const PROGRAM_MAX_LINE_LENGTH: usize = 10_000;
 
 /// Matches kept per file when several files are searched, and for a single file.
 const PER_FILE: usize = 10;
@@ -62,6 +65,28 @@ enum GrepMode {
     Content,
     Files,
     Count,
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+struct GrepResult {
+    matches: Vec<GrepMatch>,
+    files: Vec<String>,
+    counts: Vec<GrepCount>,
+    truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct GrepMatch {
+    path: String,
+    line: u64,
+    text: String,
+    context: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct GrepCount {
+    path: String,
+    count: usize,
 }
 
 /// One positive `path` entry, resolved.
@@ -123,12 +148,23 @@ impl Tool for GrepTool {
         &self.parameters
     }
 
+    fn output_schema(&self) -> Option<&Value> {
+        static SCHEMA: LazyLock<Value> = LazyLock::new(super::result_schema::<GrepResult>);
+        Some(&SCHEMA)
+    }
+
     fn replay(&self, _call: &ToolCall) -> Replay {
         Replay::Safe
     }
 
     async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ToolContext { call, cancel, .. } = cx;
+        let ToolContext {
+            call,
+            cancel,
+            parent,
+            ..
+        } = cx;
+        let program = parent.is_some();
         let mut args: GrepArgs = serde_json::from_value(Value::Object(call.arguments.clone()))
             .map_err(|err| ToolError(err.to_string()))?;
         if cancel.is_cancelled() {
@@ -159,16 +195,10 @@ impl Tool for GrepTool {
             });
         }
         let cwd = self.tools.cwd.clone();
-        let (text, details) =
-            tokio::task::spawn_blocking(move || search(args, roots, excludes, &cwd, &cancel))
-                .await
-                .map_err(|err| ToolError(err.to_string()))?
-                .map_err(ToolError)?;
-        Ok(ToolOutput {
-            content: vec![UserBlock::Text { text }],
-            details,
-            ..ToolOutput::default()
-        })
+        tokio::task::spawn_blocking(move || search(args, roots, excludes, &cwd, &cancel, program))
+            .await
+            .map_err(|err| ToolError(err.to_string()))?
+            .map_err(ToolError)
     }
 }
 
@@ -193,13 +223,36 @@ struct FileSink<'a> {
     mode: GrepMode,
     only: Option<&'a RegexMatcher>,
     lines_truncated: bool,
+    max_line_length: usize,
+    /// Program callers additionally cap all returned text (including repeated paths).
+    bytes_left: Option<usize>,
+    path_bytes: usize,
+    bytes_capped: bool,
 }
 
 impl FileSink<'_> {
+    fn push(&mut self, row: Row) -> bool {
+        if let Some(left) = &mut self.bytes_left {
+            let bytes = match &row {
+                Row::Match(_, text) | Row::Before(_, text) | Row::Context(_, text) => {
+                    self.path_bytes + text.len() + 1
+                }
+                Row::Break => 1,
+            };
+            if bytes > *left {
+                self.bytes_capped = true;
+                return false;
+            }
+            *left -= bytes;
+        }
+        self.rows.push(row);
+        true
+    }
+
     fn text(&mut self, bytes: &[u8]) -> String {
         let text = String::from_utf8_lossy(bytes);
         let text = text.trim_end_matches(['\n', '\r']);
-        let (cut, was_cut) = truncate_line(text, GREP_MAX_LINE_LENGTH);
+        let (cut, was_cut) = truncate_line(text, self.max_line_length);
         self.lines_truncated |= was_cut;
         cut.into_owned()
     }
@@ -223,21 +276,17 @@ impl Sink for FileSink<'_> {
             (GrepMode::Count, _) => {}
             (GrepMode::Content, Some(matcher)) => {
                 let bytes = mat.bytes();
-                let mut hits = Vec::new();
                 matcher
                     .find_iter(bytes, |hit| {
-                        hits.push(hit);
-                        true
+                        let text = self.text(&bytes[hit.start()..hit.end()]);
+                        self.push(Row::Match(number, text))
                     })
                     .map_err(io::Error::other)?;
-                for hit in hits {
-                    let text = self.text(&bytes[hit.start()..hit.end()]);
-                    self.rows.push(Row::Match(number, text));
-                }
+                return Ok(!self.bytes_capped);
             }
             (GrepMode::Content, None) => {
                 let text = self.text(mat.bytes());
-                self.rows.push(Row::Match(number, text));
+                return Ok(self.push(Row::Match(number, text)));
             }
         }
         Ok(true)
@@ -250,16 +299,14 @@ impl Sink for FileSink<'_> {
     ) -> Result<bool, io::Error> {
         let number = context.line_number().unwrap_or(0) + self.offset;
         let text = self.text(context.bytes());
-        self.rows.push(match context.kind() {
+        Ok(self.push(match context.kind() {
             SinkContextKind::Before => Row::Before(number, text),
             _ => Row::Context(number, text),
-        });
-        Ok(true)
+        }))
     }
 
     fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
-        self.rows.push(Row::Break);
-        Ok(true)
+        Ok(self.push(Row::Break))
     }
 }
 
@@ -314,7 +361,8 @@ fn search(
     excludes: Vec<String>,
     cwd: &Path,
     cancel: &CancellationToken,
-) -> Result<(String, Option<Value>), String> {
+    program: bool,
+) -> Result<ToolOutput, String> {
     let mut dirs = Vec::with_capacity(roots.len());
     for root in &roots {
         let shown = super::shown(&root.path, root.label.as_deref()).display();
@@ -336,10 +384,22 @@ fn search(
     } else {
         (0, 0)
     };
+    let default_limit = if program {
+        PROGRAM_LIMIT
+    } else {
+        DEFAULT_LIMIT
+    };
     let limit = args
         .limit
-        .map_or(DEFAULT_LIMIT, |limit| limit.max(1.0).ceil() as usize);
-    let per_file = if roots.len() > 1 || dirs.iter().any(|dir| *dir) {
+        .map_or(default_limit, |limit| limit.max(1.0).ceil() as usize);
+    let max_line_length = if program {
+        PROGRAM_MAX_LINE_LENGTH
+    } else {
+        GREP_MAX_LINE_LENGTH
+    };
+    let per_file = if program {
+        usize::MAX
+    } else if roots.len() > 1 || dirs.iter().any(|dir| *dir) {
         PER_FILE
     } else {
         SINGLE_FILE
@@ -367,6 +427,9 @@ fn search(
     let mut total = 0;
     let mut limit_reached = false;
     let mut lines_truncated = false;
+    let mut structured = program.then(GrepResult::default);
+    let mut bytes_left = PROGRAM_MAX_BYTES;
+    let mut bytes_capped = false;
     'roots: for (root, &is_dir) in roots.iter().zip(&dirs) {
         let mut walk = super::walker(&root.path);
         if args.glob.is_some() || !excludes.is_empty() {
@@ -410,6 +473,7 @@ fn search(
                 GrepMode::Files => 1,
                 GrepMode::Count => usize::MAX,
             };
+            let name = header(path, root, is_dir, cwd);
             let mut sink = FileSink {
                 rows: Vec::new(),
                 offset: 0,
@@ -419,6 +483,10 @@ fn search(
                 mode,
                 only,
                 lines_truncated: false,
+                max_line_length,
+                bytes_left: (program && mode == GrepMode::Content).then_some(bytes_left),
+                path_bytes: name.len(),
+                bytes_capped: false,
             };
             let result = match &root.ranges {
                 None => searcher.search_path(&matcher, path, &mut sink),
@@ -427,7 +495,7 @@ fn search(
                         + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
                     let ranges = selector::resolve(specs, total_lines).map_err(io::Error::other)?;
                     for (start, end) in ranges {
-                        if sink.capped {
+                        if sink.capped || sink.bytes_capped {
                             break;
                         }
                         let rows = sink.rows.len();
@@ -453,7 +521,8 @@ fn search(
                 continue;
             }
             lines_truncated |= sink.lines_truncated;
-            let name = header(path, root, is_dir, cwd);
+            bytes_left = sink.bytes_left.unwrap_or(bytes_left);
+            bytes_capped = sink.bytes_capped;
             if sink.capped {
                 let limit_bound = match mode {
                     GrepMode::Content => limit - total <= per_file,
@@ -466,6 +535,42 @@ fn search(
                 }
             }
             if sink.kept > 0 {
+                if let Some(structured) = &mut structured {
+                    if mode != GrepMode::Content {
+                        let bytes = name.len() + 1;
+                        if bytes > bytes_left {
+                            bytes_capped = true;
+                            break 'roots;
+                        }
+                        bytes_left -= bytes;
+                    }
+                    match mode {
+                        GrepMode::Content => {
+                            structured
+                                .matches
+                                .extend(sink.rows.iter().filter_map(|row| {
+                                    let (line, text, context) = match row {
+                                        Row::Match(line, text) => (*line, text, false),
+                                        Row::Context(line, text) | Row::Before(line, text) => {
+                                            (*line, text, true)
+                                        }
+                                        Row::Break => return None,
+                                    };
+                                    Some(GrepMatch {
+                                        path: name.clone(),
+                                        line,
+                                        text: text.clone(),
+                                        context,
+                                    })
+                                }))
+                        }
+                        GrepMode::Files => structured.files.push(name.clone()),
+                        GrepMode::Count => structured.counts.push(GrepCount {
+                            path: name.clone(),
+                            count: sink.kept,
+                        }),
+                    }
+                }
                 groups.push(match mode {
                     GrepMode::Files => name,
                     GrepMode::Count => format!("{name}:{}", sink.kept),
@@ -491,18 +596,28 @@ fn search(
                     _ => 1,
                 };
             }
-            if limit_reached {
+            if limit_reached || bytes_capped {
                 break 'roots;
             }
         }
     }
     // ripgrep exits 2 after any walk/read error, and pi rejects that unless it killed rg
     // for the match limit.
-    if !limit_reached && !errors.is_empty() {
+    if !limit_reached && !bytes_capped && !errors.is_empty() {
         return Err(errors.join("\n"));
     }
+    let structured_content = structured.map(|mut result| {
+        result.truncated = lines_truncated || limit_reached || bytes_capped;
+        json!(result)
+    });
     if groups.is_empty() {
-        return Ok(("No matches found".into(), None));
+        return Ok(ToolOutput {
+            content: vec![UserBlock::Text {
+                text: "No matches found".into(),
+            }],
+            structured_content,
+            ..ToolOutput::default()
+        });
     }
 
     let separator = if mode == GrepMode::Content {
@@ -521,7 +636,7 @@ fn search(
         };
         notices.push(format!(
             "{limit} {unit} limit reached. Use limit={} for more, or refine pattern",
-            limit * 2
+            limit.saturating_mul(2)
         ));
         details.insert("matchLimitReached".into(), limit.into());
     }
@@ -545,11 +660,17 @@ fn search(
     let mut after_notices = Vec::new();
     if lines_truncated {
         after_notices.push(format!(
-            "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            "Some lines truncated to {max_line_length} chars. Use read tool to see full lines"
         ));
         details.insert("linesTruncated".into(), true.into());
     }
-    Ok(super::byte_capped(&raw, notices, after_notices, details))
+    let (text, details) = super::byte_capped(&raw, notices, after_notices, details);
+    Ok(ToolOutput {
+        content: vec![UserBlock::Text { text }],
+        details,
+        structured_content,
+        ..ToolOutput::default()
+    })
 }
 
 #[cfg(test)]
@@ -567,7 +688,19 @@ mod tests {
                 ranges: None,
             })
             .collect();
-        search(args, roots, Vec::new(), dir, &CancellationToken::new()).unwrap()
+        let output = search(
+            args,
+            roots,
+            Vec::new(),
+            dir,
+            &CancellationToken::new(),
+            false,
+        )
+        .unwrap();
+        let Some(UserBlock::Text { text }) = output.content.into_iter().next() else {
+            panic!("expected text block");
+        };
+        (text, output.details)
     }
 
     fn run(dir: &Path, args: Value, paths: &[&str]) -> String {

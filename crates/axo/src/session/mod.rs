@@ -9,6 +9,8 @@ pub(crate) mod journal;
 pub(crate) mod maintenance;
 pub(crate) mod modes;
 mod policy;
+#[cfg(test)]
+mod program_results;
 pub(crate) mod prompt;
 mod prompt_cache;
 pub(crate) mod registrations;
