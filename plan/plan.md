@@ -98,7 +98,7 @@ Possible only by going through `bash`, at the cost of a process per step, text i
 | Fuzzy-dedupe 50k strings | V8 or Python speed | QuickJS interprets with a 256 MB heap; slow, or bash a real runtime |
 | Hash files, diff text, resize images | Standard library or packages | `sha256sum`, `diff`, `magick` through bash |
 
-Codemode plus bash covers everything eval does except state between calls and orchestration. Items 3 and 6 are not sandbox limits: `agent()` or `completion()` is another host function or tool call. What a sandbox cannot give on its own is state or a handle that outlives the script.
+pi's codemode plus bash covers everything eval does except live state between calls and orchestration. Items 3 and 6 are not sandbox limits: `agent()` or `completion()` is another host function or tool call. What a sandbox cannot give on its own is state or a handle that outlives the script.
 
 ### Embedded, not the Bun host
 
