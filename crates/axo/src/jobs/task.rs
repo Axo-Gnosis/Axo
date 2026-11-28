@@ -345,6 +345,8 @@ mod tests {
             updates: ToolUpdates::sink(),
             steer: SteerSignal::never(),
             invocation: ToolInvocationId(7),
+            parent: None,
+            calls: axo_agent::Calls::none(),
         }
     }
 

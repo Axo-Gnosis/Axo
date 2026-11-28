@@ -577,7 +577,7 @@ impl SessionHooks {
                     name: tool.name().to_owned(),
                     description: tool.description().to_owned(),
                     parameters: tool.parameters().clone(),
-                    raw_input: None,
+                    raw_input: tool.raw_input().map(str::to_owned),
                 })
                 .collect();
             let changes = axo_ai::transcript::tool_state_changes(

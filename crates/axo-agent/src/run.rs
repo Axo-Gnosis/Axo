@@ -1235,7 +1235,7 @@ fn declare_tool_changes(
             name: tool.name().to_owned(),
             description: tool.description().to_owned(),
             parameters: tool.parameters().clone(),
-            raw_input: None,
+            raw_input: tool.raw_input().map(str::to_owned),
         })
         .collect();
     let changes = tool_state_changes(&declared, &executable);
