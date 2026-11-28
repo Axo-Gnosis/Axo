@@ -62,7 +62,7 @@ Hosts spawn asynchronous children with `Session::spawn` and teams with `Session:
 
 ### Supervised commands & background jobs
 
-Every local command runs in a host-selected container (`Supervision::ProcessGroup` or `Supervision::Cgroup`); long commands and `codemode` scripts can continue as `bg_N` background jobs whose results are delivered exactly once. Scripts are tasks, not subprocesses; use the same `proc://`, `wait`, and `kill` tools. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) and [Background Job Durability](crates/axo/docs/sessions-and-compaction.md#background-job-durability).
+Every local command runs in a host-selected container (`Supervision::ProcessGroup` or `Supervision::Cgroup`). Long commands and `codemode` scripts can continue as `bg_N` background jobs. Each result is consumed once, either through a model-visible message or by a `wait` inside a script without a model-visible message of its own. Scripts are tasks, not subprocesses, and use the same `proc://`, `wait`, and `kill` tools. See [Command supervision](crates/axo/docs/configuration.md#command-supervision-axosupervision) and [Background Job Durability](crates/axo/docs/sessions-and-compaction.md#background-job-durability).
 
 Hosts can read live or retained output as raw merged bytes or stdout/stderr-tagged chunks through `CommandOutput`, with durable `.streams` sidecars. Ordering is capture order, not guaranteed cross-stream write chronology. See [Background jobs for hosts](crates/axo/docs/extending.md#background-jobs-for-hosts).
 
