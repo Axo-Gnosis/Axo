@@ -1,9 +1,10 @@
-//! Per-session command and child-session jobs, and the session's incoming mail.
+//! Per-session command, script and child-session jobs, and the session's incoming mail.
 //! Rows own ordered messages with separate admission and delivery receipts;
 //! rebuilding uses every raw journal entry.
 
 pub(crate) mod child;
 pub(crate) mod command;
+pub(crate) mod task;
 
 use child::{ChildMessage, ChildPhase, ChildRun};
 pub use command::{CommandOutput, OutputProgress};
@@ -29,6 +30,7 @@ use crate::schemes::artifact::Artifacts;
 use crate::session::children::SessionTable;
 use crate::session::{SessionEvent, journal};
 use crate::store::{Entry, Header, SeqEntry, TeamRef};
+use crate::tools::FileRecord;
 
 /// Custom type of the message that delivers background job results.
 pub(crate) const JOB_RESULT: &str = "job_result";
@@ -173,7 +175,7 @@ pub struct JobInfo {
     pub status: JobStatus,
     /// The tool call that started or spawned it; `None` for host spawns.
     pub call_id: Option<String>,
-    /// Command spawn or child admission time, in milliseconds since the epoch.
+    /// Command or script start, or child admission time, in milliseconds since the epoch.
     pub started_at: i64,
     pub kind: JobKind,
     pub messages: Vec<JobMessageInfo>,
@@ -193,6 +195,16 @@ pub enum JobKind {
         cwd: PathBuf,
         artifact: u64,
         /// `None` for foreground commands retained for their helpers.
+        promotion: Option<Promotion>,
+        promoted_at: Option<i64>,
+        ended_at: Option<i64>,
+        exit: Option<CommandExit>,
+    },
+    /// A script running as a job (the `codemode` tool).
+    Script {
+        /// The display label supplied by the tool.
+        label: String,
+        artifact: u64,
         promotion: Option<Promotion>,
         promoted_at: Option<i64>,
         ended_at: Option<i64>,
@@ -322,13 +334,14 @@ struct JobMessage {
     note: bool,
     usage: Option<Usage>,
     value: Option<Value>,
+    files: Vec<FileRecord>,
     /// `None` once delivered: the transcript holds it.
     text: Option<String>,
     delivery: Delivery,
 }
 
 impl JobMessage {
-    fn command(text: String, is_error: bool) -> Self {
+    fn command(text: String, is_error: bool, files: Vec<FileRecord>) -> Self {
         Self {
             is_error,
             partial: false,
@@ -336,6 +349,7 @@ impl JobMessage {
             note: false,
             usage: None,
             value: None,
+            files,
             text: Some(text),
             delivery: Delivery::NotDeliverable,
         }
@@ -377,8 +391,16 @@ impl Job {
                     _ if last.is_none() => JobStatus::Running,
                     _ => ended_status(),
                 };
-                (
-                    status,
+                let kind = if run.script {
+                    JobKind::Script {
+                        label: run.command.clone(),
+                        promotion: run.promotion,
+                        promoted_at: run.promoted_at,
+                        ended_at: run.ended_at,
+                        exit: run.exit.clone(),
+                        artifact: run.artifact,
+                    }
+                } else {
                     JobKind::Command {
                         command: run.command.clone(),
                         tool: run.tool.clone(),
@@ -388,8 +410,9 @@ impl Job {
                         ended_at: run.ended_at,
                         exit: run.exit.clone(),
                         artifact: run.artifact,
-                    },
-                )
+                    }
+                };
+                (status, kind)
             }
             Kind::Child(run) => (
                 match run.phase {
@@ -493,6 +516,15 @@ pub(crate) struct ReservedMessage {
     pub(crate) msg: MessageRef,
     pub(crate) label: String,
     pub(crate) text: String,
+    pub(crate) files: Vec<FileRecord>,
+}
+
+/// Adds file records to the message that delivers these results.
+pub(crate) fn add_result_files(details: &mut Value, results: &[ReservedMessage]) {
+    let files: Vec<_> = results.iter().flat_map(|result| &result.files).collect();
+    if !files.is_empty() {
+        details["files"] = serde_json::json!(files);
+    }
 }
 
 /// Journal metadata reserved for one message; settled only after its append completes.
@@ -520,6 +552,15 @@ struct Replayed {
     next_agent: u64,
     next_team: u64,
     unended: Vec<JobId>,
+}
+
+fn interrupted_script_files(
+    _entries: &[SeqEntry],
+    _session_id: &str,
+    _id: JobId,
+) -> Vec<FileRecord> {
+    // integration: after this job's JobStart, collect details.files from NestedToolCall entries for its root call.
+    Vec::new()
 }
 
 /// Rebuilds listed jobs from the journal without opening a session.
@@ -563,7 +604,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                 job_id,
                 command,
                 artifact,
-                ..
+                script,
             } => {
                 let Some(id) = JobId::parse(job_id) else {
                     continue;
@@ -575,6 +616,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                         Job {
                             kind: Kind::Command(CommandRun {
                                 command: command.clone(),
+                                script: *script,
                                 call_id: call_id.clone(),
                                 tool: tool.clone().unwrap_or_default(),
                                 cwd: cwd.clone().unwrap_or_default(),
@@ -674,7 +716,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                 note,
                 usage,
                 value,
-                ..
+                files,
             } => {
                 if let Some(msg) = MessageRef::parse(job_id) {
                     observe(msg.job);
@@ -690,6 +732,7 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                             base.timestamp_ms(),
                             usage,
                             value,
+                            files,
                         ),
                     );
                 }
@@ -704,7 +747,8 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
             job.admission = Admission::Admitted;
         }
     }
-    for (msg, (text, is_error, partial, run_id, note, exit, ended_at, usage, value)) in ended {
+    for (msg, (text, is_error, partial, run_id, note, exit, ended_at, usage, value, files)) in ended
+    {
         if let Some(job) = jobs.get_mut(&msg.job) {
             if matches!(&job.kind, Kind::Command(_)) && msg.seq != 1 {
                 continue;
@@ -723,6 +767,11 @@ fn replay(session_id: &str, child_depth: u32, entries: &[SeqEntry]) -> Replayed 
                     note,
                     usage: usage.clone(),
                     value: value.clone(),
+                    files: if was_delivered {
+                        Vec::new()
+                    } else {
+                        files.clone()
+                    },
                     text: (!was_delivered).then(|| text.clone()),
                     delivery: if was_delivered {
                         Delivery::Delivered
@@ -795,8 +844,8 @@ impl JobRegistry {
                 match id.ns {
                     Namespace::Agent => self.admit_child(id).await,
                     Namespace::Bg => {
-                        if let Some((text, is_error, exit)) = self.admitted(id) {
-                            self.command_done(id, text, is_error, exit).await;
+                        if let Some((text, is_error, exit, files)) = self.admitted(id) {
+                            self.command_done(id, text, is_error, exit, files).await;
                         }
                     }
                 }
@@ -821,14 +870,15 @@ impl JobRegistry {
             return None;
         }
         let jobs: Vec<String> = results.iter().map(|r| r.msg.to_string()).collect();
+        let text = format!("Background job results:\n\n{}", render_results(&results));
+        let mut details = serde_json::json!({ "jobs": jobs });
+        add_result_files(&mut details, &results);
         Some(QueuedMessage {
             message: AgentMessage::Custom(CustomMessage {
                 custom_type: JOB_RESULT.into(),
-                content: vec![UserBlock::Text {
-                    text: format!("Background job results:\n\n{}", render_results(&results)),
-                }],
+                content: vec![UserBlock::Text { text }],
                 display: true,
-                details: Some(serde_json::json!({ "jobs": jobs })),
+                details: Some(details),
                 timestamp: axo_ai::now_ms(),
             }),
             id: Some(id),
@@ -839,30 +889,36 @@ impl JobRegistry {
         self.reserve(DeliveryKey::Invocation(invocation))
     }
 
-    /// Ends interrupted commands without starting delivery during session open.
+    /// Ends interrupted jobs without starting delivery during session open.
     pub(crate) async fn reconcile(
         &self,
         unfinished: Vec<JobId>,
+        entries: &[SeqEntry],
         artifacts: &Artifacts,
         host: &dyn JobHost,
     ) -> Result<(), Error> {
         for id in unfinished {
-            let Some((
-                JobInfo {
-                    kind: JobKind::Command { artifact, .. },
-                    ..
-                },
-                _,
-            )) = self.get(id)
-            else {
+            let Some((job, _)) = self.get(id) else {
                 continue;
             };
-            let text = if artifacts.find(artifact).is_some() {
-                format!(
-                    "Command was interrupted when the session closed; it may have partially run. Output so far: artifact://{artifact}"
-                )
-            } else {
-                "Command was interrupted when the session closed; it may have partially run. Its output is unavailable.".to_owned()
+            let (text, files) = match job.kind {
+                JobKind::Script { artifact, .. } => (
+                    format!(
+                        "Script was interrupted when the session closed; it may have partially run. Output so far: artifact://{artifact}"
+                    ),
+                    interrupted_script_files(entries, &self.session_id, id),
+                ),
+                JobKind::Command { artifact, .. } => (
+                    if artifacts.find(artifact).is_some() {
+                        format!(
+                            "Command was interrupted when the session closed; it may have partially run. Output so far: artifact://{artifact}"
+                        )
+                    } else {
+                        "Command was interrupted when the session closed; it may have partially run. Its output is unavailable.".to_owned()
+                    },
+                    Vec::new(),
+                ),
+                JobKind::Child { .. } => continue,
             };
             let base = journal::base();
             let ended_at = base.timestamp_ms();
@@ -877,14 +933,15 @@ impl JobRegistry {
                 exit: Some(CommandExit::Interrupted),
                 usage: None,
                 value: None,
+                files: files.clone(),
             })
             .await?;
-            self.recovered_end(id, text, ended_at);
+            self.recovered_end(id, text, ended_at, files);
         }
         Ok(())
     }
 
-    /// Rebuilds from every raw entry, returning admitted unfinished commands for reconciliation.
+    /// Rebuilds from every raw entry, returning admitted unfinished commands and scripts for reconciliation.
     pub(crate) fn new(
         session_id: String,
         child_depth: u32,
@@ -982,10 +1039,11 @@ impl JobRegistry {
         }
     }
 
-    /// A newly started foreground command.
+    /// A newly started foreground command or script.
     fn register(&self, request: RegisterCommand) -> JobId {
         let RegisterCommand {
             command,
+            script,
             tool,
             cwd,
             call_id,
@@ -1008,6 +1066,7 @@ impl JobRegistry {
             Job {
                 kind: Kind::Command(CommandRun {
                     command,
+                    script,
                     tool,
                     cwd,
                     call_id,
@@ -1016,7 +1075,7 @@ impl JobRegistry {
                     promoted_at: None,
                     ended_at: None,
                     exit: None,
-                    output: Some(output),
+                    output,
                     artifact,
                     phase: Phase::Running,
                     control: Some(control),
@@ -1059,6 +1118,7 @@ impl JobRegistry {
             tool: Some(run.tool.clone()),
             cwd: Some(run.cwd.clone()),
             promotion: run.promotion,
+            script: run.script,
         }
     }
 
@@ -1142,13 +1202,14 @@ impl JobRegistry {
         }
     }
 
-    /// Whichever arrives second (command result or admission) journals the end.
+    /// Whichever arrives second (result or admission) journals the end.
     async fn command_done(
         &self,
         id: JobId,
         text: String,
         is_error: bool,
         exit: Option<CommandExit>,
+        files: Vec<FileRecord>,
     ) {
         let (end, ready) = {
             let mut state = self.lock();
@@ -1182,8 +1243,10 @@ impl JobRegistry {
                         exit,
                         usage: None,
                         value: None,
+                        files: files.clone(),
                     });
-            job.messages.insert(1, JobMessage::command(text, is_error));
+            job.messages
+                .insert(1, JobMessage::command(text, is_error, files));
             (end, shut_down && job.release_message(1))
         };
         self.bump();
@@ -1213,14 +1276,21 @@ impl JobRegistry {
     }
 
     /// Already journaled; opening never starts delivery.
-    fn recovered_end(&self, id: JobId, text: String, ended_at: Option<i64>) {
+    fn recovered_end(
+        &self,
+        id: JobId,
+        text: String,
+        ended_at: Option<i64>,
+        files: Vec<FileRecord>,
+    ) {
         if let Some(job) = self.lock().jobs.get_mut(&id) {
             if let Kind::Command(run) = &mut job.kind {
                 run.ended_at = ended_at;
                 run.exit = Some(CommandExit::Interrupted);
                 run.phase = Phase::Closed;
             }
-            job.messages.insert(1, JobMessage::command(text, true));
+            job.messages
+                .insert(1, JobMessage::command(text, true, files));
             job.release_message(1);
         }
         self.bump();
@@ -1237,7 +1307,7 @@ impl JobRegistry {
         self.bump();
     }
 
-    /// A never-promoted command leaves no state after its container closes.
+    /// A never-promoted command or script leaves no state after it closes.
     fn closed(&self, id: JobId) {
         let mut state = self.lock();
         let Some(Job {
@@ -1276,7 +1346,7 @@ impl JobRegistry {
         }
     }
 
-    /// Stops a listed command or the current run of a live child.
+    /// Stops a listed command, a script or the current run of a live child.
     pub(crate) fn kill(&self, id: JobId, by: Killer) -> bool {
         let child_id = {
             let state = self.lock();
@@ -1308,8 +1378,8 @@ impl JobRegistry {
         self.lock().admissions.remove(&invocation)
     }
 
-    /// Commits admission, returning an already-ended command for `command_done`.
-    fn admitted(&self, id: JobId) -> Option<(String, bool, Option<CommandExit>)> {
+    /// Commits admission, returning an already-ended background result for `command_done`.
+    fn admitted(&self, id: JobId) -> Option<(String, bool, Option<CommandExit>, Vec<FileRecord>)> {
         let (end, ready) = {
             let mut state = self.lock();
             let shut_down = state.shut_down;
@@ -1334,6 +1404,7 @@ impl JobRegistry {
                         result.text.clone().unwrap_or_default(),
                         result.is_error,
                         exit,
+                        result.files.clone(),
                     )
                 });
             (end, shut_down && job.release_message(1))
@@ -1400,6 +1471,7 @@ impl JobRegistry {
                     },
                     label,
                     text,
+                    files: message.files.clone(),
                 });
             }
         }
@@ -1427,6 +1499,7 @@ impl JobRegistry {
                     message.delivery = to.clone();
                     if to == Delivery::Delivered {
                         message.text = None;
+                        message.files = Vec::new();
                     }
                     changed = true;
                 }
@@ -1583,7 +1656,7 @@ impl JobRegistry {
             .jobs
             .iter()
             .filter_map(|(id, job)| match &job.kind {
-                Kind::Command(run) if run.call_id == call_id => Some(id.to_string()),
+                Kind::Command(run) if !run.script && run.call_id == call_id => Some(id.to_string()),
                 _ => None,
             })
             .collect()
@@ -1594,8 +1667,8 @@ impl JobRegistry {
             let state = self.lock();
             let (id, run) = match key {
                 OutputKey::Job(id) => match &state.jobs.get(&id)?.kind {
-                    Kind::Command(run) => (id, run),
-                    Kind::Child(_) => return None,
+                    Kind::Command(run) if !run.script || run.phase == Phase::Closed => (id, run),
+                    _ => return None,
                 },
                 OutputKey::Call(call) => {
                     state
@@ -1603,7 +1676,9 @@ impl JobRegistry {
                         .iter()
                         .rev()
                         .find_map(|(id, job)| match &job.kind {
-                            Kind::Command(run) if run.call_id == call => Some((*id, run)),
+                            Kind::Command(run) if !run.script && run.call_id == call => {
+                                Some((*id, run))
+                            }
                             _ => None,
                         })?
                 }
@@ -1726,6 +1801,7 @@ impl JobRegistry {
                             exit: None,
                             usage: message.usage.clone(),
                             value: message.value.clone(),
+                            files: Vec::new(),
                         },
                     ))
                 })
@@ -2065,6 +2141,7 @@ impl JobRegistry {
                             note: message.note,
                             usage: message.usage,
                             value: message.value,
+                            files: Vec::new(),
                             delivery: Delivery::Held,
                         },
                     );
@@ -2088,6 +2165,7 @@ impl JobRegistry {
                     exit: None,
                     usage: message.usage.clone(),
                     value: message.value.clone(),
+                    files: Vec::new(),
                 };
                 job.messages.insert(
                     seq,
@@ -2099,6 +2177,7 @@ impl JobRegistry {
                         note: message.note,
                         usage: message.usage,
                         value: message.value,
+                        files: Vec::new(),
                         delivery: Delivery::NotDeliverable,
                     },
                 );
@@ -2148,7 +2227,7 @@ impl JobRegistry {
         })
     }
 
-    /// Stops commands and awaits their tasks; the parent session shuts down children.
+    /// Stops commands and scripts and awaits their tasks; the parent session shuts down children.
     pub(crate) async fn shutdown(&self) {
         let tasks: Vec<_> = {
             let mut state = self.lock();
@@ -2175,7 +2254,7 @@ impl JobRegistry {
         }
     }
 
-    /// Kills command processes without waiting; for `Drop`.
+    /// Kills command processes and cancels scripts without waiting; for `Drop`.
     pub(crate) fn kill_all(&self) {
         let mut state = self.lock();
         state.shut_down = true;
@@ -2184,7 +2263,11 @@ impl JobRegistry {
                 && run.phase != Phase::Closed
                 && let Some(control) = &run.control
             {
-                control.container.kill();
+                if let Some(container) = &control.container {
+                    container.kill();
+                } else {
+                    control.stop(Stop::Shutdown);
+                }
             }
         }
         drop(state);

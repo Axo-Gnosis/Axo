@@ -106,14 +106,14 @@ pub(super) enum Stop {
     Aborted,
     TimedOut(f64),
     Killed(Killer),
-    /// The session shut down around the command.
+    /// The session shut down around the job.
     Shutdown,
 }
 
 pub(super) struct JobControl {
     pub(super) cancel: CancellationToken,
     pub(super) stop: Mutex<Option<Stop>>,
-    pub(super) container: Container,
+    pub(super) container: Option<Container>,
     pub(super) promote: Notify,
 }
 
@@ -129,6 +129,7 @@ impl JobControl {
 
 pub(super) struct CommandRun {
     pub(super) command: String,
+    pub(super) script: bool,
     pub(super) call_id: String,
     pub(super) tool: String,
     pub(super) cwd: PathBuf,
@@ -137,7 +138,7 @@ pub(super) struct CommandRun {
     pub(super) promoted_at: Option<i64>,
     pub(super) ended_at: Option<i64>,
     pub(super) exit: Option<CommandExit>,
-    /// `None` for replayed rows. In-process rows retain output state after closing.
+    /// Live capture state for processes; absent for scripts and replayed rows.
     pub(super) output: Option<Arc<OutputState>>,
     pub(super) artifact: u64,
     pub(super) mode: Mode,
@@ -148,13 +149,14 @@ pub(super) struct CommandRun {
 
 pub(super) struct RegisterCommand {
     pub(super) command: String,
+    pub(super) script: bool,
     pub(super) tool: String,
     pub(super) cwd: PathBuf,
     pub(super) call_id: String,
     pub(super) started_at: i64,
     pub(super) artifact: u64,
     pub(super) control: Arc<JobControl>,
-    pub(super) output: Arc<OutputState>,
+    pub(super) output: Option<Arc<OutputState>>,
 }
 
 pub(super) struct OutputState {
@@ -492,7 +494,7 @@ impl CommandRunner {
         let control = Arc::new(JobControl {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
-            container: process.container(),
+            container: Some(process.container()),
             promote: Notify::new(),
         });
         let output = Arc::new(OutputState {
@@ -501,13 +503,14 @@ impl CommandRunner {
         });
         let id = jobs.register(RegisterCommand {
             command: label,
+            script: false,
             tool: call.name.clone(),
             cwd,
             call_id: call.id.clone(),
             started_at,
             artifact,
             control: control.clone(),
-            output: output.clone(),
+            output: Some(output.clone()),
         });
         let (done, mut ended) = oneshot::channel();
         let mut changes = output.progress.subscribe();
@@ -647,12 +650,12 @@ struct CommandShared {
     done: Mutex<Option<oneshot::Sender<CommandEnd>>>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Stops the job when the waiter is dropped before its command finished.
-struct StopOnDrop<'a>(Option<(&'a JobRegistry, JobId)>);
+/// Stops the job when the waiter is dropped before it finishes.
+pub(super) struct StopOnDrop<'a>(pub(super) Option<(&'a JobRegistry, JobId)>);
 
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
@@ -868,11 +871,13 @@ impl CommandTask {
             }
         }
         if promoted {
-            jobs.command_done(id, text, is_error, exit).await;
+            jobs.command_done(id, text, is_error, exit, Vec::new())
+                .await;
         } else {
             if retained {
                 // `proc://bg_N` shows the result while the helpers run; never journaled.
-                jobs.command_done(id, text.clone(), is_error, exit).await;
+                jobs.command_done(id, text.clone(), is_error, exit, Vec::new())
+                    .await;
             }
             if let Some(done) = lock(&shared.done).take() {
                 let _ = done.send(CommandEnd {
@@ -935,7 +940,7 @@ impl CommandTask {
 }
 
 /// Appends `text`'s status line after a blank line, or uses it alone for empty output.
-fn with_status(text: String, line: &str) -> String {
+pub(super) fn with_status(text: String, line: &str) -> String {
     if text.is_empty() {
         line.to_owned()
     } else {

@@ -69,7 +69,8 @@ pub use changes::{
     FileChange, LineDiff, Omitted, SnapshotBlob, SquashedChange, file_changes, squash,
 };
 pub use ledger::{
-    FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, lock_file,
+    FileAccess, FileLedger, FileRecord, LedgerRecord, file_details, file_records, file_records_in,
+    lock_file,
 };
 pub(crate) use ledger::{file_key, ledger_records};
 pub use shell::{ShellKind, ShellUnit, classify_bash};

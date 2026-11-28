@@ -622,7 +622,8 @@ impl Session {
             .command_output(call_id, self.hooks.tools.schemes.artifacts().dir())
     }
 
-    /// Opens one command's flushed raw output by job id (`bg_N`), foreground commands included.
+    /// Opens flushed command output or a finished script's log by job id (`bg_N`).
+    /// Foreground commands are included; use the artifact for a running script.
     #[ext(skip = "live reader; the wire method reads one page")]
     pub fn job_output(&self, job_id: &str) -> Option<crate::jobs::CommandOutput> {
         self.hooks
@@ -638,7 +639,7 @@ impl Session {
         self.hooks.tools.runner.jobs.command_jobs(call_id)
     }
 
-    /// Requests promotion of every foreground command the call started. A command that finishes first stays foreground.
+    /// Requests promotion of each foreground command or script the call started. Work that finishes first stays foreground.
     #[ext]
     pub fn background(&self, call_id: &str) -> bool {
         self.hooks.tools.runner.jobs.background(call_id)

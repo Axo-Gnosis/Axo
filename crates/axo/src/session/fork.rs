@@ -96,13 +96,22 @@ impl Session {
         // The blobs the fork's path references: its file changes stay reviewable.
         let snapshots = path
             .iter()
-            .flat_map(|entry| match entry {
-                Entry::Message {
-                    message: AgentMessage::Llm(Message::ToolResult(result)),
-                    ..
-                } => tools::file_changes(result),
-                _ => Vec::new(),
+            .flat_map(|entry| {
+                let details = match entry {
+                    Entry::Message {
+                        message: AgentMessage::Llm(Message::ToolResult(result)),
+                        ..
+                    } => &result.details,
+                    Entry::Message {
+                        message: AgentMessage::Custom(message),
+                        ..
+                    } => &message.details,
+                    Entry::CustomMessage { details, .. } => details,
+                    _ => return Vec::new(),
+                };
+                tools::file_records_in(details.as_ref())
             })
+            .filter_map(|record| record.change)
             .flat_map(|change| change.before.into_iter().chain([change.after]))
             .filter(|blob| blob.omitted.is_none())
             .map(|blob| blob.sha256)

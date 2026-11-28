@@ -78,7 +78,7 @@ pub use tools::{
     LineDiff, MAX_SNAPSHOT_BYTES, MarkdownBlock, NumberQuestion, Omitted, QuestionOption,
     SessionTools, ShellKind, ShellUnit, SnapshotBlob, SnapshotStore, SquashedChange, TextQuestion,
     ToolAccess, ToolFactory, WriteRoot, WriteScope, Written, classify_bash, file_changes,
-    file_details, file_records, squash, valid_tool_name,
+    file_details, file_records, file_records_in, squash, valid_tool_name,
 };
 
 #[cfg(doctest)]
