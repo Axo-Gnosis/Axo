@@ -494,7 +494,7 @@ impl Session {
                 child,
             }
         });
-        let agent = Arc::new(Agent::new(AgentConfig {
+        let agent = Agent::new(AgentConfig {
             thinking,
             service_tier: tier,
             tools,
@@ -505,7 +505,7 @@ impl Session {
             follow_up_mode: settings.follow_up_mode,
             session_id: Some(session_id.clone()),
             ..AgentConfig::new(inherited.streamer.clone(), model)
-        }));
+        });
         let _ = hooks.agent.set(Arc::downgrade(&agent));
         tokio::spawn(super::prompt_cache::keep_warm(
             Arc::downgrade(&hooks),

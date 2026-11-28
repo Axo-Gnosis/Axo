@@ -143,6 +143,7 @@ impl Tool for RemoteTool {
             Ok(ToolOutput {
                 content: output.content,
                 details: output.details,
+                structured_content: None,
                 is_error: output.is_error.unwrap_or(false),
                 terminate: output.terminate.unwrap_or(false),
             })

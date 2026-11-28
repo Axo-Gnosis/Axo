@@ -442,6 +442,7 @@ impl CommandRunner {
             updates,
             mut steer,
             invocation,
+            ..
         } = cx;
         let CommandRequest {
             mut spec,
@@ -590,6 +591,7 @@ impl CommandRunner {
                                 "job": name,
                                 "fullOutput": format!("artifact://{artifact}"),
                             })),
+                            structured_content: None,
                             is_error: false,
                             terminate: false,
                         });
@@ -625,6 +627,7 @@ impl CommandRunner {
         Ok(ToolOutput {
             content: vec![UserBlock::Text { text }],
             details: end.details,
+            structured_content: None,
             is_error: end.is_error,
             terminate: false,
         })

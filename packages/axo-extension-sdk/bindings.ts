@@ -73,10 +73,10 @@ export type AgentDef_Serialize =
 /**  A team roster and charter. */
 { type: "team"; value: TeamSpec_Serialize };
 
-/**  One event of a run, delivered to the ordered, awaited [`Persist`] sink. */
+/**  One event of a run or nested call, delivered to the awaited [`Persist`] sink. */
 export type AgentEvent = AgentEvent_Serialize | AgentEvent_Deserialize;
 
-/**  One event of a run, delivered to the ordered, awaited [`Persist`] sink. */
+/**  One event of a run or nested call, delivered to the awaited [`Persist`] sink. */
 export type AgentEvent_Deserialize = { type: "agentStart" } | 
 /**  Last event of a run; `messages` are the messages this run added. */
 { type: "agentEnd"; messages: AgentMessage_Deserialize[] } | { type: "turnStart" } | { type: "turnEnd"; message: AgentMessage_Deserialize; toolResults: ToolResultMessage_Deserialize[] } | 
@@ -91,11 +91,11 @@ export type AgentEvent_Deserialize = { type: "agentStart" } |
  */
 { type: "messageUpdate"; event: AssistantEvent_Deserialize } | 
 /**  The finished message. */
-{ type: "messageEnd"; message: AgentMessage_Deserialize; origin: MessageOrigin_Deserialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value } } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Deserialize } | 
+{ type: "messageEnd"; message: AgentMessage_Deserialize; origin: MessageOrigin_Deserialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value }; parentCallId?: string | null } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Deserialize; parentCallId?: string | null } | 
 /**  The finalized result (after `after_tool_call`), in completion order. */
-{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Deserialize };
+{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Deserialize; parentCallId?: string | null; invocation?: ToolInvocationId | null; durationMs?: number | null };
 
-/**  One event of a run, delivered to the ordered, awaited [`Persist`] sink. */
+/**  One event of a run or nested call, delivered to the awaited [`Persist`] sink. */
 export type AgentEvent_Serialize = { type: "agentStart" } | 
 /**  Last event of a run; `messages` are the messages this run added. */
 { type: "agentEnd"; messages: AgentMessage_Serialize[] } | { type: "turnStart" } | { type: "turnEnd"; message: AgentMessage_Serialize; toolResults: ToolResultMessage_Serialize[] } | 
@@ -110,9 +110,9 @@ export type AgentEvent_Serialize = { type: "agentStart" } |
  */
 { type: "messageUpdate"; event: AssistantEvent_Serialize } | 
 /**  The finished message. */
-{ type: "messageEnd"; message: AgentMessage_Serialize; origin: MessageOrigin_Serialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value } } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Serialize } | 
+{ type: "messageEnd"; message: AgentMessage_Serialize; origin: MessageOrigin_Serialize } | { type: "toolExecutionStart"; callId: string; name: string; args: { [key in string]: Value }; parentCallId?: string } | { type: "toolExecutionUpdate"; callId: string; update: ToolUpdate_Serialize; parentCallId?: string } | 
 /**  The finalized result (after `after_tool_call`), in completion order. */
-{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Serialize };
+{ type: "toolExecutionEnd"; callId: string; name: string; result: ToolOutput_Serialize; parentCallId?: string; invocation?: ToolInvocationId; durationMs?: number };
 
 /**
  *  A transcript entry. `Custom` messages never reach a provider directly:
@@ -4746,6 +4746,8 @@ export type ToolOutput_Deserialize = {
 	content: UserBlock[],
 	/**  Host/log data; never reaches the model. */
 	details?: Value | null,
+	/**  A typed value for programmatic callers; never reaches the model or transcript. */
+	structuredContent?: Value | null,
 	isError: boolean,
 	/**  Hint to stop after this batch; only honored when every result in the batch sets it. */
 	terminate: boolean,
@@ -4756,6 +4758,8 @@ export type ToolOutput_Serialize = {
 	content: UserBlock[],
 	/**  Host/log data; never reaches the model. */
 	details: Value | null,
+	/**  A typed value for programmatic callers; never reaches the model or transcript. */
+	structuredContent?: Value,
 	isError: boolean,
 	/**  Hint to stop after this batch; only honored when every result in the batch sets it. */
 	terminate: boolean,

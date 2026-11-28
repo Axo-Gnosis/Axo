@@ -590,8 +590,7 @@ fn steered() -> ToolOutput {
                 .into(),
         }],
         details: Some(json!({ "outcome": "steered" })),
-        is_error: false,
-        terminate: false,
+        ..ToolOutput::default()
     }
 }
 
@@ -602,8 +601,7 @@ fn dismissed() -> ToolOutput {
                 .into(),
         }],
         details: Some(json!({ "outcome": "dismissed" })),
-        is_error: false,
-        terminate: false,
+        ..ToolOutput::default()
     }
 }
 
@@ -620,8 +618,7 @@ fn answered(prefix: &str, answers: Map<String, Value>, timed_out: bool) -> ToolO
     ToolOutput {
         content: vec![UserBlock::Text { text }],
         details: Some(details),
-        is_error: false,
-        terminate: false,
+        ..ToolOutput::default()
     }
 }
 

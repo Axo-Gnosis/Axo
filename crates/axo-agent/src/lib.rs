@@ -2,6 +2,7 @@
 //! cancellation. A port of pi's `@earendil-works/pi-agent-core` (v1.3.0).
 
 pub mod agent;
+mod calls;
 pub mod cancel;
 pub mod error;
 pub mod event;
@@ -11,6 +12,7 @@ mod run;
 pub mod tool;
 
 pub use agent::{Agent, AgentConfig, QueueMode, RemovedQueued, RunOutcome, SentRequest};
+pub use calls::Calls;
 pub use cancel::CancelReason;
 pub use error::Error;
 pub use event::{AgentEvent, MessageOrigin, Persist, PersistError};

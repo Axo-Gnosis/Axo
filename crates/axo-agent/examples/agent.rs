@@ -46,9 +46,7 @@ impl Tool for FnTool {
             content: vec![UserBlock::Text {
                 text: (self.run)(&cx.call.arguments).to_string(),
             }],
-            details: None,
-            is_error: false,
-            terminate: false,
+            ..ToolOutput::default()
         })
     }
 }

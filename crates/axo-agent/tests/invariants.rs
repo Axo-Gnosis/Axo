@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axo_agent::{
-    Agent, AgentConfig, AgentContext, AgentEvent, AgentMessage, BeforeToolCallContext,
-    CancelReason, ExecutionMode, HookError, LoopHooks, MessageOrigin, Persist, PersistError,
-    QueuedMessage, RunOutcome, Tool, ToolCallDecision, ToolContext, ToolError, ToolHooks,
-    ToolInvocationId, ToolOutput, TurnContext, TurnFinish,
+    AfterToolCallContext, AfterToolCallResult, Agent, AgentConfig, AgentContext, AgentEvent,
+    AgentMessage, BeforeToolCallContext, Blocked, CancelReason, ExecutionMode, HookError,
+    LoopHooks, MessageOrigin, Persist, PersistError, QueuedMessage, RunOutcome, Tool,
+    ToolCallDecision, ToolContext, ToolError, ToolHooks, ToolInvocationId, ToolOutput, TurnContext,
+    TurnFinish,
 };
 use axo_ai::testing::{reply_text, reply_tool_calls, scripted_model};
 use axo_ai::{
@@ -709,7 +710,7 @@ fn setup(
     config.hooks = rec.clone();
     config.tool_hooks = vec![rec.clone()];
     config.persist = Some(rec.clone());
-    let agent = Arc::new(Agent::new(config));
+    let agent = Agent::new(config);
     rec.agent.set(Arc::downgrade(&agent)).unwrap();
     Harness { agent, api, rec }
 }
@@ -1879,7 +1880,7 @@ fn bare_agent(
     let mut config = AgentConfig::new(Arc::new(ScriptedApi::new(turns)), scripted_model());
     config.tools = tools;
     config.persist = Some(persist);
-    Arc::new(Agent::new(config))
+    Agent::new(config)
 }
 
 /// Shared state of the lock-inversion scenario.
@@ -2442,4 +2443,454 @@ async fn a_failed_persist_joins_every_call_first() {
         .await
         .expect("run settles");
     assert!(tool.done.load(Ordering::SeqCst));
+}
+
+// ---------------------------------------------------------------------------------------
+// Nested calls
+// ---------------------------------------------------------------------------------------
+
+struct ScriptTool<F> {
+    name: &'static str,
+    run: F,
+}
+
+#[async_trait]
+impl<F, Fut> Tool for ScriptTool<F>
+where
+    F: Fn(ToolContext) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolOutput> + Send + 'static,
+{
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "Runs a test script."
+    }
+
+    fn parameters(&self) -> &Value {
+        static SCHEMA: OnceLock<Value> = OnceLock::new();
+        SCHEMA.get_or_init(|| json!({ "type": "object" }))
+    }
+
+    fn nestable(&self) -> bool {
+        self.name != "outer"
+    }
+
+    async fn execute(&self, cx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok((self.run)(cx).await)
+    }
+}
+
+#[derive(Default)]
+struct NestedEvents {
+    events: Mutex<Vec<AgentEvent>>,
+    nested_end: Notify,
+}
+
+#[async_trait]
+impl Persist for NestedEvents {
+    async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError> {
+        if matches!(
+            event,
+            AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::ToolExecutionUpdate { .. }
+                | AgentEvent::ToolExecutionEnd { .. }
+        ) {
+            self.events.lock().unwrap().push(event.clone());
+            if matches!(
+                event,
+                AgentEvent::ToolExecutionEnd {
+                    parent_call_id: Some(_),
+                    ..
+                }
+            ) {
+                self.nested_end.notify_one();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn nested_agent<F, Fut>(mut tools: Vec<Arc<dyn Tool>>, script: F) -> (Arc<Agent>, Arc<NestedEvents>)
+where
+    F: Fn(ToolContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tools.push(Arc::new(ScriptTool {
+        name: "outer",
+        run: move |cx: ToolContext| {
+            assert!(cx.parent.is_none() && cx.calls.available());
+            let script = script(cx);
+            async move {
+                script.await;
+                ToolOutput::default()
+            }
+        },
+    }));
+    let events = Arc::new(NestedEvents::default());
+    let agent = bare_agent(
+        vec![turn(&[("outer", "outer", json!({}))]), text("done")],
+        tools,
+        events.clone(),
+    );
+    (agent, events)
+}
+
+async fn run_outer(agent: &Agent) {
+    let outcome = tokio::time::timeout(TIMEOUT, agent.prompt(vec![user("go").into()]))
+        .await
+        .expect("outer settles")
+        .expect("run succeeds");
+    assert_eq!(outcome, RunOutcome::Done);
+    let results: Vec<_> = agent
+        .messages()
+        .into_iter()
+        .filter_map(|message| match message {
+            AgentMessage::Llm(Message::ToolResult(result)) => Some(result),
+            _ => None,
+        })
+        .collect();
+    let [result] = results.as_slice() else {
+        panic!("only the outer call belongs in the transcript: {results:?}");
+    };
+    assert_eq!(result.tool_call_id, "outer");
+    assert!(
+        !result.is_error,
+        "outer failed: {}",
+        first_text(&result.content)
+    );
+}
+
+#[tokio::test]
+async fn nested_calls_emit_start_updates_and_end_under_the_outer_id() {
+    let chatty = Arc::new(ChattyTool {
+        schema: json!({ "type": "object" }),
+    });
+    let (agent, events) = nested_agent(vec![chatty.clone()], |cx| async move {
+        let tools = cx.calls.tools();
+        assert_eq!(
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            ["chatty", "deferred"]
+        );
+        assert!(!cx.calls.call("chatty", JsonMap::new()).await.is_error);
+        assert!(!cx.calls.call("deferred", JsonMap::new()).await.is_error);
+    });
+    agent.set_deferred(vec![
+        chatty,
+        Arc::new(ScriptTool {
+            name: "deferred",
+            run: |cx: ToolContext| async move {
+                assert_eq!(cx.parent.as_deref(), Some("outer"));
+                assert!(!cx.calls.available());
+                assert!(!cx.steer.is_pending());
+                ToolOutput::default()
+            },
+        }),
+    ]);
+    run_outer(&agent).await;
+    let events = events.events.lock().unwrap();
+    let mut invocations = Vec::new();
+    let calls: Vec<_> = events
+        .iter()
+        .map(|event| match event {
+            AgentEvent::ToolExecutionStart {
+                call_id,
+                parent_call_id,
+                ..
+            } => ("start", call_id.as_str(), parent_call_id.as_deref()),
+            AgentEvent::ToolExecutionUpdate {
+                call_id,
+                parent_call_id,
+                ..
+            } => ("update", call_id.as_str(), parent_call_id.as_deref()),
+            AgentEvent::ToolExecutionEnd {
+                call_id,
+                parent_call_id,
+                invocation,
+                duration_ms,
+                ..
+            } => {
+                invocations.push(invocation.expect("executed call has invocation"));
+                assert!(duration_ms.is_some());
+                ("end", call_id.as_str(), parent_call_id.as_deref())
+            }
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("start", "outer", None),
+            ("start", "outer/1", Some("outer")),
+            ("update", "outer/1", Some("outer")),
+            ("update", "outer/1", Some("outer")),
+            ("update", "outer/1", Some("outer")),
+            ("end", "outer/1", Some("outer")),
+            ("start", "outer/2", Some("outer")),
+            ("end", "outer/2", Some("outer")),
+            ("end", "outer", None),
+        ]
+    );
+    assert_eq!(
+        invocations
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+}
+
+struct NestedPolicy;
+
+#[async_trait]
+impl ToolHooks for NestedPolicy {
+    async fn before_tool_call(
+        &self,
+        cx: BeforeToolCallContext<'_>,
+        _: &CancellationToken,
+    ) -> Result<ToolCallDecision, ToolError> {
+        if cx.tool_call.name != "mark" {
+            return Ok(ToolCallDecision::Allow);
+        }
+        assert_eq!(cx.parent, Some("outer"));
+        let original = cx.assistant_message.tool_calls().next().unwrap();
+        assert_eq!(
+            (original.id.as_str(), original.name.as_str()),
+            ("outer", "outer")
+        );
+        assert!(cx.context.messages.iter().any(|message| {
+            matches!(message, AgentMessage::Llm(Message::Assistant(assistant)) if assistant == cx.assistant_message)
+        }));
+        Ok(ToolCallDecision::Block {
+            reason: Some("blocked by test".into()),
+            terminate: false,
+            origin: Some("test".into()),
+        })
+    }
+
+    async fn after_tool_call(
+        &self,
+        cx: AfterToolCallContext<'_>,
+        _: &CancellationToken,
+    ) -> Result<Option<AfterToolCallResult>, ToolError> {
+        if cx.tool_call.name != "typed" {
+            return Ok(None);
+        }
+        assert_eq!(cx.parent, Some("outer"));
+        assert_eq!(cx.result.structured_content, Some(json!({ "ok": true })));
+        Ok(Some(AfterToolCallResult {
+            content: Some(vec![UserBlock::Text {
+                text: "replaced".into(),
+            }]),
+            ..Default::default()
+        }))
+    }
+}
+
+#[tokio::test]
+async fn nested_before_hook_can_block_execution() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, _) = nested_agent(
+        vec![Arc::new(MarkTool {
+            ran: ran.clone(),
+            schema: json!({ "type": "object" }),
+        })],
+        |cx| async move {
+            let blocked = cx.calls.call("mark", JsonMap::new()).await;
+            assert!(blocked.is_error);
+            assert_eq!(first_text(&blocked.content), "blocked by test");
+            assert_eq!(
+                Blocked::of(blocked.details.as_ref())
+                    .unwrap()
+                    .origin
+                    .as_deref(),
+                Some("test")
+            );
+        },
+    );
+    agent.set_tool_hooks(vec![Arc::new(NestedPolicy)]);
+    run_outer(&agent).await;
+    assert!(!ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn nested_calls_reject_unknown_invalid_and_non_nestable_tools() {
+    let probe = Arc::new(Probe::default());
+    let (agent, events) = nested_agent(
+        vec![probe_tool("probe", ExecutionMode::Parallel, &probe)],
+        |cx| async move {
+            for (name, args, expected) in [
+                ("unknown", JsonMap::new(), "Tool unknown not found"),
+                (
+                    "probe",
+                    JsonMap::from_iter([("ms".into(), json!("wrong"))]),
+                    "Validation failed for tool \"probe\":",
+                ),
+                (
+                    "outer",
+                    JsonMap::new(),
+                    "outer cannot be called from a script",
+                ),
+            ] {
+                let result = cx.calls.call(name, args).await;
+                assert!(result.is_error);
+                assert!(
+                    first_text(&result.content).starts_with(expected),
+                    "{result:?}"
+                );
+            }
+        },
+    );
+    run_outer(&agent).await;
+    assert!(probe.started().is_empty());
+    assert_eq!(
+        events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::ToolExecutionEnd {
+                    parent_call_id: Some(_),
+                    invocation: None,
+                    duration_ms: None,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn nested_sequential_tools_never_overlap_but_parallel_ones_do() {
+    let sequential = Arc::new(Probe::default());
+    let parallel = Arc::new(Probe::default());
+    let (agent, _) = nested_agent(
+        vec![
+            probe_tool("serial", ExecutionMode::Sequential, &sequential),
+            probe_tool("parallel", ExecutionMode::Parallel, &parallel),
+        ],
+        |cx| async move {
+            for name in ["serial", "parallel"] {
+                let args = JsonMap::from_iter([("ms".into(), json!(50))]);
+                let (a, b) =
+                    tokio::join!(cx.calls.call(name, args.clone()), cx.calls.call(name, args));
+                assert!(!a.is_error && !b.is_error);
+            }
+        },
+    );
+    run_outer(&agent).await;
+    assert_eq!(sequential.max_running.load(Ordering::SeqCst), 1);
+    assert_eq!(parallel.max_running.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn nested_family_cancellation_hard_stops_and_recovers() {
+    let parked = Arc::new(ParkedTool {
+        started: Notify::new(),
+        schema: json!({ "type": "object" }),
+    });
+    let armed = Arc::new(ArmedTool {
+        schema: json!({ "type": "object" }),
+        admitted: Notify::new(),
+        recovering: Arc::default(),
+        release: Arc::default(),
+    });
+    let (agent, _) = nested_agent(vec![parked.clone(), armed.clone()], move |cx| {
+        let (parked, armed) = (parked.clone(), armed.clone());
+        async move {
+            let hung = cx.calls.call("parked", JsonMap::new());
+            let recovering = cx.calls.call("armed", JsonMap::new());
+            parked.started.notified().await;
+            armed.admitted.notified().await;
+            let stopped = std::time::Instant::now();
+            cx.calls.cancel();
+            armed.release.notify_one();
+            let (hung, recovered) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(hung, recovering)
+            })
+            .await
+            .expect("both calls settle within the stop grace plus slack");
+            assert!(stopped.elapsed() >= Duration::from_secs(3));
+            assert!(hung.is_error);
+            assert_eq!(first_text(&hung.content), "Operation aborted");
+            assert_eq!(recovered.details, Some(json!({ "mutation": "committed" })));
+        }
+    });
+    run_outer(&agent).await;
+}
+
+#[tokio::test]
+async fn nested_call_survives_outer_return_and_a_dropped_waiter() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let detached = Arc::new(ScriptTool {
+        name: "detached",
+        run: {
+            let (started, release) = (started.clone(), release.clone());
+            move |_: ToolContext| {
+                let (started, release) = (started.clone(), release.clone());
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    ToolOutput::default()
+                }
+            }
+        },
+    });
+    let (agent, events) = nested_agent(vec![detached], move |cx| {
+        let started = started.clone();
+        async move {
+            drop(cx.calls.call("detached", JsonMap::new()));
+            started.notified().await;
+        }
+    });
+    run_outer(&agent).await;
+    assert!(
+        matches!(events.events.lock().unwrap().last(), Some(AgentEvent::ToolExecutionEnd { call_id, .. }) if call_id == "outer")
+    );
+    release.notify_one();
+    tokio::time::timeout(TIMEOUT, events.nested_end.notified())
+        .await
+        .expect("detached call emits end");
+    assert!(
+        matches!(events.events.lock().unwrap().last(), Some(AgentEvent::ToolExecutionEnd { call_id, result, .. }) if call_id == "outer/1" && !result.is_error)
+    );
+}
+
+#[tokio::test]
+async fn nested_tool_panic_becomes_an_error_result() {
+    let panics = Arc::new(ScriptTool {
+        name: "panics",
+        run: |_: ToolContext| async move { panic!("kaboom") },
+    });
+    let (agent, _) = nested_agent(vec![panics], |cx| async move {
+        let result = cx.calls.call("panics", JsonMap::new()).await;
+        assert!(result.is_error);
+        assert!(first_text(&result.content).starts_with("Tool panics crashed:"));
+    });
+    run_outer(&agent).await;
+}
+
+#[tokio::test]
+async fn nested_hook_content_overrides_clear_structured_content() {
+    let typed = Arc::new(ScriptTool {
+        name: "typed",
+        run: |_: ToolContext| async move {
+            ToolOutput {
+                structured_content: Some(json!({ "ok": true })),
+                ..ToolOutput::default()
+            }
+        },
+    });
+    let (agent, _) = nested_agent(vec![typed], |cx| async move {
+        let result = cx.calls.call("typed", JsonMap::new()).await;
+        assert_eq!(first_text(&result.content), "replaced");
+        assert!(result.structured_content.is_none());
+    });
+    agent.set_tool_hooks(vec![Arc::new(NestedPolicy)]);
+    run_outer(&agent).await;
 }

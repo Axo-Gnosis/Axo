@@ -605,6 +605,7 @@ impl Persist for SessionHooks {
                 call_id,
                 name,
                 args,
+                parent_call_id: None,
             } => {
                 let tools = self.relay_live(event, |live| {
                     live.tool_calls.push(ToolCall {
@@ -619,7 +620,11 @@ impl Persist for SessionHooks {
                 self.publish_child_tools(tools);
                 return Ok(());
             }
-            AgentEvent::ToolExecutionEnd { call_id, .. } => {
+            AgentEvent::ToolExecutionEnd {
+                call_id,
+                parent_call_id: None,
+                ..
+            } => {
                 let tools = self.relay_live(event, |live| {
                     live.tool_calls.retain(|call| &call.id != call_id);
                     tool_names(live)
