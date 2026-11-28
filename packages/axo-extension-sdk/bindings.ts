@@ -756,6 +756,7 @@ export type Compat_Deserialize = {
 	vllmPriority?: number | null,
 	supportsAdditionalTools?: boolean | null,
 	supportsToolSearch?: boolean | null,
+	supportsCustomTools?: boolean | null,
 	supportsEagerToolInputStreaming?: boolean | null,
 	supportsCacheControlOnTools?: boolean | null,
 	supportsTemperature?: boolean | null,
@@ -807,6 +808,7 @@ export type Compat_Serialize = {
 	vllmPriority?: number | null,
 	supportsAdditionalTools?: boolean,
 	supportsToolSearch?: boolean,
+	supportsCustomTools?: boolean,
 	supportsEagerToolInputStreaming?: boolean,
 	supportsCacheControlOnTools?: boolean,
 	supportsTemperature?: boolean,
@@ -4487,7 +4489,7 @@ export type SystemMessage = SystemMessage_Serialize | SystemMessage_Deserialize;
 export type SystemMessage_Deserialize = {
 	content: MessageContent<text> | null,
 	sections?: { [key in string]: string | null } | null,
-	toolsAdded?: ToolSpec[],
+	toolsAdded?: ToolSpec_Deserialize[],
 	toolsRemoved?: string[],
 	timestamp: number,
 };
@@ -4503,7 +4505,7 @@ export type SystemMessage_Deserialize = {
 export type SystemMessage_Serialize = {
 	content: text[],
 	sections?: { [key in string]: string | null },
-	toolsAdded?: ToolSpec[],
+	toolsAdded?: ToolSpec_Serialize[],
 	toolsRemoved?: string[],
 	timestamp: number,
 };
@@ -4852,11 +4854,32 @@ export type ToolScope_Serialize = {
 };
 
 /**  A tool declaration as the model sees it. */
-export type ToolSpec = {
+export type ToolSpec = ToolSpec_Serialize | ToolSpec_Deserialize;
+
+/**  A tool declaration as the model sees it. */
+export type ToolSpec_Deserialize = {
 	name: string,
 	description: string,
 	/**  JSON Schema of the arguments object. */
 	parameters: Value,
+	/**
+	 *  The single string argument a provider may take as raw text instead of JSON
+	 *  (OpenAI Responses custom tools). Other providers ignore it.
+	 */
+	rawInput?: string | null,
+};
+
+/**  A tool declaration as the model sees it. */
+export type ToolSpec_Serialize = {
+	name: string,
+	description: string,
+	/**  JSON Schema of the arguments object. */
+	parameters: Value,
+	/**
+	 *  The single string argument a provider may take as raw text instead of JSON
+	 *  (OpenAI Responses custom tools). Other providers ignore it.
+	 */
+	rawInput?: string,
 };
 
 /**  A partial result streamed while a tool runs. */

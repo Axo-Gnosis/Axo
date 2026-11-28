@@ -2,13 +2,12 @@
 //! `api/openai-responses-shared.ts`: `convertResponsesMessages`, `convertResponsesTools`
 //! and `processResponsesStream`.
 //!
-//! Not ported: grammar (`custom`) tools and strict JSON-schema tools, which need pi's
-//! `constrainedSampling` tool metadata that [`ToolSpec`] does not carry (so `custom_tool_call`
-//! items are ignored); `configuration_update` effort items, which no shipped transport
-//! requests; tool-call namespaces. Tool-call ids are already normalized by
+//! Unconstrained custom tools are supported. Not ported: grammar formats and strict
+//! JSON-schema tools, which need pi's `constrainedSampling` metadata; `configuration_update`
+//! effort items; tool-call namespaces. Tool-call ids are already normalized by
 //! `transform_messages`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexSet;
 use serde_json::{Value, json};
@@ -33,6 +32,21 @@ pub(crate) struct ConvertOptions {
     /// Later system messages are sent in place; otherwise the caller collapsed them.
     pub supports_mid_convo_system_messages: bool,
     pub supports_strict_mode: bool,
+    pub supports_custom_tools: bool,
+}
+
+/// Collect raw input declarations before collapsing system messages, so calls to tools
+/// since removed can still be replayed as custom calls.
+pub(crate) fn raw_tool_inputs(messages: &[Message]) -> HashMap<&str, &str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System(system) => Some(&system.tools_added),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|tool| Some((tool.name.as_str(), tool.raw_input.as_deref()?)))
+        .collect()
 }
 
 /// Convert a resolved transcript (see `Transcript::resolve`) into Responses `input` items.
@@ -40,6 +54,7 @@ pub(crate) fn convert_messages(
     model: &Model,
     messages: &[Message],
     options: &ConvertOptions,
+    raw_inputs: &HashMap<&str, &str>,
 ) -> Vec<Value> {
     let support = model.tool_support();
     let transcript_tools = resolve_transcript_tools(messages, support);
@@ -53,6 +68,7 @@ pub(crate) fn convert_messages(
     let mut declared_additional_tools = false;
     // Tools announced as removed and not declared again since.
     let mut unavailable: IndexSet<String> = IndexSet::new();
+    let mut custom_calls = HashSet::new();
 
     let mut msg_index = 0usize;
     let mut system_index = 0usize;
@@ -99,7 +115,7 @@ pub(crate) fn convert_messages(
                                 input.push(json!({
                                     "type": "additional_tools",
                                     "role": "developer",
-                                    "tools": convert_tools(&system.tools_added, options.supports_strict_mode, false),
+                                    "tools": convert_tools(&system.tools_added, options.supports_strict_mode, options.supports_custom_tools, false),
                                 }));
                             }
                             TranscriptToolSupport::Additions => {
@@ -124,7 +140,7 @@ pub(crate) fn convert_messages(
                                     "call_id": call_id,
                                     "execution": "client",
                                     "status": "completed",
-                                    "tools": convert_tools(&system.tools_added, options.supports_strict_mode, true),
+                                    "tools": convert_tools(&system.tools_added, options.supports_strict_mode, options.supports_custom_tools, true),
                                 }));
                             }
                             TranscriptToolSupport::None => {}
@@ -228,20 +244,37 @@ pub(crate) fn convert_messages(
                         AssistantBlock::ToolCall(call) => {
                             let mut parts = call.id.split('|');
                             let call_id = parts.next().unwrap_or_default();
+                            let item_id = parts.next();
+                            let raw_input = raw_inputs
+                                .get(call.name.as_str())
+                                .filter(|_| call.arguments.len() == 1)
+                                .and_then(|&property| call.arguments.get(property)?.as_str());
                             // A different model's item ids were paired with its reasoning
-                            // items; omitting them avoids that validation. Function call
-                            // item ids must start with `fc_`.
-                            let item_id = parts
-                                .next()
-                                .filter(|item_id| !different_model && item_id.starts_with("fc_"));
-                            let mut item = json!({ "type": "function_call" });
+                            // items; omitting them avoids that validation.
+                            let (mut item, item_id) = if let Some(text) = raw_input {
+                                custom_calls.insert(call_id);
+                                (
+                                    json!({"type": "custom_tool_call", "input": text}),
+                                    item_id.filter(|id| {
+                                        same_provider_and_api
+                                            && !different_model
+                                            && id.starts_with("ctc_")
+                                    }),
+                                )
+                            } else {
+                                (
+                                    json!({
+                                        "type": "function_call",
+                                        "arguments": serde_json::to_string(&call.arguments).unwrap_or_default(),
+                                    }),
+                                    item_id.filter(|id| !different_model && id.starts_with("fc_")),
+                                )
+                            };
                             if let Some(item_id) = item_id {
                                 item["id"] = json!(item_id);
                             }
                             item["call_id"] = json!(call_id);
                             item["name"] = json!(call.name);
-                            item["arguments"] =
-                                json!(serde_json::to_string(&call.arguments).unwrap_or_default());
                             output.push(item);
                         }
                     }
@@ -290,11 +323,12 @@ pub(crate) fn convert_messages(
                     }));
                     Value::Array(parts)
                 };
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                }));
+                let kind = if custom_calls.remove(call_id) {
+                    "custom_tool_call_output"
+                } else {
+                    "function_call_output"
+                };
+                input.push(json!({ "type": kind, "call_id": call_id, "output": output }));
             }
         }
         if !leading {
@@ -304,29 +338,33 @@ pub(crate) fn convert_messages(
     input
 }
 
-/// Responses function tools (pi `convertResponsesTools` with `strict: null`; strict
-/// schemas need constrained-sampling metadata axo tools do not have).
+/// Responses tool declarations. Function tools use `strict: null` where accepted;
+/// strict schemas need constrained-sampling metadata axo tools do not have.
 pub(crate) fn convert_tools(
     tools: &[ToolSpec],
     supports_strict_mode: bool,
+    supports_custom_tools: bool,
     tool_search_result: bool,
 ) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
-            let mut function = json!({
-                "type": "function",
+            let custom = supports_custom_tools && tool.raw_input.is_some();
+            let mut declaration = json!({
+                "type": if custom { "custom" } else { "function" },
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.parameters,
             });
+            if !custom {
+                declaration["parameters"] = tool.parameters.clone();
+                if supports_strict_mode {
+                    declaration["strict"] = Value::Null;
+                }
+            }
             if tool_search_result {
-                function["defer_loading"] = json!(true);
+                declaration["defer_loading"] = json!(true);
             }
-            if supports_strict_mode {
-                function["strict"] = Value::Null;
-            }
-            function
+            declaration
         })
         .collect()
 }
@@ -354,6 +392,7 @@ enum SlotKind {
     Thinking,
     Text,
     ToolCall,
+    CustomToolCall,
 }
 
 /// An output item still streaming: its kind and the content block it fills.
@@ -368,6 +407,7 @@ struct Slot {
 /// [`ResponsesStream::finish`] once the stream ends.
 pub(crate) struct ResponsesStream<'a> {
     model: &'a Model,
+    raw_inputs: HashMap<String, String>,
     slots: HashMap<u64, Slot>,
     /// Content index of each finished reasoning item, by item id.
     reasoning_by_id: HashMap<String, usize>,
@@ -375,9 +415,10 @@ pub(crate) struct ResponsesStream<'a> {
 }
 
 impl<'a> ResponsesStream<'a> {
-    pub fn new(model: &'a Model) -> Self {
+    pub fn new(model: &'a Model, raw_inputs: HashMap<String, String>) -> Self {
         Self {
             model,
+            raw_inputs,
             slots: HashMap::new(),
             reasoning_by_id: HashMap::new(),
             saw_terminal: false,
@@ -441,6 +482,13 @@ impl<'a> ResponsesStream<'a> {
                     });
                 }
             }
+            "response.custom_tool_call_input.delta" => {
+                if let Some(index) = self.slot(output_index, SlotKind::CustomToolCall) {
+                    let quoted = serde_json::to_string(delta).expect("string is JSON serializable");
+                    reply.push_tool_args(index, &quoted[1..quoted.len() - 1]);
+                }
+            }
+            // The custom input's `.done` event is redundant with the finished item.
             "response.output_item.done" => {
                 if let (Some(output_index), Some(item)) = (output_index, event.get("item")) {
                     self.finish_item(output_index, item, reply);
@@ -511,9 +559,14 @@ impl<'a> ResponsesStream<'a> {
         }
     }
 
+    fn raw_property(&self, name: &str) -> &str {
+        self.raw_inputs.get(name).map_or("input", String::as_str)
+    }
+
     fn create_slot(&mut self, output_index: u64, item: &Value, reply: &mut Reply) -> Option<Slot> {
         let content_index = reply.message.content.len();
-        let (kind, block, event) = match item.get("type").and_then(Value::as_str)? {
+        let item_type = item.get("type").and_then(Value::as_str)?;
+        let (kind, block, event) = match item_type {
             "reasoning" => (
                 SlotKind::Thinking,
                 AssistantBlock::Thinking {
@@ -531,13 +584,18 @@ impl<'a> ResponsesStream<'a> {
                 },
                 AssistantEvent::TextStart { content_index },
             ),
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
                 let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
                 let id = format!("{}|{}", text("call_id"), text("id"));
                 let name = text("name").to_owned();
-                reply.set_tool_args(content_index, text("arguments").to_owned());
+                let kind = if item_type == "custom_tool_call" {
+                    SlotKind::CustomToolCall
+                } else {
+                    reply.set_tool_args(content_index, text("arguments").to_owned());
+                    SlotKind::ToolCall
+                };
                 (
-                    SlotKind::ToolCall,
+                    kind,
                     AssistantBlock::ToolCall(ToolCall {
                         id: id.clone(),
                         name: name.clone(),
@@ -561,6 +619,12 @@ impl<'a> ResponsesStream<'a> {
         };
         self.slots.insert(output_index, slot);
         reply.emit(event);
+        if kind == SlotKind::CustomToolCall
+            && let AssistantBlock::ToolCall(call) = &reply.message.content[content_index]
+        {
+            let opening = format!("{{{}:\"", json!(self.raw_property(&call.name)));
+            reply.push_tool_args(content_index, &opening);
+        }
         Some(slot)
     }
 
@@ -574,10 +638,10 @@ impl<'a> ResponsesStream<'a> {
         };
         let index = slot.content_index;
         let item_type = item.get("type").and_then(Value::as_str);
-        let partial = if slot.kind == SlotKind::ToolCall && item_type == Some("function_call") {
-            reply.take_tool_args(index)
-        } else {
-            String::new()
+        let partial = match (item_type, slot.kind) {
+            (Some("function_call"), SlotKind::ToolCall)
+            | (Some("custom_tool_call"), SlotKind::CustomToolCall) => reply.take_tool_args(index),
+            _ => String::new(),
         };
         match (item_type, slot.kind, reply.message.content.get_mut(index)) {
             (
@@ -661,6 +725,36 @@ impl<'a> ResponsesStream<'a> {
                     .filter(|text| !text.is_empty())
                     .unwrap_or(partial.as_str());
                 (call.arguments, call.arguments_error) = parse_tool_arguments(text);
+            }
+            (
+                Some("custom_tool_call"),
+                SlotKind::CustomToolCall,
+                Some(AssistantBlock::ToolCall(call)),
+            ) => {
+                let property = self.raw_property(&call.name);
+                let text = item
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                call.arguments = [(property.to_owned(), json!(text))].into_iter().collect();
+                call.arguments_error = None;
+                // A finished item can also arrive without any or all of its deltas.
+                const CLOSE: &str = "\"}";
+                let complete = serde_json::to_string(&call.arguments).unwrap_or_default();
+                if let Some(rest) = complete
+                    .strip_suffix(CLOSE)
+                    .and_then(|s| s.strip_prefix(&partial))
+                    && !rest.is_empty()
+                {
+                    reply.emit(AssistantEvent::ToolCallDelta {
+                        content_index: index,
+                        delta: rest.to_owned(),
+                    });
+                }
+                reply.emit(AssistantEvent::ToolCallDelta {
+                    content_index: index,
+                    delta: CLOSE.to_owned(),
+                });
             }
             _ => return,
         };

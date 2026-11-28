@@ -47,6 +47,7 @@ fn tool(name: &str) -> ToolSpec {
             "properties": {"name": {"type": "string", "enum": ["read", "_read"]}},
             "required": ["name"]
         }),
+        raw_input: None,
     }
 }
 

@@ -120,6 +120,7 @@ async fn google_round_trip() {
             name: "read".into(),
             description: "Read".into(),
             parameters: json!({"type": "object", "properties": {"mode": {"const": "fast"}}}),
+            raw_input: None,
         }],
         ..Default::default()
     });

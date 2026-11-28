@@ -466,11 +466,16 @@ impl std::str::FromStr for ServiceTier {
 
 /// A tool declaration as the model sees it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     /// JSON Schema of the arguments object.
     pub parameters: Value,
+    /// The single string argument a provider may take as raw text instead of JSON
+    /// (OpenAI Responses custom tools). Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<String>,
 }
 
 /// Block types that a plain-string `content` deserializes into.

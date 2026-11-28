@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "properties": { "city": { "type": "string" } },
             "required": ["city"],
         }),
+        raw_input: None,
     };
     let mut messages = vec![Message::User(UserMessage {
         content: vec![UserBlock::Text {
