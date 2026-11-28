@@ -369,10 +369,13 @@ async fn only_failure_abandons_pending_calls() {
         let host = Arc::new(Host::default());
         let cancel = CancellationToken::new();
         let mut script = std::pin::pin!(run(
-            "store('k', 1); tools.hang(); return 1;",
+            "store('k', 1); for (let i = 0; i < 5; i++) tools.hang().finally(() => print('late')); return 1;",
             BTreeMap::new(),
             host.clone(),
-            limits(),
+            Limits {
+                max_in_flight: 1,
+                ..limits()
+            },
             cancel.clone(),
         ));
         tokio::select! {
@@ -396,10 +399,12 @@ async fn only_failure_abandons_pending_calls() {
             assert_error(end, "Script cancelled");
         } else {
             assert_eq!(end.store.set.get("k"), Some(&json!(1)));
+            assert_eq!(end.calls, 5);
             assert_ok(end, &host, &["1"]);
         }
         assert_eq!(host.abandoned.load(Relaxed), usize::from(cancelled));
-        assert_eq!(host.finished.load(Relaxed), 1);
+        assert_eq!(host.peak.load(Relaxed), 1);
+        assert_eq!(host.finished.load(Relaxed), if cancelled { 1 } else { 5 });
     }
 }
 

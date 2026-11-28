@@ -120,22 +120,6 @@ async fn drive(
     let permits = Semaphore::new(limits.max_in_flight);
     let stopping = AtomicBool::new(false);
     let running = AtomicUsize::new(0);
-    let start_call = {
-        let (host, permits, stopping, running) = (&host, &permits, &stopping, &running);
-        move |id, name: String, args| async move {
-            let _permit = permits
-                .acquire()
-                .await
-                .expect("script call semaphore stays open");
-            if stopping.load(Relaxed) {
-                return None;
-            }
-            running.fetch_add(1, Relaxed);
-            let result = host.call(&name, args).await;
-            running.fetch_sub(1, Relaxed);
-            Some((id, result))
-        }
-    };
     let mut calls = FuturesUnordered::new();
     let result = loop {
         tokio::select! {
@@ -149,7 +133,17 @@ async fn drive(
                 let memory = limits.memory_bytes;
                 match request.op {
                     Operation::Call(name, args) => {
-                        calls.push(start_call(id, name, args));
+                        let (host, permits, stopping, running) = (&host, &permits, &stopping, &running);
+                        calls.push(async move {
+                            let _permit = permits.acquire().await.expect("script call semaphore stays open");
+                            if stopping.load(Relaxed) {
+                                return None;
+                            }
+                            running.fetch_add(1, Relaxed);
+                            let result = host.call(&name, args).await;
+                            running.fetch_sub(1, Relaxed);
+                            Some(Completion { id, result: wire(result, memory) })
+                        });
                     }
                     op => {
                         let value = match op {
@@ -161,32 +155,14 @@ async fn drive(
                     }
                 }
             }
-            Some(Some((id, result))) = calls.next(), if !calls.is_empty() => {
-                let _ = replies.send(Reply::Complete(Completion { id, result: wire(result, limits.memory_bytes) }));
+            Some(Some(completion)) = calls.next(), if !calls.is_empty() => {
+                let _ = replies.send(Reply::Complete(completion));
             }
-            result = &mut end => break Some(result),
+            result = &mut end => match result {
+                Ok(end) if end.error.is_none() => return end,
+                result => break Some(result),
+            },
         }
-    };
-    let result = match result {
-        Some(Ok(mut end)) if end.error.is_none() => {
-            // The VM has stopped publishing. A send could have raced the select's
-            // final receive poll, so take any calls it dispatched before returning.
-            for Request { id, op } in requests.try_iter() {
-                if let Operation::Call(name, args) = op {
-                    calls.push(start_call(id, name, args));
-                }
-            }
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    end.error = Some(problem(CANCELLED));
-                    end.store = StoreChanges::default();
-                }
-                () = async { while calls.next().await.is_some() {} } => return end,
-            }
-            Some(Ok(end))
-        }
-        result => result,
     };
     // On failure or cancellation, stop active calls without starting any still queued.
     stopping.store(true, Relaxed);
@@ -287,10 +263,10 @@ impl Worker {
         // Detach the tracker and drop its JS roots before the runtime, including
         // when a trusted host callback panics.
         let _detach_tracker = DetachRejectionTracker(&rt);
-        let (settle, print, promise) = meter.slice(|| {
+        let (settle, print, drain, promise) = meter.slice(|| {
             context.with(|cx| {
                 let initialized = (|| {
-                    let (settle, print) = self.prelude(&cx, calls, store)?;
+                    let (settle, print, drain) = self.prelude(&cx, calls, store)?;
                     let mut options = EvalOptions::default();
                     options.filename = Some(SOURCE.into());
                     let promise: Promise =
@@ -298,6 +274,7 @@ impl Worker {
                     Ok((
                         Persistent::save(&cx, settle),
                         Persistent::save(&cx, print),
+                        Persistent::save(&cx, drain),
                         Persistent::save(&cx, promise),
                     ))
                 })();
@@ -342,7 +319,7 @@ impl Worker {
                 })
             })?;
             if let Some(value) = value {
-                return meter.slice(|| {
+                meter.slice(|| {
                     context.with(|cx| {
                         let output = (|| {
                             let value = value.restore(&cx)?;
@@ -353,11 +330,10 @@ impl Worker {
                         })();
                         output.map_err(|error| self.js_error(&cx, error))
                     })
-                });
+                })?;
+                return self.drain(&context, meter, drain);
             }
-            let Ok(Reply::Complete(completion)) = self.replies.recv() else {
-                return Err(problem(CANCELLED));
-            };
+            let completion = self.completion()?;
             meter.slice(|| {
                 context.with(|cx| {
                     let settled = (|| {
@@ -383,12 +359,40 @@ impl Worker {
         }
     }
 
+    fn completion(&self) -> Result<Completion, ScriptError> {
+        match self.replies.recv() {
+            Ok(Reply::Complete(completion)) => Ok(completion),
+            _ => Err(problem(CANCELLED)),
+        }
+    }
+
+    fn drain(
+        &self,
+        context: &Context,
+        meter: &Meter,
+        drain: Persistent<Function<'static>>,
+    ) -> Result<(), ScriptError> {
+        let mut completed = None;
+        while meter.slice(|| {
+            context.with(|cx| {
+                drain
+                    .clone()
+                    .restore(&cx)
+                    .and_then(|drain| drain.call((completed,)))
+                    .map_err(|error| self.js_error(&cx, error))
+            })
+        })? {
+            completed = Some(self.completion()?.id);
+        }
+        Ok(())
+    }
+
     fn prelude<'js>(
         &self,
         cx: &Ctx<'js>,
         calls: &Rc<Cell<u32>>,
         store: &Rc<RefCell<Store>>,
-    ) -> rquickjs::Result<(Function<'js>, Function<'js>)> {
+    ) -> rquickjs::Result<(Function<'js>, Function<'js>, Function<'js>)> {
         let prelude: Function = cx.eval(include_str!("prelude.js"))?;
         let limits = &self.limits;
         let max_calls = limits.max_calls;
@@ -465,7 +469,7 @@ impl Worker {
             limits.max_in_flight as u32,
             max_calls,
         ))?;
-        Ok((functions.get(0)?, functions.get(1)?))
+        Ok((functions.get(0)?, functions.get(1)?, functions.get(2)?))
     }
 
     fn js_error(&self, cx: &Ctx<'_>, error: Error) -> ScriptError {

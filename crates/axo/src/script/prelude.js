@@ -15,7 +15,7 @@
   // Keep undispatched work on the VM heap. A large Promise.all must neither
   // overflow the bridge nor queue its full argument set in Rust memory. A
   // lookup can still proceed when all tool call slots are occupied.
-  function pump(q) {
+  function pump(q, draining = false) {
     while (q.head && q.inFlight < q.limit) {
       const { id, op, json, error, reject } = q.head;
       q.head = q.head.next;
@@ -25,8 +25,10 @@
         q.inFlight++;
       } catch (cause) {
         remove(id);
-        error.message = cause.message;
-        reject(error);
+        if (!draining) {
+          error.message = cause.message;
+          reject(error);
+        }
       }
     }
   }
@@ -100,14 +102,19 @@
     searchTools: { value: freeze(searchTools) }, describeTool: { value: freeze(describeTool) },
   });
 
+  function finish(id) {
+    const entry = get(id);
+    remove(id);
+    entry.q.inFlight--;
+    return entry;
+  }
+
   function settle(id, ok, payload) {
-    const { resolve, reject, error, q } = get(id);
+    const { resolve, reject, error, q } = finish(id);
     if (ok) {
       try { payload = parse(payload); }
       catch { ok = false; payload = 'Result too large'; }
     }
-    remove(id);
-    q.inFlight--;
     if (ok) resolve(payload);
     else {
       error.message = payload ?? 'Result too large';
@@ -115,5 +122,11 @@
     }
     pump(q);
   }
-  return [settle, print];
+  // After the script returns, release slots and dispatch queued requests without
+  // resolving promises or executing user continuations.
+  function drain(id) {
+    if (id != null) pump(finish(id).q, true);
+    return calls.inFlight !== 0 || lookups.inFlight !== 0;
+  }
+  return [settle, print, drain];
 })
