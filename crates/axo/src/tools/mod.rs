@@ -538,13 +538,14 @@ fn clean_path(path: &str) -> Cow<'_, str> {
 }
 
 /// The built-in tools in prompt order: `read, write, edit, bash, grep, find, wait, kill`,
-/// followed by `spawn`, `send` and `ask` when supplied.
+/// followed by `spawn`, `send`, `ask` and `codemode` when supplied.
 pub(crate) fn builtin(
     tools: &Arc<SessionTools>,
     spawn: Option<Arc<dyn Tool>>,
     send: Option<Arc<dyn Tool>>,
     team: Option<TeamSeat>,
     ask: Option<Arc<dyn Tool>>,
+    codemode: Option<Arc<dyn Tool>>,
     settings: &Settings,
 ) -> Vec<Arc<dyn Tool>> {
     let mut list: Vec<Arc<dyn Tool>> = vec![
@@ -567,6 +568,7 @@ pub(crate) fn builtin(
         list.push(send);
     }
     list.extend(ask);
+    list.extend(codemode);
     list
 }
 

@@ -53,7 +53,8 @@ pub trait ScriptHost: Send + Sync + 'static {
     fn describe(&self, name: &str) -> Result<Value, String>;
     /// One finished output item, in order. Runs on the VM thread.
     fn output(&self, text: &str);
-    /// The script ended with calls still running; stop them. `run` awaits them afterwards.
+    /// Stop active calls after script failure, cancellation or interruption. `run` awaits
+    /// them afterwards. A successful script drains both queued and active calls.
     fn abandon(&self);
 }
 
@@ -80,7 +81,8 @@ pub struct ScriptEnd {
     pub cpu: Duration,
 }
 
-/// Runs `code` to completion. Returns only after every host call it started has settled.
+/// Runs `code` to completion and waits for its host calls. On success this includes calls
+/// still queued behind the in-flight limit when the script returns.
 pub async fn run(
     code: &str,
     store: BTreeMap<String, Value>,

@@ -43,6 +43,8 @@ pub struct Settings {
     pub nested_context_files: bool,
     pub bash: BashSettings,
     pub ask: AskSettings,
+    /// Script execution and limits. User settings only.
+    pub codemode: CodemodeSettings,
     pub read: ReadSettings,
     pub project: ProjectSettings,
     pub compaction: CompactionSettings,
@@ -72,6 +74,7 @@ impl Default for Settings {
             nested_context_files: true,
             bash: BashSettings::default(),
             ask: AskSettings::default(),
+            codemode: CodemodeSettings::default(),
             read: ReadSettings::default(),
             project: ProjectSettings::default(),
             compaction: CompactionSettings::default(),
@@ -624,6 +627,34 @@ pub struct AskSettings {
     pub timeout_ms: Option<u64>,
 }
 
+/// The `codemode` tool. Available only in builds with the `codemode` feature.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CodemodeSettings {
+    pub enabled: bool,
+    /// Milliseconds before a foreground script becomes a background job; zero disables it.
+    pub promote_after_ms: u64,
+    pub cpu_ms: u64,
+    pub memory_mb: u32,
+    pub max_calls: u32,
+    pub max_in_flight: u32,
+    pub max_output_tokens: u32,
+}
+
+impl Default for CodemodeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            promote_after_ms: 60_000,
+            cpu_ms: 30_000,
+            memory_mb: 256,
+            max_calls: 1000,
+            max_in_flight: 16,
+            max_output_tokens: 10_000,
+        }
+    }
+}
+
 /// The `read` tool.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase", default)]
@@ -737,6 +768,7 @@ pub const USER_ONLY_KEYS: &[&str] = &[
     "cacheTtl",
     "cacheWarming",
     "extensions",
+    "codemode",
 ];
 
 #[expose]

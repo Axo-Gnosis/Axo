@@ -158,10 +158,13 @@ async fn drive(
             Some(Some(completion)) = calls.next(), if !calls.is_empty() => {
                 let _ = replies.send(Reply::Complete(completion));
             }
-            result = &mut end => break Some(result),
+            result = &mut end => match result {
+                Ok(end) if end.error.is_none() => return end,
+                result => break Some(result),
+            },
         }
     };
-    // Drain calls already polled without starting any still queued on shutdown.
+    // On failure or cancellation, stop active calls without starting any still queued.
     stopping.store(true, Relaxed);
     if running.load(Relaxed) != 0 {
         host.abandon();
@@ -260,10 +263,10 @@ impl Worker {
         // Detach the tracker and drop its JS roots before the runtime, including
         // when a trusted host callback panics.
         let _detach_tracker = DetachRejectionTracker(&rt);
-        let (settle, print, promise) = meter.slice(|| {
+        let (settle, print, drain, promise) = meter.slice(|| {
             context.with(|cx| {
                 let initialized = (|| {
-                    let (settle, print) = self.prelude(&cx, calls, store)?;
+                    let (settle, print, drain) = self.prelude(&cx, calls, store)?;
                     let mut options = EvalOptions::default();
                     options.filename = Some(SOURCE.into());
                     let promise: Promise =
@@ -271,6 +274,7 @@ impl Worker {
                     Ok((
                         Persistent::save(&cx, settle),
                         Persistent::save(&cx, print),
+                        Persistent::save(&cx, drain),
                         Persistent::save(&cx, promise),
                     ))
                 })();
@@ -315,7 +319,7 @@ impl Worker {
                 })
             })?;
             if let Some(value) = value {
-                return meter.slice(|| {
+                meter.slice(|| {
                     context.with(|cx| {
                         let output = (|| {
                             let value = value.restore(&cx)?;
@@ -326,11 +330,10 @@ impl Worker {
                         })();
                         output.map_err(|error| self.js_error(&cx, error))
                     })
-                });
+                })?;
+                return self.drain(&context, meter, drain);
             }
-            let Ok(Reply::Complete(completion)) = self.replies.recv() else {
-                return Err(problem(CANCELLED));
-            };
+            let completion = self.completion()?;
             meter.slice(|| {
                 context.with(|cx| {
                     let settled = (|| {
@@ -356,12 +359,40 @@ impl Worker {
         }
     }
 
+    fn completion(&self) -> Result<Completion, ScriptError> {
+        match self.replies.recv() {
+            Ok(Reply::Complete(completion)) => Ok(completion),
+            _ => Err(problem(CANCELLED)),
+        }
+    }
+
+    fn drain(
+        &self,
+        context: &Context,
+        meter: &Meter,
+        drain: Persistent<Function<'static>>,
+    ) -> Result<(), ScriptError> {
+        let mut completed = None;
+        while meter.slice(|| {
+            context.with(|cx| {
+                drain
+                    .clone()
+                    .restore(&cx)
+                    .and_then(|drain| drain.call((completed,)))
+                    .map_err(|error| self.js_error(&cx, error))
+            })
+        })? {
+            completed = Some(self.completion()?.id);
+        }
+        Ok(())
+    }
+
     fn prelude<'js>(
         &self,
         cx: &Ctx<'js>,
         calls: &Rc<Cell<u32>>,
         store: &Rc<RefCell<Store>>,
-    ) -> rquickjs::Result<(Function<'js>, Function<'js>)> {
+    ) -> rquickjs::Result<(Function<'js>, Function<'js>, Function<'js>)> {
         let prelude: Function = cx.eval(include_str!("prelude.js"))?;
         let limits = &self.limits;
         let max_calls = limits.max_calls;
@@ -438,7 +469,7 @@ impl Worker {
             limits.max_in_flight as u32,
             max_calls,
         ))?;
-        Ok((functions.get(0)?, functions.get(1)?))
+        Ok((functions.get(0)?, functions.get(1)?, functions.get(2)?))
     }
 
     fn js_error(&self, cx: &Ctx<'_>, error: Error) -> ScriptError {

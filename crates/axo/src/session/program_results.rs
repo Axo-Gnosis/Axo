@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Session, SessionOptions};
 use crate::{Axo, JobKind, JsonlStore, ProjectAccess, StaticEnv};
 
-async fn session(turns: Vec<ScriptedTurn>) -> (tempfile::TempDir, Session) {
+pub(super) async fn session(turns: Vec<ScriptedTurn>) -> (tempfile::TempDir, Session) {
     let dir = tempfile::tempdir().unwrap();
     let models = Models::load(ModelsOptions {
         http_client: None,

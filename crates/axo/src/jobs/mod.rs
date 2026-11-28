@@ -4,6 +4,7 @@
 
 pub(crate) mod child;
 pub(crate) mod command;
+#[cfg(any(test, feature = "codemode"))]
 pub(crate) mod task;
 
 use child::{ChildMessage, ChildPhase, ChildRun};

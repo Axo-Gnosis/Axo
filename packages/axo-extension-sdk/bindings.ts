@@ -607,6 +607,33 @@ export type ChoiceQuestion_Serialize = {
 	multi?: boolean,
 };
 
+/**  The `codemode` tool. Available only in builds with the `codemode` feature. */
+export type CodemodeSettings = CodemodeSettings_Serialize | CodemodeSettings_Deserialize;
+
+/**  The `codemode` tool. Available only in builds with the `codemode` feature. */
+export type CodemodeSettings_Deserialize = {
+	enabled?: boolean,
+	/**  Milliseconds before a foreground script becomes a background job; zero disables it. */
+	promoteAfterMs?: number,
+	cpuMs?: number,
+	memoryMb?: number,
+	maxCalls?: number,
+	maxInFlight?: number,
+	maxOutputTokens?: number,
+};
+
+/**  The `codemode` tool. Available only in builds with the `codemode` feature. */
+export type CodemodeSettings_Serialize = {
+	enabled: boolean,
+	/**  Milliseconds before a foreground script becomes a background job; zero disables it. */
+	promoteAfterMs: number,
+	cpuMs: number,
+	memoryMb: number,
+	maxCalls: number,
+	maxInFlight: number,
+	maxOutputTokens: number,
+};
+
 /**  A built-in session operation, mode or registered command, decoded and validated. */
 export type Command = Command_Serialize | Command_Deserialize;
 
@@ -4093,6 +4120,8 @@ export type Settings_Deserialize = {
 	nestedContextFiles?: boolean,
 	bash?: BashSettings_Deserialize,
 	ask?: AskSettings_Deserialize,
+	/**  Script execution and limits. User settings only. */
+	codemode?: CodemodeSettings_Deserialize,
 	read?: ReadSettings_Deserialize,
 	project?: ProjectSettings_Deserialize,
 	compaction?: CompactionSettings_Deserialize,
@@ -4127,6 +4156,8 @@ export type Settings_Serialize = {
 	nestedContextFiles: boolean,
 	bash: BashSettings_Serialize,
 	ask: AskSettings_Serialize,
+	/**  Script execution and limits. User settings only. */
+	codemode: CodemodeSettings_Serialize,
 	read: ReadSettings_Serialize,
 	project: ProjectSettings_Serialize,
 	compaction: CompactionSettings_Serialize,

@@ -28,11 +28,12 @@ pub use commands::{
     valid_command_name,
 };
 pub use config::{
-    AskSettings, BashSettings, CacheTtl, CacheTtlSettings, CacheWarming, CompactionSettings,
-    ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, EnabledExtension, ExtensionListError,
-    ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings, PromptOverride,
-    ReadSettings, RetrySettings, ServiceTierSettings, Settings, SubagentSettings, SubagentTier,
-    SummaryRequest, TierOnModelChange, USER_ONLY_KEYS, UserConfig, valid_extension_id,
+    AskSettings, BashSettings, CacheTtl, CacheTtlSettings, CacheWarming, CodemodeSettings,
+    CompactionSettings, ConfigLayer, ConfigSource, DevShellMode, EffectiveConfig, EnabledExtension,
+    ExtensionListError, ModelChoice, PROMPT_NAMES, ProjectAccess, ProjectFiles, ProjectSettings,
+    PromptOverride, ReadSettings, RetrySettings, ServiceTierSettings, Settings, SubagentSettings,
+    SubagentTier, SummaryRequest, TierOnModelChange, USER_ONLY_KEYS, UserConfig,
+    valid_extension_id,
 };
 pub use context::agents::{AgentSpec, RunAs};
 pub use context::definitions::Definitions;
