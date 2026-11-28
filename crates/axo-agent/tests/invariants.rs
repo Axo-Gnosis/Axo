@@ -2715,6 +2715,52 @@ async fn nested_before_hook_can_block_execution() {
 }
 
 #[tokio::test]
+async fn any_of_errors_name_the_intended_branch() {
+    let probe = Arc::new(Probe::default());
+    let paths = Arc::new(ProbeTool {
+        name: "paths",
+        mode: ExecutionMode::Parallel,
+        probe: probe.clone(),
+        schema: json!({
+            "type": "object",
+            "properties": { "path": { "anyOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" }, "maxItems": 20 }
+            ] } }
+        }),
+    });
+    let (agent, _) = nested_agent(vec![paths], |cx| async move {
+        let many: Vec<String> = (0..26)
+            .map(|i| format!("crates/axo/src/tools/file_{i}.rs"))
+            .collect();
+        let result = cx
+            .calls
+            .call("paths", JsonMap::from_iter([("path".into(), json!(many))]))
+            .await;
+        let text = first_text(&result.content);
+        assert!(
+            text.contains("path: the value has more than 20 items"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("anyOf") && !text.contains("file_25"),
+            "{text}"
+        );
+        let result = cx
+            .calls
+            .call("paths", JsonMap::from_iter([("path".into(), json!(7))]))
+            .await;
+        let text = first_text(&result.content);
+        assert!(
+            text.contains("path: 7 is not valid under any of the schemas"),
+            "{text}"
+        );
+    });
+    run_outer(&agent).await;
+    assert!(probe.started().is_empty());
+}
+
+#[tokio::test]
 async fn nested_calls_reject_unknown_invalid_and_non_nestable_tools() {
     let probe = Arc::new(Probe::default());
     let (agent, events) = nested_agent(

@@ -12,6 +12,7 @@ use axo_ai::{
     ToolSpec, Transcript, UserBlock, now_ms,
 };
 use futures::StreamExt;
+use jsonschema::ValidationError;
 use jsonschema::error::ValidationErrorKind;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -1143,8 +1144,15 @@ pub(crate) fn error_output(text: impl Into<String>) -> ToolOutput {
     }
 }
 
+/// Values longer than this are named, not quoted, in validation errors; the model has
+/// its own call.
+const QUOTED_VALUE_BYTES: usize = 200;
+
 /// Validates a call's arguments against its tool's JSON Schema, with pi's error text
-/// (`validateToolArguments`). pi's type coercion is not ported.
+/// (`validateToolArguments`). pi's type coercion is not ported. A failed `anyOf`/`oneOf`
+/// reports the branch the value was meant for (the one with no type mismatch at that
+/// spot), so `"path": [26 items]` reads "has more than 20 items", not "not valid under
+/// any of the schemas".
 pub(crate) fn validate_arguments(tool: &dyn Tool, call: &ToolCall) -> Result<(), String> {
     if let Some(error) = &call.arguments_error {
         return Err(format!(
@@ -1159,40 +1167,67 @@ pub(crate) fn validate_arguments(tool: &dyn Tool, call: &ToolCall) -> Result<(),
         )
     })?;
     let arguments = Value::Object(call.arguments.clone());
-    let errors: Vec<String> = validator
-        .iter_errors(&arguments)
-        .map(|error| {
-            let path = error
-                .instance_path()
-                .as_str()
-                .trim_start_matches('/')
-                .replace('/', ".");
-            let path = match error.kind() {
-                ValidationErrorKind::Required { property } => {
-                    let property = property
-                        .as_str()
-                        .map_or_else(|| property.to_string(), str::to_owned);
-                    if path.is_empty() {
-                        property
-                    } else {
-                        format!("{path}.{property}")
-                    }
-                }
-                _ if path.is_empty() => "root".to_owned(),
-                _ => path,
-            };
-            format!("  - {path}: {error}")
-        })
-        .collect();
+    let mut errors = Vec::new();
+    for error in validator.iter_errors(&arguments) {
+        describe_error(&error, &mut errors);
+    }
     if errors.is_empty() {
         return Ok(());
     }
-    let received = serde_json::to_string_pretty(&arguments).unwrap_or_default();
+    let compact = serde_json::to_string(&arguments).unwrap_or_default();
+    let received = if compact.len() > 4 * QUOTED_VALUE_BYTES {
+        format!("({} bytes; not repeated)", compact.len())
+    } else {
+        serde_json::to_string_pretty(&arguments).unwrap_or_default()
+    };
     Err(format!(
         "Validation failed for tool \"{}\":\n{}\n\nReceived arguments:\n{received}",
         call.name,
         errors.join("\n")
     ))
+}
+
+fn describe_error(error: &ValidationError<'_>, lines: &mut Vec<String>) {
+    let at = error.instance_path().as_str();
+    if let ValidationErrorKind::AnyOf { context } | ValidationErrorKind::OneOfNotValid { context } =
+        error.kind()
+        && let Some(branch) = context
+            .iter()
+            .filter(|branch| {
+                !branch.iter().any(|error| {
+                    matches!(error.kind(), ValidationErrorKind::Type { .. })
+                        && error.instance_path().as_str() == at
+                })
+            })
+            .min_by_key(|branch| branch.len())
+    {
+        for error in branch {
+            describe_error(error, lines);
+        }
+        return;
+    }
+    let path = at.trim_start_matches('/').replace('/', ".");
+    let path = match error.kind() {
+        ValidationErrorKind::Required { property } => {
+            let property = property
+                .as_str()
+                .map_or_else(|| property.to_string(), str::to_owned);
+            if path.is_empty() {
+                property
+            } else {
+                format!("{path}.{property}")
+            }
+        }
+        _ if path.is_empty() => "root".to_owned(),
+        _ => path,
+    };
+    let quoted = serde_json::to_string(error.instance().as_ref()).map_or(0, |text| text.len());
+    let message = if quoted > QUOTED_VALUE_BYTES {
+        error.masked_with("the value").to_string()
+    } else {
+        error.to_string()
+    };
+    lines.push(format!("  - {path}: {message}"));
 }
 
 /// A queued input as a pending message with its origin.
