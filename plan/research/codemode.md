@@ -1,6 +1,6 @@
 # Codemode engine spike
 
-**Decision (2026-11-27): ship `rquickjs` 0.14.0 with `std` only.** It passed the go/no-go checks on x86_64 Linux. Version 0.15.0 also passed those checks, but was published the same day; the plan requires at least two weeks in the field. The difference in caught-OOM behavior is noted below. Neither `aarch64-darwin` nor `aarch64-linux` was available, and there was no cross-target build or runtime verification.
+**Decision (2026-11-27): ship `rquickjs` 0.14.0 with `std` only.** It passed the go/no-go checks on x86_64 Linux. Version 0.15.0 also passed those checks, but was published the same day; the plan requires at least two weeks in the field. The difference in caught-OOM behavior is noted below.
 
 Background: [decision record](../../.axome/research/codemode/decision.md), [engine comparison and spike checklist](../../.axome/research/codemode/engines.md#spike-checklist-any-failure-falsifies-the-choice-or-the-config), and [industry prior art](../../.axome/research/codemode/prior-art-industry.md). Those working notes are local to checkouts that carry `.axome/`.
 
@@ -93,12 +93,29 @@ Release `crates/axo/examples/memory` built with and without `--features codemode
 
 No idle or mid-turn PSS difference is measurable.
 
+### Memory after a 200 MB script
+
+A release probe linking `axo` with `codemode` ran one script that filled 200 one-MiB typed arrays (512 MiB heap limit), then a trivial script. PSS: 2,449 KiB before, 4,127 KiB after the first script and still 4,127 KiB two seconds later, 4,375 KiB after the second. The script took 92 ms of CPU. glibc returned the VM heap; no `malloc_trim` is needed.
+
+### Script-favouring prompts (gpt-5-mini)
+
+T3: add `// audited` as the first line of every `.rs` file directly under `crates/axo/src/tools/` (26 files). T4: list the string each tool's `name()` returns. T5: per Markdown file in `crates/axo/docs/`, its top heading and `##` count.
+
+| Mode | Task | Requests | Input | Cache read | Output | Cost (USD) | Wall s | Top-level calls | Scripts | Files changed |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| on | T3 | 2 | 6,543 | 6,272 | 531 | 0.0029 | 600 (stalled) | 2 | 0 | 0 |
+| on | T4 | 12 | 8,554 | 100,224 | 2,033 | 0.0087 | 35.5 | 11 | 0 | – |
+| on | T5 | 20 | 47,065 | 757,248 | 2,448 | 0.0356 | 49.3 | 19 | 0 | – |
+| off | T3 | 6 | 33,393 | 100,352 | 2,492 | 0.0158 | 35.2 | 5 | 0 | 26 |
+| off | T4 | 23 | 33,066 | 392,192 | 2,670 | 0.0234 | 60.2 | 22 | 0 | – |
+| off | T5 | 6 | 19,576 | 70,144 | 1,149 | 0.0089 | 23.2 | 5 | 0 | – |
+
+The stalled run's third model request got no response for 600 s; two reruns of the same prompt finished in 36 s and 74 s. On the second rerun the model used one script that read and rewrote all 26 files correctly (`changed_count: 26`), then spent 12 more calls re-verifying the result with `bash`/`grep`. In every other run the model used `read`, `grep` and `bash` directly; turn counts vary more between runs than between modes. Two incidental findings, both independent of codemode: axo-ai has no stream idle or first-byte timeout, so a stalled provider stream holds a run until the host aborts it; and models sending more than 20 paths to `read` get a validation error and retry.
+
 ### Not yet measured
 
 - An Anthropic model.
-- Prompts where a script should win: many non-shell calls such as spawn/wait fan-out or read-then-edit across many files, or modes without `bash`.
+- Spawn/wait fan-out prompts and modes without `bash`.
 - The corpus re-run against the batching baseline in `efficiency.md`.
-- PSS after one 200 MB script.
-- aarch64-darwin.
 
 Default enablement and model gating stay undecided until these exist.
