@@ -164,10 +164,13 @@ async fn deadline_cannot_be_caught_and_ends_an_oom_loop_and_regex() {
         "try { while(true){} } catch {print('caught')} finally {print('finally')}",
         r#"/(a+)+$/.test("a".repeat(40)+"b")"#,
     ] {
-        let start = Instant::now();
         let (end, host) = eval(code, limits.clone()).await;
-        assert!(start.elapsed() < Duration::from_secs(1));
-        assert!(end.cpu >= limits.cpu);
+        // Other tests can hold all worker slots; only time spent executing counts here.
+        assert!(
+            end.cpu >= limits.cpu && end.cpu < Duration::from_secs(1),
+            "{code}: {:?}",
+            end.cpu
+        );
         assert_error(end, "Script exceeded its CPU limit of 0.035 s");
         assert!(host.output.lock().unwrap().is_empty());
     }
