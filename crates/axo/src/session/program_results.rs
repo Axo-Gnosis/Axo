@@ -156,6 +156,33 @@ async fn bash_raw_and_failure() {
 }
 
 #[tokio::test]
+async fn host_cannot_background_a_nested_command() {
+    let (dir, session) = session(vec![]).await;
+    let (output, ()) = tokio::join!(
+        execute(
+            &session,
+            "bash",
+            json!({"command": "while [[ ! -e release ]]; do sleep .01; done; printf done"}),
+            true,
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while session.command_jobs("outer/bash").is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("command row was registered");
+            assert!(!session.background("outer/bash"));
+            std::fs::write(dir.path().join("work/release"), "").unwrap();
+        },
+    );
+    let result = output.structured_content.unwrap();
+    assert_eq!(result["output"], "done");
+    assert_eq!(result["job"], Value::Null);
+}
+
+#[tokio::test]
 async fn read_whole_mixed_and_selected() {
     let (dir, session) = session(vec![]).await;
     let cwd = dir.path().join("work");

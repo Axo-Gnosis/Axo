@@ -116,6 +116,7 @@ pub(super) struct JobControl {
     pub(super) cancel: CancellationToken,
     pub(super) stop: Mutex<Option<Stop>>,
     pub(super) container: Option<Container>,
+    pub(super) host_promotable: bool,
     pub(super) promote: Notify,
 }
 
@@ -500,6 +501,7 @@ impl CommandRunner {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
             container: Some(process.container()),
+            host_promotable: !nested,
             promote: Notify::new(),
         });
         let output = Arc::new(OutputState {

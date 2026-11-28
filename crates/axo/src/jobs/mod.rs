@@ -1721,6 +1721,7 @@ impl JobRegistry {
             if run.call_id == call_id
                 && run.mode == Mode::Foreground
                 && let Some(control) = &run.control
+                && control.host_promotable
             {
                 control.promote.notify_one();
                 matched = true;

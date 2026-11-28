@@ -92,6 +92,7 @@ impl CommandRunner {
             cancel: CancellationToken::new(),
             stop: Mutex::new(None),
             container: None,
+            host_promotable: true,
             promote: Notify::new(),
         });
         let started_at = axo_ai::now_ms();
