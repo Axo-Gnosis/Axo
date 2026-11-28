@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axo_ai::transcript::{replay_tools, tool_state_changes};
@@ -16,16 +15,17 @@ use futures::StreamExt;
 use jsonschema::error::ValidationErrorKind;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio::task::{Id, JoinSet};
+use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, RunOutcome, SentRequest};
+use crate::calls::Calls;
 use crate::cancel::CancelReason;
 use crate::error::Error;
 use crate::event::{AgentEvent, MessageOrigin};
 use crate::hooks::{
     AfterToolCallContext, AgentContext, BeforeToolCallContext, Blocked, ToolCallDecision,
-    TurnContext,
+    ToolHooks, TurnContext,
 };
 use crate::message::{AgentMessage, QueuedMessage, last_non_system, unanswered_calls};
 use crate::tool::{
@@ -38,6 +38,15 @@ pub struct Routed<'a> {
     pub call: Cow<'a, ToolCall>,
     /// The dispatcher the model called, when the call was redirected.
     pub via: Option<Arc<dyn Tool>>,
+}
+
+impl Routed<'_> {
+    pub(crate) fn validate(&self, original: &ToolCall) -> Result<(), String> {
+        if let Some(via) = &self.via {
+            validate_arguments(&**via, original)?;
+        }
+        validate_arguments(&*self.tool, &self.call)
+    }
 }
 
 /// The tool `call` runs. `Err` is the model-facing "not found" text.
@@ -99,14 +108,7 @@ pub(crate) async fn run_loop(
     start: RunStart,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, Error> {
-    let context = {
-        let state = agent.lock();
-        AgentContext {
-            messages: state.messages.clone(),
-            tools: state.tools.clone(),
-            deferred: state.deferred.clone(),
-        }
-    };
+    let context = agent.lock().context();
     let mut run = Run {
         agent,
         cancel,
@@ -130,10 +132,10 @@ struct Completed {
 }
 
 /// One finished tool call, before it becomes a tool-result message.
-struct Outcome {
+pub(crate) struct Outcome {
     call_id: String,
     name: String,
-    output: ToolOutput,
+    pub(crate) output: ToolOutput,
     duration_ms: Option<u64>,
     /// Set once the tool is executed; kept whatever it returns. `None` for results the
     /// loop synthesizes, so the persisted result keeps its provenance.
@@ -141,13 +143,59 @@ struct Outcome {
 }
 
 impl Outcome {
-    fn synthetic(call: &ToolCall, output: ToolOutput) -> Self {
+    pub(crate) fn synthetic(call: &ToolCall, output: ToolOutput) -> Self {
         Self {
             call_id: call.id.clone(),
             name: call.name.clone(),
             output,
             duration_ms: None,
             invocation: None,
+        }
+    }
+
+    pub(crate) fn joined(
+        call: &ToolCall,
+        invocation: ToolInvocationId,
+        started: Instant,
+        result: Result<(Result<ToolOutput, ToolError>, u64, bool), JoinError>,
+    ) -> (Self, bool) {
+        let (output, duration_ms, executed) = match result {
+            Ok((result, duration_ms, executed)) => (
+                result.unwrap_or_else(|error| error_output(error.0)),
+                duration_ms,
+                executed,
+            ),
+            Err(error) if error.is_cancelled() => (
+                error_output("Operation aborted"),
+                elapsed_ms(started),
+                false,
+            ),
+            Err(error) => (
+                error_output(format!("Tool {} crashed: {error}", call.name)),
+                elapsed_ms(started),
+                true,
+            ),
+        };
+        (
+            Self {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                output,
+                duration_ms: Some(duration_ms),
+                invocation: Some(invocation),
+            },
+            executed,
+        )
+    }
+
+    pub(crate) fn end_event(&self, parent_call_id: Option<String>) -> AgentEvent {
+        AgentEvent::ToolExecutionEnd {
+            call_id: self.call_id.clone(),
+            name: self.name.clone(),
+            result: self.output.clone(),
+            parent_call_id,
+            invocation: self.invocation,
+            duration_ms: self.duration_ms,
         }
     }
 }
@@ -161,7 +209,7 @@ enum Prepared {
 
 /// How long a stopped call may take to return on its own before its future is dropped.
 /// Covers bash's SIGTERM→SIGKILL grace (1 s) plus its drain.
-const STOP_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// The spawned calls of one batch, their shared cancellation, and the channel their
 /// updates arrive on.
@@ -585,6 +633,10 @@ impl Run<'_> {
         message: &AssistantMessage,
         calls: &[ToolCall],
     ) -> Result<(Vec<ToolResultMessage>, bool), Error> {
+        if calls.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let message = Arc::new(message.clone());
         let routed: Vec<_> = calls
             .iter()
             .map(|call| route(&self.context.tools, &self.context.deferred, call))
@@ -622,7 +674,7 @@ impl Run<'_> {
                 let effective = routed.as_ref().map_or(call, |routed| routed.call.as_ref());
                 self.emit_start(effective).await?;
                 let prepared = match routed {
-                    Ok(routed) => self.prepare(message, call, routed).await,
+                    Ok(routed) => self.prepare(&message, call, routed).await,
                     Err(text) => Prepared::Immediate(error_output(text.clone())),
                 };
                 match prepared {
@@ -646,9 +698,9 @@ impl Run<'_> {
             } else {
                 let mut batch = Batch::new(&self.cancel);
                 for (index, tool, call) in ready {
-                    self.spawn_call(&mut batch, index, tool, call);
+                    self.spawn_call(&mut batch, index, tool, call, message.clone());
                 }
-                for (index, outcome) in self.drive(message, batch).await? {
+                for (index, outcome) in self.drive(&message, batch).await? {
                     slots[index] = Some(outcome);
                 }
             }
@@ -673,62 +725,42 @@ impl Run<'_> {
         original: &ToolCall,
         routed: &Routed<'_>,
     ) -> Prepared {
-        if let Some(via) = &routed.via
-            && let Err(text) = validate_arguments(&**via, original)
-        {
+        if let Err(text) = routed.validate(original) {
             return Prepared::Immediate(error_output(text));
         }
-        let tool = &routed.tool;
         let call = routed.call.as_ref();
-        if let Err(text) = validate_arguments(&**tool, call) {
-            return Prepared::Immediate(error_output(text));
-        }
-        let hooks = self.agent.tool_hooks();
-        for hook in hooks.iter() {
-            let decision = hook
-                .before_tool_call(
-                    BeforeToolCallContext {
-                        assistant_message: message,
-                        tool_call: call,
-                        context: &self.context,
-                    },
-                    &self.cancel,
-                )
-                .await;
-            match decision {
-                Err(error) => return Prepared::Immediate(error_output(error.0)),
-                Ok(_) if self.cancel.is_cancelled() => {
-                    return Prepared::Immediate(error_output("Operation aborted"));
-                }
-                Ok(ToolCallDecision::Block {
-                    reason,
-                    terminate,
-                    origin,
-                }) => {
-                    let mut output =
-                        error_output(reason.unwrap_or_else(|| "Tool execution was blocked".into()));
-                    output.terminate = terminate;
-                    output.details = Some(serde_json::json!({ "blocked": Blocked { origin } }));
-                    return Prepared::Immediate(output);
-                }
-                Ok(ToolCallDecision::Allow) => {}
-            }
-        }
-        if self.cancel.is_cancelled() {
-            Prepared::Immediate(error_output("Operation aborted"))
-        } else {
-            Prepared::Ready(tool.clone(), call.clone())
+        match before_tool_call(
+            &self.agent.tool_hooks(),
+            BeforeToolCallContext {
+                assistant_message: message,
+                tool_call: call,
+                context: &self.context,
+                parent: None,
+            },
+            &self.cancel,
+        )
+        .await
+        {
+            Some(output) => Prepared::Immediate(output),
+            None => Prepared::Ready(routed.tool.clone(), call.clone()),
         }
     }
 
     /// Starts one prepared call on its own task, so the loop never polls tool futures:
     /// a tool waiting on something the loop's `Persist` holds cannot stall the loop. The
     /// call's token is a child of the batch's, so Stop and a failed persist both reach it.
-    fn spawn_call(&self, batch: &mut Batch, index: usize, tool: Arc<dyn Tool>, call: ToolCall) {
+    fn spawn_call(
+        &self,
+        batch: &mut Batch,
+        index: usize,
+        tool: Arc<dyn Tool>,
+        call: ToolCall,
+        assistant: Arc<AssistantMessage>,
+    ) {
         let call = Arc::new(call);
-        let invocation =
-            ToolInvocationId(self.agent.next_invocation.fetch_add(1, Ordering::Relaxed));
+        let invocation = self.agent.invocation();
         let call_id: Arc<str> = Arc::from(call.id.as_str());
+        let calls = Calls::new(self.agent, call_id.clone(), assistant);
         let sender = batch.sender.clone();
         let cx = ToolContext {
             call: Arc::clone(&call),
@@ -738,6 +770,8 @@ impl Run<'_> {
             }),
             steer: SteerSignal(self.agent.steer_pending.subscribe()),
             invocation,
+            parent: None,
+            calls,
         };
         let started = Instant::now();
         let hard_stop = batch.hard_stop.clone();
@@ -807,33 +841,19 @@ impl Run<'_> {
             if failure.is_some() {
                 continue;
             }
-            let (output, duration_ms, executed) = match result {
-                Ok((result, duration_ms, executed)) => (
-                    result.unwrap_or_else(|error| error_output(error.0)),
-                    duration_ms,
-                    executed,
-                ),
-                Err(error) if error.is_cancelled() => (
-                    error_output("Operation aborted"),
-                    elapsed_ms(spawned.started),
-                    false,
-                ),
-                Err(error) => (
-                    error_output(format!("Tool {} crashed: {error}", spawned.call.name)),
-                    elapsed_ms(spawned.started),
-                    true,
-                ),
-            };
-            let mut outcome = Outcome {
-                call_id: spawned.call.id.clone(),
-                name: spawned.call.name.clone(),
-                output,
-                duration_ms: Some(duration_ms),
-                invocation: Some(spawned.invocation),
-            };
+            let (mut outcome, executed) =
+                Outcome::joined(&spawned.call, spawned.invocation, spawned.started, result);
             if executed {
-                self.after_tool_call(message, &spawned.call, &mut outcome.output)
-                    .await;
+                after_tool_call(
+                    &self.agent.tool_hooks(),
+                    message,
+                    &spawned.call,
+                    &self.context,
+                    None,
+                    &mut outcome.output,
+                    &self.cancel,
+                )
+                .await;
             }
             let emitted = async {
                 // Updates sent before the call returned precede its end.
@@ -857,53 +877,11 @@ impl Run<'_> {
         }
     }
 
-    /// Applies `after_tool_call` overrides to an executed call's output.
-    async fn after_tool_call(
-        &self,
-        message: &AssistantMessage,
-        call: &ToolCall,
-        output: &mut ToolOutput,
-    ) {
-        let hooks = self.agent.tool_hooks();
-        for hook in hooks.iter() {
-            let overrides = hook
-                .after_tool_call(
-                    AfterToolCallContext {
-                        assistant_message: message,
-                        tool_call: call,
-                        result: &*output,
-                        context: &self.context,
-                    },
-                    &self.cancel,
-                )
-                .await;
-            match overrides {
-                Ok(Some(overrides)) => {
-                    if let Some(content) = overrides.content {
-                        output.content = content;
-                    }
-                    if let Some(details) = overrides.details {
-                        output.details = Some(details);
-                    }
-                    if let Some(is_error) = overrides.is_error {
-                        output.is_error = is_error;
-                    }
-                    if let Some(terminate) = overrides.terminate {
-                        output.terminate = terminate;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(tool = %call.name, %error, "after_tool_call failed; keeping the executed result");
-                }
-            }
-        }
-    }
-
     async fn emit_update(&self, call_id: Arc<str>, update: ToolUpdate) -> Result<(), Error> {
         self.emit(&AgentEvent::ToolExecutionUpdate {
             call_id: call_id.as_ref().to_owned(),
             update,
+            parent_call_id: None,
         })
         .await
     }
@@ -1053,17 +1031,13 @@ impl Run<'_> {
             call_id: call.id.clone(),
             name: call.name.clone(),
             args: call.arguments.clone(),
+            parent_call_id: None,
         })
         .await
     }
 
     async fn emit_end(&self, outcome: &Outcome) -> Result<(), Error> {
-        self.emit(&AgentEvent::ToolExecutionEnd {
-            call_id: outcome.call_id.clone(),
-            name: outcome.name.clone(),
-            result: outcome.output.clone(),
-        })
-        .await
+        self.emit(&outcome.end_event(None)).await
     }
 
     /// Delivers one event to the persistence sink.
@@ -1076,35 +1050,102 @@ impl Run<'_> {
     /// is persisted, so the run resumes from the last state saved before it; returns
     /// whether the event was persisted.
     async fn persist(&self, event: &AgentEvent) -> Result<bool, Error> {
-        if self.cancel_reason() == Some(CancelReason::Shutdown)
-            && !matches!(event, AgentEvent::AgentEnd { .. })
-        {
-            return Ok(false);
-        }
-        if let Some(persist) = &self.agent.persist {
-            persist.persist(event).await?;
-        }
-        Ok(true)
+        self.agent.emit(event).await
     }
 }
 
-fn elapsed_ms(started: Instant) -> u64 {
+/// Returns a synthetic result when the call cannot execute.
+pub(crate) async fn before_tool_call(
+    hooks: &[Arc<dyn ToolHooks>],
+    context: BeforeToolCallContext<'_>,
+    cancel: &CancellationToken,
+) -> Option<ToolOutput> {
+    for hook in hooks {
+        match hook.before_tool_call(context, cancel).await {
+            Err(error) => return Some(error_output(error.0)),
+            Ok(_) if cancel.is_cancelled() => return Some(error_output("Operation aborted")),
+            Ok(ToolCallDecision::Block {
+                reason,
+                terminate,
+                origin,
+            }) => {
+                let mut output =
+                    error_output(reason.unwrap_or_else(|| "Tool execution was blocked".into()));
+                output.terminate = terminate;
+                output.details = Some(serde_json::json!({ "blocked": Blocked { origin } }));
+                return Some(output);
+            }
+            Ok(ToolCallDecision::Allow) => {}
+        }
+    }
+    cancel
+        .is_cancelled()
+        .then(|| error_output("Operation aborted"))
+}
+
+/// Applies `after_tool_call` overrides to an executed call's output.
+pub(crate) async fn after_tool_call(
+    hooks: &[Arc<dyn ToolHooks>],
+    assistant_message: &AssistantMessage,
+    tool_call: &ToolCall,
+    context: &AgentContext,
+    parent: Option<&str>,
+    output: &mut ToolOutput,
+    cancel: &CancellationToken,
+) {
+    for hook in hooks {
+        let overrides = hook
+            .after_tool_call(
+                AfterToolCallContext {
+                    assistant_message,
+                    tool_call,
+                    result: output,
+                    context,
+                    parent,
+                },
+                cancel,
+            )
+            .await;
+        match overrides {
+            Ok(Some(overrides)) => {
+                if let Some(content) = overrides.content {
+                    output.content = content;
+                    output.structured_content = None;
+                }
+                if let Some(details) = overrides.details {
+                    output.details = Some(details);
+                }
+                if let Some(is_error) = overrides.is_error {
+                    output.is_error = is_error;
+                }
+                if let Some(terminate) = overrides.terminate {
+                    output.terminate = terminate;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(tool = %tool_call.name, %error, "after_tool_call failed; keeping the executed result");
+            }
+        }
+    }
+}
+
+pub(crate) fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// An error result with one text block (pi `createErrorToolResult`).
-fn error_output(text: impl Into<String>) -> ToolOutput {
+pub(crate) fn error_output(text: impl Into<String>) -> ToolOutput {
     ToolOutput {
         content: vec![UserBlock::Text { text: text.into() }],
-        details: None,
         is_error: true,
-        terminate: false,
+        ..ToolOutput::default()
     }
 }
 
 /// Validates a call's arguments against its tool's JSON Schema, with pi's error text
 /// (`validateToolArguments`). pi's type coercion is not ported.
-fn validate_arguments(tool: &dyn Tool, call: &ToolCall) -> Result<(), String> {
+pub(crate) fn validate_arguments(tool: &dyn Tool, call: &ToolCall) -> Result<(), String> {
     if let Some(error) = &call.arguments_error {
         return Err(format!(
             "Invalid arguments for tool \"{}\": {error}",

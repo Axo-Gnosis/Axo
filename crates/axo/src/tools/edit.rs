@@ -382,7 +382,7 @@ pub(super) mod tests {
 
     use async_trait::async_trait;
     use axo_agent::{
-        Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
+        Calls, Replay, SteerSignal, Tool, ToolContext, ToolError, ToolInvocationId, ToolOutput,
         ToolUpdates,
     };
     use axo_ai::{ToolCall, UserBlock};
@@ -513,6 +513,8 @@ pub(super) mod tests {
                 updates: ToolUpdates::sink(),
                 steer: SteerSignal::never(),
                 invocation: ToolInvocationId(0),
+                parent: None,
+                calls: Calls::none(),
             }
         }
 

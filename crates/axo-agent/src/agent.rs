@@ -2,8 +2,8 @@
 //! loop in [`crate::run`]. Events are delivered through [`Persist`].
 
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use axo_ai::{
     AssistantMessage, Message, Model, ServiceTier, SimpleStreamOptions, Streamer, ThinkingLevel,
@@ -15,11 +15,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cancel::CancelReason;
 use crate::error::Error;
-use crate::event::Persist;
-use crate::hooks::{LoopHooks, NoHooks, ToolHooks};
+use crate::event::{AgentEvent, Persist};
+use crate::hooks::{AgentContext, LoopHooks, NoHooks, ToolHooks};
 use crate::message::{AgentMessage, QueuedMessage, last_non_system};
 use crate::run::{self, RunStart};
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolInvocationId};
 
 pub struct AgentConfig {
     pub streamer: Arc<dyn Streamer>,
@@ -108,7 +108,9 @@ pub struct Agent {
     /// True while `state.steering` is non-empty; written under the state lock.
     pub(crate) steer_pending: watch::Sender<bool>,
     /// The next [`ToolInvocationId`](crate::ToolInvocationId).
-    pub(crate) next_invocation: AtomicU64,
+    next_invocation: AtomicU64,
+    pub(crate) this: Weak<Agent>,
+    pub(crate) nested_stop: CancellationToken,
     /// See [`Agent::last_request`].
     pub(crate) last_request: watch::Sender<Option<Arc<SentRequest>>>,
 }
@@ -142,6 +144,21 @@ pub(crate) struct State {
     pub(crate) shut_down: bool,
 }
 
+impl State {
+    pub(crate) fn context(&self) -> AgentContext {
+        AgentContext {
+            messages: self.messages.clone(),
+            tools: self.tools.clone(),
+            deferred: self.deferred.clone(),
+        }
+    }
+
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.shut_down
+            || self.run.as_ref().and_then(|run| run.reason) == Some(CancelReason::Shutdown)
+    }
+}
+
 pub(crate) struct ActiveRun {
     pub(crate) cancel: CancellationToken,
     /// Set by the first `Agent::cancel` of the run.
@@ -159,8 +176,8 @@ impl Drop for RunGuard<'_> {
 }
 
 impl Agent {
-    pub fn new(cfg: AgentConfig) -> Self {
-        Self {
+    pub fn new(cfg: AgentConfig) -> Arc<Self> {
+        Arc::new_cyclic(|this| Self {
             streamer: cfg.streamer,
             hooks: cfg.hooks,
             tool_hooks: Mutex::new(cfg.tool_hooks.into()),
@@ -182,8 +199,25 @@ impl Agent {
             }),
             steer_pending: watch::channel(false).0,
             next_invocation: AtomicU64::new(0),
+            this: this.clone(),
+            nested_stop: CancellationToken::new(),
             last_request: watch::channel(None).0,
+        })
+    }
+
+    pub(crate) fn invocation(&self) -> ToolInvocationId {
+        ToolInvocationId(self.next_invocation.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// During shutdown only AgentEnd is delivered, so the session can clear live state.
+    pub(crate) async fn emit(&self, event: &AgentEvent) -> Result<bool, Error> {
+        if !matches!(event, AgentEvent::AgentEnd { .. }) && self.lock().shutting_down() {
+            return Ok(false);
         }
+        if let Some(persist) = &self.persist {
+            persist.persist(event).await?;
+        }
+        Ok(true)
     }
 
     /// Locks the state, recovering from a poisoned lock (no invariant spans a panic).
@@ -416,6 +450,7 @@ impl Agent {
     pub fn shutdown(&self) {
         let mut state = self.lock();
         state.shut_down = true;
+        self.nested_stop.cancel();
         if let Some(run) = &mut state.run {
             run.reason.get_or_insert(CancelReason::Shutdown);
             run.cancel.cancel();

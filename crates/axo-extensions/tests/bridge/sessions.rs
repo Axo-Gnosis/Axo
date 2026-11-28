@@ -291,11 +291,9 @@ async fn tools_policy_state_command_and_events() {
     let mut updates = Vec::new();
     loop {
         match &*events.try_recv().expect("read execution end not received") {
-            SessionEvent::Agent(AgentEvent::ToolExecutionUpdate { call_id, update })
-                if call_id == "read" =>
-            {
-                updates.extend_from_slice(&update.content)
-            }
+            SessionEvent::Agent(AgentEvent::ToolExecutionUpdate {
+                call_id, update, ..
+            }) if call_id == "read" => updates.extend_from_slice(&update.content),
             SessionEvent::Agent(AgentEvent::ToolExecutionEnd { call_id, .. })
                 if call_id == "read" =>
             {
@@ -1264,11 +1262,13 @@ async fn dropped_manager_fences_hooks_and_restores_layer() {
             assistant_message,
             tool_call: &tool_call,
             context: &context,
+            parent: None,
         };
         let after = axo_agent::AfterToolCallContext {
             assistant_message,
             tool_call: &tool_call,
             context: &context,
+            parent: None,
             result: &Default::default(),
         };
         let closed = "extension lab: the extension manager is shut down";

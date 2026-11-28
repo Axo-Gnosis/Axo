@@ -55,10 +55,13 @@ pub struct TurnContext<'a> {
 }
 
 /// Context passed to `before_tool_call`. `tool_call.arguments` are already validated.
+#[derive(Clone, Copy)]
 pub struct BeforeToolCallContext<'a> {
     pub assistant_message: &'a AssistantMessage,
     pub tool_call: &'a ToolCall,
     pub context: &'a AgentContext,
+    /// For a nested call, the id of the model-issued call in `assistant_message`.
+    pub parent: Option<&'a str>,
 }
 
 /// `before_tool_call`'s verdict (pi `BeforeToolCallResult`).
@@ -98,6 +101,8 @@ pub struct AfterToolCallContext<'a> {
     /// The executed result, including overrides from earlier hooks in the list.
     pub result: &'a ToolOutput,
     pub context: &'a AgentContext,
+    /// For a nested call, the id of the model-issued call in `assistant_message`.
+    pub parent: Option<&'a str>,
 }
 
 /// Field-by-field override of an executed result (pi `AfterToolCallResult`); `None`

@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::message::AgentMessage;
 use crate::tool::{ToolInvocationId, ToolOutput, ToolUpdate};
 
-/// One event of a run, delivered to the ordered, awaited [`Persist`] sink.
+/// One event of a run or nested call, delivered to the awaited [`Persist`] sink.
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(
     tag = "type",
@@ -44,16 +44,26 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         args: JsonMap,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
     },
     ToolExecutionUpdate {
         call_id: String,
         update: ToolUpdate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
     },
     /// The finalized result (after `after_tool_call`), in completion order.
     ToolExecutionEnd {
         call_id: String,
         name: String,
         result: ToolOutput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation: Option<ToolInvocationId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 }
 
@@ -74,8 +84,9 @@ pub enum MessageOrigin {
     Tool(ToolInvocationId),
 }
 
-/// The ordered, awaited event subscriber. The session saves each finished message here
-/// before the next request goes out. An error stops the run.
+/// The awaited event subscriber. The loop delivers events in order and stops the run on
+/// error. Nested call events can arrive concurrently with loop and other nested events;
+/// each call's start precedes its updates and end. A nested error stops its call family.
 #[async_trait]
 pub trait Persist: Send + Sync {
     async fn persist(&self, event: &AgentEvent) -> Result<(), PersistError>;
