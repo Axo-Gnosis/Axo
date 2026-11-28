@@ -406,7 +406,7 @@ fn shape_output(body: &str, max_bytes: usize, artifact: &str) -> (String, bool) 
     if body.len() <= max_bytes {
         return (body.into(), false);
     }
-    let head_bytes = max_bytes / 5 * 2 + max_bytes % 5 * 2 / 5;
+    let head_bytes = max_bytes * 2 / 5;
     let head = truncate::truncate_head(
         body,
         truncate::Limits {
