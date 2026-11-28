@@ -3154,6 +3154,8 @@ export type ProviderInfo = {
 	oauthOnly: boolean,
 	/**  The provider supports `Models::login`. */
 	login: boolean,
+	/**  The provider reports account usage through `Models::usage`. */
+	usage: boolean,
 	/**  The winning contributor of this id. */
 	origin: ProviderOrigin,
 };

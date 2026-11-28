@@ -50,6 +50,10 @@ pub struct AccountUsage {
     /// while every limit comes from observed responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<i64>,
+    /// When `ProviderUsage::observe` last merged limits off a model response, in milliseconds
+    /// since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<i64>,
 }
 
 /// One limit: a usage window or a spend meter.

@@ -42,6 +42,8 @@ pub struct ProviderInfo {
     pub oauth_only: bool,
     /// The provider supports `Models::login`.
     pub login: bool,
+    /// The provider reports account usage through `Models::usage`.
+    pub usage: bool,
     /// The winning contributor of this id.
     pub origin: ProviderOrigin,
 }

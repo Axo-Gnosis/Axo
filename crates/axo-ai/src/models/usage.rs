@@ -38,7 +38,10 @@ impl Shared {
         Some(Arc::new(move |status, headers| {
             let limits = usage.observe(status, headers);
             if !limits.is_empty() {
-                shared.edit_usage(&slot, |tracked| merge(&mut tracked.report.limits, limits));
+                shared.edit_usage(&slot, |tracked| {
+                    merge(&mut tracked.report.limits, limits);
+                    tracked.report.observed_at = Some(now_ms());
+                });
             }
         }))
     }
@@ -129,6 +132,7 @@ impl Models {
             shared.edit_usage(&info.slot, |tracked| {
                 tracked.report = AccountUsage {
                     fetched_at: Some(now_ms()),
+                    observed_at: None,
                     ..report
                 };
             });

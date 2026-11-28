@@ -100,24 +100,30 @@ impl Published {
             .collect();
         let mut by_id: Vec<usize> = (0..snapshot.len()).collect();
         by_id.sort_unstable_by_key(|&i| (&snapshot[i].provider, &snapshot[i].id, i));
-        let mut providers: BTreeMap<&str, (&ProviderAuth, ProviderOrigin)> = loaded
+        let mut providers: BTreeMap<&str, (&ProviderAuth, bool, ProviderOrigin)> = loaded
             .providers
             .iter()
-            .map(|(id, info)| (id.as_str(), (info.as_ref(), ProviderOrigin::Loaded)))
+            .map(|(id, info)| (id.as_str(), (info.as_ref(), false, ProviderOrigin::Loaded)))
             .collect();
-        providers.extend(
-            winners
-                .iter()
-                .map(|(&id, (registered, origin))| (id, (registered.auth.as_ref(), *origin))),
-        );
+        providers.extend(winners.iter().map(|(&id, (registered, origin))| {
+            (
+                id,
+                (
+                    registered.auth.as_ref(),
+                    registered.usage.is_some(),
+                    *origin,
+                ),
+            )
+        }));
         let providers = providers
             .into_values()
-            .map(|(info, origin)| ProviderInfo {
+            .map(|(info, usage, origin)| ProviderInfo {
                 id: info.id.clone(),
                 env: info.env.clone(),
                 requires_key: info.requires_key,
                 oauth_only: info.oauth_only,
                 login: info.login.is_some(),
+                usage,
                 origin,
             })
             .collect();

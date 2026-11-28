@@ -1881,6 +1881,19 @@ async fn usage_merges_fetched_and_observed_limits() {
         )
         .unwrap();
     let mut changes = models.subscribe_usage();
+    let metered_info = models
+        .providers()
+        .into_iter()
+        .find(|info| info.id == "metered")
+        .unwrap();
+    assert!(metered_info.usage);
+    assert!(
+        models
+            .providers()
+            .iter()
+            .filter(|info| info.id != "metered")
+            .all(|info| !info.usage)
+    );
 
     // No credential: nothing is fetched.
     assert_eq!(models.refresh_usage("metered").await.unwrap(), None);
@@ -1891,6 +1904,7 @@ async fn usage_merges_fetched_and_observed_limits() {
     let report = models.refresh_usage("metered").await.unwrap().unwrap();
     assert_eq!(report.plan.as_deref(), Some("max"));
     assert!(report.fetched_at.is_some());
+    assert!(report.observed_at.is_none());
     models.refresh_usage("metered").await.unwrap();
     assert_eq!(*usage.fetches.lock().unwrap(), [Some("key-1".to_owned())]);
     assert!(changes.has_changed().unwrap());
@@ -1914,9 +1928,9 @@ async fn usage_merges_fetched_and_observed_limits() {
     .pop()
     .unwrap();
     assert!(matches!(last, AssistantEvent::Error { .. }), "{last:?}");
-    let ids: Vec<(String, String)> = models
-        .usage("metered")
-        .unwrap()
+    let observed = models.usage("metered").unwrap();
+    assert!(observed.observed_at.is_some());
+    let ids: Vec<(String, String)> = observed
         .limits
         .into_iter()
         .map(|limit| (limit.id, limit.label))
